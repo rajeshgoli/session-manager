@@ -70,10 +70,12 @@ class SessionManagerApp:
         self.telegram_bot: Optional[TelegramBot] = None
 
         if telegram_config.get("token"):
+            services_config = self.config.get("services", {})
             self.telegram_bot = TelegramBot(
                 token=telegram_config["token"],
                 allowed_chat_ids=telegram_config.get("allowed_chat_ids"),
                 allowed_user_ids=telegram_config.get("allowed_user_ids"),
+                office_automate_url=services_config.get("office_automate_url"),
             )
             self._setup_telegram_handlers()
 

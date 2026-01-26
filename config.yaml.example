@@ -29,3 +29,7 @@ email:
   # Leave empty to use defaults from ../claude-email-automation/
   smtp_config: ""
   imap_config: ""
+
+services:
+  # Office automation service (for /password command and other utilities)
+  office_automate_url: "http://192.168.5.140:8080"

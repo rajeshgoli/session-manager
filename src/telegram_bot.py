@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from typing import Optional, Callable, Awaitable
+import httpx
 
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -87,6 +88,7 @@ class TelegramBot:
         token: str,
         allowed_chat_ids: Optional[list[int]] = None,
         allowed_user_ids: Optional[list[int]] = None,
+        office_automate_url: Optional[str] = None,
     ):
         """
         Initialize the Telegram bot.
@@ -95,10 +97,12 @@ class TelegramBot:
             token: Telegram bot token from BotFather
             allowed_chat_ids: List of chat IDs allowed to use the bot (None = allow all)
             allowed_user_ids: List of user IDs allowed to use the bot (None = allow all)
+            office_automate_url: URL to office-automate service for utilities like /password
         """
         self.token = token
         self.allowed_chat_ids = set(allowed_chat_ids) if allowed_chat_ids else None
         self.allowed_user_ids = set(allowed_user_ids) if allowed_user_ids else None
+        self.office_automate_url = office_automate_url or "http://192.168.5.140:8080"
         self.application: Optional[Application] = None
         self.bot: Optional[Bot] = None
 
@@ -214,6 +218,7 @@ class TelegramBot:
             "/kill [id] - Kill a session\n"
             "/open [id] - Open session in Terminal.app\n"
             "/name <name> - Set friendly name (reply to session)\n"
+            "/password - Get LocalTunnel password\n"
             "/help - Show this message\n\n"
             "Reply to a session thread to send input."
         )
@@ -733,6 +738,26 @@ class TelegramBot:
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
+    async def _cmd_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /password command to get LocalTunnel password."""
+        if not self._is_allowed(update.effective_chat.id, update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+
+        try:
+            async with httpx.AsyncClient() as client:
+                url = f"{self.office_automate_url}/localtunnel/password"
+                response = await client.get(url, timeout=5)
+                response.raise_for_status()
+
+                data = response.json()
+                password = data.get("password") or str(data)
+
+                await update.message.reply_text(f"🔐 LocalTunnel Password:\n`{password}`", parse_mode="MarkdownV2")
+        except Exception as e:
+            logger.error(f"Error fetching password: {e}")
+            await update.message.reply_text(f"Failed to fetch password: {e}")
+
     async def _handle_new_project(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle project selection button press."""
         query = update.callback_query
@@ -831,6 +856,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("open", self._cmd_open))
         self.application.add_handler(CommandHandler("name", self._cmd_name))
+        self.application.add_handler(CommandHandler("password", self._cmd_password))
 
         # Handle button presses for project selection
         self.application.add_handler(CallbackQueryHandler(self._handle_new_project, pattern="^new_project:"))

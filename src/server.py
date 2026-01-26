@@ -419,6 +419,39 @@ def create_app(
             message = payload.get("message", "")
             logger.info(f"Claude notification: {notification_type} - {message}")
 
+            # Send notification to Telegram for permission prompts and errors
+            if app.state.notifier and app.state.session_manager:
+                # Try to find the session
+                target_session = None
+
+                if session_manager_id:
+                    target_session = app.state.session_manager.get_session(session_manager_id)
+                    if target_session:
+                        logger.info(f"Found session {session_manager_id} for notification")
+
+                if not target_session and claude_session_id:
+                    target_session = app.state.session_manager.get_session(claude_session_id)
+                    if target_session:
+                        logger.info(f"Found session {claude_session_id} for notification")
+
+                # Send notification if we found a session
+                if target_session and target_session.telegram_chat_id:
+                    from .models import NotificationEvent
+                    event = NotificationEvent(
+                        session_id=target_session.id,
+                        event_type=notification_type,  # "permission_prompt", "idle_prompt", etc.
+                        message=message,
+                        context=last_message or "",
+                        urgent=notification_type in ["permission_prompt", "error"],
+                    )
+                    await app.state.notifier.notify(event, target_session)
+                else:
+                    logger.warning(
+                        f"Notification hook: Could not find matching session for "
+                        f"session_manager_id={session_manager_id}, "
+                        f"claude_session_id={claude_session_id}"
+                    )
+
         return {"status": "received", "hook_event": hook_event}
 
     return app
