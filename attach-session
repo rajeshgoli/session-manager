@@ -1,0 +1,30 @@
+#!/bin/bash
+# List and attach to a Claude session
+
+sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -E "^claude-" | sort)
+
+if [ -z "$sessions" ]; then
+    echo "No Claude sessions found"
+    exit 1
+fi
+
+# If only one session, attach directly
+if [ $(echo "$sessions" | wc -l) -eq 1 ]; then
+    tmux attach -t "$sessions"
+    exit 0
+fi
+
+# Multiple sessions - show menu
+echo "Available sessions:"
+echo "$sessions" | nl -v 1 -s '. '
+
+read -p "Select session (number): " choice
+
+session=$(echo "$sessions" | sed -n "${choice}p")
+
+if [ -z "$session" ]; then
+    echo "Invalid selection"
+    exit 1
+fi
+
+tmux attach -t "$session"
