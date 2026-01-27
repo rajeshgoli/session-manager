@@ -17,20 +17,17 @@ def cmd_name(client: SessionManagerClient, session_id: str, friendly_name: str) 
         1: Failed to set
         2: Session manager unavailable
     """
-    success = client.update_friendly_name(session_id, friendly_name)
+    success, unavailable = client.update_friendly_name(session_id, friendly_name)
 
     if success:
         print(f"Name set: {friendly_name} ({session_id})")
         return 0
+    elif unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
     else:
-        # Check if it's a connection issue
-        session = client.get_session(session_id)
-        if session is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
-            return 2
-        else:
-            print("Error: Failed to set name", file=sys.stderr)
-            return 1
+        print("Error: Failed to set name", file=sys.stderr)
+        return 1
 
 
 def cmd_me(client: SessionManagerClient, session_id: str) -> int:
@@ -238,13 +235,13 @@ def cmd_task(client: SessionManagerClient, session_id: str, description: str) ->
         1: Failed to register
         2: Session manager unavailable
     """
-    success = client.update_task(session_id, description)
+    success, unavailable = client.update_task(session_id, description)
 
     if success:
         print(f"Task registered for session {session_id}")
         return 0
-    else:
-        # Fallback to lock file
+    elif unavailable:
+        # Fallback to lock file when session manager unavailable
         lock_manager = LockManager()
         if lock_manager.acquire_lock(session_id, description):
             print(f"Task registered in lock file (session manager unavailable)")
@@ -252,6 +249,10 @@ def cmd_task(client: SessionManagerClient, session_id: str, description: str) ->
         else:
             print("Error: Failed to register task", file=sys.stderr)
             return 1
+    else:
+        # API error (not unavailable, but failed)
+        print("Error: Failed to register task", file=sys.stderr)
+        return 1
 
 
 def cmd_lock(session_id: Optional[str], description: str) -> int:

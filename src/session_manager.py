@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
@@ -82,7 +83,6 @@ class SessionManager:
         Returns:
             Git remote URL or None if not a git repo
         """
-        import subprocess
         try:
             working_path = Path(working_dir).expanduser().resolve()
             result = subprocess.run(
