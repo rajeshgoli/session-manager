@@ -37,6 +37,10 @@ def main():
     others_parser = subparsers.add_parser("others", help="List others + what they're doing")
     others_parser.add_argument("--repo", action="store_true", help="Include sessions in other worktrees of same repo")
 
+    # sm all
+    all_parser = subparsers.add_parser("all", help="List all sessions system-wide")
+    all_parser.add_argument("--summaries", action="store_true", help="Include AI-generated summaries")
+
     # sm alone
     subparsers.add_parser("alone", help="Check if you're the only active agent (for scripting)")
 
@@ -68,7 +72,7 @@ def main():
 
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
-    if not session_id and args.command not in ["lock", "unlock", "subagent-start", "subagent-stop", None]:
+    if not session_id and args.command not in ["lock", "unlock", "subagent-start", "subagent-stop", "all", None]:
         print("Error: CLAUDE_SESSION_MANAGER_ID environment variable not set", file=sys.stderr)
         print("This tool must be run inside a Claude Code session managed by Session Manager", file=sys.stderr)
         sys.exit(2)
@@ -87,6 +91,8 @@ def main():
         sys.exit(commands.cmd_what(client, args.session_id, args.lines, args.deep))
     elif args.command == "others":
         sys.exit(commands.cmd_others(client, session_id, args.repo))
+    elif args.command == "all":
+        sys.exit(commands.cmd_all(client, args.summaries))
     elif args.command == "alone":
         sys.exit(commands.cmd_alone(client, session_id))
     elif args.command == "task":
