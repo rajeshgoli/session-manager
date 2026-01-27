@@ -28,6 +28,35 @@ class TmuxController:
         result = self._run_tmux("has-session", "-t", session_name, check=False)
         return result.returncode == 0
 
+    def set_status_bar(self, session_name: str, friendly_name: str) -> bool:
+        """
+        Update tmux status bar to show friendly name.
+
+        Args:
+            session_name: tmux session name
+            friendly_name: User-friendly name to display
+
+        Returns:
+            True if successful
+        """
+        if not self.session_exists(session_name):
+            logger.warning(f"Session {session_name} does not exist")
+            return False
+
+        try:
+            # Set status-left to show friendly name
+            self._run_tmux(
+                "set-option",
+                "-t", session_name,
+                "status-left",
+                f"[{friendly_name}] "
+            )
+            logger.info(f"Updated status bar for {session_name} to show '{friendly_name}'")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to set status bar: {e.stderr}")
+            return False
+
     def create_session(
         self,
         session_name: str,

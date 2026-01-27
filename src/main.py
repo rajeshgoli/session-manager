@@ -160,6 +160,10 @@ class SessionManagerApp:
 
             session.friendly_name = name
             self.session_manager._save_state()
+
+            # Update tmux status bar to show friendly name
+            self.session_manager.tmux.set_status_bar(session.tmux_session, name)
+
             return True
 
         async def on_get_last_output(session_id: str) -> Optional[str]:
@@ -224,6 +228,10 @@ class SessionManagerApp:
             if session.status not in (SessionStatus.STOPPED, SessionStatus.ERROR):
                 await self.output_monitor.start_monitoring(session, is_restored=True)
                 logger.info(f"Restored monitoring for session {session.name}")
+
+                # Update tmux status bar if friendly name exists
+                if session.friendly_name:
+                    self.session_manager.tmux.set_status_bar(session.tmux_session, session.friendly_name)
 
         # Start the web server
         config = uvicorn.Config(
