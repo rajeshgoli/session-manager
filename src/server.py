@@ -263,6 +263,90 @@ def create_app(
             output = app.state.last_claude_output.get("latest")
         return {"session_id": session_id, "message": output}
 
+    @app.get("/sessions/{session_id}/summary")
+    async def get_summary(session_id: str, lines: int = 100):
+        """
+        Generate AI-powered summary of session activity.
+
+        Args:
+            session_id: Session to summarize
+            lines: Number of lines of tmux output to analyze (default 100)
+
+        Returns:
+            JSON with summary text
+        """
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        try:
+            # Get tmux output
+            tmux_output = app.state.session_manager.capture_output(session_id, lines)
+
+            if not tmux_output:
+                raise HTTPException(status_code=404, detail="No output available for session")
+
+            # Strip ANSI codes
+            from .notifier import strip_ansi
+            clean_output = strip_ansi(tmux_output)
+
+            # Prepare prompt for Claude Haiku
+            prompt = f"""You are analyzing terminal output from a Claude Code session. Based on the output below, write a 2-3 line summary of what the session is currently working on. Focus on:
+- What task/problem they're solving
+- Current status (working, waiting, error, etc)
+- Key details (files, commands, progress)
+
+Output from session:
+{clean_output}
+
+Provide ONLY the summary, no preamble or questions."""
+
+            logger.info(f"Generating summary for session {session_id}, input length: {len(prompt)} chars")
+
+            # Use asyncio.create_subprocess_exec for non-blocking execution
+            import asyncio
+            proc = await asyncio.create_subprocess_exec(
+                '/opt/homebrew/bin/claude', '--model', 'haiku', '--print',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=prompt.encode('utf-8')),
+                    timeout=60
+                )
+                result_stdout = stdout.decode('utf-8')
+                result_stderr = stderr.decode('utf-8')
+                returncode = proc.returncode
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise HTTPException(status_code=504, detail="Summary generation timed out (60s)")
+
+            logger.info(f"Summary generated, return code: {returncode}, output length: {len(result_stdout)}")
+
+            if returncode != 0:
+                logger.error(f"Claude command failed: {result_stderr}")
+                raise HTTPException(status_code=500, detail=f"Error generating summary: {result_stderr[:200]}")
+
+            summary = result_stdout.strip()
+
+            if not summary:
+                raise HTTPException(status_code=500, detail="Summary was empty")
+
+            return {"session_id": session_id, "summary": summary}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error generating summary for session {session_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.post("/notify")
     async def send_notification(request: NotifyRequest):
         """
