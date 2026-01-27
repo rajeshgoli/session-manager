@@ -77,6 +77,8 @@ class OutputMonitor:
 
         self._event_callback: Optional[Callable[[NotificationEvent], Awaitable[None]]] = None
         self._status_callback: Optional[Callable[[str, SessionStatus], Awaitable[None]]] = None
+        self._save_state_callback: Optional[Callable[[], None]] = None
+        self._session_manager = None  # Reference to SessionManager for looking up sessions
         self._running = False
         self._tasks: dict[str, asyncio.Task] = {}
         self._file_positions: dict[str, int] = {}
@@ -97,6 +99,14 @@ class OutputMonitor:
     def set_hook_output_store(self, store: dict):
         """Set reference to hook output storage (from server)."""
         self._hook_output_store = store
+
+    def set_save_state_callback(self, callback: Callable[[], None]):
+        """Set callback to save session state."""
+        self._save_state_callback = callback
+
+    def set_session_manager(self, session_manager):
+        """Set reference to SessionManager for session lookups."""
+        self._session_manager = session_manager
 
     async def start_monitoring(self, session: Session, is_restored: bool = False):
         """Start monitoring a session's output."""
@@ -166,7 +176,13 @@ class OutputMonitor:
                         new_content = f.read()
 
                     self._file_positions[session.id] = current_size
-                    self._last_activity[session.id] = datetime.now()
+                    now = datetime.now()
+                    self._last_activity[session.id] = now
+                    # Also update the Session model's last_activity
+                    session.last_activity = now
+                    # Save state to persist the update
+                    if self._save_state_callback:
+                        self._save_state_callback()
                     # Clear idle notification flag on new activity
                     self._notified_permissions.pop(f"{session.id}_idle", None)
 
@@ -310,27 +326,13 @@ class OutputMonitor:
                 return
 
             if self._event_callback:
-                # Try to get last Claude message from hooks first (structured output)
-                context = ""
-                if self._hook_output_store:
-                    context = self._hook_output_store.get(session.id) or self._hook_output_store.get("latest") or ""
-
-                # Fall back to log file if no hook output
-                if not context:
-                    log_path = Path(session.log_file)
-                    if log_path.exists():
-                        try:
-                            with open(log_path, 'r', errors='ignore') as f:
-                                content = f.read()
-                                context = self._get_context(content)
-                        except Exception as e:
-                            logger.warning(f"Failed to read log for context: {e}")
-
+                # Don't send context - user already got the last message via response hook
+                # Including context would duplicate the entire message
                 event = NotificationEvent(
                     session_id=session.id,
                     event_type="idle",
                     message=f"Session has been idle for {int(idle_duration.total_seconds())} seconds",
-                    context=context,
+                    context="",  # No context to avoid duplicating the response
                     urgent=False,
                 )
                 await self._event_callback(event)
@@ -345,7 +347,15 @@ class OutputMonitor:
 
     def update_activity(self, session_id: str):
         """Manually update last activity time (e.g., when input is sent)."""
-        self._last_activity[session_id] = datetime.now()
+        now = datetime.now()
+        self._last_activity[session_id] = now
+        # Also update Session model if we have access to it
+        if self._session_manager:
+            session = self._session_manager.get_session(session_id)
+            if session:
+                session.last_activity = now
+                if self._save_state_callback:
+                    self._save_state_callback()
         # Clear idle notification flag
         notified_key = f"{session_id}_idle"
         self._notified_permissions.pop(notified_key, None)

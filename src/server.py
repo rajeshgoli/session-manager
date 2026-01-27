@@ -345,8 +345,13 @@ def create_app(
         # Store last message
         if last_message:
             app.state.last_claude_output["latest"] = last_message
-            app.state.last_claude_output[claude_session_id or "default"] = last_message
-            logger.info(f"Stored Claude output: {last_message[:100]}...")
+            # If we have the session manager ID, store under that immediately
+            if session_manager_id:
+                app.state.last_claude_output[session_manager_id] = last_message
+                logger.info(f"Stored Claude output for session {session_manager_id}: {last_message[:100]}...")
+            else:
+                app.state.last_claude_output[claude_session_id or "default"] = last_message
+                logger.warning(f"No session_manager_id in hook - stored as {claude_session_id or 'default'}")
 
         # Handle Stop hook - Claude finished responding
         if hook_event == "Stop" and last_message:
@@ -392,6 +397,11 @@ def create_app(
 
                     # Store last output under our session ID for /status
                     app.state.last_claude_output[target_session.id] = last_message
+
+                    # Update session's last activity timestamp
+                    from datetime import datetime
+                    target_session.last_activity = datetime.now()
+                    app.state.session_manager._save_state()
 
                     from .models import NotificationEvent
                     event = NotificationEvent(

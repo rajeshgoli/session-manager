@@ -94,6 +94,8 @@ class SessionManagerApp:
         # Wire up output monitor callbacks
         self.output_monitor.set_event_callback(self._handle_monitor_event)
         self.output_monitor.set_status_callback(self._handle_status_change)
+        self.output_monitor.set_save_state_callback(self.session_manager._save_state)
+        self.output_monitor.set_session_manager(self.session_manager)
 
         # Create FastAPI app
         self.app = create_app(
@@ -162,19 +164,19 @@ class SessionManagerApp:
 
         async def on_get_last_output(session_id: str) -> Optional[str]:
             """Get last Claude output for a session."""
-            # Try session-specific output first, then "latest"
-            output = self.app.state.last_claude_output.get(session_id)
-            if not output:
-                output = self.app.state.last_claude_output.get("latest")
-            return output
+            # Only return session-specific output - don't fall back to "latest"
+            # (fallback would show output from wrong session)
+            return self.app.state.last_claude_output.get(session_id)
 
         async def on_get_last_message(session_id: str) -> Optional[str]:
             """Get last Claude message for a session (full message from hooks)."""
-            # Try session-specific message first, then "latest"
-            message = self.app.state.last_claude_output.get(session_id)
-            if not message:
-                message = self.app.state.last_claude_output.get("latest")
-            return message
+            # Only return session-specific message - don't fall back to "latest"
+            # (fallback would show message from wrong session)
+            return self.app.state.last_claude_output.get(session_id)
+
+        async def on_get_tmux_output(session_id: str, lines: int) -> Optional[str]:
+            """Get tmux output for a session."""
+            return self.session_manager.capture_output(session_id, lines)
 
         async def on_interrupt_session(session_id: str) -> bool:
             """Send Escape to interrupt Claude."""
@@ -194,6 +196,7 @@ class SessionManagerApp:
         self.telegram_bot.set_name_handler(on_set_name)
         self.telegram_bot.set_get_last_output_handler(on_get_last_output)
         self.telegram_bot.set_get_last_message_handler(on_get_last_message)
+        self.telegram_bot.set_get_tmux_output_handler(on_get_tmux_output)
         self.telegram_bot.set_interrupt_handler(on_interrupt_session)
 
     async def _handle_monitor_event(self, event: NotificationEvent):

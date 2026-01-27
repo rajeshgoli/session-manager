@@ -117,6 +117,7 @@ class TelegramBot:
         self._on_set_name: Optional[Callable[[str, str], Awaitable[bool]]] = None
         self._on_get_last_output: Optional[Callable[[str], Awaitable[Optional[str]]]] = None
         self._on_get_last_message: Optional[Callable[[str], Awaitable[Optional[str]]]] = None
+        self._on_get_tmux_output: Optional[Callable[[str, int], Awaitable[Optional[str]]]] = None
         self._on_interrupt_session: Optional[Callable[[str], Awaitable[bool]]] = None
         self._on_update_topic: Optional[Callable[[str, int, int], Awaitable[None]]] = None
 
@@ -183,6 +184,10 @@ class TelegramBot:
         """Set handler for getting last Claude message. Handler receives session_id."""
         self._on_get_last_message = handler
 
+    def set_get_tmux_output_handler(self, handler: Callable[[str, int], Awaitable[Optional[str]]]):
+        """Set handler for getting tmux output. Handler receives session_id and line count."""
+        self._on_get_tmux_output = handler
+
     def set_interrupt_handler(self, handler: Callable[[str], Awaitable[bool]]):
         """Set handler for interrupting a session. Handler receives session_id."""
         self._on_interrupt_session = handler
@@ -220,6 +225,7 @@ class TelegramBot:
             "/list - List active sessions\n"
             "/status - What is Claude doing? (reply to session)\n"
             "/message - Get last Claude message (reply to session)\n"
+            "/summary - AI summary of session activity (reply to session)\n"
             "/stop - Interrupt Claude (reply to session)\n"
             "/kill [id] - Kill a session\n"
             "/open [id] - Open session in Terminal.app\n"
@@ -371,8 +377,13 @@ class TelegramBot:
                     idle_str = f"{int(idle_seconds // 60)}m"
 
                 # Determine if working or idle
-                if session.status.value in ("running", "waiting_input", "waiting_permission"):
-                    status_emoji = "Working" if idle_seconds < 30 else "Idle"
+                # Use the session status directly - it's more reliable than guessing from idle time
+                if session.status.value == "running":
+                    status_emoji = "Working"
+                elif session.status.value in ("waiting_input", "waiting_permission"):
+                    status_emoji = session.status.value.replace("_", " ").title()
+                elif session.status.value == "idle":
+                    status_emoji = "Idle"
                 else:
                     status_emoji = session.status.value.title()
 
@@ -435,6 +446,96 @@ class TelegramBot:
 
         except Exception as e:
             logger.error(f"Error getting last message: {e}")
+            await update.message.reply_text(f"Error: {e}")
+
+    async def _cmd_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /summary command - AI-generated summary of what session is doing."""
+        if not self._is_allowed(update.effective_chat.id, update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+
+        if not self._on_get_tmux_output:
+            await update.message.reply_text("Summary not configured.")
+            return
+
+        # Find session from topic or reply context
+        session_id = self._get_session_from_context(update)
+
+        if not session_id:
+            await update.message.reply_text(
+                "Could not identify session. Use /summary in a session topic or reply to a session message."
+            )
+            return
+
+        try:
+            # Get tmux output (last 100 lines)
+            tmux_output = await self._on_get_tmux_output(session_id, 100)
+
+            if not tmux_output:
+                await update.message.reply_text(f"No output available for session {session_id}")
+                return
+
+            # Strip ANSI codes
+            from .notifier import strip_ansi
+            clean_output = strip_ansi(tmux_output)
+
+            # Send to claude haiku for summary
+            import subprocess
+            prompt = f"""You are analyzing terminal output from a Claude Code session. Based on the output below, write a 2-3 line summary of what the session is currently working on. Focus on:
+- What task/problem they're solving
+- Current status (working, waiting, error, etc)
+- Key details (files, commands, progress)
+
+Output from session:
+{clean_output}
+
+Provide ONLY the summary, no preamble or questions."""
+
+            logger.info(f"Generating summary for session {session_id}, input length: {len(prompt)} chars")
+
+            # Use asyncio.create_subprocess_exec for non-blocking execution
+            import asyncio
+            proc = await asyncio.create_subprocess_exec(
+                '/opt/homebrew/bin/claude', '--model', 'haiku', '--print',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=prompt.encode('utf-8')),
+                    timeout=60
+                )
+                result_stdout = stdout.decode('utf-8')
+                result_stderr = stderr.decode('utf-8')
+                returncode = proc.returncode
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise subprocess.TimeoutExpired(cmd='/opt/homebrew/bin/claude', timeout=60)
+
+            logger.info(f"Summary generated, return code: {returncode}, output length: {len(result_stdout)}")
+
+            if returncode != 0:
+                logger.error(f"Claude command failed: {result_stderr}")
+                await update.message.reply_text(f"Error generating summary: {result_stderr[:200]}")
+                return
+
+            summary = result_stdout.strip()
+
+            if not summary:
+                await update.message.reply_text("Summary was empty")
+                return
+
+            # Send summary
+            await update.message.reply_text(f"📋 *Summary:*\n{summary}", parse_mode="Markdown")
+
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"Summary generation timed out for session {session_id} after 60s")
+            await update.message.reply_text("Summary generation timed out (60s) - try /status instead")
+        except Exception as e:
+            logger.error(f"Error generating summary for session {session_id}: {e}", exc_info=True)
             await update.message.reply_text(f"Error: {e}")
 
     async def _cmd_kill(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -926,6 +1027,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("list", self._cmd_list))
         self.application.add_handler(CommandHandler("status", self._cmd_status))
         self.application.add_handler(CommandHandler("message", self._cmd_message))
+        self.application.add_handler(CommandHandler("summary", self._cmd_summary))
         self.application.add_handler(CommandHandler("kill", self._cmd_kill))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("open", self._cmd_open))
