@@ -120,6 +120,7 @@ class TelegramBot:
         self._on_get_tmux_output: Optional[Callable[[str, int], Awaitable[Optional[str]]]] = None
         self._on_interrupt_session: Optional[Callable[[str], Awaitable[bool]]] = None
         self._on_update_topic: Optional[Callable[[str, int, int], Awaitable[None]]] = None
+        self._on_get_subagents: Optional[Callable[[str], Awaitable[Optional[list]]]] = None
 
         # Track message threads for sessions
         self._session_threads: dict[str, tuple[int, int]] = {}  # session_id -> (chat_id, message_id)
@@ -196,6 +197,49 @@ class TelegramBot:
         """Set handler for updating session topic. Handler receives (session_id, chat_id, topic_id)."""
         self._on_update_topic = handler
 
+    def set_get_subagents_handler(self, handler: Callable[[str], Awaitable[Optional[list]]]):
+        """Set handler for getting subagents. Handler receives session_id."""
+        self._on_get_subagents = handler
+
+    def _format_subagents(self, subagents: list) -> str:
+        """Format subagents list for display."""
+        from datetime import datetime
+
+        if not subagents:
+            return ""
+
+        lines = ["\nSubagents:"]
+        for sa in subagents:
+            # Calculate elapsed time
+            started_at = datetime.fromisoformat(sa["started_at"])
+            elapsed_seconds = (datetime.now() - started_at).total_seconds()
+
+            if elapsed_seconds < 60:
+                elapsed_str = f"{int(elapsed_seconds)}s ago"
+            elif elapsed_seconds < 3600:
+                elapsed_str = f"{int(elapsed_seconds // 60)}m ago"
+            else:
+                elapsed_str = f"{int(elapsed_seconds // 3600)}h ago"
+
+            # Status icon
+            status = sa["status"]
+            if status == "completed":
+                icon = "✓"
+            elif status == "error":
+                icon = "✗"
+            else:
+                icon = "→"
+
+            # Format agent line
+            agent_id = sa["agent_id"][:6] if len(sa["agent_id"]) > 6 else sa["agent_id"]
+            lines.append(f"  {icon} {sa['agent_type']} ({agent_id}) | {status} | {elapsed_str}")
+
+            # Add summary if available
+            if sa.get("summary"):
+                lines.append(f"     {sa['summary']}")
+
+        return "\n".join(lines)
+
     def _is_allowed(self, chat_id: int, user_id: Optional[int] = None) -> bool:
         """Check if a chat/user is allowed to use the bot."""
         # Check user allowlist first (if configured)
@@ -224,6 +268,7 @@ class TelegramBot:
             "/session - Pick a project and create a session\n"
             "/list - List active sessions\n"
             "/status - What is Claude doing? (reply to session)\n"
+            "/subagents - List spawned subagents (reply to session)\n"
             "/message - Get last Claude message (reply to session)\n"
             "/summary - AI summary of session activity (reply to session)\n"
             "/stop - Interrupt Claude (reply to session)\n"
@@ -404,12 +449,68 @@ class TelegramBot:
                             last_output = last_output[:300] + "..."
                         lines.append(f"\nLast output:\n{last_output}")
 
+                # Get subagents if available
+                if self._on_get_subagents:
+                    subagents = await self._on_get_subagents(session_id)
+                    if subagents:
+                        subagent_info = self._format_subagents(subagents)
+                        if subagent_info:
+                            lines.append(subagent_info)
+
                 await update.message.reply_text("\n".join(lines))
             else:
                 await update.message.reply_text(f"Session not found: {session_id}")
 
         except Exception as e:
             logger.error(f"Error getting status: {e}")
+            await update.message.reply_text(f"Error: {e}")
+
+    async def _cmd_subagents(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /subagents command - lists spawned subagents."""
+        if not self._is_allowed(update.effective_chat.id, update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+
+        if not self._on_get_subagents:
+            await update.message.reply_text("Subagent tracking not configured.")
+            return
+
+        # Find session from topic or reply context
+        session_id = self._get_session_from_context(update)
+
+        if not session_id:
+            await update.message.reply_text(
+                "Could not identify session. Use /subagents in a session topic or reply to a session message."
+            )
+            return
+
+        try:
+            # Get session info for name
+            session = None
+            if self._on_session_status:
+                session = await self._on_session_status(session_id)
+
+            # Get subagents
+            subagents = await self._on_get_subagents(session_id)
+
+            if not subagents:
+                name_str = f"{session.friendly_name} " if session and session.friendly_name else ""
+                await update.message.reply_text(f"{name_str}[{session_id}] has no subagents")
+                return
+
+            # Format and send
+            name_str = f"{session.friendly_name} " if session and session.friendly_name else ""
+            header = f"{name_str}[{session_id}] subagents:"
+            subagent_info = self._format_subagents(subagents)
+
+            # Remove the "Subagents:" header from format_subagents output since we have our own
+            subagent_lines = subagent_info.split('\n')[1:]  # Skip first line
+            message = header + "\n" + "\n".join(subagent_lines)
+
+            await update.message.reply_text(message)
+
+        except Exception as e:
+            logger.error(f"Error getting subagents: {e}")
             await update.message.reply_text(f"Error: {e}")
 
     async def _cmd_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1026,6 +1127,7 @@ Provide ONLY the summary, no preamble or questions."""
         self.application.add_handler(CommandHandler("session", self._cmd_session))
         self.application.add_handler(CommandHandler("list", self._cmd_list))
         self.application.add_handler(CommandHandler("status", self._cmd_status))
+        self.application.add_handler(CommandHandler("subagents", self._cmd_subagents))
         self.application.add_handler(CommandHandler("message", self._cmd_message))
         self.application.add_handler(CommandHandler("summary", self._cmd_summary))
         self.application.add_handler(CommandHandler("kill", self._cmd_kill))

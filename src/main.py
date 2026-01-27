@@ -189,6 +189,22 @@ class SessionManagerApp:
                 return False
             return self.session_manager.send_key(session_id, "Escape")
 
+        async def on_get_subagents(session_id: str) -> Optional[list]:
+            """Get subagents for a session."""
+            import httpx
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        f"http://127.0.0.1:{self.config['server']['port']}/sessions/{session_id}/subagents",
+                        timeout=5.0
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        return data.get("subagents", [])
+            except Exception as e:
+                logger.error(f"Error getting subagents: {e}")
+            return None
+
         self.telegram_bot.set_new_session_handler(on_new_session)
         self.telegram_bot.set_list_sessions_handler(on_list_sessions)
         self.telegram_bot.set_kill_session_handler(on_kill_session)
@@ -202,6 +218,7 @@ class SessionManagerApp:
         self.telegram_bot.set_get_last_message_handler(on_get_last_message)
         self.telegram_bot.set_get_tmux_output_handler(on_get_tmux_output)
         self.telegram_bot.set_interrupt_handler(on_interrupt_session)
+        self.telegram_bot.set_get_subagents_handler(on_get_subagents)
 
     async def _handle_monitor_event(self, event: NotificationEvent):
         """Handle events from the output monitor."""
