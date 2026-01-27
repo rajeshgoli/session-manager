@@ -92,7 +92,7 @@ def cmd_who(client: SessionManagerClient, session_id: str) -> int:
     return 0
 
 
-def cmd_what(client: SessionManagerClient, target_session_id: str, lines: int) -> int:
+def cmd_what(client: SessionManagerClient, target_session_id: str, lines: int, deep: bool = False) -> int:
     """
     Get AI-generated summary of what a session is doing.
 
@@ -120,6 +120,20 @@ def cmd_what(client: SessionManagerClient, target_session_id: str, lines: int) -
             return 1
 
     print(summary)
+
+    # If --deep flag is set, show subagent activity
+    if deep:
+        subagents = client.list_subagents(target_session_id)
+        if subagents:
+            print()
+            print("Subagents:")
+            for sa in subagents:
+                elapsed = format_relative_time(sa["started_at"])
+                status_icon = "✓" if sa["status"] == "completed" else "→"
+                print(f"  {status_icon} {sa['agent_type']} ({sa['agent_id'][:6]}) | {sa['status']} | {elapsed}")
+                if sa.get("summary"):
+                    print(f"     {sa['summary']}")
+
     return 0
 
 
@@ -338,5 +352,142 @@ def cmd_status(client: SessionManagerClient, session_id: str) -> int:
             print(f"Lock file: {lock.session_id} - {lock.task}")
     else:
         print("Lock file: none")
+
+    return 0
+
+
+def cmd_subagent_start(client: SessionManagerClient, session_id: str) -> int:
+    """
+    Register subagent start (called by SubagentStart hook).
+
+    Reads JSON payload from stdin with fields:
+    - agent_id: Subagent identifier
+    - agent_type: Role (engineer, architect, etc.)
+    - agent_transcript_path: Path to subagent transcript
+
+    Exit codes:
+        0: Success
+        1: Failed to register
+        2: Session manager unavailable
+    """
+    import json
+
+    # Read hook payload from stdin
+    try:
+        payload = json.loads(sys.stdin.read())
+    except Exception as e:
+        print(f"Error: Failed to parse hook payload: {e}", file=sys.stderr)
+        return 1
+
+    agent_id = payload.get("agent_id")
+    agent_type = payload.get("agent_type", payload.get("subagent_type", "unknown"))
+    transcript_path = payload.get("agent_transcript_path")
+
+    if not agent_id:
+        print("Error: Missing agent_id in hook payload", file=sys.stderr)
+        return 1
+
+    # Use session_id from hook payload if available, otherwise from environment
+    hook_session_id = payload.get("session_id", session_id)
+
+    success, unavailable = client.register_subagent_start(
+        hook_session_id, agent_id, agent_type, transcript_path
+    )
+
+    if success:
+        return 0
+    elif unavailable:
+        # Silent failure when session manager is unavailable
+        return 2
+    else:
+        return 1
+
+
+def cmd_subagent_stop(client: SessionManagerClient, session_id: str) -> int:
+    """
+    Register subagent stop (called by SubagentStop hook).
+
+    Reads JSON payload from stdin with fields:
+    - agent_id: Subagent identifier
+    - agent_transcript_path: Path to subagent transcript (for generating summary)
+
+    Exit codes:
+        0: Success
+        1: Failed to register
+        2: Session manager unavailable
+    """
+    import json
+
+    # Read hook payload from stdin
+    try:
+        payload = json.loads(sys.stdin.read())
+    except Exception as e:
+        print(f"Error: Failed to parse hook payload: {e}", file=sys.stderr)
+        return 1
+
+    agent_id = payload.get("agent_id")
+    transcript_path = payload.get("agent_transcript_path")
+
+    if not agent_id:
+        print("Error: Missing agent_id in hook payload", file=sys.stderr)
+        return 1
+
+    # Use session_id from hook payload if available
+    hook_session_id = payload.get("session_id", session_id)
+
+    # TODO: Generate summary from transcript_path using Haiku
+    # For now, just register the stop without a summary
+    summary = None
+
+    success, unavailable = client.register_subagent_stop(hook_session_id, agent_id, summary)
+
+    if success:
+        return 0
+    elif unavailable:
+        return 2
+    else:
+        return 1
+
+
+def cmd_subagents(client: SessionManagerClient, target_session_id: str) -> int:
+    """
+    List subagents spawned by a session.
+
+    Exit codes:
+        0: Success (may have 0 subagents)
+        1: Session not found
+        2: Session manager unavailable
+    """
+    # First check if session exists
+    session = client.get_session(target_session_id)
+    if session is None:
+        sessions = client.list_sessions()
+        if sessions is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        else:
+            print("Error: Session not found", file=sys.stderr)
+            return 1
+
+    # Get subagents
+    subagents = client.list_subagents(target_session_id)
+
+    if subagents is None:
+        print("Error: Failed to list subagents", file=sys.stderr)
+        return 1
+
+    if not subagents:
+        print(f"{session.get('friendly_name', target_session_id)} has no subagents")
+        return 0
+
+    # Display subagents
+    name = session.get("friendly_name", target_session_id)
+    print(f"{name} ({target_session_id}) subagents:")
+    for sa in subagents:
+        elapsed = format_relative_time(sa["started_at"])
+        status_icon = "✓" if sa["status"] == "completed" else "→"
+        print(f"  {status_icon} {sa['agent_type']} ({sa['agent_id'][:6]}) | {sa['status']} | {elapsed}")
+        if sa.get("summary"):
+            print(f"     {sa['summary']}")
 
     return 0

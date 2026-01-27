@@ -109,3 +109,42 @@ class SessionManagerClient:
         if success and data:
             return data.get("summary")
         return None
+
+    def register_subagent_start(self, session_id: str, agent_id: str, agent_type: str, transcript_path: Optional[str] = None) -> tuple[bool, bool]:
+        """
+        Register a subagent start.
+
+        Returns:
+            Tuple of (success, unavailable)
+        """
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/subagents",
+            {
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "transcript_path": transcript_path,
+            }
+        )
+        return success, unavailable
+
+    def register_subagent_stop(self, session_id: str, agent_id: str, summary: Optional[str] = None) -> tuple[bool, bool]:
+        """
+        Register a subagent stop.
+
+        Returns:
+            Tuple of (success, unavailable)
+        """
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/subagents/{agent_id}/stop",
+            {"summary": summary}
+        )
+        return success, unavailable
+
+    def list_subagents(self, session_id: str) -> Optional[list]:
+        """List all subagents for a session."""
+        data, success, _ = self._request("GET", f"/sessions/{session_id}/subagents")
+        if success and data:
+            return data.get("subagents", [])
+        return None

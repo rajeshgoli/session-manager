@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, List
 import uuid
 
 
@@ -22,6 +22,53 @@ class NotificationChannel(Enum):
     """Available notification channels."""
     TELEGRAM = "telegram"
     EMAIL = "email"
+
+
+class SubagentStatus(Enum):
+    """Subagent lifecycle status."""
+    RUNNING = "running"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+@dataclass
+class Subagent:
+    """Represents a subagent spawned by a Claude session."""
+    agent_id: str
+    agent_type: str  # engineer, architect, explorer, etc.
+    parent_session_id: str
+    transcript_path: Optional[str] = None
+    started_at: datetime = field(default_factory=datetime.now)
+    stopped_at: Optional[datetime] = None
+    status: SubagentStatus = SubagentStatus.RUNNING
+    summary: Optional[str] = None  # Cached summary of work done
+
+    def to_dict(self) -> dict:
+        """Convert subagent to dictionary for JSON serialization."""
+        return {
+            "agent_id": self.agent_id,
+            "agent_type": self.agent_type,
+            "parent_session_id": self.parent_session_id,
+            "transcript_path": self.transcript_path,
+            "started_at": self.started_at.isoformat(),
+            "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
+            "status": self.status.value,
+            "summary": self.summary,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Subagent":
+        """Create subagent from dictionary."""
+        return cls(
+            agent_id=data["agent_id"],
+            agent_type=data["agent_type"],
+            parent_session_id=data["parent_session_id"],
+            transcript_path=data.get("transcript_path"),
+            started_at=datetime.fromisoformat(data["started_at"]),
+            stopped_at=datetime.fromisoformat(data["stopped_at"]) if data.get("stopped_at") else None,
+            status=SubagentStatus(data["status"]),
+            summary=data.get("summary"),
+        )
 
 
 @dataclass
@@ -43,6 +90,7 @@ class Session:
     friendly_name: Optional[str] = None  # User-friendly name
     current_task: Optional[str] = None  # What the session is currently working on
     git_remote_url: Optional[str] = None  # Git remote URL for repo matching
+    subagents: List[Subagent] = field(default_factory=list)  # Subagents spawned by this session
 
     def __post_init__(self):
         if not self.name:
@@ -69,11 +117,15 @@ class Session:
             "friendly_name": self.friendly_name,
             "current_task": self.current_task,
             "git_remote_url": self.git_remote_url,
+            "subagents": [s.to_dict() for s in self.subagents],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":
         """Create session from dictionary."""
+        subagents_data = data.get("subagents", [])
+        subagents = [Subagent.from_dict(s) for s in subagents_data] if subagents_data else []
+
         return cls(
             id=data["id"],
             name=data["name"],
@@ -91,6 +143,7 @@ class Session:
             friendly_name=data.get("friendly_name"),
             current_task=data.get("current_task"),
             git_remote_url=data.get("git_remote_url"),
+            subagents=subagents,
         )
 
 

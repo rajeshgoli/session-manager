@@ -31,6 +31,7 @@ def main():
     what_parser = subparsers.add_parser("what", help="Get summary of what a session is doing")
     what_parser.add_argument("session_id", help="Session ID")
     what_parser.add_argument("--lines", type=int, default=100, help="Lines to analyze (default: 100)")
+    what_parser.add_argument("--deep", action="store_true", help="Include subagent activity")
 
     # sm others
     others_parser = subparsers.add_parser("others", help="List others + what they're doing")
@@ -53,11 +54,21 @@ def main():
     # sm status
     subparsers.add_parser("status", help="Full status: you + others + lock")
 
+    # sm subagent-start (called by SubagentStart hook)
+    subparsers.add_parser("subagent-start", help="Register subagent start (called by hook)")
+
+    # sm subagent-stop (called by SubagentStop hook)
+    subparsers.add_parser("subagent-stop", help="Register subagent stop (called by hook)")
+
+    # sm subagents <session-id>
+    subagents_parser = subparsers.add_parser("subagents", help="List subagents spawned by a session")
+    subagents_parser.add_argument("session_id", help="Session ID")
+
     args = parser.parse_args()
 
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
-    if not session_id and args.command not in ["lock", "unlock", None]:
+    if not session_id and args.command not in ["lock", "unlock", "subagent-start", "subagent-stop", None]:
         print("Error: CLAUDE_SESSION_MANAGER_ID environment variable not set", file=sys.stderr)
         print("This tool must be run inside a Claude Code session managed by Session Manager", file=sys.stderr)
         sys.exit(2)
@@ -73,7 +84,7 @@ def main():
     elif args.command == "who":
         sys.exit(commands.cmd_who(client, session_id))
     elif args.command == "what":
-        sys.exit(commands.cmd_what(client, args.session_id, args.lines))
+        sys.exit(commands.cmd_what(client, args.session_id, args.lines, args.deep))
     elif args.command == "others":
         sys.exit(commands.cmd_others(client, session_id, args.repo))
     elif args.command == "alone":
@@ -86,6 +97,12 @@ def main():
         sys.exit(commands.cmd_unlock(session_id))
     elif args.command == "status":
         sys.exit(commands.cmd_status(client, session_id))
+    elif args.command == "subagent-start":
+        sys.exit(commands.cmd_subagent_start(client, session_id))
+    elif args.command == "subagent-stop":
+        sys.exit(commands.cmd_subagent_stop(client, session_id))
+    elif args.command == "subagents":
+        sys.exit(commands.cmd_subagents(client, args.session_id))
     else:
         parser.print_help()
         sys.exit(0)

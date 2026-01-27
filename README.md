@@ -113,6 +113,93 @@ curl -X POST http://localhost:8420/notify \
   -d '{"message": "Task complete!", "channel": "email", "urgent": true}'
 ```
 
+## SM CLI - Multi-Agent Coordination
+
+The `sm` CLI tool enables Claude sessions to coordinate with each other. It's automatically available inside sessions managed by the Session Manager.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `sm name <name>` | Set friendly name for current session |
+| `sm me` | Show current session info |
+| `sm who` | List other sessions in same workspace |
+| `sm what <session-id> [--deep]` | Get AI summary of what a session is doing |
+| `sm others [--repo]` | List others with summaries |
+| `sm alone` | Check if you're the only agent (exit code 0=alone, 1=others) |
+| `sm task "<description>"` | Register what you're working on |
+| `sm status` | Full status: you + others + lock file |
+| `sm subagents <session-id>` | List subagents spawned by a session |
+
+### Subagent Tracking
+
+When Claude spawns subagents (e.g., "As EM, implement epic #987"), the Session Manager can track them automatically via Claude Code hooks.
+
+**To enable subagent tracking in your project**, add this to your project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sm subagent-start"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sm subagent-stop"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Note**: The `.claude/settings.json` file in this repository is for development/testing of the Session Manager itself. Each project that wants subagent tracking needs its own hooks configuration.
+
+### Example Workflows
+
+**Coordinating with other agents:**
+```bash
+# Check if others are working in same workspace
+$ sm who
+engineer-db (a1b2c3d4) | running | 5min ago
+
+# See what they're doing
+$ sm what a1b2c3d4
+Working on database migration script for users table.
+
+# Register your task to avoid conflicts
+$ sm task "Implementing user authentication API"
+```
+
+**Tracking subagents:**
+```bash
+# List subagents spawned by a session
+$ sm subagents 1749a2fe
+em-epic987 (1749a2fe) subagents:
+  → engineer (abc123) | running | 3min ago
+  ✓ architect (def456) | completed | 10min ago
+
+# Get deep summary with subagent activity
+$ sm what 1749a2fe --deep
+EM orchestrating epic #987. Currently coordinating Engineer on #984.
+
+Subagents:
+  → engineer (abc123) | running | 3min ago
+  ✓ architect (def456) | completed | 10min ago
+     Designed pivot detection architecture
+```
+
 ## Email Integration
 
 The session manager reuses the existing email harness from `../claude-email-automation/`. Ensure that directory contains:

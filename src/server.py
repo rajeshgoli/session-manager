@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 
-from .models import Session, SessionStatus, NotificationChannel
+from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,29 @@ class HookPayload(BaseModel):
 
     class Config:
         extra = "allow"  # Allow additional fields from Claude
+
+
+class SubagentStartRequest(BaseModel):
+    """Request to register subagent start."""
+    agent_id: str
+    agent_type: str
+    transcript_path: Optional[str] = None
+
+
+class SubagentStopRequest(BaseModel):
+    """Request to register subagent stop."""
+    summary: Optional[str] = None
+
+
+class SubagentResponse(BaseModel):
+    """Response containing subagent info."""
+    agent_id: str
+    agent_type: str
+    parent_session_id: str
+    started_at: str
+    stopped_at: Optional[str] = None
+    status: str
+    summary: Optional[str] = None
 
 
 def create_app(
@@ -404,6 +427,107 @@ Provide ONLY the summary, no preamble or questions."""
         except Exception as e:
             logger.error(f"Error generating summary for session {session_id}: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/sessions/{session_id}/subagents", response_model=SubagentResponse)
+    async def register_subagent_start(session_id: str, request: SubagentStartRequest):
+        """Register a new subagent spawned by this session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Create new subagent
+        from datetime import datetime
+        subagent = Subagent(
+            agent_id=request.agent_id,
+            agent_type=request.agent_type,
+            parent_session_id=session_id,
+            transcript_path=request.transcript_path,
+            started_at=datetime.now(),
+            status=SubagentStatus.RUNNING,
+        )
+
+        # Add to session
+        session.subagents.append(subagent)
+        app.state.session_manager._save_state()
+
+        logger.info(f"Registered subagent {request.agent_id} ({request.agent_type}) for session {session_id}")
+
+        return SubagentResponse(
+            agent_id=subagent.agent_id,
+            agent_type=subagent.agent_type,
+            parent_session_id=subagent.parent_session_id,
+            started_at=subagent.started_at.isoformat(),
+            stopped_at=None,
+            status=subagent.status.value,
+            summary=None,
+        )
+
+    @app.post("/sessions/{session_id}/subagents/{agent_id}/stop")
+    async def register_subagent_stop(session_id: str, agent_id: str, request: SubagentStopRequest):
+        """Register subagent completion."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Find the subagent
+        subagent = None
+        for sa in session.subagents:
+            if sa.agent_id == agent_id:
+                subagent = sa
+                break
+
+        if not subagent:
+            raise HTTPException(status_code=404, detail=f"Subagent {agent_id} not found")
+
+        # Update subagent
+        from datetime import datetime
+        subagent.stopped_at = datetime.now()
+        subagent.status = SubagentStatus.COMPLETED
+        if request.summary:
+            subagent.summary = request.summary
+
+        app.state.session_manager._save_state()
+
+        logger.info(f"Stopped subagent {agent_id} for session {session_id}")
+
+        return {
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "status": "stopped",
+            "summary": subagent.summary,
+        }
+
+    @app.get("/sessions/{session_id}/subagents")
+    async def list_subagents(session_id: str):
+        """List all subagents for a session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return {
+            "session_id": session_id,
+            "subagents": [
+                SubagentResponse(
+                    agent_id=sa.agent_id,
+                    agent_type=sa.agent_type,
+                    parent_session_id=sa.parent_session_id,
+                    started_at=sa.started_at.isoformat(),
+                    stopped_at=sa.stopped_at.isoformat() if sa.stopped_at else None,
+                    status=sa.status.value,
+                    summary=sa.summary,
+                )
+                for sa in session.subagents
+            ],
+        }
 
     @app.post("/notify")
     async def send_notification(request: NotifyRequest):
