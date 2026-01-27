@@ -2,8 +2,68 @@
 
 ## Recent Work (2026-01-27)
 
-### Session Continuation Context
-This section helps the next AI agent continue from where we left off.
+### Session 2: sm CLI Implementation
+
+**What was completed:**
+
+1. **sm CLI Tool** (src/cli/)
+   - Full implementation of multi-agent coordination CLI
+   - 10 commands: name, me, who, what, others, alone, task, lock, unlock, status
+   - HTTP client with 2s timeout for API calls
+   - Pretty output formatting with relative times
+   - Proper exit codes (0=success, 1=error, 2=unavailable)
+   - Installed as `sm` system command via pyproject.toml
+
+2. **Lock Manager** (src/lock_manager.py)
+   - File-based coordination fallback when session manager unavailable
+   - Lock file: `.claude/workspace.lock` in repo root
+   - Stale lock detection (>30 minutes)
+   - Operations: acquire, release, check
+
+3. **Model & API Enhancements**
+   - Added `current_task` and `git_remote_url` fields to Session model
+   - Added `PATCH /sessions/{id}` endpoint to update friendly_name
+   - Added `PUT /sessions/{id}/task` endpoint to register current task
+   - Updated SessionResponse to include new fields
+
+4. **Session Manager**
+   - Git remote URL detection from working_dir
+   - Automatic population of git_remote_url when creating sessions
+   - Support for matching sessions across git worktrees
+
+**Implementation Details:**
+- 8 tasks completed: model changes, API endpoints, git detection, lock manager, CLI framework, commands, entry point, testing
+- 949 lines added across 10 files
+- All Python files compile successfully
+- Package installs and works correctly
+- Lock/unlock commands tested and working
+
+**PR Created:**
+- Branch: `feature/sm-cli`
+- PR: https://github.com/rajeshgoli/claude-sessions/pull/1
+- Status: Open for review
+- Commit: `b32a1ab`
+
+**Files Changed:**
+- `src/models.py` - Added current_task, git_remote_url fields
+- `src/server.py` - New endpoints + SessionResponse updates
+- `src/session_manager.py` - Git detection method
+- `src/lock_manager.py` - New file
+- `src/cli/__init__.py` - New file
+- `src/cli/client.py` - New file
+- `src/cli/commands.py` - New file
+- `src/cli/formatting.py` - New file
+- `src/cli/main.py` - New file
+- `pyproject.toml` - Added sm entry point
+
+**Next Steps:**
+- Review and merge PR #1
+- Test sm CLI with actual session manager running
+- Consider adding shell completion for sm commands
+
+---
+
+### Session 1: Notifications & Summaries
 
 **What was completed in this session:**
 
@@ -150,6 +210,11 @@ This section helps the next AI agent continue from where we left off.
 - ✅ Terminal attachment
 - ✅ Session interrupt (Escape key)
 - ✅ REST API for all core operations (sessions, input, output, summary)
+- ✅ **sm CLI tool** for multi-agent coordination (PR #1)
+  - 10 commands: name, me, who, what, others, alone, task, lock, unlock, status
+  - Lock file fallback when session manager unavailable
+  - Git worktree support via remote URL matching
+  - Exit codes for scripting (0=success, 1=error, 2=unavailable)
 
 ---
 
