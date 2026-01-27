@@ -48,7 +48,6 @@ class Session:
     # Existing fields...
     parent_session_id: Optional[str] = None  # Parent that spawned this session
     spawn_prompt: Optional[str] = None       # Initial prompt used to spawn
-    agent_type: Optional[str] = None         # Engineer, Architect, Explore, etc.
     completion_status: Optional[str] = None  # completed, error, abandoned, killed
     completion_message: Optional[str] = None # Message when completed
 
@@ -90,30 +89,36 @@ class SessionEvent:
 
 **Syntax:**
 ```bash
-sm spawn <agent-type> "<prompt>" [options]
+sm spawn "<prompt>" [options]
 ```
 
 **Arguments:**
-- `agent-type`: Engineer, Architect, Explore, general-purpose, or custom
-- `prompt`: Initial prompt/task for the child agent
+- `prompt`: Full prompt for the child agent (e.g., "As engineer, implement epic #1042 per docs/spec.md")
 
 **Options:**
-- `--model <model>`: Optional override of default model (opus, sonnet, haiku). Defaults to your config.yaml setting for this agent type.
-- `--preset <name>`: Use named preset from config (user-defined)
-- `--parent <session-id>`: Explicit parent (defaults to current session)
-- `--working-dir <path>`: Override working directory
-- `--name <friendly-name>`: Set friendly name
+- `--model <model>`: Optional override of default model (opus, sonnet, haiku). Defaults to your config.yaml setting.
+- `--wait <seconds>`: Block until child completes or is idle for N seconds. Session manager will send notification to parent's input when triggered.
+- `--name <friendly-name>`: Set friendly name for the child session
+- `--working-dir <path>`: Override working directory (defaults to parent's directory)
 - `--json`: Return JSON output
 
 **Note:** Agents can optionally override the model for task-specific needs. The Claude Code command and arguments are user-controlled via `config.yaml` and cannot be overridden by agents.
+
+**Wait Behavior:**
+When `--wait` is specified:
+1. Parent agent blocks after spawn (sm spawn doesn't return)
+2. Session manager monitors child
+3. When child completes OR is idle for N seconds:
+   - Session manager sends message to parent's Claude input
+   - Message contains: child ID, status, completion message/summary
+   - Parent wakes up and continues with completion info in context
 
 **Returns:**
 ```json
 {
   "session_id": "abc123",
-  "name": "engineer-abc123",
-  "friendly_name": "engineer-task1042",
-  "agent_type": "Engineer",
+  "name": "child-abc123",
+  "friendly_name": "task1042-impl",
   "working_dir": "/path/to/project",
   "parent_session_id": "1749a2fe",
   "tmux_session": "claude-abc123",
@@ -123,18 +128,22 @@ sm spawn <agent-type> "<prompt>" [options]
 
 **Example:**
 ```bash
-# Basic spawn - uses YOUR configured default model for Engineer (from config.yaml)
-$ sm spawn Engineer "Implement API endpoint for user login"
-Spawned engineer-abc123 (abc123) in tmux session claude-abc123
+# Fire-and-forget: spawn and continue
+$ sm spawn "As engineer, implement user login API endpoint per spec docs/auth.md"
+Spawned child-abc123 (abc123) in tmux session claude-abc123
 
-# Agent overrides to opus for complex task (you still control the --args)
-$ sm spawn Engineer "Design and implement distributed lock mechanism" --model opus --name engineer-lock
+# Spawn and wait: blocks until complete or 600s idle (EM pattern)
+$ sm spawn "As architect, review and merge PR #1042" --wait 600
+Spawned child-xyz789 (xyz789) in tmux session claude-xyz789
+Waiting for completion or 600s idle...
+[Session manager sends to parent's input when done]:
+"Child child-xyz789 completed: PR #1042 approved and merged"
 
-# Agent overrides to haiku for simple, quick task
-$ sm spawn Engineer "Fix typo in README" --model haiku
+# Agent overrides to opus for complex task requiring deep reasoning
+$ sm spawn "As engineer, design and implement distributed lock mechanism for cache layer" --model opus --wait 1200
 
-# With preset - uses YOUR preset definition from config.yaml
-$ sm spawn Engineer "Quick syntax fix in login.py" --preset quick-fix
+# Uses user's default model from config.yaml
+$ sm spawn "Fix typo in README.md line 42" --wait 300
 ```
 
 ### `sm children` - List Child Sessions
@@ -163,101 +172,35 @@ engineer-task1042 (abc123) | completed | 5min ago
 engineer-task1043 (def456) | running   | 2min ago
 ```
 
-### `sm progress` - Monitor Child Progress
+### `sm what` - Check Child Status
+
+**Note:** Use existing `sm what` command to check on child sessions.
 
 **Syntax:**
 ```bash
-sm progress <session-id> [--json] [--watch]
-```
-
-**Output:**
-```bash
-$ sm progress def456
-
-engineer-task1043 (def456) | working | 3min elapsed
-Tokens: 2,450 / ~10,000 est (24%)
-Tools: Read(5) Write(3) Bash(2) Edit(1)
-Status: Writing unit tests for API endpoint
-Last tool: Write → tests/api.test.ts (10s ago)
-
-Checkpoints:
-  [15:10] Started: Implement feature X
-  [15:12] Completed data model (3/5 tasks)
-  [15:14] Writing tests
-```
-
-**JSON Output:**
-```json
-{
-  "session_id": "def456",
-  "status": "working",
-  "elapsed_seconds": 180,
-  "tokens_used": 2450,
-  "tokens_remaining_estimate": 7550,
-  "completion_percentage": 24,
-  "tools_used": {
-    "Read": 5,
-    "Write": 3,
-    "Bash": 2,
-    "Edit": 1
-  },
-  "last_tool": {
-    "name": "Write",
-    "args": {"file_path": "tests/api.test.ts"},
-    "timestamp": "2026-01-27T15:20:30Z",
-    "seconds_ago": 10
-  },
-  "current_activity": "Writing unit tests for API endpoint",
-  "checkpoints": [
-    {"timestamp": "2026-01-27T15:10:00Z", "message": "Started: Implement feature X"},
-    {"timestamp": "2026-01-27T15:12:00Z", "message": "Completed data model (3/5 tasks)"}
-  ],
-  "is_idle": false,
-  "is_waiting_input": false,
-  "is_complete": false
-}
-```
-
-**Watch Mode:**
-```bash
-$ sm progress def456 --watch
-# Updates every 5 seconds, shows live progress
-```
-
-### `sm checkpoint` - Report Progress Milestone
-
-**Syntax:**
-```bash
-sm checkpoint "<message>" [--metadata key=value ...]
+sm what <session-id> [--deep]
 ```
 
 **Example:**
 ```bash
-# In child agent
-$ sm checkpoint "Phase 1 complete: Data model implemented (3/5 tasks done)"
-Checkpoint recorded
+$ sm what def456
+Writing unit tests for API endpoint. Last activity 30s ago.
 
-$ sm checkpoint "Starting tests" --metadata coverage=0
-Checkpoint recorded
+$ sm what def456 --deep
+Writing unit tests for API endpoint. Last activity 30s ago.
+
+Recent tools: Write(tests/api.test.ts), Read(src/api.ts), Bash(npm test)
+Tokens used: ~2,450
+Elapsed: 3min
 ```
 
-### `sm checkpoints` - List Checkpoints
+**Use Case:**
+Rarely needed - typically use `sm spawn --wait` which notifies parent automatically. Use `sm what` only when:
+- Checking on fire-and-forget spawns
+- Investigating why child hasn't completed
+- Manual debugging
 
-**Syntax:**
-```bash
-sm checkpoints <session-id> [--json]
-```
-
-**Example:**
-```bash
-$ sm checkpoints def456
-[15:10] Started: Implement feature X
-[15:12] Phase 1 complete: Data model implemented (3/5 tasks done)
-[15:14] Starting tests
-[15:16] Tests written, running validation
-```
-
-### `sm complete` - Signal Completion
+### `sm complete` - Signal Completion (Optional)
 
 **Syntax:**
 ```bash
@@ -265,37 +208,26 @@ sm complete ["<message>"] [--status <status>]
 ```
 
 **Options:**
-- `message`: Completion message/summary
+- `message`: Completion message/summary sent to parent
 - `--status`: completed (default), error, abandoned
 
 **Example:**
 ```bash
-# In child agent
+# In child agent (optional - auto-detection also works)
 $ sm complete "Feature X implemented successfully. All 26 tests passing."
-Session marked complete. Notifying parent.
+Session marked complete. Parent notified.
 
 $ sm complete "Unable to proceed without API keys" --status error
-Session marked as error. Notifying parent.
+Session marked as error. Parent notified.
 ```
 
-### `sm events` - View Session Events
+**Note:** Child agents can optionally call `sm complete` to explicitly signal completion. However, session manager also auto-detects completion based on:
+- Idle timeout (configured in `--wait` or config.yaml)
+- Common completion patterns in transcript
 
-**Syntax:**
-```bash
-sm events <session-id> [--type <type>] [--limit N]
-```
+Explicit `sm complete` is useful when you want to provide a detailed completion message to the parent.
 
-**Example:**
-```bash
-$ sm events 1749a2fe
-[15:10] spawned: Child engineer-abc123 (abc123) started
-[15:15] completed: Child abc123 completed - "Feature X done"
-[15:16] spawned: Child explore-xyz (789abc) started
-[15:18] checkpoint: Child 789abc - "Found 15 TypeScript files"
-[15:20] idle: Child 789abc idle for 5 minutes
-```
-
-### `sm send` - Send Input to Session
+### `sm send` - Send Input to Child Session
 
 **Syntax:**
 ```bash
@@ -309,51 +241,106 @@ $ sm send def456 "Add error handling for network failures"
 Input sent to session def456
 ```
 
+## Workflow Patterns
+
+### Pattern 1: Spawn and Wait (EM Orchestration)
+
+**Use case:** Parent needs child's result to proceed (spec review, PR merge, investigation)
+
+**How it works:**
+1. Parent spawns child with `--wait N`
+2. Parent blocks (doesn't burn tokens while waiting)
+3. Session manager monitors child
+4. When child completes OR N seconds idle:
+   - Session manager sends message to parent's Claude input
+   - Message contains: child ID, status, completion summary
+   - Parent wakes up with result in context and continues
+
+**Example: EM orchestrating Engineer → Architect flow:**
+```bash
+# EM spawns engineer and waits
+$ sm spawn "As engineer, read docs/working/sessionmanager.md and implement ticket #1042. Pay special attention to timeout handling." --wait 600
+Spawned child-abc123 (abc123)
+[Parent blocks, not burning tokens...]
+
+# 5 minutes later, engineer finishes
+[Session manager sends to EM's input]:
+"Child child-abc123 completed: Implemented feature X. PR #1042 created. All tests passing."
+
+# EM continues with architect review
+$ sm spawn "As architect, review PR #1042. Focus on error handling and test coverage." --wait 600
+Spawned child-def456 (def456)
+[Parent blocks again...]
+
+# Architect finishes
+[Session manager sends to EM's input]:
+"Child child-def456 completed: Approved. Merged to dev."
+
+# EM proceeds to next ticket
+```
+
+**Benefits:**
+- Parent preserves context without burning tokens
+- Automatic notification when work completes
+- Simple sequential orchestration
+- Timeout handling (gets notified after N seconds even if child stuck)
+
+### Pattern 2: Spawn and Forget
+
+**Use case:** Fire parallel tasks, collect results later (rare)
+
+**How it works:**
+1. Parent spawns multiple children without `--wait`
+2. Parent continues immediately
+3. Later, parent checks status with `sm children` or `sm what`
+
+**Example:**
+```bash
+# Spawn multiple exploratory tasks
+$ sm spawn "List all API endpoints" --name explore-apis --model haiku
+$ sm spawn "Find all database queries" --name explore-db --model haiku
+$ sm spawn "Map authentication flow" --name explore-auth
+
+# Continue working on something else...
+
+# Later, check results
+$ sm children
+explore-apis (abc123) | completed | 5min ago
+explore-db (def456) | completed | 3min ago
+explore-auth (ghi789) | running | 1min ago
+
+$ sm what abc123
+Found 47 API endpoints. Results written to docs/api-inventory.md
+```
+
+**Benefits:**
+- Parallel exploration
+- Don't block parent
+- Collect results asynchronously
+
+**Drawbacks:**
+- Parent must remember to check
+- More context overhead tracking multiple children
+- Less common pattern
+
+### Pattern Recommendation
+
+**Default to spawn-and-wait** for most cases. It's simpler, preserves parent context, and matches the EM orchestration pattern. Only use spawn-and-forget when truly parallelizing independent work.
+
 ## Configuration
 
 ### Global Config (`config.yaml`)
 
 ```yaml
 claude:
-  # User-controlled: Command and arguments for spawning Claude Code
-  # Agents CANNOT override these - only user can configure via this file
-  default_command: "claude"
-  default_args:
+  # User-controlled: How to spawn Claude Code sessions
+  # Agents CANNOT override command or args - only model
+  command: "claude"
+  args:
     - "--bypass-permissions"
 
-  # Per-agent-type configurations
-  # model: User sets the default model used unless agent explicitly overrides with --model
-  # args: User-controlled arguments (CANNOT be overridden by agents)
-  agent_configs:
-    Engineer:
-      model: "sonnet"  # YOUR default - used unless agent specifies --model
-      args:
-        - "--bypass-permissions"
-
-    Architect:
-      model: "opus"  # YOUR default for architecture work
-      args:
-        - "--plan"
-
-    Explore:
-      model: "haiku"  # YOUR default - fast and cheap
-      args:
-        - "--bypass-permissions"
-
-    general-purpose:
-      model: "sonnet"  # YOUR default - balanced
-      args: []
-
-  # Named presets - user-controlled shortcuts
-  # Agents use via --preset flag, cannot modify the preset contents
-  presets:
-    quick-fix:
-      model: "sonnet"
-      args: ["--bypass-permissions", "--compact"]
-
-    deep-analysis:
-      model: "opus"
-      args: ["--plan"]
+  # Default model for spawned sessions (agent can override with --model flag)
+  default_model: "sonnet"
 
 child_agents:
   # Lifecycle mode: auto | manual | supervised
@@ -398,34 +385,31 @@ sessions:
 
   # Session naming
   naming:
-    pattern: "{agent_type}-{friendly_name}"  # e.g., engineer-task1042
-    fallback: "{agent_type}-{short_id}"      # e.g., engineer-abc123
+    pattern: "{friendly_name}"               # e.g., task1042-fix
+    fallback: "child-{short_id}"             # e.g., child-abc123
 ```
 
 ### Agent Control vs User Control
 
 **User-controlled (configured in `config.yaml` only):**
-- Claude Code command and all arguments
-- Per-agent-type default arguments
-- Named preset definitions
+- Claude Code command (e.g., `claude`)
+- All command-line arguments (e.g., `--bypass-permissions`)
+- Default model (e.g., `sonnet`)
 
 **Agent-controlled (optional override at spawn time):**
-- Model selection via `--model <model>` flag (defaults to user's config, agent can override for task-specific needs)
-- Preset selection via `--preset <name>` flag (chooses from user-defined presets)
+- Model selection via `--model <model>` flag (defaults to user's config.yaml setting, agent can override for task-specific needs)
+- The prompt content (can include persona instructions, task details, etc.)
 
 **Example:**
 ```bash
-# Uses YOUR configured default model for Engineer (e.g., sonnet from config.yaml)
-sm spawn Engineer "Implement API endpoint"
+# Uses YOUR configured default model (e.g., sonnet from config.yaml)
+sm spawn "As engineer, implement API endpoint per docs/spec.md"
 
 # Agent overrides to opus for complex task requiring deeper reasoning
-sm spawn Engineer "Design distributed consensus algorithm" --model opus
+sm spawn "As architect, design distributed consensus algorithm" --model opus
 
 # Agent overrides to haiku for simple, quick task
-sm spawn Explore "List all TypeScript files" --model haiku
-
-# Agent uses preset (YOU defined the preset contents in config.yaml)
-sm spawn Engineer "Quick syntax fix" --preset quick-fix
+sm spawn "List all TypeScript files in src/" --model haiku
 ```
 
 ## Lifecycle Management
