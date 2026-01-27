@@ -98,14 +98,14 @@ sm spawn <agent-type> "<prompt>" [options]
 - `prompt`: Initial prompt/task for the child agent
 
 **Options:**
-- `--model <model>`: Choose model for this task (opus, sonnet, haiku) - context-dependent choice
-- `--preset <name>`: Use named preset from config
+- `--model <model>`: Optional override of default model (opus, sonnet, haiku). Defaults to your config.yaml setting for this agent type.
+- `--preset <name>`: Use named preset from config (user-defined)
 - `--parent <session-id>`: Explicit parent (defaults to current session)
 - `--working-dir <path>`: Override working directory
 - `--name <friendly-name>`: Set friendly name
 - `--json`: Return JSON output
 
-**Note:** Agents can only specify the model. The Claude Code command and arguments are user-controlled via `config.yaml` and cannot be overridden by agents.
+**Note:** Agents can optionally override the model for task-specific needs. The Claude Code command and arguments are user-controlled via `config.yaml` and cannot be overridden by agents.
 
 **Returns:**
 ```json
@@ -123,17 +123,17 @@ sm spawn <agent-type> "<prompt>" [options]
 
 **Example:**
 ```bash
-# Basic spawn (uses default model from config for Engineer)
+# Basic spawn - uses YOUR configured default model for Engineer (from config.yaml)
 $ sm spawn Engineer "Implement API endpoint for user login"
 Spawned engineer-abc123 (abc123) in tmux session claude-abc123
 
-# Agent chooses opus for complex task requiring deep reasoning
+# Agent overrides to opus for complex task (you still control the --args)
 $ sm spawn Engineer "Design and implement distributed lock mechanism" --model opus --name engineer-lock
 
-# Agent chooses haiku for simple, quick task
+# Agent overrides to haiku for simple, quick task
 $ sm spawn Engineer "Fix typo in README" --model haiku
 
-# With preset (uses user-configured preset settings)
+# With preset - uses YOUR preset definition from config.yaml
 $ sm spawn Engineer "Quick syntax fix in login.py" --preset quick-fix
 ```
 
@@ -322,26 +322,26 @@ claude:
     - "--bypass-permissions"
 
   # Per-agent-type configurations
-  # model: Default model (can be overridden by agent via --model flag)
+  # model: User sets the default model used unless agent explicitly overrides with --model
   # args: User-controlled arguments (CANNOT be overridden by agents)
   agent_configs:
     Engineer:
-      model: "sonnet"  # Default, but agent can choose opus/haiku based on task
+      model: "sonnet"  # YOUR default - used unless agent specifies --model
       args:
         - "--bypass-permissions"
 
     Architect:
-      model: "opus"  # Default for architecture work
+      model: "opus"  # YOUR default for architecture work
       args:
         - "--plan"
 
     Explore:
-      model: "haiku"  # Fast and cheap for exploration
+      model: "haiku"  # YOUR default - fast and cheap
       args:
         - "--bypass-permissions"
 
     general-purpose:
-      model: "sonnet"  # Balanced default
+      model: "sonnet"  # YOUR default - balanced
       args: []
 
   # Named presets - user-controlled shortcuts
@@ -409,19 +409,22 @@ sessions:
 - Per-agent-type default arguments
 - Named preset definitions
 
-**Agent-controlled (can specify at spawn time):**
-- Model selection via `--model <model>` flag (context-dependent choice based on task complexity)
+**Agent-controlled (optional override at spawn time):**
+- Model selection via `--model <model>` flag (defaults to user's config, agent can override for task-specific needs)
 - Preset selection via `--preset <name>` flag (chooses from user-defined presets)
 
 **Example:**
 ```bash
-# Agent chooses opus for complex reasoning task, uses Engineer's user-configured args
+# Uses YOUR configured default model for Engineer (e.g., sonnet from config.yaml)
+sm spawn Engineer "Implement API endpoint"
+
+# Agent overrides to opus for complex task requiring deeper reasoning
 sm spawn Engineer "Design distributed consensus algorithm" --model opus
 
-# Agent chooses haiku for simple exploration, uses Explore's user-configured args
+# Agent overrides to haiku for simple, quick task
 sm spawn Explore "List all TypeScript files" --model haiku
 
-# Agent uses preset (user defined the preset contents)
+# Agent uses preset (YOU defined the preset contents in config.yaml)
 sm spawn Engineer "Quick syntax fix" --preset quick-fix
 ```
 
