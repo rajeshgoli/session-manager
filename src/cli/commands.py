@@ -205,6 +205,38 @@ def cmd_others(client: SessionManagerClient, session_id: str, include_repo: bool
     return 0
 
 
+def cmd_all(client: SessionManagerClient, include_summaries: bool) -> int:
+    """
+    List all sessions system-wide across all workspaces.
+
+    Exit codes:
+        0: Sessions found
+        1: No sessions
+        2: Session manager unavailable
+    """
+    # List all sessions
+    sessions = client.list_sessions()
+    if sessions is None:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+
+    if not sessions:
+        print("No active sessions")
+        return 1
+
+    # Show sessions with optional summaries
+    if include_summaries:
+        for session in sessions:
+            summary = client.get_summary(session["id"], lines=100)
+            print(format_session_line(session, show_summary=True, summary=summary))
+            print()  # Blank line between sessions
+    else:
+        for session in sessions:
+            print(format_session_line(session, show_working_dir=True))
+
+    return 0
+
+
 def cmd_alone(client: SessionManagerClient, session_id: str) -> int:
     """
     Check if you're the only active agent (silent, for scripting).
