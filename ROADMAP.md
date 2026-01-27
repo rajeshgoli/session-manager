@@ -2,6 +2,37 @@
 
 ## Recent Work (2026-01-27)
 
+### Session 3: sm CLI Demo & Timeout Fix
+
+**What was completed:**
+
+1. **sm CLI Demo**
+   - Demonstrated all 10 commands with live session manager
+   - Verified: name, me, task, who, alone, status, lock, unlock, what, others
+   - Confirmed exit codes work correctly (0=success, 1=error, 2=unavailable)
+   - Verified lock file fallback system
+   - Tested friendly name updates (propagate to tmux status bar)
+
+2. **Timeout Fix** (src/cli/client.py)
+   - **Problem:** `sm what` command timed out (2s timeout, but summary takes 60s)
+   - **Solution:** Made `_request()` timeout configurable, use 65s for `get_summary()`
+   - **Result:** `sm what` now works and returns AI-generated summaries
+   - Commit: `fedccb7`
+
+**Testing:**
+- ✅ All commands work with live session manager
+- ✅ `sm what a4af4272` returns summaries successfully
+- ✅ Lock file system works correctly
+- ✅ Exit codes conform to specification
+
+**Git Status:**
+- Latest commit: `fedccb7` - Fix timeout issue in sm what command
+- Branch: `main`
+- Working tree: clean
+- Ready for next agent
+
+---
+
 ### Session 2: sm CLI Implementation
 
 **What was completed:**
