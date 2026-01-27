@@ -181,14 +181,11 @@ class Notifier:
                 lines.append(f"\\[{session_id_escaped}\\] *Claude:*")
 
             if event.context:
-                # Strip ANSI codes and truncate for Telegram (4096 char limit)
+                # Strip ANSI codes
                 context = strip_ansi(event.context)
 
                 # Convert markdown headings (##, ###, etc) to bold since MarkdownV2 doesn't support headings
                 context = re.sub(r'^#{1,6}\s+(.+)$', r'*\1*', context, flags=re.MULTILINE)
-
-                if len(context) > 2000:
-                    context = context[:2000] + "\\.\\.\\."
 
                 # Escape for MarkdownV2
                 context = escape_markdown_v2(context)
@@ -196,8 +193,8 @@ class Notifier:
         else:
             # Non-response events: plain text formatting (no escaping needed)
             if event.event_type == "idle":
-                # Simple idle message - replies to last response so no context needed
-                lines.append(f"^ {event.message}")
+                # Simple idle message - just notify that Claude is idle
+                lines.append("Claude is idle.")
                 lines.append("Waiting for your input.")
             else:
                 lines.append(f"[{event.event_type.upper()}] {event.message}")
@@ -205,8 +202,6 @@ class Notifier:
 
                 if event.context:
                     context = strip_ansi(event.context)
-                    if len(context) > 2000:
-                        context = context[:2000] + "..."
                     lines.append("")
                     lines.append("Recent output:")
                     lines.append("---")

@@ -116,6 +116,7 @@ class TelegramBot:
         self._on_update_thread: Optional[Callable[[str, int, int], Awaitable[None]]] = None
         self._on_set_name: Optional[Callable[[str, str], Awaitable[bool]]] = None
         self._on_get_last_output: Optional[Callable[[str], Awaitable[Optional[str]]]] = None
+        self._on_get_last_message: Optional[Callable[[str], Awaitable[Optional[str]]]] = None
         self._on_interrupt_session: Optional[Callable[[str], Awaitable[bool]]] = None
         self._on_update_topic: Optional[Callable[[str, int, int], Awaitable[None]]] = None
 
@@ -178,6 +179,10 @@ class TelegramBot:
         """Set handler for getting last Claude output. Handler receives session_id."""
         self._on_get_last_output = handler
 
+    def set_get_last_message_handler(self, handler: Callable[[str], Awaitable[Optional[str]]]):
+        """Set handler for getting last Claude message. Handler receives session_id."""
+        self._on_get_last_message = handler
+
     def set_interrupt_handler(self, handler: Callable[[str], Awaitable[bool]]):
         """Set handler for interrupting a session. Handler receives session_id."""
         self._on_interrupt_session = handler
@@ -214,6 +219,7 @@ class TelegramBot:
             "/session - Pick a project and create a session\n"
             "/list - List active sessions\n"
             "/status - What is Claude doing? (reply to session)\n"
+            "/message - Get last Claude message (reply to session)\n"
             "/stop - Interrupt Claude (reply to session)\n"
             "/kill [id] - Kill a session\n"
             "/open [id] - Open session in Terminal.app\n"
@@ -395,6 +401,42 @@ class TelegramBot:
             logger.error(f"Error getting status: {e}")
             await update.message.reply_text(f"Error: {e}")
 
+    async def _cmd_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /message command - retrieves the last Claude message."""
+        if not self._is_allowed(update.effective_chat.id, update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+
+        if not self._on_get_last_message:
+            await update.message.reply_text("Last message retrieval not configured.")
+            return
+
+        # Find session from topic or reply context
+        session_id = self._get_session_from_context(update)
+
+        if not session_id:
+            await update.message.reply_text(
+                "Could not identify session. Use /message in a session topic or reply to a session message."
+            )
+            return
+
+        try:
+            last_message = await self._on_get_last_message(session_id)
+
+            if last_message:
+                # Send the full message with markdown formatting
+                session_id_escaped = session_id.replace('-', '\\-').replace('.', '\\.')
+                header = f"\\[{session_id_escaped}\\] *Last Claude message:*\n\n"
+                full_message = header + escape_markdown_v2(last_message)
+
+                await update.message.reply_text(full_message, parse_mode="MarkdownV2")
+            else:
+                await update.message.reply_text(f"No message found for session {session_id}")
+
+        except Exception as e:
+            logger.error(f"Error getting last message: {e}")
+            await update.message.reply_text(f"Error: {e}")
+
     async def _cmd_kill(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /kill command."""
         if not self._is_allowed(update.effective_chat.id, update.effective_user.id):
@@ -538,9 +580,15 @@ class TelegramBot:
         session_id = self._get_session_from_context(update)
 
         if not session_id:
+            logger.warning(f"Could not identify session for message in chat {chat_id}, topic {update.message.message_thread_id}")
             # In forum mode, only respond in session topics
             if update.effective_chat.is_forum:
-                return  # Silently ignore messages in General or unlinked topics
+                # Show error in forum topics (except General topic which is usually None or 1)
+                if update.message.message_thread_id and update.message.message_thread_id != 1:
+                    await update.message.reply_text(
+                        "Could not identify session for this topic. The session may have been created before the server started."
+                    )
+                return  # Silently ignore in General topic
             await update.message.reply_text(
                 "Could not identify session. Reply to a message containing [session_id]."
             )
@@ -683,9 +731,12 @@ class TelegramBot:
         chat_id = update.effective_chat.id
         topic_id = update.message.message_thread_id
 
+        logger.debug(f"Getting session from context: chat_id={chat_id}, topic_id={topic_id}")
+
         # First, check if we're in a forum topic
         if topic_id:
             session_id = self.get_session_from_topic(chat_id, topic_id)
+            logger.debug(f"Topic lookup: (chat_id={chat_id}, topic_id={topic_id}) -> session_id={session_id}")
             if session_id:
                 return session_id
 
@@ -696,17 +747,39 @@ class TelegramBot:
             match = re.search(r'\[([a-f0-9]{8})\]|ID:\s*([a-f0-9]{8})', reply_text)
             if match:
                 session_id = match.group(1) or match.group(2)
+                # Check if session exists in either thread registry or topic registry
                 if session_id in self._session_threads:
                     return session_id
+                # Also check topic registry
+                for (cid, tid), sid in self._topic_sessions.items():
+                    if sid == session_id and cid == chat_id:
+                        return session_id
 
         # Third, if only one session in this chat, use it
-        chat_sessions = [
+        # Check both thread sessions and topic sessions
+        chat_sessions = []
+
+        # Add sessions from reply threads
+        chat_sessions.extend([
             sid for sid, (cid, mid) in self._session_threads.items()
             if cid == chat_id
-        ]
+        ])
+
+        # Add sessions from forum topics
+        chat_sessions.extend([
+            sid for (cid, tid), sid in self._topic_sessions.items()
+            if cid == chat_id
+        ])
+
+        # Remove duplicates and return if exactly one
+        chat_sessions = list(set(chat_sessions))
+        logger.debug(f"Fallback: found {len(chat_sessions)} sessions in chat {chat_id}: {chat_sessions}")
         if len(chat_sessions) == 1:
             return chat_sessions[0]
 
+        logger.debug(f"Could not identify session from context")
+        logger.debug(f"Topic sessions: {self._topic_sessions}")
+        logger.debug(f"Thread sessions: {self._session_threads}")
         return None
 
     async def _cmd_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -852,6 +925,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("session", self._cmd_session))
         self.application.add_handler(CommandHandler("list", self._cmd_list))
         self.application.add_handler(CommandHandler("status", self._cmd_status))
+        self.application.add_handler(CommandHandler("message", self._cmd_message))
         self.application.add_handler(CommandHandler("kill", self._cmd_kill))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("open", self._cmd_open))

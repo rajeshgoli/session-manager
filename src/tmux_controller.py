@@ -79,22 +79,26 @@ class TmuxController:
                 f"cat >> {log_file}",
             )
 
-            # Start Claude Code in the session with session ID in environment
+            # Set up environment variable first (persists in the shell)
             if session_id:
-                # Pass session ID as environment variable so hooks can identify which session this is
+                # Export session ID so it persists even if user exits and restarts Claude
                 self._run_tmux(
                     "send-keys",
                     "-t", session_name,
-                    f"export CLAUDE_SESSION_MANAGER_ID={session_id} && claude",
+                    f"export CLAUDE_SESSION_MANAGER_ID={session_id}",
                     "Enter",
                 )
-            else:
-                self._run_tmux(
-                    "send-keys",
-                    "-t", session_name,
-                    "claude",
-                    "Enter",
-                )
+                # Small delay to ensure export completes
+                import time
+                time.sleep(0.1)
+
+            # Start Claude Code in the session
+            self._run_tmux(
+                "send-keys",
+                "-t", session_name,
+                "claude",
+                "Enter",
+            )
 
             logger.info(f"Created session {session_name} (id={session_id}) in {working_dir}")
             return True

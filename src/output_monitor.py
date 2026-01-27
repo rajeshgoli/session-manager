@@ -62,10 +62,18 @@ class OutputMonitor:
         idle_timeout: int = 300,  # 5 minutes
         poll_interval: float = 1.0,
         context_lines: int = 20,
+        notify_errors: bool = False,
+        notify_permission_prompts: bool = True,
+        notify_completion: bool = False,
+        notify_idle: bool = True,
     ):
         self.idle_timeout = idle_timeout
         self.poll_interval = poll_interval
         self.context_lines = context_lines
+        self.notify_errors = notify_errors
+        self.notify_permission_prompts = notify_permission_prompts
+        self.notify_completion = notify_completion
+        self.notify_idle = notify_idle
 
         self._event_callback: Optional[Callable[[NotificationEvent], Awaitable[None]]] = None
         self._status_callback: Optional[Callable[[str, SessionStatus], Awaitable[None]]] = None
@@ -202,6 +210,11 @@ class OutputMonitor:
         if self._status_callback:
             await self._status_callback(session.id, SessionStatus.WAITING_PERMISSION)
 
+        # Only send notification if enabled
+        if not self.notify_permission_prompts:
+            logger.debug(f"Permission prompt detected but notifications disabled for session {session.id}")
+            return
+
         # Get context (last few lines)
         context = self._get_context(content)
 
@@ -223,6 +236,11 @@ class OutputMonitor:
         if self._status_callback:
             await self._status_callback(session.id, SessionStatus.ERROR)
 
+        # Only send notification if enabled
+        if not self.notify_errors:
+            logger.debug(f"Error detected but notifications disabled for session {session.id}")
+            return
+
         context = self._get_context(content)
 
         if self._event_callback:
@@ -239,6 +257,11 @@ class OutputMonitor:
 
     async def _handle_completion(self, session: Session, content: str):
         """Handle detected completion."""
+        # Only send notification if enabled
+        if not self.notify_completion:
+            logger.debug(f"Completion detected but notifications disabled for session {session.id}")
+            return
+
         context = self._get_context(content)
 
         if self._event_callback:
@@ -280,6 +303,11 @@ class OutputMonitor:
 
             if self._status_callback:
                 await self._status_callback(session.id, SessionStatus.IDLE)
+
+            # Only send notification if enabled
+            if not self.notify_idle:
+                logger.debug(f"Session {session.id} is idle but notifications disabled")
+                return
 
             if self._event_callback:
                 # Try to get last Claude message from hooks first (structured output)

@@ -14,17 +14,41 @@ if [ $(echo "$sessions" | wc -l) -eq 1 ]; then
     exit 0
 fi
 
-# Multiple sessions - show menu
+# Multiple sessions - show menu with friendly names
+STATE_FILE="/tmp/claude-sessions/sessions.json"
 echo "Available sessions:"
-echo "$sessions" | nl -v 1 -s '. '
+
+index=1
+declare -a session_array
+while IFS= read -r session_name; do
+    session_array+=("$session_name")
+
+    # Try to get friendly name from state file
+    if [ -f "$STATE_FILE" ] && command -v jq >/dev/null 2>&1; then
+        # Extract session ID from tmux name (claude-abc123de -> abc123de)
+        session_id="${session_name#claude-}"
+
+        # Look up friendly name in JSON
+        friendly_name=$(jq -r --arg id "$session_id" '.sessions[] | select(.id == $id) | .friendly_name // empty' "$STATE_FILE" 2>/dev/null)
+
+        if [ -n "$friendly_name" ]; then
+            echo "${index}. ${friendly_name} [${session_name}]"
+        else
+            echo "${index}. ${session_name}"
+        fi
+    else
+        echo "${index}. ${session_name}"
+    fi
+
+    ((index++))
+done <<< "$sessions"
 
 read -p "Select session (number): " choice
 
-session=$(echo "$sessions" | sed -n "${choice}p")
-
-if [ -z "$session" ]; then
+if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#session_array[@]}" ]; then
     echo "Invalid selection"
     exit 1
 fi
 
+session="${session_array[$((choice-1))]}"
 tmux attach -t "$session"

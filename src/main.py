@@ -53,9 +53,15 @@ class SessionManagerApp:
             state_file=self.state_file,
         )
 
+        monitor_config = config.get("monitor", {})
+        notify_config = monitor_config.get("notify", {})
         self.output_monitor = OutputMonitor(
-            idle_timeout=config.get("monitor", {}).get("idle_timeout", 300),
-            poll_interval=config.get("monitor", {}).get("poll_interval", 1.0),
+            idle_timeout=monitor_config.get("idle_timeout", 300),
+            poll_interval=monitor_config.get("poll_interval", 1.0),
+            notify_errors=notify_config.get("errors", False),
+            notify_permission_prompts=notify_config.get("permission_prompts", True),
+            notify_completion=notify_config.get("completion", False),
+            notify_idle=notify_config.get("idle", True),
         )
 
         # Email handler (uses existing harness)
@@ -162,6 +168,14 @@ class SessionManagerApp:
                 output = self.app.state.last_claude_output.get("latest")
             return output
 
+        async def on_get_last_message(session_id: str) -> Optional[str]:
+            """Get last Claude message for a session (full message from hooks)."""
+            # Try session-specific message first, then "latest"
+            message = self.app.state.last_claude_output.get(session_id)
+            if not message:
+                message = self.app.state.last_claude_output.get("latest")
+            return message
+
         async def on_interrupt_session(session_id: str) -> bool:
             """Send Escape to interrupt Claude."""
             session = self.session_manager.get_session(session_id)
@@ -179,6 +193,7 @@ class SessionManagerApp:
         self.telegram_bot.set_update_topic_handler(on_update_topic)
         self.telegram_bot.set_name_handler(on_set_name)
         self.telegram_bot.set_get_last_output_handler(on_get_last_output)
+        self.telegram_bot.set_get_last_message_handler(on_get_last_message)
         self.telegram_bot.set_interrupt_handler(on_interrupt_session)
 
     async def _handle_monitor_event(self, event: NotificationEvent):
