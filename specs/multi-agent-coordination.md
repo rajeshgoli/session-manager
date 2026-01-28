@@ -78,10 +78,10 @@ class SessionEvent:
 **Essential commands for parent agents:**
 
 1. **`sm spawn "<prompt>" --wait N`** - Spawn child and get notified when done/idle
-2. **`sm kill <id>`** - Terminate a child session
+2. **`sm kill <id>`** - Terminate YOUR child session (only allows killing own children)
 3. **`sm what <id>`** - Check status (rarely needed - for fire-and-forget spawns)
-4. **`sm children`** - List all children (optional)
-5. **`sm send <id> "text"`** - Send input to child (optional)
+4. **`sm children`** - List all YOUR children (optional)
+5. **`sm send <id> "text"`** - Send input to any session (optional)
 
 **No special commands needed for child agents** - session manager auto-detects completion, progress, and errors by monitoring the tmux transcript.
 
@@ -187,15 +187,25 @@ sm kill <session-id> [--force]
 **Options:**
 - `--force`: Force immediate kill (SIGKILL). Default is graceful (sends Escape to interrupt).
 
+**Security:**
+- **ONLY allows killing your own children** - cannot kill arbitrary sessions
+- Checks parent-child relationship before terminating
+- Prevents accidental/malicious termination of unrelated sessions
+- Returns error if session is not your child
+
 **Example:**
 ```bash
-# Graceful termination (sends Escape key)
+# Graceful termination (sends Escape key to your child)
 $ sm kill def456
 Session def456 terminated
 
 # Force kill (immediate SIGKILL)
 $ sm kill def456 --force
 Session def456 force killed
+
+# Trying to kill unrelated session
+$ sm kill xyz789
+Error: Cannot kill session xyz789 - not your child session
 ```
 
 **Use Case:**
@@ -203,6 +213,8 @@ Session def456 force killed
 - Need to cancel work in progress
 - Error detected, need to abort
 - Resource cleanup
+
+**Safety:** This prevents a "virtual bloodbath" - misbehaving agents cannot kill other agents' sessions or unrelated work.
 
 ### `sm what` - Check Child Status
 
@@ -797,16 +809,17 @@ sm status          # Shows full status including children
 
 ### Phase 1: Basic Spawning (MVP)
 - [ ] `sm spawn` command implementation
-- [ ] Parent-child relationship tracking
-- [ ] Basic lifecycle (manual mode)
+- [ ] Parent-child relationship tracking (store parent_session_id)
 - [ ] `sm children` command
+- [ ] `sm kill` command with parent-child check (CRITICAL: only allow killing own children)
 - [ ] Configurable Claude command/args
 
 **Deliverables:**
 - Can spawn child sessions
 - Children appear in `sm all`
-- Manual lifecycle management
-- Parent-child tracking
+- Manual lifecycle management via `sm kill`
+- Parent-child tracking with safety constraints
+- Prevents agents from killing unrelated sessions
 
 ### Phase 2: Auto-Detection & Monitoring
 - [ ] Transcript parsing for tool usage tracking
