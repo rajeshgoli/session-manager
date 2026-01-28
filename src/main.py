@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +25,73 @@ from .message_queue import MessageQueueManager
 from .tool_logger import ToolLogger
 
 logger = logging.getLogger(__name__)
+
+
+class EventLoopWatchdog:
+    """
+    Watchdog that monitors the asyncio event loop health.
+    If the event loop becomes unresponsive, it kills the process to allow
+    the process supervisor (launchd) to restart it.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, check_interval: int = 30, timeout: int = 10):
+        """
+        Args:
+            loop: The asyncio event loop to monitor
+            check_interval: Seconds between health checks
+            timeout: Seconds to wait for event loop response before considering it frozen
+        """
+        self.loop = loop
+        self.check_interval = check_interval
+        self.timeout = timeout
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """Start the watchdog in a background thread."""
+        self._thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"Event loop watchdog started (check every {self.check_interval}s, timeout {self.timeout}s)")
+
+    def stop(self):
+        """Stop the watchdog."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _watchdog_loop(self):
+        """Main watchdog loop running in a separate thread."""
+        while not self._stop_event.wait(self.check_interval):
+            if not self._check_event_loop_health():
+                logger.error("Event loop is frozen! Killing process for restart...")
+                # Give a moment for the log to flush
+                time.sleep(0.5)
+                # Kill ourselves - launchd will restart
+                os._exit(1)
+
+    def _check_event_loop_health(self) -> bool:
+        """
+        Check if the event loop is responsive.
+        Returns True if healthy, False if frozen.
+        """
+        response_event = threading.Event()
+
+        def set_response():
+            response_event.set()
+
+        try:
+            # Schedule a callback on the event loop
+            self.loop.call_soon_threadsafe(set_response)
+
+            # Wait for it to execute
+            if response_event.wait(timeout=self.timeout):
+                return True
+            else:
+                logger.warning(f"Event loop did not respond within {self.timeout}s")
+                return False
+        except Exception as e:
+            logger.error(f"Error checking event loop health: {e}")
+            return False
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -345,10 +415,21 @@ async def main():
     app = SessionManagerApp(config)
     setup_signal_handlers(app)
 
+    # Start event loop watchdog
+    watchdog_config = config.get("watchdog", {})
+    watchdog = EventLoopWatchdog(
+        loop=asyncio.get_running_loop(),
+        check_interval=watchdog_config.get("check_interval", 30),
+        timeout=watchdog_config.get("timeout", 10),
+    )
+    watchdog.start()
+
     try:
         await app.start()
     except KeyboardInterrupt:
         await app.stop()
+    finally:
+        watchdog.stop()
 
 
 def run():
