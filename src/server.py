@@ -35,6 +35,7 @@ class SendInputRequest(BaseModel):
     text: str
     sender_session_id: Optional[str] = None  # Optional sender identification
     delivery_mode: str = "sequential"  # sequential, important, urgent
+    from_sm_send: bool = False  # True if called from sm send command
 
 
 class NotifyRequest(BaseModel):
@@ -276,6 +277,7 @@ def create_app(
             request.text,
             sender_session_id=request.sender_session_id,
             delivery_mode=request.delivery_mode,
+            from_sm_send=request.from_sm_send,
         )
 
         if not success:

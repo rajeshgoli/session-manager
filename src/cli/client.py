@@ -149,7 +149,14 @@ class SessionManagerClient:
             return data.get("subagents", [])
         return None
 
-    def send_input(self, session_id: str, text: str, sender_session_id: Optional[str] = None, delivery_mode: str = "sequential") -> tuple[bool, bool]:
+    def send_input(
+        self,
+        session_id: str,
+        text: str,
+        sender_session_id: Optional[str] = None,
+        delivery_mode: str = "sequential",
+        from_sm_send: bool = False,
+    ) -> tuple[bool, bool]:
         """
         Send text input to a session.
 
@@ -158,11 +165,12 @@ class SessionManagerClient:
             text: Text to send to the session's Claude input
             sender_session_id: Optional sender session ID (for metadata)
             delivery_mode: Delivery mode (sequential, important, urgent)
+            from_sm_send: True if called from sm send command (triggers notification)
 
         Returns:
             Tuple of (success, unavailable)
         """
-        payload = {"text": text, "delivery_mode": delivery_mode}
+        payload = {"text": text, "delivery_mode": delivery_mode, "from_sm_send": from_sm_send}
         if sender_session_id:
             payload["sender_session_id"] = sender_session_id
 

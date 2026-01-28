@@ -18,6 +18,13 @@ class SessionStatus(Enum):
     ERROR = "error"
 
 
+class DeliveryMode(Enum):
+    """Message delivery modes for sm send."""
+    SEQUENTIAL = "sequential"
+    IMPORTANT = "important"
+    URGENT = "urgent"
+
+
 class NotificationChannel(Enum):
     """Available notification channels."""
     TELEGRAM = "telegram"

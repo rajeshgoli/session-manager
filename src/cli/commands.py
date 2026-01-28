@@ -584,8 +584,14 @@ def cmd_send(client: SessionManagerClient, identifier: str, text: str, delivery_
     # Get sender session ID from environment (if available)
     sender_session_id = client.session_id  # Set from CLAUDE_SESSION_MANAGER_ID in __init__
 
-    # Send input with sender metadata and delivery mode
-    success, unavailable = client.send_input(session_id, text, sender_session_id=sender_session_id, delivery_mode=delivery_mode)
+    # Send input with sender metadata, delivery mode, and sm send flag
+    success, unavailable = client.send_input(
+        session_id,
+        text,
+        sender_session_id=sender_session_id,
+        delivery_mode=delivery_mode,
+        from_sm_send=True,  # This is from sm send command
+    )
 
     if unavailable:
         print("Error: Session manager unavailable", file=sys.stderr)

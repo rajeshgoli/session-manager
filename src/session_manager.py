@@ -294,6 +294,7 @@ class SessionManager:
         text: str,
         sender_session_id: Optional[str] = None,
         delivery_mode: str = "sequential",
+        from_sm_send: bool = False,
     ) -> bool:
         """
         Send input to a session with optional sender metadata and delivery mode.
@@ -303,6 +304,7 @@ class SessionManager:
             text: Text to send
             sender_session_id: Optional ID of sending session (for metadata)
             delivery_mode: Delivery mode (sequential, important, urgent)
+            from_sm_send: True if called from sm send command (triggers notification)
 
         Returns:
             True if successful
@@ -324,6 +326,15 @@ class SessionManager:
         else:
             formatted_text = text
 
+        # Send Telegram notification if from sm send
+        if from_sm_send and sender_session_id:
+            asyncio.create_task(self._notify_sm_send(
+                sender_session_id=sender_session_id,
+                recipient_session_id=session_id,
+                text=text,
+                delivery_mode=delivery_mode,
+            ))
+
         # Handle delivery modes
         if delivery_mode == "sequential" and self.message_queue_manager:
             # Check if session is idle
@@ -340,6 +351,58 @@ class SessionManager:
             self._save_state()
 
         return success
+
+    async def _notify_sm_send(
+        self,
+        sender_session_id: str,
+        recipient_session_id: str,
+        text: str,
+        delivery_mode: str,
+    ):
+        """
+        Send Telegram notification about sm send message.
+
+        Args:
+            sender_session_id: Sender session ID
+            recipient_session_id: Recipient session ID
+            text: Message text
+            delivery_mode: Delivery mode (sequential, important, urgent)
+        """
+        recipient_session = self.sessions.get(recipient_session_id)
+        sender_session = self.sessions.get(sender_session_id)
+
+        if not recipient_session or not sender_session:
+            return
+
+        # Only notify if recipient has Telegram configured
+        if not recipient_session.telegram_chat_id:
+            return
+
+        # Get sender friendly name
+        sender_name = sender_session.friendly_name or sender_session.name or sender_session_id
+
+        # Format delivery mode with icon
+        mode_icons = {
+            "sequential": "📨",
+            "important": "❗",
+            "urgent": "⚡",
+        }
+        icon = mode_icons.get(delivery_mode, "📨")
+
+        # Format notification message
+        notification_text = f"{icon} **From [{sender_name}]** ({delivery_mode}): {text}"
+
+        # Emit notification event
+        from .models import NotificationEvent
+        event = NotificationEvent(
+            session_id=recipient_session_id,
+            event_type="sm_send",
+            message=notification_text,
+            context="",
+            urgent=False,
+        )
+
+        await self._emit_event(event)
 
     def send_key(self, session_id: str, key: str) -> bool:
         """Send a key to a session (e.g., 'y', 'n')."""
