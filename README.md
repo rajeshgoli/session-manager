@@ -188,8 +188,11 @@ engineer-db (a1b2c3d4) | running | ~/projects/myapp
 # Register your task to avoid conflicts
 $ sm task "Implementing user authentication API"
 
-# Send input to another agent
-$ sm send a1b2c3d4 "Database migration complete, you can proceed"
+# Send input to another agent (using friendly name or session ID)
+$ sm send engineer-db "Database migration complete, you can proceed"
+Input sent to engineer-db (a1b2c3d4)
+
+$ sm send a1b2c3d4 "Additional context..."
 Input sent to engineer-db (a1b2c3d4)
 ```
 

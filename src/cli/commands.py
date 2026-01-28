@@ -8,6 +8,35 @@ from .formatting import format_session_line, format_relative_time, format_status
 from ..lock_manager import LockManager
 
 
+def resolve_session_id(client: SessionManagerClient, identifier: str) -> tuple[Optional[str], Optional[dict]]:
+    """
+    Resolve a session identifier (ID or friendly name) to session ID and details.
+
+    Args:
+        client: API client
+        identifier: Session ID or friendly name
+
+    Returns:
+        Tuple of (session_id, session_dict) or (None, None) if not found/unavailable
+    """
+    # Try as session ID first
+    session = client.get_session(identifier)
+    if session:
+        return identifier, session
+
+    # Not found by ID, try as friendly name
+    sessions = client.list_sessions()
+    if sessions is None:
+        return None, None  # Session manager unavailable
+
+    # Search by friendly_name
+    for s in sessions:
+        if s.get("friendly_name") == identifier:
+            return s["id"], s
+
+    return None, None  # Not found
+
+
 def cmd_name(client: SessionManagerClient, session_id: str, friendly_name: str) -> int:
     """
     Set friendly name for current session.
@@ -525,13 +554,13 @@ def cmd_subagents(client: SessionManagerClient, target_session_id: str) -> int:
     return 0
 
 
-def cmd_send(client: SessionManagerClient, session_id: str, text: str) -> int:
+def cmd_send(client: SessionManagerClient, identifier: str, text: str) -> int:
     """
     Send input text to a session.
 
     Args:
         client: API client
-        session_id: Target session ID
+        identifier: Target session ID or friendly name
         text: Text to send
 
     Exit codes:
@@ -539,15 +568,16 @@ def cmd_send(client: SessionManagerClient, session_id: str, text: str) -> int:
         1: Session not found or send failed
         2: Session manager unavailable
     """
-    # Check if session exists
-    session = client.get_session(session_id)
-    if session is None:
+    # Resolve identifier to session ID and get session details
+    session_id, session = resolve_session_id(client, identifier)
+    if session_id is None:
+        # Check if it's unavailable or not found
         sessions = client.list_sessions()
         if sessions is None:
             print("Error: Session manager unavailable", file=sys.stderr)
             return 2
         else:
-            print(f"Error: Session {session_id} not found", file=sys.stderr)
+            print(f"Error: Session '{identifier}' not found", file=sys.stderr)
             return 1
 
     # Send input
