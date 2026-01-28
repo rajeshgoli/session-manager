@@ -523,3 +523,45 @@ def cmd_subagents(client: SessionManagerClient, target_session_id: str) -> int:
             print(f"     {sa['summary']}")
 
     return 0
+
+
+def cmd_send(client: SessionManagerClient, session_id: str, text: str) -> int:
+    """
+    Send input text to a session.
+
+    Args:
+        client: API client
+        session_id: Target session ID
+        text: Text to send
+
+    Exit codes:
+        0: Success
+        1: Session not found or send failed
+        2: Session manager unavailable
+    """
+    # Check if session exists
+    session = client.get_session(session_id)
+    if session is None:
+        sessions = client.list_sessions()
+        if sessions is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        else:
+            print(f"Error: Session {session_id} not found", file=sys.stderr)
+            return 1
+
+    # Send input
+    success, unavailable = client.send_input(session_id, text)
+
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+
+    if not success:
+        print(f"Error: Failed to send input to session {session_id}", file=sys.stderr)
+        return 1
+
+    # Success
+    name = session.get("friendly_name") or session.get("name") or session_id
+    print(f"Input sent to {name} ({session_id})")
+    return 0

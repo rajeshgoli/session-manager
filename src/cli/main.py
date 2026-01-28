@@ -68,11 +68,18 @@ def main():
     subagents_parser = subparsers.add_parser("subagents", help="List subagents spawned by a session")
     subagents_parser.add_argument("session_id", help="Session ID")
 
+    # sm send <session-id> "<text>"
+    send_parser = subparsers.add_parser("send", help="Send input to a session")
+    send_parser.add_argument("session_id", help="Target session ID")
+    send_parser.add_argument("text", help="Text to send to the session")
+
     args = parser.parse_args()
 
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
-    if not session_id and args.command not in ["lock", "unlock", "subagent-start", "subagent-stop", "all", None]:
+    # Commands that don't need session_id: lock, unlock, hooks, all, send, what, subagents
+    no_session_needed = ["lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "what", "subagents", None]
+    if not session_id and args.command not in no_session_needed:
         print("Error: CLAUDE_SESSION_MANAGER_ID environment variable not set", file=sys.stderr)
         print("This tool must be run inside a Claude Code session managed by Session Manager", file=sys.stderr)
         sys.exit(2)
@@ -109,6 +116,8 @@ def main():
         sys.exit(commands.cmd_subagent_stop(client, session_id))
     elif args.command == "subagents":
         sys.exit(commands.cmd_subagents(client, args.session_id))
+    elif args.command == "send":
+        sys.exit(commands.cmd_send(client, args.session_id, args.text))
     else:
         parser.print_help()
         sys.exit(0)

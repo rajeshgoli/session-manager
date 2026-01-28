@@ -131,6 +131,7 @@ The `sm` CLI tool enables Claude sessions to coordinate with each other. It's au
 | `sm task "<description>"` | Register what you're working on |
 | `sm status` | Full status: you + others + lock file |
 | `sm subagents <session-id>` | List subagents spawned by a session |
+| `sm send <session-id> "<text>"` | Send input to any session |
 
 ### Subagent Tracking
 
@@ -186,6 +187,10 @@ engineer-db (a1b2c3d4) | running | ~/projects/myapp
 
 # Register your task to avoid conflicts
 $ sm task "Implementing user authentication API"
+
+# Send input to another agent
+$ sm send a1b2c3d4 "Database migration complete, you can proceed"
+Input sent to engineer-db (a1b2c3d4)
 ```
 
 **Tracking subagents:**
