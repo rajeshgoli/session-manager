@@ -1,6 +1,50 @@
 # Claude Session Manager - Roadmap
 
-## Recent Work (2026-01-27)
+## Recent Work (2026-01-28)
+
+### Session 6: Tool Usage Logging for Security Audit
+
+**What was completed:**
+
+1. **Spec: Tool Usage Logging** (Issue #26)
+   - Comprehensive spec at `specs/tool-usage-logging.md`
+   - Architect review with 4 blocking items addressed
+   - Hook payload format verified from official Claude Code docs
+   - Database schema with destructive operation detection
+
+2. **Phase 1 Implementation** (Issue #26)
+   - `hooks/log_tool_use.sh` - Fire-and-forget hook script
+     - Timeout protection (5s process + 3s curl)
+     - Fallback to local file on API failure
+     - Injects CLAUDE_SESSION_MANAGER_ID
+   - `src/tool_logger.py` - ToolLogger class (230 lines)
+     - SQLite at `~/.local/share/claude-sessions/tool_usage.db`
+     - tool_use_id for Pre/Post correlation
+     - project_name derived from cwd
+     - 20+ destructive patterns (git push --force, rm -rf, DROP TABLE, etc.)
+     - Sensitive file detection (.env, credentials, .ssh)
+     - 8 indexes for efficient queries
+   - `POST /hooks/tool-use` endpoint in server.py
+   - Wired up in main.py
+
+3. **Hook Configuration**
+   - Added PreToolUse/PostToolUse hooks to `~/.claude/settings.json`
+   - Also logs SubagentStart/SubagentStop events
+
+**Tests Passed:**
+- Database initialization
+- Destructive pattern detection (6/6)
+- Sensitive file detection (4/4)
+- Async logging with Pre/Post correlation
+- Server endpoint registered
+
+**Files Changed:** 4 files, +311 lines
+
+**Pending:** Phase 2 (sm tools CLI), Phase 3 (config options)
+
+---
+
+## Previous Work (2026-01-27)
 
 ### Session 5: CLI Enhancements & Agent Workflow Improvements
 
@@ -389,6 +433,13 @@
   - sm name: Rename child sessions (not just self)
   - /follow: Associate Telegram topics with existing sessions
   - ToolSearch bug workaround (ENABLE_TOOL_SEARCH=false)
+- ✅ **Tool Usage Logging Phase 1** (Session 6)
+  - Hook script with timeout protection + fallback file
+  - ToolLogger class with SQLite database
+  - Destructive operation detection (20+ patterns)
+  - Sensitive file detection
+  - POST /hooks/tool-use API endpoint
+  - PreToolUse/PostToolUse/SubagentStart/SubagentStop hooks configured
 
 ---
 
