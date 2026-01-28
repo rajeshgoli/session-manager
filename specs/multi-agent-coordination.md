@@ -97,7 +97,7 @@ sm spawn "<prompt>" [options]
 
 **Options:**
 - `--model <model>`: Optional override of default model (opus, sonnet, haiku). Defaults to your config.yaml setting.
-- `--wait <seconds>`: Block until child completes or is idle for N seconds. Session manager will send notification to parent's input when triggered.
+- `--wait <seconds>`: Monitor child and notify parent when complete or idle for N seconds. Command returns immediately.
 - `--name <friendly-name>`: Set friendly name for the child session
 - `--working-dir <path>`: Override working directory (defaults to parent's directory)
 - `--json`: Return JSON output
@@ -105,13 +105,15 @@ sm spawn "<prompt>" [options]
 **Note:** Agents can optionally override the model for task-specific needs. The Claude Code command and arguments are user-controlled via `config.yaml` and cannot be overridden by agents.
 
 **Wait Behavior:**
-When `--wait` is specified:
-1. Parent agent blocks after spawn (sm spawn doesn't return)
-2. Session manager monitors child
+When `--wait N` is specified:
+1. `sm spawn` returns immediately with child ID
+2. Session manager monitors child in background
 3. When child completes OR is idle for N seconds:
-   - Session manager sends message to parent's Claude input
-   - Message contains: child ID, status, completion message/summary
-   - Parent wakes up and continues with completion info in context
+   - Session manager sends notification to parent's Claude input
+   - Notification contains: child ID, status, completion message/summary
+   - Parent wakes from idle with completion info in context
+
+**Non-blocking pattern:** Parent doesn't burn tokens waiting - it continues working or goes idle, and session manager notifies when child is done.
 
 **Returns:**
 ```json
@@ -128,22 +130,25 @@ When `--wait` is specified:
 
 **Example:**
 ```bash
-# Fire-and-forget: spawn and continue
+# Fire-and-forget: spawn without monitoring
 $ sm spawn "As engineer, implement user login API endpoint per spec docs/auth.md"
 Spawned child-abc123 (abc123) in tmux session claude-abc123
 
-# Spawn and wait: blocks until complete or 600s idle (EM pattern)
+# Spawn with notification: returns immediately, parent notified later (EM pattern)
 $ sm spawn "As architect, review and merge PR #1042" --wait 600
 Spawned child-xyz789 (xyz789) in tmux session claude-xyz789
-Waiting for completion or 600s idle...
-[Session manager sends to parent's input when done]:
+# Command returns, parent continues or goes idle
+# Later, when child completes or 600s idle:
+[Session manager sends to parent's input]:
 "Child child-xyz789 completed: PR #1042 approved and merged"
 
 # Agent overrides to opus for complex task requiring deep reasoning
 $ sm spawn "As engineer, design and implement distributed lock mechanism for cache layer" --model opus --wait 1200
+Spawned child-def456 (def456)
 
 # Uses user's default model from config.yaml
 $ sm spawn "Fix typo in README.md line 42" --wait 300
+Spawned child-ghi789 (ghi789)
 ```
 
 ### `sm children` - List Child Sessions
@@ -298,47 +303,48 @@ No special commands needed - all extracted automatically.
 
 ## Workflow Patterns
 
-### Pattern 1: Spawn and Wait (EM Orchestration)
+### Pattern 1: Spawn with Notification (EM Orchestration)
 
 **Use case:** Parent needs child's result to proceed (spec review, PR merge, investigation)
 
 **How it works:**
-1. Parent spawns child with `--wait N`
-2. Parent blocks (doesn't burn tokens while waiting)
-3. Session manager monitors child
+1. Parent spawns child with `--wait N` (command returns immediately)
+2. Parent continues working or goes idle (doesn't burn tokens)
+3. Session manager monitors child in background
 4. When child completes OR N seconds idle:
-   - Session manager sends message to parent's Claude input
-   - Message contains: child ID, status, completion summary
-   - Parent wakes up with result in context and continues
+   - Session manager sends notification to parent's Claude input
+   - Notification contains: child ID, status, completion summary
+   - Parent wakes from idle with result in context and continues
 
 **Example: EM orchestrating Engineer → Architect flow:**
 ```bash
-# EM spawns engineer and waits
+# EM spawns engineer with notification
 $ sm spawn "As engineer, read docs/working/sessionmanager.md and implement ticket #1042. Pay special attention to timeout handling." --wait 600
 Spawned child-abc123 (abc123)
-[Parent blocks, not burning tokens...]
+# Command returns, EM goes idle (not burning tokens)
 
 # 5 minutes later, engineer finishes
 [Session manager sends to EM's input]:
 "Child child-abc123 completed: Implemented feature X. PR #1042 created. All tests passing."
 
-# EM continues with architect review
+# EM wakes from idle, continues with architect review
 $ sm spawn "As architect, review PR #1042. Focus on error handling and test coverage." --wait 600
 Spawned child-def456 (def456)
-[Parent blocks again...]
+# EM goes idle again
 
 # Architect finishes
 [Session manager sends to EM's input]:
 "Child child-def456 completed: Approved. Merged to dev."
 
-# EM proceeds to next ticket
+# EM wakes, proceeds to next ticket
 ```
 
 **Benefits:**
-- Parent preserves context without burning tokens
+- Parent preserves context without burning tokens (goes idle while child works)
 - Automatic notification when work completes
 - Simple sequential orchestration
 - Timeout handling (gets notified after N seconds even if child stuck)
+- Non-blocking: parent can do other work while waiting for notification
 
 ### Pattern 2: Spawn and Forget
 
@@ -380,7 +386,7 @@ Found 47 API endpoints. Results written to docs/api-inventory.md
 
 ### Pattern Recommendation
 
-**Default to spawn-and-wait** for most cases. It's simpler, preserves parent context, and matches the EM orchestration pattern. Only use spawn-and-forget when truly parallelizing independent work.
+**Default to spawn-with-notification** (`--wait`) for most cases. It's simpler, preserves parent context without burning tokens, and matches the EM orchestration pattern. Only use spawn-and-forget when truly parallelizing independent work where results aren't needed immediately.
 
 ## Configuration
 
