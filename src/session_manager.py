@@ -327,12 +327,14 @@ class SessionManager:
             formatted_text = text
 
         # Send Telegram notification if from sm send
-        if from_sm_send and sender_session_id:
+        # Note: notifier will be set by server when calling send_input
+        if from_sm_send and sender_session_id and hasattr(self, 'notifier'):
             asyncio.create_task(self._notify_sm_send(
                 sender_session_id=sender_session_id,
                 recipient_session_id=session_id,
                 text=text,
                 delivery_mode=delivery_mode,
+                notifier=self.notifier,
             ))
 
         # Handle delivery modes
@@ -358,6 +360,7 @@ class SessionManager:
         recipient_session_id: str,
         text: str,
         delivery_mode: str,
+        notifier=None,
     ):
         """
         Send Telegram notification about sm send message.
@@ -367,6 +370,7 @@ class SessionManager:
             recipient_session_id: Recipient session ID
             text: Message text
             delivery_mode: Delivery mode (sequential, important, urgent)
+            notifier: Notifier instance (passed from server)
         """
         recipient_session = self.sessions.get(recipient_session_id)
         sender_session = self.sessions.get(sender_session_id)
@@ -376,6 +380,11 @@ class SessionManager:
 
         # Only notify if recipient has Telegram configured
         if not recipient_session.telegram_chat_id:
+            return
+
+        # Need notifier to send Telegram messages
+        if not notifier:
+            logger.warning(f"No notifier available for sm_send notification")
             return
 
         # Get sender friendly name
@@ -392,7 +401,7 @@ class SessionManager:
         # Format notification message
         notification_text = f"{icon} **From [{sender_name}]** ({delivery_mode}): {text}"
 
-        # Emit notification event
+        # Send notification via notifier
         from .models import NotificationEvent
         event = NotificationEvent(
             session_id=recipient_session_id,
@@ -402,7 +411,7 @@ class SessionManager:
             urgent=False,
         )
 
-        await self._emit_event(event)
+        await notifier.notify(event, recipient_session)
 
     def send_key(self, session_id: str, key: str) -> bool:
         """Send a key to a session (e.g., 'y', 'n')."""

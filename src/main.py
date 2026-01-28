@@ -56,6 +56,9 @@ class SessionManagerApp:
             config=config,
         )
 
+        # Will set notifier reference after creating notifier below
+        self.session_manager.notifier = None
+
         monitor_config = config.get("monitor", {})
         notify_config = monitor_config.get("notify", {})
         self.output_monitor = OutputMonitor(
@@ -93,6 +96,9 @@ class SessionManagerApp:
             telegram_bot=self.telegram_bot,
             email_handler=self.email_handler,
         )
+
+        # Set notifier reference in session manager for sm_send notifications
+        self.session_manager.notifier = self.notifier
 
         # Wire up output monitor callbacks
         self.output_monitor.set_event_callback(self._handle_monitor_event)
