@@ -1,14 +1,39 @@
 """FastAPI server for hooks and API endpoints."""
 
 import logging
+import time
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Body, Request
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus
 
 logger = logging.getLogger(__name__)
+
+
+class RequestTimingMiddleware(BaseHTTPMiddleware):
+    """Log slow requests for debugging."""
+
+    async def dispatch(self, request: Request, call_next):
+        start = time.monotonic()
+        response = await call_next(request)
+        elapsed = time.monotonic() - start
+
+        # Log slow requests (>1 second)
+        if elapsed > 1.0:
+            logger.warning(
+                f"SLOW REQUEST: {request.method} {request.url.path} "
+                f"took {elapsed:.2f}s"
+            )
+        elif elapsed > 0.1:
+            logger.info(
+                f"Request: {request.method} {request.url.path} "
+                f"took {elapsed*1000:.0f}ms"
+            )
+
+        return response
 
 
 class CreateSessionRequest(BaseModel):
@@ -122,6 +147,9 @@ def create_app(
         description="Manage Claude Code sessions with Telegram/Email notifications",
         version="0.1.0",
     )
+
+    # Add timing middleware for debugging
+    app.add_middleware(RequestTimingMiddleware)
 
     # Store references to components
     app.state.session_manager = session_manager
@@ -931,15 +959,19 @@ Provide ONLY the summary, no preamble or questions."""
         """
         Receive tool usage events from Claude Code hooks.
         """
+        import asyncio
+
+        start = time.monotonic()
         data = await request.json()
+        parse_time = time.monotonic() - start
 
         # Our session ID (injected by hook script)
         session_manager_id = data.get("session_manager_id")
 
         # Claude Code's native fields
         claude_session_id = data.get("session_id")  # Claude's internal ID
-        hook_type = data.get("hook_event_name")  # PreToolUse or PostToolUse
-        tool_name = data.get("tool_name")
+        hook_type = data.get("hook_event_name")  # PreToolUse, PostToolUse, SubagentStart, SubagentStop
+        tool_name = data.get("tool_name") or hook_type  # Fall back to hook_type for non-tool events
         tool_input = data.get("tool_input", {})
         tool_response = data.get("tool_response")  # Only for PostToolUse
         tool_use_id = data.get("tool_use_id")  # For Pre/Post correlation
@@ -953,9 +985,10 @@ Provide ONLY the summary, no preamble or questions."""
         if session_manager_id and app.state.session_manager:
             session = app.state.session_manager.get_session(session_manager_id)
 
-        # Log to database
+        # Log to database (fire and forget - don't block response)
         if hasattr(app.state, 'tool_logger') and app.state.tool_logger:
-            await app.state.tool_logger.log(
+            # Create task but don't await - let it run in background
+            asyncio.create_task(app.state.tool_logger.log(
                 session_id=session_manager_id,
                 claude_session_id=claude_session_id,
                 session_name=session.friendly_name if session else None,
@@ -967,7 +1000,11 @@ Provide ONLY the summary, no preamble or questions."""
                 tool_use_id=tool_use_id,
                 cwd=cwd,
                 agent_id=agent_id,
-            )
+            ))
+
+        elapsed = time.monotonic() - start
+        if elapsed > 0.05:  # Log if > 50ms
+            logger.debug(f"hook_tool_use: parse={parse_time*1000:.1f}ms total={elapsed*1000:.1f}ms tool={tool_name}")
 
         return {"status": "logged"}
 
