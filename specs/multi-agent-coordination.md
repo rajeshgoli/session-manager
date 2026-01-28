@@ -78,9 +78,10 @@ class SessionEvent:
 **Essential commands for parent agents:**
 
 1. **`sm spawn "<prompt>" --wait N`** - Spawn child and get notified when done/idle
-2. **`sm what <id>`** - Check status (rarely needed - for fire-and-forget spawns)
-3. **`sm children`** - List all children (optional)
-4. **`sm send <id> "text"`** - Send input to child (optional)
+2. **`sm kill <id>`** - Terminate a child session
+3. **`sm what <id>`** - Check status (rarely needed - for fire-and-forget spawns)
+4. **`sm children`** - List all children (optional)
+5. **`sm send <id> "text"`** - Send input to child (optional)
 
 **No special commands needed for child agents** - session manager auto-detects completion, progress, and errors by monitoring the tmux transcript.
 
@@ -170,6 +171,33 @@ engineer-task1042 (abc123) | completed | 5min ago
   └─ engineer-fix (xyz111) | completed | 3min ago
 engineer-task1043 (def456) | running   | 2min ago
 ```
+
+### `sm kill` - Terminate Child Session
+
+**Syntax:**
+```bash
+sm kill <session-id> [--force]
+```
+
+**Options:**
+- `--force`: Force immediate kill (SIGKILL). Default is graceful (sends Escape to interrupt).
+
+**Example:**
+```bash
+# Graceful termination (sends Escape key)
+$ sm kill def456
+Session def456 terminated
+
+# Force kill (immediate SIGKILL)
+$ sm kill def456 --force
+Session def456 force killed
+```
+
+**Use Case:**
+- Child is stuck or taking too long
+- Need to cancel work in progress
+- Error detected, need to abort
+- Resource cleanup
 
 ### `sm what` - Check Child Status
 
