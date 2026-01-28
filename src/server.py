@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from pydantic import BaseModel
 
 from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus
@@ -925,5 +925,50 @@ Provide ONLY the summary, no preamble or questions."""
             return {"error": "Failed to kill session"}
 
         return {"status": "killed", "session_id": target_session_id}
+
+    @app.post("/hooks/tool-use")
+    async def hook_tool_use(request: Request):
+        """
+        Receive tool usage events from Claude Code hooks.
+        """
+        data = await request.json()
+
+        # Our session ID (injected by hook script)
+        session_manager_id = data.get("session_manager_id")
+
+        # Claude Code's native fields
+        claude_session_id = data.get("session_id")  # Claude's internal ID
+        hook_type = data.get("hook_event_name")  # PreToolUse or PostToolUse
+        tool_name = data.get("tool_name")
+        tool_input = data.get("tool_input", {})
+        tool_response = data.get("tool_response")  # Only for PostToolUse
+        tool_use_id = data.get("tool_use_id")  # For Pre/Post correlation
+        cwd = data.get("cwd")  # Working directory
+
+        # Subagent context (if present)
+        agent_id = data.get("agent_id")  # From SubagentStart context
+
+        # Get session info if available
+        session = None
+        if session_manager_id and app.state.session_manager:
+            session = app.state.session_manager.get_session(session_manager_id)
+
+        # Log to database
+        if hasattr(app.state, 'tool_logger') and app.state.tool_logger:
+            await app.state.tool_logger.log(
+                session_id=session_manager_id,
+                claude_session_id=claude_session_id,
+                session_name=session.friendly_name if session else None,
+                parent_session_id=session.parent_session_id if session else None,
+                hook_type=hook_type,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_response=tool_response,
+                tool_use_id=tool_use_id,
+                cwd=cwd,
+                agent_id=agent_id,
+            )
+
+        return {"status": "logged"}
 
     return app

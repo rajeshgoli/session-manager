@@ -19,6 +19,7 @@ from .notifier import Notifier
 from .server import create_app
 from .child_monitor import ChildMonitor
 from .message_queue import MessageQueueManager
+from .tool_logger import ToolLogger
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,11 @@ class SessionManagerApp:
         # Pass message queue to session manager
         self.session_manager.message_queue_manager = self.message_queue
 
+        # Tool logger for security audit
+        tool_logging_config = config.get("tool_logging", {})
+        db_path = tool_logging_config.get("db_path", "~/.local/share/claude-sessions/tool_usage.db")
+        self.tool_logger = ToolLogger(db_path=db_path)
+
         # Create FastAPI app
         self.app = create_app(
             session_manager=self.session_manager,
@@ -121,6 +127,9 @@ class SessionManagerApp:
             output_monitor=self.output_monitor,
             child_monitor=self.child_monitor,
         )
+
+        # Attach tool logger to app state
+        self.app.state.tool_logger = self.tool_logger
 
         # Connect output monitor to hook output storage
         self.output_monitor.set_hook_output_store(self.app.state.last_claude_output)
