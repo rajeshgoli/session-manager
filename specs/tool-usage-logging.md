@@ -330,6 +330,7 @@ class ToolLogger:
                 claude_session_id TEXT,       -- Claude Code's internal session ID
                 tool_use_id TEXT,             -- For correlating PreToolUse/PostToolUse
                 cwd TEXT,                     -- Working directory at time of call
+                project_name TEXT,            -- Derived from cwd (last path component)
                 agent_id TEXT,                -- Subagent ID if this is a subagent call
 
                 -- Hook info
@@ -358,6 +359,7 @@ class ToolLogger:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_hook_type ON tool_usage(hook_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tool_use_id ON tool_usage(tool_use_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_id ON tool_usage(agent_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_name ON tool_usage(project_name)")
 
         conn.commit()
         conn.close()
@@ -431,20 +433,25 @@ class ToolLogger:
             if tool_name in ("Write", "Edit", "Read") and not target_file:
                 target_file = tool_input.get("file_path")
 
+            # Derive project name from cwd (last path component)
+            project_name = None
+            if cwd:
+                project_name = Path(cwd).name
+
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
             cursor.execute("""
                 INSERT INTO tool_usage (
                     session_id, claude_session_id, session_name, parent_session_id,
-                    tool_use_id, cwd, agent_id,
+                    tool_use_id, cwd, project_name, agent_id,
                     hook_type, tool_name, tool_input, tool_response,
                     is_destructive, destructive_type, is_sensitive_file,
                     target_file, bash_command, exit_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 session_id, claude_session_id, session_name, parent_session_id,
-                tool_use_id, cwd, agent_id,
+                tool_use_id, cwd, project_name, agent_id,
                 hook_type, tool_name,
                 json.dumps(tool_input) if tool_input else None,
                 json.dumps(tool_response) if tool_response else None,
@@ -544,13 +551,10 @@ sm tools --export csv       # Export to CSV
 
 **Problem:** Busy agents may generate thousands of tool calls.
 
-**Solutions:**
+**Solution:** Log 100% - database is cheap, filter post-hoc.
 - Async writes (fire-and-forget from hook)
-- Batch inserts (buffer and write periodically)
-- Log rotation (auto-delete logs older than N days)
-- Sampling option (log 1 in N for high-volume tools like Read)
-
-**Recommendation:** Start simple (async writes), add batching if needed.
+- 30-day retention with auto-cleanup
+- Add batching later if performance becomes an issue
 
 ### 2. Hook Failures
 
@@ -713,13 +717,7 @@ tool_logging:
     - "SECRET=\\S+"
     - "TOKEN=\\S+"
 
-  # Sampling (for high-volume scenarios)
-  sampling:
-    enabled: false
-    tools:
-      Read: 0.1      # Log 10% of Read calls
-      Grep: 0.1
-      Glob: 0.1
+  # Note: No sampling - log 100% of tool calls. Database is cheap, filter post-hoc.
 ```
 
 ---
