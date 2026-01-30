@@ -20,6 +20,21 @@ from .models import Session, UserInput, NotificationChannel
 logger = logging.getLogger(__name__)
 
 
+def create_permission_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    """Create inline keyboard for permission prompts."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✓ Yes", callback_data=f"perm:{session_id}:y"),
+            InlineKeyboardButton("✗ No", callback_data=f"perm:{session_id}:n"),
+        ],
+        [
+            InlineKeyboardButton("Always", callback_data=f"perm:{session_id}:a"),
+            InlineKeyboardButton("Never", callback_data=f"perm:{session_id}:v"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def escape_markdown_v2(text: str) -> str:
     """Escape special characters for Telegram MarkdownV2, preserving formatting."""
     # Characters that need escaping in MarkdownV2 (outside of code blocks)
@@ -827,6 +842,7 @@ Provide ONLY the summary, no preamble or questions."""
         reply_to_message_id: Optional[int] = None,
         message_thread_id: Optional[int] = None,
         parse_mode: Optional[str] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
     ) -> Optional[int]:
         """
         Send a notification message.
@@ -837,6 +853,7 @@ Provide ONLY the summary, no preamble or questions."""
             reply_to_message_id: Optional message to reply to (for threading)
             message_thread_id: Optional forum topic ID
             parse_mode: Optional parse mode ("MarkdownV2", "HTML", or None for plain text)
+            reply_markup: Optional inline keyboard markup for buttons
 
         Returns:
             Message ID of sent message, or None on failure
@@ -852,6 +869,7 @@ Provide ONLY the summary, no preamble or questions."""
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=message_thread_id,
                 parse_mode=parse_mode,
+                reply_markup=reply_markup,
             )
             return msg.message_id
 
@@ -867,6 +885,7 @@ Provide ONLY the summary, no preamble or questions."""
                         text=plain_message,
                         reply_to_message_id=reply_to_message_id,
                         message_thread_id=message_thread_id,
+                        reply_markup=reply_markup,
                     )
                     return msg.message_id
                 except Exception as e2:
@@ -1218,6 +1237,64 @@ Provide ONLY the summary, no preamble or questions."""
             logger.error(f"Error creating session: {e}")
             await query.edit_message_text(f"Error: {e}")
 
+    async def _handle_permission_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle permission button press (Yes/No/Always/Never)."""
+        query = update.callback_query
+        await query.answer()
+
+        # Extract session_id and response from callback data
+        # Format: "perm:session_id:response" (e.g., "perm:a4af4272:y")
+        parts = query.data.split(":", 2)
+        if len(parts) != 3:
+            await query.edit_message_text("Invalid button data.")
+            return
+
+        _, session_id, response = parts
+        chat_id = query.message.chat_id
+
+        # Map button responses to display names
+        response_names = {
+            "y": "Yes",
+            "n": "No",
+            "a": "Always",
+            "v": "Never",
+        }
+        response_name = response_names.get(response, response)
+
+        if not self._on_session_input:
+            await query.edit_message_text("Session input handler not configured.")
+            return
+
+        try:
+            # Send the response to the session
+            user_input = UserInput(
+                session_id=session_id,
+                text=response,
+                source=NotificationChannel.TELEGRAM,
+                chat_id=chat_id,
+                message_id=query.message.message_id,
+            )
+
+            success = await self._on_session_input(user_input)
+
+            if success:
+                # Update the message to show the response was sent
+                # Keep the original message but update to show what was selected
+                original_text = query.message.text or ""
+                # Remove the "Reply with:" line since we handled it
+                lines = original_text.split("\n")
+                lines = [l for l in lines if not l.startswith("Reply with:")]
+                lines.append(f"\n✓ Sent: {response_name}")
+                await query.edit_message_text("\n".join(lines))
+            else:
+                await query.edit_message_text(
+                    f"{query.message.text}\n\n✗ Failed to send response."
+                )
+
+        except Exception as e:
+            logger.error(f"Error handling permission callback: {e}")
+            await query.edit_message_text(f"Error: {e}")
+
     async def _handle_follow_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle follow button press."""
         query = update.callback_query
@@ -1316,6 +1393,9 @@ Provide ONLY the summary, no preamble or questions."""
 
         # Handle button presses for follow command
         self.application.add_handler(CallbackQueryHandler(self._handle_follow_callback, pattern="^follow:"))
+
+        # Handle button presses for permission prompts
+        self.application.add_handler(CallbackQueryHandler(self._handle_permission_callback, pattern="^perm:"))
 
         # Handle regular messages (for replies) - include commands so /clear, /compact, etc can be sent as input
         self.application.add_handler(MessageHandler(filters.TEXT, self._handle_message))

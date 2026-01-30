@@ -6,7 +6,7 @@ import re
 from typing import Optional
 
 from .models import Session, NotificationEvent, NotificationChannel
-from .telegram_bot import TelegramBot, escape_markdown_v2
+from .telegram_bot import TelegramBot, escape_markdown_v2, create_permission_keyboard
 from .email_handler import EmailHandler
 
 logger = logging.getLogger(__name__)
@@ -129,6 +129,11 @@ class Notifier:
         # Use MarkdownV2 for response events (Claude's output is markdown)
         parse_mode = "MarkdownV2" if use_markdown else None
 
+        # Create inline keyboard for permission prompts
+        reply_markup = None
+        if event.event_type == "permission_prompt":
+            reply_markup = create_permission_keyboard(event.session_id)
+
         # In topic mode, don't use reply_to (just post to the topic)
         msg_id = await self.telegram.send_notification(
             chat_id=chat_id,
@@ -136,6 +141,7 @@ class Notifier:
             reply_to_message_id=reply_to if not topic_id else None,
             message_thread_id=topic_id,
             parse_mode=parse_mode,
+            reply_markup=reply_markup,
         )
 
         # Store message ID for response notifications (so idle can reply to it)
