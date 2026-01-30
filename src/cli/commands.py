@@ -1,11 +1,56 @@
 """Command implementations for sm CLI."""
 
+import re
 import sys
 from typing import Optional
 
 from .client import SessionManagerClient
 from .formatting import format_session_line, format_relative_time, format_status_list
 from ..lock_manager import LockManager
+
+
+def parse_duration(duration_str: str) -> int:
+    """
+    Parse a duration string into seconds.
+
+    Supports formats: 30s, 5m, 1h, 2h30m, etc.
+
+    Args:
+        duration_str: Duration string (e.g., "5m", "30s", "1h", "2h30m")
+
+    Returns:
+        Duration in seconds
+
+    Raises:
+        ValueError: If format is invalid
+    """
+    if not duration_str:
+        raise ValueError("Empty duration string")
+
+    # Try pure integer (assume seconds)
+    if duration_str.isdigit():
+        return int(duration_str)
+
+    total_seconds = 0
+    pattern = re.compile(r'(\d+)([smhd])', re.IGNORECASE)
+    matches = pattern.findall(duration_str)
+
+    if not matches:
+        raise ValueError(f"Invalid duration format: {duration_str}")
+
+    for value, unit in matches:
+        value = int(value)
+        unit = unit.lower()
+        if unit == 's':
+            total_seconds += value
+        elif unit == 'm':
+            total_seconds += value * 60
+        elif unit == 'h':
+            total_seconds += value * 3600
+        elif unit == 'd':
+            total_seconds += value * 86400
+
+    return total_seconds
 
 
 def resolve_session_id(client: SessionManagerClient, identifier: str) -> tuple[Optional[str], Optional[dict]]:
@@ -479,6 +524,13 @@ def cmd_subagent_start(client: SessionManagerClient, session_id: str) -> int:
     """
     import json
 
+    # If no CLAUDE_SESSION_MANAGER_ID, this session isn't managed by us
+    # Skip entirely - no need to track subagents for unmanaged sessions
+    if not session_id:
+        # Still need to consume stdin to avoid broken pipe
+        sys.stdin.read()
+        return 0
+
     # Read hook payload from stdin
     try:
         payload = json.loads(sys.stdin.read())
@@ -494,8 +546,8 @@ def cmd_subagent_start(client: SessionManagerClient, session_id: str) -> int:
         print("Error: Missing agent_id in hook payload", file=sys.stderr)
         return 1
 
-    # Use session_id from hook payload if available, otherwise from environment
-    hook_session_id = payload.get("session_id", session_id)
+    # Use OUR session_id from CLAUDE_SESSION_MANAGER_ID, not Claude's internal UUID
+    hook_session_id = session_id
 
     success, unavailable = client.register_subagent_start(
         hook_session_id, agent_id, agent_type, transcript_path
@@ -525,6 +577,13 @@ def cmd_subagent_stop(client: SessionManagerClient, session_id: str) -> int:
     """
     import json
 
+    # If no CLAUDE_SESSION_MANAGER_ID, this session isn't managed by us
+    # Skip entirely - no need to track subagents for unmanaged sessions
+    if not session_id:
+        # Still need to consume stdin to avoid broken pipe
+        sys.stdin.read()
+        return 0
+
     # Read hook payload from stdin
     try:
         payload = json.loads(sys.stdin.read())
@@ -539,8 +598,8 @@ def cmd_subagent_stop(client: SessionManagerClient, session_id: str) -> int:
         print("Error: Missing agent_id in hook payload", file=sys.stderr)
         return 1
 
-    # Use session_id from hook payload if available
-    hook_session_id = payload.get("session_id", session_id)
+    # Use OUR session_id from CLAUDE_SESSION_MANAGER_ID, not Claude's internal UUID
+    hook_session_id = session_id
 
     # TODO: Generate summary from transcript_path using Haiku
     # For now, just register the stop without a summary
@@ -600,7 +659,15 @@ def cmd_subagents(client: SessionManagerClient, target_session_id: str) -> int:
     return 0
 
 
-def cmd_send(client: SessionManagerClient, identifier: str, text: str, delivery_mode: str = "sequential") -> int:
+def cmd_send(
+    client: SessionManagerClient,
+    identifier: str,
+    text: str,
+    delivery_mode: str = "sequential",
+    timeout_seconds: Optional[int] = None,
+    notify_on_delivery: bool = False,
+    notify_after_seconds: Optional[int] = None,
+) -> int:
     """
     Send input text to a session.
 
@@ -609,6 +676,9 @@ def cmd_send(client: SessionManagerClient, identifier: str, text: str, delivery_
         identifier: Target session ID or friendly name
         text: Text to send
         delivery_mode: Delivery mode (sequential, important, urgent)
+        timeout_seconds: Drop message if not delivered in this time
+        notify_on_delivery: Notify sender when delivered
+        notify_after_seconds: Notify sender N seconds after delivery
 
     Exit codes:
         0: Success
@@ -637,6 +707,9 @@ def cmd_send(client: SessionManagerClient, identifier: str, text: str, delivery_
         sender_session_id=sender_session_id,
         delivery_mode=delivery_mode,
         from_sm_send=True,  # This is from sm send command
+        timeout_seconds=timeout_seconds,
+        notify_on_delivery=notify_on_delivery,
+        notify_after_seconds=notify_after_seconds,
     )
 
     if unavailable:
@@ -655,6 +728,100 @@ def cmd_send(client: SessionManagerClient, identifier: str, text: str, delivery_
         print(f"Input sent to {name} ({session_id}) (interrupted)")
     else:  # important
         print(f"Input sent to {name} ({session_id})")
+
+    # Show additional options if used
+    extras = []
+    if timeout_seconds:
+        extras.append(f"timeout={timeout_seconds}s")
+    if notify_on_delivery:
+        extras.append("notify-on-delivery")
+    if notify_after_seconds:
+        extras.append(f"notify-after={notify_after_seconds}s")
+    if extras:
+        print(f"  Options: {', '.join(extras)}")
+
+    return 0
+
+
+def cmd_remind(client: SessionManagerClient, session_id: str, delay_seconds: int, message: str) -> int:
+    """
+    Schedule a self-reminder.
+
+    Args:
+        client: API client
+        session_id: Current session ID (to receive the reminder)
+        delay_seconds: Seconds until reminder fires
+        message: Reminder message
+
+    Exit codes:
+        0: Success
+        1: Failed to schedule
+        2: Session manager unavailable
+    """
+    result = client.schedule_reminder(session_id, delay_seconds, message)
+
+    if result is None:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+
+    if result.get("status") == "scheduled":
+        reminder_id = result.get("reminder_id", "unknown")
+        # Format delay for display
+        if delay_seconds >= 3600:
+            delay_str = f"{delay_seconds // 3600}h{(delay_seconds % 3600) // 60}m"
+        elif delay_seconds >= 60:
+            delay_str = f"{delay_seconds // 60}m{delay_seconds % 60}s"
+        else:
+            delay_str = f"{delay_seconds}s"
+        print(f"Reminder scheduled ({reminder_id}): fires in {delay_str}")
+        return 0
+    else:
+        print(f"Error: Failed to schedule reminder", file=sys.stderr)
+        return 1
+
+
+def cmd_queue(client: SessionManagerClient, session_id: str) -> int:
+    """
+    Show pending message queue for a session.
+
+    Args:
+        client: API client
+        session_id: Session ID to check
+
+    Exit codes:
+        0: Success
+        1: Session not found
+        2: Session manager unavailable
+    """
+    result = client.get_queue_status(session_id)
+
+    if result is None:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+
+    is_idle = result.get("is_idle", False)
+    pending_count = result.get("pending_count", 0)
+    messages = result.get("pending_messages", [])
+    saved_input = result.get("saved_user_input")
+
+    # Print status
+    status = "idle" if is_idle else "active"
+    print(f"Session {session_id}: {status}")
+    print(f"Pending messages: {pending_count}")
+
+    if saved_input:
+        print(f"Saved user input: {saved_input[:50]}...")
+
+    if messages:
+        print()
+        for i, msg in enumerate(messages, 1):
+            sender = msg.get("sender") or "unknown"
+            mode = msg.get("delivery_mode", "sequential")
+            queued = msg.get("queued_at", "")[:19]  # Trim to datetime
+            timeout = msg.get("timeout_at")
+            timeout_str = f" (expires {timeout[:19]})" if timeout else ""
+            print(f"  {i}. from {sender} [{mode}] queued {queued}{timeout_str}")
+
     return 0
 
 
