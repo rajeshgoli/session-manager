@@ -180,8 +180,13 @@ class SessionManagerApp:
         # Child monitor for --wait functionality
         self.child_monitor = ChildMonitor(self.session_manager)
 
-        # Message queue manager for sequential delivery mode
-        self.message_queue = MessageQueueManager(self.session_manager)
+        # Message queue manager for reliable inter-agent messaging (sm-send-v2)
+        sm_send_config = config.get("sm_send", {})
+        self.message_queue = MessageQueueManager(
+            self.session_manager,
+            db_path=sm_send_config.get("db_path", "~/.local/share/claude-sessions/message_queue.db"),
+            config=sm_send_config,
+        )
         # Pass message queue to session manager
         self.session_manager.message_queue_manager = self.message_queue
 
@@ -228,7 +233,11 @@ class SessionManagerApp:
             return self.session_manager.kill_session(session_id)
 
         async def on_session_input(user_input: UserInput) -> bool:
-            success = self.session_manager.send_input(user_input.session_id, user_input.text)
+            success = self.session_manager.send_input(
+                user_input.session_id,
+                user_input.text,
+                bypass_queue=user_input.is_permission_response,
+            )
             if success:
                 self.output_monitor.update_activity(user_input.session_id)
             return success

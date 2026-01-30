@@ -21,15 +21,22 @@ logger = logging.getLogger(__name__)
 
 
 def create_permission_keyboard(session_id: str) -> InlineKeyboardMarkup:
-    """Create inline keyboard for permission prompts."""
+    """Create inline keyboard for permission prompts.
+
+    Claude Code permission prompts use numbered options:
+    1. Yes, allow once
+    2. Yes, always allow for this session
+    3. No
+    4. Don't ask again for this session
+    """
     keyboard = [
         [
-            InlineKeyboardButton("✓ Yes", callback_data=f"perm:{session_id}:y"),
-            InlineKeyboardButton("✗ No", callback_data=f"perm:{session_id}:n"),
+            InlineKeyboardButton("✓ Yes (once)", callback_data=f"perm:{session_id}:1"),
+            InlineKeyboardButton("✓ Always", callback_data=f"perm:{session_id}:2"),
         ],
         [
-            InlineKeyboardButton("Always", callback_data=f"perm:{session_id}:a"),
-            InlineKeyboardButton("Never", callback_data=f"perm:{session_id}:v"),
+            InlineKeyboardButton("✗ No", callback_data=f"perm:{session_id}:3"),
+            InlineKeyboardButton("✗ Never", callback_data=f"perm:{session_id}:4"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -1242,40 +1249,49 @@ Provide ONLY the summary, no preamble or questions."""
         query = update.callback_query
         await query.answer()
 
+        logger.info(f"Permission callback received: {query.data}")
+
         # Extract session_id and response from callback data
-        # Format: "perm:session_id:response" (e.g., "perm:a4af4272:y")
+        # Format: "perm:session_id:response" (e.g., "perm:a4af4272:1")
         parts = query.data.split(":", 2)
         if len(parts) != 3:
+            logger.error(f"Invalid permission callback data: {query.data}")
             await query.edit_message_text("Invalid button data.")
             return
 
         _, session_id, response = parts
         chat_id = query.message.chat_id
+        logger.info(f"Permission callback: session={session_id}, response={response}")
 
         # Map button responses to display names
+        # Claude Code uses numbered options: 1=Yes once, 2=Always, 3=No, 4=Never
         response_names = {
-            "y": "Yes",
-            "n": "No",
-            "a": "Always",
-            "v": "Never",
+            "1": "Yes (once)",
+            "2": "Always",
+            "3": "No",
+            "4": "Never",
         }
         response_name = response_names.get(response, response)
 
         if not self._on_session_input:
+            logger.error("Session input handler not configured!")
             await query.edit_message_text("Session input handler not configured.")
             return
 
         try:
-            # Send the response to the session
+            # Send the response to the session (bypass queue for immediate delivery)
             user_input = UserInput(
                 session_id=session_id,
                 text=response,
                 source=NotificationChannel.TELEGRAM,
                 chat_id=chat_id,
                 message_id=query.message.message_id,
+                is_permission_response=True,
             )
 
+            logger.info(f"Sending permission response to session {session_id}: {response}")
             success = await self._on_session_input(user_input)
+            logger.info(f"Permission response sent, success={success}")
 
             if success:
                 # Update the message to show the response was sent

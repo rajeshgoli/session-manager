@@ -300,6 +300,10 @@ class SessionManager:
         sender_session_id: Optional[str] = None,
         delivery_mode: str = "sequential",
         from_sm_send: bool = False,
+        timeout_seconds: Optional[int] = None,
+        notify_on_delivery: bool = False,
+        notify_after_seconds: Optional[int] = None,
+        bypass_queue: bool = False,
     ) -> bool:
         """
         Send input to a session with optional sender metadata and delivery mode.
@@ -310,6 +314,10 @@ class SessionManager:
             sender_session_id: Optional ID of sending session (for metadata)
             delivery_mode: Delivery mode (sequential, important, urgent)
             from_sm_send: True if called from sm send command (triggers notification)
+            timeout_seconds: Drop message if not delivered in this time
+            notify_on_delivery: Notify sender when delivered
+            notify_after_seconds: Notify sender N seconds after delivery
+            bypass_queue: If True, send directly to tmux (for permission responses)
 
         Returns:
             True if successful
@@ -319,7 +327,16 @@ class SessionManager:
             logger.error(f"Session not found: {session_id}")
             return False
 
+        # For permission responses, bypass queue and send directly
+        if bypass_queue:
+            logger.info(f"Bypassing queue for direct send to {session_id}: {text}")
+            success = self.tmux.send_input(session.tmux_session, text)
+            if success:
+                session.last_activity = datetime.now()
+            return success
+
         # Format message with sender metadata if provided
+        sender_name = None
         if sender_session_id:
             sender_session = self.sessions.get(sender_session_id)
             if sender_session:
@@ -342,15 +359,38 @@ class SessionManager:
                 notifier=self.notifier,
             ))
 
-        # Handle delivery modes
-        if delivery_mode == "sequential" and self.message_queue_manager:
-            # Check if session is idle
-            if not self.message_queue_manager.is_session_idle(session_id):
-                # Session is active, queue the message
-                return self.message_queue_manager.queue_message(session_id, formatted_text)
-            # else: session is idle, send immediately (fall through)
+        # Handle delivery modes using the message queue manager
+        if self.message_queue_manager:
+            # For sequential mode, always queue (queue manager handles idle detection)
+            if delivery_mode == "sequential":
+                # Check if session is idle - if so, queue will deliver immediately
+                self.message_queue_manager.queue_message(
+                    target_session_id=session_id,
+                    text=formatted_text,
+                    sender_session_id=sender_session_id,
+                    sender_name=sender_name,
+                    delivery_mode=delivery_mode,
+                    timeout_seconds=timeout_seconds,
+                    notify_on_delivery=notify_on_delivery,
+                    notify_after_seconds=notify_after_seconds,
+                )
+                return True
 
-        # For important, urgent, or idle sequential: send immediately
+            # For important/urgent, queue handles delivery logic
+            if delivery_mode in ("important", "urgent"):
+                self.message_queue_manager.queue_message(
+                    target_session_id=session_id,
+                    text=formatted_text,
+                    sender_session_id=sender_session_id,
+                    sender_name=sender_name,
+                    delivery_mode=delivery_mode,
+                    timeout_seconds=timeout_seconds,
+                    notify_on_delivery=notify_on_delivery,
+                    notify_after_seconds=notify_after_seconds,
+                )
+                return True
+
+        # Fallback: send immediately (no queue manager or unknown mode)
         success = self.tmux.send_input(session.tmux_session, formatted_text)
         if success:
             session.last_activity = datetime.now()

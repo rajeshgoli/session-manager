@@ -205,3 +205,47 @@ class UserInput:
     source: NotificationChannel
     chat_id: Optional[int] = None
     message_id: Optional[int] = None
+    is_permission_response: bool = False  # If True, bypass queue and send directly
+
+
+@dataclass
+class QueuedMessage:
+    """A message queued for delivery to a session."""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    target_session_id: str = ""
+    sender_session_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    text: str = ""
+    delivery_mode: str = "sequential"  # sequential, important, urgent
+    queued_at: datetime = field(default_factory=datetime.now)
+    timeout_at: Optional[datetime] = None  # None = no timeout
+    notify_on_delivery: bool = False
+    notify_after_seconds: Optional[int] = None  # None = no post-delivery notification
+    delivered_at: Optional[datetime] = None  # None = pending
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "id": self.id,
+            "target_session_id": self.target_session_id,
+            "sender_session_id": self.sender_session_id,
+            "sender_name": self.sender_name,
+            "text": self.text,
+            "delivery_mode": self.delivery_mode,
+            "queued_at": self.queued_at.isoformat(),
+            "timeout_at": self.timeout_at.isoformat() if self.timeout_at else None,
+            "notify_on_delivery": self.notify_on_delivery,
+            "notify_after_seconds": self.notify_after_seconds,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+        }
+
+
+@dataclass
+class SessionDeliveryState:
+    """Tracks delivery state for a session."""
+    session_id: str
+    is_idle: bool = False  # Set True by Stop hook, False on input injection
+    last_idle_at: Optional[datetime] = None
+    saved_user_input: Optional[str] = None  # Saved input during delivery
+    pending_user_input: Optional[str] = None  # Currently detected input
+    pending_input_first_seen: Optional[datetime] = None  # When we first saw the pending input
