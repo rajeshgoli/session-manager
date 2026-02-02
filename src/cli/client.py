@@ -311,3 +311,20 @@ class SessionManagerClient:
             timeout=10
         )
         return data if success else None
+
+    def get_queue_status(self, session_id: str) -> Optional[dict]:
+        """
+        Get queue status and idle state for a session.
+
+        Args:
+            session_id: Session ID
+
+        Returns:
+            Dict with is_idle, pending_count, pending_messages, saved_user_input
+            or None if unavailable
+        """
+        data, success, unavailable = self._request(
+            "GET",
+            f"/sessions/{session_id}/send-queue"
+        )
+        return data if success else None

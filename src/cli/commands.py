@@ -667,6 +667,7 @@ def cmd_send(
     timeout_seconds: Optional[int] = None,
     notify_on_delivery: bool = False,
     notify_after_seconds: Optional[int] = None,
+    wait_seconds: Optional[int] = None,
 ) -> int:
     """
     Send input text to a session.
@@ -679,6 +680,7 @@ def cmd_send(
         timeout_seconds: Drop message if not delivered in this time
         notify_on_delivery: Notify sender when delivered
         notify_after_seconds: Notify sender N seconds after delivery
+        wait_seconds: Notify sender N seconds after delivery if recipient is idle (alias for notify_after_seconds)
 
     Exit codes:
         0: Success
@@ -700,6 +702,9 @@ def cmd_send(
     # Get sender session ID from environment (if available)
     sender_session_id = client.session_id  # Set from CLAUDE_SESSION_MANAGER_ID in __init__
 
+    # Use wait_seconds if provided, otherwise use notify_after_seconds
+    effective_notify_after = wait_seconds if wait_seconds is not None else notify_after_seconds
+
     # Send input with sender metadata, delivery mode, and sm send flag
     success, unavailable = client.send_input(
         session_id,
@@ -709,7 +714,7 @@ def cmd_send(
         from_sm_send=True,  # This is from sm send command
         timeout_seconds=timeout_seconds,
         notify_on_delivery=notify_on_delivery,
-        notify_after_seconds=notify_after_seconds,
+        notify_after_seconds=effective_notify_after,
     )
 
     if unavailable:
@@ -735,8 +740,8 @@ def cmd_send(
         extras.append(f"timeout={timeout_seconds}s")
     if notify_on_delivery:
         extras.append("notify-on-delivery")
-    if notify_after_seconds:
-        extras.append(f"notify-after={notify_after_seconds}s")
+    if effective_notify_after:
+        extras.append(f"wait={effective_notify_after}s")
     if extras:
         print(f"  Options: {', '.join(extras)}")
 
@@ -1249,6 +1254,69 @@ def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int
     # Print output
     print(output, end="")
     return 0
+
+
+def cmd_wait(
+    client: SessionManagerClient,
+    identifier: str,
+    timeout_seconds: int,
+) -> int:
+    """
+    Wait for a session to go idle or timeout.
+
+    Args:
+        client: API client
+        identifier: Target session ID or friendly name
+        timeout_seconds: Maximum seconds to wait
+
+    Exit codes:
+        0: Session went idle
+        1: Timeout reached (session still active)
+        2: Session manager unavailable or session not found
+    """
+    import time
+
+    # Resolve identifier to session ID
+    session_id, session = resolve_session_id(client, identifier)
+    if session_id is None:
+        # Check if it's unavailable or not found
+        sessions = client.list_sessions()
+        if sessions is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        else:
+            print(f"Error: Session '{identifier}' not found", file=sys.stderr)
+            return 2
+
+    # Poll interval (check every 2 seconds)
+    poll_interval = 2
+    elapsed = 0
+    start_time = time.time()
+
+    while elapsed < timeout_seconds:
+        # Check if session is idle
+        result = client.get_queue_status(session_id)
+
+        if result is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+
+        is_idle = result.get("is_idle", False)
+
+        if is_idle:
+            # Session is idle
+            name = session.get("friendly_name") or session.get("name") or session_id
+            print(f"{name} is idle (waited {int(elapsed)}s)")
+            return 0
+
+        # Sleep and continue
+        time.sleep(poll_interval)
+        elapsed = time.time() - start_time
+
+    # Timeout reached
+    name = session.get("friendly_name") or session.get("name") or session_id
+    print(f"Timeout: {name} still active after {timeout_seconds}s")
+    return 1
 
 
 def cmd_clear(

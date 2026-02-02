@@ -76,6 +76,12 @@ def main():
     send_parser.add_argument("--sequential", action="store_true", help="Wait for idle before sending (default)")
     send_parser.add_argument("--important", action="store_true", help="Inject immediately, queue behind current work")
     send_parser.add_argument("--urgent", action="store_true", help="Interrupt immediately")
+    send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
+
+    # sm wait <session-id> <seconds>
+    wait_parser = subparsers.add_parser("wait", help="Wait for session to go idle (or timeout)")
+    wait_parser.add_argument("session_id", help="Session ID to monitor")
+    wait_parser.add_argument("seconds", type=int, help="Maximum seconds to wait")
 
     # sm spawn "<prompt>"
     spawn_parser = subparsers.add_parser("spawn", help="Spawn a child agent session")
@@ -154,8 +160,8 @@ def main():
 
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
-    # Commands that don't need session_id: lock, unlock, hooks, all, send, what, subagents, children, kill, new, attach, output, clear
-    no_session_needed = ["lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "what", "subagents", "children", "kill", "new", "attach", "output", "clear", None]
+    # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, new, attach, output, clear
+    no_session_needed = ["lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what", "subagents", "children", "kill", "new", "attach", "output", "clear", None]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
     if not session_id and args.command in requires_session_id:
@@ -206,7 +212,11 @@ def main():
             delivery_mode = "urgent"
         elif args.important:
             delivery_mode = "important"
-        sys.exit(commands.cmd_send(client, args.session_id, args.text, delivery_mode))
+        # Extract wait parameter
+        wait_seconds = args.wait if hasattr(args, 'wait') else None
+        sys.exit(commands.cmd_send(client, args.session_id, args.text, delivery_mode, wait_seconds=wait_seconds))
+    elif args.command == "wait":
+        sys.exit(commands.cmd_wait(client, args.session_id, args.seconds))
     elif args.command == "spawn":
         sys.exit(commands.cmd_spawn(client, session_id, args.prompt, args.name, args.wait, args.model, args.working_dir, args.json))
     elif args.command == "children":
