@@ -1,5 +1,6 @@
 """Regression tests for #72 (sm send --wait) and #73 (sm wait)."""
 
+import asyncio
 import time
 from unittest.mock import MagicMock, patch
 import pytest
@@ -208,6 +209,113 @@ class TestWaitCommand:
 
             # Should return 2 (unavailable)
             assert exit_code == 2
+
+
+class TestFollowupNotificationIdleCheck:
+    """Test idle check in follow-up notifications (issue #72 fix)."""
+
+    @pytest.mark.asyncio
+    async def test_followup_notification_only_sent_if_idle(self):
+        """Test that follow-up notification is only sent if recipient is still idle."""
+        from src.message_queue import MessageQueueManager
+        from src.models import QueuedMessage
+        from datetime import datetime
+        from unittest.mock import AsyncMock
+
+        # Create mock session manager
+        mock_sm = MagicMock()
+        mock_sm.get_session.return_value = MagicMock(
+            id="target456",
+            tmux_session="test-session"
+        )
+        mock_sm.tmux = MagicMock()
+        mock_sm.tmux.send_input_async = AsyncMock(return_value=True)
+        mock_sm._save_state = MagicMock()
+
+        # Create message queue manager
+        queue_mgr = MessageQueueManager(
+            session_manager=mock_sm,
+            db_path="/tmp/test_queue_idle_check.db"
+        )
+        queue_mgr._init_db()
+
+        # Mock is_session_idle to return False (recipient became active)
+        queue_mgr.is_session_idle = MagicMock(return_value=False)
+
+        # Create a message with notify_after_seconds
+        msg = QueuedMessage(
+            id="msg123",
+            target_session_id="target456",
+            sender_session_id="sender123",
+            text="test message",
+            queued_at=datetime.now(),
+            notify_after_seconds=1
+        )
+
+        # Mock queue_message to track if notification was queued
+        queue_mgr.queue_message = MagicMock()
+
+        # Trigger the follow-up notification
+        await queue_mgr._schedule_followup_notification(msg)
+
+        # Wait for the notification to fire
+        await asyncio.sleep(1.5)
+
+        # Verify no notification was queued (recipient is not idle)
+        queue_mgr.queue_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_followup_notification_sent_when_idle(self):
+        """Test that follow-up notification IS sent if recipient is idle."""
+        from src.message_queue import MessageQueueManager
+        from src.models import QueuedMessage
+        from datetime import datetime
+        from unittest.mock import AsyncMock
+
+        # Create mock session manager
+        mock_sm = MagicMock()
+        mock_sm.get_session.return_value = MagicMock(
+            id="target456",
+            tmux_session="test-session"
+        )
+        mock_sm.tmux = MagicMock()
+        mock_sm.tmux.send_input_async = AsyncMock(return_value=True)
+        mock_sm._save_state = MagicMock()
+
+        # Create message queue manager
+        queue_mgr = MessageQueueManager(
+            session_manager=mock_sm,
+            db_path="/tmp/test_queue_idle_check_2.db"
+        )
+        queue_mgr._init_db()
+
+        # Mock is_session_idle to return True (recipient is still idle)
+        queue_mgr.is_session_idle = MagicMock(return_value=True)
+
+        # Create a message with notify_after_seconds
+        msg = QueuedMessage(
+            id="msg123",
+            target_session_id="target456",
+            sender_session_id="sender123",
+            text="test message",
+            queued_at=datetime.now(),
+            notify_after_seconds=1
+        )
+
+        # Mock queue_message to track if notification was queued
+        queue_mgr.queue_message = MagicMock()
+
+        # Trigger the follow-up notification
+        await queue_mgr._schedule_followup_notification(msg)
+
+        # Wait for the notification to fire
+        await asyncio.sleep(1.5)
+
+        # Verify notification was queued (recipient is idle)
+        queue_mgr.queue_message.assert_called_once()
+        call_args = queue_mgr.queue_message.call_args[1]
+        assert call_args['target_session_id'] == "sender123"
+        assert "Reminder" in call_args['text']
 
 
 class TestIntegration:
