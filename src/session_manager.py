@@ -41,8 +41,14 @@ class SessionManager:
         # Load existing sessions from state file
         self._load_state()
 
-    def _load_state(self):
-        """Load session state from disk."""
+    def _load_state(self) -> bool:
+        """
+        Load session state from disk.
+
+        Returns:
+            True if state loaded successfully (or no state file exists),
+            False if an error occurred during loading.
+        """
         if self.state_file.exists():
             try:
                 with open(self.state_file) as f:
@@ -55,15 +61,22 @@ class SessionManager:
                         logger.info(f"Restored session: {session.name}")
                     else:
                         logger.warning(f"Session {session.name} no longer exists in tmux")
+                return True
             except Exception as e:
-                logger.error(f"Failed to load state: {e}")
+                logger.error(f"CRITICAL: Failed to load state from {self.state_file}: {e}")
+                logger.error(f"Session state may be lost! Please check {self.state_file}")
+                return False
+        return True  # No state file is not an error
 
-    def _save_state(self):
+    def _save_state(self) -> bool:
         """
         Save session state to disk using atomic file operations.
 
         Uses temp file + rename to ensure atomic writes and prevent race conditions
         when multiple async tasks call this method concurrently.
+
+        Returns:
+            True if state saved successfully, False if an error occurred.
         """
         try:
             data = {
@@ -79,9 +92,11 @@ class SessionManager:
 
             # Atomic rename (POSIX guarantees atomicity)
             temp_file.rename(state_path)
+            return True
 
         except Exception as e:
-            logger.error(f"Failed to save state: {e}")
+            logger.error(f"CRITICAL: Failed to save state to {self.state_file}: {e}")
+            logger.error(f"Session state NOT persisted! Data may be lost on restart.")
             # Clean up temp file if it exists
             try:
                 temp_file = Path(self.state_file).with_suffix('.tmp')
@@ -89,6 +104,7 @@ class SessionManager:
                     temp_file.unlink()
             except Exception:
                 pass
+            return False
 
     def add_event_handler(self, handler: Callable[[NotificationEvent], Awaitable[None]]):
         """Register a handler for session events."""
