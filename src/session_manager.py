@@ -314,6 +314,7 @@ class SessionManager:
 
         # Generate session name if not provided
         # Use friendly_name parameter, auto-generate session.name if needed
+        # Take first 6 chars of parent ID for brevity (session IDs are 8-char UUIDs)
         session_name = f"child-{parent_session_id[:6]}" if not name else None
 
         # Create session using common logic
