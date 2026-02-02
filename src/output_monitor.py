@@ -156,10 +156,19 @@ class OutputMonitor:
     async def _monitor_loop(self, session: Session):
         """Main monitoring loop for a session."""
         log_path = Path(session.log_file)
+        check_counter = 0
 
         while True:
             try:
                 await asyncio.sleep(self.poll_interval)
+                check_counter += 1
+
+                # Every ~30 polls (~30 seconds with default 1s interval), verify tmux still exists
+                if check_counter % 30 == 0:
+                    if self._session_manager and not self._session_manager.tmux.session_exists(session.tmux_session):
+                        logger.info(f"Tmux session {session.tmux_session} no longer exists, cleaning up")
+                        await self._handle_session_died(session)
+                        break
 
                 # Check if log file exists
                 if not log_path.exists():
@@ -338,6 +347,82 @@ class OutputMonitor:
                 await self._event_callback(event)
 
             logger.info(f"Session {session.id} is idle")
+
+    async def cleanup_session(self, session: Session):
+        """
+        Perform full cleanup for a session.
+
+        This includes:
+        - Setting status to STOPPED
+        - Deleting Telegram forum topic (if exists)
+        - Cleaning up in-memory Telegram mappings
+        - Removing from sessions dict
+        - Saving state
+        - Cleaning up hook output cache
+        - Cleaning up monitoring state
+
+        Can be called when:
+        - Tmux session dies (detected by monitor)
+        - Session is explicitly killed
+        """
+        session_id = session.id
+        logger.info(f"Cleaning up session {session_id}")
+
+        # Update session status
+        session.status = SessionStatus.STOPPED
+
+        # Clean up Telegram forum topic if it exists
+        # Note: Only attempt cleanup if we have Telegram integration
+        if session.telegram_topic_id and session.telegram_chat_id:
+            # Get notifier to access telegram_bot
+            notifier = getattr(self._session_manager, 'notifier', None) if self._session_manager else None
+            telegram_bot = getattr(notifier, 'telegram_bot', None) if notifier else None
+
+            if telegram_bot and telegram_bot.bot:
+                try:
+                    await telegram_bot.bot.delete_forum_topic(
+                        chat_id=session.telegram_chat_id,
+                        message_thread_id=session.telegram_topic_id,
+                    )
+                    logger.info(f"Deleted Telegram forum topic for session {session_id}")
+                except Exception as e:
+                    # Don't fail cleanup if Telegram deletion fails (might not have permission)
+                    logger.warning(f"Could not delete Telegram topic for {session_id}: {e}")
+
+                # Clean up in-memory mappings
+                key = (session.telegram_chat_id, session.telegram_topic_id)
+                telegram_bot._topic_sessions.pop(key, None)
+                telegram_bot._session_threads.pop(session_id, None)
+                logger.debug(f"Cleaned up Telegram mappings for session {session_id}")
+
+        # Remove from session manager
+        if self._session_manager:
+            if session_id in self._session_manager.sessions:
+                del self._session_manager.sessions[session_id]
+                logger.debug(f"Removed session {session_id} from sessions dict")
+
+            # Save state
+            self._session_manager._save_state()
+
+            # Clean up hook output cache
+            if hasattr(self._session_manager, 'app') and self._session_manager.app:
+                if hasattr(self._session_manager.app.state, 'last_claude_output'):
+                    self._session_manager.app.state.last_claude_output.pop(session_id, None)
+                    logger.debug(f"Cleaned up hook output cache for session {session_id}")
+
+        # Clean up monitoring state
+        self._file_positions.pop(session_id, None)
+        self._last_activity.pop(session_id, None)
+        self._notified_permissions.pop(session_id, None)
+        self._tasks.pop(session_id, None)
+        logger.info(f"Completed cleanup for session {session_id}")
+
+    async def _handle_session_died(self, session: Session):
+        """
+        Handle tmux session death - called when monitor detects tmux no longer exists.
+        """
+        logger.info(f"Tmux session {session.tmux_session} died, performing cleanup")
+        await self.cleanup_session(session)
 
     def _get_context(self, content: str) -> str:
         """Extract recent context from content."""

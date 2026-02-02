@@ -532,17 +532,4 @@ class SessionManager:
 
         return self.tmux.capture_pane(session.tmux_session, lines)
 
-    def cleanup_dead_sessions(self):
-        """Remove sessions that no longer exist in tmux."""
-        dead_sessions = []
-        for session_id, session in self.sessions.items():
-            if not self.tmux.session_exists(session.tmux_session):
-                dead_sessions.append(session_id)
-
-        for session_id in dead_sessions:
-            session = self.sessions[session_id]
-            session.status = SessionStatus.STOPPED
-            logger.info(f"Marked dead session as stopped: {session.name}")
-
-        if dead_sessions:
-            self._save_state()
+    # cleanup_dead_sessions() removed - OutputMonitor now handles detection and cleanup automatically

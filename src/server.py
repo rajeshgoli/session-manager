@@ -408,14 +408,15 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Stop monitoring
-        if app.state.output_monitor:
-            await app.state.output_monitor.stop_monitoring(session_id)
-
+        # Kill tmux session
         success = app.state.session_manager.kill_session(session_id)
 
         if not success:
             raise HTTPException(status_code=500, detail="Failed to kill session")
+
+        # Perform full cleanup (Telegram, monitoring, state)
+        if app.state.output_monitor:
+            await app.state.output_monitor.cleanup_session(session)
 
         return {"status": "killed", "session_id": session_id}
 
@@ -983,15 +984,15 @@ Provide ONLY the summary, no preamble or questions."""
             if target_session.parent_session_id != request.requester_session_id:
                 return {"error": f"Cannot kill session {target_session_id} - not your child session"}
 
-        # Stop monitoring
-        if app.state.output_monitor:
-            await app.state.output_monitor.stop_monitoring(target_session_id)
-
         # Kill the session
         success = app.state.session_manager.kill_session(target_session_id)
 
         if not success:
             return {"error": "Failed to kill session"}
+
+        # Perform full cleanup (Telegram, monitoring, state)
+        if app.state.output_monitor:
+            await app.state.output_monitor.cleanup_session(target_session)
 
         return {"status": "killed", "session_id": target_session_id}
 
