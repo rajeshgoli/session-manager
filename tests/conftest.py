@@ -94,7 +94,7 @@ def sample_session() -> Session:
         created_at=datetime(2024, 1, 1, 12, 0, 0),
         last_activity=datetime(2024, 1, 1, 12, 30, 0),
         telegram_chat_id=123456,
-        telegram_root_msg_id=789,
+        telegram_thread_id=789,
         friendly_name="Test Session",
         current_task="Running tests",
         git_remote_url="https://github.com/test/repo.git",

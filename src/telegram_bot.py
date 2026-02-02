@@ -155,15 +155,13 @@ class TelegramBot:
         """Load thread and topic mappings from existing sessions (call on startup)."""
         for session in sessions:
             if session.telegram_chat_id:
-                # Load topic mapping if available
-                if session.telegram_topic_id:
-                    self._topic_sessions[(session.telegram_chat_id, session.telegram_topic_id)] = session.id
-                    logger.info(f"Restored topic mapping for session {session.id}")
-                # Load reply thread mapping
-                elif session.telegram_root_msg_id:
+                # Load thread/topic mapping if available
+                if session.telegram_thread_id:
+                    # Store in both mappings for backward compatibility
+                    self._topic_sessions[(session.telegram_chat_id, session.telegram_thread_id)] = session.id
                     self._session_threads[session.id] = (
                         session.telegram_chat_id,
-                        session.telegram_root_msg_id,
+                        session.telegram_thread_id,
                     )
                     logger.info(f"Restored thread mapping for session {session.id}")
 
@@ -1079,10 +1077,10 @@ Provide ONLY the summary, no preamble or questions."""
             # Get all sessions
             sessions = await self._on_list_sessions()
 
-            # Filter for eligible sessions (no telegram_topic_id AND status != stopped)
+            # Filter for eligible sessions (no telegram_thread_id AND status != stopped)
             eligible = [
                 s for s in sessions
-                if not s.telegram_topic_id and s.status.value != "stopped"
+                if not s.telegram_thread_id and s.status.value != "stopped"
             ]
 
             if not eligible:
@@ -1131,9 +1129,9 @@ Provide ONLY the summary, no preamble or questions."""
             return
 
         # Check if session already has a topic
-        if session.telegram_topic_id:
+        if session.telegram_thread_id:
             await update.message.reply_text(
-                f"Session [{session.id}] already has a topic (ID: {session.telegram_topic_id})"
+                f"Session [{session.id}] already has a topic (ID: {session.telegram_thread_id})"
             )
             return
 
@@ -1337,9 +1335,9 @@ Provide ONLY the summary, no preamble or questions."""
                 return
 
             # Check if session already has a topic
-            if session.telegram_topic_id:
+            if session.telegram_thread_id:
                 await query.edit_message_text(
-                    f"Session [{session.id}] already has a topic (ID: {session.telegram_topic_id})"
+                    f"Session [{session.id}] already has a topic (ID: {session.telegram_thread_id})"
                 )
                 return
 

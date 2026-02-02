@@ -373,7 +373,7 @@ class OutputMonitor:
 
         # Clean up Telegram forum topic if it exists
         # Note: Only attempt cleanup if we have Telegram integration
-        if session.telegram_topic_id and session.telegram_chat_id:
+        if session.telegram_thread_id and session.telegram_chat_id:
             # Get notifier to access telegram_bot
             notifier = getattr(self._session_manager, 'notifier', None) if self._session_manager else None
             telegram_bot = getattr(notifier, 'telegram_bot', None) if notifier else None
@@ -382,7 +382,7 @@ class OutputMonitor:
                 try:
                     await telegram_bot.bot.delete_forum_topic(
                         chat_id=session.telegram_chat_id,
-                        message_thread_id=session.telegram_topic_id,
+                        message_thread_id=session.telegram_thread_id,
                     )
                     logger.info(f"Deleted Telegram forum topic for session {session_id}")
                 except Exception as e:
@@ -390,7 +390,7 @@ class OutputMonitor:
                     logger.warning(f"Could not delete Telegram topic for {session_id}: {e}")
 
                 # Clean up in-memory mappings
-                key = (session.telegram_chat_id, session.telegram_topic_id)
+                key = (session.telegram_chat_id, session.telegram_thread_id)
                 telegram_bot._topic_sessions.pop(key, None)
                 telegram_bot._session_threads.pop(session_id, None)
                 logger.debug(f"Cleaned up Telegram mappings for session {session_id}")

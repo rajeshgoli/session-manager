@@ -51,13 +51,15 @@ async def test_urgent_delivery_to_completed_session_wakes_up_first(
     message_queue, mock_session_manager
 ):
     """Test that urgent delivery to a completed session sends Enter first to wake it up."""
-    # Mock session with completion_status="completed"
+    from src.models import CompletionStatus
+
+    # Mock session with completion_status=COMPLETED
     session = Session(
         id="test-123",
         name="test-session",
         working_dir="/tmp/test",
         tmux_session="claude-test-123",
-        completion_status="completed",
+        completion_status=CompletionStatus.COMPLETED,
         friendly_name="completed-agent",
     )
 

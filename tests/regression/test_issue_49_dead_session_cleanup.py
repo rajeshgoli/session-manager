@@ -29,7 +29,7 @@ def mock_session():
         log_file="/tmp/test.log",
         status=SessionStatus.RUNNING,
         telegram_chat_id=12345,
-        telegram_topic_id=67890,
+        telegram_thread_id=67890,
     )
     return session
 

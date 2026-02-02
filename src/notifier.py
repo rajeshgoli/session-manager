@@ -105,11 +105,11 @@ class Notifier:
         reply_to = None
         topic_id = None
 
-        # Get chat ID, topic, and thread info from session
+        # Get chat ID and thread info from session
         if session:
             chat_id = session.telegram_chat_id
-            topic_id = session.telegram_topic_id
-            reply_to = session.telegram_root_msg_id
+            topic_id = session.telegram_thread_id  # Can be forum topic or reply thread
+            reply_to = session.telegram_thread_id  # Same field, used for both
         else:
             # Try to get from session thread registry
             thread_info = self.telegram.get_session_thread(event.session_id)
@@ -229,7 +229,7 @@ class Notifier:
         Rename the Telegram topic for a session.
 
         Args:
-            session: Session with telegram_chat_id and telegram_topic_id
+            session: Session with telegram_chat_id and telegram_thread_id
             new_name: New friendly name for the topic
 
         Returns:
@@ -238,7 +238,7 @@ class Notifier:
         if not self.telegram:
             return False
 
-        if not session.telegram_chat_id or not session.telegram_topic_id:
+        if not session.telegram_chat_id or not session.telegram_thread_id:
             return False
 
         # Format topic name same way as when created
@@ -246,7 +246,7 @@ class Notifier:
 
         return await self.telegram.rename_forum_topic(
             chat_id=session.telegram_chat_id,
-            topic_id=session.telegram_topic_id,
+            topic_id=session.telegram_thread_id,
             name=topic_name,
         )
 

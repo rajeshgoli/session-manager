@@ -113,7 +113,8 @@ class ChildMonitor:
                     break
 
                 # Check for completion status
-                if child_session.completion_status == "completed":
+                from src.models import CompletionStatus
+                if child_session.completion_status == CompletionStatus.COMPLETED:
                     logger.info(f"Child {child_session_id} marked as completed")
                     await self._notify_parent_completion(
                         parent_session_id,
@@ -224,7 +225,8 @@ class ChildMonitor:
             logger.info(f"Sent completion notification to parent {parent_session_id}: {notification}")
             # Mark child as completed
             if child_session:
-                child_session.completion_status = "completed"
+                from src.models import CompletionStatus
+                child_session.completion_status = CompletionStatus.COMPLETED
                 child_session.completion_message = completion_message
                 child_session.completed_at = datetime.now()
                 self.session_manager._save_state()

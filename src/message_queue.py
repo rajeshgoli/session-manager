@@ -655,7 +655,8 @@ class MessageQueueManager:
 
         try:
             # If session is completed, wake it up first (like cmd_clear does)
-            if session.completion_status == "completed":
+            from src.models import CompletionStatus
+            if session.completion_status == CompletionStatus.COMPLETED:
                 logger.info(f"Session {session_id} is completed, sending Enter to wake up")
                 # Send Enter to wake up the completed session
                 proc = await asyncio.create_subprocess_exec(

@@ -304,7 +304,7 @@ def create_app(
             # Update tmux status bar
             app.state.session_manager.tmux.set_status_bar(session.tmux_session, friendly_name)
             # Update Telegram topic name if applicable
-            if session.telegram_topic_id and app.state.notifier:
+            if session.telegram_thread_id and app.state.notifier:
                 await app.state.notifier.rename_session_topic(session, friendly_name)
 
         return SessionResponse(
@@ -989,9 +989,11 @@ Or continue working if not done yet."""
             if status == "running":
                 children = [s for s in children if s.status == SessionStatus.RUNNING]
             elif status == "completed":
-                children = [s for s in children if s.completion_status == "completed"]
+                from src.models import CompletionStatus
+                children = [s for s in children if s.completion_status == CompletionStatus.COMPLETED]
             elif status == "error":
-                children = [s for s in children if s.completion_status == "error"]
+                from src.models import CompletionStatus
+                children = [s for s in children if s.completion_status == CompletionStatus.ERROR]
 
         # Handle recursive
         if recursive:
@@ -1011,7 +1013,7 @@ Or continue working if not done yet."""
                     "name": s.name,
                     "friendly_name": s.friendly_name,
                     "status": s.status.value,
-                    "completion_status": s.completion_status,
+                    "completion_status": s.completion_status.value if s.completion_status else None,
                     "completion_message": s.completion_message,
                     "last_activity": s.last_activity.isoformat(),
                     "spawned_at": s.spawned_at.isoformat() if s.spawned_at else None,

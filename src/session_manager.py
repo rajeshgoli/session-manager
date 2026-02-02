@@ -357,9 +357,9 @@ class SessionManager:
         return [s for s in self.sessions.values() if s.telegram_chat_id == chat_id]
 
     def get_session_by_telegram_thread(self, chat_id: int, message_id: int) -> Optional[Session]:
-        """Get session by Telegram thread (root message ID)."""
+        """Get session by Telegram thread (thread ID)."""
         for session in self.sessions.values():
-            if session.telegram_chat_id == chat_id and session.telegram_root_msg_id == message_id:
+            if session.telegram_chat_id == chat_id and session.telegram_thread_id == message_id:
                 return session
         return None
 
@@ -385,7 +385,7 @@ class SessionManager:
         session = self.sessions.get(session_id)
         if session:
             session.telegram_chat_id = chat_id
-            session.telegram_root_msg_id = message_id
+            session.telegram_thread_id = message_id
             self._save_state()
 
     async def send_input(

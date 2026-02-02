@@ -38,6 +38,14 @@ class SubagentStatus(Enum):
     ERROR = "error"
 
 
+class CompletionStatus(Enum):
+    """Session completion status (for child sessions)."""
+    COMPLETED = "completed"
+    ERROR = "error"
+    ABANDONED = "abandoned"
+    KILLED = "killed"
+
+
 @dataclass
 class Subagent:
     """Represents a subagent spawned by a Claude session."""
@@ -82,7 +90,7 @@ class Subagent:
 class Session:
     """Represents a Claude Code session in tmux."""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    name: str = ""
+    name: str = ""  # Internal identifier (auto-generated: claude-{id})
     working_dir: str = ""
     tmux_session: str = ""
     log_file: str = ""
@@ -90,11 +98,10 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     telegram_chat_id: Optional[int] = None
-    telegram_root_msg_id: Optional[int] = None
-    telegram_topic_id: Optional[int] = None  # Forum topic ID (message_thread_id)
+    telegram_thread_id: Optional[int] = None  # Thread/topic ID for threading (message_thread_id)
     error_message: Optional[str] = None
     transcript_path: Optional[str] = None  # Claude's transcript file path
-    friendly_name: Optional[str] = None  # User-friendly name
+    friendly_name: Optional[str] = None  # User-provided label for display
     current_task: Optional[str] = None  # What the session is currently working on
     git_remote_url: Optional[str] = None  # Git remote URL for repo matching
     subagents: List[Subagent] = field(default_factory=list)  # Subagents spawned by this session
@@ -102,7 +109,7 @@ class Session:
     # Multi-agent coordination fields
     parent_session_id: Optional[str] = None  # Parent that spawned this session
     spawn_prompt: Optional[str] = None  # Initial prompt used to spawn
-    completion_status: Optional[str] = None  # completed, error, abandoned, killed
+    completion_status: Optional[CompletionStatus] = None  # Completion state for child sessions
     completion_message: Optional[str] = None  # Message when completed
     spawned_at: Optional[datetime] = None  # When this session was spawned
     completed_at: Optional[datetime] = None  # When this session completed
@@ -133,8 +140,7 @@ class Session:
             "created_at": self.created_at.isoformat(),
             "last_activity": self.last_activity.isoformat(),
             "telegram_chat_id": self.telegram_chat_id,
-            "telegram_root_msg_id": self.telegram_root_msg_id,
-            "telegram_topic_id": self.telegram_topic_id,
+            "telegram_thread_id": self.telegram_thread_id,
             "error_message": self.error_message,
             "transcript_path": self.transcript_path,
             "friendly_name": self.friendly_name,
@@ -144,7 +150,7 @@ class Session:
             # Multi-agent coordination fields
             "parent_session_id": self.parent_session_id,
             "spawn_prompt": self.spawn_prompt,
-            "completion_status": self.completion_status,
+            "completion_status": self.completion_status.value if self.completion_status else None,
             "completion_message": self.completion_message,
             "spawned_at": self.spawned_at.isoformat() if self.spawned_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -162,6 +168,17 @@ class Session:
         subagents_data = data.get("subagents", [])
         subagents = [Subagent.from_dict(s) for s in subagents_data] if subagents_data else []
 
+        # Backward compatibility: consolidate telegram_root_msg_id and telegram_topic_id
+        telegram_thread_id = data.get("telegram_thread_id")
+        if telegram_thread_id is None:
+            # Fallback to old field names (prefer telegram_topic_id as it's more specific)
+            telegram_thread_id = data.get("telegram_topic_id") or data.get("telegram_root_msg_id")
+
+        # Backward compatibility: convert completion_status string to enum
+        completion_status = data.get("completion_status")
+        if completion_status is not None and isinstance(completion_status, str):
+            completion_status = CompletionStatus(completion_status)
+
         return cls(
             id=data["id"],
             name=data["name"],
@@ -172,8 +189,7 @@ class Session:
             created_at=datetime.fromisoformat(data["created_at"]),
             last_activity=datetime.fromisoformat(data["last_activity"]),
             telegram_chat_id=data.get("telegram_chat_id"),
-            telegram_root_msg_id=data.get("telegram_root_msg_id"),
-            telegram_topic_id=data.get("telegram_topic_id"),
+            telegram_thread_id=telegram_thread_id,
             error_message=data.get("error_message"),
             transcript_path=data.get("transcript_path"),
             friendly_name=data.get("friendly_name"),
@@ -183,7 +199,7 @@ class Session:
             # Multi-agent coordination fields
             parent_session_id=data.get("parent_session_id"),
             spawn_prompt=data.get("spawn_prompt"),
-            completion_status=data.get("completion_status"),
+            completion_status=completion_status,
             completion_message=data.get("completion_message"),
             spawned_at=datetime.fromisoformat(data["spawned_at"]) if data.get("spawned_at") else None,
             completed_at=datetime.fromisoformat(data["completed_at"]) if data.get("completed_at") else None,
