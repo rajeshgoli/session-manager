@@ -422,29 +422,32 @@ class MessageQueueManager:
             logger.error(f"Error checking user input: {e}")
             return None
 
-    def _clear_user_input(self, tmux_session: str) -> bool:
-        """Clear the current input line using Ctrl+U."""
+    async def _clear_user_input_async(self, tmux_session: str) -> bool:
+        """Clear the current input line using Ctrl+U (async, non-blocking)."""
         try:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_session, "C-u"],
-                check=True,
-                timeout=2,
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", tmux_session, "C-u",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            return True
+            await asyncio.wait_for(proc.communicate(), timeout=2)
+            return proc.returncode == 0
         except Exception as e:
             logger.error(f"Error clearing user input: {e}")
             return False
 
-    def _restore_user_input(self, tmux_session: str, text: str):
-        """Restore previously saved user input (without pressing Enter)."""
+    async def _restore_user_input_async(self, tmux_session: str, text: str):
+        """Restore previously saved user input (async, non-blocking)."""
         try:
             # Use list-based subprocess with "--" to handle text starting with "-"
-            subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_session, "--", text],
-                check=True,
-                timeout=5,
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", tmux_session, "--", text,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            logger.info(f"Restored user input: {text[:50]}...")
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode == 0:
+                logger.info(f"Restored user input: {text[:50]}...")
         except Exception as e:
             logger.error(f"Error restoring user input: {e}")
 
@@ -507,7 +510,7 @@ class MessageQueueManager:
                         # Save the input
                         state.saved_user_input = current_input
                         # Clear the line
-                        self._clear_user_input(session.tmux_session)
+                        await self._clear_user_input_async(session.tmux_session)
                         # Trigger delivery
                         await self._try_deliver_messages(session_id)
             else:
@@ -613,12 +616,13 @@ class MessageQueueManager:
             return
 
         try:
-            # Send Escape to interrupt any streaming
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session.tmux_session, "Escape"],
-                check=True,
-                timeout=2,
+            # Send Escape to interrupt any streaming (async, non-blocking)
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", session.tmux_session, "Escape",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            await asyncio.wait_for(proc.communicate(), timeout=2)
 
             # Brief delay for interrupt to process
             await asyncio.sleep(self.urgent_delay_ms / 1000)
@@ -655,7 +659,7 @@ class MessageQueueManager:
             return
 
         # Restore the saved input
-        self._restore_user_input(session.tmux_session, state.saved_user_input)
+        await self._restore_user_input_async(session.tmux_session, state.saved_user_input)
 
         # Clear saved input
         state.saved_user_input = None

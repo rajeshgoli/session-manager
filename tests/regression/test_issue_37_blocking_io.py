@@ -254,3 +254,143 @@ async def test_concurrent_async_operations_dont_block():
         assert elapsed < 0.1  # Less than 100ms
         assert call_count == 10
         assert all(r == "result" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_clear_user_input_async_no_blocking():
+    """Test that _clear_user_input_async doesn't block event loop."""
+    from src.message_queue import MessageQueueManager
+
+    manager = MessageQueueManager(
+        session_manager=Mock(),
+        db_path=":memory:",
+    )
+
+    # Mock asyncio.create_subprocess_exec
+    with patch('asyncio.create_subprocess_exec') as mock_subprocess:
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+        mock_proc.returncode = 0
+        mock_subprocess.return_value = mock_proc
+
+        # Call async version
+        result = await manager._clear_user_input_async("tmux-session")
+
+        # Verify asyncio.create_subprocess_exec was used
+        mock_subprocess.assert_called_once()
+        # Verify correct command (Ctrl+U to clear input)
+        args = mock_subprocess.call_args[0]
+        assert args == ("tmux", "send-keys", "-t", "tmux-session", "C-u")
+        assert result is True
+
+
+@pytest.mark.asyncio
+async def test_restore_user_input_async_no_blocking():
+    """Test that _restore_user_input_async doesn't block event loop."""
+    from src.message_queue import MessageQueueManager
+
+    manager = MessageQueueManager(
+        session_manager=Mock(),
+        db_path=":memory:",
+    )
+
+    # Mock asyncio.create_subprocess_exec
+    with patch('asyncio.create_subprocess_exec') as mock_subprocess:
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+        mock_proc.returncode = 0
+        mock_subprocess.return_value = mock_proc
+
+        # Call async version
+        await manager._restore_user_input_async("tmux-session", "test input")
+
+        # Verify asyncio.create_subprocess_exec was used
+        mock_subprocess.assert_called_once()
+        # Verify correct command (restore text without Enter)
+        args = mock_subprocess.call_args[0]
+        assert args == ("tmux", "send-keys", "-t", "tmux-session", "--", "test input")
+
+
+@pytest.mark.asyncio
+async def test_deliver_urgent_uses_async_escape():
+    """Test that _deliver_urgent uses async subprocess for Escape key."""
+    from src.message_queue import MessageQueueManager
+
+    mock_session_manager = Mock()
+    mock_session = Mock()
+    mock_session.tmux_session = "tmux-test"
+    mock_session_manager.get_session = Mock(return_value=mock_session)
+    mock_session_manager.tmux = Mock()
+    mock_session_manager.tmux.send_input_async = AsyncMock(return_value=True)
+
+    manager = MessageQueueManager(
+        session_manager=mock_session_manager,
+        db_path=":memory:",
+    )
+
+    # Create a mock message
+    from src.message_queue import QueuedMessage
+    msg = QueuedMessage(
+        id=1,
+        target_session_id="test-123",
+        text="urgent message",
+        delivery_mode="urgent",
+        queued_at=datetime.now(),
+    )
+
+    # Mock asyncio.create_subprocess_exec to track calls
+    with patch('asyncio.create_subprocess_exec') as mock_subprocess:
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+        mock_proc.returncode = 0
+        mock_subprocess.return_value = mock_proc
+
+        # Deliver urgent message
+        await manager._deliver_urgent("test-123", msg)
+
+        # Verify asyncio.create_subprocess_exec was used for Escape
+        # Should be called for Escape key
+        escape_call = [call for call in mock_subprocess.call_args_list
+                      if "Escape" in str(call)]
+        assert len(escape_call) > 0, "Escape should be sent via async subprocess"
+
+
+@pytest.mark.asyncio
+async def test_message_queue_no_blocking_in_delivery_path():
+    """Comprehensive test that message queue delivery uses no blocking calls."""
+    from src.message_queue import MessageQueueManager
+
+    mock_session_manager = Mock()
+    mock_session = Mock()
+    mock_session.tmux_session = "tmux-test"
+    mock_session_manager.get_session = Mock(return_value=mock_session)
+    mock_session_manager.tmux = Mock()
+    mock_session_manager.tmux.send_input_async = AsyncMock(return_value=True)
+
+    manager = MessageQueueManager(
+        session_manager=mock_session_manager,
+        db_path=":memory:",
+    )
+
+    # Verify no blocking subprocess.run calls in the entire delivery flow
+    with patch('subprocess.run') as mock_blocking_run:
+        with patch('asyncio.create_subprocess_exec') as mock_async_exec:
+            mock_proc = AsyncMock()
+            mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            mock_proc.returncode = 0
+            mock_async_exec.return_value = mock_proc
+
+            # Test clear user input
+            await manager._clear_user_input_async("tmux-test")
+
+            # Test restore user input
+            await manager._restore_user_input_async("tmux-test", "test")
+
+            # Test user input detection
+            await manager._get_pending_user_input_async("tmux-test")
+
+            # Verify no blocking calls were made
+            mock_blocking_run.assert_not_called()
+
+            # Verify async calls were made
+            assert mock_async_exec.call_count >= 3
