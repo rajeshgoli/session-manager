@@ -131,7 +131,6 @@ class SessionManager:
 
         if name:
             session.name = name
-            session.tmux_session = name
 
         # Set up log file path
         session.log_file = str(self.log_dir / f"{session.name}.log")
