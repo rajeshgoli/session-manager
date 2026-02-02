@@ -1262,7 +1262,7 @@ def cmd_wait(
     timeout_seconds: int,
 ) -> int:
     """
-    Wait for a session to go idle or timeout.
+    Watch a session and get notified asynchronously when it goes idle or timeout.
 
     Args:
         client: API client
@@ -1270,15 +1270,13 @@ def cmd_wait(
         timeout_seconds: Maximum seconds to wait
 
     Exit codes:
-        0: Session went idle
-        1: Timeout reached (session still active)
+        0: Watch registered successfully
+        1: Failed to register watch
         2: Session manager unavailable or session not found
     """
-    import time
-
     # Resolve identifier to session ID
-    session_id, session = resolve_session_id(client, identifier)
-    if session_id is None:
+    target_session_id, target_session = resolve_session_id(client, identifier)
+    if target_session_id is None:
         # Check if it's unavailable or not found
         sessions = client.list_sessions()
         if sessions is None:
@@ -1288,35 +1286,27 @@ def cmd_wait(
             print(f"Error: Session '{identifier}' not found", file=sys.stderr)
             return 2
 
-    # Poll interval (check every 2 seconds)
-    poll_interval = 2
-    elapsed = 0
-    start_time = time.time()
+    # Get watcher session ID (current session)
+    watcher_session_id = client.session_id
+    if not watcher_session_id:
+        print("Error: No session context (CLAUDE_SESSION_MANAGER_ID not set)", file=sys.stderr)
+        return 1
 
-    while elapsed < timeout_seconds:
-        # Check if session is idle
-        result = client.get_queue_status(session_id)
+    # Register watch via API (async notification)
+    result = client.watch_session(target_session_id, watcher_session_id, timeout_seconds)
 
-        if result is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
-            return 2
+    if result is None:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
 
-        is_idle = result.get("is_idle", False)
+    if result.get("status") != "watching":
+        print(f"Error: Failed to watch session", file=sys.stderr)
+        return 1
 
-        if is_idle:
-            # Session is idle
-            name = session.get("friendly_name") or session.get("name") or session_id
-            print(f"{name} is idle (waited {int(elapsed)}s)")
-            return 0
-
-        # Sleep and continue
-        time.sleep(poll_interval)
-        elapsed = time.time() - start_time
-
-    # Timeout reached
-    name = session.get("friendly_name") or session.get("name") or session_id
-    print(f"Timeout: {name} still active after {timeout_seconds}s")
-    return 1
+    # Success - watching asynchronously
+    target_name = result.get("target_name") or target_session_id
+    print(f"Watching {target_name}, will notify after {timeout_seconds}s idle")
+    return 0
 
 
 def cmd_clear(

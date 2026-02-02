@@ -1093,6 +1093,42 @@ Or continue working if not done yet."""
             "fires_in_seconds": delay_seconds,
         }
 
+    @app.post("/sessions/{target_session_id}/watch")
+    async def watch_session(
+        target_session_id: str,
+        watcher_session_id: str,
+        timeout_seconds: int,
+    ):
+        """Watch a session and notify when it goes idle or timeout."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        # Verify both sessions exist
+        target_session = app.state.session_manager.get_session(target_session_id)
+        if not target_session:
+            raise HTTPException(status_code=404, detail="Target session not found")
+
+        watcher_session = app.state.session_manager.get_session(watcher_session_id)
+        if not watcher_session:
+            raise HTTPException(status_code=404, detail="Watcher session not found")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        watch_id = await queue_mgr.watch_session(target_session_id, watcher_session_id, timeout_seconds)
+
+        target_name = target_session.friendly_name or target_session.name or target_session_id
+
+        return {
+            "status": "watching",
+            "watch_id": watch_id,
+            "target_session_id": target_session_id,
+            "target_name": target_name,
+            "watcher_session_id": watcher_session_id,
+            "timeout_seconds": timeout_seconds,
+        }
+
     @app.post("/hooks/tool-use")
     async def hook_tool_use(request: Request):
         """
