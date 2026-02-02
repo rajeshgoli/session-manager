@@ -246,11 +246,20 @@ class TmuxController:
                 # Claude Code can take 2-3 seconds to start up and show the prompt
                 import time
                 time.sleep(3)
-                # Send the prompt using same method as send_input()
-                import shlex
-                escaped_text = shlex.quote(initial_prompt)
-                cmd = f'tmux send-keys -t {session_name} {escaped_text} && sleep 1 && tmux send-keys -t {session_name} Enter'
-                subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                # Send the prompt using subprocess with list arguments (security: prevent shell injection)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "--", initial_prompt],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                time.sleep(1)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Enter"],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
                 logger.info(f"Sent initial prompt to {session_name}: {initial_prompt[:50]}...")
             else:
                 # Still wait for Claude to start even without initial prompt
@@ -282,15 +291,25 @@ class TmuxController:
             return False
 
         try:
-            import shlex
-            # Run as shell command with sleep to avoid paste detection
+            import time
+            # Use subprocess with list arguments to prevent shell injection
             # Note: -l flag causes issues with Claude Code, so we don't use it
-            # Reduced sleep from 1s to 0.3s to minimize event loop blocking
-            escaped_text = shlex.quote(text)
-            cmd = f'tmux send-keys -t {session_name} {escaped_text} && sleep 0.3 && tmux send-keys -t {session_name} Enter'
-            logger.info(f"Running command: {cmd}")
-            result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True, timeout=5)
-            logger.info(f"Command stdout: {result.stdout}, stderr: {result.stderr}")
+            # Sleep 0.3s between send-keys calls to avoid paste detection
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "--", text],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            time.sleep(0.3)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
             logger.info(f"Sent input to {session_name}: {text[:50]}...")
             return True
 
@@ -465,10 +484,13 @@ class TmuxController:
             return False
 
         # AppleScript to open new Terminal window and attach to tmux session
+        # Escape session_name for AppleScript (prevent injection)
+        import shlex
+        escaped_session = shlex.quote(session_name)
         script = f'''
         tell application "Terminal"
             activate
-            do script "tmux attach-session -t {session_name}"
+            do script "tmux attach-session -t {escaped_session}"
         end tell
         '''
 

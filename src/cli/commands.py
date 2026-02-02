@@ -1328,18 +1328,38 @@ def cmd_clear(
         time.sleep(0.5)
 
         # Now send /clear using the same approach as send_input
-        cmd = f'tmux send-keys -t {tmux_session} "/clear" && sleep 1 && tmux send-keys -t {tmux_session} Enter'
-        subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_session, "/clear"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        time.sleep(1)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         # Wait for clear to process
         time.sleep(2)
 
         # Send new prompt if provided
         if new_prompt:
-            import shlex
-            escaped_text = shlex.quote(new_prompt)
-            cmd = f'tmux send-keys -t {tmux_session} {escaped_text} && sleep 1 && tmux send-keys -t {tmux_session} Enter'
-            subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_session, new_prompt],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            time.sleep(1)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
             name = session.get("friendly_name") or session.get("name") or target_session_id
             print(f"Cleared {name} ({target_session_id}) and sent new prompt")
