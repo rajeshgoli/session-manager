@@ -104,15 +104,17 @@ class TestSendWithWait:
 
 
 class TestWaitCommand:
-    """Test sm wait <session> <seconds> functionality (issue #73)."""
+    """Test sm wait <session> <seconds> functionality - async notification (issue #89)."""
 
-    def test_wait_returns_immediately_if_idle(self):
-        """Test that wait returns immediately if session is already idle."""
+    def test_wait_returns_immediately_if_registered(self):
+        """Test that wait returns immediately after registering watch."""
         mock_client = MagicMock(spec=SessionManagerClient)
-        mock_client.get_queue_status.return_value = {
-            "is_idle": True,
-            "pending_count": 0,
-            "pending_messages": []
+        mock_client.session_id = "watcher-123"
+        mock_client.watch_session.return_value = {
+            "status": "watching",
+            "watch_id": "watch-789",
+            "target_name": "target-session",
+            "timeout_seconds": 60,
         }
 
         with patch('src.cli.commands.resolve_session_id') as mock_resolve:
@@ -125,47 +127,26 @@ class TestWaitCommand:
             exit_code = cmd_wait(mock_client, "target456", timeout_seconds=60)
             elapsed = time.time() - start_time
 
-            # Should return immediately (exit 0)
+            # Should return immediately (exit 0) after registering watch
             assert exit_code == 0
             assert elapsed < 1.0  # Should be nearly instant
 
-    def test_wait_polls_until_idle(self):
-        """Test that wait polls and detects when session becomes idle."""
+            # Verify watch_session was called
+            mock_client.watch_session.assert_called_once_with(
+                "target456",
+                "watcher-123",
+                60
+            )
+
+    def test_wait_registers_async_watch(self):
+        """Test that wait registers an async watch instead of polling."""
         mock_client = MagicMock(spec=SessionManagerClient)
-
-        # First 2 calls: not idle, then idle on 3rd call
-        mock_client.get_queue_status.side_effect = [
-            {"is_idle": False, "pending_count": 1},
-            {"is_idle": False, "pending_count": 1},
-            {"is_idle": True, "pending_count": 0}
-        ]
-
-        with patch('src.cli.commands.resolve_session_id') as mock_resolve:
-            mock_resolve.return_value = ("target456", {
-                "id": "target456",
-                "friendly_name": "target-session"
-            })
-
-            with patch('time.sleep') as mock_sleep:
-                exit_code = cmd_wait(mock_client, "target456", timeout_seconds=10)
-
-                # Should return 0 (idle detected)
-                assert exit_code == 0
-
-                # Should have polled 3 times
-                assert mock_client.get_queue_status.call_count == 3
-
-                # Should have slept twice (between polls)
-                assert mock_sleep.call_count == 2
-
-    def test_wait_times_out_if_never_idle(self):
-        """Test that wait returns 1 on timeout if session never goes idle."""
-        mock_client = MagicMock(spec=SessionManagerClient)
-
-        # Always return not idle
-        mock_client.get_queue_status.return_value = {
-            "is_idle": False,
-            "pending_count": 1
+        mock_client.session_id = "watcher-123"
+        mock_client.watch_session.return_value = {
+            "status": "watching",
+            "watch_id": "watch-456",
+            "target_name": "target-session",
+            "timeout_seconds": 10,
         }
 
         with patch('src.cli.commands.resolve_session_id') as mock_resolve:
@@ -174,15 +155,33 @@ class TestWaitCommand:
                 "friendly_name": "target-session"
             })
 
-            with patch('time.sleep') as mock_sleep:
-                with patch('time.time') as mock_time:
-                    # Simulate time passing
-                    mock_time.side_effect = [0, 2, 4, 6, 8, 10, 12]  # Exceeds 10s timeout
+            exit_code = cmd_wait(mock_client, "target456", timeout_seconds=10)
 
-                    exit_code = cmd_wait(mock_client, "target456", timeout_seconds=10)
+            # Should register watch and return success
+            assert exit_code == 0
+            mock_client.watch_session.assert_called_once()
 
-                    # Should return 1 (timeout)
-                    assert exit_code == 1
+    def test_wait_fails_if_watch_not_registered(self):
+        """Test that wait fails if watch registration fails."""
+        mock_client = MagicMock(spec=SessionManagerClient)
+        mock_client.session_id = "watcher-123"
+
+        # watch_session returns error status
+        mock_client.watch_session.return_value = {
+            "status": "error",
+            "error": "Failed to register watch"
+        }
+
+        with patch('src.cli.commands.resolve_session_id') as mock_resolve:
+            mock_resolve.return_value = ("target456", {
+                "id": "target456",
+                "friendly_name": "target-session"
+            })
+
+            exit_code = cmd_wait(mock_client, "target456", timeout_seconds=10)
+
+            # Should return 1 (failed)
+            assert exit_code == 1
 
     def test_wait_handles_session_not_found(self):
         """Test that wait returns 2 if session not found."""
@@ -321,12 +320,17 @@ class TestFollowupNotificationIdleCheck:
 class TestIntegration:
     """Integration tests for wait features."""
 
-    def test_send_wait_and_poll_workflow(self):
-        """Test realistic workflow: send with --wait, then poll."""
+    def test_send_wait_and_async_watch_workflow(self):
+        """Test realistic workflow: send with --wait, then async watch."""
         mock_client = MagicMock(spec=SessionManagerClient)
         mock_client.session_id = "sender123"
         mock_client.send_input.return_value = (True, False)
-        mock_client.get_queue_status.return_value = {"is_idle": True, "pending_count": 0}
+        mock_client.watch_session.return_value = {
+            "status": "watching",
+            "watch_id": "watch-123",
+            "target_name": "target-session",
+            "timeout_seconds": 60,
+        }
 
         with patch('src.cli.commands.resolve_session_id') as mock_resolve:
             mock_resolve.return_value = ("target456", {
@@ -348,6 +352,13 @@ class TestIntegration:
             call_kwargs = mock_client.send_input.call_args[1]
             assert call_kwargs['notify_after_seconds'] == 30
 
-            # Step 2: Wait for completion
+            # Step 2: Register async watch (returns immediately)
             exit_code = cmd_wait(mock_client, "target456", timeout_seconds=60)
             assert exit_code == 0
+
+            # Verify watch was registered
+            mock_client.watch_session.assert_called_once_with(
+                "target456",
+                "sender123",
+                60
+            )

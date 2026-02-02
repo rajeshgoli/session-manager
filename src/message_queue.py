@@ -846,6 +846,100 @@ class MessageQueueManager:
                 logger.info(f"Recovered reminder {reminder_id}, fires in {delay:.0f}s")
 
     # =========================================================================
+    # Session Watching (sm wait async notification)
+    # =========================================================================
+
+    async def watch_session(
+        self,
+        target_session_id: str,
+        watcher_session_id: str,
+        timeout_seconds: int,
+    ) -> str:
+        """
+        Watch a session and notify the watcher when it goes idle or timeout.
+
+        Args:
+            target_session_id: Session to watch
+            watcher_session_id: Session to notify when target is idle
+            timeout_seconds: Maximum seconds to wait
+
+        Returns:
+            Watch ID
+        """
+        import uuid
+        watch_id = uuid.uuid4().hex[:12]
+
+        # Schedule async watch task
+        task = asyncio.create_task(
+            self._watch_for_idle(watch_id, target_session_id, watcher_session_id, timeout_seconds)
+        )
+        self._scheduled_tasks[watch_id] = task
+
+        logger.info(f"Watching {target_session_id} for {timeout_seconds}s, will notify {watcher_session_id}")
+        return watch_id
+
+    async def _watch_for_idle(
+        self,
+        watch_id: str,
+        target_session_id: str,
+        watcher_session_id: str,
+        timeout_seconds: int,
+    ):
+        """Watch a session and notify when it goes idle or timeout."""
+        try:
+            start_time = datetime.now()
+            poll_interval = 2  # Check every 2 seconds
+            elapsed = 0
+
+            while elapsed < timeout_seconds:
+                # Check if target is idle
+                state = self.delivery_states.get(target_session_id)
+                is_idle = state.is_idle if state else False
+
+                if is_idle:
+                    # Target is idle - notify watcher
+                    target_session = self.session_manager.get_session(target_session_id)
+                    target_name = "unknown"
+                    if target_session:
+                        target_name = target_session.friendly_name or target_session.name or target_session_id
+
+                    notification = (
+                        f"[sm wait] {target_name} is now idle (waited {int(elapsed)}s)"
+                    )
+                    self.queue_message(
+                        target_session_id=watcher_session_id,
+                        text=notification,
+                        delivery_mode="urgent",  # Use urgent to interrupt
+                    )
+                    logger.info(f"Watch {watch_id}: {target_session_id} idle after {elapsed:.0f}s")
+                    return
+
+                # Wait and check again
+                await asyncio.sleep(poll_interval)
+                elapsed = (datetime.now() - start_time).total_seconds()
+
+            # Timeout reached - notify watcher
+            target_session = self.session_manager.get_session(target_session_id)
+            target_name = "unknown"
+            if target_session:
+                target_name = target_session.friendly_name or target_session.name or target_session_id
+
+            notification = (
+                f"[sm wait] Timeout: {target_name} still active after {timeout_seconds}s"
+            )
+            self.queue_message(
+                target_session_id=watcher_session_id,
+                text=notification,
+                delivery_mode="urgent",  # Use urgent to interrupt
+            )
+            logger.info(f"Watch {watch_id}: {target_session_id} timeout after {timeout_seconds}s")
+
+        except asyncio.CancelledError:
+            logger.info(f"Watch {watch_id} cancelled")
+        finally:
+            self._scheduled_tasks.pop(watch_id, None)
+
+    # =========================================================================
     # API Helpers
     # =========================================================================
 

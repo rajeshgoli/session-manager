@@ -328,3 +328,34 @@ class SessionManagerClient:
             f"/sessions/{session_id}/send-queue"
         )
         return data if success else None
+
+    def watch_session(
+        self,
+        target_session_id: str,
+        watcher_session_id: str,
+        timeout_seconds: int,
+    ) -> Optional[dict]:
+        """
+        Watch a session and get notified when it goes idle or timeout.
+
+        Args:
+            target_session_id: Session to watch
+            watcher_session_id: Session to notify when target is idle
+            timeout_seconds: Maximum seconds to wait
+
+        Returns:
+            Dict with watch info or None if unavailable
+        """
+        payload = {
+            "watcher_session_id": watcher_session_id,
+            "timeout_seconds": timeout_seconds,
+        }
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{target_session_id}/watch",
+            payload,
+            timeout=5,
+        )
+        if unavailable:
+            return None
+        return data if success else None
