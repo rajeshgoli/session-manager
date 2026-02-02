@@ -703,11 +703,17 @@ Provide ONLY the summary, no preamble or questions."""
             import asyncio
 
             def read_transcript():
-                """Read transcript file synchronously (runs in thread pool)."""
+                """
+                Read transcript file synchronously (runs in thread pool).
+
+                Returns:
+                    Tuple of (success: bool, message: str | None)
+                """
                 try:
                     transcript_file = Path(transcript_path)
                     if not transcript_file.exists():
-                        return None
+                        logger.warning(f"Transcript file does not exist: {transcript_path}")
+                        return (False, None)
                     # JSONL file - read last lines and find last assistant message
                     lines = transcript_file.read_text().strip().split('\n')
                     for line in reversed(lines):
@@ -722,17 +728,24 @@ Provide ONLY the summary, no preamble or questions."""
                                     if isinstance(item, dict) and item.get("type") == "text":
                                         texts.append(item.get("text", ""))
                                 if texts:
-                                    return "\n".join(texts)
-                        except json.JSONDecodeError:
+                                    return (True, "\n".join(texts))
+                        except json.JSONDecodeError as e:
+                            logger.debug(f"Skipping malformed JSON line in transcript: {e}")
                             continue
+                    # No assistant message found
+                    return (True, None)
                 except Exception as e:
-                    logger.error(f"Error reading transcript: {e}")
-                return None
+                    logger.error(f"CRITICAL: Error reading transcript {transcript_path}: {e}")
+                    logger.error(f"Claude output will not be available for this hook event")
+                    return (False, None)
 
             try:
-                last_message = await asyncio.to_thread(read_transcript)
+                success, last_message = await asyncio.to_thread(read_transcript)
+                if not success:
+                    logger.warning(f"Failed to read transcript for hook event: {hook_event}")
             except Exception as e:
-                logger.error(f"Error reading transcript in thread: {e}")
+                logger.error(f"CRITICAL: Error reading transcript in thread: {e}")
+                last_message = None
 
         # Store last message
         if last_message:

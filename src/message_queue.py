@@ -472,20 +472,47 @@ class MessageQueueManager:
     # =========================================================================
 
     async def _monitor_loop(self):
-        """Main monitoring loop - checks for stale user input."""
-        try:
-            while self._running:
-                # Check each session with pending messages
-                sessions_with_pending = self._get_sessions_with_pending()
+        """
+        Main monitoring loop - checks for stale user input.
 
-                for session_id in sessions_with_pending:
-                    await self._check_stale_input(session_id)
+        Automatically restarts on errors to ensure continuous monitoring.
+        """
+        retry_count = 0
+        max_retries = 5
+        retry_delay = 1.0
 
-                await asyncio.sleep(self.input_poll_interval)
-        except asyncio.CancelledError:
-            logger.info("Monitor loop cancelled")
-        except Exception as e:
-            logger.error(f"Error in monitor loop: {e}")
+        while self._running:
+            try:
+                while self._running:
+                    # Check each session with pending messages
+                    sessions_with_pending = self._get_sessions_with_pending()
+
+                    for session_id in sessions_with_pending:
+                        await self._check_stale_input(session_id)
+
+                    await asyncio.sleep(self.input_poll_interval)
+                    retry_count = 0  # Reset on successful iteration
+            except asyncio.CancelledError:
+                logger.info("Monitor loop cancelled")
+                break
+            except Exception as e:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    logger.error(
+                        f"CRITICAL: Error in monitor loop (retry {retry_count}/{max_retries}): {e}",
+                        exc_info=True
+                    )
+                    logger.warning(f"Restarting monitor loop in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30)  # Exponential backoff, max 30s
+                else:
+                    logger.error(
+                        f"CRITICAL: Monitor loop failed {max_retries} times, giving up: {e}",
+                        exc_info=True
+                    )
+                    logger.error("Message queue monitoring STOPPED! Messages may not be delivered.")
+                    self._running = False
+                    break
 
     def _get_sessions_with_pending(self) -> List[str]:
         """Get list of session IDs with pending messages."""
