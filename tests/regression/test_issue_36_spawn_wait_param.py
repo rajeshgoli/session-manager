@@ -52,7 +52,8 @@ def session_manager(temp_state_file, tmp_path, mock_child_monitor):
     return manager
 
 
-def test_spawn_child_with_wait_registers_monitor(session_manager, mock_child_monitor):
+@pytest.mark.asyncio
+async def test_spawn_child_with_wait_registers_monitor(session_manager, mock_child_monitor):
     """Test that spawn_child_session with wait parameter calls child_monitor.register_child."""
     # Create a parent session first
     parent_session = Session(
@@ -65,7 +66,7 @@ def test_spawn_child_with_wait_registers_monitor(session_manager, mock_child_mon
     session_manager.sessions[parent_session.id] = parent_session
 
     # Spawn a child session with wait parameter
-    child_session = session_manager.spawn_child_session(
+    child_session = await session_manager.spawn_child_session(
         parent_session_id=parent_session.id,
         prompt="Test prompt",
         name="test-child",
@@ -86,7 +87,8 @@ def test_spawn_child_with_wait_registers_monitor(session_manager, mock_child_mon
     assert call_args[1]["wait_seconds"] == 300
 
 
-def test_spawn_child_without_wait_skips_monitor(session_manager, mock_child_monitor):
+@pytest.mark.asyncio
+async def test_spawn_child_without_wait_skips_monitor(session_manager, mock_child_monitor):
     """Test that spawn_child_session without wait parameter doesn't call child_monitor.register_child."""
     # Create a parent session
     parent_session = Session(
@@ -99,7 +101,7 @@ def test_spawn_child_without_wait_skips_monitor(session_manager, mock_child_moni
     session_manager.sessions[parent_session.id] = parent_session
 
     # Spawn a child session WITHOUT wait parameter
-    child_session = session_manager.spawn_child_session(
+    child_session = await session_manager.spawn_child_session(
         parent_session_id=parent_session.id,
         prompt="Test prompt",
         name="test-child-2",
@@ -114,7 +116,8 @@ def test_spawn_child_without_wait_skips_monitor(session_manager, mock_child_moni
     mock_child_monitor.register_child.assert_not_called()
 
 
-def test_spawn_child_with_wait_zero_skips_monitor(session_manager, mock_child_monitor):
+@pytest.mark.asyncio
+async def test_spawn_child_with_wait_zero_skips_monitor(session_manager, mock_child_monitor):
     """Test that spawn_child_session with wait=0 doesn't call child_monitor.register_child."""
     # Create a parent session
     parent_session = Session(
@@ -127,7 +130,7 @@ def test_spawn_child_with_wait_zero_skips_monitor(session_manager, mock_child_mo
     session_manager.sessions[parent_session.id] = parent_session
 
     # Spawn a child session with wait=0 (falsy value)
-    child_session = session_manager.spawn_child_session(
+    child_session = await session_manager.spawn_child_session(
         parent_session_id=parent_session.id,
         prompt="Test prompt",
         name="test-child-3",
@@ -141,7 +144,8 @@ def test_spawn_child_with_wait_zero_skips_monitor(session_manager, mock_child_mo
     mock_child_monitor.register_child.assert_not_called()
 
 
-def test_spawn_child_without_child_monitor_succeeds(session_manager):
+@pytest.mark.asyncio
+async def test_spawn_child_without_child_monitor_succeeds(session_manager):
     """Test that spawn_child_session works even when child_monitor is not set."""
     # Remove child monitor
     session_manager.child_monitor = None
@@ -157,7 +161,7 @@ def test_spawn_child_without_child_monitor_succeeds(session_manager):
     session_manager.sessions[parent_session.id] = parent_session
 
     # Spawn a child session with wait parameter (but no child_monitor)
-    child_session = session_manager.spawn_child_session(
+    child_session = await session_manager.spawn_child_session(
         parent_session_id=parent_session.id,
         prompt="Test prompt",
         name="test-child-4",
@@ -169,7 +173,8 @@ def test_spawn_child_without_child_monitor_succeeds(session_manager):
     assert child_session.parent_session_id == parent_session.id
 
 
-def test_spawn_child_with_wait_positive_values(session_manager, mock_child_monitor):
+@pytest.mark.asyncio
+async def test_spawn_child_with_wait_positive_values(session_manager, mock_child_monitor):
     """Test various positive wait values."""
     parent_session = Session(
         id="parent-def",
@@ -187,7 +192,7 @@ def test_spawn_child_with_wait_positive_values(session_manager, mock_child_monit
         mock_child_monitor.reset_mock()
 
         # Spawn child with specific wait value
-        child_session = session_manager.spawn_child_session(
+        child_session = await session_manager.spawn_child_session(
             parent_session_id=parent_session.id,
             prompt="Test prompt",
             name=f"test-child-wait-{wait_val}",

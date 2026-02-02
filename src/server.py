@@ -177,7 +177,7 @@ def create_app(
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        session = app.state.session_manager.create_session(
+        session = await app.state.session_manager.create_session(
             working_dir=request.working_dir,
             name=request.name,
         )
@@ -218,7 +218,7 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
         # Create session using config settings
-        session = app.state.session_manager.create_session(
+        session = await app.state.session_manager.create_session(
             working_dir=working_dir,
             telegram_chat_id=None,  # No Telegram association
         )
@@ -345,7 +345,7 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        success = app.state.session_manager.send_input(
+        success = await app.state.session_manager.send_input(
             session_id,
             request.text,
             sender_session_id=request.sender_session_id,
@@ -882,7 +882,7 @@ Provide ONLY the summary, no preamble or questions."""
             return {"error": "Parent session not found"}
 
         # Spawn child session
-        child_session = app.state.session_manager.spawn_child_session(
+        child_session = await app.state.session_manager.spawn_child_session(
             parent_session_id=request.parent_session_id,
             prompt=request.prompt,
             name=request.name,

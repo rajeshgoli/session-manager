@@ -102,9 +102,38 @@ class SessionManager:
             except Exception as e:
                 logger.error(f"Event handler error: {e}")
 
+    async def _get_git_remote_url_async(self, working_dir: str) -> Optional[str]:
+        """
+        Get the git remote URL for a working directory (async, non-blocking).
+
+        Args:
+            working_dir: Directory to check
+
+        Returns:
+            Git remote URL or None if not a git repo
+        """
+        try:
+            working_path = Path(working_dir).expanduser().resolve()
+            proc = await asyncio.create_subprocess_exec(
+                "git", "config", "--get", "remote.origin.url",
+                cwd=working_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+            if proc.returncode == 0:
+                return stdout.decode().strip()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get git remote for {working_dir}: {e}")
+            return None
+
     def _get_git_remote_url(self, working_dir: str) -> Optional[str]:
         """
-        Get the git remote URL for a working directory.
+        Get the git remote URL for a working directory (sync wrapper).
+
+        DEPRECATED: Use _get_git_remote_url_async() in async contexts.
+        This sync version is kept for backward compatibility but should not be used.
 
         Args:
             working_dir: Directory to check
@@ -128,14 +157,14 @@ class SessionManager:
             logger.debug(f"Failed to get git remote for {working_dir}: {e}")
             return None
 
-    def create_session(
+    async def create_session(
         self,
         working_dir: str,
         name: Optional[str] = None,
         telegram_chat_id: Optional[int] = None,
     ) -> Optional[Session]:
         """
-        Create a new Claude Code session.
+        Create a new Claude Code session (async, non-blocking).
 
         Args:
             working_dir: Directory to run Claude in
@@ -150,8 +179,8 @@ class SessionManager:
             telegram_chat_id=telegram_chat_id,
         )
 
-        # Detect git remote URL for repo matching
-        session.git_remote_url = self._get_git_remote_url(working_dir)
+        # Detect git remote URL for repo matching (async to avoid blocking)
+        session.git_remote_url = await self._get_git_remote_url_async(working_dir)
 
         if name:
             session.name = name
@@ -183,7 +212,7 @@ class SessionManager:
         logger.info(f"Created session {session.name} (id={session.id})")
         return session
 
-    def spawn_child_session(
+    async def spawn_child_session(
         self,
         parent_session_id: str,
         prompt: str,
@@ -241,8 +270,8 @@ class SessionManager:
         # Set up log file path
         session.log_file = str(self.log_dir / f"{session.name}.log")
 
-        # Detect git remote URL for repo matching
-        session.git_remote_url = self._get_git_remote_url(session.working_dir)
+        # Detect git remote URL for repo matching (async to avoid blocking)
+        session.git_remote_url = await self._get_git_remote_url_async(session.working_dir)
 
         # Create the tmux session with custom command and model
         if not self.tmux.create_session_with_command(
@@ -321,7 +350,7 @@ class SessionManager:
             session.telegram_root_msg_id = message_id
             self._save_state()
 
-    def send_input(
+    async def send_input(
         self,
         session_id: str,
         text: str,
@@ -358,7 +387,7 @@ class SessionManager:
         # For permission responses, bypass queue and send directly
         if bypass_queue:
             logger.info(f"Bypassing queue for direct send to {session_id}: {text}")
-            success = self.tmux.send_input(session.tmux_session, text)
+            success = await self.tmux.send_input_async(session.tmux_session, text)
             if success:
                 session.last_activity = datetime.now()
             return success
@@ -419,7 +448,7 @@ class SessionManager:
                 return True
 
         # Fallback: send immediately (no queue manager or unknown mode)
-        success = self.tmux.send_input(session.tmux_session, formatted_text)
+        success = await self.tmux.send_input_async(session.tmux_session, formatted_text)
         if success:
             session.last_activity = datetime.now()
             session.status = SessionStatus.RUNNING

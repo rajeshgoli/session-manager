@@ -214,7 +214,7 @@ class ChildMonitor:
         notification = f"Child {child_name} ({child_session_id[:8]}) completed: {completion_message}"
 
         # Send to parent's input
-        success = self.session_manager.send_input(
+        success = await self.session_manager.send_input(
             parent_session_id,
             notification,
             sender_session_id=child_session_id
