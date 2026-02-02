@@ -173,6 +173,90 @@ class SessionManager:
             logger.debug(f"Failed to get git remote for {working_dir}: {e}")
             return None
 
+    async def _create_session_common(
+        self,
+        working_dir: str,
+        name: Optional[str] = None,
+        friendly_name: Optional[str] = None,
+        telegram_chat_id: Optional[int] = None,
+        parent_session_id: Optional[str] = None,
+        spawn_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+    ) -> Optional[Session]:
+        """
+        Common session creation logic (private method).
+
+        Args:
+            working_dir: Directory to run Claude in
+            name: Optional session name (generated if not provided)
+            friendly_name: Optional user-friendly name
+            telegram_chat_id: Telegram chat to associate with session
+            parent_session_id: Parent session ID (for child sessions)
+            spawn_prompt: Initial prompt used to spawn (for child sessions)
+            model: Model override (opus, sonnet, haiku)
+            initial_prompt: Initial prompt to send after creation
+
+        Returns:
+            Created Session or None on failure
+        """
+        # Create session object with common fields
+        session = Session(
+            working_dir=working_dir,
+            friendly_name=friendly_name,
+            telegram_chat_id=telegram_chat_id,
+            parent_session_id=parent_session_id,
+            spawn_prompt=spawn_prompt,
+            spawned_at=datetime.now() if parent_session_id else None,
+        )
+
+        # Set name if provided, otherwise __post_init__ generates claude-{id}
+        if name:
+            session.name = name
+
+        # Detect git remote URL for repo matching (async to avoid blocking)
+        session.git_remote_url = await self._get_git_remote_url_async(working_dir)
+
+        # Set up log file path
+        session.log_file = str(self.log_dir / f"{session.name}.log")
+
+        # Get Claude config
+        claude_config = self.config.get("claude", {})
+        claude_command = claude_config.get("command", "claude")
+        claude_args = claude_config.get("args", [])
+        default_model = claude_config.get("default_model", "sonnet")
+
+        # Select model (override or default)
+        selected_model = model or default_model
+
+        # Create the tmux session with config args
+        # NOTE: session.tmux_session is auto-set by __post_init__ to claude-{id}
+        if not self.tmux.create_session_with_command(
+            session.tmux_session,
+            working_dir,
+            session.log_file,
+            session_id=session.id,
+            command=claude_command,
+            args=claude_args,
+            model=selected_model if model else None,  # Only pass if explicitly set
+            initial_prompt=initial_prompt,
+        ):
+            logger.error(f"Failed to create tmux session for {session.name}")
+            return None
+
+        # Mark as running and save
+        session.status = SessionStatus.RUNNING
+        self.sessions[session.id] = session
+        self._save_state()
+
+        # Log creation
+        if parent_session_id:
+            logger.info(f"Spawned child session {session.name} (id={session.id}, parent={parent_session_id})")
+        else:
+            logger.info(f"Created session {session.name} (id={session.id})")
+
+        return session
+
     async def create_session(
         self,
         working_dir: str,
@@ -190,43 +274,11 @@ class SessionManager:
         Returns:
             Created Session or None on failure
         """
-        session = Session(
+        return await self._create_session_common(
             working_dir=working_dir,
+            name=name,
             telegram_chat_id=telegram_chat_id,
         )
-
-        # Detect git remote URL for repo matching (async to avoid blocking)
-        session.git_remote_url = await self._get_git_remote_url_async(working_dir)
-
-        if name:
-            session.name = name
-
-        # Set up log file path
-        session.log_file = str(self.log_dir / f"{session.name}.log")
-
-        # Get Claude config (same as spawn_child_session)
-        claude_config = self.config.get("claude", {})
-        claude_command = claude_config.get("command", "claude")
-        claude_args = claude_config.get("args", [])
-
-        # Create the tmux session with config args
-        if not self.tmux.create_session_with_command(
-            session.tmux_session,
-            working_dir,
-            session.log_file,
-            session_id=session.id,
-            command=claude_command,
-            args=claude_args,
-        ):
-            logger.error(f"Failed to create tmux session for {session.name}")
-            return None
-
-        session.status = SessionStatus.RUNNING
-        self.sessions[session.id] = session
-        self._save_state()
-
-        logger.info(f"Created session {session.name} (id={session.id})")
-        return session
 
     async def spawn_child_session(
         self,
@@ -251,63 +303,32 @@ class SessionManager:
         Returns:
             Created child Session or None on failure
         """
-        from datetime import datetime
-
         # Get parent session
         parent_session = self.sessions.get(parent_session_id)
         if not parent_session:
             logger.error(f"Parent session not found: {parent_session_id}")
             return None
 
-        # Get Claude config
-        claude_config = self.config.get("claude", {})
-        claude_command = claude_config.get("command", "claude")
-        claude_args = claude_config.get("args", [])
-        default_model = claude_config.get("default_model", "sonnet")
+        # Determine working directory
+        child_working_dir = working_dir or parent_session.working_dir
 
-        # Override model if specified
-        selected_model = model or default_model
+        # Generate session name if not provided
+        # Use friendly_name parameter, auto-generate session.name if needed
+        session_name = f"child-{parent_session_id[:6]}" if not name else None
 
-        # Create child session
-        session = Session(
-            working_dir=working_dir or parent_session.working_dir,
+        # Create session using common logic
+        session = await self._create_session_common(
+            working_dir=child_working_dir,
+            name=session_name,
             friendly_name=name,
             parent_session_id=parent_session_id,
             spawn_prompt=prompt,
-            spawned_at=datetime.now(),
+            model=model,
+            initial_prompt=prompt,
         )
 
-        # Generate session name (tmux_session is auto-set by __post_init__)
-        if name:
-            session.name = name
-        else:
-            session.name = f"child-{session.id}"
-
-        # Set up log file path
-        session.log_file = str(self.log_dir / f"{session.name}.log")
-
-        # Detect git remote URL for repo matching (async to avoid blocking)
-        session.git_remote_url = await self._get_git_remote_url_async(session.working_dir)
-
-        # Create the tmux session with custom command and model
-        if not self.tmux.create_session_with_command(
-            session.tmux_session,
-            session.working_dir,
-            session.log_file,
-            session_id=session.id,
-            command=claude_command,
-            args=claude_args,
-            model=selected_model,
-            initial_prompt=prompt,
-        ):
-            logger.error(f"Failed to create tmux session for {session.name}")
+        if not session:
             return None
-
-        session.status = SessionStatus.RUNNING
-        self.sessions[session.id] = session
-        self._save_state()
-
-        logger.info(f"Spawned child session {session.name} (id={session.id}, parent={parent_session_id})")
 
         # Register background monitoring if wait is specified
         if wait and self.child_monitor:
