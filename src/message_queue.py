@@ -129,6 +129,18 @@ class MessageQueueManager:
         """
         sessions_with_pending = self._get_sessions_with_pending()
         for session_id in sessions_with_pending:
+            # Check if session still exists
+            session = self.session_manager.get_session(session_id)
+            if not session:
+                count = self.get_queue_length(session_id)
+                logger.warning(
+                    f"Session {session_id} has {count} pending message(s) but session no longer exists. "
+                    f"Messages will be cleaned up."
+                )
+                # Clean up messages for non-existent session
+                self._cleanup_messages_for_session(session_id)
+                continue
+
             count = self.get_queue_length(session_id)
             # Mark session as idle to trigger delivery
             # If Claude is actually busy, the next activity will mark it active
@@ -265,9 +277,18 @@ class MessageQueueManager:
         # For sequential mode, check if session is already idle and deliver immediately
         elif delivery_mode == "sequential":
             state = self.delivery_states.get(target_session_id)
+            # Check in-memory idle state first
             if state and state.is_idle:
-                logger.info(f"Session {target_session_id} already idle, triggering immediate delivery")
+                logger.info(f"Session {target_session_id} already idle (in-memory), triggering immediate delivery")
                 asyncio.create_task(self._try_deliver_messages(target_session_id))
+            else:
+                # Check actual session status - sessions with ERROR or IDLE status should receive messages
+                session = self.session_manager.get_session(target_session_id)
+                if session:
+                    from .models import SessionStatus
+                    if session.status in (SessionStatus.ERROR, SessionStatus.IDLE):
+                        logger.info(f"Session {target_session_id} has status={session.status.value}, marking idle for delivery")
+                        self.mark_session_idle(target_session_id)
 
         return msg
 
@@ -335,6 +356,28 @@ class MessageQueueManager:
         finally:
             conn.close()
         logger.info(f"Message {message_id} expired and deleted")
+
+    def _cleanup_messages_for_session(self, session_id: str):
+        """Clean up all pending messages for a session that no longer exists."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            cursor = conn.cursor()
+            # First get the count for logging
+            cursor.execute(
+                "SELECT COUNT(*) FROM message_queue WHERE target_session_id = ? AND delivered_at IS NULL",
+                (session_id,)
+            )
+            count = cursor.fetchone()[0]
+
+            # Delete all pending messages for this session
+            cursor.execute(
+                "DELETE FROM message_queue WHERE target_session_id = ? AND delivered_at IS NULL",
+                (session_id,)
+            )
+            conn.commit()
+            logger.info(f"Cleaned up {count} pending message(s) for non-existent session {session_id}")
+        finally:
+            conn.close()
 
     # =========================================================================
     # User Input Detection and Management
