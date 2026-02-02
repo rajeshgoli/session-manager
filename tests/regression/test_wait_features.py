@@ -215,8 +215,8 @@ class TestFollowupNotificationIdleCheck:
     """Test idle check in follow-up notifications (issue #72 fix)."""
 
     @pytest.mark.asyncio
-    async def test_followup_notification_only_sent_if_idle(self):
-        """Test that follow-up notification is only sent if recipient is still idle."""
+    async def test_followup_notification_sent_regardless_of_idle(self):
+        """Test that follow-up notification is sent after N seconds regardless of recipient state."""
         from src.message_queue import MessageQueueManager
         from src.models import QueuedMessage
         from datetime import datetime
@@ -239,7 +239,7 @@ class TestFollowupNotificationIdleCheck:
         )
         queue_mgr._init_db()
 
-        # Mock is_session_idle to return False (recipient became active)
+        # Mock is_session_idle to return False (recipient is active)
         queue_mgr.is_session_idle = MagicMock(return_value=False)
 
         # Create a message with notify_after_seconds
@@ -261,12 +261,12 @@ class TestFollowupNotificationIdleCheck:
         # Wait for the notification to fire
         await asyncio.sleep(1.5)
 
-        # Verify no notification was queued (recipient is not idle)
-        queue_mgr.queue_message.assert_not_called()
+        # Verify notification WAS queued even though recipient is not idle
+        queue_mgr.queue_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_followup_notification_sent_when_idle(self):
-        """Test that follow-up notification IS sent if recipient is idle."""
+    async def test_followup_notification_sent_after_timeout(self):
+        """Test that follow-up notification is sent after timeout with correct format."""
         from src.message_queue import MessageQueueManager
         from src.models import QueuedMessage
         from datetime import datetime

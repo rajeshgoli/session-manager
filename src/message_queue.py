@@ -679,21 +679,20 @@ class MessageQueueManager:
 
         async def send_followup():
             await asyncio.sleep(msg.notify_after_seconds)
-            # Only notify if recipient is idle
-            if self.is_session_idle(msg.target_session_id):
-                truncated = msg.text[:100] + "..." if len(msg.text) > 100 else msg.text
-                notification = (
-                    f'[sm] Reminder: {msg.notify_after_seconds}s since your message to '
-                    f'{msg.target_session_id} was delivered\n'
-                    f'Original: "{truncated}"\n'
-                    f'You can check status with: sm output {msg.target_session_id}'
-                )
-                self.queue_message(
-                    target_session_id=msg.sender_session_id,
-                    text=notification,
-                    delivery_mode="sequential",
-                )
-                logger.info(f"Sent follow-up notification to {msg.sender_session_id}")
+            # Send notification after N seconds regardless of recipient state
+            truncated = msg.text[:100] + "..." if len(msg.text) > 100 else msg.text
+            notification = (
+                f'[sm] Reminder: {msg.notify_after_seconds}s since your message to '
+                f'{msg.target_session_id} was delivered\n'
+                f'Original: "{truncated}"\n'
+                f'You can check status with: sm output {msg.target_session_id}'
+            )
+            self.queue_message(
+                target_session_id=msg.sender_session_id,
+                text=notification,
+                delivery_mode="sequential",
+            )
+            logger.info(f"Sent follow-up notification to {msg.sender_session_id}")
 
         asyncio.create_task(send_followup())
 
