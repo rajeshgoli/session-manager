@@ -219,7 +219,7 @@ class SessionManagerApp:
             return
 
         async def on_new_session(chat_id: int, working_dir: str) -> Optional[Session]:
-            session = self.session_manager.create_session(
+            session = await self.session_manager.create_session(
                 working_dir=working_dir,
                 telegram_chat_id=chat_id,
             )
@@ -235,7 +235,7 @@ class SessionManagerApp:
             return self.session_manager.kill_session(session_id)
 
         async def on_session_input(user_input: UserInput) -> bool:
-            success = self.session_manager.send_input(
+            success = await self.session_manager.send_input(
                 user_input.session_id,
                 user_input.text,
                 bypass_queue=user_input.is_permission_response,

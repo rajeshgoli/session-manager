@@ -386,23 +386,24 @@ class MessageQueueManager:
     # User Input Detection and Management
     # =========================================================================
 
-    def _get_pending_user_input(self, tmux_session: str) -> Optional[str]:
+    async def _get_pending_user_input_async(self, tmux_session: str) -> Optional[str]:
         """
-        Check if user has typed something at the prompt.
+        Check if user has typed something at the prompt (async, non-blocking).
 
         Returns the user's typed text if present, None otherwise.
         """
         try:
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-p", "-t", tmux_session],
-                capture_output=True,
-                text=True,
-                timeout=2,
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "capture-pane", "-p", "-t", tmux_session,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode != 0:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+
+            if proc.returncode != 0:
                 return None
 
-            output = result.stdout.strip()
+            output = stdout.decode().strip()
             if not output:
                 return None
 
@@ -493,7 +494,7 @@ class MessageQueueManager:
         if not session:
             return
 
-        current_input = self._get_pending_user_input(session.tmux_session)
+        current_input = await self._get_pending_user_input_async(session.tmux_session)
 
         if current_input:
             # User has typed something
@@ -557,7 +558,7 @@ class MessageQueueManager:
                     return
 
             # Check for user input (final gate)
-            current_input = self._get_pending_user_input(session.tmux_session)
+            current_input = await self._get_pending_user_input_async(session.tmux_session)
             if current_input and not state.saved_user_input:
                 # User is typing - don't inject
                 logger.debug(f"User typing detected at final gate, aborting delivery")
