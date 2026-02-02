@@ -54,6 +54,9 @@ class MessageQueueManager:
         # In-memory state (not persisted - rebuilt from hooks)
         self.delivery_states: Dict[str, SessionDeliveryState] = {}
 
+        # Per-session delivery locks to prevent double-delivery race condition
+        self._delivery_locks: Dict[str, asyncio.Lock] = {}
+
         # Background task
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
@@ -520,80 +523,86 @@ class MessageQueueManager:
         """
         Attempt to deliver pending messages to a session.
 
+        Uses per-session lock to prevent double-delivery when multiple Stop hooks
+        fire rapidly and create concurrent delivery tasks.
+
         Args:
             session_id: Target session ID
             important_only: Only deliver important mode messages
         """
-        state = self._get_or_create_state(session_id)
-        session = self.session_manager.get_session(session_id)
+        # Acquire per-session lock to prevent concurrent delivery
+        lock = self._delivery_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            state = self._get_or_create_state(session_id)
+            session = self.session_manager.get_session(session_id)
 
-        if not session:
-            logger.warning(f"Session {session_id} not found, cannot deliver")
-            return
+            if not session:
+                logger.warning(f"Session {session_id} not found, cannot deliver")
+                return
 
-        # Get pending messages
-        messages = self.get_pending_messages(session_id)
-        if not messages:
-            return
-
-        # Filter by mode if needed
-        if important_only:
-            messages = [m for m in messages if m.delivery_mode == "important"]
+            # Get pending messages
+            messages = self.get_pending_messages(session_id)
             if not messages:
                 return
-        else:
-            # For sequential, only deliver if session is idle
-            if not state.is_idle:
-                logger.debug(f"Session {session_id} not idle, skipping sequential delivery")
+
+            # Filter by mode if needed
+            if important_only:
+                messages = [m for m in messages if m.delivery_mode == "important"]
+                if not messages:
+                    return
+            else:
+                # For sequential, only deliver if session is idle
+                if not state.is_idle:
+                    logger.debug(f"Session {session_id} not idle, skipping sequential delivery")
+                    return
+
+            # Check for user input (final gate)
+            current_input = self._get_pending_user_input(session.tmux_session)
+            if current_input and not state.saved_user_input:
+                # User is typing - don't inject
+                logger.debug(f"User typing detected at final gate, aborting delivery")
                 return
 
-        # Check for user input (final gate)
-        current_input = self._get_pending_user_input(session.tmux_session)
-        if current_input and not state.saved_user_input:
-            # User is typing - don't inject
-            logger.debug(f"User typing detected at final gate, aborting delivery")
-            return
+            # Batch messages (up to max_batch_size)
+            batch = messages[:self.max_batch_size]
 
-        # Batch messages (up to max_batch_size)
-        batch = messages[:self.max_batch_size]
+            # Format batch payload
+            if len(batch) == 1:
+                payload = batch[0].text
+            else:
+                # Multiple messages - concatenate with headers
+                parts = []
+                for msg in batch:
+                    parts.append(msg.text)
+                payload = "\n\n".join(parts)
 
-        # Format batch payload
-        if len(batch) == 1:
-            payload = batch[0].text
-        else:
-            # Multiple messages - concatenate with headers
-            parts = []
-            for msg in batch:
-                parts.append(msg.text)
-            payload = "\n\n".join(parts)
+            # Inject the message (use async version to avoid blocking event loop)
+            logger.info(f"Delivering {len(batch)} message(s) to {session_id}")
+            success = await self.session_manager.tmux.send_input_async(session.tmux_session, payload)
 
-        # Inject the message (use async version to avoid blocking event loop)
-        logger.info(f"Delivering {len(batch)} message(s) to {session_id}")
-        success = await self.session_manager.tmux.send_input_async(session.tmux_session, payload)
+            if success:
+                # Mark session as active
+                state.is_idle = False
 
-        if success:
-            # Mark session as active
-            state.is_idle = False
+                # Mark messages as delivered
+                for msg in batch:
+                    self._mark_delivered(msg.id)
+                    logger.info(f"Delivered message {msg.id}")
 
-            # Mark messages as delivered
-            for msg in batch:
-                self._mark_delivered(msg.id)
-                logger.info(f"Delivered message {msg.id}")
+                    # Handle delivery notifications
+                    if msg.notify_on_delivery and msg.sender_session_id:
+                        await self._send_delivery_notification(msg)
 
-                # Handle delivery notifications
-                if msg.notify_on_delivery and msg.sender_session_id:
-                    await self._send_delivery_notification(msg)
+                    if msg.notify_after_seconds and msg.sender_session_id:
+                        await self._schedule_followup_notification(msg)
 
-                if msg.notify_after_seconds and msg.sender_session_id:
-                    await self._schedule_followup_notification(msg)
-
-            # Update session activity
-            session.last_activity = datetime.now()
-            from .models import SessionStatus
-            session.status = SessionStatus.RUNNING
-            self.session_manager._save_state()
-        else:
-            logger.error(f"Failed to deliver messages to {session_id}")
+                # Update session activity
+                session.last_activity = datetime.now()
+                from .models import SessionStatus
+                session.status = SessionStatus.RUNNING
+                self.session_manager._save_state()
+            else:
+                logger.error(f"Failed to deliver messages to {session_id}")
 
     async def _deliver_urgent(self, session_id: str, msg: QueuedMessage):
         """Deliver an urgent message immediately, interrupting Claude."""
