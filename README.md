@@ -1,297 +1,292 @@
 # Claude Session Manager
 
-A local macOS server that manages Claude Code sessions in tmux, with bidirectional communication via Telegram and Email.
+**Distributed infrastructure for AI agent swarms.** Spawn Claude agents, orchestrate workflows, coordinate without burning tokens.
 
-## Features
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         ORCHESTRATOR (EM)                       │
+│                    "Implement Epic #987"                        │
+└──────────────┬────────────────┬────────────────┬───────────────┘
+               │                │                │
+         sm spawn          sm spawn          sm spawn
+               │                │                │
+               ▼                ▼                ▼
+        ┌──────────┐     ┌──────────┐     ┌──────────┐
+        │ Engineer │     │ Architect│     │  Scout   │
+        │  Agent   │     │  Agent   │     │  Agent   │
+        └────┬─────┘     └────┬─────┘     └────┬─────┘
+             │                │                │
+             └────────────────┼────────────────┘
+                              │
+                      sm send em-main
+                       "done: PR #42"
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │  EM wakes up,   │
+                    │  routes to next │
+                    │  agent          │
+                    └─────────────────┘
+```
 
-- **Session Management**: Create, list, kill Claude Code sessions running in tmux
-- **Telegram Bot**: Control sessions via Telegram commands, reply to threads to send input
-- **Email Notifications**: Reuses existing email harness for urgent notifications
-- **Output Monitoring**: Detects permission prompts, errors, and idle sessions
-- **Terminal Integration**: Open sessions in Terminal.app windows
+## Why This Exists
 
-## Prerequisites
+**Problem:** Claude agents burn tokens while waiting. Spawn a worker, wait for completion, context grows, costs explode.
 
-- macOS
-- Python 3.11+
-- tmux (`brew install tmux`)
-- Claude Code CLI installed
-
-## Quick Setup
+**Solution:** A central manager that lets agents go idle. Spawn workers → go to sleep → wake on notification. Zero tokens burned while waiting.
 
 ```bash
-# Clone and enter directory
-cd claude-session-manager
+# EM spawns engineer, goes idle (no tokens burned)
+sm spawn "Implement ticket #123" --name engineer --wait 600
 
-# Run setup script
-chmod +x setup.sh
+# Engineer works autonomously...
+# ...finishes, notifies EM
+sm send em-main "done: PR #456 created"
+
+# EM wakes up, routes PR to architect
+sm send architect "Review PR #456"
+```
+
+**Result:** Complex multi-agent workflows at a fraction of the token cost.
+
+---
+
+## What It Enables
+
+### Agent Swarms
+Spawn specialized agents that work in parallel. Engineer implements while Architect reviews while Scout investigates.
+
+### Async Orchestration
+The EM (Engineering Manager) pattern: spawn workers, dispatch tasks, collect results. Never wait synchronously.
+
+### Workspace Coordination
+Auto-locking on file writes. Conflict detection. Multiple agents, one codebase, zero collisions.
+
+### Message Queuing
+Reliable delivery with priority levels. Sequential (wait for idle), Important (queue behind), Urgent (interrupt now).
+
+### Token Efficiency
+Agents sleep while waiting. Central manager handles coordination. Pay only for actual work.
+
+---
+
+## Quick Start
+
+```bash
+# Install
+git clone https://github.com/rajeshgoli/claude-session-manager
+cd claude-session-manager
 ./setup.sh
 
-# Edit configuration
-vim config.yaml
+# Configure
+cp config.yaml.example config.yaml
+vim config.yaml  # Add Telegram token if desired
 
-# Start the server
+# Run
 source venv/bin/activate
-python -m src.main
+python -m src.server
 ```
 
-## Setting Up the Telegram Bot
+---
 
-1. **Create a bot with BotFather**:
-   - Open Telegram and search for `@BotFather`
-   - Send `/newbot`
-   - Choose a name (e.g., "Claude Session Manager")
-   - Choose a username (e.g., "my_claude_sessions_bot")
-   - Copy the token provided
+## The SM CLI
 
-2. **Get your chat ID**:
-   - Send a message to your new bot
-   - Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-   - Find your chat ID in the response
+Every managed session gets the `sm` command. This is how agents coordinate.
 
-3. **Configure**:
-   ```yaml
-   telegram:
-     token: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
-     allowed_chat_ids:
-       - 123456789  # Your chat ID
-   ```
+### Core Commands
 
-## Usage
+| Command | Purpose |
+|---------|---------|
+| `sm spawn "<prompt>" --name X` | Spawn child agent |
+| `sm send <id> "<text>"` | Send message to agent |
+| `sm wait <id> N` | Async wait, notify after N seconds |
+| `sm clear <id>` | Clear agent context for reuse |
+| `sm children` | List your spawned agents |
+| `sm what <id>` | AI summary of what agent is doing |
+| `sm kill <id>` | Terminate an agent |
 
-### Telegram Commands
+### Coordination Commands
 
-| Command | Description |
-|---------|-------------|
-| `/new [path]` | Create new Claude session in directory |
-| `/list` | List active sessions |
-| `/status <id>` | Get session status |
-| `/kill <id>` | Kill a session |
-| `/open <id>` | Open session in Terminal.app |
-| `/help` | Show help message |
+| Command | Purpose |
+|---------|---------|
+| `sm name "<name>"` | Set your friendly name |
+| `sm status` | Your status + others + locks |
+| `sm alone` | Check if you're the only agent |
+| `sm others` | List other agents in workspace |
+| `sm lock "<reason>"` | Acquire workspace lock |
+| `sm unlock` | Release lock |
 
-**Reply to a session message** to send input to Claude.
-
-### API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/sessions` | POST | Create new session |
-| `/sessions` | GET | List all sessions |
-| `/sessions/{id}` | GET | Get session details |
-| `/sessions/{id}/input` | POST | Send input to session |
-| `/sessions/{id}/key` | POST | Send key (y/n) to session |
-| `/sessions/{id}` | DELETE | Kill session |
-| `/sessions/{id}/open` | POST | Open in Terminal.app |
-| `/sessions/{id}/output` | GET | Capture recent output |
-| `/notify` | POST | Send notification |
-
-### Example API Usage
+### Message Delivery Modes
 
 ```bash
-# Create a session
-curl -X POST http://localhost:8420/sessions \
-  -H "Content-Type: application/json" \
-  -d '{"working_dir": "~/projects/myapp"}'
-
-# List sessions
-curl http://localhost:8420/sessions
-
-# Send input
-curl -X POST http://localhost:8420/sessions/abc123/input \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Fix the bug in login.py"}'
-
-# Send permission response
-curl -X POST http://localhost:8420/sessions/abc123/key \
-  -H "Content-Type: application/json" \
-  -d '{"key": "y"}'
-
-# Request email notification (from Claude hook)
-curl -X POST http://localhost:8420/notify \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Task complete!", "channel": "email", "urgent": true}'
+sm send agent "message"              # Sequential: wait for idle
+sm send agent "message" --important  # Queue behind current work
+sm send agent "message" --urgent     # Interrupt immediately
 ```
 
-## SM CLI - Multi-Agent Coordination
+---
 
-The `sm` CLI tool enables Claude sessions to coordinate with each other. It's automatically available inside sessions managed by the Session Manager.
+## The EM Pattern
 
-### Commands
+The Engineering Manager orchestrates without doing implementation work.
 
-| Command | Description |
-|---------|-------------|
-| `sm name <name>` | Set friendly name for current session |
-| `sm me` | Show current session info |
-| `sm who` | List other sessions in same workspace |
-| `sm what <session-id> [--deep]` | Get AI summary of what a session is doing |
-| `sm others [--repo]` | List others with summaries |
-| `sm all [--summaries]` | List all sessions system-wide across all directories |
-| `sm alone` | Check if you're the only agent (exit code 0=alone, 1=others) |
-| `sm task "<description>"` | Register what you're working on |
-| `sm status` | Full status: you + others + lock file |
-| `sm subagents <session-id>` | List subagents spawned by a session |
-| `sm send <session-id> "<text>"` | Send input to any session (includes sender metadata) |
+```bash
+# 1. Spawn standby agents at session start
+sm spawn "As engineer, await tasks" --name engineer-standby --wait 600
+sm spawn "As architect, await tasks" --name architect-standby --wait 300
 
-### Subagent Tracking
+# 2. Dispatch work
+sm clear engineer-standby
+sm send engineer-standby "Implement ticket #123. When done: sm send $EM_ID 'done: PR created'" --urgent
+sm wait engineer-standby 600  # Async - EM goes idle
 
-When Claude spawns subagents (e.g., "As EM, implement epic #987"), the Session Manager can track them automatically via Claude Code hooks.
+# 3. Wake on notification, route to next agent
+sm send architect-standby "Review PR #456" --urgent
 
-**To enable subagent tracking in your project**, add this to your project's `.claude/settings.json`:
+# 4. Repeat until workflow complete
+```
+
+**Key insight:** EM's context is preserved across worker completions. Workers are disposable; EM maintains state.
+
+---
+
+## Auto-Locking
+
+File writes automatically acquire workspace locks via Claude Code hooks.
 
 ```json
+// .claude/settings.json
 {
   "hooks": {
-    "SubagentStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sm subagent-start"
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sm subagent-stop"
-          }
-        ]
-      }
-    ]
+    "PreToolUse": [{
+      "matcher": { "tool_name": "write|edit" },
+      "hooks": [{ "type": "command", "command": "sm auto-lock" }]
+    }]
   }
 }
 ```
 
-**Note**: The `.claude/settings.json` file in this repository is for development/testing of the Session Manager itself. Each project that wants subagent tracking needs its own hooks configuration.
+Multiple agents, same repo, no conflicts. If another agent holds the lock, your write blocks until they release.
 
-### Example Workflows
-
-**Coordinating with other agents:**
-```bash
-# Check if others are working in same workspace
-$ sm who
-engineer-db (a1b2c3d4) | running | 5min ago
-
-# See what they're doing
-$ sm what a1b2c3d4
-Working on database migration script for users table.
-
-# List all sessions across all projects
-$ sm all
-office-automate (fc7d7dbc) | idle | ~/Desktop/automation/office-automate
-engineer-db (a1b2c3d4) | running | ~/projects/myapp
-
-# Register your task to avoid conflicts
-$ sm task "Implementing user authentication API"
-
-# Send input to another agent (using friendly name or session ID)
-$ sm send engineer-db "Database migration complete, you can proceed"
-Input sent to engineer-db (a1b2c3d4)
-
-# When sent from a managed session, includes sender metadata:
-# The receiving agent sees:
-# [Input from: architect-pr1032 (08bc57cf) via sm send]
-# Database migration complete, you can proceed
-```
-
-**Note:** When `sm send` is called from within a managed session, it automatically includes sender metadata so the receiving agent knows who sent the message. When called from a terminal outside a session, the message is sent without metadata.
-
-**Tracking subagents:**
-```bash
-# List subagents spawned by a session
-$ sm subagents 1749a2fe
-em-epic987 (1749a2fe) subagents:
-  → engineer (abc123) | running | 3min ago
-  ✓ architect (def456) | completed | 10min ago
-
-# Get deep summary with subagent activity
-$ sm what 1749a2fe --deep
-EM orchestrating epic #987. Currently coordinating Engineer on #984.
-
-Subagents:
-  → engineer (abc123) | running | 3min ago
-  ✓ architect (def456) | completed | 10min ago
-     Designed pivot detection architecture
-```
-
-## Email Integration
-
-The session manager reuses the existing email harness from `../claude-email-automation/`. Ensure that directory contains:
-- `email.yaml` - SMTP configuration
-- `imap.yaml` - IMAP configuration
-
-Claude can request email notifications via the `/notify` endpoint with `"channel": "email"`.
+---
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────┐
-│  Telegram Bot   │────▶│  Session Manager │
-└─────────────────┘     └────────┬─────────┘
-                                 │
-┌─────────────────┐              │
-│   FastAPI       │◀─────────────┤
-│   Server        │              │
-└─────────────────┘              ▼
-                        ┌──────────────────┐
-┌─────────────────┐     │  tmux Controller │
-│ Output Monitor  │────▶│                  │
-└─────────────────┘     └────────┬─────────┘
-        │                        │
-        ▼                        ▼
-┌─────────────────┐     ┌──────────────────┐
-│   Notifier      │     │  tmux sessions   │
-│ (Telegram/Email)│     │  (Claude Code)   │
-└─────────────────┘     └──────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    SESSION MANAGER                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+│  │   FastAPI   │  │   Message   │  │   Lock Manager      │  │
+│  │   Server    │  │   Queue     │  │   (workspace locks) │  │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘  │
+│         │                │                    │             │
+│         └────────────────┼────────────────────┘             │
+│                          │                                  │
+│                   ┌──────▼──────┐                           │
+│                   │    tmux     │                           │
+│                   │ Controller  │                           │
+│                   └──────┬──────┘                           │
+└──────────────────────────┼──────────────────────────────────┘
+                           │
+           ┌───────────────┼───────────────┐
+           │               │               │
+     ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐
+     │  Claude   │   │  Claude   │   │  Claude   │
+     │  Agent 1  │   │  Agent 2  │   │  Agent 3  │
+     └───────────┘   └───────────┘   └───────────┘
 ```
 
-## Configuration Reference
+**Components:**
+- **FastAPI Server** - REST API for session control
+- **Message Queue** - SQLite-backed reliable delivery
+- **Lock Manager** - Workspace coordination
+- **tmux Controller** - Session lifecycle management
+- **Output Monitor** - Detects idle, errors, permission prompts
+
+---
+
+## Telegram Integration (Optional)
+
+Control your swarm from your phone.
+
+| Command | Action |
+|---------|--------|
+| `/new [path]` | Spawn new session |
+| `/list` | List active sessions |
+| `/kill <id>` | Terminate session |
+| Reply to message | Send input to that session |
+
+Sessions can notify you on completion, errors, or when they need input.
+
+---
+
+## API Reference
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/sessions` | POST | Create session |
+| `/sessions` | GET | List sessions |
+| `/sessions/{id}/input` | POST | Send input |
+| `/sessions/{id}/watch` | POST | Watch for completion |
+| `/sessions/{id}` | DELETE | Kill session |
+| `/health` | GET | Server health check |
+
+Full API docs at `http://localhost:8420/docs` when running.
+
+---
+
+## Configuration
 
 ```yaml
 server:
-  host: "127.0.0.1"      # Bind address
-  port: 8420             # Server port
+  host: "127.0.0.1"
+  port: 8420
 
 paths:
-  log_dir: "/tmp/claude-sessions"
-  state_file: "/tmp/claude-sessions/sessions.json"
+  state_file: "~/.claude-sessions/state.json"
 
 monitor:
-  idle_timeout: 300      # Seconds before idle notification
-  poll_interval: 1.0     # Output check frequency
+  idle_timeout: 300      # Notify after 5min idle
+  poll_interval: 1.0
 
-telegram:
-  token: "BOT_TOKEN"     # From @BotFather
-  allowed_chat_ids: []   # Empty = allow all
-
-email:
-  smtp_config: ""        # Path to email.yaml (optional)
-  imap_config: ""        # Path to imap.yaml (optional)
+telegram:  # Optional
+  token: "BOT_TOKEN"
+  allowed_chat_ids: [123456789]
 ```
 
-## Troubleshooting
+---
 
-**Bot not responding**: Verify the token is correct and the bot is started.
-
-**Session not created**: Check that tmux is installed and Claude Code CLI is available.
-
-**No notifications**: Ensure the session has a Telegram chat ID associated (create via `/new`).
-
-**Email not sending**: Verify the email harness at `../claude-email-automation/` is configured.
-
-## Development
+## Testing
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+# Run test suite (194 tests)
+pytest tests/ -v
 
-# Run tests
-pytest
-
-# Run with debug logging
-LOG_LEVEL=DEBUG python -m src.main
+# Run with coverage
+pytest tests/ --cov=src
 ```
+
+---
+
+## Requirements
+
+- macOS (Linux support planned)
+- Python 3.11+
+- tmux (`brew install tmux`)
+- Claude Code CLI
+
+---
+
+## License
+
+MIT
+
+---
+
+## Contributing
+
+Issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+**Built for the age of AI agents.** When one Claude isn't enough.
