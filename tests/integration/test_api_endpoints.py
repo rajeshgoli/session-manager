@@ -383,12 +383,45 @@ class TestUpdateSession:
 
         response = test_client.patch(
             "/sessions/test123",
-            json={"friendly_name": "New Name"}
+            json={"friendly_name": "new-name"}
         )
         assert response.status_code == 200
 
         data = response.json()
-        assert data["friendly_name"] == "New Name"
+        assert data["friendly_name"] == "new-name"
+
+    def test_update_friendly_name_rejects_empty(self, test_client, mock_session_manager, sample_session):
+        """PATCH /sessions/{id} rejects empty friendly name (Issue #105)."""
+        mock_session_manager.get_session.return_value = sample_session
+
+        response = test_client.patch(
+            "/sessions/test123",
+            json={"friendly_name": ""}
+        )
+        assert response.status_code == 400
+        assert "empty" in response.json()["detail"].lower()
+
+    def test_update_friendly_name_rejects_spaces(self, test_client, mock_session_manager, sample_session):
+        """PATCH /sessions/{id} rejects names with spaces (Issue #105)."""
+        mock_session_manager.get_session.return_value = sample_session
+
+        response = test_client.patch(
+            "/sessions/test123",
+            json={"friendly_name": "bad name"}
+        )
+        assert response.status_code == 400
+        assert "alphanumeric" in response.json()["detail"].lower()
+
+    def test_update_friendly_name_rejects_too_long(self, test_client, mock_session_manager, sample_session):
+        """PATCH /sessions/{id} rejects names over 32 chars (Issue #105)."""
+        mock_session_manager.get_session.return_value = sample_session
+
+        response = test_client.patch(
+            "/sessions/test123",
+            json={"friendly_name": "a" * 33}
+        )
+        assert response.status_code == 400
+        assert "too long" in response.json()["detail"].lower()
 
     def test_update_task(self, test_client, mock_session_manager, sample_session):
         """PUT /sessions/{id}/task updates current task."""

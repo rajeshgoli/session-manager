@@ -324,6 +324,36 @@ class TestSessionResolution:
         assert session_id is None
         assert session is None
 
+    def test_resolve_rejects_empty_string(self):
+        """Empty string identifier returns None (Issue #105)."""
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = None
+        mock_client.list_sessions.return_value = [
+            {"id": "abc123", "friendly_name": ""},  # Session with empty name
+            {"id": "def456", "friendly_name": "test-session"},
+        ]
+
+        session_id, session = resolve_session_id(mock_client, "")
+
+        # Should not match empty-named session
+        assert session_id is None
+        assert session is None
+        # Should not even try to search by friendly name
+        mock_client.list_sessions.assert_not_called()
+
+    def test_resolve_rejects_blank_string(self):
+        """Blank string (spaces only) identifier returns None (Issue #105)."""
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = None
+
+        session_id, session = resolve_session_id(mock_client, "   ")
+
+        # Should not match
+        assert session_id is None
+        assert session is None
+        # Should not even try to search
+        mock_client.list_sessions.assert_not_called()
+
 
 class TestParseDuration:
     """Tests for duration parsing utility."""

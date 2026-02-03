@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus, DeliveryResult
+from .cli.commands import validate_friendly_name
 
 logger = logging.getLogger(__name__)
 
@@ -735,6 +736,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found")
 
         if friendly_name is not None:
+            # Validate friendly name
+            valid, error = validate_friendly_name(friendly_name)
+            if not valid:
+                raise HTTPException(status_code=400, detail=error)
+
             session.friendly_name = friendly_name
             app.state.session_manager._save_state()
             # Update tmux status bar

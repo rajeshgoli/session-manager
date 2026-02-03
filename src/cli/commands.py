@@ -64,6 +64,10 @@ def resolve_session_id(client: SessionManagerClient, identifier: str) -> tuple[O
     Returns:
         Tuple of (session_id, session_dict) or (None, None) if not found/unavailable
     """
+    # Reject empty or blank identifiers
+    if not identifier or not identifier.strip():
+        return None, None
+
     # Try as session ID first
     session = client.get_session(identifier)
     if session:
