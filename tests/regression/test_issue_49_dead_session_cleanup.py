@@ -177,7 +177,7 @@ async def test_cleanup_without_telegram(output_monitor, mock_session, mock_sessi
     """Test that cleanup works when session has no Telegram integration."""
     # Create session without Telegram
     mock_session.telegram_chat_id = None
-    mock_session.telegram_topic_id = None
+    mock_session.telegram_thread_id = None
 
     # Add session to manager
     mock_session_manager.sessions[mock_session.id] = mock_session

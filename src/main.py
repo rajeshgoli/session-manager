@@ -260,7 +260,7 @@ class SessionManagerApp:
             session = self.session_manager.get_session(session_id)
             if session:
                 session.telegram_chat_id = chat_id
-                session.telegram_topic_id = topic_id
+                session.telegram_thread_id = topic_id
                 self.session_manager._save_state()
 
         async def on_set_name(session_id: str, name: str) -> bool:
