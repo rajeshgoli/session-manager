@@ -231,7 +231,6 @@ class NotificationEvent:
 
 
 @dataclass
-@dataclass
 class UserInput:
     """Input received from user via Telegram or Email."""
     session_id: str
