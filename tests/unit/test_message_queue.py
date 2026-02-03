@@ -56,7 +56,8 @@ def message_queue(mock_session_manager, temp_db_path):
                     "async_send_timeout_seconds": 2,
                 }
             }
-        }
+        },
+        notifier=None,  # No Telegram mirroring in tests
     )
     return mq
 
@@ -277,6 +278,7 @@ class TestDatabaseOperations:
         mq = MessageQueueManager(
             session_manager=mock_session_manager,
             db_path=temp_db_path,
+            notifier=None,
         )
 
         # Verify database file exists
@@ -359,3 +361,190 @@ class TestDeliveryLocks:
         lock2 = message_queue._delivery_locks.setdefault("session1", asyncio.Lock())
 
         assert lock1 is lock2
+
+
+class TestTelegramMirroring:
+    """Tests for Telegram mirroring of agent-to-agent communications (issue #103)."""
+
+    @pytest.mark.asyncio
+    async def test_mirror_to_telegram_with_notifier(self, mock_session_manager, temp_db_path):
+        """_mirror_to_telegram sends notification when notifier is configured."""
+        # Create mock notifier
+        mock_notifier = AsyncMock()
+        mock_notifier.notify = AsyncMock(return_value=True)
+
+        # Create message queue with notifier
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=mock_notifier,
+        )
+
+        # Create mock session with telegram_chat_id
+        mock_session = MagicMock()
+        mock_session.id = "test123"
+        mock_session.telegram_chat_id = 12345
+
+        # Call mirror method
+        await mq._mirror_to_telegram("Test message", mock_session, "test_event")
+
+        # Verify notifier was called
+        assert mock_notifier.notify.call_count == 1
+        call_args = mock_notifier.notify.call_args
+        event = call_args[0][0]
+        session = call_args[0][1]
+
+        assert event.session_id == "test123"
+        assert event.event_type == "test_event"
+        assert event.message == "Test message"
+        assert session == mock_session
+
+    @pytest.mark.asyncio
+    async def test_mirror_to_telegram_without_notifier(self, mock_session_manager, temp_db_path):
+        """_mirror_to_telegram is silent when notifier is None."""
+        # Create message queue without notifier
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=None,
+        )
+
+        # Create mock session
+        mock_session = MagicMock()
+        mock_session.id = "test123"
+        mock_session.telegram_chat_id = 12345
+
+        # Call should not raise
+        await mq._mirror_to_telegram("Test message", mock_session, "test_event")
+
+    @pytest.mark.asyncio
+    async def test_mirror_to_telegram_without_chat_id(self, mock_session_manager, temp_db_path):
+        """_mirror_to_telegram is silent when session has no telegram_chat_id."""
+        mock_notifier = AsyncMock()
+        mock_notifier.notify = AsyncMock(return_value=True)
+
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=mock_notifier,
+        )
+
+        # Create mock session WITHOUT telegram_chat_id
+        mock_session = MagicMock()
+        mock_session.id = "test123"
+        mock_session.telegram_chat_id = None
+
+        # Call should not raise and notifier should not be called
+        await mq._mirror_to_telegram("Test message", mock_session, "test_event")
+        assert mock_notifier.notify.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_mirror_to_telegram_handles_exceptions(self, mock_session_manager, temp_db_path):
+        """_mirror_to_telegram handles exceptions gracefully (fire-and-forget)."""
+        # Create mock notifier that raises
+        mock_notifier = AsyncMock()
+        mock_notifier.notify = AsyncMock(side_effect=Exception("Telegram API error"))
+
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=mock_notifier,
+        )
+
+        mock_session = MagicMock()
+        mock_session.id = "test123"
+        mock_session.telegram_chat_id = 12345
+
+        # Should not raise - fire-and-forget
+        await mq._mirror_to_telegram("Test message", mock_session, "test_event")
+
+    @pytest.mark.asyncio
+    async def test_delivery_mirrors_to_telegram(self, mock_session_manager, temp_db_path):
+        """Message delivery triggers Telegram mirroring."""
+        mock_notifier = AsyncMock()
+        mock_notifier.notify = AsyncMock(return_value=True)
+
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=mock_notifier,
+        )
+
+        # Create mock session
+        mock_session = MagicMock()
+        mock_session.id = "target123"
+        mock_session.tmux_session = "tmux-test"
+        mock_session.telegram_chat_id = 12345
+        mock_session.status = SessionStatus.IDLE
+        mock_session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=mock_session)
+
+        # Queue a message
+        msg = mq.queue_message(
+            target_session_id="target123",
+            text="Hello from sender",
+            sender_session_id="sender456",
+            sender_name="Agent X",
+        )
+
+        # Mark session as idle
+        mq.mark_session_idle("target123")
+
+        # Trigger delivery
+        await mq._try_deliver_messages("target123")
+
+        # Verify Telegram mirroring was called (message delivered)
+        assert mock_notifier.notify.call_count >= 1
+        # Check that one of the calls was for message_delivered
+        delivered_calls = [
+            call for call in mock_notifier.notify.call_args_list
+            if call[0][0].event_type == "message_delivered"
+        ]
+        assert len(delivered_calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_stop_notification_mirrors_to_telegram(self, mock_session_manager, temp_db_path):
+        """Stop notifications are mirrored to Telegram."""
+        mock_notifier = AsyncMock()
+        mock_notifier.notify = AsyncMock(return_value=True)
+
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=mock_notifier,
+        )
+
+        # Create mock sessions
+        recipient_session = MagicMock()
+        recipient_session.id = "recipient123"
+        recipient_session.friendly_name = "Agent A"
+        recipient_session.name = "claude-recipient"
+
+        sender_session = MagicMock()
+        sender_session.id = "sender456"
+        sender_session.telegram_chat_id = 12345
+
+        def get_session_side_effect(session_id):
+            if session_id == "recipient123":
+                return recipient_session
+            elif session_id == "sender456":
+                return sender_session
+            return None
+
+        mock_session_manager.get_session = MagicMock(side_effect=get_session_side_effect)
+
+        # Send stop notification
+        await mq._send_stop_notification(
+            recipient_session_id="recipient123",
+            sender_session_id="sender456",
+            sender_name="Agent B",
+        )
+
+        # Verify Telegram mirroring was called for stop notification
+        stop_notify_calls = [
+            call for call in mock_notifier.notify.call_args_list
+            if call[0][0].event_type == "stop_notify"
+        ]
+        assert len(stop_notify_calls) == 1
+        event = stop_notify_calls[0][0][0]
+        assert "🛑" in event.message

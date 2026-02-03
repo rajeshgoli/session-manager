@@ -189,6 +189,7 @@ class SessionManagerApp:
             self.session_manager,
             db_path=sm_send_config.get("db_path", "~/.local/share/claude-sessions/message_queue.db"),
             config=config,  # Pass full config for timeout settings
+            notifier=self.notifier,  # Pass notifier for Telegram mirroring
         )
         # Pass message queue to session manager
         self.session_manager.message_queue_manager = self.message_queue

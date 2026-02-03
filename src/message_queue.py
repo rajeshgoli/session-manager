@@ -32,6 +32,7 @@ class MessageQueueManager:
         session_manager,
         db_path: str = "~/.local/share/claude-sessions/message_queue.db",
         config: Optional[dict] = None,
+        notifier=None,
     ):
         """
         Initialize message queue manager.
@@ -40,8 +41,10 @@ class MessageQueueManager:
             session_manager: SessionManager instance
             db_path: Path to SQLite database
             config: Optional config dict with sm_send settings
+            notifier: Optional Notifier instance for Telegram mirroring
         """
         self.session_manager = session_manager
+        self.notifier = notifier
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -170,6 +173,28 @@ class MessageQueueManager:
     def set_notify_callback(self, callback: Callable):
         """Set callback for delivery notifications."""
         self._notify_callback = callback
+
+    async def _mirror_to_telegram(self, text: str, session, event_type: str = "agent_comm"):
+        """
+        Mirror message to Telegram. Fire-and-forget: never blocks delivery.
+
+        Args:
+            text: Message text to mirror
+            session: Session object (must have telegram_chat_id)
+            event_type: Event type for logging/categorization
+        """
+        if not self.notifier or not session or not session.telegram_chat_id:
+            return
+        try:
+            from .models import NotificationEvent
+            event = NotificationEvent(
+                session_id=session.id,
+                event_type=event_type,
+                message=text,
+            )
+            await self.notifier.notify(event, session)
+        except Exception as e:
+            logger.warning(f"Telegram mirror failed (non-fatal): {e}")
 
     async def start(self):
         """Start the queue monitoring service."""
@@ -664,6 +689,14 @@ class MessageQueueManager:
                     self._mark_delivered(msg.id)
                     logger.info(f"Delivered message {msg.id}")
 
+                    # Mirror to Telegram (fire-and-forget)
+                    if self.notifier:
+                        sender_display = msg.sender_name or (msg.sender_session_id[:8] if msg.sender_session_id else "system")
+                        # Truncate message text for display
+                        text_preview = msg.text[:200] if len(msg.text) > 200 else msg.text
+                        mirror_text = f"📨 [{sender_display}] {text_preview}"
+                        await self._mirror_to_telegram(mirror_text, session, "message_delivered")
+
                     # Handle delivery notifications
                     if msg.notify_on_delivery and msg.sender_session_id:
                         await self._send_delivery_notification(msg)
@@ -782,6 +815,12 @@ class MessageQueueManager:
         )
         logger.info(f"Sent delivery notification to {msg.sender_session_id}")
 
+        # Mirror to Telegram (fire-and-forget)
+        sender_session = self.session_manager.get_session(msg.sender_session_id)
+        if sender_session:
+            mirror_text = f"✅ {notification}"
+            await self._mirror_to_telegram(mirror_text, sender_session, "delivery_confirm")
+
     async def _send_stop_notification(
         self,
         recipient_session_id: str,
@@ -812,6 +851,12 @@ class MessageQueueManager:
             delivery_mode="sequential",
         )
         logger.info(f"Sent stop notification to {sender_session_id} (recipient: {recipient_session_id})")
+
+        # Mirror to Telegram (fire-and-forget)
+        sender_session = self.session_manager.get_session(sender_session_id)
+        if sender_session:
+            mirror_text = f"🛑 {notification}"
+            await self._mirror_to_telegram(mirror_text, sender_session, "stop_notify")
 
     async def _schedule_followup_notification(self, msg: QueuedMessage):
         """Schedule a follow-up notification after delivery."""
@@ -987,6 +1032,13 @@ class MessageQueueManager:
                         delivery_mode="urgent",  # Use urgent to interrupt
                     )
                     logger.info(f"Watch {watch_id}: {target_session_id} idle after {elapsed:.0f}s")
+
+                    # Mirror to Telegram (fire-and-forget)
+                    watcher_session = self.session_manager.get_session(watcher_session_id)
+                    if watcher_session:
+                        mirror_text = f"💤 {notification}"
+                        await self._mirror_to_telegram(mirror_text, watcher_session, "idle_notify")
+
                     return
 
                 # Wait and check again
@@ -1008,6 +1060,12 @@ class MessageQueueManager:
                 delivery_mode="urgent",  # Use urgent to interrupt
             )
             logger.info(f"Watch {watch_id}: {target_session_id} timeout after {timeout_seconds}s")
+
+            # Mirror to Telegram (fire-and-forget)
+            watcher_session = self.session_manager.get_session(watcher_session_id)
+            if watcher_session:
+                mirror_text = f"💤 {notification}"
+                await self._mirror_to_telegram(mirror_text, watcher_session, "timeout_notify")
 
         except asyncio.CancelledError:
             logger.info(f"Watch {watch_id} cancelled")
