@@ -79,6 +79,7 @@ class SendInputRequest(BaseModel):
     timeout_seconds: Optional[int] = None  # Drop message if not delivered in time
     notify_on_delivery: bool = False  # Notify sender when delivered
     notify_after_seconds: Optional[int] = None  # Notify sender N seconds after delivery
+    notify_on_stop: bool = False  # Notify sender when receiver's Stop hook fires
 
 
 class NotifyRequest(BaseModel):
@@ -790,6 +791,7 @@ def create_app(
             timeout_seconds=request.timeout_seconds,
             notify_on_delivery=request.notify_on_delivery,
             notify_after_seconds=request.notify_after_seconds,
+            notify_on_stop=request.notify_on_stop,
         )
 
         if result == DeliveryResult.FAILED:

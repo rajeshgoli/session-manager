@@ -398,6 +398,7 @@ class SessionManager:
         timeout_seconds: Optional[int] = None,
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
+        notify_on_stop: bool = False,
         bypass_queue: bool = False,
     ) -> DeliveryResult:
         """
@@ -412,6 +413,7 @@ class SessionManager:
             timeout_seconds: Drop message if not delivered in this time
             notify_on_delivery: Notify sender when delivered
             notify_after_seconds: Notify sender N seconds after delivery
+            notify_on_stop: Notify sender when receiver's Stop hook fires
             bypass_queue: If True, send directly to tmux (for permission responses)
 
         Returns:
@@ -471,6 +473,7 @@ class SessionManager:
                     timeout_seconds=timeout_seconds,
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
+                    notify_on_stop=notify_on_stop,
                 )
                 # Return DELIVERED if idle (will be delivered immediately), else QUEUED
                 return DeliveryResult.DELIVERED if is_idle else DeliveryResult.QUEUED
@@ -486,6 +489,7 @@ class SessionManager:
                     timeout_seconds=timeout_seconds,
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
+                    notify_on_stop=notify_on_stop,
                 )
                 # Urgent always delivers (sends Escape first), important waits
                 if delivery_mode == "urgent":

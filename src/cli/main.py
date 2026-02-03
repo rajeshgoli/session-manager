@@ -77,6 +77,7 @@ def main():
     send_parser.add_argument("--important", action="store_true", help="Inject immediately, queue behind current work")
     send_parser.add_argument("--urgent", action="store_true", help="Interrupt immediately")
     send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
+    send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
 
     # sm wait <session-id> <seconds>
     wait_parser = subparsers.add_parser("wait", help="Wait for session to go idle (or timeout)")
@@ -214,7 +215,9 @@ def main():
             delivery_mode = "important"
         # Extract wait parameter
         wait_seconds = args.wait if hasattr(args, 'wait') else None
-        sys.exit(commands.cmd_send(client, args.session_id, args.text, delivery_mode, wait_seconds=wait_seconds))
+        # notify_on_stop defaults to True unless --no-notify-on-stop is passed
+        notify_on_stop = not getattr(args, 'no_notify_on_stop', False)
+        sys.exit(commands.cmd_send(client, args.session_id, args.text, delivery_mode, wait_seconds=wait_seconds, notify_on_stop=notify_on_stop))
     elif args.command == "wait":
         sys.exit(commands.cmd_wait(client, args.session_id, args.seconds))
     elif args.command == "spawn":

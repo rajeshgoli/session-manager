@@ -159,6 +159,7 @@ class SessionManagerClient:
         timeout_seconds: Optional[int] = None,
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
+        notify_on_stop: bool = False,
     ) -> tuple[bool, bool]:
         """
         Send text input to a session.
@@ -172,6 +173,7 @@ class SessionManagerClient:
             timeout_seconds: Drop message if not delivered in this time
             notify_on_delivery: Notify sender when delivered
             notify_after_seconds: Notify sender N seconds after delivery
+            notify_on_stop: Notify sender when receiver's Stop hook fires
 
         Returns:
             Tuple of (success, unavailable)
@@ -185,6 +187,8 @@ class SessionManagerClient:
             payload["notify_on_delivery"] = notify_on_delivery
         if notify_after_seconds is not None:
             payload["notify_after_seconds"] = notify_after_seconds
+        if notify_on_stop:
+            payload["notify_on_stop"] = notify_on_stop
 
         data, success, unavailable = self._request(
             "POST",
@@ -346,14 +350,12 @@ class SessionManagerClient:
         Returns:
             Dict with watch info or None if unavailable
         """
-        payload = {
-            "watcher_session_id": watcher_session_id,
-            "timeout_seconds": timeout_seconds,
-        }
+        # Server expects query params, not JSON body
+        query = f"watcher_session_id={watcher_session_id}&timeout_seconds={timeout_seconds}"
         data, success, unavailable = self._request(
             "POST",
-            f"/sessions/{target_session_id}/watch",
-            payload,
+            f"/sessions/{target_session_id}/watch?{query}",
+            None,
             timeout=5,
         )
         if unavailable:

@@ -255,6 +255,7 @@ class QueuedMessage:
     timeout_at: Optional[datetime] = None  # None = no timeout
     notify_on_delivery: bool = False
     notify_after_seconds: Optional[int] = None  # None = no post-delivery notification
+    notify_on_stop: bool = False  # Notify sender when receiver's Stop hook fires
     delivered_at: Optional[datetime] = None  # None = pending
 
     def to_dict(self) -> dict:
@@ -270,6 +271,7 @@ class QueuedMessage:
             "timeout_at": self.timeout_at.isoformat() if self.timeout_at else None,
             "notify_on_delivery": self.notify_on_delivery,
             "notify_after_seconds": self.notify_after_seconds,
+            "notify_on_stop": self.notify_on_stop,
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
         }
 
@@ -283,3 +285,5 @@ class SessionDeliveryState:
     saved_user_input: Optional[str] = None  # Saved input during delivery
     pending_user_input: Optional[str] = None  # Currently detected input
     pending_input_first_seen: Optional[datetime] = None  # When we first saw the pending input
+    stop_notify_sender_id: Optional[str] = None  # Sender to notify on Stop hook
+    stop_notify_sender_name: Optional[str] = None  # Sender name for notification

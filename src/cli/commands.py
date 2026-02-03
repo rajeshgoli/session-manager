@@ -668,6 +668,7 @@ def cmd_send(
     notify_on_delivery: bool = False,
     notify_after_seconds: Optional[int] = None,
     wait_seconds: Optional[int] = None,
+    notify_on_stop: bool = True,
 ) -> int:
     """
     Send input text to a session.
@@ -681,6 +682,7 @@ def cmd_send(
         notify_on_delivery: Notify sender when delivered
         notify_after_seconds: Notify sender N seconds after delivery
         wait_seconds: Notify sender N seconds after delivery if recipient is idle (alias for notify_after_seconds)
+        notify_on_stop: Notify sender when receiver's Stop hook fires (default True)
 
     Exit codes:
         0: Success
@@ -715,6 +717,7 @@ def cmd_send(
         timeout_seconds=timeout_seconds,
         notify_on_delivery=notify_on_delivery,
         notify_after_seconds=effective_notify_after,
+        notify_on_stop=notify_on_stop,
     )
 
     if unavailable:
@@ -742,6 +745,8 @@ def cmd_send(
         extras.append("notify-on-delivery")
     if effective_notify_after:
         extras.append(f"wait={effective_notify_after}s")
+    if notify_on_stop:
+        extras.append("notify-on-stop")
     if extras:
         print(f"  Options: {', '.join(extras)}")
 

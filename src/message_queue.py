@@ -105,6 +105,7 @@ class MessageQueueManager:
                 timeout_at TIMESTAMP,
                 notify_on_delivery INTEGER DEFAULT 0,
                 notify_after_seconds INTEGER,
+                notify_on_stop INTEGER DEFAULT 0,
                 delivered_at TIMESTAMP
             )
         """)
@@ -124,6 +125,12 @@ class MessageQueueManager:
                 fired INTEGER DEFAULT 0
             )
         """)
+        # Migration: add notify_on_stop column if it doesn't exist
+        cursor.execute("PRAGMA table_info(message_queue)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "notify_on_stop" not in columns:
+            cursor.execute("ALTER TABLE message_queue ADD COLUMN notify_on_stop INTEGER DEFAULT 0")
+            logger.info("Migrated message_queue: added notify_on_stop column")
         self._db_conn.commit()
         logger.info(f"Message queue database initialized at {self.db_path} (WAL mode enabled)")
 
@@ -228,12 +235,24 @@ class MessageQueueManager:
         """
         Mark a session as idle (called when Stop hook fires).
 
-        This triggers delivery check for any queued messages.
+        This triggers delivery check for any queued messages and
+        sends stop notification to sender if requested.
         """
         state = self._get_or_create_state(session_id)
         state.is_idle = True
         state.last_idle_at = datetime.now()
         logger.info(f"Session {session_id} marked idle")
+
+        # Send stop notification if a sender is waiting
+        if state.stop_notify_sender_id:
+            asyncio.create_task(self._send_stop_notification(
+                recipient_session_id=session_id,
+                sender_session_id=state.stop_notify_sender_id,
+                sender_name=state.stop_notify_sender_name,
+            ))
+            # Clear after sending
+            state.stop_notify_sender_id = None
+            state.stop_notify_sender_name = None
 
         # Trigger async delivery check
         asyncio.create_task(self._try_deliver_messages(session_id))
@@ -269,6 +288,7 @@ class MessageQueueManager:
         timeout_seconds: Optional[int] = None,
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
+        notify_on_stop: bool = False,
     ) -> QueuedMessage:
         """
         Queue a message for delivery.
@@ -282,6 +302,7 @@ class MessageQueueManager:
             timeout_seconds: Drop message if not delivered in this time
             notify_on_delivery: Notify sender when delivered
             notify_after_seconds: Notify sender N seconds after delivery
+            notify_on_stop: Notify sender when receiver's Stop hook fires
 
         Returns:
             QueuedMessage with assigned ID
@@ -296,14 +317,15 @@ class MessageQueueManager:
             timeout_at=datetime.now() + timedelta(seconds=timeout_seconds) if timeout_seconds else None,
             notify_on_delivery=notify_on_delivery,
             notify_after_seconds=notify_after_seconds,
+            notify_on_stop=notify_on_stop,
         )
 
         # Persist to database
         self._execute("""
             INSERT INTO message_queue
             (id, target_session_id, sender_session_id, sender_name, text,
-             delivery_mode, queued_at, timeout_at, notify_on_delivery, notify_after_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             delivery_mode, queued_at, timeout_at, notify_on_delivery, notify_after_seconds, notify_on_stop)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id,
             msg.target_session_id,
@@ -315,6 +337,7 @@ class MessageQueueManager:
             msg.timeout_at.isoformat() if msg.timeout_at else None,
             1 if msg.notify_on_delivery else 0,
             msg.notify_after_seconds,
+            1 if msg.notify_on_stop else 0,
         ))
 
         queue_len = self.get_queue_length(target_session_id)
@@ -648,6 +671,11 @@ class MessageQueueManager:
                     if msg.notify_after_seconds and msg.sender_session_id:
                         await self._schedule_followup_notification(msg)
 
+                    # Track sender for stop notification (last message with notify_on_stop wins)
+                    if msg.notify_on_stop and msg.sender_session_id:
+                        state.stop_notify_sender_id = msg.sender_session_id
+                        state.stop_notify_sender_name = msg.sender_name
+
                 # Update session activity
                 session.last_activity = datetime.now()
                 from .models import SessionStatus
@@ -702,6 +730,11 @@ class MessageQueueManager:
                 # Handle notifications
                 if msg.notify_on_delivery and msg.sender_session_id:
                     await self._send_delivery_notification(msg)
+
+                # Track sender for stop notification
+                if msg.notify_on_stop and msg.sender_session_id:
+                    state.stop_notify_sender_id = msg.sender_session_id
+                    state.stop_notify_sender_name = msg.sender_name
             else:
                 logger.error(f"Failed to deliver urgent message to {session_id}")
 
@@ -748,6 +781,37 @@ class MessageQueueManager:
             delivery_mode="sequential",
         )
         logger.info(f"Sent delivery notification to {msg.sender_session_id}")
+
+    async def _send_stop_notification(
+        self,
+        recipient_session_id: str,
+        sender_session_id: str,
+        sender_name: Optional[str] = None,
+    ):
+        """
+        Send notification to sender when recipient's Stop hook fires.
+
+        Args:
+            recipient_session_id: Session that completed (Stop hook fired)
+            sender_session_id: Session to notify
+            sender_name: Optional friendly name of sender
+        """
+        # Get recipient name for the notification
+        recipient_session = self.session_manager.get_session(recipient_session_id)
+        recipient_name = (
+            recipient_session.friendly_name or recipient_session.name or recipient_session_id
+            if recipient_session else recipient_session_id
+        )
+
+        notification = f"[sm] {recipient_name} ({recipient_session_id[:8]}) completed (Stop hook fired)"
+
+        # Queue notification to sender (as system message)
+        self.queue_message(
+            target_session_id=sender_session_id,
+            text=notification,
+            delivery_mode="sequential",
+        )
+        logger.info(f"Sent stop notification to {sender_session_id} (recipient: {recipient_session_id})")
 
     async def _schedule_followup_notification(self, msg: QueuedMessage):
         """Schedule a follow-up notification after delivery."""
