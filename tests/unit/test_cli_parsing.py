@@ -398,3 +398,21 @@ class TestParseDuration:
 
         with pytest.raises(ValueError):
             parse_duration("abc123")
+
+    def test_parse_zero_raises(self):
+        """Zero duration raises ValueError (Issue #106)."""
+        with pytest.raises(ValueError, match="Duration must be positive"):
+            parse_duration("0s")
+
+        with pytest.raises(ValueError, match="Duration must be positive"):
+            parse_duration("0m")
+
+        with pytest.raises(ValueError, match="Duration must be positive"):
+            parse_duration("0")
+
+    def test_parse_negative_raises(self):
+        """Negative duration raises ValueError (Issue #106)."""
+        # Note: Current implementation doesn't support negative syntax (e.g., "-5m")
+        # but if someone passes 0 it should fail
+        with pytest.raises(ValueError, match="Duration must be positive"):
+            parse_duration("0h0m0s")

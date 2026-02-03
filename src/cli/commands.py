@@ -29,7 +29,10 @@ def parse_duration(duration_str: str) -> int:
 
     # Try pure integer (assume seconds)
     if duration_str.isdigit():
-        return int(duration_str)
+        seconds = int(duration_str)
+        if seconds <= 0:
+            raise ValueError("Duration must be positive")
+        return seconds
 
     total_seconds = 0
     pattern = re.compile(r'(\d+)([smhd])', re.IGNORECASE)
@@ -49,6 +52,9 @@ def parse_duration(duration_str: str) -> int:
             total_seconds += value * 3600
         elif unit == 'd':
             total_seconds += value * 86400
+
+    if total_seconds <= 0:
+        raise ValueError("Duration must be positive")
 
     return total_seconds
 

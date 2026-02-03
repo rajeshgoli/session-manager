@@ -423,6 +423,52 @@ class TestUpdateSession:
         assert response.status_code == 400
         assert "too long" in response.json()["detail"].lower()
 
+    def test_update_friendly_name_logs_telegram_failure(self, mock_session_manager, mock_output_monitor, caplog):
+        """PATCH /sessions/{id} logs warning when Telegram rename fails (Issue #106)."""
+        import logging
+        from src.server import create_app
+        from fastapi.testclient import TestClient
+
+        # Create session with Telegram thread ID
+        session = Session(
+            id="test123",
+            name="test-session",
+            working_dir="/tmp/test",
+            tmux_session="claude-test123",
+            log_file="/tmp/test.log",
+            status=SessionStatus.RUNNING,
+            created_at=datetime(2024, 1, 15, 10, 0, 0),
+            last_activity=datetime(2024, 1, 15, 11, 0, 0),
+            telegram_thread_id=42,  # Has Telegram thread
+        )
+
+        mock_session_manager.get_session.return_value = session
+        mock_session_manager.tmux.set_status_bar.return_value = True
+
+        # Mock notifier that fails to rename
+        mock_notifier = MagicMock()
+        mock_notifier.rename_session_topic = AsyncMock(return_value=False)
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=mock_notifier,
+            output_monitor=mock_output_monitor,
+            config={},
+        )
+        client = TestClient(app)
+
+        with caplog.at_level(logging.WARNING):
+            response = client.patch(
+                "/sessions/test123",
+                json={"friendly_name": "new-name"}
+            )
+
+        assert response.status_code == 200
+
+        # Verify warning was logged
+        assert any("Failed to rename Telegram topic" in record.message for record in caplog.records)
+        assert any("test123" in record.message for record in caplog.records)
+
     def test_update_task(self, test_client, mock_session_manager, sample_session):
         """PUT /sessions/{id}/task updates current task."""
         mock_session_manager.get_session.return_value = sample_session

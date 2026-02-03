@@ -747,7 +747,9 @@ def create_app(
             app.state.session_manager.tmux.set_status_bar(session.tmux_session, friendly_name)
             # Update Telegram topic name if applicable
             if session.telegram_thread_id and app.state.notifier:
-                await app.state.notifier.rename_session_topic(session, friendly_name)
+                success = await app.state.notifier.rename_session_topic(session, friendly_name)
+                if not success:
+                    logger.warning(f"Failed to rename Telegram topic for session {session_id}")
 
         return SessionResponse(
             id=session.id,
