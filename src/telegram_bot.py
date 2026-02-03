@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-from .models import Session, UserInput, NotificationChannel
+from .models import Session, UserInput, NotificationChannel, DeliveryResult
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ class TelegramBot:
         self._on_new_session: Optional[Callable[[int, str], Awaitable[Optional[Session]]]] = None
         self._on_list_sessions: Optional[Callable[[], Awaitable[list[Session]]]] = None
         self._on_kill_session: Optional[Callable[[str], Awaitable[bool]]] = None
-        self._on_session_input: Optional[Callable[[UserInput], Awaitable[bool]]] = None
+        self._on_session_input: Optional[Callable[[UserInput], Awaitable[DeliveryResult]]] = None
         self._on_session_status: Optional[Callable[[str], Awaitable[Optional[Session]]]] = None
         self._on_open_terminal: Optional[Callable[[str], Awaitable[bool]]] = None
         self._on_update_thread: Optional[Callable[[str, int, int], Awaitable[None]]] = None
@@ -150,6 +150,8 @@ class TelegramBot:
         self._topic_sessions: dict[tuple[int, int], str] = {}  # (chat_id, topic_id) -> session_id
         # Track "Input sent" messages to delete when response arrives
         self._pending_input_msgs: dict[str, tuple[int, int]] = {}  # session_id -> (chat_id, msg_id)
+        # Track sessions that have completed (for progress monitoring)
+        self._completed_sessions: set[str] = set()
 
     def load_session_threads(self, sessions: list[Session]):
         """Load thread and topic mappings from existing sessions (call on startup)."""
@@ -719,6 +721,63 @@ Provide ONLY the summary, no preamble or questions."""
             logger.error(f"Error interrupting session: {e}")
             await update.message.reply_text(f"Error: {e}")
 
+    async def _cmd_force(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /force command to interrupt Claude and deliver message immediately."""
+        if not self._is_allowed(update.effective_chat.id, update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+
+        if not self._on_session_input:
+            await update.message.reply_text("Input handler not configured.")
+            return
+
+        # Find session from topic or reply context
+        session_id = self._get_session_from_context(update)
+
+        if not session_id:
+            await update.message.reply_text(
+                "Could not identify session. Use /force in a session topic or reply to a session message."
+            )
+            return
+
+        # Get the message text (everything after /force)
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /force <message>\n"
+                "Interrupts Claude and delivers your message immediately."
+            )
+            return
+
+        text = " ".join(context.args)
+        chat_id = update.effective_chat.id
+
+        try:
+            # Create UserInput with urgent delivery mode
+            user_input = UserInput(
+                session_id=session_id,
+                text=text,
+                source=NotificationChannel.TELEGRAM,
+                chat_id=chat_id,
+                message_id=update.message.message_id,
+                delivery_mode="urgent",  # Sends Escape first, then delivers
+            )
+
+            result = await self._on_session_input(user_input)
+
+            if result == DeliveryResult.DELIVERED:
+                msg = await update.message.reply_text(f"[{session_id}] ⚡ Interrupted & delivered")
+                # Track this message for deletion when response arrives
+                self._pending_input_msgs[session_id] = (chat_id, msg.message_id)
+            elif result == DeliveryResult.QUEUED:
+                # Shouldn't happen with urgent mode, but handle it
+                await update.message.reply_text(f"[{session_id}] ⏳ Queued (unexpected)")
+            else:
+                await update.message.reply_text(f"[{session_id}] ❌ Failed to force-deliver")
+
+        except Exception as e:
+            logger.error(f"Error force-delivering message: {e}")
+            await update.message.reply_text(f"Error: {e}")
+
     async def _cmd_open(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /open command to open session in Terminal."""
         if not self._is_allowed(update.effective_chat.id, update.effective_user.id):
@@ -827,14 +886,23 @@ Provide ONLY the summary, no preamble or questions."""
         )
 
         try:
-            success = await self._on_session_input(user_input)
+            result = await self._on_session_input(user_input)
 
-            if success:
-                msg = await update.message.reply_text(f"[{session_id}] Input sent.")
+            if result == DeliveryResult.DELIVERED:
+                msg = await update.message.reply_text(f"[{session_id}] ✓ Delivered")
                 # Track this message so we can delete it when response arrives
                 self._pending_input_msgs[session_id] = (chat_id, msg.message_id)
+                # Start progress monitoring for delivered messages
+                asyncio.create_task(self._monitor_progress(session_id, chat_id, msg.message_id))
+            elif result == DeliveryResult.QUEUED:
+                msg = await update.message.reply_text(
+                    f"[{session_id}] ⏳ Queued (session working)\n"
+                    f"Reply /force to deliver immediately"
+                )
+                # Track queued message for potential /force promotion
+                self._pending_input_msgs[session_id] = (chat_id, msg.message_id)
             else:
-                await update.message.reply_text(f"[{session_id}] Failed to send input.")
+                await update.message.reply_text(f"[{session_id}] ❌ Failed to send input")
 
         except Exception as e:
             logger.error(f"Error sending input: {e}")
@@ -909,6 +977,9 @@ Provide ONLY the summary, no preamble or questions."""
 
     async def delete_pending_input_msg(self, session_id: str):
         """Delete the 'Input sent' message for a session (called when response arrives)."""
+        # Mark session as completed to stop progress monitoring
+        self._completed_sessions.add(session_id)
+
         pending = self._pending_input_msgs.pop(session_id, None)
         if pending and self.bot:
             chat_id, msg_id = pending
@@ -916,6 +987,62 @@ Provide ONLY the summary, no preamble or questions."""
                 await self.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except Exception as e:
                 logger.debug(f"Could not delete input msg: {e}")
+
+    async def _monitor_progress(self, session_id: str, chat_id: int, msg_id: int):
+        """
+        Update message with Claude's progress every 5 seconds.
+
+        Runs until the Stop hook fires (session added to _completed_sessions)
+        or a timeout is reached (60 seconds).
+        """
+        # Clear any previous completion flag for this session
+        self._completed_sessions.discard(session_id)
+
+        last_content = ""
+        max_iterations = 12  # 60 seconds total (5s * 12)
+
+        for _ in range(max_iterations):
+            await asyncio.sleep(5)
+
+            # Check if Stop hook fired (response complete)
+            if session_id in self._completed_sessions:
+                self._completed_sessions.discard(session_id)
+                return
+
+            # Check if message was removed from tracking (e.g., replaced by response)
+            if session_id not in self._pending_input_msgs:
+                return
+
+            # Get current tmux output
+            if not self._on_get_tmux_output:
+                return
+
+            try:
+                output = await self._on_get_tmux_output(session_id, 20)
+                if not output or output == last_content:
+                    continue
+
+                last_content = output
+
+                # Strip ANSI codes and truncate for display
+                from .notifier import strip_ansi
+                clean_output = strip_ansi(output)
+
+                # Truncate if too long
+                if len(clean_output) > 400:
+                    clean_output = "..." + clean_output[-400:]
+
+                # Update the message with progress
+                if self.bot:
+                    await self.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=f"[{session_id}] ⏳ Working...\n```\n{clean_output}\n```",
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                # Message might be deleted or rate limited
+                logger.debug(f"Could not update progress message: {e}")
 
     async def create_forum_topic(self, chat_id: int, name: str) -> Optional[int]:
         """Create a forum topic and return its ID."""
@@ -1397,6 +1524,7 @@ Provide ONLY the summary, no preamble or questions."""
         self.application.add_handler(CommandHandler("summary", self._cmd_summary))
         self.application.add_handler(CommandHandler("kill", self._cmd_kill))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
+        self.application.add_handler(CommandHandler("force", self._cmd_force))
         self.application.add_handler(CommandHandler("open", self._cmd_open))
         self.application.add_handler(CommandHandler("name", self._cmd_name))
         self.application.add_handler(CommandHandler("password", self._cmd_password))

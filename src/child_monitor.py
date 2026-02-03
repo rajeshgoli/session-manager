@@ -7,6 +7,8 @@ from typing import Optional, Dict, Set
 from pathlib import Path
 import json
 
+from .models import DeliveryResult
+
 logger = logging.getLogger(__name__)
 
 
@@ -215,14 +217,14 @@ class ChildMonitor:
         notification = f"Child {child_name} ({child_session_id[:8]}) completed: {completion_message}"
 
         # Send to parent's input
-        success = await self.session_manager.send_input(
+        result = await self.session_manager.send_input(
             parent_session_id,
             notification,
             sender_session_id=child_session_id
         )
 
-        if success:
-            logger.info(f"Sent completion notification to parent {parent_session_id}: {notification}")
+        if result != DeliveryResult.FAILED:
+            logger.info(f"Sent completion notification to parent {parent_session_id}: {notification} (result={result.value})")
             # Mark child as completed
             if child_session:
                 from src.models import CompletionStatus

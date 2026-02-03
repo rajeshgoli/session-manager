@@ -13,7 +13,7 @@ from typing import Optional
 import yaml
 import uvicorn
 
-from .models import Session, SessionStatus, NotificationEvent, UserInput
+from .models import Session, SessionStatus, NotificationEvent, UserInput, DeliveryResult
 from .session_manager import SessionManager
 from .output_monitor import OutputMonitor
 from .telegram_bot import TelegramBot
@@ -236,15 +236,16 @@ class SessionManagerApp:
             await self.output_monitor.stop_monitoring(session_id)
             return self.session_manager.kill_session(session_id)
 
-        async def on_session_input(user_input: UserInput) -> bool:
-            success = await self.session_manager.send_input(
+        async def on_session_input(user_input: UserInput) -> DeliveryResult:
+            result = await self.session_manager.send_input(
                 user_input.session_id,
                 user_input.text,
                 bypass_queue=user_input.is_permission_response,
+                delivery_mode=getattr(user_input, 'delivery_mode', 'sequential'),
             )
-            if success:
+            if result != DeliveryResult.FAILED:
                 self.output_monitor.update_activity(user_input.session_id)
-            return success
+            return result
 
         async def on_session_status(session_id: str) -> Optional[Session]:
             return self.session_manager.get_session(session_id)

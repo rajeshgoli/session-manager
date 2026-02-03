@@ -25,6 +25,13 @@ class DeliveryMode(Enum):
     URGENT = "urgent"
 
 
+class DeliveryResult(Enum):
+    """Result of message delivery attempt."""
+    DELIVERED = "delivered"  # Message was delivered immediately (session idle)
+    QUEUED = "queued"        # Message was queued (session busy)
+    FAILED = "failed"        # Message delivery failed
+
+
 class NotificationChannel(Enum):
     """Available notification channels."""
     TELEGRAM = "telegram"
@@ -232,6 +239,7 @@ class UserInput:
     chat_id: Optional[int] = None
     message_id: Optional[int] = None
     is_permission_response: bool = False  # If True, bypass queue and send directly
+    delivery_mode: str = "sequential"  # sequential, important, urgent
 
 
 @dataclass

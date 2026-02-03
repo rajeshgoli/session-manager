@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 
-from .models import Session, SessionStatus, NotificationEvent
+from .models import Session, SessionStatus, NotificationEvent, DeliveryResult
 from .tmux_controller import TmuxController
 
 logger = logging.getLogger(__name__)
@@ -399,7 +399,7 @@ class SessionManager:
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
         bypass_queue: bool = False,
-    ) -> bool:
+    ) -> DeliveryResult:
         """
         Send input to a session with optional sender metadata and delivery mode.
 
@@ -415,12 +415,12 @@ class SessionManager:
             bypass_queue: If True, send directly to tmux (for permission responses)
 
         Returns:
-            True if successful
+            DeliveryResult indicating whether message was DELIVERED, QUEUED, or FAILED
         """
         session = self.sessions.get(session_id)
         if not session:
             logger.error(f"Session not found: {session_id}")
-            return False
+            return DeliveryResult.FAILED
 
         # For permission responses, bypass queue and send directly
         if bypass_queue:
@@ -428,7 +428,7 @@ class SessionManager:
             success = await self.tmux.send_input_async(session.tmux_session, text)
             if success:
                 session.last_activity = datetime.now()
-            return success
+            return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
         # Format message with sender metadata if provided
         sender_name = None
@@ -456,9 +456,12 @@ class SessionManager:
 
         # Handle delivery modes using the message queue manager
         if self.message_queue_manager:
+            # Check if session is idle (will be delivered immediately)
+            state = self.message_queue_manager.delivery_states.get(session_id)
+            is_idle = state.is_idle if state else True  # Assume idle if no state yet
+
             # For sequential mode, always queue (queue manager handles idle detection)
             if delivery_mode == "sequential":
-                # Check if session is idle - if so, queue will deliver immediately
                 self.message_queue_manager.queue_message(
                     target_session_id=session_id,
                     text=formatted_text,
@@ -469,7 +472,8 @@ class SessionManager:
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
                 )
-                return True
+                # Return DELIVERED if idle (will be delivered immediately), else QUEUED
+                return DeliveryResult.DELIVERED if is_idle else DeliveryResult.QUEUED
 
             # For important/urgent, queue handles delivery logic
             if delivery_mode in ("important", "urgent"):
@@ -483,7 +487,10 @@ class SessionManager:
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
                 )
-                return True
+                # Urgent always delivers (sends Escape first), important waits
+                if delivery_mode == "urgent":
+                    return DeliveryResult.DELIVERED
+                return DeliveryResult.DELIVERED if is_idle else DeliveryResult.QUEUED
 
         # Fallback: send immediately (no queue manager or unknown mode)
         success = await self.tmux.send_input_async(session.tmux_session, formatted_text)
@@ -492,7 +499,7 @@ class SessionManager:
             session.status = SessionStatus.RUNNING
             self._save_state()
 
-        return success
+        return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
     async def _notify_sm_send(
         self,

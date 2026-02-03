@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Body, Request
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus
+from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus, DeliveryResult
 
 logger = logging.getLogger(__name__)
 
@@ -781,7 +781,7 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        success = await app.state.session_manager.send_input(
+        result = await app.state.session_manager.send_input(
             session_id,
             request.text,
             sender_session_id=request.sender_session_id,
@@ -792,27 +792,28 @@ def create_app(
             notify_after_seconds=request.notify_after_seconds,
         )
 
-        if not success:
+        if result == DeliveryResult.FAILED:
             raise HTTPException(status_code=500, detail="Failed to send input")
 
         # Update activity in monitor
         if app.state.output_monitor:
             app.state.output_monitor.update_activity(session_id)
 
-        # For queued messages, return queue info
-        if request.delivery_mode == "sequential":
-            queue_mgr = app.state.session_manager.message_queue_manager
-            if queue_mgr and not queue_mgr.is_session_idle(session_id):
-                queue_len = queue_mgr.get_queue_length(session_id)
-                return {
-                    "status": "queued",
-                    "session_id": session_id,
-                    "queue_position": queue_len,
-                    "delivery_mode": request.delivery_mode,
-                    "estimated_delivery": "waiting_for_idle",
-                }
+        # Return delivery result with queue info if queued
+        response = {
+            "status": result.value,  # "delivered", "queued", or "failed"
+            "session_id": session_id,
+            "delivery_mode": request.delivery_mode,
+        }
 
-        return {"status": "sent", "session_id": session_id}
+        if result == DeliveryResult.QUEUED:
+            queue_mgr = app.state.session_manager.message_queue_manager
+            if queue_mgr:
+                queue_len = queue_mgr.get_queue_length(session_id)
+                response["queue_position"] = queue_len
+                response["estimated_delivery"] = "waiting_for_idle"
+
+        return response
 
     @app.post("/sessions/{session_id}/key")
     async def send_key(session_id: str, key: str = Body(..., embed=True)):

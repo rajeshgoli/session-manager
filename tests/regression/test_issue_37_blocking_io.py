@@ -12,7 +12,7 @@ from datetime import datetime
 
 from src.session_manager import SessionManager
 from src.message_queue import MessageQueueManager
-from src.models import Session, SessionStatus
+from src.models import Session, SessionStatus, DeliveryResult
 
 
 @pytest.fixture
@@ -136,7 +136,7 @@ async def test_send_input_async_uses_send_input_async(session_manager, mock_tmux
 
     # Verify send_input_async was called (not send_input)
     mock_tmux.send_input_async.assert_called_once_with("tmux-test", "test input")
-    assert success is True
+    assert success == DeliveryResult.DELIVERED
 
 
 @pytest.mark.asyncio
