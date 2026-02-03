@@ -82,6 +82,30 @@ def resolve_session_id(client: SessionManagerClient, identifier: str) -> tuple[O
     return None, None  # Not found
 
 
+def validate_friendly_name(name: str) -> tuple[bool, str]:
+    """
+    Validate friendly name for shell compatibility.
+
+    Args:
+        name: The friendly name to validate
+
+    Returns:
+        Tuple of (is_valid, error_message)
+        If valid, error_message is empty string
+        If invalid, error_message describes the problem
+    """
+    if not name:
+        return False, "Name cannot be empty"
+
+    if len(name) > 32:
+        return False, "Name too long (max 32 chars)"
+
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return False, "Name must be alphanumeric with - or _ only (no spaces)"
+
+    return True, ""
+
+
 def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str, new_name: Optional[str] = None) -> int:
     """
     Set friendly name for current session or a child session.
@@ -100,6 +124,13 @@ def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str
     # Case 1: Rename self (sm name <name>)
     if new_name is None:
         friendly_name = name_or_session
+
+        # Validate the name
+        valid, error = validate_friendly_name(friendly_name)
+        if not valid:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+
         success, unavailable = client.update_friendly_name(session_id, friendly_name)
 
         if success:
@@ -115,6 +146,12 @@ def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str
     # Case 2: Rename child session (sm name <session> <name>)
     target_identifier = name_or_session
     friendly_name = new_name
+
+    # Validate the name
+    valid, error = validate_friendly_name(friendly_name)
+    if not valid:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
 
     # Resolve identifier to session ID and get session details
     target_session_id, target_session = resolve_session_id(client, target_identifier)
