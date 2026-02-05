@@ -592,6 +592,9 @@ class MessageQueueManager:
         session = self.session_manager.get_session(session_id)
         if not session:
             return
+        if getattr(session, "provider", "claude") == "codex":
+            # Codex has no tmux input line to inspect
+            return
 
         current_input = await self._get_pending_user_input_async(session.tmux_session)
 
@@ -657,7 +660,9 @@ class MessageQueueManager:
                     return
 
             # Check for user input (final gate)
-            current_input = await self._get_pending_user_input_async(session.tmux_session)
+            current_input = None
+            if getattr(session, "provider", "claude") != "codex":
+                current_input = await self._get_pending_user_input_async(session.tmux_session)
             if current_input and not state.saved_user_input:
                 # User is typing - don't inject
                 logger.debug(f"User typing detected at final gate, aborting delivery")
@@ -678,7 +683,7 @@ class MessageQueueManager:
 
             # Inject the message (use async version to avoid blocking event loop)
             logger.info(f"Delivering {len(batch)} message(s) to {session_id}")
-            success = await self.session_manager.tmux.send_input_async(session.tmux_session, payload)
+            success = await self.session_manager._deliver_direct(session, payload)
 
             if success:
                 # Mark session as active
@@ -725,6 +730,26 @@ class MessageQueueManager:
             return
 
         try:
+            if getattr(session, "provider", "claude") == "codex":
+                success = await self.session_manager._deliver_urgent(session, msg.text)
+                if success:
+                    self._mark_delivered(msg.id)
+                    state = self._get_or_create_state(session_id)
+                    state.is_idle = False
+                    logger.info(f"Urgent message {msg.id} delivered to {session_id} (codex)")
+
+                    # Handle notifications
+                    if msg.notify_on_delivery and msg.sender_session_id:
+                        await self._send_delivery_notification(msg)
+
+                    # Track sender for stop notification
+                    if msg.notify_on_stop and msg.sender_session_id:
+                        state.stop_notify_sender_id = msg.sender_session_id
+                        state.stop_notify_sender_name = msg.sender_name
+                else:
+                    logger.error(f"Failed to deliver urgent message to {session_id} (codex)")
+                return
+
             # If session is completed, wake it up first (like cmd_clear does)
             from src.models import CompletionStatus
             if session.completion_status == CompletionStatus.COMPLETED:
@@ -752,7 +777,7 @@ class MessageQueueManager:
             await asyncio.sleep(self.urgent_delay_ms / 1000)
 
             # Inject message directly (use async version to avoid blocking)
-            success = await self.session_manager.tmux.send_input_async(session.tmux_session, msg.text)
+            success = await self.session_manager._deliver_direct(session, msg.text)
 
             if success:
                 self._mark_delivered(msg.id)
@@ -785,6 +810,10 @@ class MessageQueueManager:
 
         session = self.session_manager.get_session(session_id)
         if not session:
+            return
+        if getattr(session, "provider", "claude") == "codex":
+            # Codex has no tmux input to restore
+            state.saved_user_input = None
             return
 
         # Restore the saved input

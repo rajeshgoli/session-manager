@@ -17,6 +17,16 @@ from .cli.commands import validate_friendly_name
 logger = logging.getLogger(__name__)
 
 
+def _normalize_provider(provider: Optional[str]) -> str:
+    """Normalize/validate provider string."""
+    if not provider:
+        return "claude"
+    provider = provider.lower()
+    if provider not in ("claude", "codex"):
+        raise HTTPException(status_code=400, detail=f"Invalid provider: {provider}")
+    return provider
+
+
 class RequestTimingMiddleware(BaseHTTPMiddleware):
     """Log slow requests for debugging."""
 
@@ -54,6 +64,7 @@ class CreateSessionRequest(BaseModel):
     """Request to create a new session."""
     working_dir: str = "~"
     name: Optional[str] = None
+    provider: Optional[str] = "claude"
 
 
 class SessionResponse(BaseModel):
@@ -65,6 +76,7 @@ class SessionResponse(BaseModel):
     created_at: str
     last_activity: str
     tmux_session: str
+    provider: Optional[str] = "claude"
     friendly_name: Optional[str] = None
     current_task: Optional[str] = None
     git_remote_url: Optional[str] = None
@@ -81,6 +93,11 @@ class SendInputRequest(BaseModel):
     notify_on_delivery: bool = False  # Notify sender when delivered
     notify_after_seconds: Optional[int] = None  # Notify sender N seconds after delivery
     notify_on_stop: bool = False  # Notify sender when receiver's Stop hook fires
+
+
+class ClearSessionRequest(BaseModel):
+    """Request to clear/reset a session context."""
+    prompt: Optional[str] = None
 
 
 class NotifyRequest(BaseModel):
@@ -136,6 +153,7 @@ class SpawnChildRequest(BaseModel):
     wait: Optional[int] = None
     model: Optional[str] = None
     working_dir: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class KillSessionRequest(BaseModel):
@@ -343,14 +361,16 @@ def create_app(
                 message=f"Failed to list tmux sessions: {e}",
             )
 
-        # Check for sessions in memory that don't exist in tmux
+        # Check for sessions in memory that don't exist in tmux (Claude only)
         missing_in_tmux = []
         for session in memory_sessions:
+            if getattr(session, "provider", "claude") == "codex":
+                continue
             if session.status not in (SessionStatus.STOPPED,) and session.tmux_session not in all_tmux_sessions:
                 missing_in_tmux.append(session.id)
 
         # Check for orphaned tmux sessions (in tmux but not in memory)
-        memory_tmux_names = {s.tmux_session for s in memory_sessions}
+        memory_tmux_names = {s.tmux_session for s in memory_sessions if getattr(s, "provider", "claude") != "codex"}
         orphaned_tmux = list(our_tmux_sessions - memory_tmux_names)
 
         # Check for duplicate session IDs (should never happen)
@@ -552,7 +572,11 @@ def create_app(
         # Check if active sessions are being monitored
         sm = app.state.session_manager
         if sm:
-            active_sessions = [s for s in sm.sessions.values() if s.status not in (SessionStatus.STOPPED,)]
+            active_sessions = [
+                s for s in sm.sessions.values()
+                if s.status not in (SessionStatus.STOPPED,)
+                and getattr(s, "provider", "claude") != "codex"
+            ]
             monitored = len(output_monitor._tasks)
             if len(active_sessions) > monitored:
                 return HealthCheckResult(
@@ -615,16 +639,18 @@ def create_app(
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
+        provider = _normalize_provider(request.provider)
         session = await app.state.session_manager.create_session(
             working_dir=request.working_dir,
             name=request.name,
+            provider=provider,
         )
 
         if not session:
             raise HTTPException(status_code=500, detail="Failed to create session")
 
-        # Start monitoring the session
-        if app.state.output_monitor:
+        # Start monitoring the session (Claude only)
+        if app.state.output_monitor and getattr(session, "provider", "claude") != "codex":
             await app.state.output_monitor.start_monitoring(session)
 
         return SessionResponse(
@@ -635,6 +661,7 @@ def create_app(
             created_at=session.created_at.isoformat(),
             last_activity=session.last_activity.isoformat(),
             tmux_session=session.tmux_session,
+            provider=getattr(session, "provider", "claude"),
             friendly_name=session.friendly_name,
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
@@ -642,7 +669,7 @@ def create_app(
         )
 
     @app.post("/sessions/create")
-    async def create_session_endpoint(working_dir: str):
+    async def create_session_endpoint(working_dir: str, provider: str = "claude"):
         """
         Create a new Claude Code session.
 
@@ -656,16 +683,18 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
         # Create session using config settings
+        provider = _normalize_provider(provider)
         session = await app.state.session_manager.create_session(
             working_dir=working_dir,
             telegram_chat_id=None,  # No Telegram association
+            provider=provider,
         )
 
         if not session:
             raise HTTPException(status_code=500, detail="Failed to create session")
 
-        # Start monitoring (same as Telegram /new does)
-        if app.state.output_monitor:
+        # Start monitoring (Claude only)
+        if app.state.output_monitor and getattr(session, "provider", "claude") != "codex":
             await app.state.output_monitor.start_monitoring(session)
 
         return session.to_dict()
@@ -688,6 +717,7 @@ def create_app(
                     created_at=s.created_at.isoformat(),
                     last_activity=s.last_activity.isoformat(),
                     tmux_session=s.tmux_session,
+                    provider=getattr(s, "provider", "claude"),
                     friendly_name=s.friendly_name,
                     current_task=s.current_task,
                     git_remote_url=s.git_remote_url,
@@ -716,6 +746,7 @@ def create_app(
             created_at=session.created_at.isoformat(),
             last_activity=session.last_activity.isoformat(),
             tmux_session=session.tmux_session,
+            provider=getattr(session, "provider", "claude"),
             friendly_name=session.friendly_name,
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
@@ -744,7 +775,8 @@ def create_app(
             session.friendly_name = friendly_name
             app.state.session_manager._save_state()
             # Update tmux status bar
-            app.state.session_manager.tmux.set_status_bar(session.tmux_session, friendly_name)
+            if getattr(session, "provider", "claude") != "codex":
+                app.state.session_manager.tmux.set_status_bar(session.tmux_session, friendly_name)
             # Update Telegram topic name if applicable
             if session.telegram_thread_id and app.state.notifier:
                 success = await app.state.notifier.rename_session_topic(session, friendly_name)
@@ -759,6 +791,7 @@ def create_app(
             created_at=session.created_at.isoformat(),
             last_activity=session.last_activity.isoformat(),
             tmux_session=session.tmux_session,
+            provider=getattr(session, "provider", "claude"),
             friendly_name=session.friendly_name,
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
@@ -844,6 +877,22 @@ def create_app(
             app.state.output_monitor.update_activity(session_id)
 
         return {"status": "sent", "session_id": session_id, "key": key}
+
+    @app.post("/sessions/{session_id}/clear")
+    async def clear_session(session_id: str, request: ClearSessionRequest):
+        """Clear/reset a session's context."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        success = await app.state.session_manager.clear_session(session_id, request.prompt)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to clear session")
+
+        return {"status": "cleared", "session_id": session_id}
 
     @app.delete("/sessions/{session_id}")
     async def kill_session(session_id: str):
@@ -1388,6 +1437,7 @@ Or continue working if not done yet."""
             return {"error": "Parent session not found"}
 
         # Spawn child session
+        provider = _normalize_provider(request.provider) if request.provider else None
         child_session = await app.state.session_manager.spawn_child_session(
             parent_session_id=request.parent_session_id,
             prompt=request.prompt,
@@ -1395,13 +1445,14 @@ Or continue working if not done yet."""
             wait=request.wait,
             model=request.model,
             working_dir=request.working_dir or parent_session.working_dir,
+            provider=provider,
         )
 
         if not child_session:
             return {"error": "Failed to spawn child session"}
 
-        # Start monitoring the child session
-        if app.state.output_monitor:
+        # Start monitoring the child session (Claude only)
+        if app.state.output_monitor and getattr(child_session, "provider", "claude") != "codex":
             await app.state.output_monitor.start_monitoring(child_session)
 
         # Register for --wait monitoring if specified
@@ -1419,6 +1470,7 @@ Or continue working if not done yet."""
             "working_dir": child_session.working_dir,
             "parent_session_id": child_session.parent_session_id,
             "tmux_session": child_session.tmux_session,
+            "provider": getattr(child_session, "provider", "claude"),
             "created_at": child_session.created_at.isoformat(),
         }
 

@@ -100,6 +100,7 @@ class Session:
     name: str = ""  # Internal identifier (auto-generated: claude-{id})
     working_dir: str = ""
     tmux_session: str = ""
+    provider: str = "claude"  # "claude" or "codex"
     log_file: str = ""
     status: SessionStatus = SessionStatus.STARTING
     created_at: datetime = field(default_factory=datetime.now)
@@ -112,6 +113,7 @@ class Session:
     current_task: Optional[str] = None  # What the session is currently working on
     git_remote_url: Optional[str] = None  # Git remote URL for repo matching
     subagents: List[Subagent] = field(default_factory=list)  # Subagents spawned by this session
+    codex_thread_id: Optional[str] = None  # Codex app-server thread ID (if provider=codex)
 
     # Multi-agent coordination fields
     parent_session_id: Optional[str] = None  # Parent that spawned this session
@@ -130,8 +132,9 @@ class Session:
 
     def __post_init__(self):
         if not self.name:
-            self.name = f"claude-{self.id}"
-        if not self.tmux_session:
+            prefix = "codex" if self.provider == "codex" else "claude"
+            self.name = f"{prefix}-{self.id}"
+        if not self.tmux_session and self.provider == "claude":
             # IMPORTANT: tmux_session should ALWAYS be claude-{id}, not name
             self.tmux_session = f"claude-{self.id}"
 
@@ -142,6 +145,7 @@ class Session:
             "name": self.name,
             "working_dir": self.working_dir,
             "tmux_session": self.tmux_session,
+            "provider": self.provider,
             "log_file": self.log_file,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
@@ -154,6 +158,7 @@ class Session:
             "current_task": self.current_task,
             "git_remote_url": self.git_remote_url,
             "subagents": [s.to_dict() for s in self.subagents],
+            "codex_thread_id": self.codex_thread_id,
             # Multi-agent coordination fields
             "parent_session_id": self.parent_session_id,
             "spawn_prompt": self.spawn_prompt,
@@ -191,6 +196,7 @@ class Session:
             name=data["name"],
             working_dir=data["working_dir"],
             tmux_session=data["tmux_session"],
+            provider=data.get("provider", "claude"),
             log_file=data["log_file"],
             status=SessionStatus(data["status"]),
             created_at=datetime.fromisoformat(data["created_at"]),
@@ -203,6 +209,7 @@ class Session:
             current_task=data.get("current_task"),
             git_remote_url=data.get("git_remote_url"),
             subagents=subagents,
+            codex_thread_id=data.get("codex_thread_id"),
             # Multi-agent coordination fields
             parent_session_id=data.get("parent_session_id"),
             spawn_prompt=data.get("spawn_prompt"),

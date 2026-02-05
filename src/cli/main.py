@@ -86,6 +86,7 @@ def main():
 
     # sm spawn "<prompt>"
     spawn_parser = subparsers.add_parser("spawn", help="Spawn a child agent session")
+    spawn_parser.add_argument("provider", choices=["claude", "codex"], help="Provider for the child session")
     spawn_parser.add_argument("prompt", help="Initial prompt for the child agent")
     spawn_parser.add_argument("--name", help="Friendly name for the child session")
     spawn_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Monitor child and notify when complete or idle for N seconds")
@@ -104,10 +105,32 @@ def main():
     kill_parser = subparsers.add_parser("kill", help="Terminate a child session")
     kill_parser.add_argument("session_id", help="Session ID to terminate")
 
-    # sm new [working_dir]
+    # sm claude [working_dir]
+    parser_claude = subparsers.add_parser(
+        "claude",
+        help="Create a new Claude session and attach to it"
+    )
+    parser_claude.add_argument(
+        "working_dir",
+        nargs="?",
+        help="Working directory (defaults to current directory)"
+    )
+
+    # sm codex [working_dir]
+    parser_codex = subparsers.add_parser(
+        "codex",
+        help="Create a new Codex session and attach to it"
+    )
+    parser_codex.add_argument(
+        "working_dir",
+        nargs="?",
+        help="Working directory (defaults to current directory)"
+    )
+
+    # sm new (deprecated alias)
     parser_new = subparsers.add_parser(
         "new",
-        help="Create a new Claude Code session and attach to it"
+        help="Create a new Claude session (deprecated: use `sm claude` or `sm codex`)"
     )
     parser_new.add_argument(
         "working_dir",
@@ -162,7 +185,7 @@ def main():
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
     # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, new, attach, output, clear
-    no_session_needed = ["lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what", "subagents", "children", "kill", "new", "attach", "output", "clear", None]
+    no_session_needed = ["lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what", "subagents", "children", "kill", "new", "claude", "codex", "attach", "output", "clear", None]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
     if not session_id and args.command in requires_session_id:
@@ -221,15 +244,19 @@ def main():
     elif args.command == "wait":
         sys.exit(commands.cmd_wait(client, args.session_id, args.seconds))
     elif args.command == "spawn":
-        sys.exit(commands.cmd_spawn(client, session_id, args.prompt, args.name, args.wait, args.model, args.working_dir, args.json))
+        sys.exit(commands.cmd_spawn(client, session_id, args.provider, args.prompt, args.name, args.wait, args.model, args.working_dir, args.json))
     elif args.command == "children":
         # Use current session if not specified
         parent_id = args.session_id if args.session_id else session_id
         sys.exit(commands.cmd_children(client, parent_id, args.recursive, args.status, args.json))
     elif args.command == "kill":
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
+    elif args.command == "claude":
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
+    elif args.command == "codex":
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex"))
     elif args.command == "new":
-        sys.exit(commands.cmd_new(client, args.working_dir))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
     elif args.command == "attach":
         sys.exit(commands.cmd_attach(client, args.session))
     elif args.command == "output":

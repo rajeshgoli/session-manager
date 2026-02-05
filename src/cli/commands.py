@@ -885,6 +885,7 @@ def cmd_queue(client: SessionManagerClient, session_id: str) -> int:
 def cmd_spawn(
     client: SessionManagerClient,
     parent_session_id: str,
+    provider: str,
     prompt: str,
     name: Optional[str] = None,
     wait: Optional[int] = None,
@@ -920,6 +921,7 @@ def cmd_spawn(
         wait=wait,
         model=model,
         working_dir=working_dir,
+        provider=provider,
     )
 
     if result is None:
@@ -936,7 +938,11 @@ def cmd_spawn(
     else:
         child_id = result["session_id"]
         child_name = result.get("friendly_name") or result["name"]
-        print(f"Spawned {child_name} ({child_id}) in tmux session {result['tmux_session']}")
+        provider = result.get("provider", "claude")
+        if provider == "codex":
+            print(f"Spawned {child_name} ({child_id}) [codex]")
+        else:
+            print(f"Spawned {child_name} ({child_id}) in tmux session {result['tmux_session']}")
 
     return 0
 
@@ -1064,7 +1070,7 @@ def cmd_kill(
     return 0
 
 
-def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None) -> int:
+def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, provider: str = "claude") -> int:
     """
     Create a new Claude Code session and attach to it.
 
@@ -1102,16 +1108,22 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None) -> 
 
     # Create session via API
     print(f"Creating session in {working_dir}...")
-    session = client.create_session(working_dir)
+    session = client.create_session(working_dir, provider=provider)
 
     if session is None:
         print("Error: Session manager unavailable", file=sys.stderr)
         return 2
 
+    session_id = session.get("id")
+    provider = session.get("provider", provider)
+
+    if provider == "codex":
+        print(f"Codex session created: {session_id}")
+        print("No tmux attach for Codex sessions.")
+        return 0
+
     # Extract tmux session name
     tmux_session = session.get("tmux_session")
-    session_id = session.get("id")
-
     if not tmux_session:
         print("Error: Failed to get tmux session name", file=sys.stderr)
         return 1
@@ -1289,6 +1301,15 @@ def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int
             print(f"Error: Session '{identifier}' not found", file=sys.stderr)
             return 1
 
+    provider = session.get("provider", "claude")
+    if provider == "codex":
+        message = client.get_last_message(session_id)
+        if not message:
+            print("No output available for this Codex session", file=sys.stderr)
+            return 1
+        print(message)
+        return 0
+
     # Extract tmux session name
     tmux_session = session.get("tmux_session")
     if not tmux_session:
@@ -1415,6 +1436,22 @@ def cmd_clear(
         if parent_id is None:
             print(f"Error: Can only clear child sessions. Target session has no parent.", file=sys.stderr)
             return 1
+
+    provider = session.get("provider", "claude")
+    if provider == "codex":
+        success, unavailable = client.clear_session(target_session_id, new_prompt)
+        if unavailable:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        if not success:
+            print("Error: Failed to clear Codex session", file=sys.stderr)
+            return 1
+        name = session.get("friendly_name") or session.get("name") or target_session_id
+        if new_prompt:
+            print(f"Cleared {name} ({target_session_id}) and sent new prompt")
+        else:
+            print(f"Cleared {name} ({target_session_id})")
+        return 0
 
     # Extract tmux session name
     tmux_session = session.get("tmux_session")

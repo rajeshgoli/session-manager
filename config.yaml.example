@@ -124,6 +124,23 @@ claude:
   # Default model for spawned sessions (agent can override with --model flag)
   default_model: "sonnet"
 
+# Codex app-server settings (JSON-RPC over stdio)
+codex:
+  # Command to launch Codex (app-server mode)
+  command: "codex"
+  # Extra args passed to `codex app-server`
+  app_server_args: []
+  # Default model for Codex turns (optional)
+  default_model: null
+  # Approval policy: untrusted | on-failure | on-request | never
+  approval_policy: "never"
+  # Auto-response to approval prompts (accept | acceptForSession | decline | cancel)
+  approval_decision: "decline"
+  # Sandbox policy for Codex: workspace-write | read-only | danger-full-access
+  sandbox: "workspace-write"
+  # Request timeout for JSON-RPC calls
+  request_timeout_seconds: 60
+
 child_agents:
   # Auto-completion detection
   auto_complete:

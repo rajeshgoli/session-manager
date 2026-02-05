@@ -205,6 +205,7 @@ class SessionManagerClient:
         wait: Optional[int] = None,
         model: Optional[str] = None,
         working_dir: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Optional[dict]:
         """
         Spawn a child agent session.
@@ -232,6 +233,8 @@ class SessionManagerClient:
             payload["model"] = model
         if working_dir:
             payload["working_dir"] = working_dir
+        if provider:
+            payload["provider"] = provider
 
         data, success, unavailable = self._request("POST", "/sessions/spawn", payload, timeout=10)
         if unavailable:
@@ -297,7 +300,7 @@ class SessionManagerClient:
             return None
         return data
 
-    def create_session(self, working_dir: str) -> Optional[dict]:
+    def create_session(self, working_dir: str, provider: Optional[str] = None) -> Optional[dict]:
         """
         Create a new Claude Code session.
 
@@ -309,9 +312,12 @@ class SessionManagerClient:
         """
         import urllib.parse
         encoded_dir = urllib.parse.quote(working_dir)
+        query = f"working_dir={encoded_dir}"
+        if provider:
+            query += f"&provider={provider}"
         data, success, unavailable = self._request(
             "POST",
-            f"/sessions/create?working_dir={encoded_dir}",
+            f"/sessions/create?{query}",
             timeout=10
         )
         return data if success else None
@@ -332,6 +338,16 @@ class SessionManagerClient:
             f"/sessions/{session_id}/send-queue"
         )
         return data if success else None
+
+    def get_last_message(self, session_id: str) -> Optional[str]:
+        """Get the last message for a session (hook output)."""
+        data, success, _ = self._request(
+            "GET",
+            f"/sessions/{session_id}/last-message"
+        )
+        if success and data:
+            return data.get("message")
+        return None
 
     def watch_session(
         self,
@@ -361,3 +377,21 @@ class SessionManagerClient:
         if unavailable:
             return None
         return data if success else None
+
+    def clear_session(self, session_id: str, prompt: Optional[str] = None) -> tuple[bool, bool]:
+        """
+        Clear/reset a session's context.
+
+        Returns:
+            Tuple of (success, unavailable)
+        """
+        payload = {}
+        if prompt:
+            payload["prompt"] = prompt
+
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/clear",
+            payload
+        )
+        return success, unavailable
