@@ -87,7 +87,7 @@ class ChildMonitor:
                     break
 
                 # Check if child has exited (tmux only)
-                if getattr(child_session, "provider", "claude") != "codex":
+                if getattr(child_session, "provider", "claude") != "codex-app":
                     if not self.session_manager.tmux.session_exists(child_session.tmux_session):
                         logger.info(f"Child {child_session_id} tmux session exited")
                         await self._notify_parent_completion(
@@ -100,7 +100,7 @@ class ChildMonitor:
                 # Check for idle timeout
                 if child_session.last_tool_call:
                     idle_time = (datetime.now() - child_session.last_tool_call).total_seconds()
-                elif getattr(child_session, "provider", "claude") == "codex":
+                elif getattr(child_session, "provider", "claude") == "codex-app":
                     if self.session_manager.is_codex_turn_active(child_session_id):
                         await asyncio.sleep(5)
                         continue
@@ -157,7 +157,7 @@ class ChildMonitor:
         if not child_session:
             return None
 
-        if getattr(child_session, "provider", "claude") == "codex":
+        if getattr(child_session, "provider", "claude") == "codex-app":
             store = getattr(self.session_manager, "hook_output_store", None)
             if store:
                 last = store.get(child_session_id)

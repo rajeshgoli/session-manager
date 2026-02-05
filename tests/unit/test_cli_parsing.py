@@ -40,7 +40,7 @@ class TestCliParsing:
 
         # sm spawn
         spawn_parser = subparsers.add_parser("spawn")
-        spawn_parser.add_argument("provider", choices=["claude", "codex"])
+        spawn_parser.add_argument("provider", choices=["claude", "codex", "codex-app"])
         spawn_parser.add_argument("prompt")
         spawn_parser.add_argument("--name")
         spawn_parser.add_argument("--wait", type=int, metavar="SECONDS")

@@ -22,9 +22,11 @@ def _normalize_provider(provider: Optional[str]) -> str:
     if not provider:
         return "claude"
     provider = provider.lower()
-    if provider not in ("claude", "codex"):
-        raise HTTPException(status_code=400, detail=f"Invalid provider: {provider}")
-    return provider
+    if provider in ("codex-app", "codex_app", "codex-server", "codex-app-server"):
+        return "codex-app"
+    if provider in ("claude", "codex"):
+        return provider
+    raise HTTPException(status_code=400, detail=f"Invalid provider: {provider}")
 
 
 class RequestTimingMiddleware(BaseHTTPMiddleware):
@@ -351,26 +353,32 @@ def create_app(
         sm = app.state.session_manager
         memory_sessions = list(sm.sessions.values())
 
-        # Get tmux sessions managed by us (those starting with "claude-")
+        # Get tmux sessions managed by us (those starting with "claude-" or "codex-")
         try:
             all_tmux_sessions = set(sm.tmux.list_sessions())
-            our_tmux_sessions = {s for s in all_tmux_sessions if s.startswith("claude-")}
+            our_tmux_sessions = {
+                s for s in all_tmux_sessions
+                if s.startswith("claude-") or s.startswith("codex-")
+            }
         except Exception as e:
             return HealthCheckResult(
                 status="error",
                 message=f"Failed to list tmux sessions: {e}",
             )
 
-        # Check for sessions in memory that don't exist in tmux (Claude only)
+        # Check for sessions in memory that don't exist in tmux (tmux providers only)
         missing_in_tmux = []
         for session in memory_sessions:
-            if getattr(session, "provider", "claude") == "codex":
+            if getattr(session, "provider", "claude") == "codex-app":
                 continue
             if session.status not in (SessionStatus.STOPPED,) and session.tmux_session not in all_tmux_sessions:
                 missing_in_tmux.append(session.id)
 
         # Check for orphaned tmux sessions (in tmux but not in memory)
-        memory_tmux_names = {s.tmux_session for s in memory_sessions if getattr(s, "provider", "claude") != "codex"}
+        memory_tmux_names = {
+            s.tmux_session for s in memory_sessions
+            if getattr(s, "provider", "claude") != "codex-app"
+        }
         orphaned_tmux = list(our_tmux_sessions - memory_tmux_names)
 
         # Check for duplicate session IDs (should never happen)
@@ -575,7 +583,7 @@ def create_app(
             active_sessions = [
                 s for s in sm.sessions.values()
                 if s.status not in (SessionStatus.STOPPED,)
-                and getattr(s, "provider", "claude") != "codex"
+                and getattr(s, "provider", "claude") != "codex-app"
             ]
             monitored = len(output_monitor._tasks)
             if len(active_sessions) > monitored:
@@ -649,8 +657,8 @@ def create_app(
         if not session:
             raise HTTPException(status_code=500, detail="Failed to create session")
 
-        # Start monitoring the session (Claude only)
-        if app.state.output_monitor and getattr(session, "provider", "claude") != "codex":
+        # Start monitoring the session (tmux providers only)
+        if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
             await app.state.output_monitor.start_monitoring(session)
 
         return SessionResponse(
@@ -693,8 +701,8 @@ def create_app(
         if not session:
             raise HTTPException(status_code=500, detail="Failed to create session")
 
-        # Start monitoring (Claude only)
-        if app.state.output_monitor and getattr(session, "provider", "claude") != "codex":
+        # Start monitoring (tmux providers only)
+        if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
             await app.state.output_monitor.start_monitoring(session)
 
         return session.to_dict()
@@ -775,7 +783,7 @@ def create_app(
             session.friendly_name = friendly_name
             app.state.session_manager._save_state()
             # Update tmux status bar
-            if getattr(session, "provider", "claude") != "codex":
+            if getattr(session, "provider", "claude") != "codex-app":
                 app.state.session_manager.tmux.set_status_bar(session.tmux_session, friendly_name)
             # Update Telegram topic name if applicable
             if session.telegram_thread_id and app.state.notifier:
@@ -1451,8 +1459,8 @@ Or continue working if not done yet."""
         if not child_session:
             return {"error": "Failed to spawn child session"}
 
-        # Start monitoring the child session (Claude only)
-        if app.state.output_monitor and getattr(child_session, "provider", "claude") != "codex":
+        # Start monitoring the child session (tmux providers only)
+        if app.state.output_monitor and getattr(child_session, "provider", "claude") != "codex-app":
             await app.state.output_monitor.start_monitoring(child_session)
 
         # Register for --wait monitoring if specified

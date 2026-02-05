@@ -37,17 +37,24 @@ class SessionManager:
         self.hook_output_store: Optional[dict] = None
 
         codex_config = self.config.get("codex", {})
+        codex_app_config = self.config.get("codex_app_server", codex_config)
+
+        self.codex_cli_command = codex_config.get("command", "codex")
+        self.codex_cli_args = codex_config.get("args", [])
+        self.codex_default_model = codex_config.get("default_model")
+
+        # App-server config (can be overridden by codex_app_server section)
         self.codex_config = CodexAppServerConfig(
-            command=codex_config.get("command", "codex"),
-            args=codex_config.get("app_server_args", codex_config.get("args", [])),
-            default_model=codex_config.get("default_model"),
-            approval_policy=codex_config.get("approval_policy", "never"),
-            sandbox=codex_config.get("sandbox", "workspace-write"),
-            approval_decision=codex_config.get("approval_decision", "decline"),
-            request_timeout_seconds=codex_config.get("request_timeout_seconds", 60),
-            client_name=codex_config.get("client_name", "claude-session-manager"),
-            client_title=codex_config.get("client_title", "Claude Session Manager"),
-            client_version=codex_config.get("client_version", "0.1.0"),
+            command=codex_app_config.get("command", self.codex_cli_command),
+            args=codex_app_config.get("app_server_args", codex_app_config.get("args", [])),
+            default_model=codex_app_config.get("default_model", self.codex_default_model),
+            approval_policy=codex_app_config.get("approval_policy", "never"),
+            sandbox=codex_app_config.get("sandbox", "workspace-write"),
+            approval_decision=codex_app_config.get("approval_decision", "decline"),
+            request_timeout_seconds=codex_app_config.get("request_timeout_seconds", 60),
+            client_name=codex_app_config.get("client_name", "claude-session-manager"),
+            client_title=codex_app_config.get("client_title", "Claude Session Manager"),
+            client_version=codex_app_config.get("client_version", "0.1.0"),
         )
 
         # Message queue manager (set by main app)
@@ -73,10 +80,10 @@ class SessionManager:
                     data = json.load(f)
                 for session_data in data.get("sessions", []):
                     session = Session.from_dict(session_data)
-                    # Codex sessions are restored via app-server; don't require tmux
-                    if session.provider == "codex":
+                    # Codex app-server sessions are restored without tmux
+                    if session.provider == "codex-app":
                         self.sessions[session.id] = session
-                        logger.info(f"Restored codex session: {session.name}")
+                        logger.info(f"Restored codex app session: {session.name}")
                         continue
 
                     # Verify tmux session still exists (Claude)
@@ -243,34 +250,40 @@ class SessionManager:
         # Detect git remote URL for repo matching (async to avoid blocking)
         session.git_remote_url = await self._get_git_remote_url_async(working_dir)
 
-        # Set up log file path (Claude only)
-        if provider == "claude":
+        # Set up log file path and tmux session for CLI providers
+        if provider in ("claude", "codex"):
             session.log_file = str(self.log_dir / f"{session.name}.log")
 
-            # Get Claude config
-            claude_config = self.config.get("claude", {})
-            claude_command = claude_config.get("command", "claude")
-            claude_args = claude_config.get("args", [])
-            default_model = claude_config.get("default_model", "sonnet")
+            if provider == "claude":
+                # Get Claude config
+                claude_config = self.config.get("claude", {})
+                command = claude_config.get("command", "claude")
+                args = claude_config.get("args", [])
+                default_model = claude_config.get("default_model", "sonnet")
+            else:
+                # Codex CLI config
+                command = self.codex_cli_command
+                args = self.codex_cli_args
+                default_model = self.codex_default_model
 
             # Select model (override or default)
             selected_model = model or default_model
 
             # Create the tmux session with config args
-            # NOTE: session.tmux_session is auto-set by __post_init__ to claude-{id}
+            # NOTE: session.tmux_session is auto-set by __post_init__ to {provider}-{id}
             if not self.tmux.create_session_with_command(
                 session.tmux_session,
                 working_dir,
                 session.log_file,
                 session_id=session.id,
-                command=claude_command,
-                args=claude_args,
+                command=command,
+                args=args,
                 model=selected_model if model else None,  # Only pass if explicitly set
                 initial_prompt=initial_prompt,
             ):
                 logger.error(f"Failed to create tmux session for {session.name}")
                 return None
-        elif provider == "codex":
+        elif provider == "codex-app":
             try:
                 codex_session = CodexAppServerSession(
                     session_id=session.id,
@@ -294,21 +307,21 @@ class SessionManager:
                 logger.error(f"Failed to start Codex app-server session for {session.name}: {e}")
                 return None
             except Exception as e:
-                logger.error(f"Unexpected error starting Codex session: {e}")
+                logger.error(f"Unexpected error starting Codex app session: {e}")
                 return None
         else:
             logger.error(f"Unknown session provider: {provider}")
             return None
 
         # Mark as running and save
-        if provider == "codex" and not initial_prompt:
+        if provider == "codex-app" and not initial_prompt:
             session.status = SessionStatus.IDLE
         else:
             session.status = SessionStatus.RUNNING
         self.sessions[session.id] = session
         self._save_state()
 
-        if provider == "codex" and not initial_prompt and self.message_queue_manager:
+        if provider == "codex-app" and not initial_prompt and self.message_queue_manager:
             self.message_queue_manager.mark_session_idle(session.id)
 
         # Log creation
@@ -663,7 +676,7 @@ class SessionManager:
 
     async def _deliver_direct(self, session: Session, text: str, model: Optional[str] = None) -> bool:
         """Deliver a message directly to a session (no queue)."""
-        if session.provider == "codex":
+        if session.provider == "codex-app":
             codex_session = await self._ensure_codex_session(session, model=model)
             if not codex_session:
                 return False
@@ -676,7 +689,7 @@ class SessionManager:
                     self.message_queue_manager.mark_session_active(session.id)
                 return True
             except Exception as e:
-                logger.error(f"Codex send failed for {session.id}: {e}")
+                logger.error(f"Codex app send failed for {session.id}: {e}")
                 return False
 
         success = await self.tmux.send_input_async(session.tmux_session, text)
@@ -693,7 +706,7 @@ class SessionManager:
 
     async def _deliver_urgent(self, session: Session, text: str) -> bool:
         """Deliver an urgent message (interrupt if possible)."""
-        if session.provider == "codex":
+        if session.provider == "codex-app":
             codex_session = await self._ensure_codex_session(session)
             if not codex_session:
                 return False
@@ -764,12 +777,12 @@ class SessionManager:
         return session_id in self.codex_turns_in_flight
 
     async def clear_session(self, session_id: str, new_prompt: Optional[str] = None) -> bool:
-        """Clear/reset a session's context (Claude: /clear, Codex: new thread)."""
+        """Clear/reset a session's context (Claude: /clear, Codex: /new, Codex app: new thread)."""
         session = self.sessions.get(session_id)
         if not session:
             return False
 
-        if session.provider == "codex":
+        if session.provider == "codex-app":
             codex_session = await self._ensure_codex_session(session)
             if not codex_session:
                 return False
@@ -790,13 +803,21 @@ class SessionManager:
                     self.message_queue_manager.mark_session_idle(session_id)
                 return True
             except Exception as e:
-                logger.error(f"Failed to clear Codex session {session_id}: {e}")
+                logger.error(f"Failed to clear Codex app session {session_id}: {e}")
                 return False
 
-        return await self._clear_claude_session(session, new_prompt)
+        if session.provider == "codex":
+            return await self._clear_tmux_session(session, new_prompt, clear_command="/new")
 
-    async def _clear_claude_session(self, session: Session, new_prompt: Optional[str]) -> bool:
-        """Send /clear to a Claude tmux session (async)."""
+        return await self._clear_tmux_session(session, new_prompt, clear_command="/clear")
+
+    async def _clear_tmux_session(
+        self,
+        session: Session,
+        new_prompt: Optional[str],
+        clear_command: str,
+    ) -> bool:
+        """Send a clear command to a tmux session (async)."""
         tmux_session = session.tmux_session
         if not tmux_session:
             return False
@@ -822,9 +843,9 @@ class SessionManager:
             await proc.communicate()
             await asyncio.sleep(0.5)
 
-            # Send /clear
+            # Send clear command
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_session, "/clear",
+                "tmux", "send-keys", "-t", tmux_session, clear_command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -856,7 +877,7 @@ class SessionManager:
                 await proc.communicate()
             return True
         except Exception as e:
-            logger.error(f"Failed to clear Claude session {session.id}: {e}")
+            logger.error(f"Failed to clear tmux session {session.id}: {e}")
             return False
 
     def send_key(self, session_id: str, key: str) -> bool:
@@ -866,8 +887,8 @@ class SessionManager:
             logger.error(f"Session not found: {session_id}")
             return False
 
-        if session.provider == "codex":
-            # Only support interrupt for Codex sessions
+        if session.provider == "codex-app":
+            # Only support interrupt for Codex app sessions
             if key == "Escape":
                 try:
                     loop = asyncio.get_running_loop()
@@ -898,7 +919,7 @@ class SessionManager:
             logger.error(f"Session not found: {session_id}")
             return False
 
-        if session.provider == "codex":
+        if session.provider == "codex-app":
             codex_session = self.codex_sessions.pop(session_id, None)
             if codex_session:
                 try:
@@ -921,8 +942,8 @@ class SessionManager:
             logger.error(f"Session not found: {session_id}")
             return False
 
-        if session.provider == "codex":
-            logger.warning("Terminal open not supported for Codex sessions")
+        if session.provider == "codex-app":
+            logger.warning("Terminal open not supported for Codex app sessions")
             return False
 
         return self.tmux.open_in_terminal(session.tmux_session)
@@ -933,7 +954,7 @@ class SessionManager:
         if not session:
             return None
 
-        if session.provider == "codex":
+        if session.provider == "codex-app":
             if self.hook_output_store:
                 return self.hook_output_store.get(session_id)
             return None
