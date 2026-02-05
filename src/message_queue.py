@@ -877,7 +877,7 @@ class MessageQueueManager:
         self.queue_message(
             target_session_id=sender_session_id,
             text=notification,
-            delivery_mode="sequential",
+            delivery_mode="important",
         )
         logger.info(f"Sent stop notification to {sender_session_id} (recipient: {recipient_session_id})")
 
@@ -1058,7 +1058,7 @@ class MessageQueueManager:
                     self.queue_message(
                         target_session_id=watcher_session_id,
                         text=notification,
-                        delivery_mode="urgent",  # Use urgent to interrupt
+                        delivery_mode="important",
                     )
                     logger.info(f"Watch {watch_id}: {target_session_id} idle after {elapsed:.0f}s")
 
@@ -1086,7 +1086,7 @@ class MessageQueueManager:
             self.queue_message(
                 target_session_id=watcher_session_id,
                 text=notification,
-                delivery_mode="urgent",  # Use urgent to interrupt
+                delivery_mode="important",
             )
             logger.info(f"Watch {watch_id}: {target_session_id} timeout after {timeout_seconds}s")
 
