@@ -40,6 +40,7 @@ class TestCliParsing:
 
         # sm spawn
         spawn_parser = subparsers.add_parser("spawn")
+        spawn_parser.add_argument("provider", choices=["claude", "codex"])
         spawn_parser.add_argument("prompt")
         spawn_parser.add_argument("--name")
         spawn_parser.add_argument("--wait", type=int, metavar="SECONDS")
@@ -145,9 +146,10 @@ class TestSpawnCommand:
     def test_spawn_basic(self):
         """sm spawn <prompt> parses correctly."""
         parser = TestCliParsing()
-        args = parser._get_parsed_args(["spawn", "Implement feature X"])
+        args = parser._get_parsed_args(["spawn", "claude", "Implement feature X"])
 
         assert args.command == "spawn"
+        assert args.provider == "claude"
         assert args.prompt == "Implement feature X"
         assert args.name is None
         assert args.wait is None
@@ -158,14 +160,14 @@ class TestSpawnCommand:
     def test_spawn_wait_flag_parsed(self):
         """sm spawn --wait 300 parses correctly."""
         parser = TestCliParsing()
-        args = parser._get_parsed_args(["spawn", "--wait", "300", "Test prompt"])
+        args = parser._get_parsed_args(["spawn", "claude", "--wait", "300", "Test prompt"])
 
         assert args.wait == 300
 
     def test_spawn_model_flag(self):
         """sm spawn --model opus sets model."""
         parser = TestCliParsing()
-        args = parser._get_parsed_args(["spawn", "--model", "opus", "Test prompt"])
+        args = parser._get_parsed_args(["spawn", "claude", "--model", "opus", "Test prompt"])
 
         assert args.model == "opus"
 
@@ -175,27 +177,27 @@ class TestSpawnCommand:
 
         # Valid choices
         for model in ["opus", "sonnet", "haiku"]:
-            args = parser._get_parsed_args(["spawn", "--model", model, "Test"])
+            args = parser._get_parsed_args(["spawn", "claude", "--model", model, "Test"])
             assert args.model == model
 
     def test_spawn_name_flag(self):
         """sm spawn --name sets friendly name."""
         parser = TestCliParsing()
-        args = parser._get_parsed_args(["spawn", "--name", "test-agent", "Test prompt"])
+        args = parser._get_parsed_args(["spawn", "claude", "--name", "test-agent", "Test prompt"])
 
         assert args.name == "test-agent"
 
     def test_spawn_working_dir_flag(self):
         """sm spawn --working-dir sets directory."""
         parser = TestCliParsing()
-        args = parser._get_parsed_args(["spawn", "--working-dir", "/tmp/work", "Test prompt"])
+        args = parser._get_parsed_args(["spawn", "claude", "--working-dir", "/tmp/work", "Test prompt"])
 
         assert args.working_dir == "/tmp/work"
 
     def test_spawn_json_flag(self):
         """sm spawn --json enables JSON output."""
         parser = TestCliParsing()
-        args = parser._get_parsed_args(["spawn", "--json", "Test prompt"])
+        args = parser._get_parsed_args(["spawn", "claude", "--json", "Test prompt"])
 
         assert args.json is True
 

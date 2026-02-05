@@ -86,19 +86,25 @@ class ChildMonitor:
                     logger.warning(f"Child session {child_session_id} not found, stopping monitoring")
                     break
 
-                # Check if child has exited
-                if not self.session_manager.tmux.session_exists(child_session.tmux_session):
-                    logger.info(f"Child {child_session_id} tmux session exited")
-                    await self._notify_parent_completion(
-                        parent_session_id,
-                        child_session_id,
-                        "Session exited"
-                    )
-                    break
+                # Check if child has exited (tmux only)
+                if getattr(child_session, "provider", "claude") != "codex":
+                    if not self.session_manager.tmux.session_exists(child_session.tmux_session):
+                        logger.info(f"Child {child_session_id} tmux session exited")
+                        await self._notify_parent_completion(
+                            parent_session_id,
+                            child_session_id,
+                            "Session exited"
+                        )
+                        break
 
                 # Check for idle timeout
                 if child_session.last_tool_call:
                     idle_time = (datetime.now() - child_session.last_tool_call).total_seconds()
+                elif getattr(child_session, "provider", "claude") == "codex":
+                    if self.session_manager.is_codex_turn_active(child_session_id):
+                        await asyncio.sleep(5)
+                        continue
+                    idle_time = (datetime.now() - child_session.last_activity).total_seconds()
                 else:
                     # No tool call yet, check since spawned_at
                     idle_time = (datetime.now() - (child_session.spawned_at or child_session.created_at)).total_seconds()
@@ -150,6 +156,16 @@ class ChildMonitor:
         child_session = self.session_manager.get_session(child_session_id)
         if not child_session:
             return None
+
+        if getattr(child_session, "provider", "claude") == "codex":
+            store = getattr(self.session_manager, "hook_output_store", None)
+            if store:
+                last = store.get(child_session_id)
+                if last:
+                    first_sentence = last.split('.')[0]
+                    if len(first_sentence) > 100:
+                        first_sentence = first_sentence[:100] + "..."
+                    return first_sentence
 
         # Try to read from transcript if available
         if child_session.transcript_path:
