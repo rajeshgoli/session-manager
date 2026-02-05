@@ -124,11 +124,13 @@ claude:
   # Default model for spawned sessions (agent can override with --model flag)
   default_model: "sonnet"
 
-# Codex app-server settings (JSON-RPC over stdio)
+# Codex CLI + app-server settings
 codex:
-  # Command to launch Codex (app-server mode)
+  # Command to launch Codex (CLI + app-server)
   command: "codex"
-  # Extra args passed to `codex app-server`
+  # Extra args passed to interactive Codex CLI
+  args: []
+  # Extra args passed to `codex app-server` (override via codex_app_server.* if needed)
   app_server_args: []
   # Default model for Codex turns (optional)
   default_model: null

@@ -86,7 +86,11 @@ def main():
 
     # sm spawn "<prompt>"
     spawn_parser = subparsers.add_parser("spawn", help="Spawn a child agent session")
-    spawn_parser.add_argument("provider", choices=["claude", "codex"], help="Provider for the child session")
+    spawn_parser.add_argument(
+        "provider",
+        choices=["claude", "codex", "codex-app"],
+        help="Provider for the child session",
+    )
     spawn_parser.add_argument("prompt", help="Initial prompt for the child agent")
     spawn_parser.add_argument("--name", help="Friendly name for the child session")
     spawn_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Monitor child and notify when complete or idle for N seconds")
@@ -119,9 +123,21 @@ def main():
     # sm codex [working_dir]
     parser_codex = subparsers.add_parser(
         "codex",
-        help="Create a new Codex session (no tmux attach)"
+        help="Create a new Codex session and attach to it"
     )
     parser_codex.add_argument(
+        "working_dir",
+        nargs="?",
+        help="Working directory (defaults to current directory)"
+    )
+
+    # sm codex-app [working_dir]
+    parser_codex_app = subparsers.add_parser(
+        "codex-app",
+        aliases=["codex-server"],
+        help="Create a new Codex app-server session (headless)"
+    )
+    parser_codex_app.add_argument(
         "working_dir",
         nargs="?",
         help="Working directory (defaults to current directory)"
@@ -185,7 +201,11 @@ def main():
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
     # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, new, attach, output, clear
-    no_session_needed = ["lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what", "subagents", "children", "kill", "new", "claude", "codex", "attach", "output", "clear", None]
+    no_session_needed = [
+        "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
+        "subagents", "children", "kill", "new", "claude", "codex", "codex-app", "codex-server",
+        "attach", "output", "clear", None
+    ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
     if not session_id and args.command in requires_session_id:
@@ -255,6 +275,8 @@ def main():
         sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
     elif args.command == "codex":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex"))
+    elif args.command in ("codex-app", "codex-server"):
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app"))
     elif args.command == "new":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
     elif args.command == "attach":

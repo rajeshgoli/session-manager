@@ -899,7 +899,7 @@ def cmd_spawn(
     Args:
         client: API client
         parent_session_id: Parent session ID (current session)
-        provider: "claude" or "codex"
+        provider: "claude", "codex", or "codex-app"
         prompt: Initial prompt for the child agent
         name: Friendly name for the child session
         wait: Monitor child and notify when complete or idle for N seconds
@@ -940,8 +940,8 @@ def cmd_spawn(
         child_id = result["session_id"]
         child_name = result.get("friendly_name") or result["name"]
         provider = result.get("provider", "claude")
-        if provider == "codex":
-            print(f"Spawned {child_name} ({child_id}) [codex]")
+        if provider == "codex-app":
+            print(f"Spawned {child_name} ({child_id}) [codex-app]")
         else:
             print(f"Spawned {child_name} ({child_id}) in tmux session {result['tmux_session']}")
 
@@ -1073,15 +1073,15 @@ def cmd_kill(
 
 def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, provider: str = "claude") -> int:
     """
-    Create a new session (Claude attaches; Codex does not).
+    Create a new session (Claude/Codex attach; Codex app is headless).
 
     Args:
         client: API client
         working_dir: Working directory (optional, defaults to $PWD)
-        provider: "claude" or "codex"
+        provider: "claude", "codex", or "codex-app"
 
     Exit codes:
-        0: Successfully created (and attached for Claude)
+        0: Successfully created (and attached for Claude/Codex)
         1: Failed to create session
         2: Session manager unavailable
     """
@@ -1119,9 +1119,9 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, pro
     session_id = session.get("id")
     provider = session.get("provider", provider)
 
-    if provider == "codex":
-        print(f"Codex session created: {session_id}")
-        print("No tmux attach for Codex sessions.")
+    if provider == "codex-app":
+        print(f"Codex app session created: {session_id}")
+        print("No tmux attach for Codex app sessions.")
         return 0
 
     # Extract tmux session name
@@ -1304,10 +1304,10 @@ def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int
             return 1
 
     provider = session.get("provider", "claude")
-    if provider == "codex":
+    if provider == "codex-app":
         message = client.get_last_message(session_id)
         if not message:
-            print("No output available for this Codex session", file=sys.stderr)
+            print("No output available for this Codex app session", file=sys.stderr)
             return 1
         print(message)
         return 0
@@ -1392,6 +1392,7 @@ def cmd_clear(
 ) -> int:
     """
     Send /clear to a child Claude Code session to reset its context.
+    For Codex CLI sessions, sends /new instead.
     Requires parent-child ownership (requester must be parent of target).
 
     Args:
@@ -1440,13 +1441,13 @@ def cmd_clear(
             return 1
 
     provider = session.get("provider", "claude")
-    if provider == "codex":
+    if provider == "codex-app":
         success, unavailable = client.clear_session(target_session_id, new_prompt)
         if unavailable:
             print("Error: Session manager unavailable", file=sys.stderr)
             return 2
         if not success:
-            print("Error: Failed to clear Codex session", file=sys.stderr)
+            print("Error: Failed to clear Codex app session", file=sys.stderr)
             return 1
         name = session.get("friendly_name") or session.get("name") or target_session_id
         if new_prompt:
@@ -1461,7 +1462,9 @@ def cmd_clear(
         print(f"Error: Session {target_session_id} has no tmux session", file=sys.stderr)
         return 1
 
-    # Send /clear command
+    clear_command = "/new" if provider == "codex" else "/clear"
+
+    # Send clear command
     try:
         import shlex
 
@@ -1490,9 +1493,9 @@ def cmd_clear(
         # Wait for interrupt to process
         time.sleep(0.5)
 
-        # Now send /clear using the same approach as send_input
+        # Now send clear command using the same approach as send_input
         subprocess.run(
-            ["tmux", "send-keys", "-t", tmux_session, "/clear"],
+            ["tmux", "send-keys", "-t", tmux_session, clear_command],
             check=True,
             capture_output=True,
             text=True,

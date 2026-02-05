@@ -100,7 +100,7 @@ class Session:
     name: str = ""  # Internal identifier (auto-generated: claude-{id})
     working_dir: str = ""
     tmux_session: str = ""
-    provider: str = "claude"  # "claude" or "codex"
+    provider: str = "claude"  # "claude", "codex" (tmux), or "codex-app" (app-server)
     log_file: str = ""
     status: SessionStatus = SessionStatus.STARTING
     created_at: datetime = field(default_factory=datetime.now)
@@ -113,7 +113,7 @@ class Session:
     current_task: Optional[str] = None  # What the session is currently working on
     git_remote_url: Optional[str] = None  # Git remote URL for repo matching
     subagents: List[Subagent] = field(default_factory=list)  # Subagents spawned by this session
-    codex_thread_id: Optional[str] = None  # Codex app-server thread ID (if provider=codex)
+    codex_thread_id: Optional[str] = None  # Codex app-server thread ID (if provider=codex-app)
 
     # Multi-agent coordination fields
     parent_session_id: Optional[str] = None  # Parent that spawned this session
@@ -132,11 +132,16 @@ class Session:
 
     def __post_init__(self):
         if not self.name:
-            prefix = "codex" if self.provider == "codex" else "claude"
+            if self.provider == "claude":
+                prefix = "claude"
+            elif self.provider == "codex":
+                prefix = "codex"
+            else:
+                prefix = "codex-app"
             self.name = f"{prefix}-{self.id}"
-        if not self.tmux_session and self.provider == "claude":
-            # IMPORTANT: tmux_session should ALWAYS be claude-{id}, not name
-            self.tmux_session = f"claude-{self.id}"
+        if not self.tmux_session and self.provider in ("claude", "codex"):
+            # IMPORTANT: tmux_session should ALWAYS be {provider}-{id}, not name
+            self.tmux_session = f"{self.provider}-{self.id}"
 
     def to_dict(self) -> dict:
         """Convert session to dictionary for JSON serialization."""
