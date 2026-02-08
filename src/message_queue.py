@@ -916,7 +916,18 @@ class MessageQueueManager:
             if recipient_session else recipient_session_id
         )
 
-        notification = f"[sm] {recipient_name} ({recipient_session_id[:8]}) completed (Stop hook fired)"
+        # Get last output from recipient (what they said before stopping)
+        last_output = None
+        if self.session_manager.hook_output_store:
+            last_output = self.session_manager.hook_output_store.get(recipient_session_id)
+
+        # Build notification with last output if available
+        if last_output:
+            # Truncate if too long (keep it readable)
+            truncated = last_output[:500] + "..." if len(last_output) > 500 else last_output
+            notification = f"[sm] {recipient_name} stopped:\n{truncated}"
+        else:
+            notification = f"[sm] {recipient_name} ({recipient_session_id[:8]}) completed (Stop hook fired)"
 
         # Queue notification to sender (as system message)
         self.queue_message(
