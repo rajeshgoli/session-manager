@@ -272,25 +272,30 @@ async def test_urgent_delivery_marks_message_as_delivered(
     )
 
     mock_session_manager.get_session.return_value = session
+    mock_session_manager.sessions = {"test-deliver": session}
 
-    # Create and queue a test message
-    msg = message_queue.queue_message(
-        target_session_id="test-deliver",
-        text="urgent task",
-        delivery_mode="urgent",
-    )
+    # Start the message queue (required for background delivery)
+    await message_queue.start()
 
-    # Mock subprocess calls
-    async def mock_subprocess(*args, **kwargs):
-        proc = AsyncMock()
-        proc.communicate = AsyncMock(return_value=(b"", b""))
-        proc.returncode = 0
-        return proc
+    try:
+        # Create and queue a test message
+        msg = message_queue.queue_message(
+            target_session_id="test-deliver",
+            text="urgent task",
+            delivery_mode="urgent",
+        )
 
-    with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
-        # Wait for urgent delivery to complete
-        await asyncio.sleep(0.5)
+        # Mark session as idle to trigger delivery
+        message_queue.mark_session_idle("test-deliver")
 
-    # Verify message was marked as delivered
-    pending = message_queue.get_pending_messages("test-deliver")
-    assert len(pending) == 0  # Message should be delivered and removed from queue
+        # Wait for delivery to complete
+        await asyncio.sleep(0.3)
+
+        # Verify message was marked as delivered
+        pending = message_queue.get_pending_messages("test-deliver")
+        assert len(pending) == 0  # Message should be delivered and removed from queue
+
+        # Verify _deliver_direct was called
+        mock_session_manager._deliver_direct.assert_called()
+    finally:
+        await message_queue.stop()

@@ -106,7 +106,7 @@ async def test_watch_session_notifies_when_target_goes_idle(
     text = watcher_messages[0][1]["text"]
     assert "target-agent" in text or "target-123" in text
     assert "idle" in text.lower()
-    assert watcher_messages[0][1]["delivery_mode"] == "urgent"
+    assert watcher_messages[0][1]["delivery_mode"] == "important"
 
 
 @pytest.mark.asyncio
@@ -164,7 +164,7 @@ async def test_watch_session_notifies_on_timeout(
     text = watcher_messages[0][1]["text"]
     assert "busy-agent" in text or "target-789" in text
     assert "timeout" in text.lower() or "still active" in text.lower()
-    assert watcher_messages[0][1]["delivery_mode"] == "urgent"
+    assert watcher_messages[0][1]["delivery_mode"] == "important"
 
 
 @pytest.mark.asyncio

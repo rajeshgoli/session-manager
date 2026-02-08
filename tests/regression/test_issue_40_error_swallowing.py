@@ -468,7 +468,17 @@ async def test_monitor_loop_resets_retry_count_on_success(tmp_path):
     queue_mgr = MessageQueueManager(
         session_manager=mock_session_manager,
         db_path=str(tmp_path / "test.db"),
-        config={"input_poll_interval": 0.05}
+        config={
+            "sm_send": {
+                "input_poll_interval": 0.05,  # Fast polling for test
+            },
+            "timeouts": {
+                "message_queue": {
+                    "initial_retry_delay_seconds": 0.1,  # Fast retries for test
+                    "max_retry_delay_seconds": 0.2,
+                }
+            }
+        }
     )
 
     await queue_mgr.start()
@@ -485,7 +495,7 @@ async def test_monitor_loop_resets_retry_count_on_success(tmp_path):
 
     queue_mgr._get_sessions_with_pending = intermittent_failure
 
-    await asyncio.sleep(10)
+    await asyncio.sleep(2)  # Shorter wait with faster retries
     await queue_mgr.stop()
 
     # Verify it didn't give up (retry count was reset between errors)
