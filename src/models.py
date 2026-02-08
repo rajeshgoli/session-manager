@@ -9,13 +9,9 @@ import uuid
 
 class SessionStatus(Enum):
     """Session lifecycle status."""
-    STARTING = "starting"
-    RUNNING = "running"
-    WAITING_INPUT = "waiting_input"
-    WAITING_PERMISSION = "waiting_permission"
-    IDLE = "idle"
-    STOPPED = "stopped"
-    ERROR = "error"
+    RUNNING = "running"  # Actively working
+    IDLE = "idle"        # Waiting for input
+    STOPPED = "stopped"  # Terminated
 
 
 class DeliveryMode(Enum):
@@ -102,7 +98,7 @@ class Session:
     tmux_session: str = ""
     provider: str = "claude"  # "claude", "codex" (tmux), or "codex-app" (app-server)
     log_file: str = ""
-    status: SessionStatus = SessionStatus.STARTING
+    status: SessionStatus = SessionStatus.RUNNING
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     telegram_chat_id: Optional[int] = None

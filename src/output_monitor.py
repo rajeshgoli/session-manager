@@ -238,9 +238,9 @@ class OutputMonitor:
 
         self._notified_permissions[session.id] = datetime.now()
 
-        # Update status
+        # Update status to IDLE (waiting for user input)
         if self._status_callback:
-            await self._status_callback(session.id, SessionStatus.WAITING_PERMISSION)
+            await self._status_callback(session.id, SessionStatus.IDLE)
 
         # Only send notification if enabled
         if not self.notify_permission_prompts:
@@ -265,9 +265,7 @@ class OutputMonitor:
 
     async def _handle_error(self, session: Session, content: str):
         """Handle detected error."""
-        if self._status_callback:
-            await self._status_callback(session.id, SessionStatus.ERROR)
-
+        # Don't change status - error patterns in output don't mean the session failed
         # Only send notification if enabled
         if not self.notify_errors:
             logger.debug(f"Error detected but notifications disabled for session {session.id}")
@@ -289,6 +287,10 @@ class OutputMonitor:
 
     async def _handle_completion(self, session: Session, content: str):
         """Handle detected completion."""
+        # Update status to IDLE on completion (clears any ERROR status)
+        if self._status_callback:
+            await self._status_callback(session.id, SessionStatus.IDLE)
+
         # Only send notification if enabled
         if not self.notify_completion:
             logger.debug(f"Completion detected but notifications disabled for session {session.id}")

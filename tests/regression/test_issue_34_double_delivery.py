@@ -32,6 +32,7 @@ def mock_session_manager():
     # Track how many times send_input_async is called
     manager.tmux.send_input_async = AsyncMock(return_value=True)
     manager._save_state = Mock()
+    manager._deliver_direct = AsyncMock(return_value=True)
     return manager
 
 
@@ -75,8 +76,8 @@ async def test_rapid_mark_idle_no_double_delivery(queue_manager, mock_session_ma
     # Give all tasks time to execute
     await asyncio.sleep(0.5)
 
-    # Verify send_input_async was called exactly once (not 3 times)
-    assert mock_session_manager.tmux.send_input_async.call_count == 1
+    # Verify _deliver_direct was called exactly once (not 3 times)
+    assert mock_session_manager._deliver_direct.call_count == 1
 
     # Verify message was marked as delivered
     pending = queue_manager.get_pending_messages(session_id)
@@ -113,7 +114,7 @@ async def test_concurrent_delivery_tasks_serialized(queue_manager, mock_session_
 
     # The lock should ensure only one delivery happens
     # (up to max_batch_size messages in that delivery)
-    assert mock_session_manager.tmux.send_input_async.call_count == 1
+    assert mock_session_manager._deliver_direct.call_count == 1
 
     # All messages should be delivered
     pending = queue_manager.get_pending_messages(session_id)
@@ -149,7 +150,7 @@ async def test_different_sessions_not_blocked(queue_manager, mock_session_manage
     await asyncio.gather(task1, task2)
 
     # Both should have been delivered (locks are per-session)
-    assert mock_session_manager.tmux.send_input_async.call_count == 2
+    assert mock_session_manager._deliver_direct.call_count == 2
 
     # No pending messages for either session
     assert len(queue_manager.get_pending_messages("session-1")) == 0
@@ -167,8 +168,8 @@ async def test_lock_released_on_error(queue_manager, mock_session_manager):
     session.last_activity = datetime.now()
     mock_session_manager.sessions[session_id] = session
 
-    # Make send_input_async fail
-    mock_session_manager.tmux.send_input_async = AsyncMock(return_value=False)
+    # Make _deliver_direct fail
+    mock_session_manager._deliver_direct = AsyncMock(return_value=False)
 
     # Queue a message
     queue_manager.queue_message(session_id, "Test message", "sequential")
@@ -176,8 +177,8 @@ async def test_lock_released_on_error(queue_manager, mock_session_manager):
     # First delivery attempt (will fail)
     await queue_manager._try_deliver_messages(session_id)
 
-    # Make send_input_async succeed now
-    mock_session_manager.tmux.send_input_async = AsyncMock(return_value=True)
+    # Make _deliver_direct succeed now
+    mock_session_manager._deliver_direct = AsyncMock(return_value=True)
 
     # Second delivery attempt (should succeed - lock should not be stuck)
     await queue_manager._try_deliver_messages(session_id)
@@ -208,7 +209,7 @@ async def test_rapid_fire_stress_test(queue_manager, mock_session_manager):
     await asyncio.sleep(1.0)
 
     # Should only deliver once despite 20 triggers
-    assert mock_session_manager.tmux.send_input_async.call_count == 1
+    assert mock_session_manager._deliver_direct.call_count == 1
 
     # Message should be delivered
     assert len(queue_manager.get_pending_messages(session_id)) == 0

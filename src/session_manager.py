@@ -78,7 +78,28 @@ class SessionManager:
             try:
                 with open(self.state_file) as f:
                     data = json.load(f)
+                legacy_codex_sessions: list[dict] = []
+                cleaned_sessions: list[dict] = []
                 for session_data in data.get("sessions", []):
+                    raw_provider = session_data.get("provider")
+                    raw_tmux_session = session_data.get("tmux_session")
+                    raw_log_file = session_data.get("log_file")
+                    raw_codex_thread_id = session_data.get("codex_thread_id")
+                    is_legacy_codex_app = (
+                        raw_provider == "codex"
+                        and (
+                            raw_codex_thread_id is not None
+                            or (not raw_tmux_session and not raw_log_file)
+                        )
+                    )
+                    if is_legacy_codex_app:
+                        legacy_codex_sessions.append(session_data)
+                        name = session_data.get("name") or session_data.get("id", "unknown")
+                        logger.warning(
+                            f"Dropping legacy codex app session from state: {name}"
+                        )
+                        continue
+                    cleaned_sessions.append(session_data)
                     session = Session.from_dict(session_data)
                     # Codex app-server sessions are restored without tmux
                     if session.provider == "codex-app":
@@ -86,18 +107,37 @@ class SessionManager:
                         logger.info(f"Restored codex app session: {session.name}")
                         continue
 
-                    # Verify tmux session still exists (Claude)
+                    # Verify tmux session still exists (Claude/Codex CLI)
                     if self.tmux.session_exists(session.tmux_session):
                         self.sessions[session.id] = session
                         logger.info(f"Restored session: {session.name}")
                     else:
                         logger.warning(f"Session {session.name} no longer exists in tmux")
+                if legacy_codex_sessions:
+                    self._rewrite_state_raw(cleaned_sessions)
                 return True
             except Exception as e:
                 logger.error(f"CRITICAL: Failed to load state from {self.state_file}: {e}")
                 logger.error(f"Session state may be lost! Please check {self.state_file}")
                 return False
         return True  # No state file is not an error
+
+    def _rewrite_state_raw(self, sessions_data: list[dict]) -> bool:
+        """Rewrite state file with provided session data (used for one-time cleanup)."""
+        try:
+            data = {"sessions": sessions_data}
+            state_path = Path(self.state_file)
+            temp_file = state_path.with_suffix(".tmp")
+
+            with open(temp_file, "w") as f:
+                json.dump(data, f, indent=2)
+
+            temp_file.rename(state_path)
+            logger.info("State file rewritten to drop legacy codex app sessions.")
+            return True
+        except Exception as e:
+            logger.error(f"CRITICAL: Failed to rewrite state file {self.state_file}: {e}")
+            return False
 
     def _save_state(self) -> bool:
         """
@@ -731,7 +771,7 @@ class SessionManager:
 
         # Update session status and activity
         session.last_activity = datetime.now()
-        session.status = SessionStatus.IDLE if status in ("completed", "interrupted") else SessionStatus.ERROR
+        session.status = SessionStatus.IDLE  # Session stopped, waiting for input
         self._save_state()
 
         # Mark idle for message queue delivery

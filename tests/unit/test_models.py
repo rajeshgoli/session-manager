@@ -93,7 +93,7 @@ class TestSession:
         assert session.working_dir == ""
         assert session.tmux_session == f"claude-{session.id}"
         assert session.log_file == ""
-        assert session.status == SessionStatus.STARTING
+        assert session.status == SessionStatus.RUNNING
         assert isinstance(session.created_at, datetime)
         assert isinstance(session.last_activity, datetime)
         assert session.telegram_chat_id is None
@@ -330,15 +330,7 @@ class TestEnums:
 
     def test_session_status_values(self):
         """SessionStatus has all expected values."""
-        expected = [
-            "starting",
-            "running",
-            "waiting_input",
-            "waiting_permission",
-            "idle",
-            "stopped",
-            "error",
-        ]
+        expected = ["running", "idle", "stopped"]
         actual = [s.value for s in SessionStatus]
         assert set(actual) == set(expected)
 

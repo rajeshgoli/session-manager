@@ -382,12 +382,12 @@ class MessageQueueManager:
                 logger.info(f"Session {target_session_id} already idle (in-memory), triggering immediate delivery")
                 asyncio.create_task(self._try_deliver_messages(target_session_id))
             else:
-                # Check actual session status - sessions with ERROR or IDLE status should receive messages
+                # Check actual session status - IDLE sessions should receive messages
                 session = self.session_manager.get_session(target_session_id)
                 if session:
                     from .models import SessionStatus
-                    if session.status in (SessionStatus.ERROR, SessionStatus.IDLE):
-                        logger.info(f"Session {target_session_id} has status={session.status.value}, marking idle for delivery")
+                    if session.status == SessionStatus.IDLE:
+                        logger.info(f"Session {target_session_id} is idle, marking for delivery")
                         self.mark_session_idle(target_session_id)
 
         return msg

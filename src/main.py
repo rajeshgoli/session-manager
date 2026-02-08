@@ -376,7 +376,7 @@ class SessionManagerApp:
 
         # Restore monitoring for existing sessions
         for session in self.session_manager.list_sessions():
-            if session.status not in (SessionStatus.STOPPED, SessionStatus.ERROR):
+            if session.status != SessionStatus.STOPPED:
                 if session.provider != "codex-app":
                     await self.output_monitor.start_monitoring(session, is_restored=True)
                     logger.info(f"Restored monitoring for session {session.name}")

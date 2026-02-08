@@ -3,7 +3,7 @@ Regression tests for issue #76: Pending messages not delivered, accumulating in 
 
 Tests cover:
 1. Messages for non-existent sessions are cleaned up during recovery
-2. Messages for sessions with status='error' are delivered immediately
+2. Messages for idle sessions are delivered immediately
 3. Recovery runs correctly on startup
 """
 
@@ -33,6 +33,7 @@ def mock_session_manager():
     manager.get_session = lambda sid: manager.sessions.get(sid)
     manager.tmux = Mock()
     manager.tmux.send_input_async = AsyncMock(return_value=True)
+    manager._deliver_direct = AsyncMock(return_value=True)
     return manager
 
 
@@ -77,40 +78,6 @@ async def test_recovery_cleans_up_nonexistent_sessions(queue_manager, mock_sessi
 
 
 @pytest.mark.asyncio
-async def test_delivery_to_error_status_session(queue_manager, mock_session_manager):
-    """Test that messages are delivered to sessions with status='error'."""
-    # Create a session with ERROR status
-    session_id = "test-session-error"
-    session = Mock(spec=Session)
-    session.id = session_id
-    session.status = SessionStatus.ERROR
-    session.tmux_session = "tmux-session-123"
-    mock_session_manager.sessions[session_id] = session
-
-    # Queue a message - this should trigger immediate delivery
-    queue_manager.queue_message(
-        target_session_id=session_id,
-        text="Test message for error session",
-        delivery_mode="sequential"
-    )
-
-    # Give async tasks time to execute
-    await asyncio.sleep(0.2)
-
-    # Verify session was marked idle at some point (last_idle_at should be set)
-    state = queue_manager.delivery_states.get(session_id)
-    assert state is not None
-    assert state.last_idle_at is not None, "Session should have been marked idle"
-
-    # Verify message was delivered (queue should be empty)
-    pending = queue_manager.get_pending_messages(session_id)
-    assert len(pending) == 0, "Message should have been delivered"
-
-    # Verify send_input_async was called
-    mock_session_manager.tmux.send_input_async.assert_called()
-
-
-@pytest.mark.asyncio
 async def test_delivery_to_idle_status_session(queue_manager, mock_session_manager):
     """Test that messages are delivered to sessions with status='idle'."""
     # Create a session with IDLE status
@@ -140,8 +107,8 @@ async def test_delivery_to_idle_status_session(queue_manager, mock_session_manag
     pending = queue_manager.get_pending_messages(session_id)
     assert len(pending) == 0, "Message should have been delivered"
 
-    # Verify send_input_async was called
-    mock_session_manager.tmux.send_input_async.assert_called()
+    # Verify _deliver_direct was called
+    mock_session_manager._deliver_direct.assert_called()
 
 
 @pytest.mark.asyncio
