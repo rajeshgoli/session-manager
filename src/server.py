@@ -1283,7 +1283,7 @@ Provide ONLY the summary, no preamble or questions."""
                 session = app.state.session_manager.get_session(session_manager_id)
                 if session:
                     # Import lock manager functions
-                    from .lock_manager import LockManager, is_worktree, has_uncommitted_changes
+                    from .lock_manager import LockManager, is_worktree, get_worktree_status_hash
 
                     # Release all locks (silent)
                     for repo_root in session.touched_repos:
@@ -1294,12 +1294,24 @@ Provide ONLY the summary, no preamble or questions."""
                     # Check for worktrees with uncommitted changes
                     cleanup_needed = []
                     for repo_root in session.touched_repos:
-                        if is_worktree(repo_root) and has_uncommitted_changes(repo_root):
-                            cleanup_needed.append(repo_root)
+                        if not is_worktree(repo_root):
+                            continue
+
+                        status_hash = get_worktree_status_hash(repo_root)
+                        if status_hash is None:
+                            # Clean worktree: clear any prior prompt state
+                            if repo_root in session.cleanup_prompted:
+                                del session.cleanup_prompted[repo_root]
+                            continue
+
+                        if session.cleanup_prompted.get(repo_root) == status_hash:
+                            continue
+
+                        cleanup_needed.append((repo_root, status_hash))
 
                     # Inject cleanup prompt if needed
                     if cleanup_needed:
-                        paths_str = "\n".join(f"  - {p}" for p in cleanup_needed)
+                        paths_str = "\n".join(f"  - {p}" for p, _ in cleanup_needed)
                         cleanup_prompt = f"""You have uncommitted changes in worktree(s):
 {paths_str}
 
@@ -1316,6 +1328,9 @@ Or continue working if not done yet."""
                             cleanup_prompt,
                             delivery_mode="important"
                         )
+                        for repo_root, status_hash in cleanup_needed:
+                            session.cleanup_prompted[repo_root] = status_hash
+                        app.state.session_manager._save_state()
                         logger.info(f"Sent cleanup prompt for {len(cleanup_needed)} worktree(s)")
 
         if hook_event == "Stop" and last_message:

@@ -1,5 +1,6 @@
 """Lock file management for multi-agent coordination fallback."""
 
+import hashlib
 import logging
 import subprocess
 from dataclasses import dataclass
@@ -82,6 +83,32 @@ def has_uncommitted_changes(repo_root: str) -> bool:
         return bool(result.stdout.strip())
     except Exception:
         return False
+
+
+def get_worktree_status_hash(repo_root: str) -> Optional[str]:
+    """
+    Return a stable hash of the repo's working tree status.
+
+    Args:
+        repo_root: Path to git repository root
+
+    Returns:
+        Hex digest string when there are uncommitted changes, otherwise None.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        status = result.stdout.strip()
+        if not status:
+            return None
+        return hashlib.sha256(status.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
 
 
 @dataclass
