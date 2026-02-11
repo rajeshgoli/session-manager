@@ -1293,6 +1293,7 @@ Provide ONLY the summary, no preamble or questions."""
 
                     # Check for worktrees with uncommitted changes
                     cleanup_needed = []
+                    prompt_state_changed = False
                     for repo_root in session.touched_repos:
                         if not is_worktree(repo_root):
                             continue
@@ -1302,6 +1303,7 @@ Provide ONLY the summary, no preamble or questions."""
                             # Clean worktree: clear any prior prompt state
                             if repo_root in session.cleanup_prompted:
                                 del session.cleanup_prompted[repo_root]
+                                prompt_state_changed = True
                             continue
 
                         if session.cleanup_prompted.get(repo_root) == status_hash:
@@ -1332,6 +1334,8 @@ Or continue working if not done yet."""
                             session.cleanup_prompted[repo_root] = status_hash
                         app.state.session_manager._save_state()
                         logger.info(f"Sent cleanup prompt for {len(cleanup_needed)} worktree(s)")
+                    elif prompt_state_changed:
+                        app.state.session_manager._save_state()
 
         if hook_event == "Stop" and last_message:
             # Send immediate notification to Telegram
