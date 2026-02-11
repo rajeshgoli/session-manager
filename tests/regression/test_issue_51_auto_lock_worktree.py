@@ -401,9 +401,9 @@ class TestStopHookCleanup:
 
         session.touched_repos.add(str(worktree))
 
-        # Mock has_uncommitted_changes to return True
+        # Mock status hash to return a dirty hash
         with patch("src.lock_manager.is_worktree", return_value=True):
-            with patch("src.lock_manager.has_uncommitted_changes", return_value=True):
+            with patch("src.lock_manager.get_worktree_status_hash", return_value="hash1"):
                 with patch("src.session_manager.SessionManager.send_input", new_callable=AsyncMock) as mock_send:
                     test_client.post(
                         "/hooks/claude",
@@ -421,6 +421,32 @@ class TestStopHookCleanup:
                     assert "git push" in call_args[0][1]
                     assert call_args[1]["delivery_mode"] == "important"
 
+    def test_stop_hook_does_not_repeat_cleanup_prompt_for_same_changes(self, test_client, session_manager, tmp_path):
+        """Stop hook should not resend cleanup prompt for unchanged dirty worktree."""
+        session = Session(id="test", working_dir=str(tmp_path))
+        session_manager.sessions["test"] = session
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: /main/.git/worktrees/branch")
+
+        session.touched_repos.add(str(worktree))
+        session.cleanup_prompted[str(worktree)] = "hash1"
+
+        with patch("src.lock_manager.is_worktree", return_value=True):
+            with patch("src.lock_manager.get_worktree_status_hash", return_value="hash1"):
+                with patch("src.session_manager.SessionManager.send_input", new_callable=AsyncMock) as mock_send:
+                    test_client.post(
+                        "/hooks/claude",
+                        json={
+                            "hook_event_name": "Stop",
+                            "session_manager_id": "test",
+                            "transcript_path": "/tmp/transcript.jsonl",
+                        }
+                    )
+
+                    mock_send.assert_not_called()
+
     def test_stop_hook_no_prompt_for_clean_worktree(self, test_client, session_manager, tmp_path):
         """Stop hook should not prompt for clean worktrees."""
         session = Session(id="test", working_dir=str(tmp_path))
@@ -432,9 +458,9 @@ class TestStopHookCleanup:
 
         session.touched_repos.add(str(worktree))
 
-        # Mock has_uncommitted_changes to return False
+        # Mock status hash to return None (clean)
         with patch("src.lock_manager.is_worktree", return_value=True):
-            with patch("src.lock_manager.has_uncommitted_changes", return_value=False):
+            with patch("src.lock_manager.get_worktree_status_hash", return_value=None):
                 with patch("src.session_manager.SessionManager.send_input", new_callable=AsyncMock) as mock_send:
                     test_client.post(
                         "/hooks/claude",
