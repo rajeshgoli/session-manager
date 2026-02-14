@@ -1433,6 +1433,9 @@ Or continue working if not done yet."""
                     if app.state.notifier and app.state.session_manager:
                         target_session = app.state.session_manager.get_session(sid)
                         if target_session and target_session.telegram_chat_id:
+                            # Persist transcript path (same as immediate Stop path)
+                            if transcript_path and not target_session.transcript_path:
+                                target_session.transcript_path = transcript_path
                             app.state.last_claude_output[target_session.id] = last_message
                             from datetime import datetime
                             target_session.last_activity = datetime.now()
