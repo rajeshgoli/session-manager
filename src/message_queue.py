@@ -408,8 +408,12 @@ class MessageQueueManager:
         if delivery_mode == "urgent":
             asyncio.create_task(self._deliver_urgent(target_session_id, msg))
         elif is_codex:
-            # Codex: mark idle and deliver immediately (preserves queue ordering)
-            self.mark_session_idle(target_session_id)
+            # Codex: set idle flag and deliver immediately, but skip the
+            # stop-notification side effects of mark_session_idle() since
+            # this isn't a real stop event.
+            state = self._get_or_create_state(target_session_id)
+            state.is_idle = True
+            asyncio.create_task(self._try_deliver_messages(target_session_id))
         # If important mode, trigger check (delivers when response complete)
         elif delivery_mode == "important":
             asyncio.create_task(self._try_deliver_messages(target_session_id, important_only=True))
