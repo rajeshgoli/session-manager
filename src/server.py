@@ -1241,6 +1241,11 @@ Provide ONLY the summary, no preamble or questions."""
                                 full_text = "\n".join(texts).strip()
                                 if full_text:
                                     return (True, full_text)
+                                # Newest assistant message exists but has no
+                                # visible text (whitespace-only / not flushed).
+                                # Stop here — do NOT fall back to older entries
+                                # which would surface a stale message.
+                                return (True, None)
                         except json.JSONDecodeError as e:
                             logger.debug(f"Skipping malformed JSON line in transcript: {e}")
                             continue
