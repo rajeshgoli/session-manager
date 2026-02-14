@@ -217,6 +217,7 @@ def create_app(
     app.state.output_monitor = output_monitor
     app.state.child_monitor = child_monitor
     app.state.last_claude_output = {}  # Store last output per session from hooks
+    app.state.pending_stop_notifications = set()  # Sessions where Stop hook had empty transcript
 
     @app.get("/")
     async def root():
@@ -1237,8 +1238,14 @@ Provide ONLY the summary, no preamble or questions."""
                                 for item in content:
                                     if isinstance(item, dict) and item.get("type") == "text":
                                         texts.append(item.get("text", ""))
-                                if texts:
-                                    return (True, "\n".join(texts))
+                                full_text = "\n".join(texts).strip()
+                                if full_text:
+                                    return (True, full_text)
+                                # Newest assistant message exists but has no
+                                # visible text (whitespace-only / not flushed).
+                                # Stop here — do NOT fall back to older entries
+                                # which would surface a stale message.
+                                return (True, None)
                         except json.JSONDecodeError as e:
                             logger.debug(f"Skipping malformed JSON line in transcript: {e}")
                             continue
@@ -1337,8 +1344,17 @@ Or continue working if not done yet."""
                     elif prompt_state_changed:
                         app.state.session_manager._save_state()
 
+        if hook_event == "Stop" and not last_message and session_manager_id:
+            # Transcript was empty/whitespace-only at Stop time (race condition:
+            # file not flushed yet). Track this so we can send a deferred
+            # notification when the idle_prompt Notification hook arrives with
+            # the real content ~60s later.
+            app.state.pending_stop_notifications.add(session_manager_id)
+            logger.info(f"Stop hook for {session_manager_id} had empty transcript, deferring notification")
+
         if hook_event == "Stop" and last_message:
             # Send immediate notification to Telegram
+            app.state.pending_stop_notifications.discard(session_manager_id)
             if app.state.notifier and app.state.session_manager:
                 # Try to find the session this hook belongs to
                 target_session = None
@@ -1412,9 +1428,45 @@ Or continue working if not done yet."""
             message = payload.get("message", "")
             logger.info(f"Claude notification: {notification_type} - {message}")
 
-            # Skip idle notifications - user doesn't want them (gets Stop hooks anyway)
+            # idle_prompt: normally skip, but send deferred response if the
+            # preceding Stop hook had an empty transcript (race condition).
             if notification_type == "idle_prompt":
-                logger.debug(f"Skipping idle_prompt notification (filtered out)")
+                sid = session_manager_id
+                if sid and sid in app.state.pending_stop_notifications and last_message:
+                    app.state.pending_stop_notifications.discard(sid)
+                    logger.info(f"Sending deferred response notification for {sid} (idle_prompt had content)")
+                    if app.state.notifier and app.state.session_manager:
+                        target_session = app.state.session_manager.get_session(sid)
+                        if target_session and target_session.telegram_chat_id:
+                            # Persist transcript path (same as immediate Stop path)
+                            if transcript_path and not target_session.transcript_path:
+                                target_session.transcript_path = transcript_path
+                            app.state.last_claude_output[target_session.id] = last_message
+                            from datetime import datetime
+                            target_session.last_activity = datetime.now()
+                            app.state.session_manager._save_state()
+                            from .models import NotificationEvent
+                            event = NotificationEvent(
+                                session_id=target_session.id,
+                                event_type="response",
+                                message="Claude responded",
+                                context=last_message,
+                                urgent=False,
+                            )
+                            await app.state.notifier.notify(event, target_session)
+                            if app.state.output_monitor:
+                                app.state.output_monitor.mark_response_sent(target_session.id)
+                else:
+                    # Only clear pending state if the session is NOT awaiting
+                    # a deferred notification (i.e. it was never pending, or
+                    # was pending but last_message is empty — keep it pending
+                    # so a later hook can still deliver the content).
+                    if sid and sid not in app.state.pending_stop_notifications:
+                        logger.debug(f"Skipping idle_prompt notification for {sid} (filtered out)")
+                    elif sid and sid in app.state.pending_stop_notifications:
+                        logger.info(f"idle_prompt for {sid} had empty transcript, keeping deferred state")
+                    else:
+                        logger.debug(f"Skipping idle_prompt notification (filtered out)")
                 return {"status": "received", "hook_event": hook_event}
 
             # Send notification to Telegram for permission prompts and errors
