@@ -1012,7 +1012,7 @@ class SessionManager:
 
         Recovery flow:
         1. Pause message queue (prevent sm send going to bash)
-        2. Send /exit to cleanly shutdown crashed harness
+        2. Send Ctrl-C twice to kill the crashed harness
         3. Wait for shell prompt
         4. Reset terminal with stty sane
         5. Resume Claude with --resume <uuid>
@@ -1042,17 +1042,20 @@ class SessionManager:
             self.message_queue_manager.pause_session(session.id)
 
         try:
-            # 2. Send /exit to shutdown crashed harness
-            logger.debug(f"Sending /exit to session {session.id}")
-            proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session.tmux_session, "/exit", "Enter",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=5)
+            # 2. Send Ctrl-C twice to kill the crashed harness
+            #    /exit doesn't work reliably when the harness is crashed
+            logger.debug(f"Sending C-c twice to session {session.id}")
+            for _ in range(2):
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "send-keys", "-t", session.tmux_session, "C-c",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.sleep(0.5)
 
             # 3. Wait for shell to be ready
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
 
             # 4. Reset terminal with stty sane
             logger.debug(f"Sending stty sane to session {session.id}")
