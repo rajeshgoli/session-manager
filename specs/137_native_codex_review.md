@@ -1,6 +1,6 @@
 # #137 — Native Codex /review Support for Code Reviews
 
-**Status:** Draft v10
+**Status:** Draft v11
 **Author:** Claude (Opus 4.6)
 **Created:** 2026-02-14
 **Updated:** 2026-02-14
@@ -525,17 +525,7 @@ else:
 
 **Completion polling:**
 
-```python
-async def poll_pr_review(repo: str, pr_number: int, since: datetime, timeout: int):
-    """Poll for a Codex review on a PR.
-
-    Polls gh api repos/{owner}/{repo}/pulls/{number}/reviews for a review
-    by codex[bot] submitted after `since`.
-    Polls every 30 seconds until found or timeout.
-    """
-```
-
-Uses `gh api repos/{owner}/{repo}/pulls/{number}/reviews` to check for new reviews. Filter with `--jq '.[] | select(.user.login == "codex[bot]") | select(.submitted_at > "<since_iso>")'`.
+Uses `poll_for_codex_review()` (defined in Step 9, `src/github_reviews.py`) — a sync function using `subprocess.run` + `time.sleep`. Polls `gh api repos/{owner}/{repo}/pulls/{number}/reviews`, filtering with `--jq '.[] | select(.user.login == "codex[bot]") | select(.submitted_at > "<since_iso>")'`.
 
 For `--pr` mode, `ReviewConfig` (defined in section 3.6 with `pr_number`, `pr_repo`, `pr_comment_id` fields) is stored on the **caller's session** since no child tmux session is created. The `pr_comment_id` is set after the comment is posted, enabling status checks and review deduplication during polling.
 
@@ -815,6 +805,8 @@ def cmd_review(
     uncommitted: bool = False,
     commit: Optional[str] = None,
     custom: Optional[str] = None,
+    pr: Optional[int] = None,           # Phase 1b: GitHub PR mode
+    repo: Optional[str] = None,         # Phase 1b: GitHub repo (owner/repo)
     new: bool = False,
     name: Optional[str] = None,
     wait: Optional[int] = None,
@@ -823,6 +815,8 @@ def cmd_review(
     steer: Optional[str] = None,
 ) -> int:
 ```
+
+**Note:** Phase 1b extends this same function with `pr`/`repo` params rather than introducing a separate handler. The `--pr` dispatch path calls `client.start_pr_review()` while all TUI modes call `client.start_review()` or `client.spawn_review()`.
 
 Validation and defaulting:
 - Exactly one mode required: `--base`, `--uncommitted`, `--commit`, `--custom`, or `--pr`
@@ -918,10 +912,10 @@ def get_pr_repo_from_git(working_dir: str) -> Optional[str]:
     """Infer owner/repo from git remote origin URL. Synchronous (subprocess.run)."""
 ```
 
-Implementation uses `gh` CLI via `asyncio.create_subprocess_exec`:
-- `gh pr comment <number> --repo <repo> --body "<body>"` to post
-- `gh api repos/{owner}/{repo}/pulls/{number}/reviews` to poll (filter by `user.login == "codex[bot]"` and `submitted_at > comment_time`)
-- `gh repo view --json nameWithOwner` to infer repo
+All functions use `subprocess.run` (sync). Server wraps with `asyncio.to_thread()` where needed:
+- `post_pr_review_comment()`: `subprocess.run(["gh", "pr", "comment", ...])` to post
+- `poll_for_codex_review()`: `subprocess.run(["gh", "api", ...])` in a `time.sleep` loop to poll (filter by `user.login == "codex[bot]"` and `submitted_at > comment_time`)
+- `get_pr_repo_from_git()`: `subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner"])` to infer repo
 
 #### Step 10: Add `start_pr_review()` to SessionManager
 
