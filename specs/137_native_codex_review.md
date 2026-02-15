@@ -850,21 +850,34 @@ Add `steer` branch to `send_input()` (at `session_manager.py:650`, before the ex
 ```python
 # Handle steer mode — bypass queue, inject directly via Enter key
 if delivery_mode == "steer":
-    success = await self.tmux_controller.send_steer_text(
+    success = await self.tmux.send_steer_text(
         session.tmux_session, formatted_text
     )
     return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 ```
 
-This must be wired at the `SessionManager.send_input()` level, not in `message_queue.py`, because `send_input()` is the routing point that gates by delivery mode (lines 656-688). Unknown modes fall through to `_deliver_direct()` which would send as a plain prompt — wrong for steer.
+This must be wired at the `SessionManager.send_input()` level, not in `message_queue.py`, because `send_input()` is the routing point that gates by delivery mode (lines 656-688). Unknown modes fall through to `_deliver_direct()` which would send as a plain prompt — wrong for steer. The attribute is `self.tmux` (not `self.tmux_controller`) per `session_manager.py:32`.
 
 **File:** `src/cli/main.py`
 
-Add `--steer` flag to existing `send` subparser:
+Add `--steer` flag to existing `send` subparser (at line ~78, after `--urgent`):
 ```python
 send_parser.add_argument("--steer", action="store_true",
     help="Inject text into active Codex turn via steer (Enter → text → Enter)")
 ```
+
+Update delivery mode dispatch (at line ~254, after existing `urgent`/`important` branches):
+```python
+delivery_mode = "sequential"  # default
+if args.urgent:
+    delivery_mode = "urgent"
+elif args.important:
+    delivery_mode = "important"
+elif args.steer:
+    delivery_mode = "steer"
+```
+
+The flags are mutually exclusive by `elif` precedence (same pattern as existing `urgent`/`important`). If multiple are set, precedence is: urgent > important > steer > sequential.
 
 **File:** `src/server.py`
 
