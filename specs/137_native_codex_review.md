@@ -339,12 +339,12 @@ This is required because the EM is an agent — it cannot manually click the ste
 
 **`--steer` vs other delivery modes:**
 
-| Mode | When it delivers | How | Use case |
-|------|-----------------|-----|----------|
-| `--sequential` (default) | When session is idle | Normal prompt injection | Post-review follow-up |
-| `--important` | When session is idle (priority) | Normal prompt injection | Notifications |
-| `--urgent` | Immediately (sends Escape first) | Interrupts current turn | Emergency |
-| `--steer` | Immediately (sends Enter first) | Injects into current turn | Mid-review focus change |
+| Mode | Behavior | How | Use case |
+|------|----------|-----|----------|
+| `--sequential` (default) | Queued; delivered when idle (note: Codex sessions force immediate delivery) | Normal prompt injection | Post-review follow-up |
+| `--important` | Queued with priority; delivered when idle (note: Codex sessions force immediate delivery) | Normal prompt injection | Notifications |
+| `--urgent` | Immediate; sends Escape first to interrupt | Interrupts current turn | Emergency |
+| `--steer` | Immediate; sends Enter first to open steer field | Injects into current turn via Codex steer | Mid-review focus change |
 
 ### 3.6 Review Session Model
 
@@ -832,24 +832,6 @@ Validation and defaulting:
 
 The EM agent needs to steer active reviews mid-turn. Since the EM is an agent (not a human at the TUI), it cannot click the Codex steer button manually. The `--steer` flag on `sm send` automates the full steer sequence.
 
-**File:** `src/cli/main.py`
-
-Add `--steer` flag to existing `send` subparser:
-```python
-send_parser.add_argument("--steer", action="store_true",
-    help="Inject text into active Codex turn via steer (Enter → text → Enter)")
-```
-
-**File:** `src/message_queue.py`
-
-Add steer delivery path. When `delivery_mode == "steer"`:
-1. Skip normal message queue entirely
-2. Resolve target session's tmux pane name
-3. Call `tmux_controller.send_steer_text(session_name, text)` directly
-4. Return immediately — no idle detection, no queueing
-
-This reuses `send_steer_text()` from Step 2 (tmux controller). The steer mode is intentionally simple — it's a direct tmux send-keys operation, not a queued message.
-
 **File:** `src/models.py`
 
 Add to `DeliveryMode` enum:
@@ -860,6 +842,33 @@ class DeliveryMode(Enum):
     URGENT = "urgent"
     STEER = "steer"  # Enter-based injection into active Codex turn
 ```
+
+**File:** `src/session_manager.py`
+
+Add `steer` branch to `send_input()` (at `session_manager.py:650`, before the existing `sequential` and `important/urgent` branches):
+
+```python
+# Handle steer mode — bypass queue, inject directly via Enter key
+if delivery_mode == "steer":
+    success = await self.tmux_controller.send_steer_text(
+        session.tmux_session, formatted_text
+    )
+    return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
+```
+
+This must be wired at the `SessionManager.send_input()` level, not in `message_queue.py`, because `send_input()` is the routing point that gates by delivery mode (lines 656-688). Unknown modes fall through to `_deliver_direct()` which would send as a plain prompt — wrong for steer.
+
+**File:** `src/cli/main.py`
+
+Add `--steer` flag to existing `send` subparser:
+```python
+send_parser.add_argument("--steer", action="store_true",
+    help="Inject text into active Codex turn via steer (Enter → text → Enter)")
+```
+
+**File:** `src/server.py`
+
+Update `send_input` endpoint to accept `"steer"` as a valid delivery mode value.
 
 #### Step 6: Add API client methods
 
@@ -1059,7 +1068,7 @@ This keeps the server stateless for standalone invocations while giving the CLI 
 | `src/server.py` | Add `StartReviewRequest`, `SpawnReviewRequest`, `PRReviewRequest` models and three endpoints |
 | `src/cli/commands.py` | Add `cmd_review()` function with `--pr` dispatch path |
 | `src/cli/main.py` | Add `review` subparser with `--pr` and `--repo` args; add `--steer` flag to existing `send` subparser |
-| `src/message_queue.py` | Add `steer` delivery path (bypass queue, call `send_steer_text()` directly) |
+| `src/session_manager.py` | *(also)* Add `steer` branch to `send_input()` before existing mode routing |
 | `src/cli/client.py` | Add `start_review()`, `spawn_review()`, and `start_pr_review()` API client methods |
 | `config.yaml` | Add `codex.review` configuration section |
 | *(target repo)* `CLAUDE.md` | Move review checklist here from `architect.md`; add "Review guidelines" section |
