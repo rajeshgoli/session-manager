@@ -163,6 +163,31 @@ class KillSessionRequest(BaseModel):
     requester_session_id: Optional[str] = None
 
 
+class StartReviewRequest(BaseModel):
+    """Start a review on an existing session."""
+    mode: str = "branch"
+    base_branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+    custom_prompt: Optional[str] = None
+    steer: Optional[str] = None
+    wait: Optional[int] = None
+    watcher_session_id: Optional[str] = None
+
+
+class SpawnReviewRequest(BaseModel):
+    """Spawn a new session and start a review."""
+    parent_session_id: str
+    mode: str = "branch"
+    base_branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+    custom_prompt: Optional[str] = None
+    steer: Optional[str] = None
+    name: Optional[str] = None
+    wait: Optional[int] = None
+    model: Optional[str] = None
+    working_dir: Optional[str] = None
+
+
 # Health check response models
 class HealthCheckResult(BaseModel):
     """Result of a single health check."""
@@ -1552,6 +1577,71 @@ Or continue working if not done yet."""
             "tmux_session": child_session.tmux_session,
             "provider": getattr(child_session, "provider", "claude"),
             "created_at": child_session.created_at.isoformat(),
+        }
+
+    @app.post("/sessions/{session_id}/review")
+    async def start_review(session_id: str, request: StartReviewRequest):
+        """Start a Codex review on an existing session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        result = await app.state.session_manager.start_review(
+            session_id=session_id,
+            mode=request.mode,
+            base_branch=request.base_branch,
+            commit_sha=request.commit_sha,
+            custom_prompt=request.custom_prompt,
+            steer_text=request.steer,
+            wait=request.wait,
+            watcher_session_id=request.watcher_session_id,
+        )
+
+        if result.get("error"):
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    @app.post("/sessions/review")
+    async def spawn_review(request: SpawnReviewRequest):
+        """Spawn a new Codex session and start a review."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        parent = app.state.session_manager.get_session(request.parent_session_id)
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent session not found")
+
+        session = await app.state.session_manager.spawn_review_session(
+            parent_session_id=request.parent_session_id,
+            mode=request.mode,
+            base_branch=request.base_branch,
+            commit_sha=request.commit_sha,
+            custom_prompt=request.custom_prompt,
+            steer_text=request.steer,
+            name=request.name,
+            wait=request.wait,
+            model=request.model,
+            working_dir=request.working_dir,
+        )
+
+        if not session:
+            raise HTTPException(status_code=500, detail="Failed to spawn review session")
+
+        # Start monitoring
+        if app.state.output_monitor:
+            await app.state.output_monitor.start_monitoring(session)
+
+        return {
+            "session_id": session.id,
+            "name": session.name,
+            "friendly_name": session.friendly_name,
+            "review_mode": request.mode,
+            "base_branch": request.base_branch,
+            "status": "started",
         }
 
     @app.get("/sessions/{parent_session_id}/children")

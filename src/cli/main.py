@@ -77,6 +77,7 @@ def main():
     send_parser.add_argument("--important", action="store_true", help="Inject immediately, queue behind current work")
     send_parser.add_argument("--urgent", action="store_true", help="Interrupt immediately")
     send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
+    send_parser.add_argument("--steer", action="store_true", help="Inject via Enter-based mid-turn steering (for Codex reviews)")
     send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
 
     # sm wait <session-id> <seconds>
@@ -196,6 +197,22 @@ def main():
         help="Optional new prompt to send after clearing"
     )
 
+    # sm review [session] --base|--uncommitted|--commit|--custom [options]
+    review_parser = subparsers.add_parser("review", help="Start a Codex code review")
+    review_parser.add_argument("session", nargs="?", help="Session ID or name to review on")
+    review_parser.add_argument("--base", help="Review against this base branch")
+    review_parser.add_argument("--uncommitted", action="store_true", help="Review uncommitted changes")
+    review_parser.add_argument("--commit", help="Review a specific commit SHA")
+    review_parser.add_argument("--custom", help="Custom review instructions")
+    review_parser.add_argument("--new", action="store_true", help="Spawn a new session for the review")
+    review_parser.add_argument("--name", help="Friendly name (with --new)")
+    review_parser.add_argument("--wait", type=int, default=None, help="Notify when review completes (seconds; defaults to 600 when in managed session)")
+    review_parser.add_argument("--model", help="Model override (with --new)")
+    review_parser.add_argument("--working-dir", help="Working directory (with --new)")
+    review_parser.add_argument("--steer", help="Instructions to inject after review starts")
+    review_parser.add_argument("--pr", type=int, help="PR number to review (Phase 1b)")
+    review_parser.add_argument("--repo", help="Repository for PR review (Phase 1b)")
+
     args = parser.parse_args()
 
     # Check for CLAUDE_SESSION_MANAGER_ID
@@ -204,7 +221,7 @@ def main():
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-app", "codex-server",
-        "attach", "output", "clear", None
+        "attach", "output", "clear", "review", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
@@ -250,12 +267,14 @@ def main():
     elif args.command == "subagents":
         sys.exit(commands.cmd_subagents(client, args.session_id))
     elif args.command == "send":
-        # Determine delivery mode
+        # Determine delivery mode (precedence: urgent > important > steer > sequential)
         delivery_mode = "sequential"  # default
         if args.urgent:
             delivery_mode = "urgent"
         elif args.important:
             delivery_mode = "important"
+        elif args.steer:
+            delivery_mode = "steer"
         # Extract wait parameter
         wait_seconds = args.wait if hasattr(args, 'wait') else None
         # notify_on_stop defaults to True unless --no-notify-on-stop is passed
@@ -285,6 +304,24 @@ def main():
         sys.exit(commands.cmd_output(client, args.session, args.lines))
     elif args.command == "clear":
         sys.exit(commands.cmd_clear(client, session_id, args.session, args.prompt))
+    elif args.command == "review":
+        sys.exit(commands.cmd_review(
+            client,
+            parent_session_id=session_id,
+            session=args.session,
+            base=args.base,
+            uncommitted=args.uncommitted,
+            commit=args.commit,
+            custom=args.custom,
+            new=args.new,
+            name=args.name,
+            wait=args.wait,
+            model=args.model,
+            working_dir=getattr(args, 'working_dir', None),
+            steer=args.steer,
+            pr=args.pr,
+            repo=args.repo,
+        ))
     else:
         parser.print_help()
         sys.exit(0)

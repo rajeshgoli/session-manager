@@ -19,6 +19,7 @@ class DeliveryMode(Enum):
     SEQUENTIAL = "sequential"
     IMPORTANT = "important"
     URGENT = "urgent"
+    STEER = "steer"
 
 
 class DeliveryResult(Enum):
@@ -47,6 +48,37 @@ class CompletionStatus(Enum):
     ERROR = "error"
     ABANDONED = "abandoned"
     KILLED = "killed"
+
+
+@dataclass
+class ReviewConfig:
+    """Configuration for a Codex review session."""
+    mode: str  # "branch", "uncommitted", "commit", "custom"
+    base_branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+    custom_prompt: Optional[str] = None
+    steer_text: Optional[str] = None
+    steer_delivered: bool = False
+    pr_number: Optional[int] = None
+    pr_repo: Optional[str] = None
+    pr_comment_id: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "mode": self.mode,
+            "base_branch": self.base_branch,
+            "commit_sha": self.commit_sha,
+            "custom_prompt": self.custom_prompt,
+            "steer_text": self.steer_text,
+            "steer_delivered": self.steer_delivered,
+            "pr_number": self.pr_number,
+            "pr_repo": self.pr_repo,
+            "pr_comment_id": self.pr_comment_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReviewConfig":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -110,6 +142,7 @@ class Session:
     git_remote_url: Optional[str] = None  # Git remote URL for repo matching
     subagents: List[Subagent] = field(default_factory=list)  # Subagents spawned by this session
     codex_thread_id: Optional[str] = None  # Codex app-server thread ID (if provider=codex-app)
+    review_config: Optional[ReviewConfig] = None  # Active review configuration
 
     # Multi-agent coordination fields
     parent_session_id: Optional[str] = None  # Parent that spawned this session
@@ -164,6 +197,7 @@ class Session:
             "git_remote_url": self.git_remote_url,
             "subagents": [s.to_dict() for s in self.subagents],
             "codex_thread_id": self.codex_thread_id,
+            "review_config": self.review_config.to_dict() if self.review_config else None,
             # Multi-agent coordination fields
             "parent_session_id": self.parent_session_id,
             "spawn_prompt": self.spawn_prompt,
@@ -228,6 +262,7 @@ class Session:
             git_remote_url=data.get("git_remote_url"),
             subagents=subagents,
             codex_thread_id=data.get("codex_thread_id"),
+            review_config=ReviewConfig.from_dict(data["review_config"]) if data.get("review_config") else None,
             # Multi-agent coordination fields
             parent_session_id=data.get("parent_session_id"),
             spawn_prompt=data.get("spawn_prompt"),

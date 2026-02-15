@@ -142,6 +142,12 @@ codex:
   sandbox: "workspace-write"
   # Request timeout for JSON-RPC calls
   request_timeout_seconds: 60
+  # Review-specific timing (for sm review command)
+  review:
+    default_wait: 600                # Default --wait seconds for reviews
+    menu_settle_seconds: 1.0         # Wait for /review menu to appear
+    branch_settle_seconds: 1.0       # Wait for branch picker to appear
+    steer_delay_seconds: 5.0         # Wait before injecting steer text
 
 child_agents:
   # Auto-completion detection

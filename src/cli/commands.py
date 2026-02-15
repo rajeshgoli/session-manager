@@ -1383,6 +1383,161 @@ def cmd_wait(
     return 0
 
 
+def cmd_review(
+    client: SessionManagerClient,
+    parent_session_id: Optional[str],
+    session: Optional[str] = None,
+    base: Optional[str] = None,
+    uncommitted: bool = False,
+    commit: Optional[str] = None,
+    custom: Optional[str] = None,
+    new: bool = False,
+    name: Optional[str] = None,
+    wait: Optional[int] = None,
+    model: Optional[str] = None,
+    working_dir: Optional[str] = None,
+    steer: Optional[str] = None,
+    pr: Optional[int] = None,
+    repo: Optional[str] = None,
+) -> int:
+    """
+    Start a Codex code review on an existing or new session.
+
+    Args:
+        client: API client
+        parent_session_id: Current session ID (from CLAUDE_SESSION_MANAGER_ID)
+        session: Target session ID or friendly name
+        base: Review against this base branch
+        uncommitted: Review uncommitted changes
+        commit: Review a specific commit SHA
+        custom: Custom review instructions
+        new: Spawn a new session for the review
+        name: Friendly name (with --new)
+        wait: Notify when review completes (seconds)
+        model: Model override (with --new)
+        working_dir: Working directory (with --new)
+        steer: Instructions to inject after review starts
+        pr: PR number (stub for Phase 1b)
+        repo: Repository for PR (stub for Phase 1b)
+
+    Exit codes:
+        0: Success
+        1: Validation error or failed
+        2: Session manager unavailable
+    """
+    # Validate: exactly one mode required
+    modes = []
+    if base:
+        modes.append("base")
+    if uncommitted:
+        modes.append("uncommitted")
+    if commit:
+        modes.append("commit")
+    if custom:
+        modes.append("custom")
+
+    if len(modes) == 0:
+        print("Error: Must specify one of --base, --uncommitted, --commit, or --custom", file=sys.stderr)
+        return 1
+    if len(modes) > 1:
+        print(f"Error: Modes are mutually exclusive. Got: {', '.join(modes)}", file=sys.stderr)
+        return 1
+
+    # Determine mode string
+    mode = modes[0]
+    if mode == "base":
+        mode = "branch"
+
+    # --pr is mutually exclusive with session/--new (stub for Phase 1b)
+    if pr is not None:
+        if session or new:
+            print("Error: --pr is mutually exclusive with session/--new", file=sys.stderr)
+            return 1
+        print("Error: --pr support is not yet implemented (Phase 1b)", file=sys.stderr)
+        return 1
+
+    # Validation: --new requires parent session context
+    if new:
+        if not parent_session_id:
+            print("Error: --new requires session context (CLAUDE_SESSION_MANAGER_ID must be set)", file=sys.stderr)
+            return 1
+    elif not session:
+        print("Error: Must specify a session or use --new", file=sys.stderr)
+        return 1
+
+    # Default --wait to 600 when caller has session context
+    if wait is None and parent_session_id:
+        wait = 600
+
+    if new:
+        # Spawn and review
+        result = client.spawn_review(
+            parent_session_id=parent_session_id,
+            mode=mode,
+            base_branch=base,
+            commit_sha=commit,
+            custom_prompt=custom,
+            steer=steer,
+            name=name,
+            wait=wait,
+            model=model,
+            working_dir=working_dir,
+        )
+
+        if result is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+
+        if result.get("error") or result.get("detail"):
+            print(f"Error: {result.get('error') or result.get('detail')}", file=sys.stderr)
+            return 1
+
+        child_id = result.get("session_id", "unknown")
+        child_name = result.get("friendly_name") or result.get("name", child_id)
+        print(f"Review started on {child_name} ({child_id}) — mode={mode}")
+        if wait:
+            print(f"  Watching for completion (timeout={wait}s)")
+        return 0
+    else:
+        # Resolve session
+        session_id, session_info = resolve_session_id(client, session)
+        if session_id is None:
+            sessions = client.list_sessions()
+            if sessions is None:
+                print("Error: Session manager unavailable", file=sys.stderr)
+                return 2
+            else:
+                print(f"Error: Session '{session}' not found", file=sys.stderr)
+                return 1
+
+        result = client.start_review(
+            session_id=session_id,
+            mode=mode,
+            base_branch=base,
+            commit_sha=commit,
+            custom_prompt=custom,
+            steer=steer,
+            wait=wait,
+            watcher_session_id=parent_session_id,
+        )
+
+        if result is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+
+        if result.get("error") or result.get("detail"):
+            print(f"Error: {result.get('error') or result.get('detail')}", file=sys.stderr)
+            return 1
+
+        session_name = session_info.get("friendly_name") or session_info.get("name") or session_id
+        print(f"Review started on {session_name} ({session_id}) — mode={mode}")
+        if steer:
+            print(f"  Steer queued: {steer[:60]}...")
+        if wait:
+            print(f"  Watching for completion (timeout={wait}s)")
+        return 0
+
+
 def cmd_clear(
     client: SessionManagerClient,
     requester_session_id: Optional[str],

@@ -476,6 +476,223 @@ class TmuxController:
             logger.error(f"Failed to capture pane: {e.stderr}")
             return None
 
+    async def send_review_sequence(
+        self,
+        session_name: str,
+        mode: str,
+        base_branch: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
+        branch_position: Optional[int] = None,
+        config: Optional[dict] = None,
+    ) -> bool:
+        """
+        Send /review slash command and navigate the interactive menu.
+
+        Args:
+            session_name: Target tmux session
+            mode: Review mode (branch, uncommitted, commit, custom)
+            base_branch: Target branch for branch mode
+            commit_sha: Target SHA for commit mode
+            custom_prompt: Custom review text for custom mode
+            branch_position: Pre-computed position in branch list (0-indexed)
+            config: Review timing config (menu_settle_seconds, branch_settle_seconds)
+
+        Returns:
+            True if sequence sent successfully
+        """
+        if not self.session_exists(session_name):
+            logger.error(f"Session {session_name} does not exist")
+            return False
+
+        cfg = config or {}
+        menu_settle = cfg.get("menu_settle_seconds", 1.0)
+        branch_settle = cfg.get("branch_settle_seconds", 1.0)
+
+        try:
+            if mode == "custom":
+                # Custom mode: send /review <text> directly, bypasses menu
+                review_text = f"/review {custom_prompt}"
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, '--', review_text,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+                await asyncio.sleep(self.send_keys_settle_seconds)
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+                logger.info(f"Sent custom review to {session_name}")
+                return True
+
+            # All other modes: send /review + Enter, then navigate menu
+            proc = await asyncio.create_subprocess_exec(
+                'tmux', 'send-keys', '-t', session_name, '--', '/review',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+            await asyncio.sleep(self.send_keys_settle_seconds)
+
+            proc = await asyncio.create_subprocess_exec(
+                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+
+            # Wait for menu to appear
+            await asyncio.sleep(menu_settle)
+
+            if mode == "branch":
+                # 1st menu item — just press Enter
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+
+                # Wait for branch picker
+                await asyncio.sleep(branch_settle)
+
+                # Navigate to target branch
+                if branch_position and branch_position > 0:
+                    for _ in range(branch_position):
+                        proc = await asyncio.create_subprocess_exec(
+                            'tmux', 'send-keys', '-t', session_name, 'Down',
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+
+                # Confirm branch selection
+                await asyncio.sleep(self.send_keys_settle_seconds)
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+                logger.info(f"Sent branch review to {session_name} (position={branch_position})")
+
+            elif mode == "uncommitted":
+                # 2nd menu item — Down then Enter
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, 'Down',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+                await asyncio.sleep(self.send_keys_settle_seconds)
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+                logger.info(f"Sent uncommitted review to {session_name}")
+
+            elif mode == "commit":
+                if commit_sha:
+                    logger.error("Commit mode SHA navigation not yet implemented; use --custom as a workaround")
+                    return False
+
+                # 3rd menu item — Down Down then Enter
+                for _ in range(2):
+                    proc = await asyncio.create_subprocess_exec(
+                        'tmux', 'send-keys', '-t', session_name, 'Down',
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+                await asyncio.sleep(self.send_keys_settle_seconds)
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+
+                # Wait for commit picker
+                await asyncio.sleep(branch_settle)
+
+                # Select the first commit (most recent)
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+                logger.info(f"Sent commit review to {session_name}")
+
+            return True
+
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout sending review sequence to {session_name}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to send review sequence to {session_name}: {e}")
+            return False
+
+    async def send_steer_text(self, session_name: str, text: str) -> bool:
+        """
+        Inject steer text into an active Codex turn via Enter key.
+
+        Sends: Enter (open steer field) -> text -> Enter (submit).
+
+        Args:
+            session_name: Target tmux session
+            text: Steer instructions to inject
+
+        Returns:
+            True if steer text sent successfully
+        """
+        if not self.session_exists(session_name):
+            logger.error(f"Session {session_name} does not exist")
+            return False
+
+        try:
+            # Press Enter to open steer input field
+            proc = await asyncio.create_subprocess_exec(
+                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+            await asyncio.sleep(self.send_keys_settle_seconds)
+
+            # Send the steer text
+            proc = await asyncio.create_subprocess_exec(
+                'tmux', 'send-keys', '-t', session_name, '--', text,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+            await asyncio.sleep(self.send_keys_settle_seconds)
+
+            # Press Enter to submit
+            proc = await asyncio.create_subprocess_exec(
+                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
+
+            logger.info(f"Sent steer text to {session_name}: {text[:50]}...")
+            return True
+
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout sending steer text to {session_name}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to send steer text to {session_name}: {e}")
+            return False
+
     def open_in_terminal(self, session_name: str) -> bool:
         """
         Open a tmux session in a new Terminal.app window (macOS only).

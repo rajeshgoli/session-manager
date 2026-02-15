@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 
-from .models import Session, SessionStatus, NotificationEvent, DeliveryResult
+from .models import Session, SessionStatus, NotificationEvent, DeliveryResult, ReviewConfig
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
 
@@ -647,6 +647,14 @@ class SessionManager:
                 notifier=self.notifier,
             ))
 
+        # Handle steer delivery mode — direct Enter-based injection, bypasses queue
+        if delivery_mode == "steer":
+            if session.provider != "codex":
+                logger.error(f"Steer delivery only supported for Codex CLI sessions, not {session.provider}")
+                return DeliveryResult.FAILED
+            success = await self.tmux.send_steer_text(session.tmux_session, text)
+            return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
+
         # Handle delivery modes using the message queue manager
         if self.message_queue_manager:
             # Check if session is idle (will be delivered immediately)
@@ -1071,6 +1079,242 @@ class SessionManager:
         return self.tmux.capture_pane(session.tmux_session, lines)
 
     # cleanup_dead_sessions() removed - OutputMonitor now handles detection and cleanup automatically
+
+    async def start_review(
+        self,
+        session_id: str,
+        mode: str,
+        base_branch: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
+        steer_text: Optional[str] = None,
+        wait: Optional[int] = None,
+        watcher_session_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Start a Codex /review on an existing session.
+
+        Args:
+            session_id: Target session ID (must be a Codex CLI session)
+            mode: Review mode (branch, uncommitted, commit, custom)
+            base_branch: Target branch for branch mode
+            commit_sha: Target SHA for commit mode
+            custom_prompt: Custom review text for custom mode
+            steer_text: Instructions to inject after review starts
+            wait: Seconds to watch for completion
+            watcher_session_id: Session to notify when review completes
+
+        Returns:
+            Status dict with review info
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return {"error": f"Session {session_id} not found"}
+
+        if session.provider != "codex":
+            return {"error": "Review requires a Codex CLI session (provider=codex)"}
+
+        # Validate session is idle before sending /review
+        if self.message_queue_manager:
+            state = self.message_queue_manager.delivery_states.get(session_id)
+            if state and not state.is_idle:
+                return {"error": "Session is busy. Wait for current work to complete or use sm clear first."}
+
+        # Validate working dir is a git repo
+        working_path = Path(session.working_dir).expanduser().resolve()
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--git-dir"],
+                cwd=working_path,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode != 0:
+                return {"error": f"Working directory is not a git repo: {session.working_dir}"}
+        except Exception as e:
+            return {"error": f"Failed to check git repo: {e}"}
+
+        # For branch mode, find branch position
+        branch_position = None
+        if mode == "branch" and base_branch:
+            try:
+                result = subprocess.run(
+                    ["git", "branch", "--list"],
+                    cwd=working_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if result.returncode != 0:
+                    return {"error": "Failed to list git branches"}
+
+                branches = []
+                for line in result.stdout.strip().split("\n"):
+                    # Strip leading whitespace and * marker for current branch
+                    branch = line.strip().lstrip("* ").strip()
+                    if branch:
+                        branches.append(branch)
+
+                if base_branch not in branches:
+                    return {"error": f"Branch '{base_branch}' not found. Available: {', '.join(branches)}"}
+
+                branch_position = branches.index(base_branch)
+                logger.info(f"Branch '{base_branch}' at position {branch_position} in list: {branches}")
+            except subprocess.TimeoutExpired:
+                return {"error": "Timeout listing git branches"}
+
+        # Store ReviewConfig on session
+        review_config = ReviewConfig(
+            mode=mode,
+            base_branch=base_branch,
+            commit_sha=commit_sha,
+            custom_prompt=custom_prompt,
+            steer_text=steer_text,
+            steer_delivered=False,
+        )
+        session.review_config = review_config
+
+        # Reset idle baseline for ChildMonitor
+        session.last_tool_call = datetime.now()
+        self._save_state()
+
+        # Mark session active in delivery state (critical for --wait)
+        if self.message_queue_manager:
+            self.message_queue_manager.mark_session_active(session_id)
+
+        # Get review timing config
+        codex_config = self.config.get("codex", {})
+        review_timing = codex_config.get("review", {})
+
+        # Send the review key sequence
+        success = await self.tmux.send_review_sequence(
+            session_name=session.tmux_session,
+            mode=mode,
+            base_branch=base_branch,
+            commit_sha=commit_sha,
+            custom_prompt=custom_prompt,
+            branch_position=branch_position,
+            config=review_timing,
+        )
+
+        if not success:
+            return {"error": "Failed to send review sequence to tmux"}
+
+        # Schedule steer injection if requested
+        if steer_text:
+            steer_delay = review_timing.get("steer_delay_seconds", 5.0)
+
+            async def _inject_steer():
+                await asyncio.sleep(steer_delay)
+                steer_success = await self.tmux.send_steer_text(session.tmux_session, steer_text)
+                if steer_success:
+                    session.review_config.steer_delivered = True
+                    self._save_state()
+                    logger.info(f"Steer text injected for session {session_id}")
+                else:
+                    logger.error(f"Failed to inject steer text for session {session_id}")
+
+            asyncio.create_task(_inject_steer())
+
+        # Register watch if requested
+        if wait and watcher_session_id and self.message_queue_manager:
+            await self.message_queue_manager.watch_session(
+                session_id, watcher_session_id, wait
+            )
+
+        return {
+            "session_id": session_id,
+            "review_mode": mode,
+            "base_branch": base_branch,
+            "commit_sha": commit_sha,
+            "status": "started",
+            "steer_queued": steer_text is not None,
+        }
+
+    async def spawn_review_session(
+        self,
+        parent_session_id: str,
+        mode: str,
+        base_branch: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
+        steer_text: Optional[str] = None,
+        name: Optional[str] = None,
+        wait: Optional[int] = None,
+        model: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> Optional[Session]:
+        """
+        Spawn a new Codex session and immediately start a review.
+
+        Args:
+            parent_session_id: Parent session ID
+            mode: Review mode (branch, uncommitted, commit, custom)
+            base_branch: Target branch for branch mode
+            commit_sha: Target SHA for commit mode
+            custom_prompt: Custom review text for custom mode
+            steer_text: Instructions to inject after review starts
+            name: Friendly name for the new session
+            wait: Seconds to watch for completion
+            model: Model override
+            working_dir: Working directory override
+
+        Returns:
+            Created Session or None on failure
+        """
+        parent = self.sessions.get(parent_session_id)
+        if not parent:
+            logger.error(f"Parent session not found: {parent_session_id}")
+            return None
+
+        child_working_dir = working_dir or parent.working_dir
+
+        # Spawn a Codex session with no initial prompt
+        session = await self._create_session_common(
+            working_dir=child_working_dir,
+            name=f"child-{parent_session_id[:6]}" if not name else None,
+            friendly_name=name,
+            parent_session_id=parent_session_id,
+            spawn_prompt=f"review:{mode}",
+            model=model,
+            initial_prompt=None,  # No prompt — we send /review instead
+            provider="codex",
+        )
+
+        if not session:
+            return None
+
+        # Wait for Codex CLI to initialize
+        tmux_timeouts = self.config.get("timeouts", {}).get("tmux", {})
+        init_seconds = tmux_timeouts.get("claude_init_seconds", 3)
+        await asyncio.sleep(init_seconds)
+
+        # Start the review (wait/watcher handled by ChildMonitor below, not watch_session)
+        result = await self.start_review(
+            session_id=session.id,
+            mode=mode,
+            base_branch=base_branch,
+            commit_sha=commit_sha,
+            custom_prompt=custom_prompt,
+            steer_text=steer_text,
+            wait=None,
+            watcher_session_id=None,
+        )
+
+        if result.get("error"):
+            logger.error(f"Failed to start review on spawned session {session.id}: {result['error']}")
+            return None
+
+        # Register with ChildMonitor if wait specified
+        if wait and self.child_monitor:
+            self.child_monitor.register_child(
+                child_session_id=session.id,
+                parent_session_id=parent_session_id,
+                wait_seconds=wait,
+            )
+
+        return session
 
     async def recover_session(self, session: Session) -> bool:
         """

@@ -378,6 +378,97 @@ class SessionManagerClient:
             return None
         return data if success else None
 
+    def start_review(
+        self,
+        session_id: str,
+        mode: str,
+        base_branch: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
+        steer: Optional[str] = None,
+        wait: Optional[int] = None,
+        watcher_session_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Start a review on an existing session.
+
+        Returns:
+            Dict with review info or None if unavailable
+        """
+        payload = {"mode": mode}
+        if base_branch:
+            payload["base_branch"] = base_branch
+        if commit_sha:
+            payload["commit_sha"] = commit_sha
+        if custom_prompt:
+            payload["custom_prompt"] = custom_prompt
+        if steer:
+            payload["steer"] = steer
+        if wait is not None:
+            payload["wait"] = wait
+        if watcher_session_id:
+            payload["watcher_session_id"] = watcher_session_id
+
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/review",
+            payload,
+            timeout=10,
+        )
+        if unavailable:
+            return None
+        return data
+
+    def spawn_review(
+        self,
+        parent_session_id: str,
+        mode: str,
+        base_branch: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
+        steer: Optional[str] = None,
+        name: Optional[str] = None,
+        wait: Optional[int] = None,
+        model: Optional[str] = None,
+        working_dir: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Spawn a new session and start a review.
+
+        Returns:
+            Dict with session/review info or None if unavailable
+        """
+        payload = {
+            "parent_session_id": parent_session_id,
+            "mode": mode,
+        }
+        if base_branch:
+            payload["base_branch"] = base_branch
+        if commit_sha:
+            payload["commit_sha"] = commit_sha
+        if custom_prompt:
+            payload["custom_prompt"] = custom_prompt
+        if steer:
+            payload["steer"] = steer
+        if name:
+            payload["name"] = name
+        if wait is not None:
+            payload["wait"] = wait
+        if model:
+            payload["model"] = model
+        if working_dir:
+            payload["working_dir"] = working_dir
+
+        data, success, unavailable = self._request(
+            "POST",
+            "/sessions/review",
+            payload,
+            timeout=15,
+        )
+        if unavailable:
+            return None
+        return data
+
     def clear_session(self, session_id: str, prompt: Optional[str] = None) -> tuple[bool, bool]:
         """
         Clear/reset a session's context.
