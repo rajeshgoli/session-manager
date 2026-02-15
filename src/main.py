@@ -162,6 +162,7 @@ class SessionManagerApp:
                 office_automate_url=services_config.get("office_automate_url"),
             )
             self._setup_telegram_handlers()
+            self._setup_topic_creator()
 
         # Notifier
         self.notifier = Notifier(
@@ -347,6 +348,70 @@ class SessionManagerApp:
         self.telegram_bot.set_interrupt_handler(on_interrupt_session)
         self.telegram_bot.set_get_subagents_handler(on_get_subagents)
 
+    def _setup_topic_creator(self):
+        """Register topic creator callback on SessionManager."""
+        if not self.telegram_bot:
+            return
+
+        async def topic_creator(session_id: str, chat_id: int, topic_name: str) -> Optional[int]:
+            """Create a Telegram forum topic and register in-memory mappings."""
+            topic_id = await self.telegram_bot.create_forum_topic(chat_id, topic_name)
+            if topic_id:
+                self.telegram_bot.register_topic_session(chat_id, topic_id, session_id)
+                self.telegram_bot._session_threads[session_id] = (chat_id, topic_id)
+                # Send welcome message in the new topic
+                try:
+                    session = self.session_manager.get_session(session_id)
+                    session_name = session.name if session else session_id
+                    working_dir = session.working_dir if session else "unknown"
+                    await self.telegram_bot.bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=topic_id,
+                        text=f"Session created: {session_name}\n"
+                             f"ID: {session_id}\n"
+                             f"Directory: {working_dir}\n\n"
+                             "Send messages here to interact with Claude."
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send welcome message in topic: {e}")
+            return topic_id
+
+        self.session_manager.set_topic_creator(topic_creator)
+
+    async def _reconcile_telegram_topics(self):
+        """Startup reconciliation: clean up orphaned topics and backfill missing ones."""
+        if not self.telegram_bot:
+            return
+
+        # 1. Delete orphaned topics (from dead sessions collected during _load_state)
+        orphaned = self.session_manager.orphaned_topics
+        if orphaned:
+            logger.info(f"Cleaning up {len(orphaned)} orphaned Telegram topics...")
+            for chat_id, thread_id in orphaned:
+                await self.telegram_bot.delete_forum_topic(chat_id, thread_id)
+            self.session_manager.orphaned_topics.clear()
+
+        # 2. Backfill telegram_chat_id on live sessions missing it
+        default_chat_id = self.session_manager.default_forum_chat_id
+        if not default_chat_id:
+            return
+
+        sessions = self.session_manager.list_sessions()
+        changed = False
+        for session in sessions:
+            if not session.telegram_chat_id:
+                session.telegram_chat_id = default_chat_id
+                changed = True
+                logger.info(f"Backfilled chat_id={default_chat_id} on session {session.id}")
+
+        if changed:
+            self.session_manager._save_state()
+
+        # 3. Create missing topics for sessions with chat_id but no thread_id
+        for session in sessions:
+            if session.telegram_chat_id and not session.telegram_thread_id:
+                await self.session_manager._ensure_telegram_topic(session)
+
     async def _handle_monitor_event(self, event: NotificationEvent):
         """Handle events from the output monitor."""
         session = self.session_manager.get_session(event.session_id)
@@ -374,6 +439,9 @@ class SessionManagerApp:
             # Restore thread mappings from persisted sessions
             self.telegram_bot.load_session_threads(self.session_manager.list_sessions())
             logger.info("Telegram bot started")
+
+            # Reconcile topics: delete orphans, backfill chat_id, create missing topics
+            await self._reconcile_telegram_topics()
 
         # Restore monitoring for existing sessions
         for session in self.session_manager.list_sessions():

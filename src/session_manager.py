@@ -36,6 +36,11 @@ class SessionManager:
         self.codex_turns_in_flight: set[str] = set()
         self.hook_output_store: Optional[dict] = None
 
+        # Telegram topic auto-sync
+        self.orphaned_topics: list[tuple[int, int]] = []  # (chat_id, thread_id) from dead sessions
+        self.default_forum_chat_id: Optional[int] = config.get("telegram", {}).get("default_forum_chat_id")
+        self._topic_creator: Optional[Callable[..., Awaitable[Optional[int]]]] = None
+
         codex_config = self.config.get("codex", {})
         codex_app_config = self.config.get("codex_app_server", codex_config)
 
@@ -113,6 +118,15 @@ class SessionManager:
                         logger.info(f"Restored session: {session.name}")
                     else:
                         logger.warning(f"Session {session.name} no longer exists in tmux")
+                        # Collect orphaned Telegram topics for cleanup at startup
+                        if session.telegram_chat_id and session.telegram_thread_id:
+                            self.orphaned_topics.append(
+                                (session.telegram_chat_id, session.telegram_thread_id)
+                            )
+                            logger.info(
+                                f"Collected orphaned topic: chat={session.telegram_chat_id}, "
+                                f"thread={session.telegram_thread_id} from dead session {session.name}"
+                            )
                 if legacy_codex_sessions:
                     self._rewrite_state_raw(cleaned_sessions)
                 return True
@@ -361,6 +375,9 @@ class SessionManager:
         self.sessions[session.id] = session
         self._save_state()
 
+        # Auto-create Telegram topic for this session
+        await self._ensure_telegram_topic(session, telegram_chat_id)
+
         if provider == "codex-app" and not initial_prompt and self.message_queue_manager:
             self.message_queue_manager.mark_session_idle(session.id)
 
@@ -371,6 +388,50 @@ class SessionManager:
             logger.info(f"Created session {session.name} (id={session.id})")
 
         return session
+
+    def set_topic_creator(self, creator: Callable[..., Awaitable[Optional[int]]]):
+        """Set the callback used to create Telegram forum topics.
+
+        Signature: async (session_id, chat_id, topic_name) -> Optional[int]
+        Returns the topic/thread ID on success, None on failure.
+        """
+        self._topic_creator = creator
+
+    async def _ensure_telegram_topic(self, session: "Session", explicit_chat_id: Optional[int] = None):
+        """Ensure a session has a Telegram forum topic, creating one if needed.
+
+        Args:
+            session: The session to ensure a topic for
+            explicit_chat_id: Chat ID passed by the caller (e.g. from Telegram /new)
+        """
+        changed = False
+
+        # 1. Ensure chat_id is set (explicit > existing > default)
+        if not session.telegram_chat_id:
+            chat_id = explicit_chat_id or self.default_forum_chat_id
+            if chat_id:
+                session.telegram_chat_id = chat_id
+                changed = True
+
+        # 2. Create topic if chat_id is set but thread_id is missing
+        if session.telegram_chat_id and not session.telegram_thread_id and self._topic_creator:
+            topic_name = f"{session.friendly_name or 'session'} [{session.id}]"
+            try:
+                thread_id = await self._topic_creator(
+                    session.id, session.telegram_chat_id, topic_name
+                )
+                if thread_id:
+                    session.telegram_thread_id = thread_id
+                    changed = True
+                    logger.info(
+                        f"Auto-created topic for session {session.id}: "
+                        f"chat={session.telegram_chat_id}, thread={thread_id}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to auto-create topic for session {session.id}: {e}")
+
+        if changed:
+            self._save_state()
 
     async def create_session(
         self,

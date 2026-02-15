@@ -333,35 +333,39 @@ class TelegramBot:
             session = await self._on_new_session(chat_id, working_dir)
 
             if session:
-                topic_id = None
+                topic_id = session.telegram_thread_id  # May already be set by create_session()
 
-                # In forum groups, create a dedicated topic for this session
+                # In forum groups, ensure topic exists
                 if is_forum:
-                    topic_name = f"{session.friendly_name or 'session'} [{session.id}]"
-                    topic_id = await self.create_forum_topic(chat_id, topic_name)
-
                     if topic_id:
-                        # Register topic -> session mapping
+                        # Topic already created by session_manager — just register mapping
                         self.register_topic_session(chat_id, topic_id, session.id)
-
-                        # Send welcome message in the new topic
-                        msg = await self.bot.send_message(
-                            chat_id=chat_id,
-                            message_thread_id=topic_id,
-                            text=f"Session created: {session.name}\n"
-                                 f"ID: {session.id}\n"
-                                 f"Directory: {session.working_dir}\n\n"
-                                 "Send messages here to interact with Claude."
-                        )
-
-                        # Update session with topic info
-                        if self._on_update_topic:
-                            await self._on_update_topic(session.id, chat_id, topic_id)
-
+                        self._session_threads[session.id] = (chat_id, topic_id)
                         await update.message.reply_text(f"Created topic for session [{session.id}]")
                     else:
-                        await update.message.reply_text("Failed to create topic. Using reply mode.")
-                        is_forum = False
+                        # Fallback: create topic here (shouldn't happen normally)
+                        topic_name = f"{session.friendly_name or 'session'} [{session.id}]"
+                        topic_id = await self.create_forum_topic(chat_id, topic_name)
+
+                        if topic_id:
+                            self.register_topic_session(chat_id, topic_id, session.id)
+
+                            await self.bot.send_message(
+                                chat_id=chat_id,
+                                message_thread_id=topic_id,
+                                text=f"Session created: {session.name}\n"
+                                     f"ID: {session.id}\n"
+                                     f"Directory: {session.working_dir}\n\n"
+                                     "Send messages here to interact with Claude."
+                            )
+
+                            if self._on_update_topic:
+                                await self._on_update_topic(session.id, chat_id, topic_id)
+
+                            await update.message.reply_text(f"Created topic for session [{session.id}]")
+                        else:
+                            await update.message.reply_text("Failed to create topic. Using reply mode.")
+                            is_forum = False
 
                 # Non-forum mode: use reply chains
                 if not is_forum or not topic_id:
@@ -1055,6 +1059,22 @@ Provide ONLY the summary, no preamble or questions."""
             logger.error(f"Failed to create forum topic: {e}")
             return None
 
+    async def delete_forum_topic(self, chat_id: int, topic_id: int) -> bool:
+        """Delete a forum topic and clean up in-memory mappings."""
+        if not self.bot:
+            return False
+        try:
+            await self.bot.delete_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
+            # Clean up in-memory mappings
+            session_id = self._topic_sessions.pop((chat_id, topic_id), None)
+            if session_id:
+                self._session_threads.pop(session_id, None)
+            logger.info(f"Deleted forum topic: chat={chat_id}, topic={topic_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete forum topic (chat={chat_id}, topic={topic_id}): {e}")
+            return False
+
     async def rename_forum_topic(self, chat_id: int, topic_id: int, name: str) -> bool:
         """Rename a forum topic."""
         if not self.bot:
@@ -1317,35 +1337,39 @@ Provide ONLY the summary, no preamble or questions."""
             session = await self._on_new_session(chat_id, path)
 
             if session:
-                topic_id = None
+                topic_id = session.telegram_thread_id  # May already be set by create_session()
 
-                # In forum groups, create a dedicated topic for this session
+                # In forum groups, ensure topic exists
                 if is_forum:
-                    topic_name = f"{session.friendly_name or 'session'} [{session.id}]"
-                    topic_id = await self.create_forum_topic(chat_id, topic_name)
-
                     if topic_id:
-                        # Register topic -> session mapping
+                        # Topic already created by session_manager — just register mapping
                         self.register_topic_session(chat_id, topic_id, session.id)
-
-                        # Send welcome message in the new topic
-                        msg = await self.bot.send_message(
-                            chat_id=chat_id,
-                            message_thread_id=topic_id,
-                            text=f"Session created: {session.name}\n"
-                                 f"ID: {session.id}\n"
-                                 f"Directory: {session.working_dir}\n\n"
-                                 "Send messages here to interact with Claude."
-                        )
-
-                        # Update session with topic info
-                        if self._on_update_topic:
-                            await self._on_update_topic(session.id, chat_id, topic_id)
-
+                        self._session_threads[session.id] = (chat_id, topic_id)
                         await query.edit_message_text(f"Created topic for session [{session.id}]")
                     else:
-                        await query.edit_message_text("Failed to create topic. Using reply mode.")
-                        is_forum = False
+                        # Fallback: create topic here (shouldn't happen normally)
+                        topic_name = f"{session.friendly_name or 'session'} [{session.id}]"
+                        topic_id = await self.create_forum_topic(chat_id, topic_name)
+
+                        if topic_id:
+                            self.register_topic_session(chat_id, topic_id, session.id)
+
+                            await self.bot.send_message(
+                                chat_id=chat_id,
+                                message_thread_id=topic_id,
+                                text=f"Session created: {session.name}\n"
+                                     f"ID: {session.id}\n"
+                                     f"Directory: {session.working_dir}\n\n"
+                                     "Send messages here to interact with Claude."
+                            )
+
+                            if self._on_update_topic:
+                                await self._on_update_topic(session.id, chat_id, topic_id)
+
+                            await query.edit_message_text(f"Created topic for session [{session.id}]")
+                        else:
+                            await query.edit_message_text("Failed to create topic. Using reply mode.")
+                            is_forum = False
 
                 # Non-forum mode: use reply chains
                 if not is_forum or not topic_id:
