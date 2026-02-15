@@ -1,6 +1,6 @@
 # #137 — Native Codex /review Support for Code Reviews
 
-**Status:** Draft v5
+**Status:** Draft v8
 **Author:** Claude (Opus 4.6)
 **Created:** 2026-02-14
 **Updated:** 2026-02-14
@@ -43,9 +43,15 @@ The session manager already supports Codex as a provider (`codex` for tmux CLI, 
 - Run inside visible tmux sessions the user can attach to and observe
 - Produce consistent, parseable output that can be forwarded to Telegram, summarized, or acted upon programmatically
 
-### Design Constraint: Visible Sessions
+### Design Constraint: Two Review Paths
 
-A non-interactive `codex review --base main` subprocess exists but is explicitly **not** the approach here. The core value of session manager is observable, attachable sessions. The user must be able to `sm attach` to a review session and watch Codex work in the TUI. This means reviews run inside interactive Codex CLI sessions via the `/review` slash command.
+This spec supports two distinct review paths:
+
+1. **Local TUI reviews** (`--base`, `--uncommitted`, `--commit`, `--custom`) — Run inside visible tmux sessions via the `/review` slash command. The user can `sm attach` and observe. Uses the local message quota.
+
+2. **GitHub PR reviews** (`--pr`) — Trigger `@codex review` on a GitHub PR via comment. No tmux session needed. Uses the **separate weekly Code Reviews quota**, preserving local message budget for agent coding work. Review output appears as a standard GitHub PR review.
+
+The non-interactive `codex review --base main` subprocess is explicitly **not** used for either path.
 
 ---
 
@@ -116,11 +122,31 @@ review_model = "gpt-5.2-codex"
 
 Review model can be configured separately from the session model.
 
-### Quota
+### Quota — Two Separate Buckets
 
-- Local CLI `/review` commands count toward **general local message quota** (not the separate weekly code review quota)
-- The separate "Code Reviews/week" quota applies only to GitHub-integrated reviews (`@codex review` on PRs)
-- This means local reviews are effectively free relative to the agent's regular budget — they just cost one message turn
+| Bucket | What Counts | Limit (Plus) | Limit (Pro) |
+|--------|-------------|-------------|-------------|
+| **Local messages** (5-hr rolling) | Local CLI `/review`, regular prompts | 45-225 | 300-1500 |
+| **Code Reviews/week** | GitHub-integrated `@codex review` on PRs | 10-25/wk | 100-250/wk |
+
+- Local CLI `/review` counts toward the **local message** quota — same bucket as regular agent work
+- GitHub-integrated reviews (`@codex review` on PRs) use a **completely separate weekly quota**
+- This means GitHub reviews are essentially free relative to the agent's coding budget — they don't consume local messages or cloud tasks
+
+**This is the primary motivation for the `--pr` mode** added in this spec: by routing reviews through `@codex review` on GitHub, the EM can get code reviews without spending any of the local message budget that agents need for actual coding work.
+
+### `@codex review` on GitHub PRs
+
+Posting `@codex review` as a comment on a GitHub PR triggers a review from the Codex GitHub integration:
+
+1. Codex reacts with 👀 acknowledging the request
+2. Codex reads the PR diff and any `AGENTS.md` files in the repo
+3. Codex posts a standard GitHub code review (P0/P1 findings flagged)
+4. Custom focus can be added inline: `@codex review for security regressions`
+
+**Key detail — `AGENTS.md` as review checklist:** Codex searches the repo for `AGENTS.md` files and follows any "Review guidelines" section it finds. It applies the guidance from the closest `AGENTS.md` to each changed file, so subdirectory-level overrides work.
+
+This is directly relevant because in the target repo (`rajeshgoli/fractal-market-simulator`), `AGENTS.md` is a symlink to `CLAUDE.md`. Any review guidelines placed in `CLAUDE.md` will be automatically picked up by Codex GitHub reviews.
 
 ---
 
@@ -163,6 +189,8 @@ EM Agent                         Session Manager                   Codex (tmux)
 ### 3.2 The `sm review` Command
 
 ```bash
+# === Local TUI modes (use local message quota) ===
+
 # Review against a base branch (on an existing session)
 sm review <session> --base <branch> [options]
 
@@ -177,6 +205,11 @@ sm review <session> --custom "Focus on security" [options]
 
 # Spawn a new session and immediately start review
 sm review --new --base main [options]
+
+# === GitHub PR mode (uses separate Code Reviews/week quota) ===
+
+# Trigger @codex review on a GitHub PR
+sm review --pr <number> [options]
 ```
 
 **Options:**
@@ -185,7 +218,8 @@ sm review --new --base main [options]
 --wait <seconds>       Monitor and notify when review completes (default: 600 in managed session, None standalone)
 --model <model>        Model override for the spawned session (only when --new)
 --working-dir <dir>    Override working directory (only when --new)
---steer <text>         Additional instructions to inject mid-review via Enter key
+--steer <text>         Additional instructions to inject mid-review via Enter key (TUI modes) or append to @codex review comment (PR mode)
+--repo <owner/repo>    GitHub repo for --pr mode (default: inferred from git remote in working dir)
 ```
 
 **Examples:**
@@ -194,7 +228,7 @@ sm review --new --base main [options]
 sm review reviewer --base main --wait 600
 
 # Same, but also steer the review with custom focus
-sm review reviewer --base main --steer "Focus on auth security. Apply checklist from docs/review-persona.md."
+sm review reviewer --base main --steer "Focus on auth security."
 
 # Review uncommitted changes on an existing session
 sm review reviewer --uncommitted
@@ -204,6 +238,17 @@ sm review --new --base main --name pr42-review --wait 600
 
 # Custom free-form review
 sm review reviewer --custom "Check for SQL injection vulnerabilities in the auth module"
+
+# === GitHub PR mode (separate quota) ===
+
+# Trigger Codex GitHub review on PR #42
+sm review --pr 42 --wait 600
+
+# With custom focus (appended to the @codex review comment)
+sm review --pr 42 --steer "Focus on auth security and SQL injection"
+
+# Explicit repo (when not in the repo directory)
+sm review --pr 42 --repo rajeshgoli/fractal-market-simulator --wait 600
 ```
 
 ### 3.3 How It Works: Tmux Interaction Sequence
@@ -307,15 +352,20 @@ Add `review_config` to the Session model to track review metadata:
 @dataclass
 class ReviewConfig:
     """Configuration for a Codex review session."""
-    mode: str  # "branch", "uncommitted", "commit", "custom"
+    mode: str  # "branch", "uncommitted", "commit", "custom", "pr"
     base_branch: Optional[str] = None    # For branch mode
     commit_sha: Optional[str] = None     # For commit mode
     custom_prompt: Optional[str] = None  # For custom mode
-    steer_text: Optional[str] = None     # Instructions to inject after review starts
+    steer_text: Optional[str] = None     # Instructions to inject after review starts (TUI) or append to comment (PR)
     steer_delivered: bool = False         # Whether steer text was injected
+    pr_number: Optional[int] = None      # For PR mode
+    pr_repo: Optional[str] = None        # For PR mode (owner/repo)
+    pr_comment_id: Optional[int] = None  # GitHub comment ID (for tracking)
 ```
 
 Note: no `fix_branch` field. The review always runs against the current HEAD. The user must be on the fix branch before starting the review. No automatic checkout.
+
+For `--pr` mode, `ReviewConfig` is stored on the **caller's session** (not a child session) since no tmux session is created. The `pr_comment_id` is set after the comment is posted, enabling status checks.
 
 ### 3.7 API Endpoint
 
@@ -355,6 +405,32 @@ Spawns a new Codex session and starts a review.
   "wait": 600,
   "working_dir": "/path/to/repo",
   "steer": "Focus on auth security."
+}
+```
+
+**POST `/reviews/pr`** (GitHub PR mode)
+
+Triggers a `@codex review` on a GitHub PR. No session required.
+
+```json
+{
+  "pr_number": 42,
+  "repo": "rajeshgoli/fractal-market-simulator",
+  "steer": "Focus on auth security",
+  "wait": 600,
+  "caller_session_id": "abc123"
+}
+```
+
+**Response:**
+```json
+{
+  "pr_number": 42,
+  "repo": "rajeshgoli/fractal-market-simulator",
+  "comment_id": 12345678,
+  "comment_body": "@codex review for Focus on auth security",
+  "status": "posted",
+  "polling": true
 }
 ```
 
@@ -400,6 +476,129 @@ codex:
 
 No `menu_settle_seconds` or `branch_settle_seconds` TUI timing config needed in the main `codex` section — these are review-specific.
 
+### 3.10 GitHub PR Mode (`--pr`)
+
+The `--pr` mode is fundamentally different from the TUI modes. No tmux session, no key-sequence automation — it posts a GitHub comment and polls for the review to appear.
+
+```
+EM Agent                         Session Manager                   GitHub
+   │                                    │                              │
+   ├─ sm review --pr 42 --wait 600     │                              │
+   │                                    │                              │
+   │                          ┌─────────┴──────────┐                   │
+   │                          │ 1. resolve repo     │                   │
+   │                          │ 2. validate PR      │──── gh pr view ──>│
+   │                          │ 3. post comment     │──── gh pr ───────>│
+   │                          │    "@codex review"  │    comment        │
+   │                          └─────────┬──────────┘                   │
+   │                                    │                              │
+   │                                    │    (Codex reacts with 👀)    │
+   │                                    │    (Codex posts review)      │
+   │                                    │                              │
+   │                          ┌─────────┴──────────┐                   │
+   │                          │ 4. poll for review  │──── gh pr ───────>│
+   │                          │    (every 30s)      │    reviews        │
+   │                          └─────────┬──────────┘                   │
+   │                                    │                              │
+   │<─── completion notification ───────│                              │
+```
+
+**How it works:**
+
+1. **Resolve repo**: Infer from `--repo` flag or `git remote get-url origin` in working directory
+2. **Validate PR**: `gh pr view <number> --repo <owner/repo> --json state` — confirm PR exists and is open
+3. **Post comment**: Build comment body and post via `gh pr comment`
+   - Without `--steer`: `@codex review`
+   - With `--steer`: `@codex review for <steer text>`
+4. **Poll for completion** (if `--wait`): Poll `gh api repos/{owner}/{repo}/pulls/{number}/reviews` periodically, looking for a new review from Codex (the `codex[bot]` user) submitted after the comment was posted
+5. **Notify caller**: On poll success, send completion notification to the watcher session via `sm send`
+
+**Comment body construction:**
+
+```python
+if steer:
+    body = f"@codex review for {steer}"
+else:
+    body = "@codex review"
+```
+
+**Completion polling:**
+
+```python
+async def poll_pr_review(repo: str, pr_number: int, since: datetime, timeout: int):
+    """Poll for a Codex review on a PR.
+
+    Polls gh api repos/{owner}/{repo}/pulls/{number}/reviews for a review
+    by codex[bot] submitted after `since`.
+    Polls every 30 seconds until found or timeout.
+    """
+```
+
+Uses `gh api repos/{owner}/{repo}/pulls/{number}/reviews` to check for new reviews. Filter with `--jq '.[] | select(.user.login == "codex[bot]") | select(.submitted_at > "<since_iso>")'`.
+
+For `--pr` mode, `ReviewConfig` (defined in section 3.6 with `pr_number`, `pr_repo`, `pr_comment_id` fields) is stored on the **caller's session** since no child tmux session is created. The `pr_comment_id` is set after the comment is posted, enabling status checks and review deduplication during polling.
+
+**`--wait` contract for PR mode:**
+
+| Invocation | Behavior |
+|------------|----------|
+| `sm review --pr 42 --wait 600` (with `CLAUDE_SESSION_MANAGER_ID` set) | Poll for review; on completion, `sm send` notification to caller session |
+| `sm review --pr 42 --wait 600` (standalone, no session context) | Poll for review; on completion, print result to stdout and exit 0 |
+| `sm review --pr 42` (no `--wait`) | Fire-and-forget: post comment and return immediately |
+
+This matches the local TUI mode behavior: `--wait` defaults to 600 when caller has session context, None otherwise. The difference is that PR mode uses `poll_pr_review()` (GitHub API polling) instead of `watch_session()` (tmux idle detection). The two completion paths are completely decoupled — PR mode never calls `watch_session()`.
+
+**PR completion notification format:**
+```
+Review --pr 42 (rajeshgoli/fractal-market-simulator) completed: Codex posted review on PR #42
+```
+
+### 3.11 Unified Review Guidelines via AGENTS.md
+
+For the review checklist to be applied consistently across all review paths (local TUI, GitHub PR, and manual reviews by Claude Code agents), the guidelines must live where all three consumers can find them.
+
+**The convention:**
+- Codex GitHub reviews read `AGENTS.md` for "Review guidelines"
+- Claude Code reads `CLAUDE.md` for instructions
+- In the target repo, `AGENTS.md` → symlink → `CLAUDE.md`
+
+**Therefore:** Place the review checklist in `CLAUDE.md` under a "Review guidelines" section. All three paths see it.
+
+**Current state** (in `rajeshgoli/fractal-market-simulator`):
+
+```
+CLAUDE.md                          ← main instructions (Claude Code reads this)
+AGENTS.md → CLAUDE.md              ← symlink (Codex GitHub reviews read this)
+.claude/personas/architect.md      ← review checklist lives HERE currently
+```
+
+**Target state:**
+
+```
+CLAUDE.md                          ← review checklist MOVED HERE (new "Review guidelines" section)
+AGENTS.md → CLAUDE.md              ← symlink (Codex sees checklist automatically)
+.claude/personas/architect.md      ← thin wrapper: "Apply review protocol from CLAUDE.md" + architect-specific rules
+```
+
+**What moves to CLAUDE.md:**
+- The 8-point diff review checklist (dead code, magic numbers, abstraction, symmetric paths, upstream deps, pattern consistency, frontend wiring, SSE pipeline)
+- The review output format template (checklist results, spec adherence, functional verification, decision)
+- Phase structure (Phase 1: Diff, Phase 2: Spec Adherence, Phase 3: Functional Verification)
+
+**What stays in architect.md:**
+- Architect mindset ("strong bias toward deletion", trust boundary)
+- Branch rules (never merge to main)
+- Triggers (how architect is invoked)
+- Merge protocol (post to GitHub, merge to dev)
+- Fix It Now principle
+- Handoff instructions and EM notification
+- Session start naming convention
+- Reference: "Apply the review protocol defined in CLAUDE.md"
+
+**Why this matters for `--pr` mode:** When `sm review --pr 42` posts `@codex review`, Codex reads `AGENTS.md` (→ `CLAUDE.md`) and finds the same 8-point checklist. The review is automatically guided by the same standards, with no extra prompt engineering needed.
+
+**Implementation:** This is a documentation change in the target repo, not a code change in session-manager. It should be done as a prerequisite before `--pr` mode is useful. A setup step (or `sm review --setup-guidelines`) could automate verifying the guidelines are in place.
+
 ---
 
 ## 4. Implementation Plan
@@ -416,22 +615,18 @@ Add after `CompletionStatus` enum (~line 50):
 @dataclass
 class ReviewConfig:
     """Configuration for a Codex review session."""
-    mode: str  # "branch", "uncommitted", "commit", "custom"
+    mode: str  # "branch", "uncommitted", "commit", "custom", "pr"
     base_branch: Optional[str] = None
     commit_sha: Optional[str] = None
     custom_prompt: Optional[str] = None
     steer_text: Optional[str] = None
     steer_delivered: bool = False
+    pr_number: Optional[int] = None      # For PR mode
+    pr_repo: Optional[str] = None        # For PR mode (owner/repo)
+    pr_comment_id: Optional[int] = None  # GitHub comment ID (for tracking)
 
     def to_dict(self) -> dict:
-        return {
-            "mode": self.mode,
-            "base_branch": self.base_branch,
-            "commit_sha": self.commit_sha,
-            "custom_prompt": self.custom_prompt,
-            "steer_text": self.steer_text,
-            "steer_delivered": self.steer_delivered,
-        }
+        return {k: v for k, v in asdict(self).items()}
 
     @classmethod
     def from_dict(cls, data: dict) -> "ReviewConfig":
@@ -627,11 +822,12 @@ def cmd_review(
 ```
 
 Validation and defaulting:
-- Exactly one mode required: `--base`, `--uncommitted`, `--commit`, or `--custom`
-- If `--new` not set, `session` is required
+- Exactly one mode required: `--base`, `--uncommitted`, `--commit`, `--custom`, or `--pr`
+- `--pr` is mutually exclusive with `session` argument and `--new` (no tmux session involved)
+- For TUI modes (`--base`, `--uncommitted`, `--commit`, `--custom`): if `--new` not set, `session` is required
 - If `--new` set, `parent_session_id` is required (must be in a managed session)
 - If no `parent_session_id` and no `--new`, runs standalone (review on existing session, no parent tracking)
-- **`--wait` defaulting:** If `wait` is None and caller has session context (`parent_session_id` is set), default to 600. If no session context, leave as None (no watching). This avoids spurious warnings for standalone users who never asked to wait.
+- **`--wait` defaulting:** If `wait` is None and caller has session context (`parent_session_id` is set), default to 600. If no session context, leave as None (no watching). This avoids spurious warnings for standalone users who never asked to wait. Same rule applies for `--pr` mode.
 
 #### Step 6: Add API client methods
 
@@ -663,6 +859,117 @@ codex:
 
 ---
 
+### Phase 1b: GitHub PR Mode (`--pr`)
+
+#### Step 8: Move review guidelines to CLAUDE.md (target repo)
+
+**Repo:** `rajeshgoli/fractal-market-simulator`
+
+This is a prerequisite for `--pr` mode to produce useful reviews. Without it, `@codex review` runs with no project-specific guidance.
+
+1. Add a "Review guidelines" section to `CLAUDE.md` containing:
+   - The 8-point diff review checklist (from `.claude/personas/architect.md`)
+   - The review output format template
+   - Phase structure (Diff → Spec Adherence → Functional Verification)
+
+2. Update `.claude/personas/architect.md` to be a thin wrapper:
+   - Keep architect-specific rules (mindset, branch rules, merge protocol, Fix It Now, handoff, EM notification)
+   - Replace the inline checklist with: "Apply the review protocol defined in CLAUDE.md"
+   - Keep the "Review Output Format" section as-is (it's the architect's mandatory output structure, not just the checklist)
+
+Since `AGENTS.md → CLAUDE.md`, Codex GitHub reviews will automatically pick up the checklist.
+
+#### Step 9: Add `gh` CLI wrapper for PR reviews
+
+**File:** `src/github_reviews.py` (new)
+
+```python
+async def post_pr_review_comment(
+    repo: str,
+    pr_number: int,
+    steer: Optional[str] = None,
+) -> dict:
+    """Post @codex review comment on a PR.
+
+    Returns: {"comment_id": int, "body": str}
+    """
+
+async def poll_for_codex_review(
+    repo: str,
+    pr_number: int,
+    since: datetime,
+    timeout: int = 600,
+    poll_interval: int = 30,
+) -> Optional[dict]:
+    """Poll for a Codex review on a PR.
+
+    Looks for a review by codex[bot] submitted after `since`.
+    Returns review data or None on timeout.
+    """
+
+async def get_pr_repo_from_git(working_dir: str) -> Optional[str]:
+    """Infer owner/repo from git remote origin URL."""
+```
+
+Implementation uses `gh` CLI via `asyncio.create_subprocess_exec`:
+- `gh pr comment <number> --repo <repo> --body "<body>"` to post
+- `gh api repos/{owner}/{repo}/pulls/{number}/reviews` to poll (filter by `user.login == "codex[bot]"` and `submitted_at > comment_time`)
+- `gh repo view --json nameWithOwner` to infer repo
+
+#### Step 10: Add `start_pr_review()` to SessionManager
+
+**File:** `src/session_manager.py`
+
+```python
+async def start_pr_review(
+    self,
+    pr_number: int,
+    repo: Optional[str] = None,
+    steer: Optional[str] = None,
+    wait: Optional[int] = None,
+    caller_session_id: Optional[str] = None,
+) -> dict:
+```
+
+This method:
+1. Resolves repo from `--repo` flag or working directory
+2. Validates PR exists and is open via `gh pr view`
+3. If `caller_session_id` provided: stores `ReviewConfig` (mode=`"pr"`, `pr_number`, `pr_repo`) on caller's session. If absent (standalone), no persistence — state lives only in the background poll task.
+4. Posts `@codex review` comment (with optional steer text appended). Stores `pr_comment_id` on ReviewConfig if persisted.
+5. If `wait`: starts background poll task for Codex review completion
+6. On completion: if `caller_session_id`, notifies via `sm send`; if standalone, prints result to stdout
+
+#### Step 11: Add PR review API endpoint
+
+**File:** `src/server.py`
+
+```python
+class PRReviewRequest(BaseModel):
+    pr_number: int
+    repo: Optional[str] = None
+    steer: Optional[str] = None
+    wait: Optional[int] = None
+    caller_session_id: Optional[str] = None  # Where to store ReviewConfig + who to notify
+
+@app.post("/reviews/pr")
+async def start_pr_review(request: PRReviewRequest):
+    """Trigger @codex review on a GitHub PR."""
+```
+
+#### Step 12: Add `--pr` to CLI command
+
+**File:** `src/cli/main.py`
+
+Add to existing `review` subparser:
+```python
+review_parser.add_argument("--pr", type=int, help="GitHub PR number (triggers @codex review)")
+review_parser.add_argument("--repo", help="GitHub repo (owner/repo) for --pr mode")
+```
+
+Dispatch logic update:
+- If `--pr` is set: call `start_pr_review()` — no session argument needed
+- `--pr` is mutually exclusive with `--base`, `--uncommitted`, `--commit`, `--custom`, `--new`
+
 ### Phase 2: Deferred Steering & Output Parsing (follow-up)
 
 - Add `--steer` delivery mode to `sm send` for Enter-based mid-turn injection (distinct from `--urgent` which sends Escape)
@@ -680,14 +987,17 @@ codex:
 
 | File | Change |
 |------|--------|
-| `src/models.py` | Add `ReviewConfig` dataclass; add `review_config` field to `Session` |
+| `src/models.py` | Add `ReviewConfig` dataclass (with `pr_number`, `pr_repo`, `pr_comment_id` fields); add `review_config` field to `Session` |
 | `src/tmux_controller.py` | Add `send_review_sequence()` and `send_steer_text()` async methods |
-| `src/session_manager.py` | Add `start_review()` and `spawn_review_session()` methods |
-| `src/server.py` | Add `StartReviewRequest`, `SpawnReviewRequest` models and two endpoints |
-| `src/cli/commands.py` | Add `cmd_review()` function |
-| `src/cli/main.py` | Add `review` subparser and dispatch |
-| `src/cli/client.py` | Add `start_review()` and `spawn_review()` API client methods |
+| `src/session_manager.py` | Add `start_review()`, `spawn_review_session()`, and `start_pr_review()` methods |
+| `src/github_reviews.py` | **New file.** `gh` CLI wrapper: `post_pr_review_comment()`, `poll_for_codex_review()`, `get_pr_repo_from_git()` |
+| `src/server.py` | Add `StartReviewRequest`, `SpawnReviewRequest`, `PRReviewRequest` models and three endpoints |
+| `src/cli/commands.py` | Add `cmd_review()` function with `--pr` dispatch path |
+| `src/cli/main.py` | Add `review` subparser with `--pr` and `--repo` args, and dispatch |
+| `src/cli/client.py` | Add `start_review()`, `spawn_review()`, and `start_pr_review()` API client methods |
 | `config.yaml` | Add `codex.review` configuration section |
+| *(target repo)* `CLAUDE.md` | Move review checklist here from `architect.md`; add "Review guidelines" section |
+| *(target repo)* `.claude/personas/architect.md` | Thin wrapper referencing `CLAUDE.md` review protocol |
 
 ---
 
@@ -729,3 +1039,24 @@ Codex CLI 0.101.0 does not support combining branch/commit mode with custom inst
 Sending `/review` to a session that's mid-review will likely interrupt or queue a new review.
 - Validate that the session is idle before sending `/review`
 - If session is not idle, return error: "Session is busy. Wait for current work to complete or use sm clear first."
+
+### PR Mode: Private Repository Access
+`@codex review` works on private repos. The requirement is that the **ChatGPT Codex Connector** GitHub App must be installed on the repository (or org-wide with access to the repo). Once installed, you can push a branch to a private repo, open a PR, and `@codex review` works the same as on public repos.
+
+Prerequisites:
+- The Codex Connector GitHub App must be installed with access to the specific repo
+- Code review must be enabled for the repo in Codex settings
+- `gh` CLI must be authenticated with a token that has repo access
+- If the Codex app is not installed, `@codex review` will be a regular comment with no effect — the poll will time out
+
+**Validation:** Before posting the comment, check if the Codex app is installed:
+```bash
+gh api repos/{owner}/{repo}/installation --jq '.app_slug' 2>/dev/null
+```
+If this fails or returns something other than a codex-related slug, warn the user that Codex may not be installed on this repo.
+
+### PR Mode: Review Deduplication
+If `@codex review` is posted multiple times on the same PR, Codex may run multiple reviews. The polling logic must match reviews by `submittedAt > comment_posted_at` to avoid picking up stale reviews from previous invocations.
+
+### PR Mode: `gh` CLI Not Authenticated
+If `gh auth status` fails, `--pr` mode should fail fast with a clear error before attempting to post.
