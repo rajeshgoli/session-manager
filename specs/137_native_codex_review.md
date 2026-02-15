@@ -326,23 +326,14 @@ When `--steer` is provided:
 3. Send the steer text
 4. Send `Enter` to submit
 
-**Via `sm send` (during review):**
+**Via `sm send` (after review completes a turn):**
 
-The EM can steer an active review using the existing message queue:
+The EM can send follow-up instructions using the existing message queue:
 ```bash
-sm send reviewer "Also check for SQL injection" --sequential
+sm send reviewer "Also check for SQL injection"
 ```
 
-This uses `--sequential` (default) delivery, which waits for the session to be idle before injecting. This is the correct mode because:
-- `--urgent` sends Escape first (interrupts the current turn — wrong for mid-turn steering)
-- `--sequential` waits for idle then injects — but reviews don't go idle mid-turn
-
-For true mid-turn steering via `sm send`, a new delivery mode would be needed (future work):
-```bash
-sm send reviewer "Also check for SQL injection" --steer  # future: Enter-based injection
-```
-
-**v1 scope:** Only `--steer` flag at review start is supported. Deferred steering via `sm send --steer` is Phase 2.
+This uses `important` mode (the default), which waits for the session to go idle then injects. When the review turn completes and the session returns to the prompt, the message is delivered as a new prompt. No new delivery mode needed — the existing infrastructure handles this.
 
 ### 3.6 Review Session Model
 
@@ -1001,9 +992,8 @@ if wait and not caller_session_id:
 
 This keeps the server stateless for standalone invocations while giving the CLI user a blocking wait experience.
 
-### Phase 2: Deferred Steering & Output Parsing (follow-up)
+### Phase 2: Output Parsing & Telegram Integration (follow-up)
 
-- Add `--steer` delivery mode to `sm send` for Enter-based mid-turn injection (distinct from `--urgent` which sends Escape)
 - Parse review output from tmux pane to extract structured findings
 - Forward parsed findings to Telegram with formatting
 - Add `GET /sessions/{id}/review-results` endpoint
