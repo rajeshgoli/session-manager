@@ -355,6 +355,7 @@ class SessionManager:
                     on_turn_complete=self._handle_codex_turn_complete,
                     on_turn_started=self._handle_codex_turn_started,
                     on_turn_delta=self._handle_codex_turn_delta,
+                    on_review_complete=self._handle_codex_review_complete,
                 )
                 thread_id = await codex_session.start(thread_id=session.codex_thread_id, model=model)
                 session.codex_thread_id = thread_id
@@ -782,6 +783,7 @@ class SessionManager:
                 on_turn_complete=self._handle_codex_turn_complete,
                 on_turn_started=self._handle_codex_turn_started,
                 on_turn_delta=self._handle_codex_turn_delta,
+                on_review_complete=self._handle_codex_review_complete,
             )
             thread_id = await codex_session.start(thread_id=session.codex_thread_id, model=model)
             session.codex_thread_id = thread_id
@@ -922,6 +924,42 @@ class SessionManager:
         session.last_activity = datetime.now()
         if self.message_queue_manager:
             self.message_queue_manager.mark_session_active(session_id)
+
+    async def _handle_codex_review_complete(self, session_id: str, review_text: str):
+        """Handle Codex app-server review completion (exitedReviewMode)."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        session.last_activity = datetime.now()
+        session.status = SessionStatus.IDLE
+        self._save_state()
+
+        if self.message_queue_manager:
+            self.message_queue_manager.mark_session_idle(session_id)
+
+        # Store review output
+        if review_text and self.hook_output_store is not None:
+            self.hook_output_store["latest"] = review_text
+            self.hook_output_store[session_id] = review_text
+
+        # Emit review_complete notification
+        if review_text and session.review_config and hasattr(self, "notifier") and self.notifier:
+            try:
+                from .review_parser import parse_app_server_output
+                review_result = parse_app_server_output(review_text)
+                if review_result and review_result.findings:
+                    review_event = NotificationEvent(
+                        session_id=session.id,
+                        event_type="review_complete",
+                        message="Review complete",
+                        context="",
+                        urgent=False,
+                    )
+                    review_event.review_result = review_result
+                    await self.notifier.notify(review_event, session)
+            except Exception as e:
+                logger.warning(f"Failed to emit review_complete for codex-app: {e}")
 
     def is_codex_turn_active(self, session_id: str) -> bool:
         """Check if a Codex turn is currently in flight."""
@@ -1129,7 +1167,7 @@ class SessionManager:
         Start a Codex /review on an existing session.
 
         Args:
-            session_id: Target session ID (must be a Codex CLI session)
+            session_id: Target session ID (must be a Codex CLI or codex-app session)
             mode: Review mode (branch, uncommitted, commit, custom)
             base_branch: Target branch for branch mode
             commit_sha: Target SHA for commit mode
@@ -1145,8 +1183,8 @@ class SessionManager:
         if not session:
             return {"error": f"Session {session_id} not found"}
 
-        if session.provider != "codex":
-            return {"error": "Review requires a Codex CLI session (provider=codex)"}
+        if session.provider not in ("codex", "codex-app"):
+            return {"error": "Review requires a Codex session (provider=codex or codex-app)"}
 
         # Validate session is idle before sending /review
         if self.message_queue_manager:
@@ -1154,6 +1192,63 @@ class SessionManager:
             if state and not state.is_idle:
                 return {"error": "Session is busy. Wait for current work to complete or use sm clear first."}
 
+        # Store ReviewConfig on session
+        review_config = ReviewConfig(
+            mode=mode,
+            base_branch=base_branch,
+            commit_sha=commit_sha,
+            custom_prompt=custom_prompt,
+            steer_text=steer_text,
+            steer_delivered=False,
+        )
+        session.review_config = review_config
+
+        # Reset idle baseline for ChildMonitor
+        session.last_tool_call = datetime.now()
+        self._save_state()
+
+        # --- codex-app path: use review/start RPC ---
+        if session.provider == "codex-app":
+            codex_session = await self._ensure_codex_session(session)
+            if not codex_session:
+                if self.message_queue_manager:
+                    self.message_queue_manager.mark_session_idle(session_id)
+                return {"error": "Failed to connect to Codex app-server"}
+
+            try:
+                # Mark active just before dispatch (after all validation)
+                if self.message_queue_manager:
+                    self.message_queue_manager.mark_session_active(session_id)
+                await codex_session.review_start(
+                    mode=mode,
+                    base_branch=base_branch,
+                    commit_sha=commit_sha,
+                    custom_prompt=custom_prompt,
+                )
+                session.status = SessionStatus.RUNNING
+                session.last_activity = datetime.now()
+                self._save_state()
+            except CodexAppServerError as e:
+                if self.message_queue_manager:
+                    self.message_queue_manager.mark_session_idle(session_id)
+                return {"error": f"review/start RPC failed: {e}"}
+
+            # Register watch if requested
+            if wait and watcher_session_id and self.message_queue_manager:
+                await self.message_queue_manager.watch_session(
+                    session_id, watcher_session_id, wait
+                )
+
+            return {
+                "session_id": session_id,
+                "review_mode": mode,
+                "base_branch": base_branch,
+                "commit_sha": commit_sha,
+                "status": "started",
+                "steer_queued": False,  # steer not applicable for app-server
+            }
+
+        # --- codex CLI path: tmux key sequence ---
         # Validate working dir is a git repo
         working_path = Path(session.working_dir).expanduser().resolve()
         try:
@@ -1198,28 +1293,13 @@ class SessionManager:
             except subprocess.TimeoutExpired:
                 return {"error": "Timeout listing git branches"}
 
-        # Store ReviewConfig on session
-        review_config = ReviewConfig(
-            mode=mode,
-            base_branch=base_branch,
-            commit_sha=commit_sha,
-            custom_prompt=custom_prompt,
-            steer_text=steer_text,
-            steer_delivered=False,
-        )
-        session.review_config = review_config
-
-        # Reset idle baseline for ChildMonitor
-        session.last_tool_call = datetime.now()
-        self._save_state()
-
-        # Mark session active in delivery state (critical for --wait)
-        if self.message_queue_manager:
-            self.message_queue_manager.mark_session_active(session_id)
-
         # Get review timing config
         codex_config = self.config.get("codex", {})
         review_timing = codex_config.get("review", {})
+
+        # Mark active just before dispatch (after all validation)
+        if self.message_queue_manager:
+            self.message_queue_manager.mark_session_active(session_id)
 
         # Send the review key sequence
         success = await self.tmux.send_review_sequence(

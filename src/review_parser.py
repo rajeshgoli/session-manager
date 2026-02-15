@@ -100,6 +100,76 @@ def parse_tui_output(raw_output: str) -> ReviewResult:
     )
 
 
+def parse_app_server_output(raw_output: str) -> ReviewResult:
+    """Parse Codex app-server review output into structured ReviewResult.
+
+    App-server output is plain text/markdown (no ANSI codes).
+    Uses the same [P0]-[P3] pattern matching as TUI but skips ANSI stripping.
+
+    Args:
+        raw_output: Plain text review output from app-server exitedReviewMode
+
+    Returns:
+        ReviewResult with parsed findings
+    """
+    lines = raw_output.split('\n')
+
+    findings: list[ReviewFinding] = []
+    overall_confidence: Optional[float] = None
+    overall_correctness: Optional[str] = None
+
+    current_title: Optional[str] = None
+    current_priority: Optional[int] = None
+    current_body_lines: list[str] = []
+
+    def _flush_finding():
+        nonlocal current_title, current_priority, current_body_lines
+        if current_title is not None and current_priority is not None:
+            body = '\n'.join(current_body_lines).strip()
+            findings.append(ReviewFinding(
+                title=current_title,
+                body=body,
+                priority=current_priority,
+            ))
+        current_title = None
+        current_priority = None
+        current_body_lines = []
+
+    for line in lines:
+        m = PRIORITY_HEADER_RE.match(line.strip())
+        if m:
+            _flush_finding()
+            current_priority = int(m.group(1))
+            current_title = m.group(2).strip()
+            continue
+
+        cm = CONFIDENCE_RE.search(line)
+        if cm:
+            try:
+                overall_confidence = float(cm.group(1))
+            except ValueError:
+                pass
+            continue
+
+        cr = CORRECTNESS_RE.search(line)
+        if cr:
+            overall_correctness = cr.group(1).strip()
+            continue
+
+        if current_title is not None:
+            current_body_lines.append(line)
+
+    _flush_finding()
+
+    return ReviewResult(
+        findings=findings,
+        overall_correctness=overall_correctness,
+        overall_confidence_score=overall_confidence,
+        raw_output=raw_output,
+        source="codex-app",
+    )
+
+
 # --- GitHub PR review parsing ---
 
 
