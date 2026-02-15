@@ -406,6 +406,8 @@ class MessageQueueManager:
 
         # If urgent mode, trigger immediate delivery
         if delivery_mode == "urgent":
+            if target_session_id not in self._paused_sessions:
+                self.mark_session_active(target_session_id)
             asyncio.create_task(self._deliver_urgent(target_session_id, msg))
         elif is_codex:
             # Codex: set idle flag and deliver immediately, but skip the
@@ -1111,6 +1113,10 @@ class MessageQueueManager:
                 # Check if target is idle
                 state = self.delivery_states.get(target_session_id)
                 is_idle = state.is_idle if state else False
+
+                # Validate: idle with pending messages means delivery is in-flight
+                if is_idle and self.get_pending_messages(target_session_id):
+                    is_idle = False
 
                 if is_idle:
                     # Target is idle - notify watcher
