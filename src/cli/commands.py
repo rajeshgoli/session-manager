@@ -1425,7 +1425,61 @@ def cmd_review(
         1: Validation error or failed
         2: Session manager unavailable
     """
-    # Validate: exactly one mode required
+    # --pr mode: GitHub PR review (mutually exclusive with TUI modes)
+    if pr is not None:
+        if session or new:
+            print("Error: --pr is mutually exclusive with session/--new", file=sys.stderr)
+            return 1
+        if base or uncommitted or commit or custom:
+            print("Error: --pr is mutually exclusive with --base/--uncommitted/--commit/--custom", file=sys.stderr)
+            return 1
+
+        # Default --wait to 600 when caller has session context
+        if wait is None and parent_session_id:
+            wait = 600
+
+        result = client.start_pr_review(
+            pr_number=pr,
+            repo=repo,
+            steer=steer,
+            wait=wait,
+            caller_session_id=parent_session_id,
+        )
+
+        if result is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+
+        if result.get("error"):
+            print(f"Error: {result['error']}", file=sys.stderr)
+            return 1
+
+        resolved_repo = result.get("repo", repo or "unknown")
+        print(f"Posted @codex review on PR #{pr} ({resolved_repo})")
+        if result.get("server_polling"):
+            print(f"  Server polling for completion (timeout={wait}s)")
+        elif wait and not parent_session_id:
+            # CLI-side polling (standalone, no session context)
+            from src.github_reviews import poll_for_codex_review as _poll
+            from datetime import datetime as _dt
+            since = _dt.fromisoformat(result["posted_at"])
+            print(f"  Waiting for Codex review (timeout={wait}s)...")
+            review = _poll(
+                repo=resolved_repo,
+                pr_number=pr,
+                since=since,
+                timeout=wait,
+            )
+            if review:
+                print(f"Codex review posted on PR #{pr}: {review.get('state', 'unknown')}")
+                return 0
+            else:
+                print(f"Timeout: no Codex review found after {wait}s")
+                return 1
+
+        return 0
+
+    # Validate: exactly one TUI mode required
     modes = []
     if base:
         modes.append("base")
@@ -1437,7 +1491,7 @@ def cmd_review(
         modes.append("custom")
 
     if len(modes) == 0:
-        print("Error: Must specify one of --base, --uncommitted, --commit, or --custom", file=sys.stderr)
+        print("Error: Must specify one of --base, --uncommitted, --commit, --custom, or --pr", file=sys.stderr)
         return 1
     if len(modes) > 1:
         print(f"Error: Modes are mutually exclusive. Got: {', '.join(modes)}", file=sys.stderr)
@@ -1447,14 +1501,6 @@ def cmd_review(
     mode = modes[0]
     if mode == "base":
         mode = "branch"
-
-    # --pr is mutually exclusive with session/--new (stub for Phase 1b)
-    if pr is not None:
-        if session or new:
-            print("Error: --pr is mutually exclusive with session/--new", file=sys.stderr)
-            return 1
-        print("Error: --pr support is not yet implemented (Phase 1b)", file=sys.stderr)
-        return 1
 
     # Validation: --new requires parent session context
     if new:

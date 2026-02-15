@@ -11,6 +11,7 @@ from typing import Optional, Callable, Awaitable
 from .models import Session, SessionStatus, NotificationEvent, DeliveryResult, ReviewConfig
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
+from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_pr_repo_from_git
 
 logger = logging.getLogger(__name__)
 
@@ -1199,6 +1200,9 @@ class SessionManager:
         )
 
         if not success:
+            # Roll back active state to avoid wedged session
+            if self.message_queue_manager:
+                self.message_queue_manager.mark_session_idle(session_id)
             return {"error": "Failed to send review sequence to tmux"}
 
         # Schedule steer injection if requested
@@ -1304,6 +1308,8 @@ class SessionManager:
 
         if result.get("error"):
             logger.error(f"Failed to start review on spawned session {session.id}: {result['error']}")
+            # Clean up the leaked session to avoid orphans
+            self.kill_session(session.id)
             return None
 
         # Register with ChildMonitor if wait specified
@@ -1315,6 +1321,123 @@ class SessionManager:
             )
 
         return session
+
+    async def start_pr_review(
+        self,
+        pr_number: int,
+        repo: Optional[str] = None,
+        steer: Optional[str] = None,
+        wait: Optional[int] = None,
+        caller_session_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Trigger @codex review on a GitHub PR.
+
+        No tmux session needed — posts a GitHub comment and optionally
+        polls for the review to appear.
+
+        Args:
+            pr_number: GitHub PR number
+            repo: GitHub repo (owner/repo). Inferred from working dir if None.
+            steer: Focus instructions appended to the @codex review comment
+            wait: Seconds to poll for Codex review completion
+            caller_session_id: Session to store ReviewConfig on and notify
+
+        Returns:
+            Status dict with repo, pr_number, posted_at, comment_id, status
+        """
+        # 1. Resolve repo
+        if not repo:
+            # Try to infer from caller session's working dir, or cwd
+            working_dir = None
+            if caller_session_id:
+                caller = self.sessions.get(caller_session_id)
+                if caller:
+                    working_dir = caller.working_dir
+            if working_dir:
+                repo = await asyncio.to_thread(get_pr_repo_from_git, working_dir)
+            if not repo:
+                return {"error": "Could not determine repo. Provide --repo or run from a git directory."}
+
+        # 2. Validate PR exists
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "state"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return {"error": f"PR #{pr_number} not found in {repo}: {result.stderr.strip()}"}
+            pr_data = json.loads(result.stdout)
+            if pr_data.get("state") != "OPEN":
+                return {"error": f"PR #{pr_number} is {pr_data.get('state', 'unknown')}, not OPEN"}
+        except Exception as e:
+            return {"error": f"Failed to validate PR: {e}"}
+
+        # 3. Store ReviewConfig on caller session (if provided)
+        review_config = ReviewConfig(
+            mode="pr",
+            pr_number=pr_number,
+            pr_repo=repo,
+            steer_text=steer,
+        )
+        if caller_session_id:
+            caller = self.sessions.get(caller_session_id)
+            if caller:
+                caller.review_config = review_config
+                self._save_state()
+
+        # 4. Post @codex review comment
+        try:
+            comment_result = await asyncio.to_thread(
+                post_pr_review_comment, repo, pr_number, steer
+            )
+        except RuntimeError as e:
+            return {"error": str(e)}
+
+        # Store comment_id on ReviewConfig
+        if caller_session_id:
+            caller = self.sessions.get(caller_session_id)
+            if caller and caller.review_config:
+                caller.review_config.pr_comment_id = comment_result.get("comment_id")
+                self._save_state()
+
+        posted_at = comment_result["posted_at"]
+
+        # 5. Start background poll if wait AND caller_session_id
+        server_polling = False
+        if wait and caller_session_id:
+            server_polling = True
+
+            async def _poll_and_notify():
+                since = datetime.fromisoformat(posted_at)
+                review = await asyncio.to_thread(
+                    poll_for_codex_review, repo, pr_number, since, wait
+                )
+                if review:
+                    msg = f"Review --pr {pr_number} ({repo}) completed: Codex posted review on PR #{pr_number}"
+                else:
+                    msg = f"Review --pr {pr_number} ({repo}) timed out after {wait}s"
+                # Notify caller
+                await self.send_input(
+                    caller_session_id,
+                    msg,
+                    delivery_mode="important",
+                )
+
+            asyncio.create_task(_poll_and_notify())
+
+        return {
+            "repo": repo,
+            "pr_number": pr_number,
+            "posted_at": posted_at,
+            "comment_id": comment_result.get("comment_id", 0),
+            "comment_body": comment_result.get("body", ""),
+            "status": "posted",
+            "server_polling": server_polling,
+        }
 
     async def recover_session(self, session: Session) -> bool:
         """

@@ -188,6 +188,15 @@ class SpawnReviewRequest(BaseModel):
     working_dir: Optional[str] = None
 
 
+class PRReviewRequest(BaseModel):
+    """Trigger @codex review on a GitHub PR."""
+    pr_number: int
+    repo: Optional[str] = None
+    steer: Optional[str] = None
+    wait: Optional[int] = None
+    caller_session_id: Optional[str] = None
+
+
 # Health check response models
 class HealthCheckResult(BaseModel):
     """Result of a single health check."""
@@ -1601,7 +1610,7 @@ Or continue working if not done yet."""
         )
 
         if result.get("error"):
-            raise HTTPException(status_code=400, detail=result["error"])
+            return result  # Return 200 with error payload (matches spawn flow pattern)
 
         return result
 
@@ -1629,7 +1638,7 @@ Or continue working if not done yet."""
         )
 
         if not session:
-            raise HTTPException(status_code=500, detail="Failed to spawn review session")
+            return {"error": "Failed to spawn review session"}
 
         # Start monitoring
         if app.state.output_monitor:
@@ -1643,6 +1652,25 @@ Or continue working if not done yet."""
             "base_branch": request.base_branch,
             "status": "started",
         }
+
+    @app.post("/reviews/pr")
+    async def start_pr_review(request: PRReviewRequest):
+        """Trigger @codex review on a GitHub PR."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        result = await app.state.session_manager.start_pr_review(
+            pr_number=request.pr_number,
+            repo=request.repo,
+            steer=request.steer,
+            wait=request.wait,
+            caller_session_id=request.caller_session_id,
+        )
+
+        if result.get("error"):
+            return result  # Return 200 with error payload (matches spawn flow pattern)
+
+        return result
 
     @app.get("/sessions/{parent_session_id}/children")
     async def list_children_sessions(
