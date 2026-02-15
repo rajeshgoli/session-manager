@@ -393,21 +393,22 @@ class SessionManagerApp:
 
         # 2. Backfill telegram_chat_id on live sessions missing it
         default_chat_id = self.session_manager.default_forum_chat_id
-        if not default_chat_id:
-            return
-
         sessions = self.session_manager.list_sessions()
-        changed = False
-        for session in sessions:
-            if not session.telegram_chat_id:
-                session.telegram_chat_id = default_chat_id
-                changed = True
-                logger.info(f"Backfilled chat_id={default_chat_id} on session {session.id}")
 
-        if changed:
-            self.session_manager._save_state()
+        if default_chat_id:
+            changed = False
+            for session in sessions:
+                if not session.telegram_chat_id:
+                    session.telegram_chat_id = default_chat_id
+                    changed = True
+                    logger.info(f"Backfilled chat_id={default_chat_id} on session {session.id}")
+
+            if changed:
+                self.session_manager._save_state()
 
         # 3. Create missing topics for sessions with chat_id but no thread_id
+        #    (runs even without default_forum_chat_id — covers sessions that
+        #    already have a chat_id but lost their topic)
         for session in sessions:
             if session.telegram_chat_id and not session.telegram_thread_id:
                 await self.session_manager._ensure_telegram_topic(session)

@@ -38,7 +38,7 @@ class SessionManager:
 
         # Telegram topic auto-sync
         self.orphaned_topics: list[tuple[int, int]] = []  # (chat_id, thread_id) from dead sessions
-        self.default_forum_chat_id: Optional[int] = config.get("telegram", {}).get("default_forum_chat_id")
+        self.default_forum_chat_id: Optional[int] = self.config.get("telegram", {}).get("default_forum_chat_id")
         self._topic_creator: Optional[Callable[..., Awaitable[Optional[int]]]] = None
 
         codex_config = self.config.get("codex", {})
@@ -118,8 +118,16 @@ class SessionManager:
                         logger.info(f"Restored session: {session.name}")
                     else:
                         logger.warning(f"Session {session.name} no longer exists in tmux")
-                        # Collect orphaned Telegram topics for cleanup at startup
-                        if session.telegram_chat_id and session.telegram_thread_id:
+                        # Collect orphaned Telegram forum topics for cleanup at startup.
+                        # Only collect if chat_id matches the known forum group —
+                        # in non-forum chats, telegram_thread_id is a reply message_id,
+                        # not a forum topic, so delete_forum_topic would fail.
+                        if (
+                            session.telegram_chat_id
+                            and session.telegram_thread_id
+                            and self.default_forum_chat_id
+                            and session.telegram_chat_id == self.default_forum_chat_id
+                        ):
                             self.orphaned_topics.append(
                                 (session.telegram_chat_id, session.telegram_thread_id)
                             )
