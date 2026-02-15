@@ -469,6 +469,40 @@ class SessionManagerClient:
             return None
         return data
 
+    def start_pr_review(
+        self,
+        pr_number: int,
+        repo: Optional[str] = None,
+        steer: Optional[str] = None,
+        wait: Optional[int] = None,
+        caller_session_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Trigger @codex review on a GitHub PR.
+
+        Returns:
+            Dict with review info or None if unavailable
+        """
+        payload = {"pr_number": pr_number}
+        if repo:
+            payload["repo"] = repo
+        if steer:
+            payload["steer"] = steer
+        if wait is not None:
+            payload["wait"] = wait
+        if caller_session_id:
+            payload["caller_session_id"] = caller_session_id
+
+        data, success, unavailable = self._request(
+            "POST",
+            "/reviews/pr",
+            payload,
+            timeout=30,
+        )
+        if unavailable:
+            return None
+        return data
+
     def clear_session(self, session_id: str, prompt: Optional[str] = None) -> tuple[bool, bool]:
         """
         Clear/reset a session's context.
