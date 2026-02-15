@@ -70,8 +70,8 @@ def extract_thread_ids(log_path: str, session_id: str) -> list[tuple[int, int]]:
     return results
 
 
-def get_current_thread_id(session_id: str, state_file: str) -> int | None:
-    """Read the currently-persisted thread_id for a session."""
+def get_current_topic(session_id: str, state_file: str) -> tuple[int, int] | None:
+    """Read the currently-persisted (chat_id, thread_id) for a session."""
     path = Path(state_file)
     if not path.exists():
         return None
@@ -79,7 +79,11 @@ def get_current_thread_id(session_id: str, state_file: str) -> int | None:
         data = json.load(f)
     for s in data.get("sessions", []):
         if s.get("id") == session_id:
-            return s.get("telegram_thread_id")
+            chat_id = s.get("telegram_chat_id")
+            thread_id = s.get("telegram_thread_id")
+            if chat_id and thread_id:
+                return (chat_id, thread_id)
+            return None
     return None
 
 
@@ -156,9 +160,8 @@ async def main():
     )
     parser.add_argument(
         "--keep",
-        type=int,
         default=None,
-        help="Explicit thread_id to keep (overrides state file lookup)",
+        help="Explicit chat_id:thread_id to keep, e.g. -1003506774897:8654 (overrides state file lookup)",
     )
     args = parser.parse_args()
 
@@ -182,15 +185,25 @@ async def main():
 
     logger.info(f"Found {len(all_topics)} topic(s) for session {args.session} in log")
 
-    # Determine which to keep — abort if unknown to avoid deleting the active topic
-    current_thread_id = args.keep or get_current_thread_id(args.session, args.state_file)
-    logger.info(f"Currently persisted thread_id: {current_thread_id}")
+    # Determine which (chat_id, thread_id) to keep — abort if unknown
+    keep_topic: tuple[int, int] | None = None
+    if args.keep:
+        try:
+            parts = args.keep.split(":")
+            keep_topic = (int(parts[0]), int(parts[1]))
+        except (ValueError, IndexError):
+            logger.error(f"Invalid --keep format: {args.keep!r}. Expected chat_id:thread_id, e.g. -1003506774897:8654")
+            sys.exit(1)
+    else:
+        keep_topic = get_current_topic(args.session, args.state_file)
 
-    if current_thread_id is None:
+    logger.info(f"Topic to keep: chat_id={keep_topic[0]}, thread_id={keep_topic[1]}" if keep_topic else "Topic to keep: None")
+
+    if keep_topic is None:
         logger.error(
-            f"No persisted thread_id for session {args.session}. "
+            f"No persisted (chat_id, thread_id) for session {args.session}. "
             "Cannot determine which topic to keep — aborting to avoid deleting the active topic. "
-            "Fix the session state first or pass --keep <thread_id> to specify explicitly."
+            "Fix the session state first or pass --keep chat_id:thread_id to specify explicitly."
         )
         sys.exit(1)
 
@@ -206,9 +219,9 @@ async def main():
 
     logger.info(f"Unique topic IDs: {len(unique_topics)}")
 
-    # Filter out the one to keep
-    to_delete = [(c, t) for c, t in unique_topics if t != current_thread_id]
-    logger.info(f"Topics to delete: {len(to_delete)} (keeping thread_id={current_thread_id})")
+    # Filter out the one to keep — compare full (chat_id, thread_id) tuple
+    to_delete = [(c, t) for c, t in unique_topics if (c, t) != keep_topic]
+    logger.info(f"Topics to delete: {len(to_delete)} (keeping {keep_topic[0]}:{keep_topic[1]})")
 
     if not to_delete:
         logger.info("Nothing to delete!")
@@ -223,7 +236,7 @@ async def main():
 
     logger.info("=" * 60)
     mode = "EXECUTED" if args.execute else "DRY RUN"
-    logger.info(f"{mode}: {deleted} deleted, {failed} failed, 1 kept (thread_id={current_thread_id})")
+    logger.info(f"{mode}: {deleted} deleted, {failed} failed, 1 kept ({keep_topic[0]}:{keep_topic[1]})")
     logger.info("=" * 60)
 
     if failed > 0:
