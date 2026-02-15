@@ -310,7 +310,7 @@ class MessageQueueManager:
         """
         Resume message delivery to a session after recovery.
 
-        Triggers immediate delivery check if session is idle.
+        Triggers delivery if pending messages exist.
         """
         self._paused_sessions.discard(session_id)
         logger.info(f"Session {session_id} unpaused after recovery")
