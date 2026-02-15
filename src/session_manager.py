@@ -1013,7 +1013,7 @@ class SessionManager:
         Recovery flow:
         1. Pause message queue (prevent sm send going to bash)
         2. Send Ctrl-C twice to kill the crashed harness
-        3. Wait for shell prompt
+        3. Parse resume UUID from Claude's exit output in the terminal
         4. Reset terminal with stty sane
         5. Resume Claude with --resume <uuid>
         6. Unpause message queue
@@ -1028,14 +1028,7 @@ class SessionManager:
             logger.warning(f"Crash recovery only supported for Claude sessions, not {session.provider}")
             return False
 
-        if not session.transcript_path:
-            logger.error(f"Cannot recover session {session.id}: no transcript_path for --resume")
-            return False
-
-        # Extract UUID from transcript path (e.g., /path/to/uuid.jsonl -> uuid)
-        resume_uuid = Path(session.transcript_path).stem
-
-        logger.info(f"Starting crash recovery for session {session.id} (resume UUID: {resume_uuid})")
+        logger.info(f"Starting crash recovery for session {session.id}")
 
         # 1. Pause message queue
         if self.message_queue_manager:
@@ -1054,10 +1047,41 @@ class SessionManager:
                 await asyncio.wait_for(proc.communicate(), timeout=5)
                 await asyncio.sleep(0.5)
 
-            # 3. Wait for shell to be ready
+            # 3. Wait for shell to be ready and capture output
             await asyncio.sleep(1.0)
 
-            # 4. Reset terminal with stty sane
+            # 4. Parse resume ID from Claude's exit output
+            #    Claude prints: "To resume this conversation, run:\n  claude --resume <uuid>"
+            resume_uuid = None
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "capture-pane", "-p", "-t", session.tmux_session, "-S", "-50",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode == 0:
+                import re
+                # Match Claude's specific exit block:
+                #   "To resume this conversation, run:\n  claude --resume <uuid>"
+                match = re.search(
+                    r'To resume this conversation.*?--resume\s+([0-9a-f-]{36})',
+                    stdout.decode(),
+                    re.DOTALL,
+                )
+                if match:
+                    resume_uuid = match.group(1)
+                    logger.info(f"Parsed resume UUID from terminal output: {resume_uuid}")
+
+            if not resume_uuid:
+                # Fallback to stored transcript_path
+                if session.transcript_path:
+                    resume_uuid = Path(session.transcript_path).stem
+                    logger.warning(f"Could not parse resume UUID from output, falling back to transcript_path: {resume_uuid}")
+                else:
+                    logger.error(f"Cannot recover session {session.id}: no resume UUID found")
+                    return False
+
+            # 5. Reset terminal with stty sane
             logger.debug(f"Sending stty sane to session {session.id}")
             proc = await asyncio.create_subprocess_exec(
                 "tmux", "send-keys", "-t", session.tmux_session, "stty sane", "Enter",
@@ -1068,7 +1092,7 @@ class SessionManager:
 
             await asyncio.sleep(0.5)
 
-            # 5. Build resume command with config args
+            # 6. Build resume command with config args
             claude_config = self.config.get("claude", {})
             command = claude_config.get("command", "claude")
             args = claude_config.get("args", [])
