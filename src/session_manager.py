@@ -868,6 +868,39 @@ class SessionManager:
                 )
                 await self.notifier.notify(event, session)
 
+                # If session has a review_config, emit review_complete
+                if session.review_config:
+                    try:
+                        review_config = session.review_config
+                        review_result = None
+                        if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
+                            from .github_reviews import fetch_latest_codex_review
+                            from .review_parser import parse_github_review
+                            codex_review = fetch_latest_codex_review(
+                                review_config.pr_repo, review_config.pr_number
+                            )
+                            if codex_review:
+                                review_result = parse_github_review(
+                                    review_config.pr_repo,
+                                    review_config.pr_number,
+                                    codex_review,
+                                )
+                        else:
+                            from .review_parser import parse_tui_output
+                            review_result = parse_tui_output(text)
+                        if review_result and review_result.findings:
+                            review_event = NotificationEvent(
+                                session_id=session.id,
+                                event_type="review_complete",
+                                message="Review complete",
+                                context="",
+                                urgent=False,
+                            )
+                            review_event.review_result = review_result
+                            await self.notifier.notify(review_event, session)
+                    except Exception as e:
+                        logger.warning(f"Failed to emit review_complete: {e}")
+
     async def _handle_codex_turn_started(self, session_id: str, turn_id: str):
         """Mark Codex turn as active and update activity timestamps."""
         self.codex_turns_in_flight.add(session_id)

@@ -134,6 +134,38 @@ def poll_for_codex_review(
     return None
 
 
+def fetch_latest_codex_review(repo: str, pr_number: int) -> Optional[dict]:
+    """Fetch the most recent Codex review from a GitHub PR.
+
+    Args:
+        repo: GitHub repo in owner/repo format
+        pr_number: PR number
+
+    Returns:
+        Review data dict or None if no Codex review found
+    """
+    owner, repo_name = repo.split("/", 1)
+    try:
+        result = subprocess.run(
+            [
+                "gh", "api",
+                f"repos/{owner}/{repo_name}/pulls/{pr_number}/reviews",
+                "--jq", ".",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            reviews = json.loads(result.stdout)
+            for review in reversed(reviews):
+                if "codex" in review.get("user", {}).get("login", "").lower():
+                    return review
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+        logger.warning(f"Failed to fetch Codex review for PR #{pr_number}: {e}")
+    return None
+
+
 def get_pr_repo_from_git(working_dir: str) -> Optional[str]:
     """Infer owner/repo from the git remote in working_dir.
 

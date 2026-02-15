@@ -82,6 +82,50 @@ class ReviewConfig:
 
 
 @dataclass
+class ReviewFinding:
+    """A single finding from a code review."""
+    title: str
+    body: str
+    priority: int  # 0-3 (P0 = critical, P3 = nitpick)
+    confidence_score: Optional[float] = None
+    file_path: Optional[str] = None
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "body": self.body,
+            "priority": self.priority,
+            "confidence_score": self.confidence_score,
+            "file_path": self.file_path,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+        }
+
+
+@dataclass
+class ReviewResult:
+    """Structured result from a code review."""
+    findings: List["ReviewFinding"]
+    overall_correctness: Optional[str] = None
+    overall_explanation: Optional[str] = None
+    overall_confidence_score: Optional[float] = None
+    raw_output: Optional[str] = None
+    source: str = "tui"  # "tui" or "github_pr"
+
+    def to_dict(self) -> dict:
+        return {
+            "findings": [f.to_dict() for f in self.findings],
+            "overall_correctness": self.overall_correctness,
+            "overall_explanation": self.overall_explanation,
+            "overall_confidence_score": self.overall_confidence_score,
+            "raw_output": self.raw_output,
+            "source": self.source,
+        }
+
+
+@dataclass
 class Subagent:
     """Represents a subagent spawned by a Claude session."""
     agent_id: str
@@ -291,6 +335,7 @@ class NotificationEvent:
     context: str = ""  # Recent output for context
     urgent: bool = False
     channel: Optional[NotificationChannel] = None  # None = use default
+    review_result: Optional["ReviewResult"] = None  # Structured review data
 
 
 @dataclass

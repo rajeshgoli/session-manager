@@ -2,6 +2,7 @@
 
 import json
 import logging
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1455,6 +1456,46 @@ Or continue working if not done yet."""
                     # Mark response sent (starts idle cooldown)
                     if app.state.output_monitor:
                         app.state.output_monitor.mark_response_sent(target_session.id)
+
+                    # If session has a review_config, emit review_complete notification
+                    if target_session.review_config:
+                        try:
+                            from .review_parser import parse_tui_output, parse_github_review
+                            review_config = target_session.review_config
+
+                            review_result = None
+                            if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
+                                # PR mode: fetch from GitHub (async)
+                                import asyncio
+                                from .github_reviews import fetch_latest_codex_review
+                                codex_review = await asyncio.to_thread(
+                                    fetch_latest_codex_review,
+                                    review_config.pr_repo,
+                                    review_config.pr_number,
+                                )
+                                if codex_review:
+                                    review_result = await asyncio.to_thread(
+                                        parse_github_review,
+                                        review_config.pr_repo,
+                                        review_config.pr_number,
+                                        codex_review,
+                                    )
+                            else:
+                                # TUI mode: parse from last message
+                                review_result = parse_tui_output(last_message)
+
+                            if review_result and review_result.findings:
+                                review_event = NotificationEvent(
+                                    session_id=target_session.id,
+                                    event_type="review_complete",
+                                    message="Review complete",
+                                    context="",
+                                    urgent=False,
+                                )
+                                review_event.review_result = review_result
+                                await app.state.notifier.notify(review_event, target_session)
+                        except Exception as e:
+                            logger.warning(f"Failed to emit review_complete notification: {e}")
                 else:
                     # Couldn't find matching session
                     logger.warning(
@@ -1587,6 +1628,55 @@ Or continue working if not done yet."""
             "provider": getattr(child_session, "provider", "claude"),
             "created_at": child_session.created_at.isoformat(),
         }
+
+    @app.get("/sessions/{session_id}/review-results")
+    async def get_review_results(session_id: str):
+        """Get parsed review results for a session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if not session.review_config:
+            raise HTTPException(status_code=404, detail="No review configured for this session")
+
+        from .review_parser import parse_github_review, parse_tui_output
+        from .github_reviews import fetch_latest_codex_review
+
+        review_config = session.review_config
+
+        if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
+            # GitHub PR mode: fetch review from GitHub API
+            import asyncio
+            repo = review_config.pr_repo
+            pr_number = review_config.pr_number
+
+            try:
+                codex_review = await asyncio.to_thread(
+                    fetch_latest_codex_review, repo, pr_number
+                )
+                if not codex_review:
+                    raise HTTPException(status_code=404, detail="No Codex review found on PR")
+
+                review_result = await asyncio.to_thread(
+                    parse_github_review, repo, pr_number, codex_review
+                )
+                return review_result.to_dict()
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to fetch review: {e}")
+        else:
+            # TUI mode: capture tmux pane output
+            output = app.state.session_manager.capture_output(session_id, lines=500)
+            if not output:
+                raise HTTPException(status_code=404, detail="No output available from session")
+
+            review_result = parse_tui_output(output)
+            return review_result.to_dict()
 
     @app.post("/sessions/{session_id}/review")
     async def start_review(session_id: str, request: StartReviewRequest):

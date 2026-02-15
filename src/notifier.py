@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Optional
 
-from .models import Session, NotificationEvent, NotificationChannel
+from .models import Session, NotificationEvent, NotificationChannel, ReviewResult
 from .telegram_bot import TelegramBot, escape_markdown_v2, create_permission_keyboard
 from .email_handler import EmailHandler
 
@@ -69,8 +69,11 @@ class Notifier:
         # Determine channel
         channel = event.channel or self.default_channel
 
-        # Format the message
-        message = self._format_message(event, session)
+        # Handle review_complete events with specialized formatting
+        if event.event_type == "review_complete" and event.review_result is not None:
+            message = self._format_review_message(event.review_result, session)
+        else:
+            message = self._format_message(event, session)
 
         success = False
 
@@ -219,6 +222,74 @@ class Notifier:
                     lines.append("Reply with: y/n/yes/no or custom input")
 
         return "\n".join(lines)
+
+    def _format_review_message(
+        self,
+        review_result: ReviewResult,
+        session: Optional[Session] = None,
+    ) -> str:
+        """Format a ReviewResult as a Telegram-friendly message.
+
+        Groups findings by priority (P0 first), respects 4096 char limit.
+        """
+        TELEGRAM_MAX = 4096
+        lines: list[str] = []
+
+        # Header
+        session_label = ""
+        if session:
+            name = session.friendly_name or session.id
+            session_label = f" [{name}]"
+        lines.append(f"Review Complete{session_label}")
+        lines.append("")
+
+        # Group findings by priority
+        by_priority: dict[int, list] = {}
+        for f in review_result.findings:
+            by_priority.setdefault(f.priority, []).append(f)
+
+        priority_icons = {0: "\u26a0\ufe0f", 1: "\u2757", 2: "\u2139\ufe0f", 3: "\ud83d\udcdd"}
+        total_findings = len(review_result.findings)
+        shown = 0
+
+        for p in sorted(by_priority.keys()):
+            icon = priority_icons.get(p, "")
+            for f in by_priority[p]:
+                entry = f"{icon} [P{p}] {f.title}"
+                if f.body:
+                    # Truncate long bodies
+                    body = f.body[:200] + "..." if len(f.body) > 200 else f.body
+                    entry += f"\n{body}"
+                if f.file_path:
+                    loc = f.file_path
+                    if f.line_start:
+                        loc += f":{f.line_start}"
+                    entry += f"\n  @ {loc}"
+                entry += "\n"
+
+                # Check if we'd exceed the limit
+                current = "\n".join(lines)
+                if len(current) + len(entry) + 50 > TELEGRAM_MAX:
+                    remaining = total_findings - shown
+                    lines.append(f"... ({remaining} more findings)")
+                    break
+                lines.append(entry)
+                shown += 1
+            else:
+                continue
+            break  # Break outer loop if inner loop broke
+
+        # Overall verdict
+        if review_result.overall_correctness:
+            lines.append(f"Correctness: {review_result.overall_correctness}")
+        if review_result.overall_confidence_score is not None:
+            lines.append(f"Confidence: {review_result.overall_confidence_score}")
+
+        message = "\n".join(lines)
+        # Final truncation safety
+        if len(message) > TELEGRAM_MAX:
+            message = message[:TELEGRAM_MAX - 20] + "\n... (truncated)"
+        return message
 
     async def rename_session_topic(
         self,

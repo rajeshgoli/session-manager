@@ -503,6 +503,22 @@ class SessionManagerClient:
             return None
         return data
 
+    def get_review_results(self, session_id: str) -> Optional[dict]:
+        """Get parsed review results for a session.
+
+        Args:
+            session_id: Session ID
+
+        Returns:
+            Dict with findings, overall verdict, etc. or None if unavailable
+        """
+        data, success, _ = self._request(
+            "GET",
+            f"/sessions/{session_id}/review-results",
+            timeout=35,
+        )
+        return data if success else None
+
     def clear_session(self, session_id: str, prompt: Optional[str] = None) -> tuple[bool, bool]:
         """
         Clear/reset a session's context.
