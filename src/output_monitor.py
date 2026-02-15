@@ -60,6 +60,9 @@ _error_re = re.compile('|'.join(ERROR_PATTERNS))
 _completion_re = re.compile('|'.join(COMPLETION_PATTERNS), re.IGNORECASE)
 _crash_re = re.compile('|'.join(CRASH_PATTERNS))
 
+CRASH_DEBOUNCE_SUCCESS = timedelta(seconds=30)
+CRASH_DEBOUNCE_FAILURE = timedelta(seconds=5)
+
 
 class OutputMonitor:
     """Monitors Claude session output for patterns that require notification."""
@@ -96,6 +99,9 @@ class OutputMonitor:
         self._notified_permissions: dict[str, datetime] = {}  # Debounce
         self._last_response_sent: dict[str, datetime] = {}  # Track when we sent response notifications
         self._hook_output_store: Optional[dict] = None  # Reference to hook output storage
+        self._pending_crash_recovery: set[str] = set()  # Sessions needing deferred recovery
+        self._last_crash_recovery: dict[str, tuple[datetime, bool]] = {}  # (timestamp, succeeded)
+        self._awaiting_permission: dict[str, bool] = {}  # Sessions at a permission prompt
 
         # Load timeout configuration with fallbacks
         timeouts = self.config.get("timeouts", {})
@@ -123,8 +129,11 @@ class OutputMonitor:
         """Set reference to SessionManager for session lookups."""
         self._session_manager = session_manager
 
-    def set_crash_recovery_callback(self, callback: Callable[[Session], Awaitable[None]]):
-        """Set callback for crash recovery (called when harness crash detected)."""
+    def set_crash_recovery_callback(self, callback):
+        """Set callback for crash recovery (called when harness crash detected).
+
+        Callback signature: async (session, graceful=False) -> bool
+        """
         self._crash_recovery_callback = callback
 
     async def start_monitoring(self, session: Session, is_restored: bool = False):
@@ -165,6 +174,9 @@ class OutputMonitor:
         self._file_positions.pop(session_id, None)
         self._last_activity.pop(session_id, None)
         self._notified_permissions.pop(session_id, None)
+        self._pending_crash_recovery.discard(session_id)
+        self._last_crash_recovery.pop(session_id, None)
+        self._awaiting_permission.pop(session_id, None)
 
     async def stop_all(self):
         """Stop all monitoring tasks."""
@@ -221,6 +233,14 @@ class OutputMonitor:
                     # No new content - check for idle
                     await self._check_idle(session)
 
+                # Retry deferred crash recovery for sessions that failed on first attempt
+                if session.id in self._pending_crash_recovery:
+                    recovery_state = self._last_crash_recovery.get(session.id)
+                    if recovery_state:
+                        last_time, last_succeeded = recovery_state
+                        if not last_succeeded and datetime.now() - last_time > CRASH_DEBOUNCE_FAILURE:
+                            await self._flush_pending_crash_recovery(session)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -229,6 +249,9 @@ class OutputMonitor:
 
     async def _analyze_content(self, session: Session, content: str):
         """Analyze new content for patterns."""
+        # New content means session moved past any permission prompt state
+        self._awaiting_permission.pop(session.id, None)
+
         # Check for harness crash (highest priority - triggers recovery)
         if _crash_re.search(content):
             await self._handle_crash(session, content)
@@ -248,6 +271,9 @@ class OutputMonitor:
 
     async def _handle_permission_prompt(self, session: Session, content: str):
         """Handle detected permission prompt."""
+        # Always track permission state (even if notification is debounced)
+        self._awaiting_permission[session.id] = True
+
         # Debounce - don't notify twice within configured window
         last_notified = self._notified_permissions.get(session.id)
         if last_notified and datetime.now() - last_notified < timedelta(seconds=self._permission_debounce):
@@ -308,6 +334,9 @@ class OutputMonitor:
         if self._status_callback:
             await self._status_callback(session.id, SessionStatus.IDLE)
 
+        # Flush deferred crash recovery now that session is safely idle
+        await self._flush_pending_crash_recovery(session)
+
         # Only send notification if enabled
         if not self.notify_completion:
             logger.debug(f"Completion detected but notifications disabled for session {session.id}")
@@ -331,31 +360,74 @@ class OutputMonitor:
         """
         Handle detected Claude Code harness crash.
 
-        This triggers the crash recovery flow:
-        1. Pause message queue (prevent sm send going to bash)
-        2. Send /exit to cleanly shutdown crashed harness
-        3. Reset terminal with stty sane
-        4. Resume Claude with --resume flag
-        5. Unpause message queue
+        For IDLE/STOPPED sessions, recovers immediately.
+        For RUNNING sessions, defers recovery until the session goes idle
+        (the harness often survives the crash and the agent keeps working).
         """
-        # Only recover sessions in IDLE or STOPPED state (not RUNNING)
+        # Only Claude sessions support crash recovery
+        if getattr(session, "provider", "claude") != "claude":
+            return
+
+        # Debounce: skip if we recovered recently (success or failure)
+        recovery_state = self._last_crash_recovery.get(session.id)
+        if recovery_state:
+            last_time, last_succeeded = recovery_state
+            cooldown = CRASH_DEBOUNCE_SUCCESS if last_succeeded else CRASH_DEBOUNCE_FAILURE
+            if datetime.now() - last_time < cooldown:
+                return
+
         if session.status == SessionStatus.RUNNING:
-            logger.warning(
-                f"Crash detected in session {session.id} but status is RUNNING, "
-                "skipping recovery (agent may still be active)"
+            # Agent is still working — defer recovery to when it goes idle
+            self._pending_crash_recovery.add(session.id)
+            logger.info(
+                f"Crash pattern detected in session {session.id} while RUNNING, "
+                "deferring recovery until idle"
             )
             return
 
-        logger.warning(f"Claude Code harness crash detected in session {session.id}")
+        logger.warning(
+            f"Claude Code harness crash detected in session {session.id} "
+            f"(status={session.status}), recovering now"
+        )
 
-        # Trigger recovery via callback
         if self._crash_recovery_callback:
             try:
-                await self._crash_recovery_callback(session)
+                success = await self._crash_recovery_callback(session)
+                self._last_crash_recovery[session.id] = (datetime.now(), bool(success))
+                if success:
+                    # Clear any stale pending state from earlier deferred attempts
+                    self._pending_crash_recovery.discard(session.id)
             except Exception as e:
                 logger.error(f"Crash recovery failed for session {session.id}: {e}")
+                self._last_crash_recovery[session.id] = (datetime.now(), False)
         else:
             logger.warning(f"No crash recovery callback set, cannot recover session {session.id}")
+
+    async def _flush_pending_crash_recovery(self, session: Session):
+        """If session has a pending crash recovery, trigger it now (gracefully)."""
+        if session.id not in self._pending_crash_recovery:
+            return
+
+        # Only flush when session is safely idle — never while RUNNING or at permission prompt
+        if session.status not in (SessionStatus.IDLE, SessionStatus.STOPPED):
+            return
+        if self._awaiting_permission.get(session.id):
+            return
+
+        logger.warning(
+            f"Session {session.id} is idle with pending crash recovery, "
+            "recovering now for a clean session"
+        )
+        if self._crash_recovery_callback:
+            try:
+                success = await self._crash_recovery_callback(session, graceful=True)
+                self._last_crash_recovery[session.id] = (datetime.now(), bool(success))
+                if success:
+                    self._pending_crash_recovery.discard(session.id)
+                # On failure, keep session in _pending_crash_recovery for retry
+            except Exception as e:
+                logger.error(f"Deferred crash recovery failed for session {session.id}: {e}")
+                self._last_crash_recovery[session.id] = (datetime.now(), False)
 
     async def _check_idle(self, session: Session):
         """Check if session has been idle too long."""
@@ -384,6 +456,9 @@ class OutputMonitor:
 
             if self._status_callback:
                 await self._status_callback(session.id, SessionStatus.IDLE)
+
+            # Flush deferred crash recovery now that session is safely idle
+            await self._flush_pending_crash_recovery(session)
 
             # Only send notification if enabled
             if not self.notify_idle:
@@ -470,6 +545,9 @@ class OutputMonitor:
         self._file_positions.pop(session_id, None)
         self._last_activity.pop(session_id, None)
         self._notified_permissions.pop(session_id, None)
+        self._pending_crash_recovery.discard(session_id)
+        self._last_crash_recovery.pop(session_id, None)
+        self._awaiting_permission.pop(session_id, None)
         self._tasks.pop(session_id, None)
         logger.info(f"Completed cleanup for session {session_id}")
 

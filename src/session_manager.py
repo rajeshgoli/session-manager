@@ -1553,14 +1553,14 @@ class SessionManager:
             "server_polling": server_polling,
         }
 
-    async def recover_session(self, session: Session) -> bool:
+    async def recover_session(self, session: Session, graceful: bool = False) -> bool:
         """
         Recover a session from Claude Code harness crash.
 
         This handles JavaScript stack overflow crashes in the TUI harness.
         The agent (Anthropic backend) is unaffected - only the local harness crashed.
 
-        Recovery flow:
+        Recovery flow (graceful=False, harness is dead):
         1. Pause message queue (prevent sm send going to bash)
         2. Send Ctrl-C twice to kill the crashed harness
         3. Parse resume UUID from Claude's exit output in the terminal
@@ -1568,8 +1568,16 @@ class SessionManager:
         5. Resume Claude with --resume <uuid>
         6. Unpause message queue
 
+        Recovery flow (graceful=True, harness survived):
+        1. Pause message queue
+        2. Send /exit + Enter to cleanly shut down the harness
+        3. Parse resume UUID from Claude's exit output
+        4. Resume Claude with --resume <uuid>
+        5. Unpause message queue
+
         Args:
             session: Session to recover
+            graceful: If True, use /exit instead of Ctrl-C (harness is still alive)
 
         Returns:
             True if recovery successful, False otherwise
@@ -1585,20 +1593,38 @@ class SessionManager:
             self.message_queue_manager.pause_session(session.id)
 
         try:
-            # 2. Send Ctrl-C twice to kill the crashed harness
-            #    /exit doesn't work reliably when the harness is crashed
-            logger.debug(f"Sending C-c twice to session {session.id}")
-            for _ in range(2):
+            # 2. Shut down the harness
+            if graceful:
+                # Harness survived the crash — use /exit for a clean shutdown
+                logger.debug(f"Sending /exit to session {session.id} (graceful)")
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session, "C-c",
+                    "tmux", "send-keys", "-t", session.tmux_session, "Escape",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=5)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "send-keys", "-t", session.tmux_session, "/exit", "Enter",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.sleep(3.0)
+            else:
+                # Harness is dead — Ctrl-C to force kill
+                logger.debug(f"Sending C-c twice to session {session.id}")
+                for _ in range(2):
+                    proc = await asyncio.create_subprocess_exec(
+                        "tmux", "send-keys", "-t", session.tmux_session, "C-c",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=5)
+                    await asyncio.sleep(0.5)
 
-            # 3. Wait for Claude to print exit message (crash dump is large)
-            await asyncio.sleep(3.0)
+                # Wait for Claude to print exit message (crash dump is large)
+                await asyncio.sleep(3.0)
 
             # 4. Parse resume ID from Claude's exit output
             #    Claude prints: "To resume this conversation, run:\n  claude --resume <uuid>"
@@ -1631,16 +1657,16 @@ class SessionManager:
                     logger.error(f"Cannot recover session {session.id}: no resume UUID found")
                     return False
 
-            # 5. Reset terminal with stty sane
-            logger.debug(f"Sending stty sane to session {session.id}")
-            proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session.tmux_session, "stty sane", "Enter",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=5)
-
-            await asyncio.sleep(0.5)
+            # 5. Reset terminal with stty sane (only needed for forceful Ctrl-C recovery)
+            if not graceful:
+                logger.debug(f"Sending stty sane to session {session.id}")
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "send-keys", "-t", session.tmux_session, "stty sane", "Enter",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.sleep(0.5)
 
             # 6. Build resume command with config args
             claude_config = self.config.get("claude", {})
