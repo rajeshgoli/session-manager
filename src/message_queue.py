@@ -310,14 +310,17 @@ class MessageQueueManager:
         """
         Resume message delivery to a session after recovery.
 
-        Triggers immediate delivery check if session is idle.
+        Triggers delivery if pending messages exist.
         """
         self._paused_sessions.discard(session_id)
         logger.info(f"Session {session_id} unpaused after recovery")
 
-        # Trigger delivery check if session is idle
-        state = self.delivery_states.get(session_id)
-        if state and state.is_idle:
+        # Trigger delivery if pending messages exist.
+        # Cannot rely on delivery_states.get() — if urgent delivery returned
+        # early due to pause, no state entry was created (#154).
+        pending = self.get_pending_messages(session_id)
+        if pending:
+            logger.info(f"Session {session_id} has {len(pending)} pending messages, scheduling delivery")
             asyncio.create_task(self._try_deliver_messages(session_id))
 
     def is_session_paused(self, session_id: str) -> bool:
