@@ -1061,9 +1061,15 @@ class SessionManager:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             if proc.returncode == 0:
                 import re
-                matches = re.findall(r'--resume\s+([0-9a-f-]{36})', stdout.decode())
-                if matches:
-                    resume_uuid = matches[-1]  # Last match is the most recent exit
+                # Match Claude's specific exit block:
+                #   "To resume this conversation, run:\n  claude --resume <uuid>"
+                match = re.search(
+                    r'To resume this conversation.*?--resume\s+([0-9a-f-]{36})',
+                    stdout.decode(),
+                    re.DOTALL,
+                )
+                if match:
+                    resume_uuid = match.group(1)
                     logger.info(f"Parsed resume UUID from terminal output: {resume_uuid}")
 
             if not resume_uuid:
