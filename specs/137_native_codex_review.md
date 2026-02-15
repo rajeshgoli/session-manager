@@ -1,6 +1,6 @@
 # #137 — Native Codex /review Support for Code Reviews
 
-**Status:** Draft v9
+**Status:** Draft v10
 **Author:** Claude (Opus 4.6)
 **Created:** 2026-02-14
 **Updated:** 2026-02-14
@@ -897,21 +897,25 @@ async def post_pr_review_comment(
     Returns: {"comment_id": int, "body": str}
     """
 
-async def poll_for_codex_review(
+def poll_for_codex_review(
     repo: str,
     pr_number: int,
     since: datetime,
     timeout: int = 600,
     poll_interval: int = 30,
 ) -> Optional[dict]:
-    """Poll for a Codex review on a PR.
+    """Poll for a Codex review on a PR. Synchronous.
 
-    Looks for a review by codex[bot] submitted after `since`.
-    Returns review data or None on timeout.
+    Uses subprocess.run in a loop with time.sleep(poll_interval) to call
+    gh api repos/{owner}/{repo}/pulls/{number}/reviews. Looks for a review
+    by codex[bot] submitted after `since`. Returns review data or None on timeout.
+
+    Callable directly from sync CLI code. Server wraps with
+    asyncio.to_thread(poll_for_codex_review, ...) for non-blocking background polling.
     """
 
-async def get_pr_repo_from_git(working_dir: str) -> Optional[str]:
-    """Infer owner/repo from git remote origin URL."""
+def get_pr_repo_from_git(working_dir: str) -> Optional[str]:
+    """Infer owner/repo from git remote origin URL. Synchronous (subprocess.run)."""
 ```
 
 Implementation uses `gh` CLI via `asyncio.create_subprocess_exec`:
@@ -940,7 +944,7 @@ This method:
 3. If `caller_session_id` provided: stores `ReviewConfig` (mode=`"pr"`, `pr_number`, `pr_repo`) on caller's session. If absent (standalone), no persistence.
 4. Posts `@codex review` comment (with optional steer text appended). Stores `pr_comment_id` on ReviewConfig if persisted.
 5. Returns response dict including `posted_at` (ISO timestamp of when comment was posted) — needed by CLI for client-side polling.
-6. If `wait` **and** `caller_session_id`: starts server-side background poll task (`asyncio.create_task`). On completion, notifies caller via `sm send`.
+6. If `wait` **and** `caller_session_id`: starts server-side background poll task via `asyncio.create_task(asyncio.to_thread(poll_for_codex_review, ...))`. On completion, notifies caller via `sm send`.
 7. If `wait` **without** `caller_session_id`: server does **not** start a poll task. The CLI is responsible for polling (see Step 12). The API response contains everything the CLI needs to poll independently (`repo`, `pr_number`, `posted_at`).
 
 #### Step 11: Add PR review API endpoint
@@ -980,14 +984,17 @@ When `--pr` + `--wait` is used without session context (`CLAUDE_SESSION_MANAGER_
 
 ```python
 # In cmd_review(), after API call returns:
+from datetime import datetime
+
 response = client.start_pr_review(pr_number=pr, repo=repo, steer=steer)
 if wait and not caller_session_id:
-    # Server did NOT start polling — CLI polls directly
+    # Server did NOT start polling — CLI polls directly (sync call)
     from src.github_reviews import poll_for_codex_review
+    since = datetime.fromisoformat(response["posted_at"])
     result = poll_for_codex_review(
         repo=response["repo"],
         pr_number=response["pr_number"],
-        since=response["posted_at"],
+        since=since,
         timeout=wait,
     )
     if result:
