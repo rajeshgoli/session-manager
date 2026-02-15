@@ -47,6 +47,7 @@ class CodexAppServerSession:
         on_turn_complete: Callable[[str, str, str], Awaitable[None]],
         on_turn_started: Optional[Callable[[str, str], Awaitable[None]]] = None,
         on_turn_delta: Optional[Callable[[str, str, str], Awaitable[None]]] = None,
+        on_review_complete: Optional[Callable[[str, str], Awaitable[None]]] = None,
     ):
         self.session_id = session_id
         self.working_dir = working_dir
@@ -54,6 +55,7 @@ class CodexAppServerSession:
         self.on_turn_complete = on_turn_complete
         self.on_turn_started = on_turn_started
         self.on_turn_delta = on_turn_delta
+        self.on_review_complete = on_review_complete
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
@@ -64,6 +66,8 @@ class CodexAppServerSession:
         self.thread_id: Optional[str] = None
         self._current_turn_id: Optional[str] = None
         self._turn_buffers: dict[str, list[str]] = {}
+        self._review_in_progress: bool = False
+        self._review_id: Optional[str] = None
 
     async def start(self, thread_id: Optional[str] = None, model: Optional[str] = None) -> str:
         """Start app-server and create or resume a thread. Returns thread_id."""
@@ -170,6 +174,59 @@ class CodexAppServerSession:
         except Exception as e:
             logger.warning(f"Failed to interrupt turn for session {self.session_id}: {e}")
             return False
+
+    async def review_start(
+        self,
+        mode: str,
+        base_branch: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+        custom_prompt: Optional[str] = None,
+        delivery: str = "inline",
+    ) -> dict:
+        """Start a code review via review/start RPC.
+
+        Args:
+            mode: Review mode (branch, uncommitted, commit, custom)
+            base_branch: Target branch for branch mode
+            commit_sha: Target SHA for commit mode
+            custom_prompt: Free-form text for custom mode
+            delivery: 'inline' (stream) or 'detached' (background)
+
+        Returns:
+            RPC response dict
+        """
+        if not self.thread_id:
+            raise CodexAppServerError("Codex thread not initialized")
+
+        # Build target object
+        if mode == "branch":
+            target: dict[str, Any] = {"type": "baseBranch", "branch": base_branch or "main"}
+        elif mode == "uncommitted":
+            target = {"type": "uncommittedChanges"}
+        elif mode == "commit":
+            if not commit_sha:
+                raise CodexAppServerError("commit_sha required for commit review mode")
+            target = {"type": "commit", "sha": commit_sha}
+        elif mode == "custom":
+            target = {"type": "custom"}
+            if custom_prompt:
+                target["prompt"] = custom_prompt
+        else:
+            raise CodexAppServerError(f"Unknown review mode: {mode}")
+
+        params: dict[str, Any] = {
+            "threadId": self.thread_id,
+            "target": target,
+            "delivery": delivery,
+        }
+
+        self._review_in_progress = True
+        try:
+            result = await self._request("review/start", params)
+        except Exception:
+            self._review_in_progress = False
+            raise
+        return result
 
     async def close(self):
         """Stop the app-server process."""
@@ -298,6 +355,30 @@ class CodexAppServerSession:
                 if self._current_turn_id == turn_id:
                     self._current_turn_id = None
             await self.on_turn_complete(self.session_id, text, status)
+            return
+
+        # Review lifecycle: item/started with enteredReviewMode
+        if method == "item/started":
+            item = params.get("item", {})
+            item_type = item.get("type")
+            if item_type == "enteredReviewMode":
+                self._review_in_progress = True
+                self._review_id = item.get("id")
+                label = item.get("review", "")
+                logger.info(f"Review started for session {self.session_id}: {label}")
+            return
+
+        # Review lifecycle: item/completed with exitedReviewMode
+        if method == "item/completed":
+            item = params.get("item", {})
+            item_type = item.get("type")
+            if item_type == "exitedReviewMode":
+                review_text = item.get("review", "")
+                self._review_in_progress = False
+                self._review_id = None
+                logger.info(f"Review completed for session {self.session_id}")
+                if self.on_review_complete:
+                    await self.on_review_complete(self.session_id, review_text)
             return
 
     async def _handle_server_request(self, message: dict[str, Any]):
