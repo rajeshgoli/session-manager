@@ -1099,6 +1099,26 @@ class MessageQueueManager:
         logger.info(f"Watching {target_session_id} for {timeout_seconds}s, will notify {watcher_session_id}")
         return watch_id
 
+    async def _check_codex_prompt(self, tmux_session: str) -> bool:
+        """Check if Codex CLI is showing the input prompt (idle)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "capture-pane", "-p", "-t", tmux_session,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
+            if proc.returncode != 0:
+                return False
+            output = stdout.decode().rstrip()
+            if not output:
+                return False
+            last_line = output.split('\n')[-1]
+            # Prompt is ">" with optional trailing whitespace, no user text
+            return last_line.rstrip() == '>' or last_line.startswith('> ') and not last_line[2:].strip()
+        except Exception:
+            return False
+
     async def _watch_for_idle(
         self,
         watch_id: str,
@@ -1111,11 +1131,25 @@ class MessageQueueManager:
             start_time = datetime.now()
             poll_interval = self.watch_poll_interval
             elapsed = 0
+            codex_prompt_count = 0
 
             while elapsed < timeout_seconds:
                 # Check if target is idle
                 state = self.delivery_states.get(target_session_id)
                 is_idle = state.is_idle if state else False
+
+                # Codex CLI fallback: detect idle via tmux prompt
+                # Requires two consecutive detections to avoid transient prompts
+                if not is_idle:
+                    session = self.session_manager.get_session(target_session_id)
+                    if session and getattr(session, "provider", "claude") == "codex" and session.tmux_session:
+                        prompt_visible = await self._check_codex_prompt(session.tmux_session)
+                        if prompt_visible:
+                            codex_prompt_count += 1
+                            if codex_prompt_count >= 2:
+                                is_idle = True
+                        else:
+                            codex_prompt_count = 0
 
                 # Validate: idle with pending messages means delivery is in-flight
                 if is_idle and self.get_pending_messages(target_session_id):

@@ -364,6 +364,267 @@ class TestDeliveryLocks:
         assert lock1 is lock2
 
 
+class TestCodexIdleDetection:
+    """Tests for Codex CLI idle detection in _watch_for_idle (#168)."""
+
+    @pytest.mark.asyncio
+    async def test_check_codex_prompt_bare_chevron(self, message_queue):
+        """_check_codex_prompt returns True for bare '>' prompt."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"some output\n>", b""))
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await message_queue._check_codex_prompt("tmux-codex")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_check_codex_prompt_with_trailing_space(self, message_queue):
+        """_check_codex_prompt returns True for '> ' prompt (no user text)."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"some output\n> ", b""))
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await message_queue._check_codex_prompt("tmux-codex")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_check_codex_prompt_with_user_text(self, message_queue):
+        """_check_codex_prompt returns False when user has typed text."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"some output\n> hello world", b""))
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await message_queue._check_codex_prompt("tmux-codex")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_check_codex_prompt_no_prompt(self, message_queue):
+        """_check_codex_prompt returns False when no prompt visible."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"Processing task...\nDone.", b""))
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await message_queue._check_codex_prompt("tmux-codex")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_check_codex_prompt_empty_output(self, message_queue):
+        """_check_codex_prompt returns False for empty output."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await message_queue._check_codex_prompt("tmux-codex")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_check_codex_prompt_tmux_error(self, message_queue):
+        """_check_codex_prompt returns False when tmux command fails."""
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"no session"))
+        mock_proc.returncode = 1
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await message_queue._check_codex_prompt("tmux-codex")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_check_codex_prompt_exception(self, message_queue):
+        """_check_codex_prompt returns False on exception."""
+        with patch("asyncio.create_subprocess_exec", side_effect=OSError("tmux not found")):
+            result = await message_queue._check_codex_prompt("tmux-codex")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_watch_codex_idle_requires_two_consecutive(self, mock_session_manager, temp_db_path):
+        """_watch_for_idle requires two consecutive prompt detections for Codex."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"watch_poll_interval_seconds": 0.01}}},
+            notifier=None,
+        )
+
+        # Create a Codex session
+        codex_session = MagicMock()
+        codex_session.id = "codex123"
+        codex_session.provider = "codex"
+        codex_session.tmux_session = "tmux-codex"
+        codex_session.friendly_name = "test-codex"
+        codex_session.name = "codex-agent"
+        mock_session_manager.get_session = MagicMock(return_value=codex_session)
+
+        # Simulate: first poll sees prompt, second poll sees prompt → idle
+        prompt_results = [True, True]
+        call_count = {"n": 0}
+
+        async def mock_check_codex_prompt(tmux_session):
+            idx = min(call_count["n"], len(prompt_results) - 1)
+            result = prompt_results[idx]
+            call_count["n"] += 1
+            return result
+
+        mq._check_codex_prompt = mock_check_codex_prompt
+
+        # Run watch with short timeout
+        await mq._watch_for_idle("watch1", "codex123", "watcher456", timeout_seconds=5)
+
+        # Should have notified the watcher (idle detected)
+        pending = mq.get_pending_messages("watcher456")
+        assert len(pending) == 1
+        assert "is now idle" in pending[0].text
+
+    @pytest.mark.asyncio
+    async def test_watch_codex_single_prompt_not_idle(self, mock_session_manager, temp_db_path):
+        """_watch_for_idle does NOT fire after single prompt detection (transient guard)."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"watch_poll_interval_seconds": 0.01}}},
+            notifier=None,
+        )
+
+        # Create a Codex session
+        codex_session = MagicMock()
+        codex_session.id = "codex123"
+        codex_session.provider = "codex"
+        codex_session.tmux_session = "tmux-codex"
+        codex_session.friendly_name = "test-codex"
+        codex_session.name = "codex-agent"
+        mock_session_manager.get_session = MagicMock(return_value=codex_session)
+
+        # Simulate: prompt visible once, then gone (transient), then timeout
+        prompt_results = [True, False, False, False]
+        call_count = {"n": 0}
+
+        async def mock_check_codex_prompt(tmux_session):
+            idx = min(call_count["n"], len(prompt_results) - 1)
+            result = prompt_results[idx]
+            call_count["n"] += 1
+            return result
+
+        mq._check_codex_prompt = mock_check_codex_prompt
+
+        # Run watch with very short timeout
+        await mq._watch_for_idle("watch2", "codex123", "watcher456", timeout_seconds=0.1)
+
+        # Should have timed out (not idle)
+        pending = mq.get_pending_messages("watcher456")
+        assert len(pending) == 1
+        assert "Timeout" in pending[0].text
+
+    @pytest.mark.asyncio
+    async def test_watch_codex_counter_resets_on_non_prompt(self, mock_session_manager, temp_db_path):
+        """Codex prompt counter resets when prompt disappears between detections."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"watch_poll_interval_seconds": 0.01}}},
+            notifier=None,
+        )
+
+        codex_session = MagicMock()
+        codex_session.id = "codex123"
+        codex_session.provider = "codex"
+        codex_session.tmux_session = "tmux-codex"
+        codex_session.friendly_name = "test-codex"
+        codex_session.name = "codex-agent"
+        mock_session_manager.get_session = MagicMock(return_value=codex_session)
+
+        # Simulate: prompt, no-prompt, prompt, prompt → idle on 4th poll
+        prompt_results = [True, False, True, True]
+        call_count = {"n": 0}
+
+        async def mock_check_codex_prompt(tmux_session):
+            idx = min(call_count["n"], len(prompt_results) - 1)
+            result = prompt_results[idx]
+            call_count["n"] += 1
+            return result
+
+        mq._check_codex_prompt = mock_check_codex_prompt
+
+        await mq._watch_for_idle("watch3", "codex123", "watcher456", timeout_seconds=5)
+
+        pending = mq.get_pending_messages("watcher456")
+        assert len(pending) == 1
+        assert "is now idle" in pending[0].text
+
+    @pytest.mark.asyncio
+    async def test_watch_claude_session_unaffected(self, mock_session_manager, temp_db_path):
+        """_watch_for_idle does not use Codex prompt detection for Claude sessions."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"watch_poll_interval_seconds": 0.01}}},
+            notifier=None,
+        )
+
+        # Create a Claude session (default provider)
+        claude_session = MagicMock()
+        claude_session.id = "claude123"
+        claude_session.provider = "claude"
+        claude_session.tmux_session = "tmux-claude"
+        claude_session.friendly_name = "test-claude"
+        claude_session.name = "claude-agent"
+        mock_session_manager.get_session = MagicMock(return_value=claude_session)
+
+        # _check_codex_prompt should never be called
+        mq._check_codex_prompt = AsyncMock(return_value=True)
+
+        # Run watch with short timeout (Claude never goes idle via hook → timeout)
+        await mq._watch_for_idle("watch4", "claude123", "watcher456", timeout_seconds=0.1)
+
+        # Should have timed out
+        pending = mq.get_pending_messages("watcher456")
+        assert len(pending) == 1
+        assert "Timeout" in pending[0].text
+
+        # _check_codex_prompt should NOT have been called
+        mq._check_codex_prompt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_watch_codex_pending_messages_suppress_idle(self, mock_session_manager, temp_db_path):
+        """Codex idle is suppressed when pending messages exist."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"watch_poll_interval_seconds": 0.01}}},
+            notifier=None,
+        )
+
+        codex_session = MagicMock()
+        codex_session.id = "codex123"
+        codex_session.provider = "codex"
+        codex_session.tmux_session = "tmux-codex"
+        codex_session.friendly_name = "test-codex"
+        codex_session.name = "codex-agent"
+        mock_session_manager.get_session = MagicMock(return_value=codex_session)
+
+        # Always show prompt
+        mq._check_codex_prompt = AsyncMock(return_value=True)
+
+        # Insert a pending message directly into DB (bypass queue_message which
+        # triggers delivery for Codex sessions)
+        mq._execute("""
+            INSERT INTO message_queue
+            (id, target_session_id, text, delivery_mode, queued_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, ("pending_msg", "codex123", "Pending task", "sequential", datetime.now().isoformat()))
+
+        # Run watch with short timeout — pending messages should suppress idle
+        await mq._watch_for_idle("watch5", "codex123", "watcher456", timeout_seconds=0.1)
+
+        # Should have timed out (not idle due to pending messages)
+        pending_watcher = mq.get_pending_messages("watcher456")
+        assert len(pending_watcher) == 1
+        assert "Timeout" in pending_watcher[0].text
+
+
 class TestTelegramMirroring:
     """Tests for Telegram mirroring of agent-to-agent communications (issue #103)."""
 
