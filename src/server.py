@@ -214,6 +214,27 @@ class HealthCheckResponse(BaseModel):
     timestamp: str
 
 
+def _invalidate_session_cache(app: FastAPI, session_id: str) -> None:
+    """Clear server-side caches for a session after a context reset.
+
+    Prevents stale cached output and notification state from a previous
+    task from leaking into stop-hook notifications for the next task (#167).
+    """
+    app.state.last_claude_output.pop(session_id, None)
+    app.state.pending_stop_notifications.discard(session_id)
+
+    queue_mgr = (
+        app.state.session_manager.message_queue_manager
+        if app.state.session_manager
+        else None
+    )
+    if queue_mgr:
+        state = queue_mgr.delivery_states.get(session_id)
+        if state:
+            state.stop_notify_sender_id = None
+            state.stop_notify_sender_name = None
+
+
 def create_app(
     session_manager=None,
     notifier=None,
@@ -939,7 +960,30 @@ def create_app(
         if not success:
             raise HTTPException(status_code=500, detail="Failed to clear session")
 
+        # Invalidate server-side caches so stale state from the previous task
+        # doesn't leak into stop-hook notifications for the next task (#167)
+        _invalidate_session_cache(app, session_id)
+
         return {"status": "cleared", "session_id": session_id}
+
+    @app.post("/sessions/{session_id}/invalidate-cache")
+    async def invalidate_session_cache(session_id: str):
+        """Invalidate server-side caches for a session.
+
+        Called by the CLI after tmux-level clear operations so that stale
+        cached output and notification state from a previous task don't
+        leak into the next task's stop-hook notifications (#167).
+        """
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        _invalidate_session_cache(app, session_id)
+
+        return {"status": "invalidated", "session_id": session_id}
 
     @app.delete("/sessions/{session_id}")
     async def kill_session(session_id: str):

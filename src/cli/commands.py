@@ -1711,6 +1711,10 @@ def cmd_clear(
         # Wait for clear to process
         time.sleep(2)
 
+        # Invalidate server-side caches so stale stop-hook notification
+        # state from the previous task doesn't leak into the next task (#167)
+        client.invalidate_cache(target_session_id)
+
         # Send new prompt if provided
         if new_prompt:
             subprocess.run(
