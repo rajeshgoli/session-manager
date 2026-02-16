@@ -111,8 +111,8 @@ Agents sleep while waiting. Central manager handles coordination. Pay only for a
 
 ```bash
 # Install
-git clone https://github.com/rajeshgoli/claude-session-manager
-cd claude-session-manager
+git clone https://github.com/rajeshgoli/session-manager
+cd session-manager
 ./setup.sh
 
 # Configure (add your Telegram bot token!)

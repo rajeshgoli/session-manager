@@ -260,7 +260,7 @@ def create_app(
     @app.get("/")
     async def root():
         """Health check endpoint."""
-        return {"status": "ok", "service": "claude-session-manager"}
+        return {"status": "ok", "service": "session-manager"}
 
     @app.get("/health")
     async def health():

@@ -58,7 +58,7 @@ class SessionManager:
             sandbox=codex_app_config.get("sandbox", "workspace-write"),
             approval_decision=codex_app_config.get("approval_decision", "decline"),
             request_timeout_seconds=codex_app_config.get("request_timeout_seconds", 60),
-            client_name=codex_app_config.get("client_name", "claude-session-manager"),
+            client_name=codex_app_config.get("client_name", "session-manager"),
             client_title=codex_app_config.get("client_title", "Claude Session Manager"),
             client_version=codex_app_config.get("client_version", "0.1.0"),
         )

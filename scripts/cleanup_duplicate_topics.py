@@ -150,7 +150,7 @@ async def main():
     )
     parser.add_argument(
         "--log",
-        default="/tmp/claude-session-manager.log",
+        default="/tmp/session-manager.log",
         help="Path to session manager log file",
     )
     parser.add_argument(

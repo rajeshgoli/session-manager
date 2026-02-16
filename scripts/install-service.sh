@@ -43,7 +43,7 @@ install_service() {
     launchctl load "$PLIST_DST"
 
     echo "Service installed and started."
-    echo "Logs: /tmp/claude-session-manager.log"
+    echo "Logs: /tmp/session-manager.log"
     echo ""
     sleep 2
     status_service

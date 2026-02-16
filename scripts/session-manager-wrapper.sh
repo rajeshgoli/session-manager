@@ -6,7 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV_PYTHON="$SCRIPT_DIR/venv/bin/python"
-LOG_FILE="/tmp/claude-session-manager.log"
+LOG_FILE="/tmp/session-manager.log"
 HEALTH_URL="http://127.0.0.1:8420/health"
 HEALTH_CHECK_INTERVAL=30
 HEALTH_CHECK_TIMEOUT=5

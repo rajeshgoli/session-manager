@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/rajesh/Desktop/automation/claude-session-manager/venv/bin/python</string>
+        <string>/Users/rajesh/Desktop/automation/session-manager/venv/bin/python</string>
         <string>-m</string>
         <string>src.main</string>
     </array>
@@ -19,13 +19,13 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/tmp/claude-session-manager.log</string>
+    <string>/tmp/session-manager.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/claude-session-manager.log</string>
+    <string>/tmp/session-manager.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/rajesh/Desktop/automation/claude-session-manager</string>
+    <string>/Users/rajesh/Desktop/automation/session-manager</string>
 
     <key>EnvironmentVariables</key>
     <dict>

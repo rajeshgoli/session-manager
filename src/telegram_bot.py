@@ -1169,7 +1169,7 @@ Provide ONLY the summary, no preamble or questions."""
         # Show project selection buttons
         projects = [
             ("fractal-market-simulator", "~/Desktop/fractal-market-simulator"),
-            ("automation (session-mgr)", "~/Desktop/automation/claude-session-manager"),
+            ("automation (session-mgr)", "~/Desktop/automation/session-manager"),
             ("office-automate", "~/Desktop/automation/office-automate"),
             ("financial-analysis", "~/Desktop/automation/financial-analysis"),
         ]

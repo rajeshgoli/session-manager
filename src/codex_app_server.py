@@ -21,7 +21,7 @@ class CodexAppServerConfig:
     sandbox: Optional[str] = "workspace-write"  # SandboxMode enum
     approval_decision: str = "decline"  # accept | acceptForSession | decline | cancel
     request_timeout_seconds: int = 60
-    client_name: str = "claude-session-manager"
+    client_name: str = "session-manager"
     client_title: Optional[str] = "Claude Session Manager"
     client_version: str = "0.1.0"
 

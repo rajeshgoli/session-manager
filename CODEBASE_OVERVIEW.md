@@ -7,7 +7,7 @@
 ## Directory Structure
 
 ```
-claude-session-manager/
+session-manager/
 ├── src/
 │   ├── main.py                 # Orchestrator entry point
 │   ├── server.py               # FastAPI API + Claude hooks

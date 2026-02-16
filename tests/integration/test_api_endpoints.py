@@ -72,7 +72,7 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
-        assert data["service"] == "claude-session-manager"
+        assert data["service"] == "session-manager"
 
     def test_health_endpoint(self, test_client):
         """GET /health returns healthy status."""
