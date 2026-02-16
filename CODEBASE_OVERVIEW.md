@@ -229,7 +229,7 @@ Claude Code Hooks
 
 **Entry points:**
 - `python -m src.main`
-- Console script: `session-manager`
+- Console script: `claude-session-manager`
 
 **Python version:** 3.11+
 
