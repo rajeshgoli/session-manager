@@ -1,6 +1,7 @@
 """tmux operations for spawning and controlling Claude Code sessions."""
 
 import asyncio
+import shlex
 import subprocess
 import shutil
 from pathlib import Path
@@ -258,6 +259,12 @@ class TmuxController:
                 # Add model flag (e.g., --model sonnet)
                 cmd_parts.extend(["--model", model])
 
+            # Pass initial prompt as a CLI positional argument instead of typing
+            # it via send-keys after startup. This avoids timing issues where
+            # Claude Code hasn't finished initializing when the prompt arrives.
+            if initial_prompt:
+                cmd_parts.append(shlex.quote(initial_prompt))
+
             # Start Claude Code in the session
             self._run_tmux(
                 "send-keys",
@@ -266,29 +273,9 @@ class TmuxController:
                 "Enter",
             )
 
-            # Send initial prompt if provided
             if initial_prompt:
-                # Wait longer for Claude to fully initialize and be ready to accept input
-                # Claude Code can take 2-3 seconds to start up and show the prompt
-                import time
-                time.sleep(self.claude_init_seconds)
-                # Send the prompt using subprocess with list arguments (security: prevent shell injection)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "--", initial_prompt],
-                    check=True,
-                    capture_output=True,
-                    text=True
-                )
-                time.sleep(self.claude_init_no_prompt_seconds)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "Enter"],
-                    check=True,
-                    capture_output=True,
-                    text=True
-                )
-                logger.info(f"Sent initial prompt to {session_name}: {initial_prompt[:50]}...")
+                logger.info(f"Created session with CLI prompt for {session_name}: {initial_prompt[:50]}...")
             else:
-                # Still wait for Claude to start even without initial prompt
                 import time
                 time.sleep(self.claude_init_no_prompt_seconds)
 
