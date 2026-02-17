@@ -1668,7 +1668,18 @@ class SessionManager:
                 await asyncio.wait_for(proc.communicate(), timeout=5)
                 await asyncio.sleep(0.5)
 
-            # 6. Build resume command with config args
+            # 6. Unset CLAUDECODE to prevent nested-session detection
+            #    (Claude Code exports this; it persists in the shell after the process dies)
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", session.tmux_session,
+                "unset CLAUDECODE", "Enter",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+            await asyncio.sleep(0.3)
+
+            # 7. Build resume command with config args
             claude_config = self.config.get("claude", {})
             command = claude_config.get("command", "claude")
             args = claude_config.get("args", [])
