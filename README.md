@@ -1,5 +1,5 @@
-# Claude Session Manager
-
+# Session Manager
+## Dispatch teams of claude and codex agents
 **Distributed infrastructure for AI agent swarms.** Spawn Claude agents, orchestrate workflows, coordinate without burning tokens. Watch it all unfold from your phone.
 
 ```
