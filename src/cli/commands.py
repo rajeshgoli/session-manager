@@ -1698,8 +1698,6 @@ def cmd_clear(
 
     # Send clear command
     try:
-        import shlex
-
         # Check if session is in "completed" state
         # If so, we need to wake it up first (send Enter) before /clear will work
         completion_status = session.get("completion_status")

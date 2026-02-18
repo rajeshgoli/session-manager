@@ -86,6 +86,8 @@ async def test_urgent_delivery_to_completed_session_wakes_up_first(
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        # Mock prompt polling so capture-pane calls don't appear in subprocess_calls (#175)
+        message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
         # Deliver urgent message
         await message_queue._deliver_urgent("test-123", msg)
 
@@ -146,6 +148,7 @@ async def test_urgent_delivery_to_running_session_no_wake_up(
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
         # Deliver urgent message
         await message_queue._deliver_urgent("test-456", msg)
 
@@ -198,6 +201,7 @@ async def test_urgent_delivery_to_error_session_no_wake_up(
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
         # Deliver urgent message
         await message_queue._deliver_urgent("test-error", msg)
 
@@ -246,6 +250,7 @@ async def test_urgent_delivery_to_abandoned_session_no_wake_up(
         return proc
 
     with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
         # Deliver urgent message
         await message_queue._deliver_urgent("test-abandoned", msg)
 

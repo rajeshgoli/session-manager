@@ -159,8 +159,6 @@ class TestBugA_PromptDetectionBeforeDelivery:
 
         sleep_calls = []
 
-        original_sleep = asyncio.sleep
-
         async def tracking_sleep(seconds):
             sleep_calls.append(seconds)
             # Don't actually sleep
@@ -171,7 +169,8 @@ class TestBugA_PromptDetectionBeforeDelivery:
             proc.returncode = 0
             return proc
 
-        with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", side_effect=tracking_sleep):
             message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
 
             await message_queue._deliver_urgent("test-175a2", msg)

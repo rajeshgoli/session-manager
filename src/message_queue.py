@@ -823,8 +823,8 @@ class MessageQueueManager:
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
 
-                # Wait for Claude to wake up (same as cmd_clear)
-                await asyncio.sleep(1.5)
+                # Wait for Claude to show prompt after wake-up (#175)
+                await self._wait_for_claude_prompt_async(session.tmux_session)
 
             # Send Escape to interrupt any streaming (async, non-blocking)
             proc = await asyncio.create_subprocess_exec(
@@ -1108,6 +1108,9 @@ class MessageQueueManager:
         the no-blocking-IO-in-async constraint (issue #37).
         Returns True if prompt detected, False if timed out (caller proceeds anyway).
         """
+        # Minimum floor sleep so function works in test environments
+        # where no real tmux pane exists (#175 spec requirement)
+        await asyncio.sleep(0.1)
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
             try:
