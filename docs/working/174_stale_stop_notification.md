@@ -378,6 +378,11 @@ This is acceptable: the deferred case is already a degraded path (transcript not
 
 4. **skip_count does not affect sessions with no pending notification**: When `mark_session_idle()` fires with skip_count > 0 but `stop_notify_sender_id = None`, skip_count is still decremented (the skip slot is consumed), and no spurious notification is sent
 
+5. **`arm_skip` path isolation** (regression for codex-app safety):
+   - Calling `_invalidate_session_cache(app, session_id, arm_skip=False)` (the codex-app `/clear` path) does NOT increment `stop_notify_skip_count`
+   - Calling `_invalidate_session_cache(app, session_id, arm_skip=True)` (the tmux `/invalidate-cache` path) DOES increment `stop_notify_skip_count` and creates delivery state if absent
+   - A subsequent `mark_session_idle()` call after a codex-app clear fires the stop notification normally (skip_count = 0)
+
 ---
 
 ## Ticket Classification
