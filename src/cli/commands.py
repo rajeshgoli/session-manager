@@ -1696,6 +1696,23 @@ def cmd_clear(
 
     clear_command = "/new" if provider == "codex" else "/clear"
 
+    # Invalidate server-side caches and arm skip_count BEFORE tmux operations,
+    # so the /clear Stop hook is absorbed even if it arrives late (#174).
+    success, unavailable = client.invalidate_cache(target_session_id)
+    if not success:
+        if unavailable:
+            print(
+                f"Warning: Cache invalidation SKIPPED for {target_session_id}: server unavailable. "
+                f"Skip fence not armed — stale stop notification possible if server recovers.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Warning: Cache invalidation failed for {target_session_id}; "
+                f"stale output may affect next notification",
+                file=sys.stderr,
+            )
+
     # Send clear command
     try:
         # Check if session is in "completed" state
@@ -1733,10 +1750,6 @@ def cmd_clear(
 
         # Wait for clear to finish and prompt to reappear (#175)
         _wait_for_claude_prompt(tmux_session, timeout=5.0)
-
-        # Invalidate server-side caches so stale stop-hook notification
-        # state from the previous task doesn't leak into the next task (#167)
-        client.invalidate_cache(target_session_id)
 
         # Send new prompt if provided
         if new_prompt:

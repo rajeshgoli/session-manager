@@ -20,6 +20,7 @@ from src.cli.client import SessionManagerClient
 def mock_client():
     """Create a mock SessionManagerClient."""
     client = Mock(spec=SessionManagerClient)
+    client.invalidate_cache = Mock(return_value=(True, False))
     return client
 
 

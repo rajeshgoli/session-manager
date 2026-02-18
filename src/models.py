@@ -395,3 +395,4 @@ class SessionDeliveryState:
     pending_input_first_seen: Optional[datetime] = None  # When we first saw the pending input
     stop_notify_sender_id: Optional[str] = None  # Sender to notify on Stop hook
     stop_notify_sender_name: Optional[str] = None  # Sender name for notification
+    stop_notify_skip_count: int = 0  # Absorb /clear Stop hooks before firing notification

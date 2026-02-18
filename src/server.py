@@ -214,11 +214,14 @@ class HealthCheckResponse(BaseModel):
     timestamp: str
 
 
-def _invalidate_session_cache(app: FastAPI, session_id: str) -> None:
+def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = False) -> None:
     """Clear server-side caches for a session after a context reset.
 
     Prevents stale cached output and notification state from a previous
     task from leaking into stop-hook notifications for the next task (#167).
+
+    When arm_skip=True (tmux CLI path), increments stop_notify_skip_count so
+    the /clear Stop hook is absorbed without consuming stop_notify_sender_id (#174).
     """
     app.state.last_claude_output.pop(session_id, None)
     app.state.pending_stop_notifications.discard(session_id)
@@ -229,7 +232,11 @@ def _invalidate_session_cache(app: FastAPI, session_id: str) -> None:
         else None
     )
     if queue_mgr:
-        state = queue_mgr.delivery_states.get(session_id)
+        if arm_skip:
+            state = queue_mgr._get_or_create_state(session_id)
+            state.stop_notify_skip_count += 1
+        else:
+            state = queue_mgr.delivery_states.get(session_id)
         if state:
             state.stop_notify_sender_id = None
             state.stop_notify_sender_name = None
@@ -981,7 +988,7 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        _invalidate_session_cache(app, session_id)
+        _invalidate_session_cache(app, session_id, arm_skip=True)
 
         return {"status": "invalidated", "session_id": session_id}
 
@@ -1362,7 +1369,7 @@ Provide ONLY the summary, no preamble or questions."""
         if hook_event == "Stop" and session_manager_id:
             queue_mgr = app.state.session_manager.message_queue_manager if app.state.session_manager else None
             if queue_mgr:
-                queue_mgr.mark_session_idle(session_manager_id)
+                queue_mgr.mark_session_idle(session_manager_id, last_output=last_message, from_stop_hook=True)
                 # Restore any saved user input
                 import asyncio
                 asyncio.create_task(queue_mgr._restore_user_input_after_response(session_manager_id))
