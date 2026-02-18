@@ -906,10 +906,11 @@ class TestWatchForIdlePhases:
 
         await mq._watch_for_idle("watch-gone", "target_gone", "watcher_gone", timeout_seconds=5)
 
-        # Should have exited to timeout path (session gone → break → timeout notification)
+        # Should emit distinct "no longer exists" notification, not a generic timeout
         pending = mq.get_pending_messages("watcher_gone")
         assert len(pending) == 1
-        assert "Timeout" in pending[0].text or "still active" in pending[0].text
+        assert "no longer exists" in pending[0].text
+        assert "Timeout" not in pending[0].text
 
     @pytest.mark.asyncio
     async def test_counters_reset_between_iterations(self, mock_session_manager, temp_db_path):

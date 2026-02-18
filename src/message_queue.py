@@ -1197,7 +1197,15 @@ class MessageQueueManager:
                 # Guard: session disappeared mid-loop (killed/cleaned up)
                 if not session:
                     logger.warning(f"Watch {watch_id}: session {target_session_id} no longer exists")
-                    break
+                    notification = (
+                        f"[sm wait] {target_session_id} no longer exists (waited {int(elapsed)}s)"
+                    )
+                    self.queue_message(
+                        target_session_id=watcher_session_id,
+                        text=notification,
+                        delivery_mode="important",
+                    )
+                    return
 
                 # Phase 1: Check in-memory idle state
                 state = self.delivery_states.get(target_session_id)
