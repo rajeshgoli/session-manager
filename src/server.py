@@ -1369,7 +1369,7 @@ Provide ONLY the summary, no preamble or questions."""
         if hook_event == "Stop" and session_manager_id:
             queue_mgr = app.state.session_manager.message_queue_manager if app.state.session_manager else None
             if queue_mgr:
-                queue_mgr.mark_session_idle(session_manager_id, last_output=last_message)
+                queue_mgr.mark_session_idle(session_manager_id, last_output=last_message, from_stop_hook=True)
                 # Restore any saved user input
                 import asyncio
                 asyncio.create_task(queue_mgr._restore_user_input_after_response(session_manager_id))

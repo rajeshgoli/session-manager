@@ -240,7 +240,7 @@ class TestHookEndpoints:
         assert data["hook_event"] == "Stop"
 
         # Verify mark_session_idle was called (last_output=None when transcript not readable)
-        mock_queue_manager.mark_session_idle.assert_called_with("test123", last_output=None)
+        mock_queue_manager.mark_session_idle.assert_called_with("test123", last_output=None, from_stop_hook=True)
 
     def test_claude_notification_hook(self, test_client):
         """POST /hooks/claude with Notification routes correctly."""

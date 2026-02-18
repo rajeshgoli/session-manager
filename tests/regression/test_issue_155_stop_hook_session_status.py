@@ -143,7 +143,7 @@ class TestStopHookSetsSessionStatusIdle:
         )
 
         # Both should be called (last_output=None when transcript not readable)
-        mock_queue.mark_session_idle.assert_called_with("run-155", last_output=None)
+        mock_queue.mark_session_idle.assert_called_with("run-155", last_output=None, from_stop_hook=True)
         mock_session_manager.update_session_status.assert_called_with(
             "run-155", SessionStatus.IDLE
         )
@@ -194,7 +194,7 @@ class TestStopHookSkipsStoppedSession:
         )
 
         # mark_session_idle is called regardless (delivery queue cleanup)
-        mock_queue.mark_session_idle.assert_called_with("stop-155", last_output=None)
+        mock_queue.mark_session_idle.assert_called_with("stop-155", last_output=None, from_stop_hook=True)
 
 
 # ---------------------------------------------------------------------------

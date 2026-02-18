@@ -10,12 +10,19 @@ Stop hook without consuming stop_notify_sender_id.
 """
 
 import pytest
-from unittest.mock import Mock, patch, AsyncMock, MagicMock
+from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime
 
-from src.models import SessionDeliveryState
+from src.models import SessionDeliveryState, Session, SessionStatus
+from src.message_queue import MessageQueueManager
 from src.cli.commands import cmd_clear
 from src.cli.client import SessionManagerClient
+
+
+def noop_create_task(coro):
+    """Silently close coroutine without running it."""
+    coro.close()
+    return MagicMock()
 
 
 # ============================================================================
@@ -44,6 +51,40 @@ def app_with_state():
 
 
 @pytest.fixture
+def mock_session_manager():
+    """Create a mock SessionManager for MessageQueueManager."""
+    manager = MagicMock()
+    manager.get_session = MagicMock(return_value=None)
+    return manager
+
+
+@pytest.fixture
+def message_queue(mock_session_manager, tmp_path):
+    """Create a real MessageQueueManager for testing mark_session_idle()."""
+    mq = MessageQueueManager(
+        session_manager=mock_session_manager,
+        db_path=str(tmp_path / "test_174.db"),
+        config={
+            "sm_send": {
+                "input_poll_interval": 1,
+                "input_stale_timeout": 30,
+                "max_batch_size": 10,
+                "urgent_delay_ms": 100,
+            },
+            "timeouts": {
+                "message_queue": {
+                    "subprocess_timeout_seconds": 1,
+                    "async_send_timeout_seconds": 2,
+                    "watch_poll_interval_seconds": 0.1,
+                }
+            },
+        },
+        notifier=None,
+    )
+    return mq
+
+
+@pytest.fixture
 def mock_client():
     """Create a mock SessionManagerClient."""
     client = Mock(spec=SessionManagerClient)
@@ -61,27 +102,36 @@ def mock_subprocess_run():
 
 
 # ============================================================================
-# Core race scenario: late /clear Stop hook
+# Core race scenario: late /clear Stop hook (AC3)
 # ============================================================================
 
 
-def test_race_scenario_skip_count_absorbs_late_clear_hook(app_with_state):
+def test_race_scenario_skip_count_absorbs_late_clear_hook(app_with_state, message_queue):
     """
     Acceptance criterion 3: full race scenario end-to-end.
 
     1. invalidate_cache(arm_skip=True) → skip_count=1
     2. sm send --urgent arms stop_notify_sender_id
-    3. Late /clear Stop hook fires → absorbed by skip_count, sender_id preserved
-    4. Task B Stop hook fires → notification sent with task B content
+    3. Late /clear Stop hook fires mark_session_idle(from_stop_hook=True) → absorbed
+    4. Task B Stop hook fires mark_session_idle(from_stop_hook=True) → notification sent
     """
     from src.server import _invalidate_session_cache
 
-    app, queue_mgr = app_with_state
+    app, _ = app_with_state
     session_id = "engineer-174"
+
+    # Use the real MessageQueueManager's delivery_states so mark_session_idle works
+    # Wire app's queue_mgr mock to delegate _get_or_create_state to the real MQ
+    app.state.session_manager.message_queue_manager._get_or_create_state = (
+        message_queue._get_or_create_state
+    )
+    app.state.session_manager.message_queue_manager.delivery_states = (
+        message_queue.delivery_states
+    )
 
     # Step 1: sm clear calls invalidate_cache with arm_skip=True
     _invalidate_session_cache(app, session_id, arm_skip=True)
-    state = queue_mgr.delivery_states[session_id]
+    state = message_queue.delivery_states[session_id]
     assert state.stop_notify_skip_count == 1
 
     # Step 2: sm send --urgent arms stop_notify_sender_id (simulated)
@@ -89,22 +139,35 @@ def test_race_scenario_skip_count_absorbs_late_clear_hook(app_with_state):
     state.stop_notify_sender_name = "em-1615"
 
     # Step 3: Late /clear Stop hook fires with stale content
-    # mark_session_idle would be called — simulate skip logic directly
-    assert state.stop_notify_skip_count > 0
-    state.stop_notify_skip_count -= 1
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id, last_output="stale X", from_stop_hook=True)
 
-    # Verify: no notification consumed, sender_id preserved
+        # Verify: _send_stop_notification NOT called
+        mock_notify.assert_not_called()
+
+    # Verify: sender_id preserved, skip_count consumed
     assert state.stop_notify_sender_id == "em-parent"
     assert state.stop_notify_sender_name == "em-1615"
     assert state.stop_notify_skip_count == 0
 
     # Step 4: Task B Stop hook fires — skip_count is 0, notification should fire
-    assert state.stop_notify_skip_count == 0
-    assert state.stop_notify_sender_id == "em-parent"
-    # In real code, mark_session_idle would fire _send_stop_notification here
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id, last_output="task B response Y", from_stop_hook=True)
+
+        # Verify: _send_stop_notification IS called with task B content
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args
+        assert call_kwargs[1]["last_output"] == "task B response Y"
+        assert call_kwargs[1]["sender_session_id"] == "em-parent"
+
+    # Verify: sender_id cleared after notification
+    assert state.stop_notify_sender_id is None
+    assert state.stop_notify_sender_name is None
 
 
-def test_happy_path_skip_count_consumed_before_send(app_with_state):
+def test_happy_path_skip_count_consumed_before_send(app_with_state, message_queue):
     """
     Happy path: /clear Stop hook arrives early (before sm send --urgent).
     skip_count is consumed by the /clear hook, then sm send sets sender_id,
@@ -112,25 +175,42 @@ def test_happy_path_skip_count_consumed_before_send(app_with_state):
     """
     from src.server import _invalidate_session_cache
 
-    app, queue_mgr = app_with_state
+    app, _ = app_with_state
     session_id = "engineer-happy"
+
+    app.state.session_manager.message_queue_manager._get_or_create_state = (
+        message_queue._get_or_create_state
+    )
+    app.state.session_manager.message_queue_manager.delivery_states = (
+        message_queue.delivery_states
+    )
 
     # Step 1: invalidate_cache arms skip
     _invalidate_session_cache(app, session_id, arm_skip=True)
-    state = queue_mgr.delivery_states[session_id]
+    state = message_queue.delivery_states[session_id]
     assert state.stop_notify_skip_count == 1
 
     # Step 2: /clear Stop hook arrives early (no sender_id set yet)
     assert state.stop_notify_sender_id is None
-    state.stop_notify_skip_count -= 1
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id, last_output="stale X", from_stop_hook=True)
+        mock_notify.assert_not_called()
+
     assert state.stop_notify_skip_count == 0
 
     # Step 3: sm send --urgent arms sender_id
     state.stop_notify_sender_id = "em-parent"
+    state.stop_notify_sender_name = "em-1615"
 
     # Step 4: Task B Stop hook fires — skip_count=0, sender set → notification fires
-    assert state.stop_notify_skip_count == 0
-    assert state.stop_notify_sender_id == "em-parent"
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id, last_output="task B response Y", from_stop_hook=True)
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args[1]["last_output"] == "task B response Y"
+
+    assert state.stop_notify_sender_id is None
 
 
 # ============================================================================
@@ -138,25 +218,95 @@ def test_happy_path_skip_count_consumed_before_send(app_with_state):
 # ============================================================================
 
 
-def test_skip_count_consumed_even_without_pending_notification(app_with_state):
+def test_skip_count_consumed_even_without_pending_notification(app_with_state, message_queue):
     """
     When skip_count > 0 but stop_notify_sender_id is None, skip_count is still
     decremented and no spurious notification is sent.
     """
     from src.server import _invalidate_session_cache
 
-    app, queue_mgr = app_with_state
+    app, _ = app_with_state
     session_id = "engineer-no-sender"
 
+    app.state.session_manager.message_queue_manager._get_or_create_state = (
+        message_queue._get_or_create_state
+    )
+    app.state.session_manager.message_queue_manager.delivery_states = (
+        message_queue.delivery_states
+    )
+
     _invalidate_session_cache(app, session_id, arm_skip=True)
-    state = queue_mgr.delivery_states[session_id]
+    state = message_queue.delivery_states[session_id]
     assert state.stop_notify_skip_count == 1
     assert state.stop_notify_sender_id is None
 
-    # Simulate /clear Stop hook when no sender is armed
-    state.stop_notify_skip_count -= 1
+    # /clear Stop hook when no sender is armed
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id, last_output="stale", from_stop_hook=True)
+        mock_notify.assert_not_called()
+
     assert state.stop_notify_skip_count == 0
-    assert state.stop_notify_sender_id is None  # no spurious sender
+    assert state.stop_notify_sender_id is None
+
+
+# ============================================================================
+# from_stop_hook guard: sequential delivery path must NOT consume skip_count
+# ============================================================================
+
+
+def test_sequential_delivery_does_not_consume_skip_count(app_with_state, message_queue):
+    """
+    Blocking issue #2: queue_message() sequential path calls mark_session_idle()
+    without from_stop_hook. That call must NOT consume skip_count, otherwise the
+    real /clear Stop hook will slip through and steal stop_notify_sender_id.
+    """
+    from src.server import _invalidate_session_cache
+
+    app, _ = app_with_state
+    session_id = "engineer-seq-race"
+
+    app.state.session_manager.message_queue_manager._get_or_create_state = (
+        message_queue._get_or_create_state
+    )
+    app.state.session_manager.message_queue_manager.delivery_states = (
+        message_queue.delivery_states
+    )
+
+    # Arm skip via invalidate_cache
+    _invalidate_session_cache(app, session_id, arm_skip=True)
+    state = message_queue.delivery_states[session_id]
+    assert state.stop_notify_skip_count == 1
+
+    # Simulate the sequential delivery path calling mark_session_idle (no from_stop_hook)
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id)  # from_stop_hook=False (default)
+        mock_notify.assert_not_called()
+
+    # skip_count must NOT have been consumed
+    assert state.stop_notify_skip_count == 1
+
+    # Now arm sender and fire real Stop hook
+    state.stop_notify_sender_id = "em-parent"
+    state.stop_notify_sender_name = "em-1615"
+
+    # /clear Stop hook (from_stop_hook=True) — should consume skip
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id, last_output="stale X", from_stop_hook=True)
+        mock_notify.assert_not_called()
+
+    assert state.stop_notify_skip_count == 0
+    assert state.stop_notify_sender_id == "em-parent"  # preserved
+
+    # Task B Stop hook fires notification
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(session_id, last_output="task B response", from_stop_hook=True)
+        mock_notify.assert_called_once()
+
+    assert state.stop_notify_sender_id is None
 
 
 # ============================================================================
@@ -239,28 +389,37 @@ def test_arm_skip_false_does_not_create_state(app_with_state):
 # ============================================================================
 
 
-def test_consecutive_clears_increment_skip_count(app_with_state):
+def test_consecutive_clears_increment_skip_count(app_with_state, message_queue):
     """
     Two consecutive sm clear calls should set skip_count=2, absorbing
     two /clear Stop hooks correctly.
     """
     from src.server import _invalidate_session_cache
 
-    app, queue_mgr = app_with_state
+    app, _ = app_with_state
     session_id = "engineer-double-clear"
 
+    app.state.session_manager.message_queue_manager._get_or_create_state = (
+        message_queue._get_or_create_state
+    )
+    app.state.session_manager.message_queue_manager.delivery_states = (
+        message_queue.delivery_states
+    )
+
     _invalidate_session_cache(app, session_id, arm_skip=True)
     _invalidate_session_cache(app, session_id, arm_skip=True)
 
-    state = queue_mgr.delivery_states[session_id]
+    state = message_queue.delivery_states[session_id]
     assert state.stop_notify_skip_count == 2
 
     # First /clear Stop hook absorbed
-    state.stop_notify_skip_count -= 1
+    with patch("asyncio.create_task", noop_create_task):
+        message_queue.mark_session_idle(session_id, last_output="stale 1", from_stop_hook=True)
     assert state.stop_notify_skip_count == 1
 
     # Second /clear Stop hook absorbed
-    state.stop_notify_skip_count -= 1
+    with patch("asyncio.create_task", noop_create_task):
+        message_queue.mark_session_idle(session_id, last_output="stale 2", from_stop_hook=True)
     assert state.stop_notify_skip_count == 0
 
 
