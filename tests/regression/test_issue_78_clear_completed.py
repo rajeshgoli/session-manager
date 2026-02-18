@@ -26,9 +26,10 @@ def mock_client():
 
 @pytest.fixture
 def mock_subprocess_run():
-    """Mock subprocess.run and _wait_for_claude_prompt to avoid tmux and polling."""
+    """Mock subprocess.run, time.sleep, and _wait_for_claude_prompt to avoid tmux calls."""
     with patch('subprocess.run') as mock_run, \
-         patch('src.cli.commands._wait_for_claude_prompt', return_value=True):
+         patch('src.cli.commands._wait_for_claude_prompt', return_value=True), \
+         patch('time.sleep'):  # Suppress settle-delay sleeps in tests (#178)
         # Default: successful tmux commands
         mock_run.return_value = Mock(
             returncode=0,
@@ -73,8 +74,11 @@ def test_clear_completed_session_wakes_up_first(mock_client, mock_subprocess_run
     # Second call should be Escape (to interrupt)
     assert calls[1][0][0] == ["tmux", "send-keys", "-t", "claude-test-123", "Escape"]
 
-    # Third call should be /clear+Enter atomic (#175)
-    assert calls[2][0][0] == ["tmux", "send-keys", "-t", "claude-test-123", "--", "/clear\r"]
+    # Third call should be /clear text (no \r — two-call approach, #178)
+    assert calls[2][0][0] == ["tmux", "send-keys", "-t", "claude-test-123", "--", "/clear"]
+
+    # Fourth call should be Enter as separate keystroke (#178 settle delay)
+    assert calls[3][0][0] == ["tmux", "send-keys", "-t", "claude-test-123", "Enter"]
 
 
 def test_clear_running_session_no_wake_up(mock_client, mock_subprocess_run):
@@ -109,8 +113,11 @@ def test_clear_running_session_no_wake_up(mock_client, mock_subprocess_run):
     # First call should be Escape (NOT Enter)
     assert calls[0][0][0] == ["tmux", "send-keys", "-t", "claude-test-456", "Escape"]
 
-    # Second call should be /clear+Enter atomic (#175)
-    assert calls[1][0][0] == ["tmux", "send-keys", "-t", "claude-test-456", "--", "/clear\r"]
+    # Second call should be /clear text (two-call approach, #178)
+    assert calls[1][0][0] == ["tmux", "send-keys", "-t", "claude-test-456", "--", "/clear"]
+
+    # Third call should be Enter as separate keystroke (#178)
+    assert calls[2][0][0] == ["tmux", "send-keys", "-t", "claude-test-456", "Enter"]
 
 
 def test_clear_error_session_no_wake_up(mock_client, mock_subprocess_run):
@@ -174,17 +181,21 @@ def test_clear_with_new_prompt_after_completed(mock_client, mock_subprocess_run)
     # Verify sequence includes wake-up, clear, and new prompt
     calls = mock_subprocess_run.call_args_list
 
-    # Should have: Enter (wake), Escape, /clear\r (atomic), new_prompt\r (atomic)
-    assert len(calls) >= 4
+    # Should have: Enter (wake), Escape, /clear text, Enter, new_prompt text, Enter (two-call, #178)
+    assert len(calls) >= 6
 
     # First: wake up
     assert calls[0][0][0][4] == "Enter"
     # Then Escape
     assert calls[1][0][0][4] == "Escape"
-    # Then /clear+Enter atomic (#175)
-    assert calls[2][0][0] == ["tmux", "send-keys", "-t", "claude-test-prompt", "--", "/clear\r"]
-    # Then new prompt+Enter atomic (#175)
-    assert calls[3][0][0] == ["tmux", "send-keys", "-t", "claude-test-prompt", "--", "Start working on new task\r"]
+    # Then /clear text (no \r — two-call approach, #178)
+    assert calls[2][0][0] == ["tmux", "send-keys", "-t", "claude-test-prompt", "--", "/clear"]
+    # Then Enter as separate keystroke (#178)
+    assert calls[3][0][0] == ["tmux", "send-keys", "-t", "claude-test-prompt", "Enter"]
+    # Then new prompt text (no \r — two-call approach, #178)
+    assert calls[4][0][0] == ["tmux", "send-keys", "-t", "claude-test-prompt", "--", "Start working on new task"]
+    # Then Enter as separate keystroke (#178)
+    assert calls[5][0][0] == ["tmux", "send-keys", "-t", "claude-test-prompt", "Enter"]
 
 
 def test_clear_not_authorized(mock_client, mock_subprocess_run):

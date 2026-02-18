@@ -263,6 +263,121 @@ async def test_urgent_delivery_to_abandoned_session_no_wake_up(
 
 
 @pytest.mark.asyncio
+async def test_urgent_delivery_acquires_delivery_lock(
+    message_queue, mock_session_manager
+):
+    """Test that _deliver_urgent acquires the per-session delivery lock (#178)."""
+    session = Session(
+        id="test-lock",
+        name="test-session",
+        working_dir="/tmp/test",
+        tmux_session="claude-test-lock",
+        completion_status=None,
+        friendly_name="lock-agent",
+    )
+    mock_session_manager.get_session.return_value = session
+
+    msg = QueuedMessage(
+        id="msg-lock",
+        target_session_id="test-lock",
+        text="urgent task",
+        delivery_mode="urgent",
+    )
+
+    lock_acquired = []
+
+    async def mock_subprocess(*args, **kwargs):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    # Pre-create the lock and wrap it to track acquisition
+    original_lock = asyncio.Lock()
+    message_queue._delivery_locks["test-lock"] = original_lock
+    original_acquire = original_lock.acquire
+
+    async def tracking_acquire():
+        lock_acquired.append(True)
+        return await original_acquire()
+
+    original_lock.acquire = tracking_acquire
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
+        await message_queue._deliver_urgent("test-lock", msg)
+
+    assert len(lock_acquired) == 1, "Delivery lock must be acquired exactly once"
+
+
+@pytest.mark.asyncio
+async def test_urgent_delivery_lock_prevents_concurrent_try_deliver(
+    message_queue, mock_session_manager
+):
+    """Test that _deliver_urgent and _try_deliver_messages cannot run concurrently (#178)."""
+    session = Session(
+        id="test-mutex",
+        name="test-session",
+        working_dir="/tmp/test",
+        tmux_session="claude-test-mutex",
+        completion_status=None,
+        friendly_name="mutex-agent",
+    )
+    mock_session_manager.get_session.return_value = session
+
+    # Track which function holds the lock
+    concurrent_overlap = []
+    currently_running = []
+
+    original_deliver_direct = mock_session_manager._deliver_direct
+
+    async def slow_deliver_direct(*args, **kwargs):
+        currently_running.append("urgent")
+        await asyncio.sleep(0.05)  # Simulate work
+        if "try_deliver" in currently_running:
+            concurrent_overlap.append(True)
+        currently_running.remove("urgent")
+        return True
+
+    mock_session_manager._deliver_direct = AsyncMock(side_effect=slow_deliver_direct)
+
+    msg = QueuedMessage(
+        id="msg-mutex",
+        target_session_id="test-mutex",
+        text="urgent task",
+        delivery_mode="urgent",
+    )
+
+    async def mock_subprocess(*args, **kwargs):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
+        # Run urgent delivery; while it holds the lock, _try_deliver_messages
+        # must wait (not overlap)
+        urgent_task = asyncio.create_task(
+            message_queue._deliver_urgent("test-mutex", msg)
+        )
+        # Let urgent delivery start and acquire lock
+        await asyncio.sleep(0.01)
+        # Try to trigger sequential delivery concurrently
+        state = message_queue._get_or_create_state("test-mutex")
+        state.is_idle = True
+        try_task = asyncio.create_task(
+            message_queue._try_deliver_messages("test-mutex")
+        )
+        await asyncio.gather(urgent_task, try_task)
+
+    # The two functions must not overlap while holding the lock
+    assert len(concurrent_overlap) == 0, (
+        "_deliver_urgent and _try_deliver_messages ran concurrently — lock not working"
+    )
+
+
+@pytest.mark.asyncio
 async def test_urgent_delivery_marks_message_as_delivered(
     message_queue, mock_session_manager
 ):
@@ -279,22 +394,31 @@ async def test_urgent_delivery_marks_message_as_delivered(
     mock_session_manager.get_session.return_value = session
     mock_session_manager.sessions = {"test-deliver": session}
 
+    async def mock_subprocess(*args, **kwargs):
+        """Return immediately so _deliver_urgent doesn't block on real tmux."""
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
     # Start the message queue (required for background delivery)
     await message_queue.start()
 
     try:
-        # Create and queue a test message
-        msg = message_queue.queue_message(
-            target_session_id="test-deliver",
-            text="urgent task",
-            delivery_mode="urgent",
-        )
+        with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+            # Mock prompt polling so urgent delivery completes immediately (#178 lock)
+            message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
 
-        # Mark session as idle to trigger delivery
-        message_queue.mark_session_idle("test-deliver")
+            # Create and queue a test message
+            msg = message_queue.queue_message(
+                target_session_id="test-deliver",
+                text="urgent task",
+                delivery_mode="urgent",
+            )
 
-        # Wait for delivery to complete
-        await asyncio.sleep(0.3)
+            # Wait for delivery to complete (urgent path: _deliver_urgent acquires lock
+            # then delivers; with mocked subprocess it completes quickly)
+            await asyncio.sleep(0.3)
 
         # Verify message was marked as delivered
         pending = message_queue.get_pending_messages("test-deliver")

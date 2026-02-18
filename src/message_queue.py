@@ -830,51 +830,57 @@ class MessageQueueManager:
                     logger.error(f"Failed to deliver urgent message to {session_id} (codex-app)")
                 return
 
-            # If session is completed, wake it up first (like cmd_clear does)
-            from src.models import CompletionStatus
-            if session.completion_status == CompletionStatus.COMPLETED:
-                logger.info(f"Session {session_id} is completed, sending Enter to wake up")
-                # Send Enter to wake up the completed session
+            # Acquire delivery lock to prevent racing with _try_deliver_messages (#178).
+            # Without this, a Stop hook firing during prompt polling can cause
+            # _try_deliver_messages to deliver sequential messages before the urgent
+            # message, producing out-of-order delivery.
+            lock = self._delivery_locks.setdefault(session_id, asyncio.Lock())
+            async with lock:
+                # If session is completed, wake it up first (like cmd_clear does)
+                from src.models import CompletionStatus
+                if session.completion_status == CompletionStatus.COMPLETED:
+                    logger.info(f"Session {session_id} is completed, sending Enter to wake up")
+                    # Send Enter to wake up the completed session
+                    proc = await asyncio.create_subprocess_exec(
+                        "tmux", "send-keys", "-t", session.tmux_session, "Enter",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
+
+                    # Wait for Claude to show prompt after wake-up (#175)
+                    await self._wait_for_claude_prompt_async(session.tmux_session)
+
+                # Send Escape to interrupt any streaming (async, non-blocking)
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session, "Enter",
+                    "tmux", "send-keys", "-t", session.tmux_session, "Escape",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
 
-                # Wait for Claude to show prompt after wake-up (#175)
+                # Wait for Claude to show idle prompt before sending payload (#175)
                 await self._wait_for_claude_prompt_async(session.tmux_session)
 
-            # Send Escape to interrupt any streaming (async, non-blocking)
-            proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session.tmux_session, "Escape",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
+                # Inject message directly (use async version to avoid blocking)
+                success = await self.session_manager._deliver_direct(session, msg.text)
 
-            # Wait for Claude to show idle prompt before sending payload (#175)
-            await self._wait_for_claude_prompt_async(session.tmux_session)
+                if success:
+                    self._mark_delivered(msg.id)
+                    state = self._get_or_create_state(session_id)
+                    state.is_idle = False
+                    logger.info(f"Urgent message {msg.id} delivered to {session_id}")
 
-            # Inject message directly (use async version to avoid blocking)
-            success = await self.session_manager._deliver_direct(session, msg.text)
+                    # Handle notifications
+                    if msg.notify_on_delivery and msg.sender_session_id:
+                        await self._send_delivery_notification(msg)
 
-            if success:
-                self._mark_delivered(msg.id)
-                state = self._get_or_create_state(session_id)
-                state.is_idle = False
-                logger.info(f"Urgent message {msg.id} delivered to {session_id}")
-
-                # Handle notifications
-                if msg.notify_on_delivery and msg.sender_session_id:
-                    await self._send_delivery_notification(msg)
-
-                # Track sender for stop notification
-                if msg.notify_on_stop and msg.sender_session_id:
-                    state.stop_notify_sender_id = msg.sender_session_id
-                    state.stop_notify_sender_name = msg.sender_name
-            else:
-                logger.error(f"Failed to deliver urgent message to {session_id}")
+                    # Track sender for stop notification
+                    if msg.notify_on_stop and msg.sender_session_id:
+                        state.stop_notify_sender_id = msg.sender_session_id
+                        state.stop_notify_sender_name = msg.sender_name
+                else:
+                    logger.error(f"Failed to deliver urgent message to {session_id}")
 
         except Exception as e:
             logger.error(f"Error delivering urgent message: {e}")

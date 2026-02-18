@@ -354,19 +354,36 @@ class TmuxController:
             return False
 
         try:
-            # Send text + Enter atomically in a single tmux send-keys call (#175)
-            payload = text + "\r"
+            # Send text first
             proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, '--', payload,
+                'tmux', 'send-keys', '-t', session_name, '--', text,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.send_keys_timeout_seconds
             )
-
             if proc.returncode != 0:
-                logger.error(f"Failed to send input: {stderr.decode()}")
+                logger.error(f"Failed to send text: {stderr.decode()}")
+                return False
+
+            # Settle delay to avoid paste detection (#178)
+            # Claude Code (Node.js TUI in raw mode) treats a rapid character burst
+            # as pasted text, in which \r is a literal byte not a submit command.
+            # The gap lets paste mode end before Enter arrives as a separate event.
+            await asyncio.sleep(self.send_keys_settle_seconds)
+
+            # Send Enter as a separate keystroke
+            proc = await asyncio.create_subprocess_exec(
+                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self.send_keys_timeout_seconds
+            )
+            if proc.returncode != 0:
+                logger.error(f"Failed to send Enter: {stderr.decode()}")
                 return False
 
             logger.info(f"Sent input (async) to {session_name}: {text[:50]}...")

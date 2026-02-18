@@ -7,8 +7,9 @@ Bug B: Separate text and Enter subprocess calls with no atomic guarantee.
 Tests verify:
 - Bug A: _wait_for_claude_prompt_async is called before _deliver_direct in urgent delivery
 - Bug A: Prompt polling correctly detects bare '>' prompt
-- Bug B: send_input_async sends text+Enter atomically in a single send-keys call
-- Bug B: send_input_async returns False and logs error when unified call fails
+- Bug B: send_input_async uses TWO separate send-keys calls (text, then Enter) with
+         a settle delay between them to avoid paste-detection regression (#178)
+- Bug B: send_input_async returns False and logs error when EITHER call fails
 """
 
 import pytest
@@ -296,12 +297,13 @@ class TestBugA_PromptPolling:
 # --- Bug B Tests ---
 
 
-class TestBugB_AtomicSendInput:
-    """Verify send_input_async sends text+Enter in a single tmux send-keys call."""
+class TestBugB_TwoCallSendInput:
+    """Verify send_input_async sends text and Enter as two separate tmux send-keys calls
+    with a settle delay between them (fixes paste-detection regression from #176)."""
 
     @pytest.mark.asyncio
-    async def test_single_subprocess_call_with_carriage_return(self, tmux_controller):
-        """send_input_async makes exactly one subprocess call with text + \\r."""
+    async def test_two_subprocess_calls_text_then_enter(self, tmux_controller):
+        """send_input_async makes TWO subprocess calls: text, then a separate Enter."""
         subprocess_calls = []
 
         async def mock_subprocess(*args, **kwargs):
@@ -312,35 +314,115 @@ class TestBugB_AtomicSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
-             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-test", "hello world")
 
         assert result is True
-        # Exactly one subprocess call (no separate Enter call)
-        assert len(subprocess_calls) == 1
+        # Exactly two subprocess calls
+        assert len(subprocess_calls) == 2
 
-        call_args = subprocess_calls[0]
-        assert call_args[0] == "tmux"
-        assert call_args[1] == "send-keys"
-        assert call_args[2] == "-t"
-        assert call_args[3] == "claude-test"
-        assert call_args[4] == "--"
-        assert call_args[5] == "hello world\r"
+        # First call: send text (no \r)
+        text_call = subprocess_calls[0]
+        assert text_call[0] == "tmux"
+        assert text_call[1] == "send-keys"
+        assert text_call[2] == "-t"
+        assert text_call[3] == "claude-test"
+        assert text_call[4] == "--"
+        assert text_call[5] == "hello world"
+        assert "\r" not in text_call[5], "text call must not contain \\r"
+
+        # Second call: send Enter as a separate keystroke
+        enter_call = subprocess_calls[1]
+        assert enter_call[0] == "tmux"
+        assert enter_call[1] == "send-keys"
+        assert enter_call[2] == "-t"
+        assert enter_call[3] == "claude-test"
+        assert enter_call[4] == "Enter"
 
     @pytest.mark.asyncio
-    async def test_returns_false_on_nonzero_returncode(self, tmux_controller):
-        """send_input_async returns False when the unified send-keys call fails."""
+    async def test_settle_delay_called_between_text_and_enter(self, tmux_controller):
+        """asyncio.sleep is called with send_keys_settle_seconds between text and Enter."""
+        call_order = []
+
         async def mock_subprocess(*args, **kwargs):
+            call_order.append(("subprocess", args[4]))  # track the key argument
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.returncode = 0
+            return proc
+
+        sleep_args = []
+
+        async def mock_sleep(seconds):
+            call_order.append(("sleep", seconds))
+            sleep_args.append(seconds)
+
+        with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", side_effect=mock_sleep):
+            await tmux_controller.send_input_async("claude-test", "hello world")
+
+        # Verify settle delay was called with the correct value
+        assert len(sleep_args) == 1
+        assert sleep_args[0] == tmux_controller.send_keys_settle_seconds
+
+        # Verify order: text send → sleep → Enter send
+        text_idx = next(i for i, (t, k) in enumerate(call_order) if t == "subprocess" and k == "--")
+        sleep_idx = next(i for i, (t, _) in enumerate(call_order) if t == "sleep")
+        enter_idx = next(i for i, (t, k) in enumerate(call_order) if t == "subprocess" and k == "Enter")
+        assert text_idx < sleep_idx < enter_idx, (
+            f"Expected text({text_idx}) < sleep({sleep_idx}) < Enter({enter_idx})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_text_call_fails(self, tmux_controller):
+        """send_input_async returns False when the text send-keys call fails."""
+        call_count = 0
+
+        async def mock_subprocess(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
             proc = AsyncMock()
             proc.communicate = AsyncMock(return_value=(b"", b"tmux error"))
-            proc.returncode = 1
+            proc.returncode = 1  # Both calls fail
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
-             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-test", "test message")
 
         assert result is False
+        # Should stop after first failing call
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_enter_call_fails(self, tmux_controller):
+        """send_input_async returns False when the Enter send-keys call fails."""
+        call_count = 0
+
+        async def mock_subprocess(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            proc = AsyncMock()
+            if call_count == 1:
+                # Text call succeeds
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+                proc.returncode = 0
+            else:
+                # Enter call fails
+                proc.communicate = AsyncMock(return_value=(b"", b"tmux error"))
+                proc.returncode = 1
+            return proc
+
+        with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await tmux_controller.send_input_async("claude-test", "test message")
+
+        assert result is False
+        assert call_count == 2  # Both calls were made
 
     @pytest.mark.asyncio
     async def test_returns_false_on_timeout(self, tmux_controller):
@@ -372,3 +454,11 @@ class TestBugB_AtomicSendInput:
         source = inspect.getsource(tmux_controller.send_input_async)
         assert "proc.wait()" not in source
         assert "proc.communicate()" in source
+
+    @pytest.mark.asyncio
+    async def test_no_atomic_carriage_return(self, tmux_controller):
+        """The broken atomic text+\\r approach is NOT used."""
+        import inspect
+        source = inspect.getsource(tmux_controller.send_input_async)
+        assert 'text + "\\r"' not in source
+        assert "payload = text" not in source
