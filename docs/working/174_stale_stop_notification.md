@@ -90,32 +90,115 @@ T=later task B Stop hook fires:
 - FastAPI async task scheduling: the `/clear` Stop hook HTTP request is in-flight concurrently with `invalidate_cache()`; if they race and the Stop hook completes AFTER invalidate, X is re-stored
 - Server load causing delayed HTTP request processing
 
-### Why X appears in the notification (not Y or nothing)
+### Why the original proposed fix is incomplete
 
-After `/clear`, Claude continues to use the **same transcript file** (transcript path does not change). The old file still contains task A's last assistant message. When `read_transcript()` reads that file, it finds X as the latest assistant entry and returns it.
+A previous version of this spec proposed passing `last_output` directly from the Stop hook handler to `_send_stop_notification()` (bypassing the cache read). This is a valid and useful change — the notification content would no longer be stale — but it does **not** fix the race condition.
 
-The existing guard at `server.py:1326-1330` prevents falling back to older entries when the newest assistant entry has no text — but when the newest assistant entry IS task A's message (X), it's returned normally.
+The fundamental problem is that `mark_session_idle()` unconditionally consumes `stop_notify_sender_id` on **any** Stop hook that finds it set (lines 275-283 of `src/message_queue.py`). Passing `last_output` through changes what X the notification contains, but the `/clear` Stop hook still consumes `stop_notify_sender_id` and prevents task B's Stop hook from firing a notification at all.
+
+What's needed is a **correlation mechanism**: a way for `mark_session_idle()` to know that a specific Stop hook invocation should be skipped (because it originated from `/clear`, not from task B completion).
 
 ### Verified against code
 
 - `_send_stop_notification()` at `src/message_queue.py:914-960`: reads `hook_output_store.get(recipient_session_id)` — no guard against stale cache
-- `mark_session_idle()` at `src/message_queue.py:262-286`: unconditionally reads and clears `stop_notify_sender_id`
-- `cmd_clear` at `src/cli/commands.py:1716`: `client.invalidate_cache()` return value is **not checked** — silent failure is possible
-- Stop hook handler at `src/server.py:1349-1365`: updates `last_claude_output` THEN calls `mark_session_idle()` — correct ordering within a single hook, but does not protect against a previous hook's stale content
+- `mark_session_idle()` at `src/message_queue.py:262-286`: unconditionally reads and clears `stop_notify_sender_id` — no guard against spurious Stop hooks
+- `cmd_clear` at `src/cli/commands.py:1716`: `client.invalidate_cache()` is called AFTER the 2s sleep, opening the race window; return value is also **not checked** (silent failure possible)
+- Stop hook handler at `src/server.py:1349-1365`: updates `last_claude_output` THEN calls `mark_session_idle()` — correct ordering within a single hook, but does not protect against a late hook consuming a newer sender_id
 
 ---
 
 ## Proposed Fix
 
-### Core change: pass `last_output` through directly instead of reading from cache
+### Core mechanism: `stop_notify_skip_count`
 
-The fundamental problem is that `_send_stop_notification()` reads from a **shared cache** that can hold stale data. The fix is to pass `last_output` directly from the Stop hook handler to `mark_session_idle()` and then to `_send_stop_notification()`.
+The fix uses a skip counter on `SessionDeliveryState` and reorders the `cmd_clear` operations to arm the counter **before** the `/clear` command reaches Claude.
 
-This eliminates the stale cache read entirely for notification purposes: the notification always uses the output from the **specific Stop hook that triggered it**, not whatever happens to be in the cache.
+**Invariant**: `stop_notify_skip_count` tracks how many Stop hook invocations should be absorbed (skipped) before the next legitimate notification is fired. Each `/clear` command contributes one skip. When `mark_session_idle()` fires with `skip_count > 0`, it decrements the counter, preserves `stop_notify_sender_id` intact, and does NOT send a notification. The next Stop hook (from task B) sees `skip_count = 0` and fires normally.
 
-#### Change 1: `mark_session_idle()` in `src/message_queue.py`
+### Trace: race scenario fixed
 
-Add `last_output: Optional[str] = None` parameter. Pass it through to `_send_stop_notification()`:
+```
+T=0    cmd_clear: invalidate_cache() called FIRST (before tmux ops)
+         → skip_count incremented to 1
+         → last_claude_output[id] cleared
+         → pending_stop_notifications cleared
+         → stop_notify_sender_id = None (was None)
+T=0+   ESC → /clear → Enter sent to Claude via tmux
+T=2s   sleep completes, cmd_clear returns
+T=2s+  caller: sm send --urgent → stop_notify_sender_id = EM
+T=2.5s LATE Stop hook from /clear arrives:
+           last_claude_output[id] = X        (stale content re-stored, but won't be read)
+           mark_session_idle(last_output=X):
+             skip_count = 1 > 0 → decrement to 0
+             preserve stop_notify_sender_id = EM
+             SKIP notification ✓
+T=later task B Stop hook:
+           last_claude_output[id] = Y
+           mark_session_idle(last_output=Y):
+             skip_count = 0, stop_notify_sender_id = EM
+             fire notification with Y ✓
+             stop_notify_sender_id = None
+```
+
+### Trace: happy path still works
+
+```
+T=0    cmd_clear: invalidate_cache() called FIRST
+         → skip_count incremented to 1
+T=0+   ESC → /clear → Enter sent to Claude via tmux
+T=1s   /clear Stop hook arrives (early, before sleep ends):
+           mark_session_idle(last_output=X):
+             skip_count = 1 > 0 → decrement to 0
+             stop_notify_sender_id = None → nothing to preserve
+             SKIP notification (correct, no sender armed yet) ✓
+T=2s   sleep completes, cmd_clear returns
+T=2s+  caller: sm send --urgent → stop_notify_sender_id = EM
+T=later task B Stop hook:
+           mark_session_idle(last_output=Y):
+             skip_count = 0, stop_notify_sender_id = EM → fire notification with Y ✓
+```
+
+### Change 1: `SessionDeliveryState` in `src/models.py`
+
+Add a `stop_notify_skip_count` field:
+
+```python
+@dataclass
+class SessionDeliveryState:
+    """Tracks delivery state for a session."""
+    session_id: str
+    is_idle: bool = False
+    last_idle_at: Optional[datetime] = None
+    saved_user_input: Optional[str] = None
+    pending_user_input: Optional[str] = None
+    pending_input_first_seen: Optional[datetime] = None
+    stop_notify_sender_id: Optional[str] = None
+    stop_notify_sender_name: Optional[str] = None
+    stop_notify_skip_count: int = 0            # ← new: absorb /clear Stop hooks
+```
+
+### Change 2: `_invalidate_session_cache()` in `src/server.py`
+
+Increment `stop_notify_skip_count` when invalidating:
+
+```python
+def _invalidate_session_cache(app: FastAPI, session_id: str) -> None:
+    app.state.last_claude_output.pop(session_id, None)
+    app.state.pending_stop_notifications.discard(session_id)
+    queue_mgr = (app.state.session_manager.message_queue_manager if app.state.session_manager else None)
+    if queue_mgr:
+        state = queue_mgr.delivery_states.get(session_id)
+        if state:
+            state.stop_notify_sender_id = None
+            state.stop_notify_sender_name = None
+            state.stop_notify_skip_count += 1    # ← new: arm one skip for the /clear Stop hook
+```
+
+Note: use `+= 1` (increment) rather than `= 1` (set) to handle two consecutive `sm clear` calls correctly. Two clears increment skip_count to 2; each generates one `/clear` Stop hook; both are absorbed.
+
+### Change 3: `mark_session_idle()` in `src/message_queue.py`
+
+Add `last_output` parameter and skip logic:
 
 ```python
 def mark_session_idle(self, session_id: str, last_output: Optional[str] = None):
@@ -124,6 +207,17 @@ def mark_session_idle(self, session_id: str, last_output: Optional[str] = None):
     state.last_idle_at = datetime.now()
     logger.info(f"Session {session_id} marked idle")
 
+    # Absorb stop hooks generated by /clear commands
+    if state.stop_notify_skip_count > 0:
+        state.stop_notify_skip_count -= 1
+        logger.debug(
+            f"Session {session_id}: skip_count decremented to {state.stop_notify_skip_count}; "
+            f"stop notification deferred (sender_id preserved: {state.stop_notify_sender_id})"
+        )
+        asyncio.create_task(self._try_deliver_messages(session_id))
+        return
+
+    # Send stop notification if a sender is waiting
     if state.stop_notify_sender_id:
         asyncio.create_task(self._send_stop_notification(
             recipient_session_id=session_id,
@@ -137,9 +231,9 @@ def mark_session_idle(self, session_id: str, last_output: Optional[str] = None):
     asyncio.create_task(self._try_deliver_messages(session_id))
 ```
 
-#### Change 2: `_send_stop_notification()` in `src/message_queue.py`
+### Change 4: `_send_stop_notification()` in `src/message_queue.py`
 
-Accept `last_output` as a parameter. Remove the cache read:
+Accept `last_output` as a parameter. Remove the cache read (defense-in-depth: even if the wrong hook were to slip through, it would only carry the content of that specific hook invocation, not stale cached content):
 
 ```python
 async def _send_stop_notification(
@@ -163,7 +257,7 @@ async def _send_stop_notification(
     ...
 ```
 
-#### Change 3: Stop hook handler in `src/server.py`
+### Change 5: Stop hook handler in `src/server.py`
 
 Pass `last_message` to `mark_session_idle()`:
 
@@ -175,35 +269,44 @@ if hook_event == "Stop" and session_manager_id:
         asyncio.create_task(queue_mgr._restore_user_input_after_response(session_manager_id))
 ```
 
-#### Change 4 (defense-in-depth): check `invalidate_cache` return value in `cmd_clear`
+### Change 6: Reorder and fix `cmd_clear` in `src/cli/commands.py`
 
-In `src/cli/commands.py`, `cmd_clear` currently ignores the return value:
-
-```python
-client.invalidate_cache(target_session_id)
-```
-
-Change to log a warning on failure (not a hard error since the tmux clear already happened):
+Move `invalidate_cache()` to BEFORE the tmux operations, so skip_count is armed before the `/clear` Stop hook can fire. Also check the return value:
 
 ```python
+# NEW: invalidate before sending /clear, so skip_count is set before the Stop hook fires
 success, unavailable = client.invalidate_cache(target_session_id)
 if not success:
-    logger.warning(f"Cache invalidation failed for {target_session_id}; stale output may affect next notification")
+    logger.warning(
+        f"Cache invalidation failed for {target_session_id}; "
+        f"stale output may affect next notification"
+    )
+
+# Send ESC + /clear + Enter to Claude (existing tmux operations follow here)
+...
+# sleep(2) is still needed to let Claude process /clear before new prompt is sent
+
+# REMOVED: the existing invalidate_cache() call at the end of cmd_clear is deleted
 ```
 
 ### Why this fix is correct
 
-- **No race**: the notification uses `last_message` read in the **same hook invocation** that triggered it — it cannot be stale from a different invocation
-- **The /clear Stop hook no longer contaminates**: even if the /clear Stop hook arrives late and passes `last_message = X`, that X is only used for the notification IF `stop_notify_sender_id` is set at that exact moment AND the stop hook fires for the new task
-- **Backward compatible**: `hook_output_store` still updated for `/status` and `sm what` — no change to those flows
-- **No schema changes**: no new session state fields, no database changes
+- **Skip_count prevents wrong hook from consuming sender_id**: the `/clear` Stop hook is absorbed by the skip counter; `stop_notify_sender_id` is preserved until task B's Stop hook fires
+- **Pass-through eliminates stale cache as defense-in-depth**: even in unforeseen scenarios, the notification content comes from the specific Stop hook that triggers it, not from a shared cache that may be stale
+- **Both race and happy path work**: traced above — skip_count is armed before `/clear` is sent in both cases
+- **Backward compatible**: `hook_output_store` still updated for `/status` and `sm what`; no protocol changes; no database schema changes
+- **Consecutive clears handled**: `+= 1` means two consecutive clears set skip_count=2, absorbing two `/clear` Stop hooks correctly
+
+### Known limitation: orphaned skip_count
+
+If `sm clear` is called but Claude never processes the `/clear` command (e.g., process crash), the `/clear` Stop hook never fires and skip_count is never decremented. The next legitimate task B Stop hook would be incorrectly skipped. This is a rare edge case (agent crash during clear), and the user can recover by calling `sm clear` again (which calls `invalidate_cache()` and increments skip_count, pairing with the eventual task B Stop hook in the new session). This limitation is documented here and does not need to block this fix.
 
 ### What about the deferred notification case?
 
 When the transcript isn't flushed at Stop hook time (`last_message = None`):
 - `mark_session_idle(session_id, last_output=None)` is called
-- `_send_stop_notification()` receives `last_output=None` → sends generic "(Stop hook fired)" message
-- `stop_notify_sender_id` is cleared
+- If skip_count > 0: absorb the skip as normal (don't send)
+- If skip_count = 0 and sender_id set: `_send_stop_notification()` receives `last_output=None` → sends generic "(Stop hook fired)" message
 
 The deferred `idle_prompt` path (`server.py:1570-1595`) does NOT call `mark_session_idle()`, so it does not re-send the stop notification. The EM receives a generic message instead of the full content.
 
@@ -214,16 +317,30 @@ This is acceptable: the deferred case is already a degraded path (transcript not
 ## Acceptance Criteria
 
 1. **Repro scenario fixed**: After `sm clear` + `sm send --urgent`, the stop notification sent to the EM contains the agent's response to the new task (or the generic "Stop hook fired" message), NOT a message from before the clear
+
 2. **Regression for #167 still passes**: existing tests in `tests/regression/test_issue_167_clear_stale_stop_notification.py` continue to pass
-3. **New regression test**: A new test in `tests/regression/` simulates the race: Stop hook fires with stale content AFTER `sm send --urgent` has set `stop_notify_sender_id`. The notification should contain the stale content (since it came from that same hook) — but crucially, a SUBSEQUENT hook with new content should also work correctly
+
+3. **New regression test**: A new test in `tests/regression/` simulates the exact race scenario end-to-end:
+   - Call `_invalidate_session_cache(app, session_id)` → verifies skip_count becomes 1
+   - Arm `stop_notify_sender_id = "em-parent"` (simulating `sm send --urgent`)
+   - Call `mark_session_idle(session_id, last_output="stale X")` (simulating the late `/clear` Stop hook) → verifies:
+     - No notification was sent
+     - `stop_notify_sender_id` is still `"em-parent"` (not consumed)
+     - skip_count is now 0
+   - Call `mark_session_idle(session_id, last_output="task B response Y")` (simulating task B Stop hook) → verifies:
+     - Notification IS sent with `"task B response Y"`
+     - `stop_notify_sender_id` is cleared
+
+4. **skip_count does not affect sessions with no pending notification**: When `mark_session_idle()` fires with skip_count > 0 but `stop_notify_sender_id = None`, skip_count is still decremented (the skip slot is consumed), and no spurious notification is sent
 
 ---
 
 ## Ticket Classification
 
-**Single ticket.** The fix touches 3 files with targeted, well-understood changes:
-- `src/message_queue.py`: add parameter to `mark_session_idle()` and `_send_stop_notification()`
-- `src/server.py`: pass `last_message` to `mark_session_idle()`
-- `src/cli/commands.py`: check `invalidate_cache()` return value
+**Single ticket.** The fix touches 4 files with targeted, well-understood changes:
+- `src/models.py`: add `stop_notify_skip_count: int = 0` to `SessionDeliveryState`
+- `src/message_queue.py`: add `last_output` param to `mark_session_idle()` and `_send_stop_notification()`; add skip_count decrement logic
+- `src/server.py`: increment `stop_notify_skip_count` in `_invalidate_session_cache()`; pass `last_message` to `mark_session_idle()`
+- `src/cli/commands.py`: move `invalidate_cache()` call before tmux operations; check return value
 
 One agent can complete this without context compaction.
