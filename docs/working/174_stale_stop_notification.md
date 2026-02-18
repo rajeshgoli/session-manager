@@ -210,15 +210,17 @@ def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = Fa
 
 **Why `arm_skip` is conditional on the endpoint, not on the session type:**
 Two server endpoints both call `_invalidate_session_cache()`:
-- `/sessions/{id}/invalidate-cache` (tmux `cmd_clear` path, `src/server.py:984`): this is the CLI-driven clear for Claude Code sessions — **pass `arm_skip=True`**
-- `/sessions/{id}/clear` (codex-app path, `src/server.py:965`): codex-app clear starts a new agent thread but does NOT emit a dedicated `/clear` Stop hook; the next `mark_session_idle()` call comes from legitimate task completion — **keep default `arm_skip=False`**
+- `/sessions/{id}/invalidate-cache` (`src/server.py:984`): called by the tmux `cmd_clear` CLI path — **pass `arm_skip=True`**
+- `/sessions/{id}/clear` (`src/server.py:965`): a generic endpoint that routes internally by provider in `session_manager.clear_session()`; in current CLI usage, the codex-app path calls this endpoint. Codex-app clear starts a new agent thread and does NOT emit a dedicated `/clear` Stop hook; the next `mark_session_idle()` call comes from legitimate task completion — **keep default `arm_skip=False`**
+
+The arm/no-arm split is therefore a property of which endpoint is called, not of the session provider type. If a future provider uses `/invalidate-cache`, it would correctly receive skip arming.
 
 Endpoint-level change in `src/server.py`:
 ```python
-# /invalidate-cache endpoint (tmux path only):
+# /invalidate-cache endpoint (tmux CLI path — emits a /clear Stop hook):
 _invalidate_session_cache(app, session_id, arm_skip=True)   # ← new
 
-# /clear endpoint (codex-app path, unchanged):
+# /clear endpoint (generic; in current usage, codex-app — does NOT emit a /clear Stop hook):
 _invalidate_session_cache(app, session_id)                  # arm_skip=False (default)
 ```
 
@@ -330,7 +332,7 @@ if not success:
 
 - **Skip_count prevents wrong hook from consuming sender_id**: the `/clear` Stop hook is absorbed by the skip counter; `stop_notify_sender_id` is preserved until task B's Stop hook fires
 - **State-missing gap closed**: `_get_or_create_state()` always creates state before arming, so the skip is guaranteed even for sessions the queue manager has never seen
-- **Codex-app not regressed**: `arm_skip=True` is only passed by the `/invalidate-cache` endpoint (tmux path); the `/clear` endpoint (codex-app) keeps `False`, so skip_count is never armed for flows that don't emit a `/clear` Stop hook
+- **Non-tmux flows not regressed**: `arm_skip=True` is only passed by the `/invalidate-cache` endpoint (tmux CLI path); the `/clear` endpoint (used by codex-app in current CLI usage) keeps `False`, so skip_count is never armed for flows that don't emit a `/clear` Stop hook
 - **Pass-through eliminates stale cache as defense-in-depth**: the notification content comes from the specific Stop hook invocation that triggered it, not a shared cache
 - **Both race and happy path work**: traced above — skip_count is armed before `/clear` is sent in both cases
 - **Backward compatible**: `hook_output_store` still updated for `/status` and `sm what`; no protocol changes; no database schema changes
@@ -366,7 +368,7 @@ This is acceptable: the deferred case is already a degraded path (transcript not
 2. **Regression for #167 still passes**: existing tests in `tests/regression/test_issue_167_clear_stale_stop_notification.py` continue to pass
 
 3. **New regression test**: A new test in `tests/regression/` simulates the exact race scenario end-to-end:
-   - Call `_invalidate_session_cache(app, session_id)` → verifies skip_count becomes 1
+   - Call `_invalidate_session_cache(app, session_id, arm_skip=True)` → verifies skip_count becomes 1
    - Arm `stop_notify_sender_id = "em-parent"` (simulating `sm send --urgent`)
    - Call `mark_session_idle(session_id, last_output="stale X")` (simulating the late `/clear` Stop hook) → verifies:
      - No notification was sent
@@ -378,10 +380,10 @@ This is acceptable: the deferred case is already a degraded path (transcript not
 
 4. **skip_count does not affect sessions with no pending notification**: When `mark_session_idle()` fires with skip_count > 0 but `stop_notify_sender_id = None`, skip_count is still decremented (the skip slot is consumed), and no spurious notification is sent
 
-5. **`arm_skip` path isolation** (regression for codex-app safety):
-   - Calling `_invalidate_session_cache(app, session_id, arm_skip=False)` (the codex-app `/clear` path) does NOT increment `stop_notify_skip_count`
-   - Calling `_invalidate_session_cache(app, session_id, arm_skip=True)` (the tmux `/invalidate-cache` path) DOES increment `stop_notify_skip_count` and creates delivery state if absent
-   - A subsequent `mark_session_idle()` call after a codex-app clear fires the stop notification normally (skip_count = 0)
+5. **`arm_skip` path isolation** (regression for non-tmux flow safety):
+   - Calling `_invalidate_session_cache(app, session_id, arm_skip=False)` (e.g., the `/clear` endpoint used by codex-app) does NOT increment `stop_notify_skip_count`
+   - Calling `_invalidate_session_cache(app, session_id, arm_skip=True)` (the `/invalidate-cache` endpoint, tmux CLI path) DOES increment `stop_notify_skip_count` and creates delivery state if absent
+   - A subsequent `mark_session_idle()` after a `/clear`-endpoint clear fires the stop notification normally (skip_count = 0, not suppressed)
 
 ---
 
