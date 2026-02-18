@@ -8,6 +8,12 @@ from .client import SessionManagerClient
 from .formatting import format_session_line, format_relative_time, format_status_list
 from ..lock_manager import LockManager
 
+# Settle delay between tmux send-keys calls to avoid paste detection.
+# Mirrors TmuxController.send_keys_settle_seconds (default 0.3s).
+# Claude Code (Node.js TUI in raw mode) treats a rapid character burst as pasted
+# text; Enter must arrive as a separate event after the paste mode ends.
+_SEND_KEYS_SETTLE_SECONDS = 0.3
+
 
 def parse_duration(duration_str: str) -> int:
     """
@@ -1749,7 +1755,7 @@ def cmd_clear(
             capture_output=True,
             text=True,
         )
-        time.sleep(0.3)  # Settle delay: allow paste mode to end before Enter arrives
+        time.sleep(_SEND_KEYS_SETTLE_SECONDS)  # Allow paste mode to end before Enter arrives
         subprocess.run(
             ["tmux", "send-keys", "-t", tmux_session, "Enter"],
             check=True,
@@ -1768,7 +1774,7 @@ def cmd_clear(
                 capture_output=True,
                 text=True,
             )
-            time.sleep(0.3)  # Settle delay (#178)
+            time.sleep(_SEND_KEYS_SETTLE_SECONDS)  # Allow paste mode to end before Enter arrives
             subprocess.run(
                 ["tmux", "send-keys", "-t", tmux_session, "Enter"],
                 check=True,

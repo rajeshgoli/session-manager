@@ -306,7 +306,10 @@ class TestRegression1_CmdClearTwoCall:
 
         assert result == 0
         assert len(sleep_calls) >= 1
-        assert sleep_calls[0] == 0.3, f"Expected settle delay 0.3s, got {sleep_calls[0]}"
+        from src.cli.commands import _SEND_KEYS_SETTLE_SECONDS
+        assert sleep_calls[0] == _SEND_KEYS_SETTLE_SECONDS, (
+            f"Expected settle delay {_SEND_KEYS_SETTLE_SECONDS}s, got {sleep_calls[0]}"
+        )
 
 
 # ---------------------------------------------------------------------------
