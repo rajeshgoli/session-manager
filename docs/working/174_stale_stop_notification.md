@@ -187,22 +187,42 @@ class SessionDeliveryState:
 
 ### Change 2: `_invalidate_session_cache()` in `src/server.py`
 
-Increment `stop_notify_skip_count` when invalidating:
+Add `arm_skip: bool = False` parameter. When `True`, unconditionally create-or-get the delivery state and increment `stop_notify_skip_count`. When `False` (default), behavior is unchanged — no skip is armed.
 
 ```python
-def _invalidate_session_cache(app: FastAPI, session_id: str) -> None:
+def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = False) -> None:
     app.state.last_claude_output.pop(session_id, None)
     app.state.pending_stop_notifications.discard(session_id)
     queue_mgr = (app.state.session_manager.message_queue_manager if app.state.session_manager else None)
     if queue_mgr:
-        state = queue_mgr.delivery_states.get(session_id)
+        if arm_skip:
+            # Always create state if absent (do not skip the arm just because
+            # the session has no prior queue-manager state).
+            state = queue_mgr._get_or_create_state(session_id)  # ← fixes state-missing gap
+            state.stop_notify_skip_count += 1    # ← arm one skip for the /clear Stop hook
+        else:
+            # Non-tmux paths (codex-app): only clear existing state; do NOT arm skip.
+            state = queue_mgr.delivery_states.get(session_id)
         if state:
             state.stop_notify_sender_id = None
             state.stop_notify_sender_name = None
-            state.stop_notify_skip_count += 1    # ← new: arm one skip for the /clear Stop hook
 ```
 
-Note: use `+= 1` (increment) rather than `= 1` (set) to handle two consecutive `sm clear` calls correctly. Two clears increment skip_count to 2; each generates one `/clear` Stop hook; both are absorbed.
+**Why `arm_skip` is conditional on the endpoint, not on the session type:**
+Two server endpoints both call `_invalidate_session_cache()`:
+- `/sessions/{id}/invalidate-cache` (tmux `cmd_clear` path, `src/server.py:984`): this is the CLI-driven clear for Claude Code sessions — **pass `arm_skip=True`**
+- `/sessions/{id}/clear` (codex-app path, `src/server.py:965`): codex-app clear starts a new agent thread but does NOT emit a dedicated `/clear` Stop hook; the next `mark_session_idle()` call comes from legitimate task completion — **keep default `arm_skip=False`**
+
+Endpoint-level change in `src/server.py`:
+```python
+# /invalidate-cache endpoint (tmux path only):
+_invalidate_session_cache(app, session_id, arm_skip=True)   # ← new
+
+# /clear endpoint (codex-app path, unchanged):
+_invalidate_session_cache(app, session_id)                  # arm_skip=False (default)
+```
+
+Note: use `+= 1` (increment) rather than `= 1` (set) so that two consecutive `sm clear` calls correctly arm skip_count to 2, absorbing two `/clear` Stop hooks.
 
 ### Change 3: `mark_session_idle()` in `src/message_queue.py`
 
@@ -309,14 +329,22 @@ if not success:
 ### Why this fix is correct
 
 - **Skip_count prevents wrong hook from consuming sender_id**: the `/clear` Stop hook is absorbed by the skip counter; `stop_notify_sender_id` is preserved until task B's Stop hook fires
-- **Pass-through eliminates stale cache as defense-in-depth**: even in unforeseen scenarios, the notification content comes from the specific Stop hook that triggers it, not from a shared cache that may be stale
+- **State-missing gap closed**: `_get_or_create_state()` always creates state before arming, so the skip is guaranteed even for sessions the queue manager has never seen
+- **Codex-app not regressed**: `arm_skip=True` is only passed by the `/invalidate-cache` endpoint (tmux path); the `/clear` endpoint (codex-app) keeps `False`, so skip_count is never armed for flows that don't emit a `/clear` Stop hook
+- **Pass-through eliminates stale cache as defense-in-depth**: the notification content comes from the specific Stop hook invocation that triggered it, not a shared cache
 - **Both race and happy path work**: traced above — skip_count is armed before `/clear` is sent in both cases
 - **Backward compatible**: `hook_output_store` still updated for `/status` and `sm what`; no protocol changes; no database schema changes
-- **Consecutive clears handled**: `+= 1` means two consecutive clears set skip_count=2, absorbing two `/clear` Stop hooks correctly
+- **Consecutive clears handled**: `+= 1` means two consecutive tmux clears set skip_count=2, absorbing two `/clear` Stop hooks correctly
 
 ### Known limitation: orphaned skip_count
 
-If `sm clear` is called but Claude never processes the `/clear` command (e.g., process crash), the `/clear` Stop hook never fires and skip_count is never decremented. The next legitimate task B Stop hook would be incorrectly skipped. This is a rare edge case (agent crash during clear), and the user can recover by calling `sm clear` again (which calls `invalidate_cache()` and increments skip_count, pairing with the eventual task B Stop hook in the new session). This limitation is documented here and does not need to block this fix.
+If `sm clear` is called but Claude never processes the `/clear` command (e.g., process crash before the Stop hook fires), skip_count is incremented but never decremented. The next legitimate task B Stop hook would be incorrectly skipped.
+
+With additive (`+= 1`) semantics, calling `sm clear` again does NOT help: it increments skip_count further rather than draining the orphan, creating a deeper deficit.
+
+Since delivery state is entirely in-memory, a **session manager server restart** is the only guaranteed remediation — all `SessionDeliveryState` instances are destroyed, and skip_count returns to 0 on next access. Alternatively, terminating and recreating the agent session produces a new `session_id` and therefore a fresh delivery state.
+
+This edge case (Claude crash mid-clear) is rare. It does not need to block this fix.
 
 ### What about the deferred notification case?
 
