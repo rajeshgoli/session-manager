@@ -87,6 +87,7 @@ class SessionResponse(BaseModel):
     current_task: Optional[str] = None
     git_remote_url: Optional[str] = None
     parent_session_id: Optional[str] = None
+    last_handoff_path: Optional[str] = None  # Last executed handoff doc path (#203)
 
 
 class SendInputRequest(BaseModel):
@@ -756,6 +757,7 @@ def create_app(
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
             parent_session_id=session.parent_session_id,
+            last_handoff_path=session.last_handoff_path,
         )
 
     @app.post("/sessions/create")
@@ -812,6 +814,7 @@ def create_app(
                     current_task=s.current_task,
                     git_remote_url=s.git_remote_url,
                     parent_session_id=s.parent_session_id,
+                    last_handoff_path=s.last_handoff_path,
                 )
                 for s in sessions
             ]
@@ -841,6 +844,7 @@ def create_app(
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
             parent_session_id=session.parent_session_id,
+            last_handoff_path=session.last_handoff_path,
         )
 
     @app.patch("/sessions/{session_id}", response_model=SessionResponse)
@@ -886,6 +890,7 @@ def create_app(
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
             parent_session_id=session.parent_session_id,
+            last_handoff_path=session.last_handoff_path,
         )
 
     @app.put("/sessions/{session_id}/task")
@@ -2175,5 +2180,102 @@ Or continue working if not done yet."""
             logger.debug(f"hook_tool_use: parse={parse_time*1000:.1f}ms total={elapsed*1000:.1f}ms tool={tool_name}")
 
         return {"status": "logged"}
+
+    @app.post("/hooks/context-usage")
+    async def hook_context_usage(request: Request):
+        """
+        Receive context usage events from Claude Code status line and hook scripts (#203).
+
+        Three event types:
+        - compaction event (from PreCompact hook): resets one-shot flags, notifies parent
+        - context_reset event (from SessionStart clear hook): resets one-shot flags
+        - context usage update (from status line script): stores tokens_used, sends
+          warning at warning_percentage and critical at critical_percentage (one-shot per cycle)
+        """
+        data = await request.json()
+        session_id = data.get("session_id")
+
+        session = app.state.session_manager.get_session(session_id) if session_id and app.state.session_manager else None
+        if not session:
+            return {"status": "unknown_session"}
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+
+        # Handle compaction event (from PreCompact hook)
+        if data.get("event") == "compaction":
+            trigger = data.get("trigger", "unknown")
+            logger.warning(
+                f"Compaction fired for {session.friendly_name or session_id} (trigger={trigger})"
+            )
+            # Reset one-shot flags — PreCompact fires before context is refreshed,
+            # so this is the reliable reset point for the next accumulation cycle.
+            # Cannot rely on used_pct < warning_pct because post-compaction context
+            # may land above the warning threshold (documented range: 55K–110K tokens,
+            # warning at 50% = 100K — overlap is possible).
+            session._context_warning_sent = False
+            session._context_critical_sent = False
+            # Notify parent session / user
+            if session.parent_session_id and queue_mgr:
+                msg = (
+                    f"[sm context] Compaction fired for {session.friendly_name or session_id}. "
+                    "Context was lost."
+                )
+                queue_mgr.queue_message(
+                    target_session_id=session.parent_session_id,
+                    text=msg,
+                    delivery_mode="sequential",
+                )
+            return {"status": "compaction_logged"}
+
+        # Handle manual /clear event (from SessionStart clear hook)
+        if data.get("event") == "context_reset":
+            # Re-arm one-shot flags so warnings fire correctly in the new cycle.
+            # Covers: TUI /clear and sm clear CLI (both trigger SessionStart source=clear).
+            session._context_warning_sent = False
+            session._context_critical_sent = False
+            return {"status": "flags_reset"}
+
+        # Handle context usage update (from status line script)
+        used_pct = data.get("used_percentage")
+        if used_pct is None:
+            # used_percentage is null before first API call — ignore
+            return {"status": "ok", "used_percentage": None}
+
+        session.tokens_used = data.get("total_input_tokens", 0)
+
+        config = (app.state.config or {}).get("context_monitor", {})
+        warning_pct = config.get("warning_percentage", 50)
+        critical_pct = config.get("critical_percentage", 65)
+
+        if used_pct >= critical_pct:
+            if not session._context_critical_sent:
+                session._context_critical_sent = True
+                if queue_mgr:
+                    msg = (
+                        f"[sm context] Context at {used_pct}% — critically high. "
+                        "Write your handoff doc NOW and run `sm handoff <path>`. "
+                        "Compaction is imminent."
+                    )
+                    queue_mgr.queue_message(
+                        target_session_id=session.id,
+                        text=msg,
+                        delivery_mode="urgent",
+                    )
+        elif used_pct >= warning_pct:
+            if not session._context_warning_sent:
+                session._context_warning_sent = True
+                if queue_mgr:
+                    total = data.get("total_input_tokens", 0)
+                    msg = (
+                        f"[sm context] Context at {used_pct}% ({total:,} tokens). "
+                        "Consider writing a handoff doc and running `sm handoff <path>`."
+                    )
+                    queue_mgr.queue_message(
+                        target_session_id=session.id,
+                        text=msg,
+                        delivery_mode="sequential",
+                    )
+
+        return {"status": "ok", "used_percentage": used_pct}
 
     return app

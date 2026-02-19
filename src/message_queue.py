@@ -1286,6 +1286,13 @@ class MessageQueueManager:
                 # 7. Mark session as active (new context is now processing)
                 self.mark_session_active(session_id)
 
+                # 8. Persist handoff path for post-compaction recovery (#203)
+                # and re-arm context monitor flags for the new cycle.
+                session.last_handoff_path = file_path
+                self.session_manager._save_state()
+                session._context_warning_sent = False
+                session._context_critical_sent = False
+
                 logger.info(f"Handoff complete for {session_id}")
 
             except Exception as e:

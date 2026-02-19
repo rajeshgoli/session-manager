@@ -375,6 +375,31 @@ class TestExecuteHandoff:
         # Lock should have been acquired (True) during execution
         assert any(lock_was_locked_during)
 
+    @pytest.mark.asyncio
+    async def test_context_flags_reset_on_success(self, message_queue, handoff_doc):
+        """_execute_handoff resets _context_warning_sent and _context_critical_sent flags."""
+        session = message_queue.session_manager.sessions["abc12345"]
+        session._context_warning_sent = True
+        session._context_critical_sent = True
+
+        state = message_queue._get_or_create_state("abc12345")
+        state.is_idle = False
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+            mock_proc = AsyncMock()
+            mock_proc.communicate.return_value = (b"", b"")
+            mock_exec.return_value = mock_proc
+
+            with patch.object(message_queue, "_wait_for_claude_prompt_async", new_callable=AsyncMock):
+                with patch("asyncio.create_task") as mock_task:
+                    mock_task.side_effect = lambda coro: (coro.close(), MagicMock())[1]
+                    with patch("asyncio.wait_for", new_callable=AsyncMock) as mock_wait:
+                        mock_wait.return_value = (b"", b"")
+                        await message_queue._execute_handoff("abc12345", handoff_doc)
+
+        assert session._context_warning_sent is False
+        assert session._context_critical_sent is False
+
 
 # ---------------------------------------------------------------------------
 # Test 5: Model field
