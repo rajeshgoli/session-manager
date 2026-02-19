@@ -746,7 +746,7 @@ def cmd_dispatch(
         1: Template/param error or send failed
         2: Session manager unavailable
     """
-    from .dispatch import load_template, expand_template, get_role_params, DispatchError
+    from .dispatch import load_template, expand_template, get_role_params, get_auto_remind_config, DispatchError
 
     try:
         config = load_template(os.getcwd())
@@ -777,9 +777,14 @@ def cmd_dispatch(
         print(expanded)
         return 0
 
+    # Auto-arm periodic remind on every dispatch (#225-A).
+    soft_threshold, hard_threshold = get_auto_remind_config(os.getcwd())
+
     return cmd_send(
         client, agent_id, expanded, delivery_mode,
         notify_on_stop=notify_on_stop,
+        remind_soft_threshold=soft_threshold,
+        remind_hard_threshold=hard_threshold,
     )
 
 
@@ -858,6 +863,8 @@ def cmd_send(
     wait_seconds: Optional[int] = None,
     notify_on_stop: bool = True,
     remind_seconds: Optional[int] = None,
+    remind_soft_threshold: Optional[int] = None,
+    remind_hard_threshold: Optional[int] = None,
 ) -> int:
     """
     Send input text to a session.
@@ -873,16 +880,20 @@ def cmd_send(
         wait_seconds: Notify sender N seconds after delivery if recipient is idle (alias for notify_after_seconds)
         notify_on_stop: Notify sender when receiver's Stop hook fires (default True)
         remind_seconds: Start periodic remind registration with this soft threshold (#188)
+        remind_soft_threshold: Explicit soft threshold in seconds; overrides remind_seconds (#225-A)
+        remind_hard_threshold: Explicit hard threshold in seconds (#225-A)
 
     Exit codes:
         0: Success
         1: Session not found or send failed
         2: Session manager unavailable
     """
-    # Compute remind thresholds if requested (#188)
-    # hard_threshold is intentionally None — server computes it from config.remind.hard_gap_seconds
-    remind_soft_threshold = remind_seconds
-    remind_hard_threshold = None
+    # Resolve remind thresholds.
+    # Explicit remind_soft_threshold/remind_hard_threshold (from sm dispatch) take
+    # precedence over the legacy remind_seconds (from sm send --remind).
+    if remind_soft_threshold is None and remind_seconds is not None:
+        remind_soft_threshold = remind_seconds
+        # remind_hard_threshold stays None: server computes from config.remind.hard_gap_seconds
 
     # Resolve identifier to session ID and get session details
     session_id, session = resolve_session_id(client, identifier)
@@ -944,8 +955,9 @@ def cmd_send(
         extras.append(f"wait={effective_notify_after}s")
     if notify_on_stop:
         extras.append("notify-on-stop")
-    if remind_seconds:
-        extras.append(f"remind={remind_seconds}s")
+    if remind_soft_threshold:
+        extras.append(f"remind={remind_soft_threshold}s soft"
+                      + (f"/{remind_hard_threshold}s hard" if remind_hard_threshold else ""))
     if extras:
         print(f"  Options: {', '.join(extras)}")
 

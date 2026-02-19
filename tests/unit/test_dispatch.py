@@ -10,8 +10,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.cli.dispatch import (
+    DEFAULT_DISPATCH_HARD_THRESHOLD,
+    DEFAULT_DISPATCH_SOFT_THRESHOLD,
     DispatchError,
     expand_template,
+    get_auto_remind_config,
     get_role_params,
     load_template,
     parse_dispatch_args,
@@ -477,3 +480,244 @@ class TestParseDispatchArgs:
             ["agent1", "--role", "engineer", "--no-notify-on-stop", "--issue", "1", "--spec", "s"]
         )
         assert notify is False
+
+
+# ---------------------------------------------------------------------------
+# 14. Auto-remind integration (sm#225-A)
+# ---------------------------------------------------------------------------
+
+class TestAutoRemindConfig:
+    def test_defaults_when_no_config_file(self, tmp_path):
+        """Falls back to module-level defaults when no config.yaml exists."""
+        empty_dir = tmp_path / "no_config"
+        empty_dir.mkdir()
+        soft, hard = get_auto_remind_config(str(empty_dir))
+        assert soft == DEFAULT_DISPATCH_SOFT_THRESHOLD  # 210
+        assert hard == DEFAULT_DISPATCH_HARD_THRESHOLD  # 420
+
+    def test_reads_thresholds_from_config_yaml(self, tmp_path):
+        """Custom thresholds from config.yaml dispatch.auto_remind are returned."""
+        import yaml
+        config = {
+            "dispatch": {
+                "auto_remind": {
+                    "soft_threshold_seconds": 300,
+                    "hard_threshold_seconds": 600,
+                }
+            }
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+        soft, hard = get_auto_remind_config(str(tmp_path))
+        assert soft == 300
+        assert hard == 600
+
+    def test_partial_config_falls_back_for_missing_keys(self, tmp_path):
+        """Partial dispatch.auto_remind uses defaults for absent keys."""
+        import yaml
+        config = {
+            "dispatch": {
+                "auto_remind": {
+                    "soft_threshold_seconds": 120,
+                    # hard_threshold_seconds absent → use default
+                }
+            }
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+        soft, hard = get_auto_remind_config(str(tmp_path))
+        assert soft == 120
+        assert hard == DEFAULT_DISPATCH_HARD_THRESHOLD
+
+    def test_walks_up_to_find_config(self, tmp_path):
+        """Config.yaml in a parent directory is discovered by walking up."""
+        import yaml
+        config = {
+            "dispatch": {
+                "auto_remind": {
+                    "soft_threshold_seconds": 180,
+                    "hard_threshold_seconds": 360,
+                }
+            }
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+        subdir = tmp_path / "src" / "cli"
+        subdir.mkdir(parents=True)
+        soft, hard = get_auto_remind_config(str(subdir))
+        assert soft == 180
+        assert hard == 360
+
+    def test_missing_dispatch_section_uses_defaults(self, tmp_path):
+        """config.yaml without dispatch section uses defaults."""
+        import yaml
+        config = {"remind": {"soft_threshold_seconds": 180}}
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+        soft, hard = get_auto_remind_config(str(tmp_path))
+        assert soft == DEFAULT_DISPATCH_SOFT_THRESHOLD
+        assert hard == DEFAULT_DISPATCH_HARD_THRESHOLD
+
+    def test_invalid_yaml_uses_defaults(self, tmp_path):
+        """Malformed config.yaml uses defaults without crashing."""
+        (tmp_path / "config.yaml").write_text("{{bad: yaml: [}")
+        soft, hard = get_auto_remind_config(str(tmp_path))
+        assert soft == DEFAULT_DISPATCH_SOFT_THRESHOLD
+        assert hard == DEFAULT_DISPATCH_HARD_THRESHOLD
+
+
+class TestAutoRemindDispatch:
+    """Tests that cmd_dispatch passes auto-remind thresholds to cmd_send."""
+
+    def _make_client(self):
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = {
+            "id": "agent1",
+            "friendly_name": "eng",
+            "status": "running",
+        }
+        mock_client.session_id = "em-abc"
+        mock_client.send_input.return_value = (True, False)
+        return mock_client
+
+    def test_dispatch_passes_default_remind_thresholds(self, sample_config):
+        """cmd_dispatch passes default soft/hard thresholds to send_input."""
+        mock_client = self._make_client()
+
+        with patch("src.cli.commands.os.getcwd", return_value="/tmp"), \
+             patch("src.cli.dispatch.load_template", return_value=sample_config), \
+             patch("src.cli.dispatch.get_auto_remind_config",
+                   return_value=(DEFAULT_DISPATCH_SOFT_THRESHOLD,
+                                 DEFAULT_DISPATCH_HARD_THRESHOLD)):
+            exit_code = cmd_dispatch(
+                mock_client, "agent1", "engineer",
+                {"issue": "42", "spec": "s.md"},
+                em_id="em-abc",
+            )
+
+        assert exit_code == 0
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["remind_soft_threshold"] == DEFAULT_DISPATCH_SOFT_THRESHOLD
+        assert call_kwargs["remind_hard_threshold"] == DEFAULT_DISPATCH_HARD_THRESHOLD
+
+    def test_dispatch_passes_custom_remind_thresholds_from_config(self, sample_config):
+        """cmd_dispatch uses thresholds from config when available."""
+        mock_client = self._make_client()
+
+        with patch("src.cli.commands.os.getcwd", return_value="/tmp"), \
+             patch("src.cli.dispatch.load_template", return_value=sample_config), \
+             patch("src.cli.dispatch.get_auto_remind_config",
+                   return_value=(300, 600)):
+            exit_code = cmd_dispatch(
+                mock_client, "agent1", "engineer",
+                {"issue": "42", "spec": "s.md"},
+                em_id="em-abc",
+            )
+
+        assert exit_code == 0
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["remind_soft_threshold"] == 300
+        assert call_kwargs["remind_hard_threshold"] == 600
+
+    def test_dispatch_always_arms_remind_no_flag_needed(self, sample_config):
+        """Remind is always armed on dispatch without any explicit flag."""
+        mock_client = self._make_client()
+
+        with patch("src.cli.commands.os.getcwd", return_value="/tmp"), \
+             patch("src.cli.dispatch.load_template", return_value=sample_config), \
+             patch("src.cli.dispatch.get_auto_remind_config",
+                   return_value=(210, 420)):
+            cmd_dispatch(
+                mock_client, "agent1", "engineer",
+                {"issue": "42", "spec": "s.md"},
+                em_id="em-abc",
+            )
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        # Remind must be armed regardless of calling flags
+        assert call_kwargs["remind_soft_threshold"] is not None
+        assert call_kwargs["remind_hard_threshold"] is not None
+
+    def test_dry_run_does_not_call_send(self, sample_config, capsys):
+        """--dry-run mode prints template and does not call send_input."""
+        mock_client = self._make_client()
+
+        with patch("src.cli.commands.os.getcwd", return_value="/tmp"), \
+             patch("src.cli.dispatch.load_template", return_value=sample_config):
+            exit_code = cmd_dispatch(
+                mock_client, "agent1", "engineer",
+                {"issue": "42", "spec": "s.md"},
+                em_id="em-abc",
+                dry_run=True,
+            )
+
+        assert exit_code == 0
+        mock_client.send_input.assert_not_called()
+        captured = capsys.readouterr()
+        assert "#42" in captured.out
+
+
+class TestCmdSendRemindParams:
+    """Tests that cmd_send correctly wires remind_soft/hard_threshold."""
+
+    def _make_client(self):
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = {
+            "id": "sess1",
+            "friendly_name": "eng",
+            "status": "idle",
+        }
+        mock_client.session_id = "sender1"
+        mock_client.send_input.return_value = (True, False)
+        return mock_client
+
+    def test_explicit_thresholds_passed_through(self):
+        """Explicit remind_soft_threshold and remind_hard_threshold are forwarded."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+
+        cmd_send(
+            mock_client, "sess1", "hello",
+            remind_soft_threshold=210,
+            remind_hard_threshold=420,
+        )
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["remind_soft_threshold"] == 210
+        assert call_kwargs["remind_hard_threshold"] == 420
+
+    def test_remind_seconds_maps_to_soft_threshold(self):
+        """Legacy remind_seconds param maps to remind_soft_threshold."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+
+        cmd_send(mock_client, "sess1", "hello", remind_seconds=180)
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["remind_soft_threshold"] == 180
+        # hard stays None when using legacy remind_seconds
+        assert call_kwargs["remind_hard_threshold"] is None
+
+    def test_explicit_soft_overrides_remind_seconds(self):
+        """Explicit remind_soft_threshold takes precedence over remind_seconds."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+
+        # Both provided — explicit wins
+        cmd_send(
+            mock_client, "sess1", "hello",
+            remind_seconds=180,
+            remind_soft_threshold=210,
+            remind_hard_threshold=420,
+        )
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["remind_soft_threshold"] == 210  # explicit wins
+        assert call_kwargs["remind_hard_threshold"] == 420
+
+    def test_no_remind_params_sends_none(self):
+        """Without any remind params, thresholds are None."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+
+        cmd_send(mock_client, "sess1", "hello")
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["remind_soft_threshold"] is None
+        assert call_kwargs["remind_hard_threshold"] is None

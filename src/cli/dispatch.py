@@ -16,6 +16,52 @@ class DispatchError(Exception):
     pass
 
 
+# Default auto-remind thresholds for sm dispatch (#225-A).
+# Overridable via config.yaml dispatch.auto_remind section.
+DEFAULT_DISPATCH_SOFT_THRESHOLD = 210  # 3.5 min — important, non-interrupting
+DEFAULT_DISPATCH_HARD_THRESHOLD = 420  # 7 min — urgent, ESC interrupt
+
+
+def get_auto_remind_config(working_dir: str) -> tuple[int, int]:
+    """Read dispatch auto_remind thresholds from config.yaml.
+
+    Searches for config.yaml by walking up from working_dir. Falls back to
+    module-level defaults (210s soft, 420s hard) if no config is found or the
+    dispatch.auto_remind section is absent.
+
+    Args:
+        working_dir: Directory to start searching from.
+
+    Returns:
+        Tuple of (soft_threshold_seconds, hard_threshold_seconds).
+    """
+    import yaml
+
+    config_data = None
+    current = Path(working_dir).resolve()
+    while True:
+        candidate = current / "config.yaml"
+        if candidate.is_file():
+            try:
+                with open(candidate) as f:
+                    config_data = yaml.safe_load(f)
+            except Exception:
+                pass
+            break
+        parent = current.parent
+        if parent == current:
+            break  # filesystem root
+        current = parent
+
+    if config_data and isinstance(config_data, dict):
+        auto_remind = (config_data.get("dispatch") or {}).get("auto_remind") or {}
+        soft = auto_remind.get("soft_threshold_seconds", DEFAULT_DISPATCH_SOFT_THRESHOLD)
+        hard = auto_remind.get("hard_threshold_seconds", DEFAULT_DISPATCH_HARD_THRESHOLD)
+        return int(soft), int(hard)
+
+    return DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD
+
+
 def load_template(working_dir: str) -> dict:
     """Load dispatch template YAML by walking up from working_dir.
 

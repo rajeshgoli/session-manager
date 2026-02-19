@@ -193,6 +193,14 @@ remind:
   # Gap from soft to hard threshold (hard = soft + hard_gap)
   hard_gap_seconds: 120
 
+# sm dispatch v2: Auto-remind thresholds (#225-A)
+dispatch:
+  auto_remind:
+    # Soft (important, non-interrupting) remind threshold in seconds
+    soft_threshold_seconds: 210   # 3.5 min
+    # Hard (urgent, ESC interrupt) remind threshold in seconds
+    hard_threshold_seconds: 420   # 7 min
+
 # sm send v2: Reliable inter-agent messaging
 sm_send:
   # Path to SQLite database for message queue persistence
