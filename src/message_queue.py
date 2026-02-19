@@ -828,7 +828,6 @@ class MessageQueueManager:
                 logger.info(f"Stuck delivery fallback: {session_id} at prompt with pending messages")
                 asyncio.create_task(self._try_deliver_messages(session_id))
         else:
-            state = self.delivery_states.get(session_id)
             if state:
                 state._stuck_delivery_count = 0
 

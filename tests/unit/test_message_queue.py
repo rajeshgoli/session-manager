@@ -1593,16 +1593,21 @@ class TestCheckStuckDelivery:
         mock_session_manager._deliver_direct = AsyncMock(return_value=True)
 
         self._insert_pending_message(mq, "target229j", msg_id="pending229j")
-        mq.delivery_states["target229j"] = SessionDeliveryState(session_id="target229j", is_idle=False)
+        state = SessionDeliveryState(session_id="target229j", is_idle=False)
+        state._stuck_delivery_count = 1  # pre-populate so next prompt detection fires T2
+        mq.delivery_states["target229j"] = state
         mq._check_idle_prompt = AsyncMock(return_value=True)
 
-        # Simulate Stop hook + fallback both firing
+        # Simulate Stop hook + fallback both firing before either task runs.
+        # _stuck_delivery_count=1 means the first _check_stuck_delivery call triggers T2,
+        # then mark_session_idle() triggers T1. Both are scheduled before the event loop
+        # yields, so the asyncio lock in _try_deliver_messages must prevent double-delivery.
         with patch("asyncio.create_task", side_effect=lambda coro: asyncio.ensure_future(coro)):
-            # Stop hook: sets is_idle=True, schedules _try_deliver_messages T1
+            # Fallback fires: count 1→2, sets is_idle=True, schedules T2
+            await mq._check_stuck_delivery("target229j")
+            # Stop hook also fires: is_idle already True, schedules T1
             mq.mark_session_idle("target229j")
-            # Fallback: also fires on 2nd consecutive prompt detection
-            await mq._check_stuck_delivery("target229j")  # count=1 (is_idle is True now from Stop hook → early return)
-            await mq._check_stuck_delivery("target229j")  # still early-return
+            # T1 and T2 are now both scheduled; neither has run yet
 
         # Let all scheduled tasks run
         await asyncio.sleep(0.05)
