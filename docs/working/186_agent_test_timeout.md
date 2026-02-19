@@ -31,7 +31,7 @@ This runs **every test**, verbose, with no timeout. The `-v` flag produces one l
 
 ### 2. Claude Code Bash tool has a 2-minute default timeout
 
-The Claude Code Bash tool defaults to a 120-second (2-minute) timeout. Agents can pass `timeout` up to 600s (10 min), but the engineer persona doesn't instruct this. When the timeout fires mid-run, the agent receives a truncated/error result and doesn't understand the test run was interrupted — it may retry, re-run, or stall.
+Per the issue report and observed agent behavior, the Claude Code Bash tool defaults to a 120-second (2-minute) timeout. Agents can request up to 600s (10 min) via the `timeout` parameter, but the engineer persona doesn't instruct this. When the timeout fires mid-run, the agent receives a truncated/error result and doesn't understand the test run was interrupted — it may retry, re-run, or stall.
 
 ### 3. No per-test timeout guard
 
@@ -39,26 +39,27 @@ Neither repo configures `pytest-timeout` or equivalent. A single hanging test (e
 
 ## Empirical Data
 
-Measured on local machine (single-agent, unloaded):
+Measured on local machine (`-q --tb=no`), runtime varies significantly with system load:
 
-| Repo | Tests | Runtime (`-q --tb=no`) | Est. with `-v` |
-|------|-------|----------------------|----------------|
-| fractal-market-simulator | 2462 (2401 run, 61 skipped) | 60s | ~70-90s |
-| session-manager | 560 | 77s | ~85-100s |
+| Repo | Tests | Unloaded | Under multi-agent load |
+|------|-------|----------|----------------------|
+| fractal-market-simulator | 2462 (2401 run, 61 skipped) | ~60s | ~138s |
+| session-manager | 560 | ~78s | ~78s (CPU-light tests) |
 
-Both suites currently fit within the 2-minute window under ideal conditions. However:
-- Multi-agent load (2-3 agents running) increases wall-clock time
+**Fractal exceeds the 2-minute budget under realistic multi-agent conditions.** The 60s→138s increase (2.3x) occurs because fractal tests are CPU-intensive (data loading, numerical computation). Session-manager tests are I/O-mock-heavy and less affected by load.
+
+Additional factors that increase runtime:
 - The `-v` flag adds output overhead proportional to test count
-- Any new slow test pushes the suite over the threshold
+- Any new slow test pushes the suite further over the threshold
 - Fractal's `pytest_sessionfinish` hook spawns a background backtest — while non-blocking, it adds process startup overhead
 
-The issue reports 10+ minute stalls, which suggests agents are **retrying** after timeout, not that a single run takes 10 minutes. Each retry burns another 2-minute window, and the agent may retry 3-5 times before giving up or being nudged.
+The issue reports 10+ minute stalls, which suggests agents are also **retrying** after timeout. Each retry burns another 2-minute window, and the agent may retry 3-5 times before giving up or being nudged.
 
 ## Existing Safeguards
 
 - **Fractal conftest.py** already has a `@pytest.mark.slow` marker with `--run-slow` opt-in. This is a good pattern but only covers explicitly-marked tests.
-- **No `pytest-timeout`** configured in either repo's `pyproject.toml`.
-- **No CI test pipeline** — fractal only has a `protect-main.yml` workflow that blocks PRs to main. No automated test runs in CI.
+- **No `pytest-timeout`** configured in either repo. Fractal's `pytest.ini` has a commented-out `timeout = 60` line, confirming intent but never enabled. Session-manager's `pyproject.toml` has no timeout setting.
+- **No CI test pipeline** — fractal only has a `protect-main.yml` workflow that blocks PRs to main. Session-manager has no CI workflows at all. Neither repo runs tests automatically.
 
 ## Proposed Solution
 
@@ -66,7 +67,7 @@ A two-layer fix: **persona guidance** (immediate) + **pytest-timeout guard** (de
 
 ### Layer 1: Update engineer persona test instructions
 
-**File:** `.agent-os/personas/engineer.md` (both repos symlink to same file)
+**File:** `.agent-os/personas/engineer.md` (separate copies in each repo, same content)
 
 Change the test step from:
 
@@ -79,30 +80,34 @@ To:
 ```
 7. **Test** — Run targeted tests first, then full suite if time permits:
    - Identify test files relevant to your changes (same module name, or grep for imports)
-   - Run targeted: `python -m pytest tests/test_<relevant>.py -v`
+   - Run targeted: `python -m pytest tests/<path>/test_<relevant>.py -v` (or use `-k <pattern>` for cross-file filtering)
    - If targeted tests pass AND full suite fits in budget: `python -m pytest tests/ -q --timeout=120`
-   - If full suite would exceed shell budget, skip it — CI will catch regressions
+   - If full suite would exceed shell budget, skip it — note in PR that full suite was not run
    - STOP if any tests fail
 ```
 
 And update the Task Completion Protocol similarly:
 
 ```
-1. **Test**: Run relevant test file(s): `python -m pytest tests/test_<relevant>.py -v`
+1. **Test**: Run relevant test file(s): `python -m pytest tests/<path>/test_<relevant>.py -v` (or `-k <pattern>`)
    - If tests fail: STOP. Fix failures before proceeding.
-   - Full suite is optional — CI catches regressions. Don't burn 10 minutes retrying timeouts.
+   - Full suite run is optional locally. Note in the PR if only targeted tests were run.
 ```
+
+**Note:** Neither repo currently has CI test automation, so skipping the full suite locally means no automated regression check exists. This is an accepted tradeoff until CI is added — the alternative (agents stuck in retry loops) is worse.
 
 ### Layer 2: Add pytest-timeout to both repos
 
-**fractal-market-simulator `pyproject.toml`** (create `[tool.pytest.ini_options]` section — currently absent):
+**fractal-market-simulator** — uses `pytest.ini` (not pyproject.toml). Uncomment and set the existing timeout line:
 
-```toml
-[tool.pytest.ini_options]
+```ini
+# In pytest.ini:
 timeout = 30
 ```
 
-**session-manager `pyproject.toml`** (extend existing `[tool.pytest.ini_options]`):
+Also add `pytest-timeout` to `requirements.txt`.
+
+**session-manager** — uses `pyproject.toml`. Extend existing `[tool.pytest.ini_options]`:
 
 ```toml
 [tool.pytest.ini_options]
@@ -111,9 +116,9 @@ testpaths = ["tests"]
 timeout = 30
 ```
 
-This sets a **per-test** timeout of 30 seconds. Any individual test taking longer than 30s is almost certainly hanging. Tests that legitimately need more time can use `@pytest.mark.timeout(120)` to override.
+Also add `pytest-timeout>=2.0` to `[project.optional-dependencies].dev`.
 
-**Dependency:** Add `pytest-timeout>=2.0` to dev dependencies in both repos.
+This sets a **per-test** timeout of 30 seconds. Any individual test taking longer than 30s is almost certainly hanging. Tests that legitimately need more time can use `@pytest.mark.timeout(120)` to override.
 
 ### Layer 3 (optional): Update EM dispatch checklist
 
@@ -126,7 +131,7 @@ In `personas/em.md`, change:
 To:
 
 ```
-- Always: "Run targeted tests for your changes. Full suite is optional — CI catches regressions."
+- Always: "Run targeted tests for your changes. Full suite is optional locally."
 ```
 
 This matches the engineer persona change and prevents the EM from issuing contradictory "run all tests" instructions.
@@ -146,11 +151,10 @@ This matches the engineer persona change and prevents the EM from issuing contra
 
 ## Ticket Classification
 
-Single ticket. One engineer can:
-1. Add `pytest-timeout` to both repos' dev dependencies
-2. Add `timeout = 30` to both `pyproject.toml` files
-3. Update `engineer.md` persona test instructions
-4. Update `em.md` dispatch checklist
-5. Test all changes
+Single ticket, but requires **Director** involvement for persona file edits (engineer persona explicitly forbids modifying persona files — see `engineer.md` line 170: "Modify persona files (escalate to Director)").
 
-No epic needed.
+Recommended split:
+- **Engineer** handles: pytest-timeout dependency + config in both repos (requirements.txt for fractal, pyproject.toml for SM)
+- **Director** handles: persona file edits (engineer.md test instructions, em.md dispatch checklist) in both repos
+
+No epic needed — two small changes that can be coordinated in one session.
