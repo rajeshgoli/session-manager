@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from typing import Optional, Callable, Awaitable
 import httpx
 
@@ -14,10 +15,50 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from .models import Session, UserInput, NotificationChannel, DeliveryResult
 
 logger = logging.getLogger(__name__)
+
+# Stall detection thresholds
+_POLLING_CHECK_INTERVAL = 30   # seconds between health checks
+_POLLING_STALL_THRESHOLD = 45  # seconds without a getUpdates before restart
+
+# getUpdates HTTP timeouts — per-chunk (not total); effective httpx read timeout for
+# getUpdates = _POLLING_READ_TIMEOUT + Telegram long-poll hold (10s default) = 40s,
+# which is intentionally < _POLLING_STALL_THRESHOLD so httpx fires first on normal
+# TCP stalls; the health monitor catches keepalive-defeated stalls as backup.
+_POLLING_READ_TIMEOUT = 30.0
+_POLLING_CONNECT_TIMEOUT = 5.0
+_POLLING_WRITE_TIMEOUT = 5.0
+_POLLING_POOL_TIMEOUT = 5.0
+
+
+class _PollingTracker:
+    """Shared mutable tracker for last getUpdates timestamp."""
+
+    def __init__(self) -> None:
+        self._last_get_updates_ts: float = time.monotonic()
+
+    def record(self) -> None:
+        self._last_get_updates_ts = time.monotonic()
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._last_get_updates_ts
+
+
+class _TrackingHTTPXRequest(HTTPXRequest):
+    """HTTPXRequest subclass that records the timestamp of each getUpdates call."""
+
+    def __init__(self, tracker: _PollingTracker, **kwargs) -> None:
+        self._tracker = tracker
+        super().__init__(**kwargs)
+
+    async def do_request(self, url: str, method: str, **kwargs) -> tuple[int, bytes]:
+        if "getUpdates" in url:
+            self._tracker.record()
+        return await super().do_request(url=url, method=method, **kwargs)
 
 
 def create_permission_keyboard(session_id: str) -> InlineKeyboardMarkup:
@@ -127,6 +168,9 @@ class TelegramBot:
         self.office_automate_url = office_automate_url or "http://192.168.5.140:8080"
         self.application: Optional[Application] = None
         self.bot: Optional[Bot] = None
+        self._polling_tracker = _PollingTracker()
+        self._health_monitor_task: Optional[asyncio.Task] = None
+        self._polling_check_interval: float = _POLLING_CHECK_INTERVAL
 
         # Callbacks for session operations
         self._on_new_session: Optional[Callable[[int, str], Awaitable[Optional[Session]]]] = None
@@ -1526,11 +1570,37 @@ Provide ONLY the summary, no preamble or questions."""
             logger.error(f"Error creating topic for session: {e}")
             await query.edit_message_text(f"Error: {e}")
 
+    async def _polling_health_monitor(self) -> None:
+        """Restart the updater if getUpdates has stalled."""
+        while True:
+            await asyncio.sleep(self._polling_check_interval)
+            elapsed = self._polling_tracker.elapsed()
+            if elapsed > _POLLING_STALL_THRESHOLD:
+                logger.warning(
+                    f"getUpdates stalled for {elapsed:.0f}s — restarting updater"
+                )
+                try:
+                    await self.application.updater.stop()
+                    # Reset tracker so health monitor doesn't immediately re-fire
+                    self._polling_tracker.record()
+                    await self.application.updater.start_polling()
+                    logger.info("Updater restarted after stall")
+                except Exception as e:
+                    logger.error(f"Failed to restart updater after stall: {e}")
+
     async def start(self):
         """Start the bot."""
+        get_updates_request = _TrackingHTTPXRequest(
+            tracker=self._polling_tracker,
+            read_timeout=_POLLING_READ_TIMEOUT,
+            connect_timeout=_POLLING_CONNECT_TIMEOUT,
+            write_timeout=_POLLING_WRITE_TIMEOUT,
+            pool_timeout=_POLLING_POOL_TIMEOUT,
+        )
         self.application = (
             Application.builder()
             .token(self.token)
+            .get_updates_request(get_updates_request)
             .build()
         )
 
@@ -1569,12 +1639,24 @@ Provide ONLY the summary, no preamble or questions."""
         # Start polling
         await self.application.initialize()
         await self.application.start()
+        self._polling_tracker.record()
         await self.application.updater.start_polling()
+
+        self._health_monitor_task = asyncio.create_task(
+            self._polling_health_monitor(), name="polling-health-monitor"
+        )
 
         logger.info("Telegram bot started")
 
     async def stop(self):
         """Stop the bot."""
+        if self._health_monitor_task is not None:
+            self._health_monitor_task.cancel()
+            try:
+                await self._health_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._health_monitor_task = None
         if self.application:
             await self.application.updater.stop()
             await self.application.stop()
