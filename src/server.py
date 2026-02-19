@@ -2015,6 +2015,7 @@ Or continue working if not done yet."""
                     # sm remind: self-reported status (#188)
                     "agent_status_text": s.agent_status_text,
                     "agent_status_at": s.agent_status_at.isoformat() if s.agent_status_at else None,
+                    "provider": getattr(s, "provider", "claude"),
                 }
                 for s in children
             ],

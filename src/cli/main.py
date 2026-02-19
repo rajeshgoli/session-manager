@@ -180,6 +180,7 @@ def main():
     children_parser.add_argument("--recursive", action="store_true", help="Include grandchildren")
     children_parser.add_argument("--status", choices=["running", "completed", "error", "all"], help="Filter by status")
     children_parser.add_argument("--json", action="store_true", help="Output JSON")
+    children_parser.add_argument("--db-path", default=None, help="Override tool_usage.db path")
 
     # sm kill <session-id>
     kill_parser = subparsers.add_parser("kill", help="Terminate a child session")
@@ -438,7 +439,7 @@ def main():
     elif args.command == "children":
         # Use current session if not specified
         parent_id = args.session_id if args.session_id else session_id
-        sys.exit(commands.cmd_children(client, parent_id, args.recursive, args.status, args.json))
+        sys.exit(commands.cmd_children(client, parent_id, args.recursive, args.status, args.json, getattr(args, 'db_path', None)))
     elif args.command == "kill":
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
     elif args.command == "claude":

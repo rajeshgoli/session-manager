@@ -3,7 +3,9 @@
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -1098,12 +1100,86 @@ def cmd_spawn(
     return 0
 
 
+_TOOL_DB_DEFAULT = "~/.local/share/claude-sessions/tool_usage.db"
+
+# Sentinel returned by _query_last_tool when the DB is unavailable or locked.
+# Distinct from None ("no data for this session") so cmd_children can warn once.
+_DB_ERROR = object()
+
+
+def _query_last_tool(session_id: str, db_path: str) -> Optional[dict]:
+    """
+    Query tool_usage.db for the most recent PreToolUse event for a session.
+
+    Returns dict with: tool_name, target_file, bash_command, timestamp_str (UTC)
+    Returns None if DB unavailable or no entries found.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT tool_name, target_file, bash_command, timestamp
+                FROM tool_usage
+                WHERE hook_type = 'PreToolUse' AND session_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return _DB_ERROR  # type: ignore[return-value]
+
+    if not row:
+        return None
+
+    return {
+        "tool_name": row[0],
+        "target_file": row[1],
+        "bash_command": row[2],
+        "timestamp_str": row[3],
+    }
+
+
+def _get_tmux_session_activity(tmux_session_name: str) -> Optional[int]:
+    """
+    Returns Unix epoch of last tmux session activity via:
+      tmux display-message -p -t <name> '#{session_activity}'
+    Returns None if session not found or tmux unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", tmux_session_name, "#{session_activity}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        output = result.stdout.strip()
+        if output:
+            return int(output)
+    except (subprocess.SubprocessError, ValueError, OSError):
+        pass
+    return None
+
+
+def _format_thinking_duration(seconds: int) -> str:
+    """Format thinking duration: 'Xm Ys' for >=1min, 'Xs' for <1min."""
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
 def cmd_children(
     client: SessionManagerClient,
     parent_session_id: str,
     recursive: bool = False,
     status_filter: Optional[str] = None,
     json_output: bool = False,
+    db_path: Optional[str] = None,
 ) -> int:
     """
     List child sessions.
@@ -1114,6 +1190,7 @@ def cmd_children(
         recursive: Include grandchildren
         status_filter: Filter by status (running, completed, error, all)
         json_output: Output JSON format
+        db_path: Override tool_usage.db path
 
     Exit codes:
         0: Success (children found)
@@ -1142,43 +1219,98 @@ def cmd_children(
     if json_output:
         print(json_lib.dumps(children, indent=2))
     else:
+        # Resolve DB path once; warn at most once on failure
+        resolved_db = str(Path(db_path or _TOOL_DB_DEFAULT).expanduser())
+        db_warned = False
+
+        now_utc = datetime.utcnow()
+
         for child in children:
             name = child.get("friendly_name") or child["name"]
             child_id = child["id"]
             status = child.get("completion_status") or child["status"]
             last_activity = child.get("last_activity", "")
             completion_msg = child.get("completion_message", "")
+            provider = child.get("provider", "claude")
 
-            # Format last activity as relative time
-            if last_activity:
-                try:
-                    activity_time = datetime.fromisoformat(last_activity)
-                    elapsed = format_relative_time(activity_time)
-                except:
-                    elapsed = "unknown"
-            else:
-                elapsed = "unknown"
+            # Format last activity as relative time — pass ISO string (fix for pre-existing bug)
+            elapsed = format_relative_time(last_activity) if last_activity else "unknown"
 
             # Format agent status if available (#188)
             agent_status_text = child.get("agent_status_text")
             agent_status_at = child.get("agent_status_at")
             status_age = ""
             if agent_status_at:
-                try:
-                    status_time = datetime.fromisoformat(agent_status_at)
-                    status_age = f" ({format_relative_time(status_time)} ago)"
-                except Exception:
-                    pass
+                status_age = f" ({format_relative_time(agent_status_at)})"
 
-            # Print child info
-            status_icon = "✓" if status == "completed" else "●" if status == "running" else "✗"
-            print(f"{name} ({child_id}) | {status} | {elapsed}", end="")
+            # Build the base line
+            line = f"{name} ({child_id}) | {status} | {elapsed}"
+
+            # Thinking duration + last tool — only for running sessions
+            raw_status = child.get("status", "")
+            if raw_status == "running":
+                thinking_str = None
+                last_tool_str = None
+
+                if provider == "claude":
+                    db_ok = Path(resolved_db).exists()
+                    if not db_ok and not db_warned:
+                        print(
+                            f"Warning: tool_usage.db not found at {resolved_db} — skipping thinking/last-tool signals",
+                            file=sys.stderr,
+                        )
+                        db_warned = True
+                    elif db_ok:
+                        row = _query_last_tool(child_id, resolved_db)
+                        if row is _DB_ERROR:
+                            if not db_warned:
+                                print(
+                                    f"Warning: tool_usage.db locked or unreadable at {resolved_db} — skipping thinking/last-tool signals",
+                                    file=sys.stderr,
+                                )
+                                db_warned = True
+                        elif row:
+                            ts = row["timestamp_str"]
+                            try:
+                                last_ts = datetime.fromisoformat(ts)
+                                delta_s = max(0, int((now_utc - last_ts).total_seconds()))
+                                thinking_str = _format_thinking_duration(delta_s)
+                                # Format last tool detail
+                                tool_name = row["tool_name"]
+                                if tool_name == "Bash" and row["bash_command"]:
+                                    detail = row["bash_command"][:60].split("\n")[0]
+                                    last_tool_str = f"Bash: {detail} ({_format_thinking_duration(delta_s)} ago)"
+                                elif tool_name in ("Read", "Write", "Edit") and row["target_file"]:
+                                    last_tool_str = f"{tool_name} {row['target_file']} ({_format_thinking_duration(delta_s)} ago)"
+                                else:
+                                    last_tool_str = f"{tool_name} ({_format_thinking_duration(delta_s)} ago)"
+                            except Exception:
+                                pass
+
+                elif provider == "codex":
+                    tmux_name = f"codex-{child_id}"
+                    epoch = _get_tmux_session_activity(tmux_name)
+                    if epoch is not None:
+                        delta_s = max(0, int(time.time() - epoch))
+                        thinking_str = _format_thinking_duration(delta_s)
+                    last_tool_str = "n/a (no hooks)"
+
+                # codex-app: skip both signals
+
+                if thinking_str is not None:
+                    line += f" | thinking {thinking_str}"
+                if last_tool_str is not None:
+                    line += f" | last tool: {last_tool_str}"
+
+            # Append agent status / completion (unchanged #188 logic)
             if agent_status_text:
-                print(f' | "{agent_status_text}"{status_age}')
+                line += f' | "{agent_status_text}"{status_age}'
             elif completion_msg:
-                print(f' | "{completion_msg}"')
+                line += f' | "{completion_msg}"'
             else:
-                print(' | (no status)')
+                line += " | (no status)"
+
+            print(line)
 
     return 0
 
