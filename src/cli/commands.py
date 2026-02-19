@@ -1907,3 +1907,78 @@ def cmd_handoff(client: SessionManagerClient, session_id: str, file_path: str) -
 
     print("Handoff scheduled — will execute after current turn completes")
     return 0
+
+
+def cmd_context_monitor(
+    client: SessionManagerClient,
+    session_id: Optional[str],
+    action: str,
+    target: Optional[str],
+) -> int:
+    """
+    Enable, disable, or show status for context monitoring.
+
+    Args:
+        client: API client
+        session_id: Caller's session ID (from CLAUDE_SESSION_MANAGER_ID)
+        action: "enable", "disable", or "status"
+        target: Optional target session ID; defaults to self when action is enable/disable
+    """
+    if action == "status":
+        monitored = client.get_context_monitor_status()
+        if monitored is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        if not monitored:
+            print("No sessions currently registered for context monitoring.")
+            return 0
+        print(f"{'Session':<12} {'Name':<24} {'Notify Target'}")
+        print("-" * 52)
+        for entry in monitored:
+            name = entry.get("friendly_name") or ""
+            notify = entry.get("notify_session_id") or "(none)"
+            print(f"{entry['session_id']:<12} {name:<24} {notify}")
+        return 0
+
+    if action in ("enable", "disable"):
+        # enable/disable require being inside a managed session (need session_id as requester)
+        if not session_id:
+            print(
+                "Error: sm context-monitor enable/disable requires a managed session "
+                "(CLAUDE_SESSION_MANAGER_ID not set)",
+                file=sys.stderr,
+            )
+            return 2
+
+        # Determine target session
+        resolved_target = target or session_id
+        if not resolved_target:
+            print("Error: No session ID — run inside a session or specify a target", file=sys.stderr)
+            return 2
+
+        enabled = (action == "enable")
+        # notify_session_id: when enabling, notify the CALLER (self), not the target
+        notify_session_id = session_id if enabled else None
+
+        data, success, unavailable = client.set_context_monitor(
+            resolved_target, enabled, notify_session_id, requester_session_id=session_id
+        )
+        if unavailable:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        if not success:
+            err = (data or {}).get("detail", "Unknown error")
+            print(f"Error: {err}", file=sys.stderr)
+            return 1
+
+        if enabled:
+            if target and target != session_id:
+                print(f"Context monitoring enabled for {target} — notifications → {session_id}")
+            else:
+                print(f"Context monitoring enabled — notifications → self ({session_id})")
+        else:
+            print(f"Context monitoring disabled for {resolved_target}")
+        return 0
+
+    print(f"Error: Unknown action '{action}'. Use: enable, disable, status", file=sys.stderr)
+    return 1

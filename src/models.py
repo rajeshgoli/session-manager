@@ -213,6 +213,10 @@ class Session:
     _context_warning_sent: bool = field(default=False, init=False, repr=False)
     _context_critical_sent: bool = field(default=False, init=False, repr=False)
 
+    # Context monitor registration (#206)
+    context_monitor_enabled: bool = False  # Default off — opt-in only
+    context_monitor_notify: Optional[str] = None  # Session ID to receive alerts; None = off
+
     def __post_init__(self):
         if not self.name:
             if self.provider == "claude":
@@ -266,6 +270,9 @@ class Session:
             "recovery_count": self.recovery_count,
             # Context monitor fields (#203)
             "last_handoff_path": self.last_handoff_path,
+            # Context monitor registration (#206)
+            "context_monitor_enabled": self.context_monitor_enabled,
+            "context_monitor_notify": self.context_monitor_notify,
         }
 
     @classmethod
@@ -333,6 +340,9 @@ class Session:
             recovery_count=data.get("recovery_count", 0),
             # Context monitor fields (#203)
             last_handoff_path=data.get("last_handoff_path"),
+            # Context monitor registration (#206)
+            context_monitor_enabled=data.get("context_monitor_enabled", False),
+            context_monitor_notify=data.get("context_monitor_notify"),
         )
 
 

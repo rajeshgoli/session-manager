@@ -560,3 +560,26 @@ class SessionManagerClient:
             f"/sessions/{session_id}/invalidate-cache",
         )
         return success, unavailable
+
+    def set_context_monitor(
+        self,
+        session_id: str,
+        enabled: bool,
+        notify_session_id: Optional[str] = None,
+        requester_session_id: str = "",  # Required by server; CLI always passes session_id
+    ) -> tuple[Optional[dict], bool, bool]:
+        """Enable or disable context monitoring for a session."""
+        payload = {
+            "enabled": enabled,
+            "notify_session_id": notify_session_id,
+            "requester_session_id": requester_session_id,
+        }
+        data, success, unavailable = self._request("POST", f"/sessions/{session_id}/context-monitor", data=payload)
+        return data, success, unavailable
+
+    def get_context_monitor_status(self) -> Optional[list]:
+        """Get list of sessions with context monitoring enabled."""
+        data, success, _ = self._request("GET", "/sessions/context-monitor")
+        if success and data:
+            return data.get("monitored", [])
+        return None

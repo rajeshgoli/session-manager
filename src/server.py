@@ -224,6 +224,13 @@ class HealthCheckResponse(BaseModel):
     timestamp: str
 
 
+class ContextMonitorRequest(BaseModel):
+    """Request to register/deregister context monitoring for a session (#206)."""
+    enabled: bool
+    notify_session_id: Optional[str] = None  # Session ID to notify; required when enabled=True
+    requester_session_id: str  # Required — caller's session ID for ownership check
+
+
 def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = False) -> None:
     """Clear server-side caches for a session after a context reset.
 
@@ -820,6 +827,22 @@ def create_app(
             ]
         }
 
+    @app.get("/sessions/context-monitor")
+    async def get_context_monitor_status():
+        """List sessions with context monitoring enabled (#206)."""
+        if not app.state.session_manager:
+            return {"monitored": []}
+        monitored = [
+            {
+                "session_id": s.id,
+                "friendly_name": s.friendly_name,
+                "notify_session_id": s.context_monitor_notify,
+            }
+            for s in app.state.session_manager.sessions.values()
+            if s.context_monitor_enabled
+        ]
+        return {"monitored": monitored}
+
     @app.get("/sessions/{session_id}", response_model=SessionResponse)
     async def get_session(session_id: str):
         """Get session details."""
@@ -892,6 +915,52 @@ def create_app(
             parent_session_id=session.parent_session_id,
             last_handoff_path=session.last_handoff_path,
         )
+
+    @app.post("/sessions/{session_id}/context-monitor")
+    async def set_context_monitor(session_id: str, request: ContextMonitorRequest):
+        """Enable or disable context monitoring for a session (#206)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if request.enabled and not request.notify_session_id:
+            raise HTTPException(status_code=422, detail="notify_session_id required when enabling")
+
+        # requester_session_id is a required field (str, not Optional).
+        # Pydantic rejects requests missing it with 422 before this code runs.
+        # Ownership check: requester must be self or the session's parent.
+        is_self = (request.requester_session_id == session_id)
+        is_parent = (session.parent_session_id == request.requester_session_id)
+        if not is_self and not is_parent:
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot configure context monitor — not your session or child session",
+            )
+
+        # Validate notify target exists (prevents silent black-holing)
+        if request.enabled and request.notify_session_id:
+            notify_session = app.state.session_manager.get_session(request.notify_session_id)
+            if not notify_session:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"notify_session_id {request.notify_session_id!r} not found",
+                )
+
+        session.context_monitor_enabled = request.enabled
+        session.context_monitor_notify = request.notify_session_id if request.enabled else None
+
+        # Re-arm one-shot flags when enabling so warnings fire fresh in the new cycle.
+        # If re-enabled after a period of being disabled (during which compaction may have
+        # fired unobserved), stale flag state would suppress the first warning.
+        if request.enabled:
+            session._context_warning_sent = False
+            session._context_critical_sent = False
+
+        app.state.session_manager._save_state()
+        return {"status": "ok", "enabled": session.context_monitor_enabled}
 
     @app.put("/sessions/{session_id}/task")
     async def update_task(session_id: str, task: str = Body(..., embed=True)):
@@ -2199,6 +2268,10 @@ Or continue working if not done yet."""
         if not session:
             return {"status": "unknown_session"}
 
+        # Gate: skip unregistered sessions (#206)
+        if not session.context_monitor_enabled:
+            return {"status": "not_registered"}
+
         queue_mgr = app.state.session_manager.message_queue_manager
 
         # Handle compaction event (from PreCompact hook)
@@ -2214,14 +2287,14 @@ Or continue working if not done yet."""
             # warning at 50% = 100K — overlap is possible).
             session._context_warning_sent = False
             session._context_critical_sent = False
-            # Notify parent session / user
-            if session.parent_session_id and queue_mgr:
+            # Notify via context_monitor_notify (#206 — replaces hardcoded parent_session_id)
+            if session.context_monitor_notify and queue_mgr:
                 msg = (
                     f"[sm context] Compaction fired for {session.friendly_name or session_id}. "
                     "Context was lost."
                 )
                 queue_mgr.queue_message(
-                    target_session_id=session.parent_session_id,
+                    target_session_id=session.context_monitor_notify,
                     text=msg,
                     delivery_mode="sequential",
                 )
@@ -2257,7 +2330,7 @@ Or continue working if not done yet."""
                         "Compaction is imminent."
                     )
                     queue_mgr.queue_message(
-                        target_session_id=session.id,
+                        target_session_id=session.context_monitor_notify,
                         text=msg,
                         delivery_mode="urgent",
                     )
@@ -2271,7 +2344,7 @@ Or continue working if not done yet."""
                         "Consider writing a handoff doc and running `sm handoff <path>`."
                     )
                     queue_mgr.queue_message(
-                        target_session_id=session.id,
+                        target_session_id=session.context_monitor_notify,
                         text=msg,
                         delivery_mode="sequential",
                     )

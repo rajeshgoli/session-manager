@@ -245,6 +245,23 @@ def main():
     handoff_parser = subparsers.add_parser("handoff", help="Self-directed context rotation via handoff doc")
     handoff_parser.add_argument("file_path", help="Path to handoff document")
 
+    # sm context-monitor <enable|disable|status> [session-id]
+    ctx_parser = subparsers.add_parser(
+        "context-monitor",
+        help="Manage context monitoring registration for a session",
+    )
+    ctx_parser.add_argument(
+        "action",
+        choices=["enable", "disable", "status"],
+        help="enable: opt-in, disable: opt-out, status: list monitored sessions",
+    )
+    ctx_parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Session ID to register/deregister; defaults to self",
+    )
+
     # sm review [session] --base|--uncommitted|--commit|--custom [options]
     review_parser = subparsers.add_parser("review", help="Start a Codex code review")
     review_parser.add_argument("session", nargs="?", help="Session ID or name to review on")
@@ -269,7 +286,7 @@ def main():
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-app", "codex-server",
-        "attach", "output", "clear", "review", None
+        "attach", "output", "clear", "review", "context-monitor", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
@@ -354,6 +371,8 @@ def main():
         sys.exit(commands.cmd_clear(client, session_id, args.session, args.prompt))
     elif args.command == "handoff":
         sys.exit(commands.cmd_handoff(client, session_id, args.file_path))
+    elif args.command == "context-monitor":
+        sys.exit(commands.cmd_context_monitor(client, session_id, args.action, args.target))
     elif args.command == "review":
         sys.exit(commands.cmd_review(
             client,

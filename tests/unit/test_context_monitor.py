@@ -23,7 +23,7 @@ from src.server import create_app
 
 def _make_session(session_id: str = "abc12345") -> Session:
     """Create a Session object for testing."""
-    return Session(
+    s = Session(
         id=session_id,
         name=f"claude-{session_id}",
         working_dir="/tmp/test",
@@ -32,6 +32,10 @@ def _make_session(session_id: str = "abc12345") -> Session:
         log_file="/tmp/test.log",
         status=SessionStatus.RUNNING,
     )
+    # Default: registered for context monitoring so existing tests pass the new gate (#206)
+    s.context_monitor_enabled = True
+    s.context_monitor_notify = session_id
+    return s
 
 
 @pytest.fixture
@@ -190,8 +194,8 @@ class TestCompactionEvent:
         assert resp.json()["status"] == "compaction_logged"
 
     def test_compaction_notifies_parent(self, client, mock_session_manager, session):
-        """When session has a parent, compaction sends a notification."""
-        session.parent_session_id = "parent999"
+        """When session has context_monitor_notify set, compaction sends a notification."""
+        session.context_monitor_notify = "parent999"
         _post_event(client, session.id, event="compaction", trigger="auto")
 
         queue_mgr = mock_session_manager.message_queue_manager
@@ -200,9 +204,9 @@ class TestCompactionEvent:
         assert call_kwargs["target_session_id"] == "parent999"
         assert "Compaction fired" in call_kwargs["text"] or "compaction" in call_kwargs["text"].lower()
 
-    def test_compaction_no_parent_no_notification(self, client, mock_session_manager, session):
-        """Without parent, no notification is sent."""
-        session.parent_session_id = None
+    def test_compaction_no_notify_no_notification(self, client, mock_session_manager, session):
+        """Without context_monitor_notify, no notification is sent."""
+        session.context_monitor_notify = None
         _post_event(client, session.id, event="compaction", trigger="auto")
 
         queue_mgr = mock_session_manager.message_queue_manager
@@ -210,6 +214,8 @@ class TestCompactionEvent:
 
     def test_warning_fires_after_compaction_reset(self, client, mock_session_manager, session):
         """After compaction resets flags, next 50% crossing sends warning again."""
+        # Suppress compaction notification so we only count warning calls
+        session.context_monitor_notify = None
         # Arm warning
         _post_context(client, session.id, used_pct=50)
         assert session._context_warning_sent is True
@@ -218,9 +224,11 @@ class TestCompactionEvent:
         _post_event(client, session.id, event="compaction", trigger="auto")
         assert session._context_warning_sent is False
 
+        # Re-enable routing for the post-compaction warning
+        session.context_monitor_notify = session.id
         # New cycle: warning fires again (even at same percentage)
         _post_context(client, session.id, used_pct=55)
-        # Total queue_message calls: warning (1) + compaction parent (0, no parent) + warning again (1) = 2
+        # Total queue_message calls: warning (1) + compaction notification (0, notify=None) + warning again (1) = 2
         queue_mgr = mock_session_manager.message_queue_manager
         assert queue_mgr.queue_message.call_count == 2
 
@@ -233,10 +241,16 @@ class TestCompactionEvent:
         session._context_warning_sent = True
         session._context_critical_sent = True
 
+        # Suppress compaction notification so only warning calls are counted below
+        session.context_monitor_notify = None
+
         # Simulate: compaction fires, then status line reports 55% (above warning threshold)
         _post_event(client, session.id, event="compaction", trigger="auto")
         assert session._context_warning_sent is False  # Reset by compaction, not by pct check
         assert session._context_critical_sent is False
+
+        # Re-enable routing for the post-compaction warning
+        session.context_monitor_notify = session.id
 
         # The status line update at 55% should now fire warning (flags were reset)
         _post_context(client, session.id, used_pct=55)
@@ -414,3 +428,255 @@ class TestSessionResponseLastHandoffPath:
         resp = client.get(f"/sessions/{session.id}")
         assert resp.status_code == 200
         assert resp.json()["last_handoff_path"] is None
+
+
+# ---------------------------------------------------------------------------
+# 8. Registration gate (#206)
+# ---------------------------------------------------------------------------
+
+
+class TestRegistrationGate:
+    """Gate: unregistered sessions return not_registered, no queue calls."""
+
+    def test_unregistered_session_returns_not_registered(self, mock_session_manager, session):
+        session.context_monitor_enabled = False
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = _post_context(client, session.id, used_pct=55)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert not mock_session_manager.message_queue_manager.queue_message.called
+
+    def test_registered_session_processes_normally(self, mock_session_manager, session):
+        session.context_monitor_enabled = True
+        session.context_monitor_notify = session.id
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = _post_context(client, session.id, used_pct=55)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        assert mock_session_manager.message_queue_manager.queue_message.called
+
+
+# ---------------------------------------------------------------------------
+# 9. Notification routing (#206)
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationRouting:
+    """All notifications route through context_monitor_notify, not hardcoded targets."""
+
+    def test_compaction_notifies_context_monitor_notify_not_parent(self, mock_session_manager, session):
+        """Compaction routes to context_monitor_notify (Y), not parent_session_id (X)."""
+        session.parent_session_id = "parent-X"
+        session.context_monitor_notify = "notify-Y"
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_event(client, session.id, event="compaction", trigger="auto")
+
+        queue_mgr = mock_session_manager.message_queue_manager
+        assert queue_mgr.queue_message.called
+        call_kwargs = queue_mgr.queue_message.call_args[1]
+        assert call_kwargs["target_session_id"] == "notify-Y"
+        assert call_kwargs["target_session_id"] != "parent-X"
+
+    def test_warning_routes_to_context_monitor_notify(self, mock_session_manager, session):
+        """Warning routes to context_monitor_notify, not session.id."""
+        session.context_monitor_notify = "parent-id"
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_context(client, session.id, used_pct=55)
+
+        queue_mgr = mock_session_manager.message_queue_manager
+        assert queue_mgr.queue_message.called
+        call_kwargs = queue_mgr.queue_message.call_args[1]
+        assert call_kwargs["target_session_id"] == "parent-id"
+
+    def test_critical_routes_to_context_monitor_notify(self, mock_session_manager, session):
+        """Critical alert routes to context_monitor_notify, not session.id."""
+        session.context_monitor_notify = "parent-id"
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_context(client, session.id, used_pct=70)
+
+        queue_mgr = mock_session_manager.message_queue_manager
+        assert queue_mgr.queue_message.called
+        call_kwargs = queue_mgr.queue_message.call_args[1]
+        assert call_kwargs["target_session_id"] == "parent-id"
+
+
+# ---------------------------------------------------------------------------
+# 10. Registration endpoint (#206)
+# ---------------------------------------------------------------------------
+
+
+class TestRegistrationEndpoint:
+    """Tests for POST /sessions/{id}/context-monitor."""
+
+    def _reg_payload(self, session_id, enabled=True, notify_session_id=None, requester_session_id=None):
+        return {
+            "enabled": enabled,
+            "notify_session_id": notify_session_id or session_id,
+            "requester_session_id": requester_session_id or session_id,
+        }
+
+    def test_enable_sets_fields(self, client, mock_session_manager, session):
+        payload = self._reg_payload(session.id)
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok", "enabled": True}
+        assert session.context_monitor_enabled is True
+        assert session.context_monitor_notify == session.id
+        mock_session_manager._save_state.assert_called()
+
+    def test_disable_clears_fields(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = True
+        session.context_monitor_notify = session.id
+        payload = {"enabled": False, "notify_session_id": None, "requester_session_id": session.id}
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 200
+        assert session.context_monitor_enabled is False
+        assert session.context_monitor_notify is None
+        mock_session_manager._save_state.assert_called()
+
+    def test_enable_without_notify_session_id_returns_422(self, client, session):
+        payload = {"enabled": True, "requester_session_id": session.id}
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 422
+
+    def test_unknown_session_returns_404(self, client, mock_session_manager):
+        mock_session_manager.get_session.return_value = None
+        payload = {"enabled": True, "notify_session_id": "abc", "requester_session_id": "abc"}
+        resp = client.post("/sessions/ghost999/context-monitor", json=payload)
+        assert resp.status_code == 404
+
+    def test_auth_rejects_missing_requester(self, client, session):
+        """Pydantic rejects request with missing required field requester_session_id."""
+        payload = {"enabled": True, "notify_session_id": session.id}
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 422
+
+    def test_auth_rejects_unrelated_requester(self, client, session):
+        """Requester that is neither self nor parent gets 403."""
+        session.parent_session_id = "other-parent"
+        payload = {
+            "enabled": True,
+            "notify_session_id": session.id,
+            "requester_session_id": "unrelated-id",
+        }
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 403
+
+    def test_auth_allows_self(self, client, mock_session_manager, session):
+        """Self-registration succeeds."""
+        mock_session_manager.get_session.return_value = session
+        payload = {
+            "enabled": True,
+            "notify_session_id": session.id,
+            "requester_session_id": session.id,
+        }
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 200
+
+    def test_auth_allows_parent(self, client, mock_session_manager, session):
+        """Parent registration succeeds."""
+        session.parent_session_id = "parent-abc"
+        notify_session = _make_session("parent-abc")
+        mock_session_manager.get_session.side_effect = lambda sid: (
+            session if sid == session.id else notify_session
+        )
+        payload = {
+            "enabled": True,
+            "notify_session_id": "parent-abc",
+            "requester_session_id": "parent-abc",
+        }
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 200
+
+    def test_invalid_notify_session_id_returns_422(self, client, mock_session_manager, session):
+        """notify_session_id that doesn't exist returns 422."""
+        mock_session_manager.get_session.side_effect = lambda sid: (
+            session if sid == session.id else None
+        )
+        payload = {
+            "enabled": True,
+            "notify_session_id": "nonexistent-id",
+            "requester_session_id": session.id,
+        }
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 422
+
+    def test_enable_rearms_flags(self, client, mock_session_manager, session):
+        """Enabling resets both one-shot flags."""
+        session._context_warning_sent = True
+        session._context_critical_sent = True
+        payload = self._reg_payload(session.id)
+        resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
+        assert resp.status_code == 200
+        assert session._context_warning_sent is False
+        assert session._context_critical_sent is False
+
+    def test_disable_reenable_reraises_warning(self, mock_session_manager, session):
+        """After disable+enable, warning fires again (flags re-armed on enable)."""
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        # Step 1: trigger warning (flag set)
+        _post_context(client, session.id, used_pct=55)
+        assert session._context_warning_sent is True
+
+        # Step 2: disable
+        client.post(f"/sessions/{session.id}/context-monitor", json={
+            "enabled": False, "notify_session_id": None, "requester_session_id": session.id,
+        })
+        assert session.context_monitor_enabled is False
+
+        # Step 3: re-enable (flags re-armed)
+        client.post(f"/sessions/{session.id}/context-monitor", json={
+            "enabled": True, "notify_session_id": session.id, "requester_session_id": session.id,
+        })
+        assert session._context_warning_sent is False
+
+        # Step 4: trigger warning again
+        mock_session_manager.message_queue_manager.queue_message.reset_mock()
+        _post_context(client, session.id, used_pct=55)
+        assert mock_session_manager.message_queue_manager.queue_message.called
+
+
+# ---------------------------------------------------------------------------
+# 11. Status endpoint (#206)
+# ---------------------------------------------------------------------------
+
+
+class TestStatusEndpoint:
+    """Tests for GET /sessions/context-monitor."""
+
+    def test_status_lists_registered_sessions(self, mock_session_manager, session):
+        other = _make_session("xyz99999")
+        other.context_monitor_enabled = False
+        mock_session_manager.sessions = {session.id: session, other.id: other}
+
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = client.get("/sessions/context-monitor")
+        assert resp.status_code == 200
+        monitored = resp.json()["monitored"]
+        assert len(monitored) == 1
+        assert monitored[0]["session_id"] == session.id
+
+    def test_status_empty_when_none_registered(self, mock_session_manager, session):
+        session.context_monitor_enabled = False
+        mock_session_manager.sessions = {session.id: session}
+
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = client.get("/sessions/context-monitor")
+        assert resp.status_code == 200
+        assert resp.json()["monitored"] == []
