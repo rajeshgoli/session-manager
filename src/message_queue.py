@@ -528,7 +528,9 @@ class MessageQueueManager:
             # Reset any stale idle status from prior work cycle BEFORE setting is_idle=True.
             # Without this, _watch_for_idle Phase 3 can see session.status=IDLE from
             # OutputMonitor and fire a false idle during the delivery window. (#193)
-            self.mark_session_active(target_session_id)
+            # Mirror the urgent path: skip mark_session_active if session is paused for recovery.
+            if target_session_id not in self._paused_sessions:
+                self.mark_session_active(target_session_id)
             state = self._get_or_create_state(target_session_id)
             state.is_idle = True  # re-set: mark_session_active clears is_idle; need True to gate delivery
             asyncio.create_task(self._try_deliver_messages(target_session_id))

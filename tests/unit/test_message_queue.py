@@ -1044,6 +1044,62 @@ class TestPhase3FalseIdle:
         assert len(pending) == 1
         assert "is now idle" in pending[0].text
 
+    def test_codex_queue_message_resets_stale_idle_status(self, message_queue, mock_session_manager):
+        """queue_message codex path resets stale session.status=IDLE before delivery (Fix A, #193).
+
+        Scenario: OutputMonitor left session.status=IDLE from a previous work cycle.
+        When sm send arrives (codex session, sequential mode), queue_message must call
+        mark_session_active() to reset status=RUNNING before scheduling delivery.
+        Without Fix A, _watch_for_idle Phase 3 can see IDLE and fire a false idle
+        during the delivery window.
+        """
+        session = MagicMock()
+        session.id = "codex-session193"
+        session.provider = "codex"
+        session.status = SessionStatus.IDLE  # stale from previous OutputMonitor cycle
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        with patch("asyncio.create_task", side_effect=noop_create_task):
+            message_queue.queue_message(
+                target_session_id="codex-session193",
+                text="hello codex",
+                sender_session_id="sender-193",
+                delivery_mode="sequential",
+            )
+
+        # Fix A: mark_session_active() must have reset status to RUNNING synchronously
+        assert session.status == SessionStatus.RUNNING
+
+    def test_codex_queue_message_skips_mark_active_when_paused(self, message_queue, mock_session_manager):
+        """queue_message codex path skips mark_session_active if session is paused (Issue 1 fix).
+
+        If a codex session is paused for recovery, mark_session_active must NOT be called —
+        it would set session.status=RUNNING and mislead Phase 3 watchers into not firing idle.
+        Mirrors the guard already present on the urgent path.
+        """
+        session = MagicMock()
+        session.id = "codex-paused193"
+        session.provider = "codex"
+        session.status = SessionStatus.IDLE  # paused during recovery
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        # Mark session as paused
+        message_queue._paused_sessions.add("codex-paused193")
+
+        with patch("asyncio.create_task", side_effect=noop_create_task):
+            message_queue.queue_message(
+                target_session_id="codex-paused193",
+                text="hello codex",
+                sender_session_id="sender-193",
+                delivery_mode="sequential",
+            )
+
+        # Status must remain IDLE — mark_session_active was skipped
+        assert session.status == SessionStatus.IDLE
+
+        # Cleanup
+        message_queue._paused_sessions.discard("codex-paused193")
+
 
 class TestTelegramMirroring:
     """Tests for Telegram mirroring of agent-to-agent communications (issue #103)."""
