@@ -197,6 +197,10 @@ def main():
         help="Optional new prompt to send after clearing"
     )
 
+    # sm handoff <file_path>
+    handoff_parser = subparsers.add_parser("handoff", help="Self-directed context rotation via handoff doc")
+    handoff_parser.add_argument("file_path", help="Path to handoff document")
+
     # sm review [session] --base|--uncommitted|--commit|--custom [options]
     review_parser = subparsers.add_parser("review", help="Start a Codex code review")
     review_parser.add_argument("session", nargs="?", help="Session ID or name to review on")
@@ -304,6 +308,8 @@ def main():
         sys.exit(commands.cmd_output(client, args.session, args.lines))
     elif args.command == "clear":
         sys.exit(commands.cmd_clear(client, session_id, args.session, args.prompt))
+    elif args.command == "handoff":
+        sys.exit(commands.cmd_handoff(client, session_id, args.file_path))
     elif args.command == "review":
         sys.exit(commands.cmd_review(
             client,

@@ -1,5 +1,6 @@
 """Command implementations for sm CLI."""
 
+import os
 import re
 import sys
 from typing import Optional
@@ -1796,3 +1797,49 @@ def cmd_clear(
     except FileNotFoundError:
         print("Error: tmux not found. Is tmux installed?", file=sys.stderr)
         return 1
+
+
+def cmd_handoff(client: SessionManagerClient, session_id: str, file_path: str) -> int:
+    """
+    Schedule a self-directed context rotation via handoff doc.
+
+    Agent writes handoff state to a doc, then calls sm handoff. The server
+    executes /clear + prompt injection after the current turn completes (Stop hook).
+
+    Args:
+        client: API client
+        session_id: Current session ID (from CLAUDE_SESSION_MANAGER_ID)
+        file_path: Path to the handoff document
+
+    Exit codes:
+        0: Handoff scheduled successfully
+        1: File not found or server rejected
+        2: Session manager unavailable or no session context
+    """
+    # 1. Verify session_id is set (handoff is self-only)
+    if not session_id:
+        print(
+            "Error: CLAUDE_SESSION_MANAGER_ID not set. sm handoff can only be called from within a session.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # 2. Resolve file_path to absolute path
+    abs_path = os.path.abspath(file_path)
+
+    # 3. Verify file exists
+    if not os.path.isfile(abs_path):
+        print(f"Error: File not found: {abs_path}", file=sys.stderr)
+        return 1
+
+    # 4. Call server API
+    result = client.schedule_handoff(session_id, abs_path)
+    if result is None:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    if result.get("error") or result.get("detail"):
+        print(f"Error: {result.get('error') or result.get('detail')}", file=sys.stderr)
+        return 1
+
+    print("Handoff scheduled — will execute after current turn completes")
+    return 0
