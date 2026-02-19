@@ -97,7 +97,8 @@ becomes `IDLE` and stays stale between dispatches.
 
 ## Root Cause 2: Double Notification per Completion (Structural Redundancy)
 
-Every completion of a dispatched agent sends **two** signals to the EM:
+In **non-#182 paths** (when the agent does not `sm send` back to its dispatcher within 30s),
+completion of a dispatched agent sends **two** signals to the EM:
 
 ```
 t=258s  Scout Stop hook fires
@@ -108,20 +109,22 @@ t=260s  _watch_for_idle polls (Phase 1 now sees is_idle=True)
           → "[sm wait] scout is now idle (waited 258s)" → EM
 ```
 
-**Evidence from logs (log-20260204-100039.log):**
+**Evidence from runtime logs (observed, not checked-in artifacts):**
 ```
 10:04:56,848 - Sent stop notification to 2837e40d (recipient: 76ea0dfc)
 10:04:58,093 - Watch 7dc28726df09: 76ea0dfc idle after 258s
 ```
 
-The stop notification and `sm wait` notification fire within 2 seconds of each other, **every
-single time** an agent completes. Both are technically correct, but both reaching EM is redundant.
+Both signals fire within 2 seconds of each other. Both are technically correct, but redundant.
 
-The EM protocol acknowledges this and says "ignore false idles, wait for sm send" — but this
-means the EM must read, process, and dismiss BOTH signals for every task cycle.
+**Note on #182 suppression**: When the agent recently `sm send`-ed to the same dispatcher
+(within 30s), `mark_session_idle()` lines 343-360 suppress the stop notification. In those
+cases EM receives only the `sm wait` idle — one signal. The double notification is limited to
+non-#182 paths where the agent completes silently (no `sm send` back). For a scout doing a
+silent investigation (no outgoing `sm send` during the task), both signals reach EM.
 
 This double-notification happens independently of RCA #1 (Phase 3). Even with Phase 3 fixed,
-the stop notification + `sm wait` idle still both fire on correct completion.
+the stop notification + `sm wait` idle still both fire in non-#182 completion paths.
 
 ---
 
@@ -172,12 +175,12 @@ itself, since it already has access to `self.session_manager`:
 # message_queue.py: mark_session_active()
 def mark_session_active(self, session_id: str):
     """Mark a session as active (not idle)."""
+    from .models import SessionStatus  # import before use — avoids UnboundLocalError
     state = self._get_or_create_state(session_id)
     state.is_idle = False
     # Sync session.status with in-memory state to prevent Phase 3 false positives (#191)
     session = self.session_manager.get_session(session_id)
     if session and session.status != SessionStatus.STOPPED:
-        from .models import SessionStatus
         session.status = SessionStatus.RUNNING
     logger.debug(f"Session {session_id} marked active")
 ```
@@ -197,29 +200,40 @@ positives because `session.status` will be correct after urgent delivery.
 
 ### Fix 2: Suppress Redundant `sm wait` Idle When Stop Notification Already Fired (addresses RCA 2)
 
-Track that a stop notification was sent for a session, and suppress the subsequent `sm wait`
-idle notification if it fires within a short window (e.g., 10s):
+Track per-watcher that a stop notification was already sent for this specific (target, watcher)
+pair, and suppress the subsequent `sm wait` idle if it fires within a short window (e.g., 10s).
+
+**Scoping requirement**: suppression must be watcher-aware. Multiple callers can watch the same
+target simultaneously — a target-level timestamp would incorrectly suppress `sm wait` idle for
+watchers that never received the stop notification (which only goes to `stop_notify_sender_id`).
+
+Implementation: record the (target, watcher) pair + timestamp in `_send_stop_notification`,
+and check it in `_watch_for_idle` using the task-local `watcher_session_id`:
+
+```python
+# message_queue.py: _send_stop_notification()
+# Record that this watcher received the stop notification for this target
+key = (recipient_session_id, sender_session_id)  # (target, watcher)
+self._recent_stop_notifications[key] = datetime.now()
+```
 
 ```python
 # message_queue.py: _watch_for_idle(), before queueing notification
 if is_idle:
-    state = self.delivery_states.get(target_session_id)
-    recent_stop = (
-        state and state.last_stop_notification_at
-        and (datetime.now() - state.last_stop_notification_at).total_seconds() < 10
-    )
-    if recent_stop:
-        logger.info(f"Watch {watch_id}: suppressing idle notification — stop already sent <10s ago")
+    key = (target_session_id, watcher_session_id)
+    stop_at = self._recent_stop_notifications.get(key)
+    if stop_at and (datetime.now() - stop_at).total_seconds() < 10:
+        logger.info(f"Watch {watch_id}: suppressing idle — stop already sent to this watcher <10s ago")
+        self._recent_stop_notifications.pop(key, None)
         return
     # ... else queue notification
 ```
 
-And in `_send_stop_notification`, record the timestamp:
-```python
-state.last_stop_notification_at = datetime.now()
-```
+`_recent_stop_notifications: Dict[Tuple[str, str], datetime]` is an in-memory dict (no
+persistence needed — 10s window is too short for crash recovery to matter).
 
-This prevents the second (redundant) signal from reaching EM on normal completion.
+This prevents the second (redundant) signal from reaching EM on normal completion while
+correctly delivering to any additional watchers who did not receive the stop notification.
 
 **Trade-off**: If `sm wait` is being used as a BACKUP (in case stop notification fails), this
 suppression would hide the backup signal. Given that stop notification uses the same `important`
