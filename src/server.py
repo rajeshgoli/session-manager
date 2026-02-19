@@ -243,6 +243,8 @@ def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = Fa
         if state:
             state.stop_notify_sender_id = None
             state.stop_notify_sender_name = None
+            state.last_outgoing_sm_send_target = None
+            state.last_outgoing_sm_send_at = None
 
 
 def create_app(

@@ -511,3 +511,105 @@ async def test_important_mode_records_outgoing_target():
         assert sender_state is not None
         assert sender_state.last_outgoing_sm_send_target == "em-001"
         assert sender_state.last_outgoing_sm_send_at is not None
+
+
+# ============================================================================
+# Regression: invalidate_session_cache clears stale sm send recording (#182)
+# ============================================================================
+
+
+def test_invalidate_cache_clears_stale_sm_send_recording(message_queue):
+    """
+    Scenario: agent sm-sends → EM clears → EM resends → agent completes
+    without sm send within 30s.
+
+    Without the fix, the stale last_outgoing_sm_send_target from the first
+    cycle would cause false suppression on the second cycle's stop hook.
+
+    _invalidate_session_cache must clear both new fields alongside
+    stop_notify_sender_id to prevent this.
+    """
+    from src.server import _invalidate_session_cache
+    from unittest.mock import Mock
+
+    app = Mock()
+    app.state.last_claude_output = {}
+    app.state.pending_stop_notifications = set()
+
+    # Wire app's queue_mgr to real MessageQueueManager
+    app.state.session_manager = Mock()
+    app.state.session_manager.message_queue_manager = message_queue
+
+    agent_id = "agent-cycle"
+    em_id = "em-parent"
+
+    # === Cycle 1: agent sm-sends to EM ===
+    state = message_queue._get_or_create_state(agent_id)
+    state.stop_notify_sender_id = em_id
+    state.stop_notify_sender_name = "em-session"
+    state.last_outgoing_sm_send_target = em_id
+    state.last_outgoing_sm_send_at = datetime.now()
+
+    # Verify suppression would fire (cycle 1 happy path)
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(agent_id, from_stop_hook=True)
+        mock_notify.assert_not_called()  # suppressed as expected
+
+    # === EM clears the agent (sm clear) ===
+    # arm_skip=True increments stop_notify_skip_count to absorb /clear stop hook
+    _invalidate_session_cache(app, agent_id, arm_skip=True)
+
+    # Verify sm send fields were cleared
+    assert state.last_outgoing_sm_send_target is None
+    assert state.last_outgoing_sm_send_at is None
+    assert state.stop_notify_sender_id is None
+    assert state.stop_notify_skip_count == 1
+
+    # /clear stop hook fires and is absorbed by skip_count
+    with patch("asyncio.create_task", noop_create_task):
+        message_queue.mark_session_idle(agent_id, from_stop_hook=True)
+    assert state.stop_notify_skip_count == 0
+
+    # === Cycle 2: EM resends, agent completes WITHOUT sm send ===
+    # Delivery sets stop_notify_sender_id but agent does NOT sm send back
+    state.stop_notify_sender_id = em_id
+    state.stop_notify_sender_name = "em-session"
+    # last_outgoing_sm_send_target remains None (no sm send in cycle 2)
+
+    with patch("asyncio.create_task", noop_create_task), \
+         patch.object(message_queue, "_send_stop_notification") as mock_notify:
+        message_queue.mark_session_idle(agent_id, from_stop_hook=True)
+
+        # Stop notification MUST fire (no sm send in this cycle)
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args[1]["sender_session_id"] == em_id
+
+
+def test_invalidate_cache_arm_skip_false_also_clears_sm_send_fields():
+    """
+    _invalidate_session_cache with arm_skip=False (codex-app /clear path)
+    also clears last_outgoing_sm_send_target and last_outgoing_sm_send_at.
+    """
+    from src.server import _invalidate_session_cache
+    from unittest.mock import Mock
+
+    app = Mock()
+    app.state.last_claude_output = {}
+    app.state.pending_stop_notifications = set()
+
+    queue_mgr = Mock()
+    queue_mgr.delivery_states = {}
+    app.state.session_manager = Mock()
+    app.state.session_manager.message_queue_manager = queue_mgr
+
+    session_id = "codex-app-182"
+    state = SessionDeliveryState(session_id=session_id)
+    state.last_outgoing_sm_send_target = "em-parent"
+    state.last_outgoing_sm_send_at = datetime.now()
+    queue_mgr.delivery_states[session_id] = state
+
+    _invalidate_session_cache(app, session_id)  # arm_skip=False
+
+    assert state.last_outgoing_sm_send_target is None
+    assert state.last_outgoing_sm_send_at is None
