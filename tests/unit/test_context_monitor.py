@@ -459,6 +459,56 @@ class TestRegistrationGate:
         assert resp.json()["status"] == "ok"
         assert mock_session_manager.message_queue_manager.queue_message.called
 
+    def test_compaction_bypasses_gate_when_not_registered(self, mock_session_manager, session):
+        """Compaction event returns compaction_logged even when context_monitor_enabled=False (#210)."""
+        session.context_monitor_enabled = False
+        session.context_monitor_notify = None
+        session.parent_session_id = None
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = _post_event(client, session.id, event="compaction", trigger="auto")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "compaction_logged"
+
+    def test_compaction_notifies_parent_when_monitor_disabled(self, mock_session_manager, session):
+        """When context_monitor_enabled=False, compaction falls back to parent_session_id (#210)."""
+        session.context_monitor_enabled = False
+        session.context_monitor_notify = None
+        session.parent_session_id = "parent-abc"
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_event(client, session.id, event="compaction", trigger="auto")
+
+        queue_mgr = mock_session_manager.message_queue_manager
+        assert queue_mgr.queue_message.called
+        call_kwargs = queue_mgr.queue_message.call_args[1]
+        assert call_kwargs["target_session_id"] == "parent-abc"
+        assert "Compaction fired" in call_kwargs["text"] or "compaction" in call_kwargs["text"].lower()
+
+    def test_warning_still_gated_when_monitor_disabled(self, mock_session_manager, session):
+        """Warning/critical usage events still gated behind context_monitor_enabled (#206, #210)."""
+        session.context_monitor_enabled = False
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = _post_context(client, session.id, used_pct=65)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert not mock_session_manager.message_queue_manager.queue_message.called
+
+    def test_critical_still_gated_when_monitor_disabled(self, mock_session_manager, session):
+        """Critical threshold event still gated behind context_monitor_enabled (#206, #210)."""
+        session.context_monitor_enabled = False
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = _post_context(client, session.id, used_pct=80)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert not mock_session_manager.message_queue_manager.queue_message.called
+
 
 # ---------------------------------------------------------------------------
 # 9. Notification routing (#206)

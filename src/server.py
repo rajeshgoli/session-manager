@@ -2373,13 +2373,11 @@ Or continue working if not done yet."""
         if not session:
             return {"status": "unknown_session"}
 
-        # Gate: skip unregistered sessions (#206)
-        if not session.context_monitor_enabled:
-            return {"status": "not_registered"}
-
         queue_mgr = app.state.session_manager.message_queue_manager
 
         # Handle compaction event (from PreCompact hook)
+        # Compaction = context loss — always process, bypasses registration gate (#210).
+        # Warning/critical/usage events remain opt-in via context_monitor_enabled (#206).
         if data.get("event") == "compaction":
             trigger = data.get("trigger", "unknown")
             logger.warning(
@@ -2392,18 +2390,24 @@ Or continue working if not done yet."""
             # warning at 50% = 100K — overlap is possible).
             session._context_warning_sent = False
             session._context_critical_sent = False
-            # Notify via context_monitor_notify (#206)
-            if session.context_monitor_notify and queue_mgr:
+            # Notify via context_monitor_notify; fall back to parent_session_id so
+            # unregistered children still alert their parent on context loss (#210).
+            notify_target = session.context_monitor_notify or session.parent_session_id
+            if notify_target and queue_mgr:
                 msg = (
                     f"[sm context] Compaction fired for {session.friendly_name or session_id}. "
                     "Context was lost."
                 )
                 queue_mgr.queue_message(
-                    target_session_id=session.context_monitor_notify,
+                    target_session_id=notify_target,
                     text=msg,
                     delivery_mode="sequential",
                 )
             return {"status": "compaction_logged"}
+
+        # Gate: skip unregistered sessions for usage/warning/critical events (#206)
+        if not session.context_monitor_enabled:
+            return {"status": "not_registered"}
 
         # Handle manual /clear event (from SessionStart clear hook)
         if data.get("event") == "context_reset":
