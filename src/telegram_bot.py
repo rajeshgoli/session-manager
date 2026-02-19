@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from typing import Optional, Callable, Awaitable
 import httpx
 
@@ -127,6 +128,8 @@ class TelegramBot:
         self.office_automate_url = office_automate_url or "http://192.168.5.140:8080"
         self.application: Optional[Application] = None
         self.bot: Optional[Bot] = None
+        self._last_get_updates_ts: float = 0.0
+        self._health_monitor_task: Optional[asyncio.Task] = None
 
         # Callbacks for session operations
         self._on_new_session: Optional[Callable[[int, str], Awaitable[Optional[Session]]]] = None
@@ -1566,15 +1569,66 @@ Provide ONLY the summary, no preamble or questions."""
         # Handle regular messages (for replies) - include commands so /clear, /compact, etc can be sent as input
         self.application.add_handler(MessageHandler(filters.TEXT, self._handle_message))
 
+        # Wrap bot.get_updates to track last successful poll timestamp
+        _original_get_updates = self.application.bot.get_updates
+
+        async def _tracked_get_updates(*args, **kwargs):
+            result = await _original_get_updates(*args, **kwargs)
+            self._last_get_updates_ts = time.monotonic()
+            return result
+
+        self.application.bot.get_updates = _tracked_get_updates
+
         # Start polling
         await self.application.initialize()
         await self.application.start()
-        await self.application.updater.start_polling()
+        self._last_get_updates_ts = time.monotonic()
+        await self._start_polling()
+
+        # Start background health monitor
+        self._health_monitor_task = asyncio.create_task(
+            self._polling_health_monitor(),
+            name="polling-health-monitor",
+        )
 
         logger.info("Telegram bot started")
 
+    async def _start_polling(self) -> None:
+        """Start updater polling with explicit timeout parameters."""
+        await self.application.updater.start_polling(
+            poll_interval=0.0,
+            timeout=10,
+            read_timeout=15,
+            write_timeout=5,
+            connect_timeout=5,
+            pool_timeout=5,
+            drop_pending_updates=False,
+        )
+
+    async def _polling_health_monitor(self) -> None:
+        """Monitor getUpdates polling health and restart the updater if stalled."""
+        while True:
+            await asyncio.sleep(30)
+            elapsed = time.monotonic() - self._last_get_updates_ts
+            if elapsed > 45:
+                logger.warning(f"getUpdates stalled for {elapsed:.0f}s, restarting updater")
+                try:
+                    await self.application.updater.stop()
+                    self._last_get_updates_ts = time.monotonic()
+                    await self._start_polling()
+                    logger.info("Updater restarted after polling stall")
+                except Exception as e:
+                    logger.error(f"Error restarting updater after stall: {e}")
+
     async def stop(self):
         """Stop the bot."""
+        if self._health_monitor_task and not self._health_monitor_task.done():
+            self._health_monitor_task.cancel()
+            try:
+                await self._health_monitor_task
+            except asyncio.CancelledError:
+                pass
+
         if self.application:
             await self.application.updater.stop()
             await self.application.stop()
