@@ -142,7 +142,7 @@ Tested with `tmux capture-pane -p` across multiple active sessions. Only shows p
 
 Tool call count varies too widely across sessions (25–1500 turns before compaction). Useful only as defense-in-depth if all other signals fail.
 
-## Recommended Design: Three-Layer Context Monitor
+## Recommended Design: Four-Layer Context Monitor
 
 ### Layer 1: Status Line (Primary — Proactive Warning)
 
@@ -179,6 +179,24 @@ sm sends urgent notification to parent session / user
 
 **Why reset flags here, not in the status line handler:** Post-compaction context can land anywhere between 55K–110K tokens. With a 200K window and warning at 50% (100K), the post-compaction percentage may remain above 50%. Resetting flags in the `used_pct < warning_pct` branch is unreliable — it fails whenever compaction leaves context above the warning threshold. PreCompact is the reliable reset point: it fires on every compaction, always before context is refreshed. Flags reset here re-arm warnings correctly for the next accumulation cycle.
 
+### Layer 2b: SessionStart `clear` Hook (Flag Reset for Manual /clear)
+
+Manual `/clear` (typed in the TUI or triggered by `sm clear`) does NOT fire PreCompact. Without a separate hook, flags stay set after `/clear` and suppress all warnings in the new cycle, breaking "one-shot per cycle" semantics.
+
+```
+Agent or user types /clear in Claude Code TUI
+    ↓
+Claude Code fires SessionStart with source="clear"
+    ↓
+Hook script POSTs {session_id, event: "context_reset"} to sm server
+    ↓
+sm resets _context_warning_sent and _context_critical_sent flags
+    ↓
+New cycle starts with warnings re-armed
+```
+
+**Coverage:** `SessionStart source="clear"` fires for both TUI `/clear` AND `sm clear` CLI (the CLI calls `/sessions/{id}/clear` which sends `/clear` to the tmux pane, which triggers SessionStart). One hook covers both paths.
+
 ### Layer 3: SessionStart `compact` (Recovery — Post-Compaction)
 
 If compaction fires despite warnings, recover gracefully:
@@ -206,7 +224,8 @@ Based on empirical data (context_window_size=200K):
 | Warning | 50% | 100K | Sequential reminder: consider handoff (one-shot per cycle) |
 | Critical | 65% | 130K | Urgent: write handoff doc NOW (one-shot per cycle) |
 | Compaction | 80-85% | ~160K | PreCompact fires — resets flags, notifies parent |
-| Post-compaction | 55%–110K tokens typical | variable | Flags already reset by PreCompact; new cycle starts |
+| Post-compaction | variable | 55K–110K tokens typical | Flags already reset by PreCompact; new cycle starts |
+| After /clear | variable | any | Flags reset by SessionStart clear hook; new cycle starts |
 
 These are configurable via sm config. Default values are conservative.
 
@@ -300,7 +319,45 @@ fi
 exit 0
 ```
 
-#### 4. SessionStart compact recovery hook
+#### 4. SessionStart clear hook (merge into settings.json hooks)
+
+**Merge** the following into the `SessionStart` array in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session_clear_notify.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`session_clear_notify.sh`:
+```bash
+#!/bin/bash
+SM_SESSION_ID="${CLAUDE_SESSION_MANAGER_ID}"
+
+if [ -n "$SM_SESSION_ID" ]; then
+  # Notify sm that context was manually cleared — re-arms one-shot warning flags
+  # sm server only listens on 127.0.0.1 — localhost-only trusted call
+  curl -s --max-time 0.5 -X POST http://localhost:8420/hooks/context-usage \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg sid "$SM_SESSION_ID" '{session_id: $sid, event: "context_reset"}')" \
+    >/dev/null 2>&1
+fi
+exit 0
+```
+
+#### 5. SessionStart compact recovery hook
 
 **Merge** into the `hooks` section of `~/.claude/settings.json`:
 
@@ -380,6 +437,14 @@ async def hook_context_usage(request: Request):
                 delivery_mode="sequential",
             )
         return {"status": "compaction_logged"}
+
+    # Handle manual /clear event (from SessionStart clear hook)
+    if data.get("event") == "context_reset":
+        # Re-arm one-shot flags so warnings fire correctly in the new cycle.
+        # Covers: TUI /clear and sm clear CLI (both trigger SessionStart source=clear).
+        session._context_warning_sent = False
+        session._context_critical_sent = False
+        return {"status": "flags_reset"}
 
     # Handle context usage update
     used_pct = data.get("used_percentage", 0)
@@ -503,6 +568,7 @@ If sm is reconfigured to listen on a non-loopback interface, hook scripts should
    - Warning flag fires once at 50%, suppressed on repeat calls at same percentage
    - Critical flag fires once at 65%, suppressed on repeat
    - Both flags reset on `event == "compaction"` — even if post-compaction `used_pct` would be above `warning_pct` (test with simulated 55% post-compaction)
+   - Both flags reset on `event == "context_reset"` (manual /clear)
    - Flags reset when `_execute_handoff` runs (sm#196 coordination)
    - **Anti-regression:** Flags NOT reset by `used_pct < warning_pct` in status line updates — verify this path no longer exists
 3. **Integration test:** Configure status line, run a session, verify `tokens_used` updates on Session model.
@@ -511,6 +577,7 @@ If sm is reconfigured to listen on a non-loopback interface, hook scripts should
    - Warning message delivered at 50% (once, not on every update)
    - Critical message delivered at 65% (once)
    - PreCompact notification logged if compaction fires
+   - After `/clear`, warning fires again at next 50% crossing (flags re-armed)
 5. **Edge cases:**
    - `used_percentage` is null (before first API call)
    - Session not tracked by sm (no `CLAUDE_SESSION_MANAGER_ID`)
@@ -518,15 +585,16 @@ If sm is reconfigured to listen on a non-loopback interface, hook scripts should
    - Multiple rapid status line updates (one-shot flags prevent duplicate messages)
    - Post-compaction recovery with `last_handoff_path` set (re-injects doc)
    - Post-compaction recovery with no prior handoff (no output, exits cleanly)
+   - `/clear` after warning sent: verify next 50% crossing sends warning again
 
 ## Ticket Classification
 
 Single ticket. One engineer can implement:
 1. Status line script + settings.json config
-2. PreCompact + SessionStart hook scripts
+2. PreCompact + SessionStart (clear + compact) hook scripts
 3. Server `/hooks/context-usage` endpoint
 4. Threshold checking and message delivery
-5. One-shot flag reset logic
+5. One-shot flag reset logic (compaction + clear paths)
 
 The sm#196 handoff mechanism (what happens when the agent runs `sm handoff`) is a separate ticket. Required coordination work is split:
 - sm#196: add `last_handoff_path` to `Session` model, set in `_execute_handoff`, reset context flags
