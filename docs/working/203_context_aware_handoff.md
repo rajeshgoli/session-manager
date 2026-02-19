@@ -6,35 +6,97 @@ Long-running agents (especially EM) accumulate context until compaction fires. C
 
 ## Investigation Summary
 
-Five approaches were tested empirically. Only one is viable.
+Six approaches were evaluated. Three official Claude Code mechanisms were discovered that, combined, provide a complete solution.
 
-### Approach 1: Official Hook or API — NOT AVAILABLE
+### Approach 1: Status Line API — AVAILABLE, RECOMMENDED PRIMARY
 
-Tested exhaustively:
+Claude Code supports a `statusLine` setting in `~/.claude/settings.json` that runs a shell command and pipes full context window data via stdin as JSON:
 
-| Signal | Result |
-|--------|--------|
-| Hook payload fields | Only: `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, `tool_response`, `tool_use_id`. **No context/token fields.** |
-| Environment variables | Only `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT=cli`, `CLAUDE_SESSION_MANAGER_ID`. **No context info.** |
-| CLI command | `claude --help` exposes no context query command. |
-| Compaction hook event | Not available. Only PreToolUse, PostToolUse, Stop, Notification, SubagentStart, SubagentStop. |
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh",
+    "padding": 2
+  }
+}
+```
 
-**Verdict:** Claude Code exposes no official mechanism for context usage.
+The stdin JSON includes (confirmed fields):
 
-### Approach 2: Tmux Status Bar Scraping — FRAGILE, NOT RECOMMENDED
+```json
+{
+  "session_id": "abc123",
+  "transcript_path": "/path/to/transcript.jsonl",
+  "context_window": {
+    "total_input_tokens": 15234,
+    "total_output_tokens": 4521,
+    "context_window_size": 200000,
+    "used_percentage": 8,
+    "remaining_percentage": 92,
+    "current_usage": {
+      "input_tokens": 8500,
+      "output_tokens": 1200,
+      "cache_creation_input_tokens": 5000,
+      "cache_read_input_tokens": 2000
+    }
+  },
+  "exceeds_200k_tokens": false,
+  "cost": {
+    "total_cost_usd": 0.01234,
+    "total_duration_ms": 45000
+  },
+  "model": { "id": "claude-opus-4-6", "display_name": "Opus" }
+}
+```
 
-Tested with `tmux capture-pane -p` across multiple active sessions:
+**Key fields:** `used_percentage`, `remaining_percentage`, `context_window_size` — pre-calculated by Claude Code.
 
-- Per-turn token counts appear (e.g., "↓ 1.9k tokens") but this is **output tokens for the current turn**, not total context.
-- Context percentage does NOT reliably appear in the TUI. It only shows when Claude Code chooses to display it (inconsistent).
-- Requires ANSI escape sequence parsing (`-e` flag).
-- Layout changes across Claude Code versions would break parsing.
+**Update frequency:** After each assistant message, on permission mode change, or vim mode toggle. Debounced at 300ms.
 
-**Verdict:** Unreliable. Cannot be used as a primary signal.
+**Caveats:** `used_percentage`, `remaining_percentage`, and `current_usage` may be `null` before the first API call.
 
-### Approach 3: Transcript File Monitoring — RECOMMENDED
+**Verdict:** Official, documented, pre-calculated context percentages. Best primary signal.
 
-**Key discovery:** The transcript JSONL file (path available in hook payload as `transcript_path`) contains `assistant` records with full API usage data:
+### Approach 2: PreCompact Hook — AVAILABLE, COMPACTION SAFETY NET
+
+Claude Code exposes a `PreCompact` hook event that fires before compaction:
+
+```json
+{
+  "hook_event_name": "PreCompact",
+  "trigger": "auto",
+  "custom_instructions": "",
+  "session_id": "abc123",
+  "transcript_path": "/path/to/transcript.jsonl"
+}
+```
+
+Matchers: `auto` (context window full) or `manual` (`/compact` command).
+
+**Cannot block compaction** — exit code 2 only shows stderr to user.
+
+**Verdict:** Direct compaction signal. Use as "last chance" notification — if handoff was too late, at least we know compaction happened.
+
+### Approach 3: SessionStart `compact` matcher — POST-COMPACTION RECOVERY
+
+`SessionStart` fires after compaction with `source: "compact"`:
+
+```json
+{
+  "hook_event_name": "SessionStart",
+  "source": "compact",
+  "model": "claude-sonnet-4-6"
+}
+```
+
+SessionStart hooks can inject `additionalContext` via JSON output — the documented pattern for "re-inject context after compaction."
+
+**Verdict:** Use as last-resort recovery — inject handoff doc content into post-compaction context.
+
+### Approach 4: Transcript File Monitoring — AVAILABLE, ALTERNATIVE
+
+The transcript JSONL file (path in hook payload as `transcript_path`) contains `assistant` records with full API usage data:
 
 ```json
 {
@@ -50,9 +112,7 @@ Tested with `tmux capture-pane -p` across multiple active sessions:
 }
 ```
 
-**Total context size = `input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`**
-
-This is the full prompt/context sent to the API on each turn.
+**Total context = `input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`**
 
 #### Compaction threshold data (from 30+ real sessions)
 
@@ -64,192 +124,240 @@ This is the full prompt/context sent to the API on each turn.
 | Session with 6 compactions | Threshold varied between 106K–144K |
 | Session with 29 compactions | Max 154K per cycle |
 
-#### Compaction detection
+Compaction creates a `summary` type record in the transcript.
 
-Compaction creates a `summary` type record in the transcript:
+**Verdict:** Reliable but requires file I/O on large files. Use as cross-check for status line data.
 
-```json
-{
-  "type": "summary",
-  "summary": "Debugging double warmup issue with trace script",
-  "leafUuid": "685843a1-02c1-4c2c-a11d-14f54c13acd8"
-}
-```
+### Approach 5: Tmux Status Bar Scraping — FRAGILE, NOT RECOMMENDED
 
-**Verdict:** Reliable, deterministic, based on actual API token counts. The data already exists — we just need to read it.
+Tested with `tmux capture-pane -p` across multiple active sessions. Only shows per-turn tokens, not total context. Requires ANSI parsing. Breaks across versions.
 
-### Approach 4: Heuristic (dispatch count / elapsed time) — USEFUL AS FALLBACK
+**Verdict:** Rejected.
 
-Session data analysis (top sessions by tool call count):
+### Approach 6: Heuristic (dispatch count / elapsed time) — FALLBACK ONLY
 
-| Session | Tool Calls | Duration (min) | Max Tokens |
-|---------|-----------|----------------|------------|
-| em-1615 | 69,362 | 14,358 | — |
-| scout-gt-nav-status | 54,757 | 28,461 | — |
-| architect-1624 | 44,678 | 12,855 | — |
+Tool call count varies too widely across sessions (25–1500 turns before compaction). Useful only as defense-in-depth if all other signals fail.
 
-Tool call count varies too widely to set a reliable threshold. But as a fallback (when transcript parsing fails), counting PostToolUse events per session is reasonable.
+## Recommended Design: Three-Layer Context Monitor
 
-**Verdict:** Useful as defense-in-depth, not as primary signal.
+### Layer 1: Status Line (Primary — Proactive Warning)
 
-### Approach 5: Defensive Handoff on Compaction — LAST RESORT
-
-Compaction IS detectable via `summary` records in the transcript. But by the time compaction fires, context is already lost. This approach is reactive, not proactive.
-
-**Verdict:** Keep as last-resort safety net, but prevent compaction rather than detect it.
-
-## Recommended Design: Transcript-Based Context Monitor
-
-### Architecture
+A status line script runs after every assistant message and reports context usage to sm:
 
 ```
-PostToolUse hook fires
+Claude Code calls statusline script (after each assistant message)
     ↓
-Existing log_tool_use.sh forwards to sm server
+Script reads context_window JSON from stdin
     ↓
-sm server reads transcript_path from hook payload
+POSTs {session_id, used_percentage, total_tokens} to sm server
     ↓
-Parse last assistant record for usage.{input_tokens, cache_creation_input_tokens, cache_read_input_tokens}
+sm server stores in Session.tokens_used
     ↓
-Compute total_context = sum of above
+If used_percentage > warning_pct → send context warning to agent
+If used_percentage > critical_pct → send urgent handoff trigger
+```
+
+### Layer 2: PreCompact Hook (Safety Net — Last Chance)
+
+If the agent ignores warnings and compaction is imminent:
+
+```
+PreCompact hook fires (trigger=auto)
     ↓
-Store in Session.tokens_used (field already exists)
+Hook script POSTs {session_id, event: "compaction_imminent"} to sm server
     ↓
-If total_context > warning_threshold → emit context_warning event
-If total_context > critical_threshold → trigger handoff (sm#196)
+sm logs warning: "Compaction triggered — handoff was too late"
+    ↓
+sm sends urgent notification to parent session / user
+```
+
+### Layer 3: SessionStart `compact` (Recovery — Post-Compaction)
+
+If compaction fires despite warnings, recover gracefully:
+
+```
+SessionStart fires with source=compact
+    ↓
+Hook script checks if handoff doc exists for this session
+    ↓
+If yes: outputs additionalContext with handoff doc content
+    ↓
+Agent resumes with handoff context injected
 ```
 
 ### Thresholds
 
-Based on empirical data:
+Based on empirical data (context_window_size=200K):
 
-| Threshold | Tokens | Rationale |
-|-----------|--------|-----------|
-| Warning | 100K | ~60% of typical compaction point. Agent gets a reminder. |
-| Critical | 130K | ~80% of typical compaction point. Trigger handoff. |
+| Threshold | used_percentage | Tokens (~) | Action |
+|-----------|----------------|------------|--------|
+| Warning | 50% | 100K | Sequential reminder: consider handoff |
+| Critical | 65% | 130K | Urgent: write handoff doc NOW |
+| Compaction | 80-85% | ~160K | PreCompact fires — too late for clean handoff |
 
-These are configurable via sm config. Default values are conservative — better to handoff early than lose context.
+These are configurable via sm config. Default values are conservative.
 
 ### Implementation
 
-#### 1. Extend the PostToolUse handler in `server.py`
+#### 1. Status line script (`~/.claude/hooks/context_monitor.sh`)
 
-After logging the tool use, check context usage:
+```bash
+#!/bin/bash
+# Status line script — receives context JSON from Claude Code via stdin
+INPUT=$(cat)
 
-```python
-# In hook_tool_use handler, after logging:
-if hook_type == "PostToolUse" and session:
-    transcript_path = data.get("transcript_path")
-    if transcript_path:
-        tokens = await read_transcript_tokens(transcript_path)
-        if tokens:
-            session.tokens_used = tokens
-            # Check thresholds
-            config = app.state.config.get("context_monitor", {})
-            warning = config.get("warning_threshold", 100_000)
-            critical = config.get("critical_threshold", 130_000)
+# Extract context data
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+USED_PCT=$(echo "$INPUT" | jq -r '.context_window.used_percentage // 0')
+TOTAL_INPUT=$(echo "$INPUT" | jq -r '.context_window.total_input_tokens // 0')
+TOTAL_OUTPUT=$(echo "$INPUT" | jq -r '.context_window.total_output_tokens // 0')
+CONTEXT_SIZE=$(echo "$INPUT" | jq -r '.context_window.context_window_size // 200000')
 
-            if tokens >= critical:
-                await trigger_context_handoff(session)
-            elif tokens >= warning:
-                await send_context_warning(session, tokens)
+# Map Claude session_id to sm session_id via env var
+SM_SESSION_ID="${CLAUDE_SESSION_MANAGER_ID}"
+
+if [ -n "$SM_SESSION_ID" ] && [ "$USED_PCT" != "null" ] && [ "$USED_PCT" != "0" ]; then
+  # Post to sm server (non-blocking, short timeout)
+  curl -s --max-time 0.5 -X POST http://localhost:8420/hooks/context-usage \
+    -H "Content-Type: application/json" \
+    -d "{\"session_id\": \"$SM_SESSION_ID\", \"used_percentage\": $USED_PCT, \"total_input_tokens\": $TOTAL_INPUT, \"total_output_tokens\": $TOTAL_OUTPUT, \"context_window_size\": $CONTEXT_SIZE}" \
+    >/dev/null 2>&1 &
+fi
+
+# Output status line text (displayed in Claude Code TUI)
+echo "${USED_PCT}% ctx"
 ```
 
-#### 2. Transcript reader function
+#### 2. Settings.json configuration
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/hooks/context_monitor.sh"
+  }
+}
+```
+
+#### 3. PreCompact hook (add to settings.json hooks)
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/precompact_notify.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`precompact_notify.sh`:
+```bash
+#!/bin/bash
+INPUT=$(cat)
+SM_SESSION_ID="${CLAUDE_SESSION_MANAGER_ID}"
+TRIGGER=$(echo "$INPUT" | jq -r '.trigger // "unknown"')
+
+if [ -n "$SM_SESSION_ID" ]; then
+  curl -s --max-time 0.5 -X POST http://localhost:8420/hooks/context-usage \
+    -H "Content-Type: application/json" \
+    -d "{\"session_id\": \"$SM_SESSION_ID\", \"event\": \"compaction\", \"trigger\": \"$TRIGGER\"}" \
+    >/dev/null 2>&1
+fi
+exit 0
+```
+
+#### 4. SessionStart compact recovery hook
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/post_compact_recovery.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`post_compact_recovery.sh`:
+```bash
+#!/bin/bash
+INPUT=$(cat)
+SM_SESSION_ID="${CLAUDE_SESSION_MANAGER_ID}"
+HANDOFF_DOC="/tmp/claude-sessions/${SM_SESSION_ID}_handoff.md"
+
+# If a handoff doc exists for this session, inject it as additional context
+if [ -f "$HANDOFF_DOC" ]; then
+  CONTENT=$(cat "$HANDOFF_DOC" | jq -Rs .)
+  echo "{\"additionalContext\": $CONTENT}"
+fi
+```
+
+#### 5. Server endpoint (`/hooks/context-usage`)
 
 ```python
-async def read_transcript_tokens(transcript_path: str) -> Optional[int]:
-    """Read the last assistant record from transcript and return total context tokens."""
-    try:
-        # Read file from end to find last assistant record efficiently
-        # (JSONL files can be large — 400MB+ for long sessions)
-        path = Path(transcript_path)
-        if not path.exists():
-            return None
+@app.post("/hooks/context-usage")
+async def hook_context_usage(request: Request):
+    data = await request.json()
+    session_id = data.get("session_id")
+    session = app.state.session_manager.get_session(session_id) if session_id else None
+    if not session:
+        return {"status": "unknown_session"}
 
-        # Read last 100KB (sufficient to find last assistant record)
-        size = path.stat().st_size
-        read_start = max(0, size - 100_000)
+    # Handle compaction event
+    if data.get("event") == "compaction":
+        logger.warning(f"Compaction fired for {session.friendly_name or session_id} (trigger={data.get('trigger')})")
+        # Notify parent session / user
+        if session.parent_session_id:
+            msg = f"[sm context] Compaction fired for {session.friendly_name or session_id}. Context was lost."
+            await message_queue.deliver(session.parent_session_id, msg, mode=DeliveryMode.SEQUENTIAL)
+        return {"status": "compaction_logged"}
 
-        with open(path, 'r') as f:
-            f.seek(read_start)
-            if read_start > 0:
-                f.readline()  # Skip partial line
+    # Handle context usage update
+    used_pct = data.get("used_percentage", 0)
+    session.tokens_used = data.get("total_input_tokens", 0)
 
-            last_assistant = None
-            for line in f:
-                try:
-                    data = json.loads(line.strip())
-                    if data.get('type') == 'assistant':
-                        usage = data.get('message', {}).get('usage', {})
-                        if usage:
-                            last_assistant = usage
-                except json.JSONDecodeError:
-                    continue
+    config = app.state.config.get("context_monitor", {})
+    warning_pct = config.get("warning_percentage", 50)
+    critical_pct = config.get("critical_percentage", 65)
 
-        if last_assistant:
-            return (
-                last_assistant.get('input_tokens', 0)
-                + last_assistant.get('cache_creation_input_tokens', 0)
-                + last_assistant.get('cache_read_input_tokens', 0)
+    if used_pct >= critical_pct:
+        if not getattr(session, '_context_critical_sent', False):
+            session._context_critical_sent = True
+            msg = (
+                f"[sm context] Context at {used_pct}% — critically high. "
+                "Write your handoff doc NOW and run `sm handoff <path>`. "
+                "Compaction is imminent."
             )
-        return None
-    except Exception as e:
-        logger.error(f"Failed to read transcript tokens: {e}")
-        return None
-```
+            await message_queue.deliver(session.id, msg, mode=DeliveryMode.URGENT)
+    elif used_pct >= warning_pct:
+        if not getattr(session, '_context_warning_sent', False):
+            session._context_warning_sent = True
+            total = data.get("total_input_tokens", 0)
+            msg = (
+                f"[sm context] Context at {used_pct}% ({total:,} tokens). "
+                "Consider writing a handoff doc and running `sm handoff <path>`."
+            )
+            await message_queue.deliver(session.id, msg, mode=DeliveryMode.SEQUENTIAL)
 
-#### 3. Context warning (integrates with sm#188 remind)
-
-When tokens exceed the warning threshold, send a reminder to the agent:
-
-```python
-async def send_context_warning(session, tokens):
-    """Send context usage warning to agent."""
-    pct = int(tokens / 200_000 * 100)  # Approximate % of model context
-    msg = f"[sm context] Context at {tokens:,} tokens (~{pct}%). Consider writing a handoff doc and running `sm handoff <path>`."
-    # Deliver as sequential (non-interrupting) reminder
-    await message_queue.deliver(session.id, msg, mode=DeliveryMode.SEQUENTIAL)
-```
-
-#### 4. Critical handoff trigger (uses sm#196)
-
-When tokens exceed the critical threshold:
-
-```python
-async def trigger_context_handoff(session):
-    """Trigger forced handoff when context is critical."""
-    msg = (
-        "[sm context] Context critically high. "
-        "Write your handoff doc NOW and run `sm handoff <path>`. "
-        "Compaction is imminent."
-    )
-    # Deliver as urgent (interrupting)
-    await message_queue.deliver(session.id, msg, mode=DeliveryMode.URGENT)
-```
-
-Note: We do NOT force-handoff the agent. We send an urgent message telling it to handoff. The agent controls its own handoff timing and content (per sm#196 design). Force-handoff would risk corrupting in-flight work.
-
-### Fallback: Tool call count heuristic
-
-If transcript parsing fails (file doesn't exist, permission error, etc.), fall back to counting PostToolUse events:
-
-```python
-# In Session model, tools_used dict already tracks counts
-total_tool_calls = sum(session.tools_used.values())
-if total_tool_calls > 500:  # Configurable
-    # Send warning via same mechanism
-```
-
-### Compaction detection (safety net)
-
-Monitor transcripts for `summary` records. If one appears, it means compaction already fired despite our warnings. Log this as a failure case and alert:
-
-```python
-# In transcript reader, also check for summary records
-if data.get('type') == 'summary':
-    logger.warning(f"Compaction detected for session {session.id} — handoff was too late")
-    # Could trigger crash-recovery-style restart with handoff doc
+    return {"status": "ok", "used_percentage": used_pct}
 ```
 
 ### Configuration
@@ -257,13 +365,9 @@ if data.get('type') == 'summary':
 ```yaml
 context_monitor:
   enabled: true
-  warning_threshold: 100000    # tokens
-  critical_threshold: 130000   # tokens
-  fallback_tool_count: 500     # tool calls before warning
-  check_frequency: 5           # check every Nth PostToolUse (not every one)
+  warning_percentage: 50       # used_percentage to send warning
+  critical_percentage: 65      # used_percentage to send urgent handoff
 ```
-
-`check_frequency` avoids reading the transcript on every single tool call. Every 5th PostToolUse is sufficient — context doesn't grow that fast between tool calls.
 
 ## Integration Points
 
@@ -271,30 +375,40 @@ context_monitor:
 |---------|-------------|
 | sm#196 (sm handoff) | This ticket provides the trigger; sm#196 provides the mechanism. Agent writes handoff doc, calls `sm handoff`. |
 | sm#188 (sm remind) | Context warnings use the same delivery mechanism as periodic reminders. |
-| Session.tokens_used | Already exists in the model. This ticket populates it with real data. |
-| Session.transcript_path | Already stored. Used to locate the JSONL file. |
-| PostToolUse hook | Already fires and reaches the sm server. Just need to add transcript reading. |
+| Session.tokens_used | Already exists in model. Populated with real data from status line. |
+| Session.transcript_path | Already stored. Available in all hooks. |
+| PreCompact + SessionStart hooks | New hooks added to settings.json. |
 
 ## What This Does NOT Do
 
 - **Force-handoff agents.** The agent controls when and how to handoff.
-- **Prevent compaction.** If the agent ignores warnings, compaction will still fire.
-- **Work for Codex sessions.** Codex has a different architecture. This is Claude Code only.
-- **Add new hooks to Claude Code.** Uses only existing hook payloads and transcript files.
+- **Block compaction.** PreCompact hook cannot block — exit code 2 only shows stderr.
+- **Work for Codex sessions.** Codex has a different architecture. Claude Code only.
+- **Replace sm#196.** This ticket provides the trigger; sm#196 provides the handoff mechanism.
 
 ## Test Plan
 
-1. **Unit test:** Mock transcript JSONL with known token counts. Verify `read_transcript_tokens()` returns correct values.
-2. **Unit test:** Verify threshold comparison triggers correct event (warning vs critical vs none).
-3. **Integration test:** Create a session, inject a mock transcript path, call PostToolUse handler, verify `Session.tokens_used` is updated.
-4. **Manual test:** Run a long session and observe context warnings being delivered at the right time.
+1. **Unit test:** Mock status line JSON input. Verify context_monitor.sh extracts correct fields and POSTs to sm.
+2. **Unit test:** Verify server endpoint threshold logic (warning at 50%, critical at 65%, debounce).
+3. **Integration test:** Configure status line, run a session, verify tokens_used updates on Session model.
+4. **Manual test:** Run a long session and observe:
+   - Status line shows context percentage in TUI
+   - Warning message delivered at 50%
+   - Critical message delivered at 65%
+   - PreCompact notification logged if compaction fires
 5. **Edge cases:**
-   - Transcript file doesn't exist (session just started)
-   - Transcript file is empty
-   - Transcript file is very large (400MB+) — verify tail-reading performance
-   - Multiple rapid PostToolUse events — verify check_frequency throttling
-   - Session with no assistant records yet (only progress records)
+   - `used_percentage` is null (before first API call)
+   - Session not tracked by sm (no CLAUDE_SESSION_MANAGER_ID)
+   - sm server down (status line script should not block)
+   - Multiple rapid status line updates (debounce in server)
+   - Post-compaction recovery with and without handoff doc
 
 ## Ticket Classification
 
-Single ticket. One engineer can implement the transcript reader + threshold checks + message delivery in one session. The sm#196 handoff mechanism is a separate ticket.
+Single ticket. One engineer can implement:
+1. Status line script + settings.json config
+2. PreCompact + SessionStart hook scripts
+3. Server `/hooks/context-usage` endpoint
+4. Threshold checking and message delivery
+
+The sm#196 handoff mechanism (what happens when the agent runs `sm handoff`) is a separate ticket.
