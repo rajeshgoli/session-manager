@@ -204,6 +204,16 @@ class TestCompactionEvent:
         assert call_kwargs["target_session_id"] == "parent999"
         assert "Compaction fired" in call_kwargs["text"] or "compaction" in call_kwargs["text"].lower()
 
+    def test_compaction_notification_wording(self, client, mock_session_manager, session):
+        """Compaction notification says 'compacted — agent is still running', not 'Context was lost'."""
+        session.context_monitor_notify = "parent999"
+        _post_event(client, session.id, event="compaction", trigger="auto")
+
+        queue_mgr = mock_session_manager.message_queue_manager
+        text = queue_mgr.queue_message.call_args[1]["text"]
+        assert "Context was compacted — agent is still running." in text
+        assert "Context was lost" not in text
+
     def test_compaction_no_notify_no_notification(self, client, mock_session_manager, session):
         """Without context_monitor_notify, no notification is sent."""
         session.context_monitor_notify = None

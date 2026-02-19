@@ -2396,7 +2396,7 @@ Or continue working if not done yet."""
             if notify_target and queue_mgr:
                 msg = (
                     f"[sm context] Compaction fired for {session.friendly_name or session_id}. "
-                    "Context was lost."
+                    "Context was compacted — agent is still running."
                 )
                 queue_mgr.queue_message(
                     target_session_id=notify_target,
