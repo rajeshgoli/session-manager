@@ -730,3 +730,104 @@ class TestStatusEndpoint:
         resp = client.get("/sessions/context-monitor")
         assert resp.status_code == 200
         assert resp.json()["monitored"] == []
+
+
+# ---------------------------------------------------------------------------
+# 12. Child-forwarded notifications (#212)
+# ---------------------------------------------------------------------------
+
+
+class TestChildForwardedNotifications:
+    """Child-forwarded alerts use 'Child <name> (<id>)' format, omit handoff instructions."""
+
+    def _make_child_session(self, session_id: str = "abc12345", friendly_name=None) -> object:
+        """Create a session configured as a child being monitored by a parent."""
+        s = _make_session(session_id)
+        s.friendly_name = friendly_name
+        s.context_monitor_notify = "parent-id"
+        return s
+
+    def test_child_critical_contains_friendly_name(self, mock_session_manager):
+        """Child critical message includes the friendly_name when set."""
+        session = self._make_child_session(friendly_name="engineer-abc")
+        mock_session_manager.sessions = {session.id: session}
+        mock_session_manager.get_session.return_value = session
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_context(client, session.id, used_pct=70)
+
+        call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
+        assert "Child" in call_kwargs["text"]
+        assert "engineer-abc" in call_kwargs["text"]
+
+    def test_child_critical_falls_back_to_session_id(self, mock_session_manager):
+        """Child critical message falls back to session.id when friendly_name is None."""
+        session = self._make_child_session(friendly_name=None)
+        mock_session_manager.sessions = {session.id: session}
+        mock_session_manager.get_session.return_value = session
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_context(client, session.id, used_pct=70)
+
+        call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
+        assert "Child" in call_kwargs["text"]
+        assert session.id in call_kwargs["text"]
+
+    def test_child_critical_omits_handoff_instruction(self, mock_session_manager):
+        """Child critical message does not include the handoff instruction."""
+        session = self._make_child_session(friendly_name=None)
+        mock_session_manager.sessions = {session.id: session}
+        mock_session_manager.get_session.return_value = session
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_context(client, session.id, used_pct=70)
+
+        call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
+        assert "Write your handoff doc" not in call_kwargs["text"]
+
+    def test_child_warning_contains_session_label(self, mock_session_manager):
+        """Child warning message includes 'Child' and the session id."""
+        session = self._make_child_session(friendly_name=None)
+        mock_session_manager.sessions = {session.id: session}
+        mock_session_manager.get_session.return_value = session
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_context(client, session.id, used_pct=55)
+
+        call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
+        assert "Child" in call_kwargs["text"]
+        assert session.id in call_kwargs["text"]
+
+    def test_child_warning_omits_handoff_suggestion(self, mock_session_manager):
+        """Child warning message does not include the handoff suggestion."""
+        session = self._make_child_session(friendly_name=None)
+        mock_session_manager.sessions = {session.id: session}
+        mock_session_manager.get_session.return_value = session
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        _post_context(client, session.id, used_pct=55)
+
+        call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
+        assert "Consider writing a handoff" not in call_kwargs["text"]
+
+    def test_self_critical_includes_handoff_instruction(self, mock_session_manager, session):
+        """Self critical alert (context_monitor_notify == session.id) includes handoff instruction."""
+        # session fixture has context_monitor_notify = session.id (self-alert path)
+        _post_context(TestClient(create_app(session_manager=mock_session_manager)), session.id, used_pct=70)
+
+        call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
+        assert "Write your handoff doc" in call_kwargs["text"]
+        assert "Child" not in call_kwargs["text"]
+
+    def test_self_warning_includes_handoff_suggestion(self, mock_session_manager, session):
+        """Self warning alert (context_monitor_notify == session.id) includes handoff suggestion."""
+        _post_context(TestClient(create_app(session_manager=mock_session_manager)), session.id, used_pct=55)
+
+        call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
+        assert "Consider writing a handoff" in call_kwargs["text"]
+        assert "Child" not in call_kwargs["text"]

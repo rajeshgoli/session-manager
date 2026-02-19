@@ -2433,11 +2433,19 @@ Or continue working if not done yet."""
             if not session._context_critical_sent:
                 session._context_critical_sent = True
                 if queue_mgr:
-                    msg = (
-                        f"[sm context] Context at {used_pct}% — critically high. "
-                        "Write your handoff doc NOW and run `sm handoff <path>`. "
-                        "Compaction is imminent."
-                    )
+                    is_self_alert = (session.context_monitor_notify == session.id)
+                    if is_self_alert:
+                        msg = (
+                            f"[sm context] Context at {used_pct}% — critically high. "
+                            "Write your handoff doc NOW and run `sm handoff <path>`. "
+                            "Compaction is imminent."
+                        )
+                    else:
+                        child_label = session.friendly_name or session.id
+                        msg = (
+                            f"[sm context] Child {child_label} ({session.id}) context at {used_pct}% — critically high. "
+                            "Compaction is imminent."
+                        )
                     queue_mgr.queue_message(
                         target_session_id=session.context_monitor_notify,
                         text=msg,
@@ -2447,11 +2455,16 @@ Or continue working if not done yet."""
             if not session._context_warning_sent:
                 session._context_warning_sent = True
                 if queue_mgr:
-                    total = data.get("total_input_tokens", 0)
-                    msg = (
-                        f"[sm context] Context at {used_pct}% ({total:,} tokens). "
-                        "Consider writing a handoff doc and running `sm handoff <path>`."
-                    )
+                    is_self_alert = (session.context_monitor_notify == session.id)
+                    if is_self_alert:
+                        total = data.get("total_input_tokens", 0)
+                        msg = (
+                            f"[sm context] Context at {used_pct}% ({total:,} tokens). "
+                            "Consider writing a handoff doc and running `sm handoff <path>`."
+                        )
+                    else:
+                        child_label = session.friendly_name or session.id
+                        msg = f"[sm context] Child {child_label} ({session.id}) context at {used_pct}%."
                     queue_mgr.queue_message(
                         target_session_id=session.context_monitor_notify,
                         text=msg,
