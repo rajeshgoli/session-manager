@@ -319,6 +319,18 @@ def main():
         help="Session ID to register/deregister; defaults to self",
     )
 
+    # sm em [name]
+    em_parser = subparsers.add_parser(
+        "em",
+        help="EM pre-flight: set name, enable context monitoring, register children",
+    )
+    em_parser.add_argument(
+        "name",
+        nargs="?",
+        default=None,
+        help="Name suffix (sets friendly name to em-<name>)",
+    )
+
     # sm setup [--overwrite]
     setup_parser = subparsers.add_parser(
         "setup",
@@ -472,6 +484,8 @@ def main():
         sys.exit(commands.cmd_handoff(client, session_id, args.file_path))
     elif args.command == "context-monitor":
         sys.exit(commands.cmd_context_monitor(client, session_id, args.action, args.target))
+    elif args.command == "em":
+        sys.exit(commands.cmd_em(client, session_id, args.name))
     elif args.command == "setup":
         sys.exit(commands.cmd_setup(overwrite=args.overwrite))
     elif args.command == "review":

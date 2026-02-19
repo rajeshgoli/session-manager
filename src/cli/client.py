@@ -278,9 +278,9 @@ class SessionManagerClient:
             path += "?" + "&".join(params)
 
         data, success, unavailable = self._request("GET", path)
-        if unavailable:
+        if unavailable or not success:
             return None
-        return data if success else {"children": []}
+        return data
 
     def kill_session(
         self,

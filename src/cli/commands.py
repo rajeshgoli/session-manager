@@ -2353,6 +2353,112 @@ def cmd_context_monitor(
     return 1
 
 
+def cmd_em(
+    client: SessionManagerClient,
+    session_id: Optional[str],
+    name_suffix: Optional[str],
+) -> int:
+    """
+    EM pre-flight: set name, enable context monitoring for self and all children,
+    register periodic remind for all children.
+
+    Args:
+        client: API client
+        session_id: Caller's session ID (must be set)
+        name_suffix: Optional suffix for friendly name (sets to em-<suffix>)
+
+    Exit codes:
+        0: Success (even if some child steps partially failed)
+        1: Invalid name
+        2: Session manager unavailable or no session ID
+    """
+    if not session_id:
+        print("Error: sm em requires a managed session (CLAUDE_SESSION_MANAGER_ID not set)", file=sys.stderr)
+        return 2
+
+    results = []
+    child_success = 0
+    child_fail = 0
+
+    # Step 1: Validate and set name
+    friendly_name = f"em-{name_suffix}" if name_suffix else "em"
+    valid, error = validate_friendly_name(friendly_name)
+    if not valid:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    success, unavailable = client.update_friendly_name(session_id, friendly_name)
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    if success:
+        results.append(f"  Name set: {friendly_name} ({session_id})")
+    else:
+        results.append(f"  Warning: Failed to set name to {friendly_name}")
+
+    # Step 2: Enable self context-monitoring
+    data, success, unavailable = client.set_context_monitor(
+        session_id, enabled=True, requester_session_id=session_id,
+        notify_session_id=session_id,
+    )
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    if success:
+        results.append("  Context monitoring: enabled (notifications → self)")
+    else:
+        results.append("  Warning: Failed to enable self context monitoring")
+
+    # Step 3: List and register children
+    children_data = client.list_children(session_id)
+    if children_data is None:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+
+    children = children_data.get("children", [])
+
+    if not children:
+        results.append("  No existing children found.")
+    else:
+        child_lines = []
+        for child in children:
+            child_id = child["id"]
+            child_name = child.get("friendly_name") or child.get("name") or child_id
+            line_parts = []
+            ok = True
+
+            _, cm_ok, _ = client.set_context_monitor(
+                child_id, enabled=True, requester_session_id=session_id,
+                notify_session_id=session_id,
+            )
+            if cm_ok:
+                line_parts.append("context monitoring enabled")
+            else:
+                line_parts.append("Warning: context monitoring failed")
+                ok = False
+
+            remind_result = client.register_remind(child_id, soft_threshold=180, hard_threshold=300)
+            if remind_result is not None:
+                line_parts.append("remind registered (soft=180s, hard=300s)")
+            else:
+                line_parts.append("remind registration failed")
+                ok = False
+
+            if ok:
+                child_success += 1
+            else:
+                child_fail += 1
+            child_lines.append(f"    {child_name} ({child_id}) → {', '.join(line_parts)}")
+
+        results.append(f"  Children processed: {len(children)} ({child_success} succeeded, {child_fail} failed)")
+        results.extend(child_lines)
+
+    print("EM pre-flight complete:")
+    for line in results:
+        print(line)
+    return 0
+
+
 def cmd_setup(overwrite: bool = False) -> int:
     """Copy default dispatch templates to ~/.sm/dispatch_templates.yaml.
 
