@@ -223,7 +223,13 @@ def parse_dispatch_args(argv: list[str]) -> tuple:
     import argparse
 
     # Phase 1: Parse known static args
-    static_parser = argparse.ArgumentParser(prog="sm dispatch", add_help=False)
+    static_parser = argparse.ArgumentParser(
+        prog="sm dispatch",
+        description=(
+            "Dispatch a template-expanded prompt to a target agent.\n"
+            "Dynamic flags (e.g. --issue, --spec) are derived from the role template."
+        ),
+    )
     static_parser.add_argument("agent_id", help="Target agent ID or friendly name")
     static_parser.add_argument("--role", required=True, help="Role name from template")
     static_parser.add_argument("--dry-run", action="store_true", help="Print expanded template without sending")

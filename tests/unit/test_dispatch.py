@@ -1,5 +1,6 @@
 """Tests for sm dispatch — template-based dispatch with auto-expansion."""
 
+import copy
 import os
 import sys
 import textwrap
@@ -65,7 +66,7 @@ SAMPLE_CONFIG = {
 
 @pytest.fixture
 def sample_config():
-    return SAMPLE_CONFIG.copy()
+    return copy.deepcopy(SAMPLE_CONFIG)
 
 
 @pytest.fixture

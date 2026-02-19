@@ -3,25 +3,26 @@
 import argparse
 import sys
 import os
+from typing import Optional
 
 from .client import SessionManagerClient
 from . import commands
 
 
-def _handle_dispatch(session_id: str) -> int:
+def _handle_dispatch(session_id: Optional[str]) -> int:
     """Handle 'sm dispatch' with two-phase argument parsing.
 
     Intercepts dispatch before the main argparse to support dynamic
     CLI flags derived from role templates. This keeps dynamic parsing
     completely isolated — existing commands retain strict validation.
     """
-    from .dispatch import parse_dispatch_args, DispatchError
+    from .dispatch import parse_dispatch_args
 
     agent_id, role, dry_run, delivery_mode, notify_on_stop, dynamic_params = \
         parse_dispatch_args(sys.argv[2:])
 
     # em_id check: required for send mode, placeholder for dry-run
-    em_id = session_id or os.environ.get("CLAUDE_SESSION_MANAGER_ID")
+    em_id = session_id
     if not em_id and not dry_run:
         print(
             "Error: CLAUDE_SESSION_MANAGER_ID not set. "
@@ -53,6 +54,12 @@ def main():
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+
+    # sm dispatch — pre-intercepted above; stub registered here for visibility in sm --help
+    subparsers.add_parser(
+        "dispatch",
+        help="Dispatch a role template to an agent (see .sm/dispatch_templates.yaml)",
+    )
 
     # sm name <friendly-name> OR sm name <session> <friendly-name>
     name_parser = subparsers.add_parser("name", help="Set friendly name for self or a child session")
