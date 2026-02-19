@@ -129,7 +129,8 @@ codex:
   # Command to launch Codex (CLI + app-server)
   command: "codex"
   # Extra args passed to interactive Codex CLI
-  args: []
+  args:
+    - "--dangerously-bypass-approvals-and-sandbox"
   # Extra args passed to `codex app-server` (override via codex_app_server.* if needed)
   app_server_args: []
   # Default model for Codex turns (optional)
