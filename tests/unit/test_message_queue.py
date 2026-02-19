@@ -950,6 +950,101 @@ class TestWatchForIdlePhases:
         assert "is now idle" in pending[0].text
 
 
+class TestPhase3FalseIdle:
+    """Tests for Phase 3 false idle fix (sm#215 / RCA 1 from spec #191)."""
+
+    def test_mark_session_active_updates_session_status(self, message_queue, mock_session_manager):
+        """mark_session_active() sets session.status=RUNNING to prevent Phase 3 false idle."""
+        session = MagicMock()
+        session.id = "session215"
+        session.status = SessionStatus.IDLE  # stale from Stop hook
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        message_queue.mark_session_active("session215")
+
+        assert session.status == SessionStatus.RUNNING
+
+    def test_mark_session_active_skips_stopped_sessions(self, message_queue, mock_session_manager):
+        """mark_session_active() does not update status for STOPPED sessions."""
+        session = MagicMock()
+        session.id = "session-stopped"
+        session.status = SessionStatus.STOPPED
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        message_queue.mark_session_active("session-stopped")
+
+        assert session.status == SessionStatus.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_watch_no_false_idle_after_urgent_dispatch(self, mock_session_manager, temp_db_path):
+        """Phase 3 does NOT fire false idle after mark_session_active() clears stale status.
+
+        Scenario: session.status=IDLE (stale from previous Stop hook), EM calls
+        mark_session_active() then sm wait. Phase 3 must see RUNNING, not fire false idle.
+        """
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"watch_poll_interval_seconds": 0.01}}},
+            notifier=None,
+        )
+
+        session = MagicMock()
+        session.id = "target215"
+        session.provider = "claude"
+        session.tmux_session = None  # No tmux — Phase 2 skipped, Phase 3 is decisive
+        session.friendly_name = "test-agent"
+        session.name = "claude-agent"
+        session.status = SessionStatus.IDLE  # stale from previous Stop hook
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        # Simulate urgent dispatch: mark_session_active() called before sm wait
+        # After fix: this also sets session.status = RUNNING
+        mq.mark_session_active("target215")
+
+        # _watch_for_idle runs with state.is_idle=False, session.status=RUNNING
+        # Phase 3 sees RUNNING → no false idle → watcher gets timeout
+        await mq._watch_for_idle("watch-215", "target215", "watcher215", timeout_seconds=0.1)
+
+        pending = mq.get_pending_messages("watcher215")
+        assert len(pending) == 1
+        assert "Timeout" in pending[0].text
+
+    @pytest.mark.asyncio
+    async def test_phase3_still_works_after_fix(self, mock_session_manager, temp_db_path):
+        """Phase 3 still detects idle after server restart (no in-memory state, no tmux).
+
+        After server restart, delivery_states are empty. Phase 3 (session.status=IDLE)
+        is the only signal. mark_session_active() was NOT called (server restarted mid-idle),
+        so session.status remains IDLE — Phase 3 should fire correctly.
+        """
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"watch_poll_interval_seconds": 0.01}}},
+            notifier=None,
+        )
+
+        session = MagicMock()
+        session.id = "target215r"
+        session.provider = "claude"
+        session.tmux_session = None  # No tmux — Phase 2 skipped
+        session.friendly_name = "restarted-agent"
+        session.name = "claude-agent"
+        session.status = SessionStatus.IDLE  # correctly IDLE — agent finished before restart
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        # No mark_session_active() — server just restarted, no in-memory state
+        # Phase 1: delivery_states empty → mem_idle=False
+        # Phase 2: no tmux → skipped
+        # Phase 3: session.status=IDLE → idle detected correctly
+        await mq._watch_for_idle("watch-215r", "target215r", "watcher215r", timeout_seconds=5)
+
+        pending = mq.get_pending_messages("watcher215r")
+        assert len(pending) == 1
+        assert "is now idle" in pending[0].text
+
+
 class TestTelegramMirroring:
     """Tests for Telegram mirroring of agent-to-agent communications (issue #103)."""
 

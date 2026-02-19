@@ -376,6 +376,12 @@ class MessageQueueManager:
         """Mark a session as active (not idle)."""
         state = self._get_or_create_state(session_id)
         state.is_idle = False
+        # Sync session.status with in-memory state to prevent Phase 3 false positives (#191).
+        # session.status stays IDLE after Stop hook; mark_session_active must clear it so
+        # _watch_for_idle Phase 3 doesn't fire false idle immediately after urgent dispatch.
+        session = self.session_manager.get_session(session_id)
+        if session and session.status != SessionStatus.STOPPED:
+            session.status = SessionStatus.RUNNING
         logger.debug(f"Session {session_id} marked active")
 
     def is_session_idle(self, session_id: str) -> bool:
