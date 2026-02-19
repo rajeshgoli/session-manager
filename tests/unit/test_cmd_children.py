@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from src.cli.commands import (
+    _DB_ERROR,
     _format_thinking_duration,
     _get_tmux_session_activity,
     _query_last_tool,
@@ -125,9 +126,10 @@ class TestQueryLastTool:
         result = _query_last_tool("nonexistent-session", str(db))
         assert result is None
 
-    def test_returns_none_when_db_missing(self, tmp_path):
+    def test_returns_sentinel_when_db_missing(self, tmp_path):
+        # Missing DB → sqlite3 creates empty file → no table → OperationalError → sentinel
         result = _query_last_tool("sess1", str(tmp_path / "no_such.db"))
-        assert result is None
+        assert result is _DB_ERROR
 
     def test_only_pretooluse_events(self, tmp_path):
         ts_pre = "2026-02-19 05:00:00"
@@ -309,6 +311,26 @@ class TestCmdChildrenOutput:
         assert rc == 0
         # One warning emitted, not three
         assert out.err.count("tool_usage.db not found") == 1
+
+    def test_db_locked_single_warning_no_crash(self, tmp_path, capsys):
+        """DB file exists but is locked — one warning, skip signals for all sessions."""
+        db = _make_db(tmp_path, [])  # file exists so db_ok passes
+        children = [
+            _child(child_id=f"jjj0000000{i}", provider="claude", status="running")
+            for i in range(3)
+        ]
+        client = _make_client(children)
+
+        with patch("src.cli.commands._query_last_tool", return_value=_DB_ERROR):
+            rc = cmd_children(client, "parent1", db_path=str(db))
+            out = capsys.readouterr()
+
+        assert rc == 0
+        # One warning emitted, not three
+        assert out.err.count("locked or unreadable") == 1
+        # No thinking/last-tool columns in output
+        assert "thinking" not in out.out
+        assert "last tool" not in out.out
 
     def test_agent_status_text_preserved_after_new_fields(self, tmp_path, capsys):
         """#188 agent_status_text still appears after thinking/last-tool fields."""

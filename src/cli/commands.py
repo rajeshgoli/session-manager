@@ -3,7 +3,9 @@
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -1100,6 +1102,10 @@ def cmd_spawn(
 
 _TOOL_DB_DEFAULT = "~/.local/share/claude-sessions/tool_usage.db"
 
+# Sentinel returned by _query_last_tool when the DB is unavailable or locked.
+# Distinct from None ("no data for this session") so cmd_children can warn once.
+_DB_ERROR = object()
+
 
 def _query_last_tool(session_id: str, db_path: str) -> Optional[dict]:
     """
@@ -1126,7 +1132,7 @@ def _query_last_tool(session_id: str, db_path: str) -> Optional[dict]:
         finally:
             conn.close()
     except sqlite3.Error:
-        return None
+        return _DB_ERROR  # type: ignore[return-value]
 
     if not row:
         return None
@@ -1145,8 +1151,6 @@ def _get_tmux_session_activity(tmux_session_name: str) -> Optional[int]:
       tmux display-message -p -t <name> '#{session_activity}'
     Returns None if session not found or tmux unavailable.
     """
-    import subprocess
-
     try:
         result = subprocess.run(
             ["tmux", "display-message", "-p", "-t", tmux_session_name, "#{session_activity}"],
@@ -1237,7 +1241,7 @@ def cmd_children(
             agent_status_at = child.get("agent_status_at")
             status_age = ""
             if agent_status_at:
-                status_age = f" ({format_relative_time(agent_status_at)} ago)"
+                status_age = f" ({format_relative_time(agent_status_at)})"
 
             # Build the base line
             line = f"{name} ({child_id}) | {status} | {elapsed}"
@@ -1258,7 +1262,14 @@ def cmd_children(
                         db_warned = True
                     elif db_ok:
                         row = _query_last_tool(child_id, resolved_db)
-                        if row:
+                        if row is _DB_ERROR:
+                            if not db_warned:
+                                print(
+                                    f"Warning: tool_usage.db locked or unreadable at {resolved_db} — skipping thinking/last-tool signals",
+                                    file=sys.stderr,
+                                )
+                                db_warned = True
+                        elif row:
                             ts = row["timestamp_str"]
                             try:
                                 last_ts = datetime.fromisoformat(ts)
@@ -1277,7 +1288,6 @@ def cmd_children(
                                 pass
 
                 elif provider == "codex":
-                    import time
                     tmux_name = f"codex-{child_id}"
                     epoch = _get_tmux_session_activity(tmux_name)
                     if epoch is not None:
