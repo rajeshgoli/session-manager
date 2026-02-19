@@ -713,6 +713,7 @@ class MessageQueueManager:
 
                     for session_id in sessions_with_pending:
                         await self._check_stale_input(session_id)
+                        await self._check_stuck_delivery(session_id)
 
                     await asyncio.sleep(self.input_poll_interval)
                     retry_count = 0  # Reset on successful iteration
@@ -787,6 +788,49 @@ class MessageQueueManager:
             # No input - clear tracking
             state.pending_user_input = None
             state.pending_input_first_seen = None
+
+    async def _check_stuck_delivery(self, session_id: str):
+        """
+        Fallback: detect sessions at the '>' prompt with pending messages but
+        state.is_idle=False (Stop hook curl not yet processed or silently failed).
+
+        Requires 2 consecutive prompt detections (~2 poll intervals) before triggering
+        delivery to avoid false positives mid-turn.
+
+        Skips: already-idle sessions, codex-app (no tmux), sessions without tmux_session.
+        Calls _try_deliver_messages() directly — does NOT call mark_session_idle() to avoid
+        false stop-notify side effects (#229).
+        """
+        state = self.delivery_states.get(session_id)
+        if state and state.is_idle:
+            return  # Already handled; _try_deliver_messages already triggered
+
+        session = self.session_manager.get_session(session_id)
+        if not session:
+            return
+
+        # Skip providers with no tmux pane
+        provider = getattr(session, "provider", "claude")
+        if provider not in ("claude", "codex"):
+            return
+        if not session.tmux_session:
+            return
+
+        if await self._check_idle_prompt(session.tmux_session):
+            state = self._get_or_create_state(session_id)
+            state._stuck_delivery_count += 1
+            if state._stuck_delivery_count >= 2:
+                state._stuck_delivery_count = 0
+                # Set idle and trigger delivery directly — do NOT call mark_session_idle()
+                # to avoid false stop-notify side effects (no from_stop_hook context).
+                state.is_idle = True
+                state.last_idle_at = datetime.now()
+                logger.info(f"Stuck delivery fallback: {session_id} at prompt with pending messages")
+                asyncio.create_task(self._try_deliver_messages(session_id))
+        else:
+            state = self.delivery_states.get(session_id)
+            if state:
+                state._stuck_delivery_count = 0
 
     async def _try_deliver_messages(self, session_id: str, important_only: bool = False):
         """
