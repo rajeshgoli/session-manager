@@ -207,6 +207,12 @@ class Session:
     # Crash recovery fields
     recovery_count: int = 0  # Number of times this session has been auto-recovered
 
+    # Context monitor fields (#203)
+    last_handoff_path: Optional[str] = None  # Last successfully executed handoff doc path (#196/#203)
+    # Runtime-only flags — not persisted (reset to False on server restart / new cycle)
+    _context_warning_sent: bool = field(default=False, init=False, repr=False)
+    _context_critical_sent: bool = field(default=False, init=False, repr=False)
+
     def __post_init__(self):
         if not self.name:
             if self.provider == "claude":
@@ -258,6 +264,8 @@ class Session:
             "cleanup_prompted": self.cleanup_prompted,
             # Crash recovery fields
             "recovery_count": self.recovery_count,
+            # Context monitor fields (#203)
+            "last_handoff_path": self.last_handoff_path,
         }
 
     @classmethod
@@ -323,6 +331,8 @@ class Session:
             cleanup_prompted=data.get("cleanup_prompted", {}),
             # Crash recovery fields
             recovery_count=data.get("recovery_count", 0),
+            # Context monitor fields (#203)
+            last_handoff_path=data.get("last_handoff_path"),
         )
 
 
