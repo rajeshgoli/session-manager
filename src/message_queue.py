@@ -9,7 +9,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Callable, Awaitable
+from typing import Optional, Dict, List, Callable, Awaitable, Tuple
 
 from .models import QueuedMessage, SessionDeliveryState, SessionStatus, RemindRegistration
 
@@ -88,6 +88,11 @@ class MessageQueueManager:
         # Periodic remind registrations (#188): keyed by target_session_id (one-active-per-target)
         self._remind_registrations: Dict[str, RemindRegistration] = {}
         self._remind_tasks: Dict[str, asyncio.Task] = {}  # target_session_id -> task
+
+        # Recent stop notifications for suppressing redundant sm wait idle (#216)
+        # Key: (recipient_session_id, sender_session_id) — (target, watcher)
+        # Value: datetime when stop notification was sent
+        self._recent_stop_notifications: Dict[Tuple[str, str], datetime] = {}
 
         # Notification callback (set by main app)
         self._notify_callback: Optional[Callable] = None
@@ -1086,6 +1091,10 @@ class MessageQueueManager:
         )
         logger.info(f"Sent stop notification to {sender_session_id} (recipient: {recipient_session_id})")
 
+        # Record timestamp so _watch_for_idle can suppress the redundant idle notification (#216)
+        key = (recipient_session_id, sender_session_id)
+        self._recent_stop_notifications[key] = datetime.now()
+
         # Mirror to Telegram (fire-and-forget)
         sender_session = self.session_manager.get_session(sender_session_id)
         if sender_session:
@@ -1695,6 +1704,18 @@ class MessageQueueManager:
                         is_idle = False          # Can't verify, assume in-flight
 
                 if is_idle:
+                    # Suppress if stop notification was already sent to this watcher <10s ago (#216)
+                    STOP_SUPPRESS_WINDOW = 10
+                    stop_key = (target_session_id, watcher_session_id)
+                    stop_at = self._recent_stop_notifications.get(stop_key)
+                    if stop_at and (datetime.now() - stop_at).total_seconds() < STOP_SUPPRESS_WINDOW:
+                        logger.info(
+                            f"Watch {watch_id}: suppressing idle — stop notification already sent "
+                            f"to {watcher_session_id} {(datetime.now() - stop_at).total_seconds():.1f}s ago (#216)"
+                        )
+                        self._recent_stop_notifications.pop(stop_key, None)
+                        return
+
                     # Target is idle - notify watcher
                     target_session = self.session_manager.get_session(target_session_id)
                     target_name = "unknown"
