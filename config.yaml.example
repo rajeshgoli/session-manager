@@ -180,6 +180,13 @@ child_agents:
     enable_tool_tracking: true      # Count tool calls in transcript
     snapshot_interval: 30           # Seconds between checks
 
+# Periodic remind configuration (#188)
+remind:
+  # Seconds after last status update before soft (important) reminder fires
+  soft_threshold_seconds: 180
+  # Gap from soft to hard threshold (hard = soft + hard_gap)
+  hard_gap_seconds: 120
+
 # sm send v2: Reliable inter-agent messaging
 sm_send:
   # Path to SQLite database for message queue persistence

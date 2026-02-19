@@ -217,6 +217,10 @@ class Session:
     context_monitor_enabled: bool = False  # Default off — opt-in only
     context_monitor_notify: Optional[str] = None  # Session ID to receive alerts; None = off
 
+    # sm remind: self-reported status (#188)
+    agent_status_text: Optional[str] = None  # Last sm status "<text>" from agent
+    agent_status_at: Optional[datetime] = None  # When agent_status_text was last set
+
     def __post_init__(self):
         if not self.name:
             if self.provider == "claude":
@@ -273,6 +277,9 @@ class Session:
             # Context monitor registration (#206)
             "context_monitor_enabled": self.context_monitor_enabled,
             "context_monitor_notify": self.context_monitor_notify,
+            # sm remind fields (#188)
+            "agent_status_text": self.agent_status_text,
+            "agent_status_at": self.agent_status_at.isoformat() if self.agent_status_at else None,
         }
 
     @classmethod
@@ -343,6 +350,9 @@ class Session:
             # Context monitor registration (#206)
             context_monitor_enabled=data.get("context_monitor_enabled", False),
             context_monitor_notify=data.get("context_monitor_notify"),
+            # sm remind fields (#188)
+            agent_status_text=data.get("agent_status_text"),
+            agent_status_at=datetime.fromisoformat(data["agent_status_at"]) if data.get("agent_status_at") else None,
         )
 
 
@@ -385,6 +395,8 @@ class QueuedMessage:
     notify_after_seconds: Optional[int] = None  # None = no post-delivery notification
     notify_on_stop: bool = False  # Notify sender when receiver's Stop hook fires
     delivered_at: Optional[datetime] = None  # None = pending
+    remind_soft_threshold: Optional[int] = None  # Seconds for soft remind after delivery (#188)
+    remind_hard_threshold: Optional[int] = None  # Seconds for hard remind after delivery (#188)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -401,7 +413,22 @@ class QueuedMessage:
             "notify_after_seconds": self.notify_after_seconds,
             "notify_on_stop": self.notify_on_stop,
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "remind_soft_threshold": self.remind_soft_threshold,
+            "remind_hard_threshold": self.remind_hard_threshold,
         }
+
+
+@dataclass
+class RemindRegistration:
+    """Registration for periodic remind monitoring (#188)."""
+    id: str
+    target_session_id: str
+    soft_threshold_seconds: int
+    hard_threshold_seconds: int  # soft + hard_gap
+    registered_at: datetime
+    last_reset_at: datetime  # updated by sm status; initialized on delivery
+    soft_fired: bool = False
+    is_active: bool = True
 
 
 @dataclass

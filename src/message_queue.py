@@ -6,11 +6,12 @@ import shlex
 import sqlite3
 import subprocess
 import threading
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Awaitable
 
-from .models import QueuedMessage, SessionDeliveryState, SessionStatus
+from .models import QueuedMessage, SessionDeliveryState, SessionStatus, RemindRegistration
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,11 @@ class MessageQueueManager:
         self.max_batch_size = sm_send_config.get("max_batch_size", 10)
         self.urgent_delay_ms = sm_send_config.get("urgent_delay_ms", 500)
 
+        # Remind configuration (#188)
+        remind_config = config.get("remind", {})
+        self.remind_soft_threshold_default = remind_config.get("soft_threshold_seconds", 180)
+        self.remind_hard_gap_seconds = remind_config.get("hard_gap_seconds", 120)
+
         # Load timeout configuration with fallbacks
         timeouts = config.get("timeouts", {})
         mq_timeouts = timeouts.get("message_queue", {})
@@ -78,6 +84,10 @@ class MessageQueueManager:
         self._running = False
         self._monitor_task: Optional[asyncio.Task] = None
         self._scheduled_tasks: Dict[str, asyncio.Task] = {}  # reminder_id -> task
+
+        # Periodic remind registrations (#188): keyed by target_session_id (one-active-per-target)
+        self._remind_registrations: Dict[str, RemindRegistration] = {}
+        self._remind_tasks: Dict[str, asyncio.Task] = {}  # target_session_id -> task
 
         # Notification callback (set by main app)
         self._notify_callback: Optional[Callable] = None
@@ -131,12 +141,33 @@ class MessageQueueManager:
                 fired INTEGER DEFAULT 0
             )
         """)
-        # Migration: add notify_on_stop column if it doesn't exist
+        # Migration: add new columns to message_queue if they don't exist
         cursor.execute("PRAGMA table_info(message_queue)")
         columns = [col[1] for col in cursor.fetchall()]
         if "notify_on_stop" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN notify_on_stop INTEGER DEFAULT 0")
             logger.info("Migrated message_queue: added notify_on_stop column")
+        if "remind_soft_threshold" not in columns:
+            cursor.execute("ALTER TABLE message_queue ADD COLUMN remind_soft_threshold INTEGER")
+            logger.info("Migrated message_queue: added remind_soft_threshold column")
+        if "remind_hard_threshold" not in columns:
+            cursor.execute("ALTER TABLE message_queue ADD COLUMN remind_hard_threshold INTEGER")
+            logger.info("Migrated message_queue: added remind_hard_threshold column")
+
+        # Remind registrations table (#188)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS remind_registrations (
+                id TEXT PRIMARY KEY,
+                target_session_id TEXT NOT NULL UNIQUE,
+                soft_threshold_seconds INTEGER NOT NULL,
+                hard_threshold_seconds INTEGER NOT NULL,
+                registered_at TIMESTAMP NOT NULL,
+                last_reset_at TIMESTAMP NOT NULL,
+                soft_fired INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1
+            )
+        """)
+
         self._db_conn.commit()
         logger.info(f"Message queue database initialized at {self.db_path} (WAL mode enabled)")
 
@@ -205,6 +236,8 @@ class MessageQueueManager:
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         # Recover pending reminders from database
         await self._recover_scheduled_reminders()
+        # Recover active periodic remind registrations (#188)
+        await self._recover_remind_registrations()
         # Recover pending messages - trigger delivery for sessions with queued messages
         await self._recover_pending_messages()
         logger.info("Message queue manager started")
@@ -249,6 +282,10 @@ class MessageQueueManager:
         for task in self._scheduled_tasks.values():
             task.cancel()
         self._scheduled_tasks.clear()
+        # Cancel all remind tasks (#188)
+        for task in self._remind_tasks.values():
+            task.cancel()
+        self._remind_tasks.clear()
         # Close database connection
         if self._db_conn:
             self._db_conn.close()
@@ -276,6 +313,10 @@ class MessageQueueManager:
         state.is_idle = True
         state.last_idle_at = datetime.now()
         logger.info(f"Session {session_id} marked idle")
+
+        # Cancel periodic remind on stop hook — agent completed their task (#188)
+        if from_stop_hook:
+            self.cancel_remind(session_id)
 
         # Check for pending handoff — takes priority over all other Stop hook logic (#196).
         # Only execute on Stop hook calls; other callers (queue_message, recovery) must not trigger it.
@@ -394,6 +435,8 @@ class MessageQueueManager:
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
         notify_on_stop: bool = False,
+        remind_soft_threshold: Optional[int] = None,
+        remind_hard_threshold: Optional[int] = None,
     ) -> QueuedMessage:
         """
         Queue a message for delivery.
@@ -408,6 +451,8 @@ class MessageQueueManager:
             notify_on_delivery: Notify sender when delivered
             notify_after_seconds: Notify sender N seconds after delivery
             notify_on_stop: Notify sender when receiver's Stop hook fires
+            remind_soft_threshold: Seconds after delivery before soft remind fires (#188)
+            remind_hard_threshold: Seconds after delivery before hard remind fires (#188)
 
         Returns:
             QueuedMessage with assigned ID
@@ -423,14 +468,17 @@ class MessageQueueManager:
             notify_on_delivery=notify_on_delivery,
             notify_after_seconds=notify_after_seconds,
             notify_on_stop=notify_on_stop,
+            remind_soft_threshold=remind_soft_threshold,
+            remind_hard_threshold=remind_hard_threshold,
         )
 
         # Persist to database
         self._execute("""
             INSERT INTO message_queue
             (id, target_session_id, sender_session_id, sender_name, text,
-             delivery_mode, queued_at, timeout_at, notify_on_delivery, notify_after_seconds, notify_on_stop)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             delivery_mode, queued_at, timeout_at, notify_on_delivery, notify_after_seconds,
+             notify_on_stop, remind_soft_threshold, remind_hard_threshold)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id,
             msg.target_session_id,
@@ -443,6 +491,8 @@ class MessageQueueManager:
             1 if msg.notify_on_delivery else 0,
             msg.notify_after_seconds,
             1 if msg.notify_on_stop else 0,
+            msg.remind_soft_threshold,
+            msg.remind_hard_threshold,
         ))
 
         queue_len = self.get_queue_length(target_session_id)
@@ -490,7 +540,8 @@ class MessageQueueManager:
         rows = self._execute_query("""
             SELECT id, target_session_id, sender_session_id, sender_name, text,
                    delivery_mode, queued_at, timeout_at, notify_on_delivery,
-                   notify_after_seconds, delivered_at
+                   notify_after_seconds, notify_on_stop, delivered_at,
+                   remind_soft_threshold, remind_hard_threshold
             FROM message_queue
             WHERE target_session_id = ? AND delivered_at IS NULL
             ORDER BY queued_at ASC
@@ -509,7 +560,10 @@ class MessageQueueManager:
                 timeout_at=datetime.fromisoformat(row[7]) if row[7] else None,
                 notify_on_delivery=bool(row[8]),
                 notify_after_seconds=row[9],
-                delivered_at=datetime.fromisoformat(row[10]) if row[10] else None,
+                notify_on_stop=bool(row[10]),
+                delivered_at=datetime.fromisoformat(row[11]) if row[11] else None,
+                remind_soft_threshold=row[12],
+                remind_hard_threshold=row[13],
             )
             # Skip expired messages
             if msg.timeout_at and datetime.now() > msg.timeout_at:
@@ -816,6 +870,14 @@ class MessageQueueManager:
                         state.stop_notify_sender_id = msg.sender_session_id
                         state.stop_notify_sender_name = msg.sender_name
 
+                    # Start periodic remind if requested (#188)
+                    if msg.remind_soft_threshold is not None:
+                        self.register_periodic_remind(
+                            target_session_id=msg.target_session_id,
+                            soft_threshold=msg.remind_soft_threshold,
+                            hard_threshold=msg.remind_hard_threshold or (msg.remind_soft_threshold + self.remind_hard_gap_seconds),
+                        )
+
                 # Update session activity
                 session.last_activity = datetime.now()
                 from .models import SessionStatus
@@ -853,6 +915,14 @@ class MessageQueueManager:
                     if msg.notify_on_stop and msg.sender_session_id:
                         state.stop_notify_sender_id = msg.sender_session_id
                         state.stop_notify_sender_name = msg.sender_name
+
+                    # Start periodic remind if requested (#188)
+                    if msg.remind_soft_threshold is not None:
+                        self.register_periodic_remind(
+                            target_session_id=msg.target_session_id,
+                            soft_threshold=msg.remind_soft_threshold,
+                            hard_threshold=msg.remind_hard_threshold or (msg.remind_soft_threshold + self.remind_hard_gap_seconds),
+                        )
                 else:
                     logger.error(f"Failed to deliver urgent message to {session_id} (codex-app)")
                 return
@@ -906,6 +976,14 @@ class MessageQueueManager:
                     if msg.notify_on_stop and msg.sender_session_id:
                         state.stop_notify_sender_id = msg.sender_session_id
                         state.stop_notify_sender_name = msg.sender_name
+
+                    # Start periodic remind if requested (#188)
+                    if msg.remind_soft_threshold is not None:
+                        self.register_periodic_remind(
+                            target_session_id=msg.target_session_id,
+                            soft_threshold=msg.remind_soft_threshold,
+                            hard_threshold=msg.remind_hard_threshold or (msg.remind_soft_threshold + self.remind_hard_gap_seconds),
+                        )
                 else:
                     logger.error(f"Failed to deliver urgent message to {session_id}")
 
@@ -1053,7 +1131,6 @@ class MessageQueueManager:
         Returns:
             Reminder ID
         """
-        import uuid
         reminder_id = uuid.uuid4().hex[:12]
         fire_at = datetime.now() + timedelta(seconds=delay_seconds)
 
@@ -1116,6 +1193,216 @@ class MessageQueueManager:
                 logger.info(f"Recovered reminder {reminder_id}, fires in {delay:.0f}s")
 
     # =========================================================================
+    # Periodic Remind (#188)
+    # =========================================================================
+
+    def register_periodic_remind(
+        self,
+        target_session_id: str,
+        soft_threshold: int,
+        hard_threshold: int,
+    ) -> str:
+        """
+        Register (or replace) a periodic remind for a target session.
+
+        One-active-per-target: if a registration already exists for this session,
+        it is cancelled and replaced.
+
+        Args:
+            target_session_id: Session to remind
+            soft_threshold: Seconds after last reset before soft (important) remind fires
+            hard_threshold: Seconds after last reset before hard (urgent) remind fires
+
+        Returns:
+            Registration ID
+        """
+        # Cancel any existing registration for this target
+        self.cancel_remind(target_session_id)
+
+        reg_id = uuid.uuid4().hex[:12]
+        now = datetime.now()
+        reg = RemindRegistration(
+            id=reg_id,
+            target_session_id=target_session_id,
+            soft_threshold_seconds=soft_threshold,
+            hard_threshold_seconds=hard_threshold,
+            registered_at=now,
+            last_reset_at=now,
+        )
+        self._remind_registrations[target_session_id] = reg
+
+        # Persist to DB
+        self._execute("""
+            INSERT OR REPLACE INTO remind_registrations
+            (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
+             registered_at, last_reset_at, soft_fired, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 1)
+        """, (
+            reg_id,
+            target_session_id,
+            soft_threshold,
+            hard_threshold,
+            now.isoformat(),
+            now.isoformat(),
+        ))
+
+        # Start async task
+        task = asyncio.create_task(self._run_remind_task(target_session_id))
+        self._remind_tasks[target_session_id] = task
+
+        logger.info(
+            f"Periodic remind registered for {target_session_id} "
+            f"(soft={soft_threshold}s, hard={hard_threshold}s, id={reg_id})"
+        )
+        return reg_id
+
+    def reset_remind(self, target_session_id: str):
+        """
+        Reset the remind timer for a session (called when agent reports sm status).
+
+        Updates last_reset_at and clears soft_fired so the cycle restarts.
+        """
+        reg = self._remind_registrations.get(target_session_id)
+        if not reg or not reg.is_active:
+            return
+
+        now = datetime.now()
+        reg.last_reset_at = now
+        reg.soft_fired = False
+
+        self._update_remind_db(target_session_id, last_reset_at=now, soft_fired=False)
+        logger.info(f"Remind timer reset for {target_session_id}")
+
+    def cancel_remind(self, target_session_id: str):
+        """
+        Cancel the periodic remind registration for a session.
+
+        Called on: stop hook, sm clear, sm kill, sm remind --stop.
+        """
+        reg = self._remind_registrations.pop(target_session_id, None)
+        if reg:
+            reg.is_active = False
+            self._execute(
+                "UPDATE remind_registrations SET is_active = 0 WHERE target_session_id = ?",
+                (target_session_id,)
+            )
+            logger.info(f"Periodic remind cancelled for {target_session_id}")
+
+        # Cancel async task
+        task = self._remind_tasks.pop(target_session_id, None)
+        if task:
+            task.cancel()
+
+    def _update_remind_db(self, target_session_id: str, **kwargs):
+        """Update remind registration fields in the DB."""
+        if not kwargs:
+            return
+        parts = []
+        values = []
+        for key, value in kwargs.items():
+            parts.append(f"{key} = ?")
+            if isinstance(value, datetime):
+                values.append(value.isoformat())
+            elif isinstance(value, bool):
+                values.append(1 if value else 0)
+            else:
+                values.append(value)
+        values.append(target_session_id)
+        self._execute(
+            f"UPDATE remind_registrations SET {', '.join(parts)} WHERE target_session_id = ?",
+            tuple(values)
+        )
+
+    async def _run_remind_task(self, target_session_id: str):
+        """
+        Async loop that fires soft/hard remind messages for a target session.
+
+        Polls every 5 seconds. Fires soft (important) when soft_threshold exceeded,
+        hard (urgent) when hard_threshold exceeded. Hard fire resets the cycle.
+        """
+        CHECK_INTERVAL = 5  # seconds
+        REMIND_PREFIX = "[sm remind]"
+        try:
+            while True:
+                await asyncio.sleep(CHECK_INTERVAL)
+                reg = self._remind_registrations.get(target_session_id)
+                if not reg or not reg.is_active:
+                    return
+
+                elapsed = (datetime.now() - reg.last_reset_at).total_seconds()
+
+                # Soft threshold: fire important remind
+                if not reg.soft_fired and elapsed >= reg.soft_threshold_seconds:
+                    # Dedup guard: skip if a remind is already pending
+                    pending = self.get_pending_messages(target_session_id)
+                    has_pending_remind = any(m.text.startswith(REMIND_PREFIX) for m in pending)
+                    if not has_pending_remind:
+                        self.queue_message(
+                            target_session_id=target_session_id,
+                            text='[sm remind] Update your status: sm status "your current progress"',
+                            delivery_mode="important",
+                        )
+                    reg.soft_fired = True
+                    self._update_remind_db(target_session_id, soft_fired=True)
+
+                # Hard threshold: fire urgent remind and reset cycle
+                if elapsed >= reg.hard_threshold_seconds:
+                    self.queue_message(
+                        target_session_id=target_session_id,
+                        text='[sm remind] Status overdue. Run: sm status "your current progress"',
+                        delivery_mode="urgent",
+                    )
+                    # Reset cycle so it restarts
+                    now = datetime.now()
+                    reg.last_reset_at = now
+                    reg.soft_fired = False
+                    self._update_remind_db(
+                        target_session_id,
+                        last_reset_at=now,
+                        soft_fired=False,
+                    )
+
+        except asyncio.CancelledError:
+            logger.info(f"Remind task cancelled for {target_session_id}")
+        finally:
+            self._remind_tasks.pop(target_session_id, None)
+
+    async def _recover_remind_registrations(self):
+        """Recover active remind registrations on server restart."""
+        rows = self._execute_query("""
+            SELECT id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
+                   registered_at, last_reset_at, soft_fired
+            FROM remind_registrations
+            WHERE is_active = 1
+        """)
+
+        for row in rows:
+            reg_id, target_session_id, soft, hard, registered_at_str, last_reset_at_str, soft_fired = row
+            last_reset_at = datetime.fromisoformat(last_reset_at_str)
+
+            reg = RemindRegistration(
+                id=reg_id,
+                target_session_id=target_session_id,
+                soft_threshold_seconds=soft,
+                hard_threshold_seconds=hard,
+                registered_at=datetime.fromisoformat(registered_at_str),
+                last_reset_at=last_reset_at,
+                soft_fired=bool(soft_fired),
+                is_active=True,
+            )
+            self._remind_registrations[target_session_id] = reg
+
+            # Restart async task
+            task = asyncio.create_task(self._run_remind_task(target_session_id))
+            self._remind_tasks[target_session_id] = task
+
+            elapsed = (datetime.now() - last_reset_at).total_seconds()
+            logger.info(
+                f"Recovered remind registration {reg_id} for {target_session_id}, "
+                f"elapsed={elapsed:.0f}s (soft={soft}s, hard={hard}s)"
+            )
+
+    # =========================================================================
     # Session Watching (sm wait async notification)
     # =========================================================================
 
@@ -1136,7 +1423,6 @@ class MessageQueueManager:
         Returns:
             Watch ID
         """
-        import uuid
         watch_id = uuid.uuid4().hex[:12]
 
         # Schedule async watch task

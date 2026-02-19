@@ -88,6 +88,8 @@ class SessionResponse(BaseModel):
     git_remote_url: Optional[str] = None
     parent_session_id: Optional[str] = None
     last_handoff_path: Optional[str] = None  # Last executed handoff doc path (#203)
+    agent_status_text: Optional[str] = None  # Self-reported agent status text (#188)
+    agent_status_at: Optional[str] = None  # When agent_status_text was last set (#188)
 
 
 class SendInputRequest(BaseModel):
@@ -100,6 +102,19 @@ class SendInputRequest(BaseModel):
     notify_on_delivery: bool = False  # Notify sender when delivered
     notify_after_seconds: Optional[int] = None  # Notify sender N seconds after delivery
     notify_on_stop: bool = False  # Notify sender when receiver's Stop hook fires
+    remind_soft_threshold: Optional[int] = None  # Seconds for soft remind after delivery (#188)
+    remind_hard_threshold: Optional[int] = None  # Seconds for hard remind after delivery (#188)
+
+
+class PeriodicRemindRequest(BaseModel):
+    """Request to register a periodic remind for a session (#188)."""
+    soft_threshold: int
+    hard_threshold: int
+
+
+class AgentStatusRequest(BaseModel):
+    """Request from an agent to self-report its current status (#188)."""
+    text: str
 
 
 class ClearSessionRequest(BaseModel):
@@ -997,6 +1012,8 @@ def create_app(
             notify_on_delivery=request.notify_on_delivery,
             notify_after_seconds=request.notify_after_seconds,
             notify_on_stop=request.notify_on_stop,
+            remind_soft_threshold=request.remind_soft_threshold,
+            remind_hard_threshold=request.remind_hard_threshold,
         )
 
         if result == DeliveryResult.FAILED:
@@ -1060,6 +1077,11 @@ def create_app(
         # doesn't leak into stop-hook notifications for the next task (#167)
         _invalidate_session_cache(app, session_id)
 
+        # Cancel periodic remind (context reset means task is over) (#188)
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if queue_mgr:
+            queue_mgr.cancel_remind(session_id)
+
         return {"status": "cleared", "session_id": session_id}
 
     @app.post("/sessions/{session_id}/invalidate-cache")
@@ -1090,6 +1112,11 @@ def create_app(
         session = app.state.session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        # Cancel periodic remind before killing (#188)
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if queue_mgr:
+            queue_mgr.cancel_remind(session_id)
 
         # Kill tmux session
         success = app.state.session_manager.kill_session(session_id)
@@ -1985,6 +2012,9 @@ Or continue working if not done yet."""
                     "last_activity": s.last_activity.isoformat(),
                     "spawned_at": s.spawned_at.isoformat() if s.spawned_at else None,
                     "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                    # sm remind: self-reported status (#188)
+                    "agent_status_text": s.agent_status_text,
+                    "agent_status_at": s.agent_status_at.isoformat() if s.agent_status_at else None,
                 }
                 for s in children
             ],
@@ -2006,6 +2036,11 @@ Or continue working if not done yet."""
             # Requester must be the parent
             if target_session.parent_session_id != request.requester_session_id:
                 return {"error": f"Cannot kill session {target_session_id} - not your child session"}
+
+        # Cancel periodic remind before killing (#188)
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if queue_mgr:
+            queue_mgr.cancel_remind(target_session_id)
 
         # Kill the session
         success = app.state.session_manager.kill_session(target_session_id)
@@ -2089,6 +2124,75 @@ Or continue working if not done yet."""
             "reminder_id": reminder_id,
             "session_id": session_id,
             "fires_in_seconds": delay_seconds,
+        }
+
+    @app.post("/sessions/{session_id}/remind")
+    async def register_remind(session_id: str, request: PeriodicRemindRequest):
+        """Register (or replace) a periodic remind for a session (#188)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        reg_id = queue_mgr.register_periodic_remind(
+            target_session_id=session_id,
+            soft_threshold=request.soft_threshold,
+            hard_threshold=request.hard_threshold,
+        )
+        return {
+            "status": "registered",
+            "registration_id": reg_id,
+            "session_id": session_id,
+            "soft_threshold": request.soft_threshold,
+            "hard_threshold": request.hard_threshold,
+        }
+
+    @app.delete("/sessions/{session_id}/remind")
+    async def cancel_remind(session_id: str):
+        """Cancel periodic remind for a session (#188)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if queue_mgr:
+            queue_mgr.cancel_remind(session_id)
+
+        return {"status": "cancelled", "session_id": session_id}
+
+    @app.post("/sessions/{session_id}/agent-status")
+    async def set_agent_status(session_id: str, request: AgentStatusRequest):
+        """Agent self-reports current status, resets remind timer (#188)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Update session fields
+        session.agent_status_text = request.text
+        session.agent_status_at = datetime.now()
+        app.state.session_manager._save_state()
+
+        # Reset remind timer so cycle restarts from now
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if queue_mgr:
+            queue_mgr.reset_remind(session_id)
+
+        return {
+            "status": "updated",
+            "session_id": session_id,
+            "agent_status_text": request.text,
         }
 
     @app.post("/sessions/{target_session_id}/watch")

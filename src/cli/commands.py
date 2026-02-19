@@ -3,6 +3,7 @@
 import os
 import re
 import sys
+from datetime import datetime
 from typing import Optional
 
 from .client import SessionManagerClient
@@ -776,6 +777,70 @@ def cmd_dispatch(
     )
 
 
+def cmd_agent_status(client: SessionManagerClient, session_id: str, text: str) -> int:
+    """
+    Self-report agent status and reset the remind timer.
+
+    Args:
+        client: API client
+        session_id: Current session ID (self)
+        text: Status text to report
+
+    Exit codes:
+        0: Success
+        1: Failed to set status
+        2: Session manager unavailable
+    """
+    success, unavailable = client.set_agent_status(session_id, text)
+
+    if success:
+        print(f"Status set: {text}")
+        return 0
+    elif unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    else:
+        print("Error: Failed to set status", file=sys.stderr)
+        return 1
+
+
+def cmd_remind_stop(client: SessionManagerClient, target_identifier: str) -> int:
+    """
+    Cancel periodic remind for a target session.
+
+    Args:
+        client: API client
+        target_identifier: Target session ID or friendly name
+
+    Exit codes:
+        0: Success
+        1: Session not found or failed
+        2: Session manager unavailable
+    """
+    target_session_id, session = resolve_session_id(client, target_identifier)
+    if target_session_id is None:
+        sessions = client.list_sessions()
+        if sessions is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        else:
+            print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
+            return 1
+
+    success, unavailable = client.cancel_remind(target_session_id)
+
+    if success:
+        name = session.get("friendly_name") or session.get("name") or target_session_id
+        print(f"Remind cancelled for {name} ({target_session_id})")
+        return 0
+    elif unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    else:
+        print("Error: Failed to cancel remind", file=sys.stderr)
+        return 1
+
+
 def cmd_send(
     client: SessionManagerClient,
     identifier: str,
@@ -786,6 +851,7 @@ def cmd_send(
     notify_after_seconds: Optional[int] = None,
     wait_seconds: Optional[int] = None,
     notify_on_stop: bool = True,
+    remind_seconds: Optional[int] = None,
 ) -> int:
     """
     Send input text to a session.
@@ -800,12 +866,18 @@ def cmd_send(
         notify_after_seconds: Notify sender N seconds after delivery
         wait_seconds: Notify sender N seconds after delivery if recipient is idle (alias for notify_after_seconds)
         notify_on_stop: Notify sender when receiver's Stop hook fires (default True)
+        remind_seconds: Start periodic remind registration with this soft threshold (#188)
 
     Exit codes:
         0: Success
         1: Session not found or send failed
         2: Session manager unavailable
     """
+    # Compute remind thresholds if requested (#188)
+    # hard_threshold is intentionally None — server computes it from config.remind.hard_gap_seconds
+    remind_soft_threshold = remind_seconds
+    remind_hard_threshold = None
+
     # Resolve identifier to session ID and get session details
     session_id, session = resolve_session_id(client, identifier)
     if session_id is None:
@@ -835,6 +907,8 @@ def cmd_send(
         notify_on_delivery=notify_on_delivery,
         notify_after_seconds=effective_notify_after,
         notify_on_stop=notify_on_stop,
+        remind_soft_threshold=remind_soft_threshold,
+        remind_hard_threshold=remind_hard_threshold,
     )
 
     if unavailable:
@@ -864,6 +938,8 @@ def cmd_send(
         extras.append(f"wait={effective_notify_after}s")
     if notify_on_stop:
         extras.append("notify-on-stop")
+    if remind_seconds:
+        extras.append(f"remind={remind_seconds}s")
     if extras:
         print(f"  Options: {', '.join(extras)}")
 
@@ -1071,7 +1147,6 @@ def cmd_children(
 
             # Format last activity as relative time
             if last_activity:
-                from datetime import datetime
                 try:
                     activity_time = datetime.fromisoformat(last_activity)
                     elapsed = format_relative_time(activity_time)
@@ -1080,13 +1155,26 @@ def cmd_children(
             else:
                 elapsed = "unknown"
 
+            # Format agent status if available (#188)
+            agent_status_text = child.get("agent_status_text")
+            agent_status_at = child.get("agent_status_at")
+            status_age = ""
+            if agent_status_at:
+                try:
+                    status_time = datetime.fromisoformat(agent_status_at)
+                    status_age = f" ({format_relative_time(status_time)} ago)"
+                except Exception:
+                    pass
+
             # Print child info
             status_icon = "✓" if status == "completed" else "●" if status == "running" else "✗"
             print(f"{name} ({child_id}) | {status} | {elapsed}", end="")
-            if completion_msg:
+            if agent_status_text:
+                print(f' | "{agent_status_text}"{status_age}')
+            elif completion_msg:
                 print(f' | "{completion_msg}"')
             else:
-                print()
+                print(' | (no status)')
 
     return 0
 

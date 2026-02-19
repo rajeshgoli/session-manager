@@ -3,8 +3,9 @@
 import os
 import sys
 from typing import Optional
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 import json
 
 # Default API endpoint
@@ -160,6 +161,8 @@ class SessionManagerClient:
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
         notify_on_stop: bool = False,
+        remind_soft_threshold: Optional[int] = None,
+        remind_hard_threshold: Optional[int] = None,
     ) -> tuple[bool, bool]:
         """
         Send text input to a session.
@@ -189,6 +192,10 @@ class SessionManagerClient:
             payload["notify_after_seconds"] = notify_after_seconds
         if notify_on_stop:
             payload["notify_on_stop"] = notify_on_stop
+        if remind_soft_threshold is not None:
+            payload["remind_soft_threshold"] = remind_soft_threshold
+        if remind_hard_threshold is not None:
+            payload["remind_hard_threshold"] = remind_hard_threshold
 
         data, success, unavailable = self._request(
             "POST",
@@ -310,7 +317,6 @@ class SessionManagerClient:
         Returns:
             Session dict or None if unavailable
         """
-        import urllib.parse
         encoded_dir = urllib.parse.quote(working_dir)
         query = f"working_dir={encoded_dir}"
         if provider:
@@ -583,3 +589,43 @@ class SessionManagerClient:
         if success and data:
             return data.get("monitored", [])
         return None
+
+    def schedule_reminder(self, session_id: str, delay_seconds: int, message: str) -> Optional[dict]:
+        """Schedule a one-shot self-reminder (calls POST /scheduler/remind)."""
+        query = (
+            f"session_id={urllib.parse.quote(session_id)}"
+            f"&delay_seconds={delay_seconds}"
+            f"&message={urllib.parse.quote(message)}"
+        )
+        data, success, unavailable = self._request("POST", f"/scheduler/remind?{query}")
+        if unavailable:
+            return None
+        return data if success else None
+
+    def set_agent_status(self, session_id: str, text: str) -> tuple[bool, bool]:
+        """Set agent self-reported status text and reset remind timer (#188)."""
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/agent-status",
+            {"text": text},
+        )
+        return success, unavailable
+
+    def register_remind(self, target_session_id: str, soft_threshold: int, hard_threshold: int) -> Optional[dict]:
+        """Register a periodic remind for a session (#188)."""
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{target_session_id}/remind",
+            {"soft_threshold": soft_threshold, "hard_threshold": hard_threshold},
+        )
+        if unavailable:
+            return None
+        return data if success else None
+
+    def cancel_remind(self, target_session_id: str) -> tuple[bool, bool]:
+        """Cancel periodic remind for a session (#188)."""
+        data, success, unavailable = self._request(
+            "DELETE",
+            f"/sessions/{target_session_id}/remind",
+        )
+        return success, unavailable

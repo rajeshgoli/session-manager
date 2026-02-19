@@ -100,8 +100,16 @@ def main():
     # sm unlock
     subparsers.add_parser("unlock", help="Release workspace lock")
 
-    # sm status
-    subparsers.add_parser("status", help="Full status: you + others + lock")
+    # sm status [text]
+    # With no args: system-wide status display (existing)
+    # With text arg: self-report agent status and reset remind timer (#188)
+    status_parser = subparsers.add_parser("status", help="Full status: you + others + lock (or report agent status)")
+    status_parser.add_argument(
+        "text",
+        nargs="?",
+        default=None,
+        help='Self-report status text (e.g., sm status "investigating bug")',
+    )
 
     # sm subagent-start (called by SubagentStart hook)
     subparsers.add_parser("subagent-start", help="Register subagent start (called by hook)")
@@ -123,6 +131,29 @@ def main():
     send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
     send_parser.add_argument("--steer", action="store_true", help="Inject via Enter-based mid-turn steering (for Codex reviews)")
     send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
+    send_parser.add_argument("--remind", type=int, metavar="SECONDS", help="Start periodic status reminders with this soft threshold (seconds)")
+
+    # sm remind <delay> <message>  (one-shot self-reminder)
+    # sm remind <session-id> --stop  (cancel periodic remind)
+    remind_parser = subparsers.add_parser(
+        "remind",
+        help="Schedule a self-reminder (sm remind <delay> <msg>) or cancel periodic remind (sm remind <id> --stop)",
+    )
+    remind_parser.add_argument(
+        "first_arg",
+        help="Delay in seconds for one-shot remind, or session ID for --stop",
+    )
+    remind_parser.add_argument(
+        "message",
+        nargs="?",
+        default=None,
+        help="Reminder message (for one-shot mode)",
+    )
+    remind_parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Cancel periodic remind for the specified session",
+    )
 
     # sm wait <session-id> <seconds>
     wait_parser = subparsers.add_parser("wait", help="Wait for session to go idle (or timeout)")
@@ -286,7 +317,7 @@ def main():
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-app", "codex-server",
-        "attach", "output", "clear", "review", "context-monitor", None
+        "attach", "output", "clear", "review", "context-monitor", "remind", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
@@ -324,7 +355,14 @@ def main():
     elif args.command == "unlock":
         sys.exit(commands.cmd_unlock(session_id))
     elif args.command == "status":
-        sys.exit(commands.cmd_status(client, session_id))
+        # With text arg: self-report agent status; without: system status display (#188)
+        if getattr(args, "text", None):
+            if not session_id:
+                print("Error: CLAUDE_SESSION_MANAGER_ID not set (required to report status)", file=sys.stderr)
+                sys.exit(2)
+            sys.exit(commands.cmd_agent_status(client, session_id, args.text))
+        else:
+            sys.exit(commands.cmd_status(client, session_id))
     elif args.command == "subagent-start":
         sys.exit(commands.cmd_subagent_start(client, session_id))
     elif args.command == "subagent-stop":
@@ -344,7 +382,29 @@ def main():
         wait_seconds = args.wait if hasattr(args, 'wait') else None
         # notify_on_stop defaults to True unless --no-notify-on-stop is passed
         notify_on_stop = not getattr(args, 'no_notify_on_stop', False)
-        sys.exit(commands.cmd_send(client, args.session_id, args.text, delivery_mode, wait_seconds=wait_seconds, notify_on_stop=notify_on_stop))
+        # --remind: periodic status reminders (#188)
+        remind_seconds = getattr(args, 'remind', None)
+        sys.exit(commands.cmd_send(
+            client, args.session_id, args.text, delivery_mode,
+            wait_seconds=wait_seconds, notify_on_stop=notify_on_stop,
+            remind_seconds=remind_seconds,
+        ))
+    elif args.command == "remind":
+        if args.stop:
+            # sm remind <session-id> --stop: cancel periodic remind (#188)
+            sys.exit(commands.cmd_remind_stop(client, args.first_arg))
+        else:
+            # sm remind <delay> <message>: one-shot self-reminder
+            if not session_id:
+                print("Error: CLAUDE_SESSION_MANAGER_ID not set (required for self-reminder)", file=sys.stderr)
+                sys.exit(2)
+            try:
+                delay_seconds = int(args.first_arg)
+            except ValueError:
+                print(f"Error: Expected integer delay (seconds), got: {args.first_arg!r}", file=sys.stderr)
+                sys.exit(1)
+            message = args.message or "Reminder"
+            sys.exit(commands.cmd_remind(client, session_id, delay_seconds, message))
     elif args.command == "wait":
         sys.exit(commands.cmd_wait(client, args.session_id, args.seconds))
     elif args.command == "spawn":

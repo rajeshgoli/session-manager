@@ -594,6 +594,8 @@ class SessionManager:
         notify_after_seconds: Optional[int] = None,
         notify_on_stop: bool = False,
         bypass_queue: bool = False,
+        remind_soft_threshold: Optional[int] = None,
+        remind_hard_threshold: Optional[int] = None,
     ) -> DeliveryResult:
         """
         Send input to a session with optional sender metadata and delivery mode.
@@ -609,6 +611,8 @@ class SessionManager:
             notify_after_seconds: Notify sender N seconds after delivery
             notify_on_stop: Notify sender when receiver's Stop hook fires
             bypass_queue: If True, send directly to tmux (for permission responses)
+            remind_soft_threshold: Seconds after delivery before soft remind fires (#188)
+            remind_hard_threshold: Seconds after delivery before hard remind fires (#188)
 
         Returns:
             DeliveryResult indicating whether message was DELIVERED, QUEUED, or FAILED
@@ -676,6 +680,8 @@ class SessionManager:
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
                     notify_on_stop=notify_on_stop,
+                    remind_soft_threshold=remind_soft_threshold,
+                    remind_hard_threshold=remind_hard_threshold,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
@@ -698,6 +704,8 @@ class SessionManager:
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
                     notify_on_stop=notify_on_stop,
+                    remind_soft_threshold=remind_soft_threshold,
+                    remind_hard_threshold=remind_hard_threshold,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 if from_sm_send and sender_session_id:
