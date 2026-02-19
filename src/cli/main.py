@@ -131,7 +131,6 @@ def main():
     send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
     send_parser.add_argument("--steer", action="store_true", help="Inject via Enter-based mid-turn steering (for Codex reviews)")
     send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
-    send_parser.add_argument("--remind", type=int, metavar="SECONDS", help="Start periodic status reminders with this soft threshold (seconds)")
 
     # sm remind <delay> <message>  (one-shot self-reminder)
     # sm remind <session-id> --stop  (cancel periodic remind)
@@ -409,12 +408,9 @@ def main():
         wait_seconds = args.wait if hasattr(args, 'wait') else None
         # notify_on_stop defaults to True unless --no-notify-on-stop is passed
         notify_on_stop = not getattr(args, 'no_notify_on_stop', False)
-        # --remind: periodic status reminders (#188)
-        remind_seconds = getattr(args, 'remind', None)
         sys.exit(commands.cmd_send(
             client, args.session_id, args.text, delivery_mode,
             wait_seconds=wait_seconds, notify_on_stop=notify_on_stop,
-            remind_seconds=remind_seconds,
         ))
     elif args.command == "remind":
         if args.stop:

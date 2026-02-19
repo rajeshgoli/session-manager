@@ -451,6 +451,19 @@ class TestExistingCommandsUnaffected:
             # argparse exits with code 2 for unrecognized arguments
             assert exc_info.value.code == 2
 
+    def test_send_remind_flag_rejected(self):
+        """sm send --remind is no longer accepted (sm#225-B).
+
+        --remind was removed from sm send; sm dispatch arms it automatically.
+        Passing --remind should now produce an argparse error (exit code 2).
+        """
+        from src.cli.main import main
+
+        with patch("sys.argv", ["sm", "send", "--remind", "180", "target", "message"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+
 
 # ---------------------------------------------------------------------------
 # parse_dispatch_args tests
@@ -680,35 +693,6 @@ class TestCmdSendRemindParams:
 
         call_kwargs = mock_client.send_input.call_args[1]
         assert call_kwargs["remind_soft_threshold"] == 210
-        assert call_kwargs["remind_hard_threshold"] == 420
-
-    def test_remind_seconds_maps_to_soft_threshold(self):
-        """Legacy remind_seconds param maps to remind_soft_threshold."""
-        from src.cli.commands import cmd_send
-        mock_client = self._make_client()
-
-        cmd_send(mock_client, "sess1", "hello", remind_seconds=180)
-
-        call_kwargs = mock_client.send_input.call_args[1]
-        assert call_kwargs["remind_soft_threshold"] == 180
-        # hard stays None when using legacy remind_seconds
-        assert call_kwargs["remind_hard_threshold"] is None
-
-    def test_explicit_soft_overrides_remind_seconds(self):
-        """Explicit remind_soft_threshold takes precedence over remind_seconds."""
-        from src.cli.commands import cmd_send
-        mock_client = self._make_client()
-
-        # Both provided — explicit wins
-        cmd_send(
-            mock_client, "sess1", "hello",
-            remind_seconds=180,
-            remind_soft_threshold=210,
-            remind_hard_threshold=420,
-        )
-
-        call_kwargs = mock_client.send_input.call_args[1]
-        assert call_kwargs["remind_soft_threshold"] == 210  # explicit wins
         assert call_kwargs["remind_hard_threshold"] == 420
 
     def test_no_remind_params_sends_none(self):
