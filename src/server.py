@@ -2040,6 +2040,12 @@ Or continue working if not done yet."""
         if session_manager_id and app.state.session_manager:
             session = app.state.session_manager.get_session(session_manager_id)
 
+        # Clear stale is_idle on PreToolUse — signals turn has started (sm#183)
+        if hook_type == "PreToolUse" and session_manager_id:
+            queue_mgr = app.state.session_manager.message_queue_manager if app.state.session_manager else None
+            if queue_mgr:
+                queue_mgr.mark_session_active(session_manager_id)
+
         # Auto-acquire lock on file write (PreToolUse for Edit/Write/NotebookEdit)
         if hook_type == "PreToolUse" and tool_name in ("Edit", "Write", "NotebookEdit"):
             file_path = tool_input.get("file_path", "")
