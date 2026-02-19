@@ -17,6 +17,9 @@ from .cli.commands import validate_friendly_name
 
 logger = logging.getLogger(__name__)
 
+# Delay before retrying a stale transcript read in the Stop hook handler (#184).
+TRANSCRIPT_RETRY_DELAY_SECONDS = 0.3
+
 
 def _normalize_provider(provider: Optional[str]) -> str:
     """Normalize/validate provider string."""
@@ -1361,14 +1364,16 @@ Provide ONLY the summary, no preamble or questions."""
             if hook_event == "Stop" and session_manager_id and last_message:
                 stored_output = app.state.last_claude_output.get(session_manager_id)
                 if stored_output and last_message == stored_output:
-                    logger.info(f"Transcript appears stale for {session_manager_id}, retrying after 300ms")
-                    await asyncio.sleep(0.3)
+                    logger.info(f"Transcript appears stale for {session_manager_id}, retrying after {TRANSCRIPT_RETRY_DELAY_SECONDS}s")
+                    await asyncio.sleep(TRANSCRIPT_RETRY_DELAY_SECONDS)
                     try:
                         success, last_message = await asyncio.to_thread(read_transcript)
                         if not success:
                             logger.warning(f"Retry: Failed to read transcript for {session_manager_id}")
+                            last_message = None
                     except Exception as e:
                         logger.error(f"Retry: Error reading transcript for {session_manager_id}: {e}")
+                        last_message = None
 
         # Store last message
         if last_message:

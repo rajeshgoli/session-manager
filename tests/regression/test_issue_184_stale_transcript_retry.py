@@ -12,7 +12,7 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 
-from src.server import create_app
+from src.server import create_app, TRANSCRIPT_RETRY_DELAY_SECONDS
 from src.models import Session, SessionStatus
 
 
@@ -91,7 +91,7 @@ def test_stale_transcript_triggers_retry(app_and_client, tmp_path):
         )
 
     assert response.status_code == 200
-    mock_sleep.assert_awaited_once_with(0.3)
+    mock_sleep.assert_awaited_once_with(TRANSCRIPT_RETRY_DELAY_SECONDS)
 
 
 def test_stale_transcript_retry_picks_up_new_content(app_and_client, tmp_path):
@@ -250,10 +250,10 @@ def test_no_session_manager_id_no_retry(app_and_client, tmp_path):
 # ============================================================================
 
 
-def test_retry_read_failure_does_not_crash(app_and_client, tmp_path):
+def test_retry_read_failure_nullifies_stale_content(app_and_client, tmp_path):
     """
-    If read_transcript() fails on retry (e.g. file deleted), the handler
-    still completes without error and uses the original content.
+    If read_transcript() fails on retry (e.g. file deleted), last_message is
+    set to None so stale content does not propagate to mark_session_idle.
     """
     app, client = app_and_client
     transcript = tmp_path / "transcript.jsonl"
@@ -277,3 +277,9 @@ def test_retry_read_failure_does_not_crash(app_and_client, tmp_path):
 
     # Handler should complete without error
     assert response.status_code == 200
+    # Stale content must NOT be stored — retry failure sets last_message = None
+    # The stored output should remain the old value (not overwritten with stale)
+    assert app.state.last_claude_output.get("agent-184") == "old response"
+    # mark_session_idle should have been called with last_output=None
+    queue_mgr = app_and_client[0].state.session_manager.message_queue_manager
+    queue_mgr.mark_session_idle.assert_called_once_with("agent-184", last_output=None, from_stop_hook=True)
