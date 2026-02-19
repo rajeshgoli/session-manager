@@ -804,7 +804,7 @@ def cmd_agent_status(client: SessionManagerClient, session_id: str, text: str) -
         return 1
 
 
-def cmd_remind_stop(client: SessionManagerClient, session_id: str, target_identifier: str) -> int:
+def cmd_remind_stop(client: SessionManagerClient, target_identifier: str) -> int:
     """
     Cancel periodic remind for a target session.
 
@@ -1174,7 +1174,7 @@ def cmd_children(
             elif completion_msg:
                 print(f' | "{completion_msg}"')
             else:
-                print()
+                print(' | (no status)')
 
     return 0
 

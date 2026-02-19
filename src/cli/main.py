@@ -392,7 +392,7 @@ def main():
     elif args.command == "remind":
         if args.stop:
             # sm remind <session-id> --stop: cancel periodic remind (#188)
-            sys.exit(commands.cmd_remind_stop(client, session_id, args.first_arg))
+            sys.exit(commands.cmd_remind_stop(client, args.first_arg))
         else:
             # sm remind <delay> <message>: one-shot self-reminder
             if not session_id:
