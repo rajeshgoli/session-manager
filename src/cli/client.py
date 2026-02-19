@@ -537,6 +537,17 @@ class SessionManagerClient:
         )
         return success, unavailable
 
+    def schedule_handoff(self, session_id: str, file_path: str) -> Optional[dict]:
+        """Schedule a self-directed handoff for a session."""
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/handoff",
+            {"requester_session_id": session_id, "file_path": file_path},
+        )
+        if unavailable:
+            return None
+        return data if data else {"error": "Unknown error"}
+
     def invalidate_cache(self, session_id: str) -> tuple[bool, bool]:
         """
         Invalidate server-side caches for a session after a CLI-driven clear.

@@ -167,6 +167,12 @@ class KillSessionRequest(BaseModel):
     requester_session_id: Optional[str] = None
 
 
+class HandoffRequest(BaseModel):
+    """Request to schedule a self-directed handoff."""
+    requester_session_id: str
+    file_path: str
+
+
 class StartReviewRequest(BaseModel):
     """Start a review on an existing session."""
     mode: str = "branch"
@@ -289,6 +295,10 @@ def create_app(
     app.state.child_monitor = child_monitor
     app.state.last_claude_output = {}  # Store last output per session from hooks
     app.state.pending_stop_notifications = set()  # Sessions where Stop hook had empty transcript
+
+    # Wire _app back-reference so _execute_handoff can clear server-side caches (#196)
+    if session_manager:
+        session_manager._app = app
 
     @app.get("/")
     async def root():
@@ -1394,9 +1404,14 @@ Provide ONLY the summary, no preamble or questions."""
             queue_mgr = app.state.session_manager.message_queue_manager if app.state.session_manager else None
             if queue_mgr:
                 queue_mgr.mark_session_idle(session_manager_id, last_output=last_message, from_stop_hook=True)
-                # Restore any saved user input
+                # Skip _restore_user_input if a handoff was triggered.
+                # mark_session_idle sets is_idle=False synchronously when a handoff is pending,
+                # so is_idle==False here reliably signals handoff in progress (#196).
                 import asyncio
-                asyncio.create_task(queue_mgr._restore_user_input_after_response(session_manager_id))
+                state = queue_mgr.delivery_states.get(session_manager_id)
+                handoff_in_progress = state and not state.is_idle
+                if not handoff_in_progress:
+                    asyncio.create_task(queue_mgr._restore_user_input_after_response(session_manager_id))
 
             # Keep session.status in sync with delivery_state.is_idle
             if app.state.session_manager:
@@ -1929,6 +1944,35 @@ Or continue working if not done yet."""
             await app.state.output_monitor.cleanup_session(target_session)
 
         return {"status": "killed", "session_id": target_session_id}
+
+    @app.post("/sessions/{session_id}/handoff")
+    async def schedule_handoff(session_id: str, request: HandoffRequest):
+        """Schedule a self-directed context rotation via handoff doc (#196)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        # 1. Verify self-auth: requester must be the session itself
+        if request.requester_session_id != session_id:
+            return {"error": "sm handoff is self-directed only — requester must equal target session"}
+
+        # 2. Verify session exists
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            return {"error": f"Session {session_id} not found"}
+
+        # 3. Reject codex-app sessions (no tmux, different clear mechanism)
+        if session.provider == "codex-app":
+            return {"error": "sm handoff is not supported for codex-app sessions"}
+
+        # 4. Store pending handoff on delivery state
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            return {"error": "Message queue manager not available"}
+
+        state = queue_mgr._get_or_create_state(session_id)
+        state.pending_handoff_path = request.file_path
+        logger.info(f"Handoff scheduled for {session_id}: {request.file_path}")
+        return {"status": "scheduled"}
 
     @app.get("/sessions/{session_id}/send-queue")
     async def get_send_queue(session_id: str):
