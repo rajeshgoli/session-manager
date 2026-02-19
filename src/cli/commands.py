@@ -1,5 +1,6 @@
 """Command implementations for sm CLI."""
 
+import os
 import re
 import sys
 from typing import Optional
@@ -709,6 +710,70 @@ def cmd_subagents(client: SessionManagerClient, target_session_id: str) -> int:
             print(f"     {sa['summary']}")
 
     return 0
+
+
+def cmd_dispatch(
+    client: SessionManagerClient,
+    agent_id: str,
+    role: str,
+    params: dict,
+    em_id: Optional[str],
+    dry_run: bool = False,
+    delivery_mode: str = "sequential",
+    notify_on_stop: bool = True,
+) -> int:
+    """Dispatch a template-expanded prompt to a target agent.
+
+    Args:
+        client: API client
+        agent_id: Target session ID or friendly name
+        role: Role name from template config
+        params: Dynamic parameters (--issue, --spec, etc.)
+        em_id: Sender's session ID
+        dry_run: Print expanded template instead of sending
+        delivery_mode: Delivery mode for sm send
+        notify_on_stop: Notify on stop flag for sm send
+
+    Exit codes:
+        0: Success
+        1: Template/param error or send failed
+        2: Session manager unavailable
+    """
+    from .dispatch import load_template, expand_template, get_role_params, DispatchError
+
+    try:
+        config = load_template(os.getcwd())
+    except DispatchError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Validate dynamic params against role's required/optional
+    try:
+        required, optional = get_role_params(config, role)
+    except DispatchError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    all_known = set(required) | set(optional)
+    for key in params:
+        if key not in all_known:
+            print(f"Error: Unknown parameter '--{key}' for role '{role}'", file=sys.stderr)
+            return 1
+
+    try:
+        expanded = expand_template(config, role, params, em_id, dry_run=dry_run)
+    except DispatchError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    if dry_run:
+        print(expanded)
+        return 0
+
+    return cmd_send(
+        client, agent_id, expanded, delivery_mode,
+        notify_on_stop=notify_on_stop,
+    )
 
 
 def cmd_send(
