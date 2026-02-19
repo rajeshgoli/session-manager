@@ -50,6 +50,12 @@ fi
 # Create log directory
 mkdir -p /tmp/claude-sessions
 
+# Install default dispatch templates (only if not already present)
+if [ ! -f "$HOME/.sm/dispatch_templates.yaml" ]; then
+    echo "Installing default dispatch templates..."
+    sm setup 2>/dev/null || python -m src.cli.main setup 2>/dev/null || true
+fi
+
 echo ""
 echo "Setup complete!"
 echo ""

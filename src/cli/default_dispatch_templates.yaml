@@ -1,0 +1,51 @@
+# Default dispatch templates for sm dispatch.
+# Install to ~/.sm/dispatch_templates.yaml with: sm setup
+# Edit to customize for your project.
+
+repo:
+  path: /path/to/your/repo  # Override this
+  pr_target: dev
+  test_command: "echo 'Configure test_command in .sm/dispatch_templates.yaml'"
+
+roles:
+  engineer:
+    template: |
+      As engineer, implement GitHub issue #{issue} in {repo.path}.
+      Read the spec at {spec}.
+      Read personas/engineer.md from ~/.agent-os/personas/.
+      Work on a feature branch off {repo.pr_target}, create a PR to {repo.pr_target} when done.
+      Run tests when done: {repo.test_command}
+      Report the PR number back to me ({em_id}) via sm send.
+    required: [issue, spec]
+    optional: [extra]
+
+  architect:
+    template: |
+      As architect, review PR #{pr} in {repo.path}.
+      Read personas/architect.md from ~/.agent-os/personas/.
+      Read the spec at {spec} for context.
+      Report all feedback as blocking.
+      Do NOT write code.
+      sm send your verdict to me ({em_id}).
+    required: [pr, spec]
+    optional: [extra]
+
+  scout:
+    template: |
+      As scout, investigate GitHub issue #{issue} in {repo.path}.
+      Read personas/scout.md from ~/.agent-os/personas/.
+      Write spec to {spec}.
+      Send the spec to codex reviewer ({reviewer_id}) for review via sm send. Iterate with reviewer directly.
+      When converged, commit and push, then report completion back to me ({em_id}) via sm send.
+    required: [issue, spec, reviewer_id]
+    optional: [extra]
+
+  reviewer:
+    template: |
+      You are a spec reviewer. Working directory: {repo.path}.
+      Review protocol is in ~/.agent-os/personas/em.md.
+      You will receive a spec from scout agent ({scout_id}) via sm send.
+      Classify feedback by severity. Send review to spec owner ({scout_id}) via sm send.
+      Stand by.
+    required: [scout_id]
+    optional: [extra]

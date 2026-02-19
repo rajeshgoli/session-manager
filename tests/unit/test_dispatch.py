@@ -705,3 +705,162 @@ class TestCmdSendRemindParams:
         call_kwargs = mock_client.send_input.call_args[1]
         assert call_kwargs["remind_soft_threshold"] is None
         assert call_kwargs["remind_hard_threshold"] is None
+
+
+# ---------------------------------------------------------------------------
+# sm setup tests (sm#225-D)
+# ---------------------------------------------------------------------------
+
+class TestCmdSetup:
+    """Tests for cmd_setup and sm setup CLI."""
+
+    def _default_template_path(self):
+        from pathlib import Path
+        return Path(__file__).parent.parent.parent / "src" / "cli" / "default_dispatch_templates.yaml"
+
+    def test_creates_file_when_not_present(self, tmp_path):
+        """sm setup installs default templates when dest doesn't exist."""
+        from src.cli.commands import cmd_setup
+        dest = tmp_path / ".sm" / "dispatch_templates.yaml"
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = cmd_setup()
+        assert result == 0
+        assert dest.exists()
+
+    def test_file_content_has_expected_roles(self, tmp_path):
+        """Installed file contains engineer, architect, scout, reviewer roles."""
+        import yaml
+        from src.cli.commands import cmd_setup
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            cmd_setup()
+        dest = tmp_path / ".sm" / "dispatch_templates.yaml"
+        data = yaml.safe_load(dest.read_text())
+        assert "roles" in data
+        roles = data["roles"]
+        assert "engineer" in roles
+        assert "architect" in roles
+        assert "scout" in roles
+        assert "reviewer" in roles
+
+    def test_does_not_overwrite_existing(self, tmp_path, capsys):
+        """sm setup prints a message and exits 0 if file already exists."""
+        from src.cli.commands import cmd_setup
+        dest = tmp_path / ".sm" / "dispatch_templates.yaml"
+        dest.parent.mkdir(parents=True)
+        dest.write_text("existing: content\n")
+
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = cmd_setup(overwrite=False)
+
+        assert result == 0
+        assert dest.read_text() == "existing: content\n"
+        captured = capsys.readouterr()
+        assert "already installed" in captured.out or "overwrite" in captured.out.lower()
+
+    def test_overwrite_flag_replaces_existing(self, tmp_path):
+        """sm setup --overwrite replaces existing file."""
+        from src.cli.commands import cmd_setup
+        dest = tmp_path / ".sm" / "dispatch_templates.yaml"
+        dest.parent.mkdir(parents=True)
+        dest.write_text("old: content\n")
+
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = cmd_setup(overwrite=True)
+
+        assert result == 0
+        content = dest.read_text()
+        assert "old: content" not in content
+        assert "roles:" in content
+
+    def test_creates_parent_directory(self, tmp_path):
+        """cmd_setup creates ~/.sm/ if it doesn't exist."""
+        from src.cli.commands import cmd_setup
+        sm_dir = tmp_path / ".sm"
+        assert not sm_dir.exists()
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = cmd_setup()
+        assert result == 0
+        assert sm_dir.is_dir()
+
+    def test_cli_setup_no_overwrite(self, tmp_path):
+        """sm setup (CLI) succeeds without --overwrite."""
+        from src.cli.main import main
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            with patch("sys.argv", ["sm", "setup"]):
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+        assert exc_info.value.code == 0
+
+    def test_cli_setup_with_overwrite_flag(self, tmp_path):
+        """sm setup --overwrite is accepted by CLI."""
+        from src.cli.main import main
+        dest = tmp_path / ".sm" / "dispatch_templates.yaml"
+        dest.parent.mkdir(parents=True)
+        dest.write_text("old\n")
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            with patch("sys.argv", ["sm", "setup", "--overwrite"]):
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+        assert exc_info.value.code == 0
+        assert "old" not in dest.read_text()
+
+
+class TestDefaultTemplateExpansion:
+    """Verify default templates expand correctly with sm dispatch."""
+
+    def _load_default_templates(self):
+        from pathlib import Path
+        import yaml
+        path = Path(__file__).parent.parent.parent / "src" / "cli" / "default_dispatch_templates.yaml"
+        return yaml.safe_load(path.read_text())
+
+    def test_engineer_role_expands(self):
+        """Default engineer template expands with required params."""
+        config = self._load_default_templates()
+        expanded = expand_template(
+            config, "engineer",
+            {"issue": "123", "spec": "docs/123.md"},
+            em_id="abc123",
+        )
+        assert "123" in expanded
+        assert "docs/123.md" in expanded
+        assert "abc123" in expanded
+
+    def test_architect_role_expands(self):
+        """Default architect template expands with required params."""
+        config = self._load_default_templates()
+        expanded = expand_template(
+            config, "architect",
+            {"pr": "42", "spec": "docs/42.md"},
+            em_id="abc123",
+        )
+        assert "42" in expanded
+        assert "docs/42.md" in expanded
+        assert "abc123" in expanded
+
+    def test_scout_role_expands(self):
+        """Default scout template expands with required params."""
+        config = self._load_default_templates()
+        expanded = expand_template(
+            config, "scout",
+            {"issue": "99", "spec": "docs/99.md", "reviewer_id": "rev456"},
+            em_id="abc123",
+        )
+        assert "99" in expanded
+        assert "rev456" in expanded
+
+    def test_reviewer_role_expands(self):
+        """Default reviewer template expands with required params."""
+        config = self._load_default_templates()
+        expanded = expand_template(
+            config, "reviewer",
+            {"scout_id": "scout789"},
+            em_id="abc123",
+        )
+        assert "scout789" in expanded
+
+    def test_engineer_missing_required_raises(self):
+        """Missing required param raises DispatchError."""
+        config = self._load_default_templates()
+        with pytest.raises(DispatchError, match="Missing required parameter"):
+            expand_template(config, "engineer", {"issue": "1"}, em_id="x")

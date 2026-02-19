@@ -2339,3 +2339,37 @@ def cmd_context_monitor(
 
     print(f"Error: Unknown action '{action}'. Use: enable, disable, status", file=sys.stderr)
     return 1
+
+
+def cmd_setup(overwrite: bool = False) -> int:
+    """Copy default dispatch templates to ~/.sm/dispatch_templates.yaml.
+
+    Installs the bundled default_dispatch_templates.yaml to the user's global
+    ~/.sm/dispatch_templates.yaml. Never overwrites an existing file unless
+    overwrite=True.
+
+    Args:
+        overwrite: If True, replace an existing file. Default False.
+
+    Returns:
+        0 on success, 1 on error.
+    """
+    import shutil
+    from pathlib import Path
+
+    src = Path(__file__).parent / "default_dispatch_templates.yaml"
+    dest = Path.home() / ".sm" / "dispatch_templates.yaml"
+
+    if not src.is_file():
+        print(f"Error: Default template file not found: {src}", file=sys.stderr)
+        return 1
+
+    if dest.exists() and not overwrite:
+        print(f"Templates already installed at {dest}")
+        print("Use --overwrite to replace.")
+        return 0
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    print(f"Installed dispatch templates to {dest}")
+    return 0

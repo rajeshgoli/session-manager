@@ -319,6 +319,17 @@ def main():
         help="Session ID to register/deregister; defaults to self",
     )
 
+    # sm setup [--overwrite]
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Install default dispatch templates to ~/.sm/dispatch_templates.yaml",
+    )
+    setup_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing templates file",
+    )
+
     # sm review [session] --base|--uncommitted|--commit|--custom [options]
     review_parser = subparsers.add_parser("review", help="Start a Codex code review")
     review_parser.add_argument("session", nargs="?", help="Session ID or name to review on")
@@ -343,7 +354,7 @@ def main():
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-app", "codex-server",
-        "attach", "output", "tail", "clear", "review", "context-monitor", "remind", None
+        "attach", "output", "tail", "clear", "review", "context-monitor", "remind", "setup", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
@@ -461,6 +472,8 @@ def main():
         sys.exit(commands.cmd_handoff(client, session_id, args.file_path))
     elif args.command == "context-monitor":
         sys.exit(commands.cmd_context_monitor(client, session_id, args.action, args.target))
+    elif args.command == "setup":
+        sys.exit(commands.cmd_setup(overwrite=args.overwrite))
     elif args.command == "review":
         sys.exit(commands.cmd_review(
             client,
