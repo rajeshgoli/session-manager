@@ -398,6 +398,21 @@ class MessageQueueManager:
             state.stop_notify_sender_id = None
             state.stop_notify_sender_name = None
 
+        # Promote paste-buffered stop notification (sm#244).
+        # If a message was pasted mid-turn (is_idle=False at paste time), the sender was
+        # staged in paste_buffered to avoid a false notification on Task X's Stop hook.
+        # On the first idle transition, promote to stop_notify_sender_id so the NEXT
+        # Stop hook fires the notification (after Task Y completes).
+        if state.paste_buffered_notify_sender_id:
+            state.stop_notify_sender_id = state.paste_buffered_notify_sender_id
+            state.stop_notify_sender_name = state.paste_buffered_notify_sender_name
+            state.paste_buffered_notify_sender_id = None
+            state.paste_buffered_notify_sender_name = None
+            logger.debug(
+                f"Session {session_id}: promoted paste-buffered stop-notify to "
+                f"stop_notify_sender_id={state.stop_notify_sender_id} (sm#244)"
+            )
+
         # Trigger async delivery check
         asyncio.create_task(self._try_deliver_messages(session_id))
 
@@ -556,23 +571,12 @@ class MessageQueueManager:
             state = self._get_or_create_state(target_session_id)
             state.is_idle = True  # re-set: mark_session_active clears is_idle; need True to gate delivery
             asyncio.create_task(self._try_deliver_messages(target_session_id))
-        # If important mode, trigger check (delivers when response complete)
+        # If important mode, trigger delivery directly (tty buffer handles ordering, sm#244)
         elif delivery_mode == "important":
             asyncio.create_task(self._try_deliver_messages(target_session_id, important_only=True))
-        # For sequential mode, check if session is already idle and deliver immediately
+        # For sequential mode, deliver directly — no idle gate needed (sm#244)
         elif delivery_mode == "sequential":
-            state = self.delivery_states.get(target_session_id)
-            # Check in-memory idle state first
-            if state and state.is_idle:
-                logger.info(f"Session {target_session_id} already idle (in-memory), triggering immediate delivery")
-                asyncio.create_task(self._try_deliver_messages(target_session_id))
-            else:
-                # Check actual session status - IDLE sessions should receive messages
-                if session:
-                    from .models import SessionStatus
-                    if session.status == SessionStatus.IDLE:
-                        logger.info(f"Session {target_session_id} is idle, marking for delivery")
-                        self.mark_session_idle(target_session_id)
+            asyncio.create_task(self._try_deliver_messages(target_session_id))
 
         return msg
 
@@ -735,7 +739,6 @@ class MessageQueueManager:
 
                     for session_id in sessions_with_pending:
                         await self._check_stale_input(session_id)
-                        await self._check_stuck_delivery(session_id)
 
                     await asyncio.sleep(self.input_poll_interval)
                     retry_count = 0  # Reset on successful iteration
@@ -774,10 +777,6 @@ class MessageQueueManager:
         """Check if user input has become stale and trigger delivery."""
         state = self._get_or_create_state(session_id)
 
-        # Only check if session is idle but has pending user input
-        if not state.is_idle:
-            return
-
         session = self.session_manager.get_session(session_id)
         if not session:
             return
@@ -810,48 +809,6 @@ class MessageQueueManager:
             # No input - clear tracking
             state.pending_user_input = None
             state.pending_input_first_seen = None
-
-    async def _check_stuck_delivery(self, session_id: str):
-        """
-        Fallback: detect sessions at the '>' prompt with pending messages but
-        state.is_idle=False (Stop hook curl not yet processed or silently failed).
-
-        Requires 2 consecutive prompt detections (~2 poll intervals) before triggering
-        delivery to avoid false positives mid-turn.
-
-        Skips: already-idle sessions, codex-app (no tmux), sessions without tmux_session.
-        Calls _try_deliver_messages() directly — does NOT call mark_session_idle() to avoid
-        false stop-notify side effects (#229).
-        """
-        state = self.delivery_states.get(session_id)
-        if state and state.is_idle:
-            return  # Already handled; _try_deliver_messages already triggered
-
-        session = self.session_manager.get_session(session_id)
-        if not session:
-            return
-
-        # Skip providers with no tmux pane
-        provider = getattr(session, "provider", "claude")
-        if provider not in ("claude", "codex"):
-            return
-        if not session.tmux_session:
-            return
-
-        if await self._check_idle_prompt(session.tmux_session):
-            state = self._get_or_create_state(session_id)
-            state._stuck_delivery_count += 1
-            if state._stuck_delivery_count >= 2:
-                state._stuck_delivery_count = 0
-                # Set idle and trigger delivery directly — do NOT call mark_session_idle()
-                # to avoid false stop-notify side effects (no from_stop_hook context).
-                state.is_idle = True
-                state.last_idle_at = datetime.now()
-                logger.info(f"Stuck delivery fallback: {session_id} at prompt with pending messages")
-                asyncio.create_task(self._try_deliver_messages(session_id))
-        else:
-            if state:
-                state._stuck_delivery_count = 0
 
     async def _try_deliver_messages(self, session_id: str, important_only: bool = False):
         """
@@ -889,15 +846,7 @@ class MessageQueueManager:
                 messages = [m for m in messages if m.delivery_mode == "important"]
                 if not messages:
                     return
-                # Important should not interrupt active work; wait until idle
-                if not state.is_idle:
-                    logger.debug(f"Session {session_id} not idle, deferring important delivery")
-                    return
-            else:
-                # For sequential, only deliver if session is idle
-                if not state.is_idle:
-                    logger.debug(f"Session {session_id} not idle, skipping sequential delivery")
-                    return
+            # No idle gate for sequential or important: tty buffer handles ordering (sm#244)
 
             # Check for user input (final gate)
             current_input = None
@@ -920,6 +869,9 @@ class MessageQueueManager:
                 for msg in batch:
                     parts.append(msg.text)
                 payload = "\n\n".join(parts)
+
+            # Capture idle state before delivery: determines notify_on_stop path (sm#244)
+            was_idle = state.is_idle
 
             # Inject the message (use async version to avoid blocking event loop)
             logger.info(f"Delivering {len(batch)} message(s) to {session_id}")
@@ -949,10 +901,19 @@ class MessageQueueManager:
                     if msg.notify_after_seconds and msg.sender_session_id:
                         await self._schedule_followup_notification(msg)
 
-                    # Track sender for stop notification (last message with notify_on_stop wins)
+                    # Track sender for stop notification (last message with notify_on_stop wins).
+                    # Two-phase promotion (sm#244): if pasted mid-turn (was_idle=False), stage in
+                    # paste_buffered — Task X's Stop hook will promote to stop_notify_sender_id
+                    # so the notification fires after Task Y (not falsely after Task X).
+                    # If pasted when idle (was_idle=True), arm stop_notify_sender_id directly:
+                    # the agent consumes the paste immediately, so the next Stop hook IS Task Y.
                     if msg.notify_on_stop and msg.sender_session_id:
-                        state.stop_notify_sender_id = msg.sender_session_id
-                        state.stop_notify_sender_name = msg.sender_name
+                        if was_idle:
+                            state.stop_notify_sender_id = msg.sender_session_id
+                            state.stop_notify_sender_name = msg.sender_name
+                        else:
+                            state.paste_buffered_notify_sender_id = msg.sender_session_id
+                            state.paste_buffered_notify_sender_name = msg.sender_name
 
                     # Start periodic remind if requested (#188)
                     if msg.remind_soft_threshold is not None:

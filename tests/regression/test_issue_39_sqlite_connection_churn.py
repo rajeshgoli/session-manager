@@ -19,6 +19,12 @@ from datetime import datetime
 from src.message_queue import MessageQueueManager
 
 
+def noop_create_task(coro):
+    """Silently close coroutine without running it (no event loop in sync tests)."""
+    coro.close()
+    return MagicMock()
+
+
 @pytest.fixture
 def temp_db(tmp_path):
     """Create a temporary database path."""
@@ -74,15 +80,16 @@ def test_connection_reused_not_recreated(queue_manager):
     conn_id = id(queue_manager._db_conn)
 
     # Perform multiple operations
-    queue_manager.queue_message(
-        target_session_id="test-session",
-        text="Message 1",
-    )
+    with patch('asyncio.create_task', noop_create_task):
+        queue_manager.queue_message(
+            target_session_id="test-session",
+            text="Message 1",
+        )
 
-    queue_manager.queue_message(
-        target_session_id="test-session",
-        text="Message 2",
-    )
+        queue_manager.queue_message(
+            target_session_id="test-session",
+            text="Message 2",
+        )
 
     pending = queue_manager.get_pending_messages("test-session")
     assert len(pending) == 2
@@ -100,7 +107,8 @@ def test_no_new_connections_created(queue_manager, temp_db):
         connect_calls.append((args, kwargs))
         return original_connect(*args, **kwargs)
 
-    with patch('sqlite3.connect', side_effect=track_connect):
+    with patch('sqlite3.connect', side_effect=track_connect), \
+         patch('asyncio.create_task', noop_create_task):
         # Perform operations (connection already created in __init__)
         queue_manager.queue_message(
             target_session_id="test-session",
@@ -142,13 +150,16 @@ def test_concurrent_operations_with_lock(queue_manager):
         )
         threads.append(thread)
 
-    # Start all threads
-    for thread in threads:
-        thread.start()
+    # Patch asyncio.create_task: sequential delivery always schedules a task (sm#244),
+    # but these threads have no running event loop.
+    with patch('asyncio.create_task', noop_create_task):
+        # Start all threads
+        for thread in threads:
+            thread.start()
 
-    # Wait for all to complete
-    for thread in threads:
-        thread.join()
+        # Wait for all to complete
+        for thread in threads:
+            thread.join()
 
     # Verify no errors occurred (no "database is locked" errors)
     assert len(errors) == 0, f"Errors occurred: {errors}"
@@ -286,10 +297,11 @@ def test_all_operations_use_persistent_connection(queue_manager):
     queue_manager._execute_query = track_execute_query
 
     # Perform various operations
-    msg_id = queue_manager.queue_message(
-        target_session_id="test-session",
-        text="Test message",
-    ).id
+    with patch('asyncio.create_task', noop_create_task):
+        msg_id = queue_manager.queue_message(
+            target_session_id="test-session",
+            text="Test message",
+        ).id
 
     queue_manager.get_pending_messages("test-session")
     queue_manager.get_queue_length("test-session")
@@ -332,10 +344,11 @@ async def test_reminder_operations_use_persistent_connection(queue_manager):
 def test_cleanup_operations_use_persistent_connection(queue_manager):
     """Test that cleanup operations use the persistent connection."""
     # Queue some messages
-    queue_manager.queue_message(
-        target_session_id="test-session",
-        text="Message 1",
-    )
+    with patch('asyncio.create_task', noop_create_task):
+        queue_manager.queue_message(
+            target_session_id="test-session",
+            text="Message 1",
+        )
 
     operations = []
 
@@ -404,13 +417,16 @@ def test_no_database_locked_errors_under_load(queue_manager):
         )
         threads.append(thread)
 
-    # Start all threads
-    for thread in threads:
-        thread.start()
+    # Patch asyncio.create_task: sequential delivery always schedules a task (sm#244),
+    # but these threads have no running event loop.
+    with patch('asyncio.create_task', noop_create_task):
+        # Start all threads
+        for thread in threads:
+            thread.start()
 
-    # Wait for completion
-    for thread in threads:
-        thread.join(timeout=30)
+        # Wait for completion
+        for thread in threads:
+            thread.join(timeout=30)
 
     # Verify no database locked errors
     assert len(errors) == 0, f"Database locked errors occurred: {errors}"

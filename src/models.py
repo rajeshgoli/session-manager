@@ -447,4 +447,5 @@ class SessionDeliveryState:
     last_outgoing_sm_send_target: Optional[str] = None  # Target of last outgoing sm send (#182)
     last_outgoing_sm_send_at: Optional[datetime] = None  # When last outgoing sm send was recorded (#182)
     pending_handoff_path: Optional[str] = None  # File path for pending handoff (#196)
-    _stuck_delivery_count: int = 0  # Consecutive prompt detections with pending msgs but is_idle=False (#229)
+    paste_buffered_notify_sender_id: Optional[str] = None  # Staged stop-notify for mid-turn paste; promoted on first idle (sm#244)
+    paste_buffered_notify_sender_name: Optional[str] = None  # Sender name for the above (sm#244)

@@ -184,8 +184,11 @@ class TestWatchForIdleRace:
         self, message_queue, mock_session_manager
     ):
         """
-        Sequential path calls mark_session_idle when session.status == IDLE.
-        _watch_for_idle must detect pending messages and not fire false-idle.
+        _watch_for_idle Phase 4: even if is_idle=True, pending messages prevent false-idle.
+
+        With sm#244, sequential delivery no longer calls mark_session_idle from queue_message.
+        But Phase 4 still guards against any future scenario where is_idle=True coexists
+        with stuck pending messages (e.g., delivery lock held, tty buffer lag).
         """
         target_id = "target-ddd"
         watcher_id = "watcher-ddd"
@@ -210,7 +213,7 @@ class TestWatchForIdleRace:
             watcher_id: watcher_session,
         }.get(sid)
 
-        # Queue sequential message (triggers mark_session_idle via session.status == IDLE)
+        # Queue sequential message (delivery task discarded by noop)
         with patch("asyncio.create_task", noop_create_task):
             message_queue.queue_message(
                 target_session_id=target_id,
@@ -218,7 +221,9 @@ class TestWatchForIdleRace:
                 delivery_mode="sequential",
             )
 
-        # State is idle (from mark_session_idle) but message is still pending
+        # Manually set is_idle=True to simulate the Phase 4 scenario:
+        # is_idle is stale-True while a message is still pending in the queue.
+        message_queue._get_or_create_state(target_id).is_idle = True
         assert message_queue.is_session_idle(target_id) is True
         assert message_queue.get_queue_length(target_id) == 1
 

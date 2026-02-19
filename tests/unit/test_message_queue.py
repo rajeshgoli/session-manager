@@ -68,12 +68,13 @@ class TestQueueing:
 
     def test_queue_message_persists_to_db(self, message_queue):
         """Queued messages are stored in SQLite."""
-        msg = message_queue.queue_message(
-            target_session_id="target123",
-            text="Hello, world!",
-            sender_session_id="sender456",
-            sender_name="Test Sender",
-        )
+        with patch('asyncio.create_task', noop_create_task):
+            msg = message_queue.queue_message(
+                target_session_id="target123",
+                text="Hello, world!",
+                sender_session_id="sender456",
+                sender_name="Test Sender",
+            )
 
         # Verify message was returned
         assert msg.id is not None
@@ -88,11 +89,12 @@ class TestQueueing:
 
     def test_queue_message_with_timeout(self, message_queue):
         """Messages with timeout have correct timeout_at."""
-        msg = message_queue.queue_message(
-            target_session_id="target123",
-            text="Urgent message",
-            timeout_seconds=300,  # 5 minutes
-        )
+        with patch('asyncio.create_task', noop_create_task):
+            msg = message_queue.queue_message(
+                target_session_id="target123",
+                text="Urgent message",
+                timeout_seconds=300,  # 5 minutes
+            )
 
         # Verify timeout was set
         assert msg.timeout_at is not None
@@ -102,17 +104,19 @@ class TestQueueing:
 
     def test_queue_message_without_timeout(self, message_queue):
         """Messages without timeout have None timeout_at."""
-        msg = message_queue.queue_message(
-            target_session_id="target123",
-            text="Normal message",
-        )
+        with patch('asyncio.create_task', noop_create_task):
+            msg = message_queue.queue_message(
+                target_session_id="target123",
+                text="Normal message",
+            )
         assert msg.timeout_at is None
 
     def test_queue_multiple_messages_preserves_order(self, message_queue):
         """Multiple queued messages preserve FIFO order."""
-        msg1 = message_queue.queue_message("target123", "First")
-        msg2 = message_queue.queue_message("target123", "Second")
-        msg3 = message_queue.queue_message("target123", "Third")
+        with patch('asyncio.create_task', noop_create_task):
+            msg1 = message_queue.queue_message("target123", "First")
+            msg2 = message_queue.queue_message("target123", "Second")
+            msg3 = message_queue.queue_message("target123", "Third")
 
         pending = message_queue.get_pending_messages("target123")
         assert len(pending) == 3
@@ -126,10 +130,11 @@ class TestDeliveryModes:
 
     def test_default_mode_is_sequential(self, message_queue):
         """Default delivery mode is sequential."""
-        msg = message_queue.queue_message(
-            target_session_id="target123",
-            text="Default mode message",
-        )
+        with patch('asyncio.create_task', noop_create_task):
+            msg = message_queue.queue_message(
+                target_session_id="target123",
+                text="Default mode message",
+            )
         assert msg.delivery_mode == "sequential"
 
     def test_important_mode_queued(self, message_queue):
@@ -214,10 +219,12 @@ class TestPendingMessages:
         """get_queue_length returns correct count."""
         assert message_queue.get_queue_length("target123") == 0
 
-        message_queue.queue_message("target123", "Message 1")
+        with patch('asyncio.create_task', noop_create_task):
+            message_queue.queue_message("target123", "Message 1")
         assert message_queue.get_queue_length("target123") == 1
 
-        message_queue.queue_message("target123", "Message 2")
+        with patch('asyncio.create_task', noop_create_task):
+            message_queue.queue_message("target123", "Message 2")
         assert message_queue.get_queue_length("target123") == 2
 
 
@@ -227,8 +234,9 @@ class TestBatchDelivery:
     def test_max_batch_size_respected(self, message_queue):
         """Batch size is limited by max_batch_size config."""
         # Queue more messages than max_batch_size
-        for i in range(15):
-            message_queue.queue_message("target123", f"Message {i}")
+        with patch('asyncio.create_task', noop_create_task):
+            for i in range(15):
+                message_queue.queue_message("target123", f"Message {i}")
 
         pending = message_queue.get_pending_messages("target123")
         assert len(pending) == 15  # All messages returned
@@ -243,12 +251,13 @@ class TestQueueStatus:
     def test_get_queue_status(self, message_queue):
         """get_queue_status returns correct status dict."""
         # Queue some messages
-        message_queue.queue_message(
-            target_session_id="target123",
-            text="Test message",
-            sender_session_id="sender456",
-            sender_name="Test Sender",
-        )
+        with patch('asyncio.create_task', noop_create_task):
+            message_queue.queue_message(
+                target_session_id="target123",
+                text="Test message",
+                sender_session_id="sender456",
+                sender_name="Test Sender",
+            )
         # Patch asyncio.create_task when marking idle
         with patch('asyncio.create_task', noop_create_task):
             message_queue.mark_session_idle("target123")
@@ -299,7 +308,8 @@ class TestDatabaseOperations:
 
     def test_mark_delivered_updates_db(self, message_queue):
         """_mark_delivered updates delivered_at in database."""
-        msg = message_queue.queue_message("target123", "Test")
+        with patch('asyncio.create_task', noop_create_task):
+            msg = message_queue.queue_message("target123", "Test")
 
         # Verify not delivered yet
         pending = message_queue.get_pending_messages("target123")
@@ -329,9 +339,10 @@ class TestCleanup:
     def test_cleanup_messages_for_session(self, message_queue):
         """_cleanup_messages_for_session removes all pending messages."""
         # Queue messages
-        message_queue.queue_message("target123", "Message 1")
-        message_queue.queue_message("target123", "Message 2")
-        message_queue.queue_message("other456", "Other session")
+        with patch('asyncio.create_task', noop_create_task):
+            message_queue.queue_message("target123", "Message 1")
+            message_queue.queue_message("target123", "Message 2")
+            message_queue.queue_message("other456", "Other session")
 
         assert message_queue.get_queue_length("target123") == 2
         assert message_queue.get_queue_length("other456") == 1
@@ -1288,8 +1299,8 @@ class TestTelegramMirroring:
         assert "🛑" in event.message
 
 
-class TestCheckStuckDelivery:
-    """Tests for _check_stuck_delivery fallback in monitor loop (#229)."""
+class TestDirectDelivery244:
+    """sm#244: Direct delivery — no idle gate for sequential/important; paste_buffered_notify."""
 
     def _make_mq(self, mock_session_manager, temp_db_path):
         return MessageQueueManager(
@@ -1306,13 +1317,14 @@ class TestCheckStuckDelivery:
                     "message_queue": {
                         "subprocess_timeout_seconds": 1,
                         "async_send_timeout_seconds": 2,
+                        "skip_fence_window_seconds": 8,
                     }
                 },
             },
             notifier=None,
         )
 
-    def _insert_pending_message(self, mq, session_id, msg_id="pending229"):
+    def _insert_pending_message(self, mq, session_id, msg_id="pending244"):
         mq._execute("""
             INSERT INTO message_queue
             (id, target_session_id, text, delivery_mode, queued_at)
@@ -1320,124 +1332,133 @@ class TestCheckStuckDelivery:
         """, (msg_id, session_id, "Stuck message", "sequential", datetime.now().isoformat()))
 
     @pytest.mark.asyncio
-    async def test_stuck_delivery_fires_on_second_detection(self, mock_session_manager, temp_db_path):
-        """Fallback delivers on 2nd consecutive prompt detection with is_idle=False."""
+    async def test_sequential_delivery_without_idle_gate(self, mock_session_manager, temp_db_path):
+        """Sequential delivery proceeds even when is_idle=False (no idle gate, sm#244)."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
 
         session = MagicMock()
-        session.id = "target229a"
+        session.id = "target244a"
         session.provider = "claude"
-        session.tmux_session = "tmux-claude"
+        session.tmux_session = "claude-target244a"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
         mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
 
-        self._insert_pending_message(mq, "target229a")
-        # State exists but is NOT idle
-        mq.delivery_states["target229a"] = SessionDeliveryState(session_id="target229a", is_idle=False)
+        self._insert_pending_message(mq, "target244a")
+        state = mq._get_or_create_state("target244a")
+        state.is_idle = False  # Agent is mid-turn
 
-        mq._check_idle_prompt = AsyncMock(return_value=True)
-        delivered = []
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
 
-        async def mock_try_deliver(sid, important_only=False):
-            delivered.append(sid)
+        await mq._try_deliver_messages("target244a")
 
-        mq._try_deliver_messages = mock_try_deliver
-
-        # First call: count → 1, no delivery yet
-        await mq._check_stuck_delivery("target229a")
-        assert mq.delivery_states["target229a"]._stuck_delivery_count == 1
-        assert len(delivered) == 0
-
-        # Second call: count hits 2, delivery triggered
-        with patch("asyncio.create_task", side_effect=lambda coro: asyncio.ensure_future(coro)):
-            await mq._check_stuck_delivery("target229a")
-
-        # Give the event loop a tick to run the created task
-        await asyncio.sleep(0)
-
-        assert mq.delivery_states["target229a"]._stuck_delivery_count == 0
-        assert mq.delivery_states["target229a"].is_idle is True
-        assert len(delivered) == 1
-        assert delivered[0] == "target229a"
+        mock_session_manager._deliver_direct.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_first_detection_does_not_deliver(self, mock_session_manager, temp_db_path):
-        """Single prompt detection does not trigger delivery (requires 2 consecutive)."""
+    async def test_important_delivery_without_idle_gate(self, mock_session_manager, temp_db_path):
+        """Important delivery proceeds even when is_idle=False (no idle gate, sm#244)."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
 
         session = MagicMock()
-        session.id = "target229b"
+        session.id = "target244b"
         session.provider = "claude"
-        session.tmux_session = "tmux-claude"
+        session.tmux_session = "claude-target244b"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
         mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
 
-        self._insert_pending_message(mq, "target229b", msg_id="pending229b")
-        mq.delivery_states["target229b"] = SessionDeliveryState(session_id="target229b", is_idle=False)
-        mq._check_idle_prompt = AsyncMock(return_value=True)
+        mq._execute("""
+            INSERT INTO message_queue
+            (id, target_session_id, text, delivery_mode, queued_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, ("imp244b", "target244b", "Important message", "important", datetime.now().isoformat()))
 
-        delivered = []
+        state = mq._get_or_create_state("target244b")
+        state.is_idle = False  # Agent is mid-turn
 
-        async def mock_try_deliver(sid, important_only=False):
-            delivered.append(sid)
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
 
-        mq._try_deliver_messages = mock_try_deliver
+        await mq._try_deliver_messages("target244b", important_only=True)
 
-        await mq._check_stuck_delivery("target229b")
-
-        assert mq.delivery_states["target229b"]._stuck_delivery_count == 1
-        assert len(delivered) == 0
-        assert mq.delivery_states["target229b"].is_idle is False
+        mock_session_manager._deliver_direct.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_mid_turn_false_positive_blocked(self, mock_session_manager, temp_db_path):
-        """Prompt appears briefly then disappears — counter resets, no delivery."""
+    async def test_notify_on_stop_mid_turn_uses_paste_buffered(self, mock_session_manager, temp_db_path):
+        """notify_on_stop=True mid-turn sets paste_buffered_notify, NOT stop_notify_sender_id (sm#244)."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
 
         session = MagicMock()
-        session.id = "target229c"
+        session.id = "target244c"
         session.provider = "claude"
-        session.tmux_session = "tmux-claude"
+        session.tmux_session = "claude-target244c"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
         mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
 
-        self._insert_pending_message(mq, "target229c", msg_id="pending229c")
-        mq.delivery_states["target229c"] = SessionDeliveryState(session_id="target229c", is_idle=False)
+        mq._execute("""
+            INSERT INTO message_queue
+            (id, target_session_id, sender_session_id, sender_name, text, delivery_mode, queued_at, notify_on_stop)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, ("msg244c", "target244c", "sender-agent-c", "Agent C",
+              "Hello while busy", "sequential", datetime.now().isoformat(), 1))
 
-        delivered = []
+        state = mq._get_or_create_state("target244c")
+        state.is_idle = False  # Agent is mid-turn
 
-        async def mock_try_deliver(sid, important_only=False):
-            delivered.append(sid)
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
 
-        mq._try_deliver_messages = mock_try_deliver
+        await mq._try_deliver_messages("target244c")
 
-        # First call: prompt visible → count=1
-        mq._check_idle_prompt = AsyncMock(return_value=True)
-        await mq._check_stuck_delivery("target229c")
-        assert mq.delivery_states["target229c"]._stuck_delivery_count == 1
-
-        # Second call: prompt gone → count resets to 0
-        mq._check_idle_prompt = AsyncMock(return_value=False)
-        await mq._check_stuck_delivery("target229c")
-        assert mq.delivery_states["target229c"]._stuck_delivery_count == 0
-        assert len(delivered) == 0
-        assert mq.delivery_states["target229c"].is_idle is False
+        # paste_buffered must be set; stop_notify_sender_id must NOT be set yet
+        assert state.paste_buffered_notify_sender_id == "sender-agent-c"
+        assert state.paste_buffered_notify_sender_name == "Agent C"
+        assert state.stop_notify_sender_id is None
 
     @pytest.mark.asyncio
-    async def test_stop_notify_isolation(self, mock_session_manager, temp_db_path):
-        """Fallback delivery does NOT trigger _send_stop_notification (#229)."""
+    async def test_notify_on_stop_idle_path_arms_directly(self, mock_session_manager, temp_db_path):
+        """notify_on_stop=True when idle sets stop_notify_sender_id directly (no paste_buffered, sm#244)."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
 
         session = MagicMock()
-        session.id = "target229d"
+        session.id = "target244d"
         session.provider = "claude"
-        session.tmux_session = "tmux-claude"
+        session.tmux_session = "claude-target244d"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
         mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
 
-        self._insert_pending_message(mq, "target229d", msg_id="pending229d")
+        mq._execute("""
+            INSERT INTO message_queue
+            (id, target_session_id, sender_session_id, sender_name, text, delivery_mode, queued_at, notify_on_stop)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, ("msg244d", "target244d", "sender-agent-d", "Agent D",
+              "Hello while idle", "sequential", datetime.now().isoformat(), 1))
 
-        # State: NOT idle, but has a stop_notify_sender_id set
-        state = SessionDeliveryState(session_id="target229d", is_idle=False)
-        state.stop_notify_sender_id = "sender-em"
-        state.stop_notify_sender_name = "em-session"
-        mq.delivery_states["target229d"] = state
+        state = mq._get_or_create_state("target244d")
+        state.is_idle = True  # Agent is idle
+
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
+
+        await mq._try_deliver_messages("target244d")
+
+        # stop_notify_sender_id set directly; paste_buffered must be None
+        assert state.stop_notify_sender_id == "sender-agent-d"
+        assert state.stop_notify_sender_name == "Agent D"
+        assert state.paste_buffered_notify_sender_id is None
+
+    def test_mark_session_idle_promotes_paste_buffered(self, mock_session_manager, temp_db_path):
+        """mark_session_idle promotes paste_buffered → stop_notify_sender_id without firing notification (sm#244)."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target244e")
+        state.is_idle = False
+
+        # Simulate: message was pasted mid-turn, sender staged in paste_buffered
+        state.paste_buffered_notify_sender_id = "sender-em"
+        state.paste_buffered_notify_sender_name = "em-session"
 
         stop_notify_calls = []
 
@@ -1445,7 +1466,65 @@ class TestCheckStuckDelivery:
             stop_notify_calls.append(kwargs)
 
         mq._send_stop_notification = mock_stop_notify
-        mq._check_idle_prompt = AsyncMock(return_value=True)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target244e")
+
+        # paste_buffered promoted to stop_notify_sender_id
+        assert state.stop_notify_sender_id == "sender-em"
+        assert state.stop_notify_sender_name == "em-session"
+        assert state.paste_buffered_notify_sender_id is None
+        assert state.paste_buffered_notify_sender_name is None
+        # No stop notification sent yet (fires on the NEXT Stop hook)
+        assert len(stop_notify_calls) == 0
+
+    def test_mark_session_idle_fires_notification_on_second_idle(self, mock_session_manager, temp_db_path):
+        """After promotion, the NEXT mark_session_idle fires the notification (sm#244)."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target244f")
+
+        # Simulate: promotion already happened on Task X's Stop hook
+        state.stop_notify_sender_id = "sender-em"
+        state.stop_notify_sender_name = "em-session"
+        state.paste_buffered_notify_sender_id = None
+
+        tasks_created = []
+
+        def capture_create_task(coro):
+            tasks_created.append(coro)
+            coro.close()
+            return MagicMock()
+
+        with patch("asyncio.create_task", capture_create_task):
+            mq.mark_session_idle("target244f")
+
+        # stop_notify_sender_id was consumed (cleared after scheduling notification)
+        assert state.stop_notify_sender_id is None
+        # At least one task was created (the stop notification coroutine)
+        assert len(tasks_created) >= 1
+
+    @pytest.mark.asyncio
+    async def test_check_stale_input_runs_without_idle(self, mock_session_manager, temp_db_path):
+        """_check_stale_input proceeds even when is_idle=False (guard removed, sm#244 Issue 3)."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        session = MagicMock()
+        session.id = "target244g"
+        session.provider = "claude"
+        session.tmux_session = "claude-target244g"
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        self._insert_pending_message(mq, "target244g", msg_id="pending244g")
+        state = mq._get_or_create_state("target244g")
+        state.is_idle = False  # Stop hook failed: not idle
+
+        # Simulate user has been typing longer than input_stale_timeout
+        stale_input = "> some text"
+        state.pending_user_input = stale_input
+        state.pending_input_first_seen = datetime.now() - timedelta(seconds=60)
+
+        mq._get_pending_user_input_async = AsyncMock(return_value=stale_input)
+        mq._clear_user_input_async = AsyncMock()
 
         delivered = []
 
@@ -1454,166 +1533,77 @@ class TestCheckStuckDelivery:
 
         mq._try_deliver_messages = mock_try_deliver
 
-        # Two consecutive prompt detections → fallback fires
-        await mq._check_stuck_delivery("target229d")
-        with patch("asyncio.create_task", side_effect=lambda coro: asyncio.ensure_future(coro)):
-            await mq._check_stuck_delivery("target229d")
+        # Should not return early despite is_idle=False
+        await mq._check_stale_input("target244g")
 
-        await asyncio.sleep(0)
-
-        # Delivery happened but stop notification was NOT sent
         assert len(delivered) == 1
-        assert len(stop_notify_calls) == 0
+        assert state.saved_user_input == stale_input
 
     @pytest.mark.asyncio
-    async def test_skip_count_not_decremented_by_fallback(self, mock_session_manager, temp_db_path):
-        """Fallback delivery does NOT decrement stop_notify_skip_count (#174 regression)."""
+    async def test_queue_message_sequential_always_schedules_delivery(self, mock_session_manager, temp_db_path):
+        """queue_message with sequential mode always schedules _try_deliver_messages (sm#244)."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
 
         session = MagicMock()
-        session.id = "target229e"
+        session.id = "target244h"
         session.provider = "claude"
-        session.tmux_session = "tmux-claude"
-        mock_session_manager.get_session = MagicMock(return_value=session)
-
-        self._insert_pending_message(mq, "target229e", msg_id="pending229e")
-
-        state = SessionDeliveryState(session_id="target229e", is_idle=False)
-        state.stop_notify_skip_count = 1
-        mq.delivery_states["target229e"] = state
-
-        mq._check_idle_prompt = AsyncMock(return_value=True)
-
-        async def mock_try_deliver(sid, important_only=False):
-            pass
-
-        mq._try_deliver_messages = mock_try_deliver
-
-        await mq._check_stuck_delivery("target229e")
-        with patch("asyncio.create_task", side_effect=lambda coro: asyncio.ensure_future(coro)):
-            await mq._check_stuck_delivery("target229e")
-
-        await asyncio.sleep(0)
-
-        # skip_count must NOT have been decremented by fallback
-        assert mq.delivery_states["target229e"].stop_notify_skip_count == 1
-
-    @pytest.mark.asyncio
-    async def test_codex_app_excluded(self, mock_session_manager, temp_db_path):
-        """codex-app sessions are skipped (no tmux pane)."""
-        mq = self._make_mq(mock_session_manager, temp_db_path)
-
-        session = MagicMock()
-        session.id = "target229f"
-        session.provider = "codex-app"
-        session.tmux_session = "tmux-codex-app"
-        mock_session_manager.get_session = MagicMock(return_value=session)
-
-        self._insert_pending_message(mq, "target229f", msg_id="pending229f")
-        mq.delivery_states["target229f"] = SessionDeliveryState(session_id="target229f", is_idle=False)
-        mq._check_idle_prompt = AsyncMock(return_value=True)
-
-        await mq._check_stuck_delivery("target229f")
-
-        # _check_idle_prompt must NOT have been called (early return)
-        mq._check_idle_prompt.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_claude_provider_proceeds(self, mock_session_manager, temp_db_path):
-        """claude provider with tmux_session set calls _check_idle_prompt."""
-        mq = self._make_mq(mock_session_manager, temp_db_path)
-
-        session = MagicMock()
-        session.id = "target229g"
-        session.provider = "claude"
-        session.tmux_session = "tmux-claude"
-        mock_session_manager.get_session = MagicMock(return_value=session)
-
-        self._insert_pending_message(mq, "target229g", msg_id="pending229g")
-        mq.delivery_states["target229g"] = SessionDeliveryState(session_id="target229g", is_idle=False)
-        mq._check_idle_prompt = AsyncMock(return_value=False)
-
-        await mq._check_stuck_delivery("target229g")
-
-        mq._check_idle_prompt.assert_called_once_with("tmux-claude")
-
-    @pytest.mark.asyncio
-    async def test_no_tmux_session_guard(self, mock_session_manager, temp_db_path):
-        """Sessions with tmux_session=None are skipped (no tmux to inspect)."""
-        mq = self._make_mq(mock_session_manager, temp_db_path)
-
-        session = MagicMock()
-        session.id = "target229h"
-        session.provider = "claude"
-        session.tmux_session = None
-        mock_session_manager.get_session = MagicMock(return_value=session)
-
-        self._insert_pending_message(mq, "target229h", msg_id="pending229h")
-        mq.delivery_states["target229h"] = SessionDeliveryState(session_id="target229h", is_idle=False)
-        mq._check_idle_prompt = AsyncMock(return_value=True)
-
-        await mq._check_stuck_delivery("target229h")
-
-        mq._check_idle_prompt.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_already_idle_skipped(self, mock_session_manager, temp_db_path):
-        """Sessions already marked idle are skipped — fallback not needed."""
-        mq = self._make_mq(mock_session_manager, temp_db_path)
-
-        session = MagicMock()
-        session.id = "target229i"
-        session.provider = "claude"
-        session.tmux_session = "tmux-claude"
-        mock_session_manager.get_session = MagicMock(return_value=session)
-
-        self._insert_pending_message(mq, "target229i", msg_id="pending229i")
-        # Already idle — fallback should return early
-        mq.delivery_states["target229i"] = SessionDeliveryState(session_id="target229i", is_idle=True)
-        mq._check_idle_prompt = AsyncMock(return_value=True)
-
-        await mq._check_stuck_delivery("target229i")
-
-        # _check_idle_prompt must NOT have been called
-        mq._check_idle_prompt.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_race_stop_hook_and_fallback_no_double_delivery(self, mock_session_manager, temp_db_path):
-        """Concurrent Stop hook (mark_session_idle) + fallback deliver exactly once (#229)."""
-        mq = self._make_mq(mock_session_manager, temp_db_path)
-
-        session = MagicMock()
-        session.id = "target229j"
-        session.provider = "claude"
-        session.tmux_session = "tmux-claude"
+        session.tmux_session = "claude-target244h"
         session.status = SessionStatus.IDLE
         session.last_activity = datetime.now()
         mock_session_manager.get_session = MagicMock(return_value=session)
-        # session_manager._deliver_direct is what _try_deliver_messages calls
-        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
 
-        self._insert_pending_message(mq, "target229j", msg_id="pending229j")
-        state = SessionDeliveryState(session_id="target229j", is_idle=False)
-        state._stuck_delivery_count = 1  # pre-populate so next prompt detection fires T2
-        mq.delivery_states["target229j"] = state
-        mq._check_idle_prompt = AsyncMock(return_value=True)
+        scheduled = []
 
-        # Simulate Stop hook + fallback both firing before either task runs.
-        # _stuck_delivery_count=1 means the first _check_stuck_delivery call triggers T2,
-        # then mark_session_idle() triggers T1. Both are scheduled before the event loop
-        # yields, so the asyncio lock in _try_deliver_messages must prevent double-delivery.
-        with patch("asyncio.create_task", side_effect=lambda coro: asyncio.ensure_future(coro)):
-            # Fallback fires: count 1→2, sets is_idle=True, schedules T2
-            await mq._check_stuck_delivery("target229j")
-            # Stop hook also fires: is_idle already True, schedules T1
-            mq.mark_session_idle("target229j")
-            # T1 and T2 are now both scheduled; neither has run yet
+        def capture_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return MagicMock()
 
-        # Let all scheduled tasks run
-        await asyncio.sleep(0.05)
+        with patch("asyncio.create_task", capture_task):
+            mq.queue_message(
+                target_session_id="target244h",
+                text="Hello from agent",
+                delivery_mode="sequential",
+            )
 
-        # Per-session delivery lock ensures exactly one delivery
-        assert mock_session_manager._deliver_direct.call_count <= 1
+        # At least one task scheduled for delivery regardless of is_idle
+        assert len(scheduled) >= 1
+
+    @pytest.mark.asyncio
+    async def test_no_double_delivery_via_lock(self, mock_session_manager, temp_db_path):
+        """Concurrent delivery calls deliver exactly once (per-session lock, sm#244)."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        session = MagicMock()
+        session.id = "target244i"
+        session.provider = "claude"
+        session.tmux_session = "claude-target244i"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        deliver_call_count = 0
+
+        async def count_deliver(sess, payload):
+            nonlocal deliver_call_count
+            deliver_call_count += 1
+            return True
+
+        mock_session_manager._deliver_direct = count_deliver
+
+        self._insert_pending_message(mq, "target244i")
+        state = mq._get_or_create_state("target244i")
+        state.is_idle = True
+
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
+
+        # Fire two concurrent delivery tasks — lock should prevent double-delivery
+        await asyncio.gather(
+            mq._try_deliver_messages("target244i"),
+            mq._try_deliver_messages("target244i"),
+        )
+
+        assert deliver_call_count <= 1
 
 
 class TestSkipFence232:
@@ -1813,8 +1803,15 @@ class TestSkipFence232:
             mq.mark_session_idle("target232h", from_stop_hook=True)
 
         await watch_task
+        # Let delivery task run (direct delivery queues and delivers the timeout notification)
+        await asyncio.sleep(0)
 
-        # Watch timed out (no false idle notification)
-        pending = mq.get_pending_messages("watcher232h")
-        assert len(pending) == 1
-        assert "Timeout" in pending[0].text
+        # Watch timed out (no false idle notification).
+        # With sm#244, the timeout notification is delivered immediately (no idle gate),
+        # so we verify via _deliver_direct rather than the pending queue.
+        mock_session_manager._deliver_direct.assert_called()
+        timeout_payloads = [
+            call.args[1] for call in mock_session_manager._deliver_direct.call_args_list
+            if "Timeout" in str(call.args[1])
+        ]
+        assert len(timeout_payloads) >= 1

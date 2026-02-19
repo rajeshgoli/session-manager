@@ -108,10 +108,11 @@ class TestDeliveryTriggeredStart:
 
     def test_queue_message_without_remind_has_none_thresholds(self, mq):
         """Messages without --remind have None remind thresholds."""
-        msg = mq.queue_message(
-            target_session_id="agent2",
-            text="Normal message",
-        )
+        with patch("asyncio.create_task", noop_create_task):
+            msg = mq.queue_message(
+                target_session_id="agent2",
+                text="Normal message",
+            )
         pending = mq.get_pending_messages("agent2")
         assert len(pending) == 1
         assert pending[0].remind_soft_threshold is None
