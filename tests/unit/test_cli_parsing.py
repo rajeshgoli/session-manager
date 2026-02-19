@@ -59,6 +59,7 @@ class TestCliParsing:
         children_parser.add_argument("--recursive", action="store_true")
         children_parser.add_argument("--status", choices=["running", "completed", "error", "all"])
         children_parser.add_argument("--json", action="store_true")
+        children_parser.add_argument("--db-path", default=None)
 
         # sm output
         output_parser = subparsers.add_parser("output")
@@ -254,6 +255,20 @@ class TestChildrenCommand:
         args = parser._get_parsed_args(["children", "--json"])
 
         assert args.json is True
+
+    def test_children_db_path(self):
+        """sm children --db-path overrides tool_usage.db path."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["children", "--db-path", "/tmp/test.db"])
+
+        assert args.db_path == "/tmp/test.db"
+
+    def test_children_db_path_default_none(self):
+        """sm children --db-path defaults to None (resolved at runtime)."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["children"])
+
+        assert args.db_path is None
 
 
 class TestOutputCommand:
