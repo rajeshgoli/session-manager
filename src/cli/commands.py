@@ -2,9 +2,13 @@
 
 import os
 import re
+import sqlite3
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
+_BASH_DISPLAY_WIDTH = 80
 
 from .client import SessionManagerClient
 from .formatting import format_session_line, format_relative_time, format_status_list
@@ -1507,11 +1511,6 @@ def cmd_tail(
         1: Session not found, DB not found, or capture error
         2: Session manager unavailable
     """
-    import sqlite3
-    import re as re_module
-    from datetime import datetime
-    from pathlib import Path
-
     # Validate -n
     if n < 1:
         print("Error: -n must be at least 1", file=sys.stderr)
@@ -1554,7 +1553,7 @@ def cmd_tail(
             return 1
 
         # Strip ANSI escape codes
-        ansi_escape = re_module.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         clean = ansi_escape.sub('', output)
         print(clean, end="")
         return 0
@@ -1568,16 +1567,18 @@ def cmd_tail(
 
     try:
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT timestamp, tool_name, target_file, bash_command
-            FROM tool_usage
-            WHERE session_id = ? AND hook_type = 'PreToolUse'
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (session_id, n))
-        rows = cursor.fetchall()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT timestamp, tool_name, target_file, bash_command
+                FROM tool_usage
+                WHERE session_id = ? AND hook_type = 'PreToolUse'
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (session_id, n))
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
     except sqlite3.Error as e:
         print(f"Error: Failed to query tool usage: {e}", file=sys.stderr)
         return 1
@@ -1609,7 +1610,7 @@ def cmd_tail(
 
         # Format action description
         if tool_name == "Bash" and bash_command:
-            desc = bash_command[:80].split('\n')[0]  # first line, truncated
+            desc = bash_command[:_BASH_DISPLAY_WIDTH].split('\n')[0]  # first line, truncated
             action = f"Bash: {desc}"
         elif tool_name in ("Read", "Write", "Edit", "Glob") and target_file:
             action = f"{tool_name}: {target_file}"
