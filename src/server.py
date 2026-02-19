@@ -267,6 +267,7 @@ def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = Fa
         if arm_skip:
             state = queue_mgr._get_or_create_state(session_id)
             state.stop_notify_skip_count += 1
+            state.skip_count_armed_at = datetime.now()  # sm#232
         else:
             state = queue_mgr.delivery_states.get(session_id)
         if state:
@@ -1514,13 +1515,18 @@ Provide ONLY the summary, no preamble or questions."""
                 if not handoff_in_progress:
                     asyncio.create_task(queue_mgr._restore_user_input_after_response(session_manager_id))
 
-            # Keep session.status in sync with delivery_state.is_idle
+            # Keep session.status in sync with delivery_state.is_idle.
+            # Only set IDLE if message_queue also considers session idle (sm#232):
+            # when skip_count absorbed the Stop hook, state.is_idle was NOT set True,
+            # so session.status correctly remains RUNNING.
             if app.state.session_manager:
                 target_session = app.state.session_manager.get_session(session_manager_id)
                 if target_session and target_session.status != SessionStatus.STOPPED:
-                    app.state.session_manager.update_session_status(
-                        session_manager_id, SessionStatus.IDLE
-                    )
+                    _mq_state = queue_mgr.delivery_states.get(session_manager_id) if queue_mgr else None
+                    if not _mq_state or _mq_state.is_idle:
+                        app.state.session_manager.update_session_status(
+                            session_manager_id, SessionStatus.IDLE
+                        )
 
             # Always keep transcript_path up to date (needed for crash recovery)
             if transcript_path and app.state.session_manager:

@@ -1614,3 +1614,176 @@ class TestCheckStuckDelivery:
 
         # Per-session delivery lock ensures exactly one delivery
         assert mock_session_manager._deliver_direct.call_count <= 1
+
+
+class TestSkipFence232:
+    """sm#232: Skip fence is time-bounded; is_idle=True moved after skip check."""
+
+    def _make_mq(self, mock_session_manager, temp_db_path, fence_window=8):
+        return MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"skip_fence_window_seconds": fence_window}}},
+            notifier=None,
+        )
+
+    def test_late_clear_stop_hook_does_not_set_idle(self, mock_session_manager, temp_db_path):
+        """Late /clear Stop hook does NOT set is_idle when re-dispatch already ran.
+
+        Scenario: mark_session_active() ran (is_idle=False), skip_count=1 armed <8s.
+        The /clear Stop hook arrives late. is_idle must stay False.
+        """
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target232a")
+        state.is_idle = False
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now()
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232a", from_stop_hook=True)
+
+        assert state.is_idle is False
+        assert state.stop_notify_skip_count == 0
+        assert state.skip_count_armed_at is None  # cleared on full consumption
+
+    def test_normal_stop_hook_sets_idle(self, mock_session_manager, temp_db_path):
+        """Normal Stop hook (no skip fence) sets is_idle=True."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target232b")
+        state.is_idle = False
+        state.stop_notify_skip_count = 0
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232b", from_stop_hook=True)
+
+        assert state.is_idle is True
+        assert state.last_idle_at is not None
+
+    def test_clear_stop_hook_before_dispatch_preserves_is_idle_false(self, mock_session_manager, temp_db_path):
+        """Clear Stop hook arriving before dispatch preserves is_idle=False (fresh session)."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target232c")
+        state.is_idle = False  # fresh session default
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now()
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232c", from_stop_hook=True)
+
+        assert state.is_idle is False
+        assert state.stop_notify_skip_count == 0
+
+    def test_clear_stop_hook_before_dispatch_preserves_is_idle_true(self, mock_session_manager, temp_db_path):
+        """Clear Stop hook arriving before dispatch preserves is_idle=True (previously idle)."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target232d")
+        state.is_idle = True  # was already idle before clear
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now()
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232d", from_stop_hook=True)
+
+        assert state.is_idle is True
+        assert state.stop_notify_skip_count == 0
+
+    def test_stale_skip_count_does_not_absorb(self, mock_session_manager, temp_db_path):
+        """Stale fence (armed >8s ago) is reset; Stop hook falls through and sets is_idle=True."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target232e")
+        state.is_idle = False
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now() - timedelta(seconds=10)  # stale
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232e", from_stop_hook=True)
+
+        # Stale fence reset; normal Stop hook → is_idle=True
+        assert state.is_idle is True
+        assert state.stop_notify_skip_count == 0
+        assert state.skip_count_armed_at is None
+
+    def test_fast_task_within_ttl_residual_risk(self, mock_session_manager, temp_db_path):
+        """Documents residual risk: fast task Stop hook absorbed if fence still live.
+
+        If the /clear hook was lost (never arrived) but fence is still within TTL,
+        the first real Stop hook from the new task is absorbed. This is an accepted
+        edge case per spec (sm#232).
+        """
+        mq = self._make_mq(mock_session_manager, temp_db_path, fence_window=8)
+        state = mq._get_or_create_state("target232f")
+        state.is_idle = False
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now() - timedelta(seconds=6)  # within 8s window
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232f", from_stop_hook=True)
+
+        # Absorbed — residual risk documented
+        assert state.is_idle is False
+        assert state.stop_notify_skip_count == 0
+
+    def test_handoff_path_arms_both_fields(self, mock_session_manager, temp_db_path):
+        """_execute_handoff arms skip_count_armed_at; subsequent /clear Stop hook is absorbed."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        state = mq._get_or_create_state("target232g")
+        state.is_idle = False
+        # Simulate what _execute_handoff does
+        state.stop_notify_skip_count += 1
+        state.skip_count_armed_at = datetime.now()
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232g", from_stop_hook=True)
+
+        # Absorbed, is_idle unchanged
+        assert state.is_idle is False
+        assert state.stop_notify_skip_count == 0
+        assert state.skip_count_armed_at is None  # cleared on full consumption
+
+    @pytest.mark.asyncio
+    async def test_watch_no_false_idle_after_clear_dispatch(self, mock_session_manager, temp_db_path):
+        """Watch does NOT fire for idle states triggered by sm clear + late Stop hook.
+
+        Sequence: mark_session_active() (is_idle=False, skip_count=1, armed <8s),
+        then late /clear Stop hook arrives. Watch must NOT fire within 10s.
+        """
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {
+                "watch_poll_interval_seconds": 0.01,
+                "skip_fence_window_seconds": 8,
+            }}},
+            notifier=None,
+        )
+
+        session = MagicMock()
+        session.id = "target232h"
+        session.provider = "claude"
+        session.tmux_session = None  # no tmux — Phase 2 skipped; Phase 1 is decisive
+        session.friendly_name = "test-agent-232"
+        session.name = "claude-agent"
+        session.status = SessionStatus.RUNNING
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        # Dispatch: mark_session_active (is_idle=False) + arm fence
+        mq.mark_session_active("target232h")
+        state = mq.delivery_states["target232h"]
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now()
+
+        # Start watch
+        watch_task = asyncio.create_task(
+            mq._watch_for_idle("watch-232h", "target232h", "watcher232h", timeout_seconds=0.1)
+        )
+
+        # Late /clear Stop hook arrives while watch is running
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("target232h", from_stop_hook=True)
+
+        await watch_task
+
+        # Watch timed out (no false idle notification)
+        pending = mq.get_pending_messages("watcher232h")
+        assert len(pending) == 1
+        assert "Timeout" in pending[0].text

@@ -77,6 +77,12 @@ timeouts:
     # Checks target session status every N seconds
     watch_poll_interval_seconds: 2
 
+    # Time window (seconds) for skip fence to absorb /clear Stop hooks (sm#232).
+    # notify_server.sh uses --max-time 5; 8s gives a reasonable buffer.
+    # If the fence was armed more than this many seconds ago, it is considered stale
+    # and the entire fence is reset so legitimate Stop hooks are not dropped.
+    skip_fence_window_seconds: 8
+
   # Server logging and request handling
   server:
     # Log requests that take longer than this (seconds)

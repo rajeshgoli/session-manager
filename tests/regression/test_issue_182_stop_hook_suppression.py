@@ -395,6 +395,7 @@ def test_skip_count_takes_precedence_over_suppression(message_queue):
 
     state = message_queue._get_or_create_state(session_id)
     state.stop_notify_skip_count = 1
+    state.skip_count_armed_at = datetime.now()  # sm#232: fence must be armed to absorb
     state.stop_notify_sender_id = em_id
     state.stop_notify_sender_name = "em-session"
     state.last_outgoing_sm_send_target = em_id
