@@ -274,9 +274,9 @@ This is a significant redesign and should be a separate ticket.
 | File | Change |
 |------|--------|
 | `src/message_queue.py` | `mark_session_active()`: update `session.status = RUNNING` |
-| `src/message_queue.py` | `_watch_for_idle()`: suppress idle notification if stop notification sent <10s ago |
-| `src/models.py` | `SessionDeliveryState`: add `last_stop_notification_at: Optional[datetime] = None` |
-| `src/message_queue.py` | `_send_stop_notification()`: record `state.last_stop_notification_at = datetime.now()` |
+| `src/message_queue.py` | `MessageQueueManager.__init__()`: add `_recent_stop_notifications: Dict[Tuple[str,str], datetime] = {}` |
+| `src/message_queue.py` | `_send_stop_notification()`: record `self._recent_stop_notifications[(recipient, sender)] = datetime.now()` |
+| `src/message_queue.py` | `_watch_for_idle()`: check `_recent_stop_notifications[(target, watcher)]` and suppress if <10s ago |
 
 ### What NOT to change
 
@@ -300,8 +300,9 @@ This is a significant redesign and should be a separate ticket.
 
 | Test | Description |
 |------|-------------|
-| `test_sm_wait_suppressed_after_stop_notification` | Stop notification fires → `sm wait` idle fires within 5s → verify EM gets only 1 signal |
-| `test_sm_wait_not_suppressed_after_window_expires` | Stop notification fires → `sm wait` fires after 15s → verify EM gets both (different events) |
+| `test_sm_wait_suppressed_after_stop_notification` | Stop notification fires to watcher A → `sm wait` from watcher A fires within 5s → verify watcher A gets only 1 signal |
+| `test_sm_wait_not_suppressed_after_window_expires` | Stop notification fires → `sm wait` fires after 15s → verify watcher gets both (different events, window expired) |
+| `test_sm_wait_multi_watcher_scope` | Two watchers (A and B) watching same target; stop notification directed at A only — verify A's `sm wait` is suppressed, B's `sm wait` is NOT suppressed |
 
 ### Manual Verification
 
