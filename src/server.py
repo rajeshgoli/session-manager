@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 # Delay before retrying a stale transcript read in the Stop hook handler (#184).
 TRANSCRIPT_RETRY_DELAY_SECONDS = 0.3
+# Delay before retrying an empty transcript read in the Stop hook handler (#230).
+EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS = 0.5
 
 
 def _normalize_provider(provider: Optional[str]) -> str:
@@ -1469,6 +1471,28 @@ Provide ONLY the summary, no preamble or questions."""
             except Exception as e:
                 logger.error(f"CRITICAL: Error reading transcript in thread: {e}")
                 last_message = None
+
+            # Fix #230: Bounded retry for empty transcript reads on Stop hooks.
+            # The Stop hook can fire before Claude flushes the current response to
+            # the transcript JSONL, returning None. Retry once after 500ms before
+            # deferring to the idle_prompt hook.
+            # Note: this retry is inside the if-transcript_path block and executes
+            # before Stop-hook side effects (queue idle, lock cleanup). The 500ms
+            # delay applies only in the empty-transcript edge case.
+            if hook_event == "Stop" and not last_message:
+                logger.info(
+                    f"Empty transcript for {session_manager_id or 'unknown'}, "
+                    f"retrying after {EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS}s"
+                )
+                await asyncio.sleep(EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS)
+                try:
+                    success, last_message = await asyncio.to_thread(read_transcript)
+                    if not success:
+                        logger.warning(f"Empty transcript retry: failed for {session_manager_id or 'unknown'}")
+                        last_message = None
+                except Exception as e:
+                    logger.error(f"Empty transcript retry: error for {session_manager_id or 'unknown'}: {e}")
+                    last_message = None
 
             # Fix #184: Bounded retry for stale transcript reads on Stop hooks.
             # The Stop hook can fire before Claude writes the current response to
