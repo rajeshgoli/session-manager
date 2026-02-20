@@ -2375,6 +2375,45 @@ def cmd_handoff(client: SessionManagerClient, session_id: str, file_path: str) -
     return 0
 
 
+def cmd_task_complete(client: SessionManagerClient, session_id: str) -> int:
+    """
+    Signal that the calling agent has completed its task.
+
+    Cancels the periodic remind and parent-wake loop for this session, then
+    sends a one-time important notification to the dispatching EM.
+
+    Args:
+        client: API client
+        session_id: Current session ID (from CLAUDE_SESSION_MANAGER_ID)
+
+    Exit codes:
+        0: Task marked complete
+        1: Server rejected the request
+        2: Session manager unavailable or no session context
+    """
+    if not session_id:
+        print(
+            "Error: CLAUDE_SESSION_MANAGER_ID not set. sm task-complete can only be called from within a session.",
+            file=sys.stderr,
+        )
+        return 2
+
+    success, unavailable, em_notified = client.task_complete(session_id)
+
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    if not success:
+        print("Error: Failed to mark task complete", file=sys.stderr)
+        return 1
+
+    if em_notified:
+        print("Task complete. Remind cancelled. EM notified.")
+    else:
+        print("Task complete. Remind cancelled. (No EM registered — no notification sent.)")
+    return 0
+
+
 def cmd_context_monitor(
     client: SessionManagerClient,
     session_id: Optional[str],

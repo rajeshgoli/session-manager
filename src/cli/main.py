@@ -315,6 +315,9 @@ def main():
     handoff_parser = subparsers.add_parser("handoff", help="Self-directed context rotation via handoff doc")
     handoff_parser.add_argument("file_path", help="Path to handoff document")
 
+    # sm task-complete
+    subparsers.add_parser("task-complete", help="Signal task completion: cancels remind + notifies EM")
+
     # sm context-monitor <enable|disable|status> [session-id]
     ctx_parser = subparsers.add_parser(
         "context-monitor",
@@ -497,6 +500,8 @@ def main():
         sys.exit(commands.cmd_clear(client, session_id, args.session, args.prompt))
     elif args.command == "handoff":
         sys.exit(commands.cmd_handoff(client, session_id, args.file_path))
+    elif args.command == "task-complete":
+        sys.exit(commands.cmd_task_complete(client, session_id))
     elif args.command == "context-monitor":
         sys.exit(commands.cmd_context_monitor(client, session_id, args.action, args.target))
     elif args.command == "em":

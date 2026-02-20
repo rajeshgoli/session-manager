@@ -1518,7 +1518,7 @@ class MessageQueueManager:
                     if not has_pending_remind:
                         self.queue_message(
                             target_session_id=target_session_id,
-                            text='[sm remind] Update your status: sm status "your current progress"',
+                            text='[sm remind] Update your status: sm status "message" — or if done: sm task-complete',
                             delivery_mode="important",
                         )
                     reg.soft_fired = True
@@ -1528,7 +1528,7 @@ class MessageQueueManager:
                 if elapsed >= reg.hard_threshold_seconds:
                     self.queue_message(
                         target_session_id=target_session_id,
-                        text='[sm remind] Status overdue. Run: sm status "your current progress"',
+                        text='[sm remind] Status overdue. Run: sm status "message" — or if done: sm task-complete',
                         delivery_mode="urgent",
                     )
                     # Reset cycle so it restarts

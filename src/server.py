@@ -193,6 +193,11 @@ class HandoffRequest(BaseModel):
     file_path: str
 
 
+class TaskCompleteRequest(BaseModel):
+    """Request to mark a session's task as complete (self-directed)."""
+    requester_session_id: str
+
+
 class StartReviewRequest(BaseModel):
     """Start a review on an existing session."""
     mode: str = "branch"
@@ -2339,6 +2344,59 @@ Or continue working if not done yet."""
         state.pending_handoff_path = request.file_path
         logger.info(f"Handoff scheduled for {session_id}: {request.file_path}")
         return {"status": "scheduled"}
+
+    @app.post("/sessions/{session_id}/task-complete")
+    async def task_complete(session_id: str, request: TaskCompleteRequest):
+        """Mark a session's task as complete: cancel remind + parent-wake, notify EM (#269)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        # 1. Verify self-auth: requester must be the session itself
+        if request.requester_session_id != session_id:
+            return {"error": "sm task-complete is self-directed only — requester must equal target session"}
+
+        # 2. Verify session exists
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            return {"error": f"Session {session_id} not found"}
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            return {"error": "Message queue manager not available"}
+
+        # 3. Resolve EM before cancelling parent-wake (cancel deactivates the DB row)
+        def _get_em_for_session(qm, sm, sid: str):
+            rows = qm._execute_query(
+                "SELECT parent_session_id FROM parent_wake_registrations "
+                "WHERE child_session_id = ? AND is_active = 1 LIMIT 1",
+                (sid,)
+            )
+            if rows:
+                return rows[0][0]
+            s = sm.get_session(sid)
+            return s.parent_session_id if s else None
+
+        em_id = _get_em_for_session(queue_mgr, app.state.session_manager, session_id)
+
+        # 4. Cancel remind and parent-wake
+        queue_mgr.cancel_remind(session_id)
+        queue_mgr.cancel_parent_wake(session_id)
+
+        # 5. Notify EM if found
+        em_notified = False
+        if em_id:
+            friendly = session.friendly_name or session_id
+            queue_mgr.queue_message(
+                target_session_id=em_id,
+                text=f"[sm task-complete] agent {session_id}({friendly}) completed its task. Clear context with: sm clear {session_id}",
+                delivery_mode="important",
+            )
+            em_notified = True
+            logger.info(f"task-complete: notified EM {em_id} about {session_id}")
+        else:
+            logger.warning(f"task-complete: no EM found for {session_id}, skipping notification")
+
+        return {"status": "completed", "session_id": session_id, "em_notified": em_notified}
 
     @app.get("/sessions/{session_id}/send-queue")
     async def get_send_queue(session_id: str):
