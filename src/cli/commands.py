@@ -675,6 +675,46 @@ def cmd_subagent_stop(client: SessionManagerClient, session_id: str) -> int:
         return 1
 
 
+def cmd_clean(client: SessionManagerClient, session_ids: Optional[list] = None) -> int:
+    """
+    Close Telegram forum topics for idle/completed sessions (Fix C: sm#271).
+
+    Without --session-id: closes topics for all sessions with completion_status=COMPLETED.
+    With --session-id: closes topics for the specified session IDs (rejects running/em sessions).
+
+    Exit codes:
+        0: Success
+        1: Operation failed or session manager error
+        2: Session manager unavailable
+    """
+    result, unavailable = client.cleanup_idle_topics(session_ids=session_ids)
+
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+
+    if result is None:
+        print("Error: Cleanup failed", file=sys.stderr)
+        return 1
+
+    if session_ids is not None:
+        # Mode 2: explicit
+        closed = result.get("closed", 0)
+        rejected = result.get("rejected", [])
+        print(f"Closed {closed} topic(s)")
+        if rejected:
+            print(f"Rejected {len(rejected)}:")
+            for r in rejected:
+                print(f"  {r['id']}: {r['reason']}")
+    else:
+        # Mode 1: automated
+        closed = result.get("closed", 0)
+        skipped = result.get("skipped", 0)
+        print(f"Closed {closed} topic(s), skipped {skipped}")
+
+    return 0
+
+
 def cmd_subagents(client: SessionManagerClient, target_session_id: str) -> int:
     """
     List subagents spawned by a session.

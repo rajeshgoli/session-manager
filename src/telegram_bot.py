@@ -1139,6 +1139,18 @@ Provide ONLY the summary, no preamble or questions."""
             logger.error(f"Failed to delete forum topic (chat={chat_id}, topic={topic_id}): {e}")
             return False
 
+    async def reopen_forum_topic(self, chat_id: int, topic_id: int) -> bool:
+        """Reopen a previously closed forum topic."""
+        if not self.bot:
+            return False
+        try:
+            await self.bot.reopen_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
+            logger.info(f"Reopened forum topic: chat={chat_id}, topic={topic_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reopen forum topic (chat={chat_id}, topic={topic_id}): {e}")
+            return False
+
     async def rename_forum_topic(self, chat_id: int, topic_id: int, name: str) -> bool:
         """Rename a forum topic."""
         if not self.bot:

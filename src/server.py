@@ -301,6 +301,103 @@ def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = Fa
         queue_mgr.cancel_context_monitor_messages_from(session_id)
 
 
+async def _handle_em_topic_inheritance(session, session_manager, telegram_bot):
+    """
+    Inherit the previous EM Telegram forum topic when a session is designated as EM.
+
+    When sm em marks a session as the EM, that session already has a freshly-created
+    Telegram topic. This function:
+    1. Deletes the newly-created topic
+    2. Reopens the previous EM topic (from session_manager.em_topic)
+    3. Updates in-memory mappings so messages route to the inherited thread
+    4. Posts a "EM session [id] continuing" message
+    5. Clears telegram_thread_id from any old EM sessions referencing the same thread
+
+    Implements Fix B from sm#271 spec.
+    """
+    em_topic = session_manager.em_topic
+    new_chat_id = session.telegram_chat_id
+    new_thread_id = session.telegram_thread_id
+
+    if not em_topic or em_topic.get("chat_id") != new_chat_id:
+        # No previous EM topic or different chat — keep the newly-created topic
+        session_manager.em_topic = {"chat_id": new_chat_id, "thread_id": new_thread_id}
+        session_manager._save_state()
+        return
+
+    old_thread_id = em_topic["thread_id"]
+
+    # Step 1: Delete the newly-created topic
+    delete_ok = await telegram_bot.delete_forum_topic(new_chat_id, new_thread_id)
+    if not delete_ok:
+        logger.warning(
+            f"EM topic inheritance: failed to delete new topic {new_thread_id}. "
+            "Keeping new topic as EM thread."
+        )
+        session_manager.em_topic = {"chat_id": new_chat_id, "thread_id": new_thread_id}
+        session_manager._save_state()
+        return
+
+    # Remove stale _topic_sessions entry for the deleted topic (applies to all paths below)
+    telegram_bot._topic_sessions.pop((new_chat_id, new_thread_id), None)
+
+    # Step 2: Reopen the old EM topic
+    reopen_ok = await telegram_bot.reopen_forum_topic(new_chat_id, old_thread_id)
+    if not reopen_ok:
+        logger.warning(
+            f"EM topic inheritance: failed to reopen old topic {old_thread_id}. "
+            "Creating a new topic as EM thread."
+        )
+        topic_name = f"{session.friendly_name or 'em'} [{session.id}]"
+        brand_new_id = await telegram_bot.create_forum_topic(new_chat_id, topic_name)
+        if brand_new_id:
+            session.telegram_thread_id = brand_new_id
+            telegram_bot.register_topic_session(new_chat_id, brand_new_id, session.id)
+            telegram_bot._session_threads[session.id] = (new_chat_id, brand_new_id)
+            session_manager.em_topic = {"chat_id": new_chat_id, "thread_id": brand_new_id}
+        else:
+            logger.warning(
+                f"EM topic inheritance: create_forum_topic returned None after reopen failure. "
+                "Session has no valid Telegram topic."
+            )
+            session.telegram_thread_id = None
+        session_manager._save_state()
+        return
+
+    # Step 3: Update the session to use the inherited thread_id
+    session.telegram_thread_id = old_thread_id
+
+    # Step 4: Update in-memory mappings for the inherited thread
+    telegram_bot.register_topic_session(new_chat_id, old_thread_id, session.id)
+    telegram_bot._session_threads[session.id] = (new_chat_id, old_thread_id)
+
+    # Step 5: Clear old EM sessions' telegram_thread_id to prevent them from
+    # closing the shared thread when cleanup_session fires (output_monitor.py:506)
+    for sid, s in session_manager.sessions.items():
+        if sid != session.id and s.telegram_thread_id == old_thread_id and s.telegram_chat_id == new_chat_id:
+            s.telegram_thread_id = None
+            telegram_bot._session_threads.pop(sid, None)
+            logger.info(f"Cleared old EM session {sid}'s telegram thread reference")
+
+    # Step 6: Post continuation message (non-critical — failure is logged only)
+    try:
+        await telegram_bot.send_with_fallback(
+            chat_id=new_chat_id,
+            message=f"EM session [{session.id}] continuing",
+            thread_id=old_thread_id,
+        )
+    except Exception as e:
+        logger.warning(f"EM topic inheritance: failed to post continuation message: {e}")
+
+    # Persist the inherited EM topic
+    session_manager.em_topic = {"chat_id": new_chat_id, "thread_id": old_thread_id}
+    session_manager._save_state()
+    logger.info(
+        f"EM session [{session.id}] inherited topic {old_thread_id} "
+        f"(deleted new topic {new_thread_id})"
+    )
+
+
 def create_app(
     session_manager=None,
     notifier=None,
@@ -937,6 +1034,20 @@ def create_app(
 
         if is_em is not None:
             session.is_em = is_em
+
+            if is_em:
+                # Clear is_em from any other session (only one EM at a time)
+                for sid, s in app.state.session_manager.sessions.items():
+                    if sid != session_id and s.is_em:
+                        s.is_em = False
+
+                # Handle EM topic inheritance (Fix B: sm#271)
+                notifier = getattr(app.state, 'notifier', None)
+                telegram_bot = getattr(notifier, 'telegram', None) if notifier else None
+                if telegram_bot and session.telegram_thread_id and session.telegram_chat_id:
+                    await _handle_em_topic_inheritance(
+                        session, app.state.session_manager, telegram_bot
+                    )
 
         if friendly_name is not None or is_em is not None:
             app.state.session_manager._save_state()
@@ -2585,5 +2696,71 @@ Or continue working if not done yet."""
                     )
 
         return {"status": "ok", "used_percentage": used_pct}
+
+    @app.post("/admin/cleanup-idle-topics")
+    async def cleanup_idle_topics(request: Request):
+        """
+        Close Telegram forum topics for idle/completed sessions (Fix C: sm#271).
+
+        Mode 1 — automated (no body or empty body):
+          Iterates sessions where completion_status == COMPLETED.
+          Calls close_session_topic() for each.
+          Returns {closed: N, skipped: M}.
+
+        Mode 2 — explicit (body with session_ids list):
+          Closes topics for the exact session IDs listed.
+          Rejects sessions that are is_em=True or status=running.
+          Returns {closed: N, rejected: [{id, reason}]}.
+        """
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        output_monitor = app.state.output_monitor
+        if not output_monitor:
+            raise HTTPException(status_code=503, detail="Output monitor not configured")
+
+        from .models import CompletionStatus, SessionStatus as SStatus
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass  # Empty body is valid for Mode 1
+
+        session_ids = body.get("session_ids") if isinstance(body, dict) else None
+
+        if session_ids is not None:
+            # Mode 2: explicit session IDs
+            closed = 0
+            rejected = []
+            for sid in session_ids:
+                session = app.state.session_manager.get_session(sid)
+                if not session:
+                    rejected.append({"id": sid, "reason": "not found"})
+                    continue
+                if session.is_em:
+                    rejected.append({"id": sid, "reason": "is_em=True (safety guard)"})
+                    continue
+                if session.status == SStatus.RUNNING:
+                    rejected.append({"id": sid, "reason": "status=running"})
+                    continue
+                await output_monitor.close_session_topic(session, message="Manually closed")
+                closed += 1
+            return {"closed": closed, "rejected": rejected}
+
+        else:
+            # Mode 1: automated — only COMPLETED sessions
+            closed = 0
+            skipped = 0
+            for session in list(app.state.session_manager.sessions.values()):
+                if session.completion_status == CompletionStatus.COMPLETED:
+                    if session.telegram_thread_id and session.telegram_chat_id:
+                        await output_monitor.close_session_topic(session, message="Completed")
+                        closed += 1
+                    else:
+                        skipped += 1
+                else:
+                    skipped += 1
+            return {"closed": closed, "skipped": skipped}
 
     return app

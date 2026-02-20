@@ -479,6 +479,57 @@ class OutputMonitor:
 
             logger.info(f"Session {session.id} is idle")
 
+    async def close_session_topic(self, session: Session, message: str = "Completed"):
+        """
+        Close the Telegram forum topic for a completed session.
+
+        Unlike cleanup_session(), this method:
+        - Does NOT remove the session from session_manager.sessions
+        - Does NOT affect codex-app session state
+        - Only closes the Telegram topic and cleans up in-memory mappings
+
+        Used by ChildMonitor on task completion to close child session topics
+        without destroying the session record (needed for sm children --status completed).
+        """
+        session_id = session.id
+        logger.info(f"Closing Telegram topic for completed session {session_id}")
+
+        if session.telegram_thread_id and session.telegram_chat_id:
+            notifier = getattr(self._session_manager, 'notifier', None) if self._session_manager else None
+            telegram_bot = getattr(notifier, 'telegram', None) if notifier else None
+
+            if telegram_bot and telegram_bot.bot:
+                completion_msg = f"Session completed [{session_id}]: {message}"
+                thread_id = session.telegram_thread_id
+                chat_id = session.telegram_chat_id
+
+                # Try forum-topic delivery first; fall back to reply-thread on failure.
+                msg_id = await telegram_bot.send_with_fallback(
+                    chat_id=chat_id,
+                    message=completion_msg,
+                    thread_id=thread_id,
+                )
+
+                if msg_id is not None:
+                    # Confirmed forum topic — close it
+                    try:
+                        await telegram_bot.bot.close_forum_topic(
+                            chat_id=chat_id, message_thread_id=thread_id
+                        )
+                        logger.info(f"Closed Telegram forum topic for completed session {session_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not close forum topic for {session_id}: {e}")
+
+                # Clean up in-memory mappings
+                telegram_bot._topic_sessions.pop((chat_id, thread_id), None)
+                telegram_bot._session_threads.pop(session_id, None)
+                logger.debug(f"Cleaned up Telegram mappings for completed session {session_id}")
+
+            # Null out session's thread_id to prevent double-close if cleanup_session fires later
+            session.telegram_thread_id = None
+            if self._session_manager:
+                self._session_manager._save_state()
+
     async def cleanup_session(self, session: Session):
         """
         Perform full cleanup for a session.

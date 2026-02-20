@@ -26,6 +26,11 @@ class ChildMonitor:
         self.monitored_children: Dict[str, dict] = {}  # child_id -> {parent_id, wait_seconds, started_at}
         self.monitoring_tasks: Dict[str, asyncio.Task] = {}  # child_id -> monitoring task
         self._running = False
+        self._output_monitor = None  # Set via set_output_monitor()
+
+    def set_output_monitor(self, output_monitor):
+        """Set reference to OutputMonitor for topic cleanup on completion."""
+        self._output_monitor = output_monitor
 
     async def start(self):
         """Start the monitoring service."""
@@ -248,6 +253,13 @@ class ChildMonitor:
                 child_session.completion_message = completion_message
                 child_session.completed_at = datetime.now()
                 self.session_manager._save_state()
+
+                # Close the child's Telegram topic (Fix A: sm#271)
+                if self._output_monitor:
+                    await self._output_monitor.close_session_topic(
+                        child_session,
+                        message=completion_message or "Completed",
+                    )
         else:
             logger.error(f"Failed to send completion notification to parent {parent_session_id}")
 
