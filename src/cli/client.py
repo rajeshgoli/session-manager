@@ -666,3 +666,24 @@ class SessionManagerClient:
             f"/sessions/{target_session_id}/remind",
         )
         return success, unavailable
+
+    def arm_stop_notify(
+        self,
+        session_id: str,
+        sender_session_id: str,
+        requester_session_id: str,
+    ) -> tuple[bool, bool]:
+        """Arm stop notification for a session without a queued message (sm#277).
+
+        Used by sm spawn when parent is EM to register stop notification on the
+        spawned child without requiring a message delivery through the queue.
+        """
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/notify-on-stop",
+            {
+                "sender_session_id": sender_session_id,
+                "requester_session_id": requester_session_id,
+            },
+        )
+        return success, unavailable

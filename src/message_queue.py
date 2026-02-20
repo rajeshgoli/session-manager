@@ -1423,6 +1423,29 @@ class MessageQueueManager:
         self._update_remind_db(target_session_id, last_reset_at=now, soft_fired=False)
         logger.info(f"Remind timer reset for {target_session_id}")
 
+    def arm_stop_notify(
+        self,
+        session_id: str,
+        sender_session_id: str,
+        sender_name: str = "",
+    ) -> None:
+        """Directly arm stop notification for a session without a message delivery (sm#277).
+
+        Used when a session is spawned by an EM and needs stop notification registered
+        without a queued message (the initial prompt goes directly to tmux, not via queue).
+
+        Args:
+            session_id: Session to arm stop notification for
+            sender_session_id: Session to notify when session_id stops
+            sender_name: Optional friendly name of sender session
+        """
+        state = self._get_or_create_state(session_id)
+        state.stop_notify_sender_id = sender_session_id
+        state.stop_notify_sender_name = sender_name
+        logger.info(
+            f"Stop notify armed for {session_id}: will notify {sender_session_id} on stop (sm#277)"
+        )
+
     def cancel_remind(self, target_session_id: str):
         """
         Cancel the periodic remind registration for a session.

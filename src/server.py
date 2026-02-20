@@ -250,6 +250,12 @@ class ContextMonitorRequest(BaseModel):
     requester_session_id: str  # Required — caller's session ID for ownership check
 
 
+class ArmStopNotifyRequest(BaseModel):
+    """Request to arm stop notification for a session without a queued message (sm#277)."""
+    sender_session_id: str  # Session to notify when target stops
+    requester_session_id: str  # Must be is_em=True (EM sessions only)
+
+
 def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = False) -> None:
     """Clear server-side caches for a session after a context reset.
 
@@ -1124,6 +1130,56 @@ def create_app(
 
         app.state.session_manager._save_state()
         return {"status": "ok", "enabled": session.context_monitor_enabled}
+
+    @app.post("/sessions/{session_id}/notify-on-stop")
+    async def arm_stop_notify(session_id: str, request: ArmStopNotifyRequest):
+        """Arm stop notification for a session without a queued message (sm#277).
+
+        Used by sm spawn when the parent is an EM: arms the spawned child to notify the EM
+        on stop without requiring a message delivery through the queue.
+        """
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Only EM sessions may arm stop notify (mirrors the is_em guard in send_input)
+        requester = app.state.session_manager.get_session(request.requester_session_id)
+        if not requester or not requester.is_em:
+            raise HTTPException(
+                status_code=403,
+                detail="Only EM sessions (is_em=True) may arm stop notifications",
+            )
+
+        # Requester must be the parent of the target session
+        if session.parent_session_id != request.requester_session_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot arm stop notify — not the parent of target session",
+            )
+
+        # Validate sender session exists
+        sender = app.state.session_manager.get_session(request.sender_session_id)
+        if not sender:
+            raise HTTPException(
+                status_code=422,
+                detail=f"sender_session_id {request.sender_session_id!r} not found",
+            )
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        sender_name = sender.friendly_name or sender.name or request.sender_session_id
+        queue_mgr.arm_stop_notify(
+            session_id=session_id,
+            sender_session_id=request.sender_session_id,
+            sender_name=sender_name,
+        )
+
+        return {"status": "ok", "session_id": session_id, "sender_session_id": request.sender_session_id}
 
     @app.put("/sessions/{session_id}/task")
     async def update_task(session_id: str, task: str = Body(..., embed=True)):

@@ -1103,6 +1103,12 @@ def cmd_spawn(
     """
     Spawn a child agent session.
 
+    When the parent session has is_em=True, auto-registers the spawned child for:
+    - remind (thresholds from config.yaml dispatch.auto_remind, default 210s soft / 420s hard → EM session)
+    - context monitoring (alerts → EM session)
+    - notify-on-stop pointing to EM session
+    This mirrors what sm dispatch does (sm#277).
+
     Args:
         client: API client
         parent_session_id: Parent session ID (current session)
@@ -1141,18 +1147,67 @@ def cmd_spawn(
         return 1
 
     # Success
+    child_id = result["session_id"]
+    child_name = result.get("friendly_name") or result["name"]
+    provider = result.get("provider", "claude")
+
     if json_output:
         print(json_lib.dumps(result, indent=2))
     else:
-        child_id = result["session_id"]
-        child_name = result.get("friendly_name") or result["name"]
-        provider = result.get("provider", "claude")
         if provider == "codex-app":
             print(f"Spawned {child_name} ({child_id}) [codex-app]")
         else:
             print(f"Spawned {child_name} ({child_id}) in tmux session {result['tmux_session']}")
 
+    # Auto-register EM monitoring when parent is EM (sm#277)
+    parent_session = client.get_session(parent_session_id)
+    if parent_session and parent_session.get("is_em"):
+        from .dispatch import get_auto_remind_config
+        soft_threshold, hard_threshold = get_auto_remind_config(os.getcwd())
+        _register_em_monitoring(client, child_id, parent_session_id, soft_threshold, hard_threshold)
+
     return 0
+
+
+def _register_em_monitoring(
+    client: SessionManagerClient,
+    child_id: str,
+    em_session_id: str,
+    soft_threshold: int,
+    hard_threshold: int,
+) -> None:
+    """Register remind, context monitoring, and notify-on-stop for an EM-spawned child (sm#277).
+
+    Args:
+        client: API client
+        child_id: Spawned child session ID
+        em_session_id: EM parent session ID (is_em=True)
+        soft_threshold: Soft remind threshold in seconds (from config.yaml or default)
+        hard_threshold: Hard remind threshold in seconds (from config.yaml or default)
+    """
+    # Remind: thresholds from config.yaml (or defaults), alerts → EM
+    remind_result = client.register_remind(child_id, soft_threshold=soft_threshold, hard_threshold=hard_threshold)
+    if remind_result is None:
+        print(f"  Warning: Failed to register remind for {child_id}", file=sys.stderr)
+
+    # Context monitoring: enabled, alerts → EM
+    _, cm_ok, _ = client.set_context_monitor(
+        child_id,
+        enabled=True,
+        requester_session_id=em_session_id,
+        notify_session_id=em_session_id,
+    )
+    if not cm_ok:
+        print(f"  Warning: Failed to enable context monitoring for {child_id}", file=sys.stderr)
+
+    # Notify-on-stop: fires → EM when child stops
+    ns_ok, _ = client.arm_stop_notify(
+        child_id,
+        sender_session_id=em_session_id,
+        requester_session_id=em_session_id,
+    )
+    if not ns_ok:
+        print(f"  Warning: Failed to arm stop notification for {child_id}", file=sys.stderr)
 
 
 _TOOL_DB_DEFAULT = "~/.local/share/claude-sessions/tool_usage.db"
