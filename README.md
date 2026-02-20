@@ -335,7 +335,7 @@ telegram:
 ## Testing
 
 ```bash
-# Run test suite (194 tests)
+# Run test suite (984 tests)
 pytest tests/ -v
 
 # Run with coverage
