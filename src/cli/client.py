@@ -676,8 +676,10 @@ class SessionManagerClient:
         )
         if unavailable:
             return False, True, False
+        if not success or (data and data.get("error")):
+            return False, False, False
         em_notified = bool(data.get("em_notified")) if data else False
-        return success, False, em_notified
+        return True, False, em_notified
 
     def arm_stop_notify(
         self,

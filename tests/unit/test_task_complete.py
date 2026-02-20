@@ -312,3 +312,50 @@ class TestCliTaskCompleteRequiresSessionId:
         assert result == 2
         captured = capsys.readouterr()
         assert "unavailable" in captured.err
+
+    def test_server_error_body_returns_failure(self, capsys):
+        from src.cli.commands import cmd_task_complete
+        client = MagicMock()
+        # Server returns success=False (error-body path in client.task_complete)
+        client.task_complete.return_value = (False, False, False)
+        result = cmd_task_complete(client, "abc12345")
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Failed" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 9. client.task_complete() handles error body in HTTP 200 response
+# ---------------------------------------------------------------------------
+
+class TestClientTaskCompleteHandlesErrorBody:
+    def test_error_body_returns_false_success(self):
+        """When _request returns HTTP-200 success=True but body has 'error' key, task_complete returns success=False."""
+        from src.cli.client import SessionManagerClient
+
+        sm_client = SessionManagerClient.__new__(SessionManagerClient)
+        # Patch _request to simulate: HTTP 200 with {"error": "Session X not found"}
+        sm_client._request = MagicMock(
+            return_value=({"error": "Session nonexistent not found"}, True, False)
+        )
+
+        success, unavailable, em_notified = sm_client.task_complete("nonexistent")
+
+        assert success is False
+        assert unavailable is False
+        assert em_notified is False
+
+    def test_success_body_returns_true(self):
+        """When _request returns HTTP-200 success=True with proper body, task_complete returns success=True."""
+        from src.cli.client import SessionManagerClient
+
+        sm_client = SessionManagerClient.__new__(SessionManagerClient)
+        sm_client._request = MagicMock(
+            return_value=({"status": "completed", "session_id": "abc12345", "em_notified": True}, True, False)
+        )
+
+        success, unavailable, em_notified = sm_client.task_complete("abc12345")
+
+        assert success is True
+        assert unavailable is False
+        assert em_notified is True
