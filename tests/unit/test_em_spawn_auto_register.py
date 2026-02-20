@@ -218,6 +218,15 @@ class TestEmSpawnAutoRegister:
         client.set_context_monitor.assert_called_once()
         client.arm_stop_notify.assert_called_once()
 
+    def test_config_override_thresholds_used(self, patch_remind_config):
+        """Config-overridden thresholds from config.yaml flow through to register_remind."""
+        # Override the autouse patch to return non-default values
+        with patch("src.cli.dispatch.get_auto_remind_config", return_value=(300, 600)):
+            client = _make_client(parent_session=_make_em_session())
+            rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
+        assert rc == 0
+        client.register_remind.assert_called_once_with("child001", soft_threshold=300, hard_threshold=600)
+
     def test_output_unchanged_for_non_em(self, capsys):
         """cmd_spawn output is unchanged when parent is not EM."""
         client = _make_client(parent_session=_make_non_em_session())

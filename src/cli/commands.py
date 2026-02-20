@@ -1104,7 +1104,7 @@ def cmd_spawn(
     Spawn a child agent session.
 
     When the parent session has is_em=True, auto-registers the spawned child for:
-    - remind (soft=210s, hard=420s → EM session)
+    - remind (thresholds from config.yaml dispatch.auto_remind, default 210s soft / 420s hard → EM session)
     - context monitoring (alerts → EM session)
     - notify-on-stop pointing to EM session
     This mirrors what sm dispatch does (sm#277).
