@@ -351,11 +351,6 @@ class MessageQueueManager:
         state = self._get_or_create_state(session_id)
         logger.info(f"Session {session_id} marked idle")
 
-        # Cancel periodic remind and parent wake on stop hook — agent completed their task (#188, #225-C)
-        if from_stop_hook:
-            self.cancel_remind(session_id)
-            self.cancel_parent_wake(session_id)
-
         # Check for pending handoff — takes priority over all other Stop hook logic (#196).
         # Only execute on Stop hook calls; other callers (queue_message, recovery) must not trigger it.
         if from_stop_hook and getattr(state, "pending_handoff_path", None):
@@ -377,6 +372,7 @@ class MessageQueueManager:
                 # Within window: absorb this /clear Stop hook.
                 # Do NOT set is_idle here — agent may already be processing new task.
                 # Preserves is_idle=False if mark_session_active already ran.
+                # Do NOT cancel remind/parent_wake — agent is still running (sm#263).
                 state.stop_notify_skip_count -= 1
                 if state.stop_notify_skip_count == 0:
                     state.skip_count_armed_at = None  # hygiene: clear when fence fully consumed
@@ -395,6 +391,12 @@ class MessageQueueManager:
                     f"Session {session_id}: skip fence was stale "
                     f"(armed >{self.skip_fence_window_seconds}s ago), resetting"
                 )
+
+        # NOT absorbed — agent genuinely completed a task.
+        # Cancel periodic remind and parent wake (#188, #225-C, sm#263).
+        if from_stop_hook:
+            self.cancel_remind(session_id)
+            self.cancel_parent_wake(session_id)
 
         # Now safe to mark idle — skip check did not absorb this Stop hook
         state.is_idle = True
