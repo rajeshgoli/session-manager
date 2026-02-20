@@ -964,6 +964,7 @@ Provide ONLY the summary, no preamble or questions."""
         message_thread_id: Optional[int] = None,
         parse_mode: Optional[str] = None,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
+        silent: bool = False,
     ) -> Optional[int]:
         """
         Send a notification message.
@@ -975,6 +976,8 @@ Provide ONLY the summary, no preamble or questions."""
             message_thread_id: Optional forum topic ID
             parse_mode: Optional parse mode ("MarkdownV2", "HTML", or None for plain text)
             reply_markup: Optional inline keyboard markup for buttons
+            silent: If True, log failures at WARNING level instead of ERROR (use for
+                    expected failures such as forum-mode probes on reply-thread sessions)
 
         Returns:
             Message ID of sent message, or None on failure
@@ -1012,7 +1015,10 @@ Provide ONLY the summary, no preamble or questions."""
                 except Exception as e2:
                     logger.error(f"Failed to send plain text message: {e2}")
                     return None
-            logger.error(f"Failed to send Telegram message: {e}")
+            if silent:
+                logger.warning(f"Failed to send Telegram message (expected): {e}")
+            else:
+                logger.error(f"Failed to send Telegram message: {e}")
             return None
 
     async def send_with_fallback(self, chat_id: int, message: str, thread_id: int) -> Optional[int]:
@@ -1020,7 +1026,9 @@ Provide ONLY the summary, no preamble or questions."""
 
         Returns the forum msg_id if forum delivery succeeded, None otherwise.
         """
-        msg_id = await self.send_notification(chat_id=chat_id, message=message, message_thread_id=thread_id)
+        msg_id = await self.send_notification(
+            chat_id=chat_id, message=message, message_thread_id=thread_id, silent=True
+        )
         if msg_id is None:
             await self.send_notification(chat_id=chat_id, message=message, reply_to_message_id=thread_id)
         return msg_id
