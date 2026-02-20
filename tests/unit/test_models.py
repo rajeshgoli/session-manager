@@ -384,6 +384,72 @@ class TestEnums:
         assert NotificationChannel.EMAIL.value == "email"
 
 
+class TestSessionIsEmField:
+    """Tests for Session.is_em field (#256)."""
+
+    def test_is_em_defaults_to_false(self):
+        """Session() without is_em → is_em == False."""
+        session = Session()
+        assert session.is_em is False
+
+    def test_is_em_can_be_set_true(self):
+        """Session(is_em=True) is stored correctly."""
+        session = Session(is_em=True)
+        assert session.is_em is True
+
+    def test_is_em_roundtrips_through_to_dict_from_dict(self):
+        """is_em=True survives to_dict() / from_dict() round-trip."""
+        original = Session(
+            id="em123456",
+            name="em-em123456",
+            working_dir="/tmp",
+            tmux_session="claude-em123456",
+            log_file="/tmp/em.log",
+            status=SessionStatus.RUNNING,
+            created_at=datetime(2024, 1, 15, 10, 0, 0),
+            last_activity=datetime(2024, 1, 15, 11, 0, 0),
+            is_em=True,
+        )
+        as_dict = original.to_dict()
+        assert as_dict["is_em"] is True
+
+        restored = Session.from_dict(as_dict)
+        assert restored.is_em is True
+
+    def test_is_em_false_roundtrips(self):
+        """is_em=False also survives round-trip."""
+        session = Session(
+            id="eng12345",
+            name="claude-eng12345",
+            working_dir="/tmp",
+            tmux_session="claude-eng12345",
+            log_file="/tmp/eng.log",
+            status=SessionStatus.RUNNING,
+            created_at=datetime(2024, 1, 15, 10, 0, 0),
+            last_activity=datetime(2024, 1, 15, 11, 0, 0),
+            is_em=False,
+        )
+        as_dict = session.to_dict()
+        restored = Session.from_dict(as_dict)
+        assert restored.is_em is False
+
+    def test_from_dict_backward_compat_no_is_em_key(self):
+        """from_dict() with no 'is_em' key → defaults to False (backward compat)."""
+        data = {
+            "id": "old12345",
+            "name": "claude-old12345",
+            "working_dir": "/tmp",
+            "tmux_session": "claude-old12345",
+            "log_file": "/tmp/old.log",
+            "status": "running",
+            "created_at": "2024-01-15T10:00:00",
+            "last_activity": "2024-01-15T11:00:00",
+            # No "is_em" key — simulates pre-#256 state file
+        }
+        session = Session.from_dict(data)
+        assert session.is_em is False
+
+
 class TestSessionDeliveryState:
     """Tests for SessionDeliveryState dataclass."""
 

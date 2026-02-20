@@ -644,6 +644,12 @@ class SessionManager:
         else:
             formatted_text = text
 
+        # Directional notify-on-stop (#256): only EM→agent sends should enroll recipient.
+        # Fail-closed: unknown sender treated as non-EM.
+        if notify_on_stop and sender_session_id:
+            if not sender_session or not sender_session.is_em:
+                notify_on_stop = False
+
         # Send Telegram notification if from sm send
         # Note: notifier will be set by server when calling send_input
         if from_sm_send and sender_session_id and hasattr(self, 'notifier'):

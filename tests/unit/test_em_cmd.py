@@ -15,6 +15,7 @@ _EMPTY_CHILDREN = {"children": []}
 
 def _make_client(
     name_result=(True, False),
+    em_role_result=(True, False),
     context_monitor_result=(None, True, False),
     children_data=_EMPTY_CHILDREN,
     remind_result={"status": "ok"},
@@ -26,6 +27,7 @@ def _make_client(
     """
     client = MagicMock()
     client.update_friendly_name.return_value = name_result
+    client.set_em_role.return_value = em_role_result
     client.set_context_monitor.return_value = context_monitor_result
     client.list_children.return_value = children_data
     client.register_remind.return_value = remind_result
@@ -200,3 +202,38 @@ def test_output_format_with_children(capsys):
     assert "Children processed: 2 (2 succeeded, 0 failed)" in out
     assert "scout-1465 (b2c3d4e5) → context monitoring enabled; remind registered (soft=180s, hard=300s)" in out
     assert "engineer-1465 (c3d4e5f6) → context monitoring enabled; remind registered (soft=180s, hard=300s)" in out
+
+
+# ---------------------------------------------------------------------------
+# Tests for set_em_role() call from cmd_em (#256)
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_em_calls_set_em_role(capsys):
+    """cmd_em calls client.set_em_role(session_id) to register EM flag server-side."""
+    client = _make_client()
+    rc = cmd_em(client, "a1b2c3d4", "session9")
+    assert rc == 0
+    client.set_em_role.assert_called_once_with("a1b2c3d4")
+    out = capsys.readouterr().out
+    assert "EM role: registered" in out
+
+
+def test_cmd_em_set_em_role_unavailable_returns_exit2(capsys):
+    """set_em_role returns (False, True) → cmd_em exits 2 with unavailable error."""
+    client = _make_client(em_role_result=(False, True))
+    rc = cmd_em(client, "a1b2c3d4", "session9")
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unavailable" in err.lower()
+
+
+def test_cmd_em_set_em_role_api_failure_warns_and_continues(capsys):
+    """set_em_role returns (False, False) → warning printed, execution continues (exit 0)."""
+    client = _make_client(em_role_result=(False, False))
+    rc = cmd_em(client, "a1b2c3d4", "session9")
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Warning: Failed to register EM role" in out
+    # Execution continued — context monitoring step should still have been called
+    client.set_context_monitor.assert_called()

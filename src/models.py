@@ -218,6 +218,9 @@ class Session:
     context_monitor_enabled: bool = False  # Default off — opt-in only
     context_monitor_notify: Optional[str] = None  # Session ID to receive alerts; None = off
 
+    # EM role flag (#256): gates directional notify-on-stop
+    is_em: bool = False  # Set by sm em; True means only EM→agent sends arm stop notification
+
     # sm remind: self-reported status (#188)
     agent_status_text: Optional[str] = None  # Last sm status "<text>" from agent
     agent_status_at: Optional[datetime] = None  # When agent_status_text was last set
@@ -281,6 +284,8 @@ class Session:
             # sm remind fields (#188)
             "agent_status_text": self.agent_status_text,
             "agent_status_at": self.agent_status_at.isoformat() if self.agent_status_at else None,
+            # EM role flag (#256)
+            "is_em": self.is_em,
         }
 
     @classmethod
@@ -354,6 +359,8 @@ class Session:
             # sm remind fields (#188)
             agent_status_text=data.get("agent_status_text"),
             agent_status_at=datetime.fromisoformat(data["agent_status_at"]) if data.get("agent_status_at") else None,
+            # EM role flag (#256)
+            is_em=data.get("is_em", False),
         )
 
 

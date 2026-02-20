@@ -92,6 +92,7 @@ class SessionResponse(BaseModel):
     last_handoff_path: Optional[str] = None  # Last executed handoff doc path (#203)
     agent_status_text: Optional[str] = None  # Self-reported agent status text (#188)
     agent_status_at: Optional[str] = None  # When agent_status_text was last set (#188)
+    is_em: bool = False  # EM role flag (#256)
 
 
 class SendInputRequest(BaseModel):
@@ -786,6 +787,7 @@ def create_app(
             git_remote_url=session.git_remote_url,
             parent_session_id=session.parent_session_id,
             last_handoff_path=session.last_handoff_path,
+            is_em=session.is_em,
         )
 
     @app.post("/sessions/create")
@@ -843,6 +845,7 @@ def create_app(
                     git_remote_url=s.git_remote_url,
                     parent_session_id=s.parent_session_id,
                     last_handoff_path=s.last_handoff_path,
+                    is_em=s.is_em,
                 )
                 for s in sessions
             ]
@@ -889,14 +892,16 @@ def create_app(
             git_remote_url=session.git_remote_url,
             parent_session_id=session.parent_session_id,
             last_handoff_path=session.last_handoff_path,
+            is_em=session.is_em,
         )
 
     @app.patch("/sessions/{session_id}", response_model=SessionResponse)
     async def update_session(
         session_id: str,
-        friendly_name: Optional[str] = Body(None, embed=True)
+        friendly_name: Optional[str] = Body(None, embed=True),
+        is_em: Optional[bool] = Body(None, embed=True),
     ):
-        """Update session metadata (currently only friendly_name)."""
+        """Update session metadata (friendly_name and/or is_em role flag)."""
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
@@ -911,7 +916,14 @@ def create_app(
                 raise HTTPException(status_code=400, detail=error)
 
             session.friendly_name = friendly_name
+
+        if is_em is not None:
+            session.is_em = is_em
+
+        if friendly_name is not None or is_em is not None:
             app.state.session_manager._save_state()
+
+        if friendly_name is not None:
             # Update tmux status bar
             if getattr(session, "provider", "claude") != "codex-app":
                 app.state.session_manager.tmux.set_status_bar(session.tmux_session, friendly_name)
@@ -935,6 +947,7 @@ def create_app(
             git_remote_url=session.git_remote_url,
             parent_session_id=session.parent_session_id,
             last_handoff_path=session.last_handoff_path,
+            is_em=session.is_em,
         )
 
     @app.post("/sessions/{session_id}/context-monitor")

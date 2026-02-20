@@ -469,6 +469,62 @@ class TestUpdateSession:
         assert any("Failed to rename Telegram topic" in record.message for record in caplog.records)
         assert any("test123" in record.message for record in caplog.records)
 
+    def test_patch_is_em_sets_flag(self, test_client, mock_session_manager, sample_session):
+        """PATCH /sessions/{id} with is_em=true sets is_em flag and returns it in response (#256)."""
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager._save_state = MagicMock()
+
+        response = test_client.patch(
+            "/sessions/test123",
+            json={"is_em": True}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["is_em"] is True
+        assert sample_session.is_em is True
+        mock_session_manager._save_state.assert_called()
+
+    def test_patch_is_em_false_clears_flag(self, test_client, mock_session_manager, sample_session):
+        """PATCH /sessions/{id} with is_em=false clears flag if previously set (#256)."""
+        sample_session.is_em = True
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager._save_state = MagicMock()
+
+        response = test_client.patch(
+            "/sessions/test123",
+            json={"is_em": False}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["is_em"] is False
+        assert sample_session.is_em is False
+
+    def test_patch_mixed_friendly_name_and_is_em(self, test_client, mock_session_manager, sample_session):
+        """PATCH /sessions/{id} with both friendly_name and is_em updates both fields (#256)."""
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager._save_state = MagicMock()
+        mock_session_manager.tmux.set_status_bar.return_value = True
+
+        response = test_client.patch(
+            "/sessions/test123",
+            json={"friendly_name": "em-session9", "is_em": True}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["friendly_name"] == "em-session9"
+        assert data["is_em"] is True
+
+    def test_get_session_includes_is_em(self, test_client, mock_session_manager, sample_session):
+        """GET /sessions/{id} response includes is_em field (#256)."""
+        sample_session.is_em = True
+        mock_session_manager.get_session.return_value = sample_session
+
+        response = test_client.get("/sessions/test123")
+        assert response.status_code == 200
+        data = response.json()
+        assert "is_em" in data
+        assert data["is_em"] is True
+
     def test_update_task(self, test_client, mock_session_manager, sample_session):
         """PUT /sessions/{id}/task updates current task."""
         mock_session_manager.get_session.return_value = sample_session

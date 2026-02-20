@@ -2396,6 +2396,16 @@ def cmd_em(
     else:
         results.append(f"  Warning: Failed to set name to {friendly_name}")
 
+    # Step 1b: Register EM role server-side (#256)
+    success, unavailable = client.set_em_role(session_id)
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    if success:
+        results.append("  EM role: registered")
+    else:
+        results.append("  Warning: Failed to register EM role")
+
     # Step 2: Enable self context-monitoring
     data, success, unavailable = client.set_context_monitor(
         session_id, enabled=True, requester_session_id=session_id,

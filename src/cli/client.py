@@ -89,6 +89,20 @@ class SessionManagerClient:
         )
         return success, unavailable
 
+    def set_em_role(self, session_id: str) -> tuple[bool, bool]:
+        """
+        Mark session as EM role (sets is_em=True server-side, #256).
+
+        Returns:
+            Tuple of (success, unavailable)
+        """
+        data, success, unavailable = self._request(
+            "PATCH",
+            f"/sessions/{session_id}",
+            {"is_em": True}
+        )
+        return success, unavailable
+
     def update_task(self, session_id: str, task: str) -> tuple[bool, bool]:
         """
         Update session current task.
