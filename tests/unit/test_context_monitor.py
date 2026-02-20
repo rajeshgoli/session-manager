@@ -841,3 +841,80 @@ class TestChildForwardedNotifications:
         call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
         assert "Consider writing a handoff" in call_kwargs["text"]
         assert "Child" not in call_kwargs["text"]
+
+
+# ---------------------------------------------------------------------------
+# 9. sm#249: compaction suppress remind
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionSuppressRemind:
+    """sm#249: _is_compacting flag set/cleared via compaction/compaction_complete events."""
+
+    def test_compaction_sets_is_compacting_flag(self, client, session):
+        """compaction event sets _is_compacting=True on session."""
+        assert session._is_compacting is False
+        _post_event(client, session.id, event="compaction", trigger="auto")
+        assert session._is_compacting is True
+
+    def test_compaction_complete_clears_is_compacting_flag(self, client, session):
+        """compaction_complete event clears _is_compacting=False on session."""
+        session._is_compacting = True
+        _post_event(client, session.id, event="compaction_complete")
+        assert session._is_compacting is False
+
+    def test_compaction_complete_resets_remind_timer(self, client, mock_session_manager, session):
+        """compaction_complete calls reset_remind on queue manager."""
+        session._is_compacting = True
+        _post_event(client, session.id, event="compaction_complete")
+        queue_mgr = mock_session_manager.message_queue_manager
+        queue_mgr.reset_remind.assert_called_once_with(session.id)
+
+    def test_compaction_complete_returns_logged_status(self, client, session):
+        """compaction_complete returns compaction_complete_logged status."""
+        resp = _post_event(client, session.id, event="compaction_complete")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "compaction_complete_logged"
+
+    def test_compaction_complete_no_queue_mgr_no_crash(self, session):
+        """compaction_complete with no queue manager doesn't crash."""
+        mock_sm = MagicMock()
+        mock_sm.get_session.return_value = session
+        mock_sm.message_queue_manager = None
+        app = create_app(session_manager=mock_sm)
+        client = TestClient(app)
+        session._is_compacting = True
+        resp = _post_event(client, session.id, event="compaction_complete")
+        assert resp.status_code == 200
+        assert session._is_compacting is False
+
+    def test_session_is_compacting_defaults_false(self):
+        """Session._is_compacting defaults to False (runtime-only, not persisted)."""
+        s = Session(
+            id="test1",
+            name="claude-test1",
+            tmux_session="claude-test1",
+        )
+        assert s._is_compacting is False
+
+    def test_is_compacting_not_in_to_dict(self):
+        """_is_compacting is a runtime flag and must not appear in to_dict()."""
+        s = Session(
+            id="test2",
+            name="claude-test2",
+            tmux_session="claude-test2",
+        )
+        s._is_compacting = True
+        d = s.to_dict()
+        assert "_is_compacting" not in d
+
+    def test_from_dict_always_starts_with_is_compacting_false(self):
+        """from_dict never restores _is_compacting (always starts False, safe default)."""
+        s = Session(
+            id="test3",
+            name="claude-test3",
+            tmux_session="claude-test3",
+        )
+        d = s.to_dict()
+        restored = Session.from_dict(d)
+        assert restored._is_compacting is False

@@ -755,6 +755,165 @@ class TestDedupGuard:
 
 
 # ===========================================================================
+# sm#249: suppress remind during compaction
+# ===========================================================================
+
+
+class TestSuppressRemindDuringCompaction:
+    """sm#249: remind delivery suppressed / delayed when session is compacting."""
+
+    @pytest.mark.asyncio
+    async def test_run_remind_task_skips_when_compacting(self, mq):
+        """_run_remind_task skips soft/hard delivery iteration when _is_compacting=True."""
+        from src.models import Session, SessionStatus
+
+        # Set up a session in compacting state
+        session = Session(
+            id="compacting1",
+            name="claude-compacting1",
+            tmux_session="claude-compacting1",
+        )
+        session._is_compacting = True
+        mq.session_manager.get_session = MagicMock(return_value=session)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind("compacting1", soft_threshold=1, hard_threshold=2)
+
+        # Simulate time past hard threshold
+        reg = mq._remind_registrations["compacting1"]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=100)
+
+        await run_one_iteration(mq, "compacting1")
+
+        # No remind messages should have been queued (compaction suppressed delivery)
+        pending = mq.get_pending_messages("compacting1")
+        assert len(pending) == 0, "Remind must not fire during compaction"
+
+    @pytest.mark.asyncio
+    async def test_run_remind_task_fires_after_compaction_clears(self, mq):
+        """_run_remind_task fires remind after _is_compacting clears."""
+        from src.models import Session, SessionStatus
+
+        session = Session(
+            id="compact2",
+            name="claude-compact2",
+            tmux_session="claude-compact2",
+        )
+        session._is_compacting = False
+        mq.session_manager.get_session = MagicMock(return_value=session)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind("compact2", soft_threshold=1, hard_threshold=100)
+
+        reg = mq._remind_registrations["compact2"]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=5)
+
+        await run_one_iteration(mq, "compact2")
+
+        pending = mq.get_pending_messages("compact2")
+        assert len(pending) == 1
+        assert "[sm remind]" in pending[0].text
+
+    @pytest.mark.asyncio
+    async def test_fire_reminder_waits_for_compaction_to_clear(self, mq):
+        """_fire_reminder waits until _is_compacting clears before delivering."""
+        from src.models import Session
+
+        session = Session(
+            id="compact3",
+            name="claude-compact3",
+            tmux_session="claude-compact3",
+        )
+        # Start compacting, then clear after two poll intervals
+        call_count = [0]
+
+        def get_session_side_effect(sid):
+            call_count[0] += 1
+            # First two calls: still compacting. Third call: done.
+            session._is_compacting = call_count[0] <= 2
+            return session
+
+        mq.session_manager.get_session = MagicMock(side_effect=get_session_side_effect)
+
+        sleep_calls = []
+
+        async def mock_sleep(t):
+            sleep_calls.append(t)
+
+        with patch("asyncio.sleep", mock_sleep):
+            # Simulate delay_seconds=0 so initial sleep returns immediately
+            await mq._fire_reminder("rid1", "compact3", "wake up!", delay_seconds=0)
+
+        # Reminder should eventually be delivered
+        pending = mq.get_pending_messages("compact3")
+        assert len(pending) == 1
+        assert "[sm] Scheduled reminder:" in pending[0].text
+
+        # At least one compaction-wait sleep should have occurred
+        compaction_wait_sleeps = [t for t in sleep_calls if t > 0]
+        assert len(compaction_wait_sleeps) >= 1
+
+    @pytest.mark.asyncio
+    async def test_fire_reminder_delivers_after_timeout_even_if_still_compacting(self, mq):
+        """_fire_reminder delivers after COMPACTION_WAIT_MAX regardless (one-shot guarantee)."""
+        from src.models import Session
+
+        session = Session(
+            id="compact4",
+            name="claude-compact4",
+            tmux_session="claude-compact4",
+        )
+        session._is_compacting = True  # Never clears during this test
+        mq.session_manager.get_session = MagicMock(return_value=session)
+
+        # Patch sleep to be instant; cap at small iteration count to avoid infinite loop
+        sleep_count = [0]
+
+        async def instant_sleep(t):
+            sleep_count[0] += 1
+            # Simulate exceeding COMPACTION_WAIT_MAX by advancing waited counter via the
+            # interval being large enough (each poll_interval = 5s, max = 300s → 60 polls).
+            # We patch get_session to return non-compacting after enough polls.
+            if sleep_count[0] > 60:
+                session._is_compacting = False
+
+        with patch("asyncio.sleep", instant_sleep):
+            await mq._fire_reminder("rid2", "compact4", "important!", delay_seconds=0)
+
+        # Despite compaction never clearing in time, message must eventually be delivered
+        pending = mq.get_pending_messages("compact4")
+        assert len(pending) == 1
+
+    @pytest.mark.asyncio
+    async def test_fire_reminder_no_wait_when_not_compacting(self, mq):
+        """_fire_reminder delivers immediately when session is not compacting."""
+        from src.models import Session
+
+        session = Session(
+            id="compact5",
+            name="claude-compact5",
+            tmux_session="claude-compact5",
+        )
+        session._is_compacting = False
+        mq.session_manager.get_session = MagicMock(return_value=session)
+
+        sleep_calls = []
+
+        async def mock_sleep(t):
+            sleep_calls.append(t)
+
+        with patch("asyncio.sleep", mock_sleep):
+            await mq._fire_reminder("rid3", "compact5", "hello!", delay_seconds=0)
+
+        # Only the initial delay sleep (0s); no compaction poll sleeps
+        compaction_poll_sleeps = [t for t in sleep_calls if t == 5]
+        assert len(compaction_poll_sleeps) == 0, "Should not poll for compaction when not compacting"
+
+        pending = mq.get_pending_messages("compact5")
+        assert len(pending) == 1
+
+
+# ===========================================================================
 # Database schema: remind_registrations table exists
 # ===========================================================================
 

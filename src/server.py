@@ -2441,6 +2441,8 @@ Or continue working if not done yet."""
             logger.warning(
                 f"Compaction fired for {session.friendly_name or session_id} (trigger={trigger})"
             )
+            # Set compaction flag — suppress remind delivery until compaction_complete (#249).
+            session._is_compacting = True
             # Reset one-shot flags — PreCompact fires before context is refreshed,
             # so this is the reliable reset point for the next accumulation cycle.
             # Cannot rely on used_pct < warning_pct because post-compaction context
@@ -2464,6 +2466,18 @@ Or continue working if not done yet."""
                     message_category="context_monitor",
                 )
             return {"status": "compaction_logged"}
+
+        # Handle compaction_complete event (from post_compact_recovery.sh SessionStart hook)
+        # Clears the compacting flag and resets the remind timer so the agent gets a fresh
+        # soft-threshold window exactly when it wakes (#249).
+        if data.get("event") == "compaction_complete":
+            session._is_compacting = False
+            if queue_mgr:
+                queue_mgr.reset_remind(session_id)
+            logger.info(
+                f"Compaction complete for {session.friendly_name or session_id}, remind timer reset"
+            )
+            return {"status": "compaction_complete_logged"}
 
         # Handle manual /clear event (from SessionStart clear hook)
         # Must be before the registration gate — unregistered sessions still receive

@@ -101,6 +101,13 @@ if [ -z "$SM_SESSION_ID" ]; then
   exit 0
 fi
 
+# Notify sm that compaction is complete — clears _is_compacting flag and resets remind timer (#249)
+# sm server only listens on 127.0.0.1 — localhost-only trusted call
+curl -s --max-time 2 -X POST http://localhost:8420/hooks/context-usage \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg sid "$SM_SESSION_ID" '{session_id: $sid, event: "compaction_complete"}')" \
+  >/dev/null 2>&1
+
 # Query sm server for the last handoff path (set by sm#196 _execute_handoff)
 # sm server only listens on 127.0.0.1 — localhost-only trusted call
 HANDOFF_PATH=$(curl -s --max-time 2 http://localhost:8420/sessions/"$SM_SESSION_ID" \

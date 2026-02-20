@@ -1280,9 +1280,25 @@ class MessageQueueManager:
         return reminder_id
 
     async def _fire_reminder(self, reminder_id: str, session_id: str, message: str, delay_seconds: int):
-        """Fire a reminder after delay."""
+        """Fire a reminder after delay.
+
+        If the session is mid-compaction when the reminder fires, waits up to
+        COMPACTION_WAIT_MAX seconds (polling every COMPACTION_POLL_INTERVAL) before
+        delivering anyway — preserves the one-shot guarantee (#249).
+        """
+        COMPACTION_WAIT_MAX = 300     # seconds
+        COMPACTION_POLL_INTERVAL = 5  # seconds
         try:
             await asyncio.sleep(delay_seconds)
+
+            # Wait for compaction to complete before delivering (#249)
+            waited = 0
+            while waited < COMPACTION_WAIT_MAX:
+                session = self.session_manager.get_session(session_id)
+                if not session or not session._is_compacting:
+                    break
+                await asyncio.sleep(COMPACTION_POLL_INTERVAL)
+                waited += COMPACTION_POLL_INTERVAL
 
             # Queue the reminder with urgent delivery to actually wake the agent
             formatted_message = f"[sm] Scheduled reminder:\n{message}"
@@ -1451,6 +1467,7 @@ class MessageQueueManager:
 
         Polls every 5 seconds. Fires soft (important) when soft_threshold exceeded,
         hard (urgent) when hard_threshold exceeded. Hard fire resets the cycle.
+        Skips delivery while session is compacting (#249).
         """
         CHECK_INTERVAL = 5  # seconds
         REMIND_PREFIX = "[sm remind]"
@@ -1460,6 +1477,11 @@ class MessageQueueManager:
                 reg = self._remind_registrations.get(target_session_id)
                 if not reg or not reg.is_active:
                     return
+
+                # Skip this iteration if the session is mid-compaction (#249)
+                session = self.session_manager.get_session(target_session_id)
+                if session and session._is_compacting:
+                    continue
 
                 elapsed = (datetime.now() - reg.last_reset_at).total_seconds()
 

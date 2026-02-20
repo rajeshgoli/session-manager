@@ -212,6 +212,7 @@ class Session:
     # Runtime-only flags — not persisted (reset to False on server restart / new cycle)
     _context_warning_sent: bool = field(default=False, init=False, repr=False)
     _context_critical_sent: bool = field(default=False, init=False, repr=False)
+    _is_compacting: bool = field(default=False, init=False, repr=False)  # True during PreCompact→SessionStart(compact) window (#249)
 
     # Context monitor registration (#206)
     context_monitor_enabled: bool = False  # Default off — opt-in only
