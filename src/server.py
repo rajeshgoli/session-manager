@@ -269,8 +269,26 @@ def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = Fa
     )
     if queue_mgr:
         if arm_skip:
+            # Arm 2 slots only when agent is explicitly known to be running:
+            # - existing delivery state (not created by this call) with is_idle=False, AND
+            # - session.status == RUNNING (set by mark_session_active on actual delivery)
+            # Both conditions required. Either alone is unreliable:
+            # - is_idle=False alone: prior clear-only path creates state with default False.
+            # - session.status RUNNING alone: persisted status could be stale post-restart.
+            # Missing delivery state (first dispatch, post-restart) → 1 slot (sm#263).
+            existing_state = queue_mgr.delivery_states.get(session_id)
+            session_obj = app.state.session_manager.get_session(session_id) if app.state.session_manager else None
+            agent_explicitly_running = (
+                existing_state is not None
+                and not existing_state.is_idle
+                and session_obj is not None
+                and session_obj.status == SessionStatus.RUNNING
+            )
+            # 2 = prev-task Stop hook + /clear Stop hook (both expected when running)
+            # 1 = /clear Stop hook only (agent idle → no in-flight prev-task hook)
+            slots = 2 if agent_explicitly_running else 1
             state = queue_mgr._get_or_create_state(session_id)
-            state.stop_notify_skip_count += 1
+            state.stop_notify_skip_count += slots
             state.skip_count_armed_at = datetime.now()  # sm#232
         else:
             state = queue_mgr.delivery_states.get(session_id)

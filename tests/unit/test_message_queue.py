@@ -1815,3 +1815,270 @@ class TestSkipFence232:
             if "Timeout" in str(call.args[1])
         ]
         assert len(timeout_payloads) >= 1
+
+
+# =============================================================================
+# TestSkipFence263 — sm#263 structural fixes
+# =============================================================================
+
+class TestSkipFence263:
+    """sm#263: absorbed hooks must not cancel remind/parent_wake; conditional 2-slot arming."""
+
+    def _make_mq(self, mock_session_manager, temp_db_path, fence_window=8):
+        return MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"timeouts": {"message_queue": {"skip_fence_window_seconds": fence_window}}},
+            notifier=None,
+        )
+
+    # -------------------------------------------------------------------------
+    # Part 2: cancel_remind / cancel_parent_wake must not fire for absorbed hooks
+    # -------------------------------------------------------------------------
+
+    def test_absorbed_hook_does_not_cancel_parent_wake(self, mock_session_manager, temp_db_path):
+        """Absorbed stop hook (skip_count=1) must NOT cancel a registered parent_wake.
+
+        Bug 2: cancel_parent_wake was called before the skip fence check, so any
+        absorbed hook (prev-task or /clear) would silently drop the EM's wake
+        registration. After the fix, cancel only fires when the hook falls through.
+        """
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_parent_wake("child263a", "parent263a")
+
+        # Arm skip fence: absorb the next stop hook
+        state = mq._get_or_create_state("child263a")
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now()
+
+        # Absorbed stop hook arrives
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("child263a", from_stop_hook=True)
+
+        # Skip fence absorbed → parent_wake must still be registered
+        assert "child263a" in mq._parent_wake_registrations, (
+            "parent_wake was cancelled by an absorbed hook — Bug 2 regression"
+        )
+
+    def test_absorbed_hook_does_not_cancel_remind(self, mock_session_manager, temp_db_path):
+        """Absorbed stop hook (skip_count=1) must NOT cancel a registered remind.
+
+        Matches the Bug 2 scenario for periodic reminds (#188).
+        """
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind("agent263b", soft_threshold=210, hard_threshold=420)
+
+        # Arm skip fence
+        state = mq._get_or_create_state("agent263b")
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now()
+
+        # Absorbed stop hook arrives
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("agent263b", from_stop_hook=True)
+
+        # Remind must still be registered
+        assert "agent263b" in mq._remind_registrations, (
+            "remind was cancelled by an absorbed hook — Bug 2 regression"
+        )
+
+    def test_real_stop_hook_cancels_parent_wake(self, mock_session_manager, temp_db_path):
+        """A non-absorbed stop hook (skip_count=0) DOES cancel parent_wake normally."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_parent_wake("child263c", "parent263c")
+
+        state = mq._get_or_create_state("child263c")
+        state.stop_notify_skip_count = 0  # no fence → hook falls through
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("child263c", from_stop_hook=True)
+
+        assert "child263c" not in mq._parent_wake_registrations
+
+    def test_two_slot_fence_absorbs_prev_task_and_clear(self, mock_session_manager, temp_db_path):
+        """skip_count=2 absorbs both hooks; is_idle stays False; parent_wake preserved.
+
+        Simulates: arm_skip=2 (agent was running), prev-task hook arrives (2→1),
+        /clear hook arrives (1→0). Both absorbed. is_idle stays False throughout.
+        """
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_parent_wake("child263d", "parent263d")
+
+        state = mq._get_or_create_state("child263d")
+        state.is_idle = False
+        state.stop_notify_skip_count = 2
+        state.skip_count_armed_at = datetime.now()
+
+        # First hook: prev-task stop hook (2→1)
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("child263d", from_stop_hook=True)
+
+        assert state.is_idle is False
+        assert state.stop_notify_skip_count == 1
+        assert "child263d" in mq._parent_wake_registrations
+
+        # Second hook: /clear stop hook (1→0)
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("child263d", from_stop_hook=True)
+
+        assert state.is_idle is False
+        assert state.stop_notify_skip_count == 0
+        assert state.skip_count_armed_at is None
+        assert "child263d" in mq._parent_wake_registrations
+
+    def test_prev_task_hook_absorbed_clear_hook_falls_through(self, mock_session_manager, temp_db_path):
+        """Regression: with skip_count=1, prev-task hook consumed, /clear falls through.
+
+        Demonstrates why the 2-slot fix is needed. With 1 slot:
+        - Prev-task hook: absorbed (1→0)
+        - /clear hook: falls through → is_idle=True (WRONG — agent is running new task)
+        """
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        state = mq._get_or_create_state("child263e")
+        state.is_idle = False
+        state.stop_notify_skip_count = 1
+        state.skip_count_armed_at = datetime.now()
+
+        # Prev-task hook arrives → absorbed (1→0)
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("child263e", from_stop_hook=True)
+
+        assert state.is_idle is False
+        assert state.stop_notify_skip_count == 0
+
+        # /clear hook arrives — with 1-slot fence, falls through and sets is_idle=True
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("child263e", from_stop_hook=True)
+
+        # This demonstrates the OLD bug: /clear hook fell through
+        assert state.is_idle is True  # falls through with 1-slot (expected old behavior)
+
+    # -------------------------------------------------------------------------
+    # Part 1: conditional skip_count arming in _invalidate_session_cache
+    # -------------------------------------------------------------------------
+
+    def _make_app(self, mq, session_obj=None):
+        """Build a mock app for _invalidate_session_cache calls."""
+        from unittest.mock import Mock
+        app = Mock()
+        app.state.last_claude_output = {}
+        app.state.pending_stop_notifications = set()
+        app.state.session_manager = Mock()
+        app.state.session_manager.message_queue_manager = mq
+        app.state.session_manager.get_session = Mock(return_value=session_obj)
+        return app
+
+    def _make_session(self, session_id, status):
+        """Build a session mock with specific status."""
+        from src.models import Session
+        s = Session(id=session_id, name=f"claude-{session_id[:8]}", working_dir="/tmp")
+        s.status = status
+        return s
+
+    def test_conditional_skip_count_running_agent(self, mock_session_manager, temp_db_path):
+        """Agent explicitly running → arm 2 slots.
+
+        Conditions: existing delivery state with is_idle=False AND session.status=RUNNING.
+        """
+        from src.server import _invalidate_session_cache
+
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        session_id = "sess263f"
+
+        # Pre-create delivery state with is_idle=False (agent running)
+        existing_state = mq._get_or_create_state(session_id)
+        existing_state.is_idle = False
+
+        # session.status = RUNNING
+        session_obj = self._make_session(session_id, SessionStatus.RUNNING)
+        app = self._make_app(mq, session_obj=session_obj)
+
+        _invalidate_session_cache(app, session_id, arm_skip=True)
+
+        state = mq.delivery_states[session_id]
+        assert state.stop_notify_skip_count == 2, (
+            f"Expected 2 slots for running agent, got {state.stop_notify_skip_count}"
+        )
+
+    def test_conditional_skip_count_idle_agent(self, mock_session_manager, temp_db_path):
+        """Agent idle (is_idle=True) → arm 1 slot."""
+        from src.server import _invalidate_session_cache
+
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        session_id = "sess263g"
+
+        # Delivery state with is_idle=True
+        existing_state = mq._get_or_create_state(session_id)
+        existing_state.is_idle = True
+
+        session_obj = self._make_session(session_id, SessionStatus.IDLE)
+        app = self._make_app(mq, session_obj=session_obj)
+
+        _invalidate_session_cache(app, session_id, arm_skip=True)
+
+        state = mq.delivery_states[session_id]
+        assert state.stop_notify_skip_count == 1, (
+            f"Expected 1 slot for idle agent, got {state.stop_notify_skip_count}"
+        )
+
+    def test_conditional_skip_count_no_prior_state(self, mock_session_manager, temp_db_path):
+        """No existing delivery state (first dispatch / post-restart) → arm 1 slot.
+
+        _get_or_create_state creates a fresh state with is_idle=False by default.
+        Using delivery_states.get() (not _get_or_create_state) to check existing state
+        ensures we don't treat a missing state as 'running'.
+        """
+        from src.server import _invalidate_session_cache
+
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        session_id = "sess263h"
+
+        # No delivery state at all
+        assert session_id not in mq.delivery_states
+
+        session_obj = self._make_session(session_id, SessionStatus.RUNNING)
+        app = self._make_app(mq, session_obj=session_obj)
+
+        _invalidate_session_cache(app, session_id, arm_skip=True)
+
+        state = mq.delivery_states[session_id]
+        assert state.stop_notify_skip_count == 1, (
+            f"Expected 1 slot when no prior state, got {state.stop_notify_skip_count}"
+        )
+
+    def test_conditional_skip_count_stale_state_status_idle(self, mock_session_manager, temp_db_path):
+        """Stale delivery state (is_idle=False) but session.status=IDLE → arm 1 slot.
+
+        A prior clear-only path can create delivery state with is_idle=False even
+        when the agent is idle. session.status=IDLE overrides is_idle=False — agent
+        is treated as idle and only 1 slot is armed.
+        """
+        from src.server import _invalidate_session_cache
+
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+        session_id = "sess263i"
+
+        # Stale delivery state: is_idle=False but agent actually idle
+        existing_state = mq._get_or_create_state(session_id)
+        existing_state.is_idle = False
+
+        # session.status shows IDLE (source of truth)
+        session_obj = self._make_session(session_id, SessionStatus.IDLE)
+        app = self._make_app(mq, session_obj=session_obj)
+
+        _invalidate_session_cache(app, session_id, arm_skip=True)
+
+        state = mq.delivery_states[session_id]
+        assert state.stop_notify_skip_count == 1, (
+            f"Expected 1 slot when session.status=IDLE overrides is_idle=False, "
+            f"got {state.stop_notify_skip_count}"
+        )
