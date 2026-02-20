@@ -52,6 +52,8 @@ def mock_session_manager():
     manager.notifier.telegram.bot = AsyncMock()
     manager.notifier.telegram._topic_sessions = {}
     manager.notifier.telegram._session_threads = {}
+    # send_with_fallback is async (#200); return msg_id to confirm forum path
+    manager.notifier.telegram.send_with_fallback = AsyncMock(return_value=9999)
 
     return manager
 
@@ -104,10 +106,11 @@ async def test_monitor_detects_tmux_death(output_monitor, mock_session, mock_ses
     # State should be saved
     mock_session_manager._save_state.assert_called()
 
-    # Telegram topic should be deleted
-    mock_session_manager.notifier.telegram.bot.delete_forum_topic.assert_called_once_with(
+    # "Session stopped" notification should have been sent (try-and-fallback, #200)
+    mock_session_manager.notifier.telegram.send_with_fallback.assert_called_once_with(
         chat_id=12345,
-        message_thread_id=67890,
+        message=f"Session stopped [{mock_session.id}]",
+        thread_id=67890,
     )
 
     # Monitoring should have stopped
@@ -143,7 +146,12 @@ async def test_cleanup_session_full_workflow(output_monitor, mock_session, mock_
     # Telegram cleanup
     assert (12345, 67890) not in mock_session_manager.notifier.telegram._topic_sessions
     assert mock_session.id not in mock_session_manager.notifier.telegram._session_threads
-    mock_session_manager.notifier.telegram.bot.delete_forum_topic.assert_called_once()
+    # "Session stopped" sent via try-and-fallback (#200); delete_forum_topic no longer used
+    mock_session_manager.notifier.telegram.send_with_fallback.assert_called_once_with(
+        chat_id=12345,
+        message=f"Session stopped [{mock_session.id}]",
+        thread_id=67890,
+    )
 
     # Hook output cache cleanup
     assert mock_session.id not in mock_session_manager.app.state.last_claude_output
@@ -155,13 +163,13 @@ async def test_cleanup_session_full_workflow(output_monitor, mock_session, mock_
 
 
 @pytest.mark.asyncio
-async def test_cleanup_handles_telegram_delete_failure(output_monitor, mock_session, mock_session_manager):
-    """Test that cleanup continues even if Telegram deletion fails."""
+async def test_cleanup_handles_telegram_notification_failure(output_monitor, mock_session, mock_session_manager):
+    """Test that cleanup continues even if Telegram notification fails (#200: try-and-fallback)."""
     # Add session to manager
     mock_session_manager.sessions[mock_session.id] = mock_session
 
-    # Make Telegram deletion fail
-    mock_session_manager.notifier.telegram.bot.delete_forum_topic.side_effect = Exception("Permission denied")
+    # Both forum and fallback sends fail (send_with_fallback returns None)
+    mock_session_manager.notifier.telegram.send_with_fallback = AsyncMock(return_value=None)
 
     # Call cleanup - should not raise
     await output_monitor.cleanup_session(mock_session)

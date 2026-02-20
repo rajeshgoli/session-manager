@@ -44,6 +44,8 @@ def mock_session_manager():
     manager.notifier.telegram.bot = AsyncMock()
     manager.notifier.telegram._topic_sessions = {}
     manager.notifier.telegram._session_threads = {}
+    # send_with_fallback is async; return a message_id so forum path is taken
+    manager.notifier.telegram.send_with_fallback = AsyncMock(return_value=9999)
 
     return manager
 
@@ -61,7 +63,8 @@ def output_monitor(mock_session_manager):
 async def test_cleanup_accesses_correct_telegram_attribute(output_monitor, mock_session, mock_session_manager):
     """Test that cleanup_session accesses notifier.telegram, not notifier.telegram_bot.
 
-    This is the fix for Bug 2 in issue #102.
+    This is the fix for Bug 2 in issue #102.  The new behaviour sends a "Session stopped"
+    message via send_notification (try-and-fallback) instead of delete_forum_topic (#200).
     """
     # Add session to manager
     mock_session_manager.sessions[mock_session.id] = mock_session
@@ -69,11 +72,12 @@ async def test_cleanup_accesses_correct_telegram_attribute(output_monitor, mock_
     # Call cleanup
     await output_monitor.cleanup_session(mock_session)
 
-    # Verify that telegram.bot.delete_forum_topic was called
-    # This would NOT happen if the code was still accessing telegram_bot (which doesn't exist)
-    mock_session_manager.notifier.telegram.bot.delete_forum_topic.assert_called_once_with(
+    # Verify that telegram.send_with_fallback was called.
+    # This would NOT happen if the code was still accessing telegram_bot (which doesn't exist).
+    mock_session_manager.notifier.telegram.send_with_fallback.assert_called_once_with(
         chat_id=12345,
-        message_thread_id=67890,
+        message=f"Session stopped [{mock_session.id}]",
+        thread_id=67890,
     )
 
 
