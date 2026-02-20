@@ -1084,6 +1084,26 @@ def create_app(
         # doesn't leak into stop-hook notifications for the next task (#167)
         _invalidate_session_cache(app, session_id)
 
+        # Send "Context cleared" marker to the Telegram thread (#200)
+        notifier = app.state.notifier if hasattr(app.state, 'notifier') else None
+        telegram_bot = getattr(notifier, 'telegram', None) if notifier else None
+        if telegram_bot and session.telegram_chat_id and session.telegram_thread_id:
+            cleared_msg = f"Context cleared [{session_id}] — ready for new task"
+            chat_id = session.telegram_chat_id
+            thread_id = session.telegram_thread_id
+            # Try forum-topic delivery; fall back to reply-thread if it fails.
+            msg_id = await telegram_bot.send_notification(
+                chat_id=chat_id,
+                message=cleared_msg,
+                message_thread_id=thread_id,
+            )
+            if msg_id is None:
+                await telegram_bot.send_notification(
+                    chat_id=chat_id,
+                    message=cleared_msg,
+                    reply_to_message_id=thread_id,
+                )
+
         # Cancel periodic remind and parent wake (context reset means task is over) (#188, #225-C)
         queue_mgr = app.state.session_manager.message_queue_manager
         if queue_mgr:
