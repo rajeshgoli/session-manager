@@ -1206,7 +1206,7 @@ def _register_em_monitoring(
         sender_session_id=em_session_id,
         requester_session_id=em_session_id,
     )
-    if not ns_ok and not ns_unavailable:
+    if not ns_ok:
         print(f"  Warning: Failed to arm stop notification for {child_id}", file=sys.stderr)
 
 

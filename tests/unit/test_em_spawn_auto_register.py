@@ -84,11 +84,15 @@ class TestEmSpawnAutoRegister:
             yield
 
     def test_em_parent_registers_remind(self):
-        """When parent is_em=True, register_remind called with soft=210, hard=420."""
+        """When parent is_em=True, register_remind called with default soft/hard thresholds."""
         client = _make_client(parent_session=_make_em_session())
         rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
         assert rc == 0
-        client.register_remind.assert_called_once_with("child001", soft_threshold=210, hard_threshold=420)
+        client.register_remind.assert_called_once_with(
+            "child001",
+            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
+            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
+        )
 
     def test_em_parent_enables_context_monitoring(self):
         """When parent is_em=True, set_context_monitor called with notify → EM session."""
@@ -206,6 +210,18 @@ class TestEmSpawnAutoRegister:
         assert "Warning" in err
         assert "stop notification" in err
 
+    def test_stop_notify_unavailable_prints_warning(self, capsys):
+        """arm_stop_notify returning (False, True) (server unavailable) still prints a warning."""
+        client = _make_client(
+            parent_session=_make_em_session(),
+            ns_result=(False, True),
+        )
+        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "Warning" in err
+        assert "stop notification" in err
+
     def test_codex_app_em_parent_also_registers(self):
         """EM registration also fires for codex-app spawned children."""
         client = _make_client(
@@ -214,7 +230,11 @@ class TestEmSpawnAutoRegister:
         )
         rc = cmd_spawn(client, "em0000aa", "codex-app", "Implement feature X")
         assert rc == 0
-        client.register_remind.assert_called_once_with("child002", soft_threshold=210, hard_threshold=420)
+        client.register_remind.assert_called_once_with(
+            "child002",
+            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
+            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
+        )
         client.set_context_monitor.assert_called_once()
         client.arm_stop_notify.assert_called_once()
 
@@ -257,8 +277,15 @@ class TestRegisterEmMonitoring:
         client.set_context_monitor.return_value = (None, True, False)
         client.arm_stop_notify.return_value = (True, False)
 
-        _register_em_monitoring(client, "childXXX", "emYYY", 210, 420)
-        client.register_remind.assert_called_once_with("childXXX", soft_threshold=210, hard_threshold=420)
+        _register_em_monitoring(
+            client, "childXXX", "emYYY",
+            DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD,
+        )
+        client.register_remind.assert_called_once_with(
+            "childXXX",
+            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
+            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
+        )
 
     def test_context_monitor_notify_points_to_em(self):
         """set_context_monitor notify_session_id points to EM session."""
@@ -267,7 +294,10 @@ class TestRegisterEmMonitoring:
         client.set_context_monitor.return_value = (None, True, False)
         client.arm_stop_notify.return_value = (True, False)
 
-        _register_em_monitoring(client, "childXXX", "emYYY", 210, 420)
+        _register_em_monitoring(
+            client, "childXXX", "emYYY",
+            DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD,
+        )
         client.set_context_monitor.assert_called_once_with(
             "childXXX",
             enabled=True,
@@ -282,7 +312,10 @@ class TestRegisterEmMonitoring:
         client.set_context_monitor.return_value = (None, True, False)
         client.arm_stop_notify.return_value = (True, False)
 
-        _register_em_monitoring(client, "childXXX", "emYYY", 210, 420)
+        _register_em_monitoring(
+            client, "childXXX", "emYYY",
+            DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD,
+        )
         client.arm_stop_notify.assert_called_once_with(
             "childXXX",
             sender_session_id="emYYY",
