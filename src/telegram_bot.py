@@ -983,7 +983,8 @@ Provide ONLY the summary, no preamble or questions."""
             Message ID of sent message, or None on failure
         """
         if not self.bot:
-            logger.error("Bot not initialized")
+            if not silent:
+                logger.error("Bot not initialized")
             return None
 
         try:
@@ -1013,7 +1014,8 @@ Provide ONLY the summary, no preamble or questions."""
                     )
                     return msg.message_id
                 except Exception as e2:
-                    logger.error(f"Failed to send plain text message: {e2}")
+                    if not silent:
+                        logger.error(f"Failed to send plain text message: {e2}")
                     return None
             if silent:
                 logger.warning(f"Failed to send Telegram message (expected): {e}")
