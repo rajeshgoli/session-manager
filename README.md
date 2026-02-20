@@ -70,15 +70,15 @@ You: *sips tea* ☕
 **Solution:** A central manager that lets agents go idle and gives you full visibility. Spawn workers → go to sleep → wake on notification. Zero tokens burned while waiting. Every message mirrored to your Telegram.
 
 ```bash
-# EM spawns engineer, goes idle (no tokens burned)
-sm spawn "Implement ticket #123" --name engineer --wait 600
+# EM dispatches engineer, goes idle (no tokens burned)
+sm dispatch engineer --role engineer --urgent --task "Implement ticket #123"
 
 # Engineer works autonomously...
 # ...finishes, notifies EM (AND you get a Telegram message)
 sm send em-main "done: PR #456 created"
 
-# EM wakes up, routes PR to architect
-sm send architect "Review PR #456"
+# EM wakes up (via notify-on-stop), routes PR to architect
+sm dispatch architect --role architect --urgent --pr 456
 ```
 
 **Result:** Complex multi-agent workflows at a fraction of the token cost. Full visibility from anywhere.
@@ -151,7 +151,7 @@ Every managed session gets the `sm` command. This is how agents coordinate.
 
 | Command | Purpose |
 |---------|---------|
-| `sm spawn "<prompt>" --name X` | Spawn child agent |
+| `sm spawn claude "<prompt>" --name X` | Spawn child agent |
 | `sm send <id> "<text>"` | Send message to agent (+ Telegram) |
 | `sm dispatch <id> --role X --task "..."` | Dispatch with auto-clear (primary EM command) |
 | `sm em [name]` | EM pre-flight: set name + enable context monitoring |
