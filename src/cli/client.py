@@ -164,6 +164,26 @@ class SessionManagerClient:
             return data.get("subagents", [])
         return None
 
+    def cleanup_idle_topics(self, session_ids: Optional[list] = None) -> tuple[Optional[dict], bool]:
+        """
+        Close Telegram forum topics for idle/completed sessions (Fix C: sm#271).
+
+        Args:
+            session_ids: If provided, close topics for these specific IDs (Mode 2).
+                         If None, close topics for all COMPLETED sessions (Mode 1).
+
+        Returns:
+            Tuple of (response_dict, unavailable)
+            response_dict contains 'closed' count and 'skipped'/'rejected' info.
+        """
+        body = {}
+        if session_ids is not None:
+            body = {"session_ids": session_ids}
+        data, success, unavailable = self._request("POST", "/admin/cleanup-idle-topics", body or None)
+        if success:
+            return data, False
+        return None, unavailable
+
     def send_input(
         self,
         session_id: str,

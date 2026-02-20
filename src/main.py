@@ -185,6 +185,8 @@ class SessionManagerApp:
         self.child_monitor = ChildMonitor(self.session_manager)
         # Pass child monitor to session manager
         self.session_manager.child_monitor = self.child_monitor
+        # Wire output_monitor so ChildMonitor can close topics on completion (Fix A: sm#271)
+        self.child_monitor.set_output_monitor(self.output_monitor)
 
         # Message queue manager for reliable inter-agent messaging (sm-send-v2)
         sm_send_config = config.get("sm_send", {})

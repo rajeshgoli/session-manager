@@ -185,6 +185,19 @@ def main():
     kill_parser = subparsers.add_parser("kill", help="Terminate a child session")
     kill_parser.add_argument("session_id", help="Session ID to terminate")
 
+    # sm clean [--session-id ID ...]
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Close Telegram forum topics for idle/completed sessions (sm#271)"
+    )
+    clean_parser.add_argument(
+        "--session-id",
+        dest="session_ids",
+        action="append",
+        metavar="ID",
+        help="Specific session ID(s) to clean (repeatable); omit for auto-mode (COMPLETED only)",
+    )
+
     # sm claude [working_dir]
     parser_claude = subparsers.add_parser(
         "claude",
@@ -461,6 +474,8 @@ def main():
         sys.exit(commands.cmd_children(client, parent_id, args.recursive, args.status, args.json, getattr(args, 'db_path', None)))
     elif args.command == "kill":
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
+    elif args.command == "clean":
+        sys.exit(commands.cmd_clean(client, session_ids=getattr(args, 'session_ids', None)))
     elif args.command == "claude":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
     elif args.command == "codex":

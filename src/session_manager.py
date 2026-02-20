@@ -69,6 +69,10 @@ class SessionManager:
         # Child monitor (set by main app)
         self.child_monitor = None
 
+        # EM topic continuity (Fix B: sm#271): persisted across handoffs
+        # Format: {"chat_id": int, "thread_id": int} or None
+        self.em_topic: Optional[dict] = None
+
         # Load existing sessions from state file
         self._load_state()
 
@@ -138,6 +142,10 @@ class SessionManager:
                             )
                 if legacy_codex_sessions:
                     self._rewrite_state_raw(cleaned_sessions)
+
+                # Load EM topic continuity field (backward compat: missing = None)
+                self.em_topic = data.get("em_topic")
+
                 return True
             except Exception as e:
                 logger.error(f"CRITICAL: Failed to load state from {self.state_file}: {e}")
@@ -174,7 +182,8 @@ class SessionManager:
         """
         try:
             data = {
-                "sessions": [s.to_dict() for s in self.sessions.values()]
+                "sessions": [s.to_dict() for s in self.sessions.values()],
+                "em_topic": self.em_topic,
             }
 
             # Write to temporary file first
