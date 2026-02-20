@@ -1,8 +1,9 @@
 # sm wait Spurious Fires at 0s/2s After Dispatch (sm#240)
 
-**Status**: Investigation complete — awaiting review
+**Status**: Investigation complete — spec reviewed, ready for implementation
+**GitHub**: #262 (this fix), #263 (structural skip fence follow-up)
 **Related**: sm#234 (dispatch --clear), specs/153_sm_wait_idle_race.md, sm#244
-**Scope vs GitHub #240**: GitHub issue #240 describes the *inverse* bug — an idle agent shown as RUNNING in `sm children` because the Stop hook never arrived. This spec covers the *opposite* symptom: an actively-running agent whose `sm wait` fires immediately at 0s or 2s due to a skip-fence race introduced by sm#234's auto-clear. These are distinct bugs. This spec should be tracked under a NEW GitHub issue (not #240). The spec file uses the EM's internal tracking number sm#240; update to the real ticket number once filed.
+**Scope vs GitHub #240**: GitHub issue #240 describes the *inverse* bug — an idle agent shown as RUNNING in `sm children` because the Stop hook never arrived. This spec covers the *opposite* symptom: an actively-running agent whose `sm wait` fires immediately at 0s or 2s due to a skip-fence race introduced by sm#234's auto-clear. Tracked under #262.
 
 **Repro context**: Observed after `sm dispatch <child> --role <role>` (default, no `--no-clear`) followed by `sm wait <child> <timeout>`. The child has a recently-completed or in-progress previous task whose Stop hook is in-flight when dispatch runs.
 
