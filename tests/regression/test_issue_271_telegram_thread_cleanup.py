@@ -209,6 +209,53 @@ async def test_close_session_topic_forum_close_error_does_not_raise():
     assert session.telegram_thread_id is None
 
 
+@pytest.mark.asyncio
+async def test_close_session_topic_codex_app_session_isolation():
+    """close_session_topic() on a codex-app session only affects Telegram mappings.
+
+    codex_sessions dict must remain unchanged — no resource leak.
+    Spec requirement: Fix A unit test for codex-app session isolation.
+    """
+    from src.models import Session
+
+    # Create a codex-app session with a Telegram forum topic
+    codex_session = Session(
+        id="codex-app-001",
+        name="codex-app-001",
+        working_dir="/tmp",
+        tmux_session="",
+        log_file="/tmp/codex-app-001.log",
+        provider="codex-app",
+        status=SessionStatus.IDLE,
+        telegram_chat_id=10000,
+        telegram_thread_id=50000,
+    )
+
+    tg = _make_telegram_bot(send_forum_returns=1234)
+    tg._topic_sessions[(10000, 50000)] = codex_session.id
+    tg._session_threads[codex_session.id] = (10000, 50000)
+
+    # A sentinel object representing the CodexAppServerSession in codex_sessions
+    sentinel_codex_app = object()
+
+    mgr = _make_session_manager({codex_session.id: codex_session}, tg)
+    # Simulate codex_sessions dict on the session manager
+    mgr.codex_sessions = {codex_session.id: sentinel_codex_app}
+
+    monitor = _make_output_monitor(mgr)
+
+    await monitor.close_session_topic(codex_session, message="Codex task done")
+
+    # Telegram mappings cleaned up (expected behaviour)
+    assert (10000, 50000) not in tg._topic_sessions
+    assert codex_session.id not in tg._session_threads
+    assert codex_session.telegram_thread_id is None
+
+    # codex_sessions dict untouched — no resource leak
+    assert codex_session.id in mgr.codex_sessions
+    assert mgr.codex_sessions[codex_session.id] is sentinel_codex_app
+
+
 # ============================================================================
 # Fix A — ChildMonitor calls close_session_topic on completion
 # ============================================================================
@@ -457,6 +504,79 @@ def test_em_topic_inheritance_reopen_fails_creates_new_topic():
     # em_topic updated to brand-new topic
     assert mgr.em_topic is not None
     assert mgr.em_topic["thread_id"] == 11111
+
+
+def test_em_topic_inheritance_success_clears_stale_topic_sessions():
+    """After delete succeeds in success path, stale _topic_sessions entry is removed."""
+    new_thread_id = 99999
+    old_thread_id = 42000
+    session = _make_forum_session(session_id="em-stale-success", chat_id=10000, thread_id=new_thread_id)
+    tg = _make_telegram_bot()
+    # Pre-populate the stale entry for the new (about-to-be-deleted) topic
+    tg._topic_sessions[(10000, new_thread_id)] = session.id
+
+    mgr = Mock()
+    mgr.em_topic = {"chat_id": 10000, "thread_id": old_thread_id}
+
+    client = _make_app_for_em_tests(session, mgr, tg)
+
+    resp = client.patch(f"/sessions/{session.id}", json={"is_em": True})
+    assert resp.status_code == 200
+
+    # Stale _topic_sessions entry for the deleted topic must be removed
+    assert (10000, new_thread_id) not in tg._topic_sessions
+    # Session now points to inherited topic
+    assert session.telegram_thread_id == old_thread_id
+
+
+def test_em_topic_inheritance_reopen_fail_clears_stale_topic_sessions():
+    """After delete succeeds in reopen-fail path, stale _topic_sessions entry is removed."""
+    new_thread_id = 88888
+    session = _make_forum_session(session_id="em-stale-reopen-fail", chat_id=10000, thread_id=new_thread_id)
+    tg = _make_telegram_bot()
+    tg.delete_forum_topic = AsyncMock(return_value=True)
+    tg.reopen_forum_topic = AsyncMock(return_value=False)
+    tg.create_forum_topic = AsyncMock(return_value=22222)
+    # Pre-populate stale entry
+    tg._topic_sessions[(10000, new_thread_id)] = session.id
+
+    mgr = Mock()
+    mgr.em_topic = {"chat_id": 10000, "thread_id": 42000}
+
+    client = _make_app_for_em_tests(session, mgr, tg)
+
+    resp = client.patch(f"/sessions/{session.id}", json={"is_em": True})
+    assert resp.status_code == 200
+
+    # Stale _topic_sessions entry for the deleted topic must be removed
+    assert (10000, new_thread_id) not in tg._topic_sessions
+    # em_topic points to brand-new topic (not the deleted one)
+    assert mgr.em_topic["thread_id"] == 22222
+
+
+def test_em_topic_inheritance_create_forum_topic_returns_none_nulls_thread():
+    """reopen fails + create_forum_topic returns None → thread_id=None, deleted ID not persisted."""
+    new_thread_id = 77777
+    session = _make_forum_session(session_id="em-create-none", chat_id=10000, thread_id=new_thread_id)
+    tg = _make_telegram_bot()
+    tg.delete_forum_topic = AsyncMock(return_value=True)
+    tg.reopen_forum_topic = AsyncMock(return_value=False)
+    tg.create_forum_topic = AsyncMock(return_value=None)  # Total failure
+
+    mgr = Mock()
+    mgr.em_topic = {"chat_id": 10000, "thread_id": 42000}
+
+    client = _make_app_for_em_tests(session, mgr, tg)
+
+    resp = client.patch(f"/sessions/{session.id}", json={"is_em": True})
+    assert resp.status_code == 200
+
+    # Invariant: session must not point to the deleted topic
+    assert session.telegram_thread_id is None
+    # em_topic must not be persisted with the deleted topic ID
+    # (em_topic may be unchanged from previous value, but never the deleted new_thread_id)
+    if mgr.em_topic is not None:
+        assert mgr.em_topic.get("thread_id") != new_thread_id
 
 
 def test_em_topic_inheritance_clears_old_em_sessions():

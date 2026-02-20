@@ -338,6 +338,9 @@ async def _handle_em_topic_inheritance(session, session_manager, telegram_bot):
         session_manager._save_state()
         return
 
+    # Remove stale _topic_sessions entry for the deleted topic (applies to all paths below)
+    telegram_bot._topic_sessions.pop((new_chat_id, new_thread_id), None)
+
     # Step 2: Reopen the old EM topic
     reopen_ok = await telegram_bot.reopen_forum_topic(new_chat_id, old_thread_id)
     if not reopen_ok:
@@ -351,7 +354,13 @@ async def _handle_em_topic_inheritance(session, session_manager, telegram_bot):
             session.telegram_thread_id = brand_new_id
             telegram_bot.register_topic_session(new_chat_id, brand_new_id, session.id)
             telegram_bot._session_threads[session.id] = (new_chat_id, brand_new_id)
-        session_manager.em_topic = {"chat_id": new_chat_id, "thread_id": session.telegram_thread_id}
+            session_manager.em_topic = {"chat_id": new_chat_id, "thread_id": brand_new_id}
+        else:
+            logger.warning(
+                f"EM topic inheritance: create_forum_topic returned None after reopen failure. "
+                "Session has no valid Telegram topic."
+            )
+            session.telegram_thread_id = None
         session_manager._save_state()
         return
 
