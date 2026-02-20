@@ -84,13 +84,12 @@ def _make_session_manager(session, telegram_bot):
     return manager
 
 
-def _make_telegram_bot(send_forum_returns=1, send_fallback_returns=2):
+def _make_telegram_bot(send_forum_returns=1):
     """
     Build a mock TelegramBot.
 
     send_forum_returns: value returned by send_with_fallback
       (None = forum send failed / not a forum topic; non-None = forum succeeded)
-    send_fallback_returns: unused (fallback is handled inside send_with_fallback)
     """
     tg = Mock()
     tg.bot = AsyncMock()
@@ -125,7 +124,7 @@ async def test_cleanup_kill_forum_mode(output_monitor_factory, forum_session):
     chat_id = forum_session.telegram_chat_id
     thread_id = forum_session.telegram_thread_id
 
-    tg = _make_telegram_bot(send_forum_returns=9001, send_fallback_returns=9002)
+    tg = _make_telegram_bot(send_forum_returns=9001)
     mgr = _make_session_manager(forum_session, tg)
     monitor = output_monitor_factory(mgr)
 
@@ -158,7 +157,7 @@ async def test_cleanup_kill_reply_thread_mode(output_monitor_factory, reply_sess
     thread_id = reply_session.telegram_thread_id
 
     # Forum send fails (None), fallback send succeeds
-    tg = _make_telegram_bot(send_forum_returns=None, send_fallback_returns=8001)
+    tg = _make_telegram_bot(send_forum_returns=None)
     mgr = _make_session_manager(reply_session, tg)
     monitor = output_monitor_factory(mgr)
 
@@ -189,7 +188,7 @@ async def test_cleanup_kill_post_restart_reply_thread(output_monitor_factory, re
     thread_id = reply_session.telegram_thread_id
 
     # Forum send fails → fallback path taken
-    tg = _make_telegram_bot(send_forum_returns=None, send_fallback_returns=7001)
+    tg = _make_telegram_bot(send_forum_returns=None)
     # Simulate server restart: reply-thread session in _topic_sessions
     tg._topic_sessions[(chat_id, thread_id)] = reply_session.id
     tg._session_threads[reply_session.id] = (chat_id, thread_id)
@@ -232,7 +231,7 @@ async def test_cleanup_notification_failure_still_cleans_mappings(
     thread_id = forum_session.telegram_thread_id
 
     # Both sends fail
-    tg = _make_telegram_bot(send_forum_returns=None, send_fallback_returns=None)
+    tg = _make_telegram_bot(send_forum_returns=None)
     tg._topic_sessions[(chat_id, thread_id)] = forum_session.id
     tg._session_threads[forum_session.id] = (chat_id, thread_id)
 
@@ -282,7 +281,7 @@ def test_clear_sends_notification_forum_mode(forum_session):
     thread_id = forum_session.telegram_thread_id
 
     # Forum send succeeds (non-None)
-    tg = _make_telegram_bot(send_forum_returns=5001, send_fallback_returns=5002)
+    tg = _make_telegram_bot(send_forum_returns=5001)
     client = _make_app_with_session(forum_session, tg)
 
     resp = client.post(f"/sessions/{forum_session.id}/clear", json={})
@@ -302,7 +301,7 @@ def test_clear_sends_notification_reply_thread_mode(reply_session):
     thread_id = reply_session.telegram_thread_id
 
     # Forum send fails, fallback succeeds
-    tg = _make_telegram_bot(send_forum_returns=None, send_fallback_returns=4001)
+    tg = _make_telegram_bot(send_forum_returns=None)
     client = _make_app_with_session(reply_session, tg)
 
     resp = client.post(f"/sessions/{reply_session.id}/clear", json={})
@@ -329,7 +328,7 @@ def test_clear_no_telegram_configured(no_tg_session):
 
 def test_clear_thread_remains_open_after_clear(forum_session):
     """POST /clear does NOT close the forum topic (session continues on new task)."""
-    tg = _make_telegram_bot(send_forum_returns=3001, send_fallback_returns=3002)
+    tg = _make_telegram_bot(send_forum_returns=3001)
     client = _make_app_with_session(forum_session, tg)
 
     resp = client.post(f"/sessions/{forum_session.id}/clear", json={})
