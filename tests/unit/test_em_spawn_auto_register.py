@@ -485,6 +485,15 @@ class TestArmStopNotifyEndpoint:
         )
         assert response.status_code == 403
 
+    def test_arm_stop_notify_unknown_sender_422(self, app_client):
+        """POST /sessions/{id}/notify-on-stop → 422 when sender_session_id doesn't exist."""
+        tc, _ = app_client
+        response = tc.post(
+            "/sessions/child001/notify-on-stop",
+            json={"sender_session_id": "nonexistent_sender", "requester_session_id": "em001"},
+        )
+        assert response.status_code == 422
+
     def test_arm_stop_notify_calls_queue_mgr(self, app_client):
         """POST /sessions/{id}/notify-on-stop calls queue_mgr.arm_stop_notify."""
         tc, mock_sm = app_client
@@ -502,3 +511,4 @@ class TestArmStopNotifyEndpoint:
         call_kwargs = mock_sm.message_queue_manager.arm_stop_notify.call_args
         assert call_kwargs.kwargs["session_id"] == "child001"
         assert call_kwargs.kwargs["sender_session_id"] == "em001"
+        assert call_kwargs.kwargs["sender_name"] == "em"  # friendly_name takes precedence
