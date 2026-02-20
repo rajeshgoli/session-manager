@@ -284,6 +284,8 @@ def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = Fa
                 and session_obj is not None
                 and session_obj.status == SessionStatus.RUNNING
             )
+            # 2 = prev-task Stop hook + /clear Stop hook (both expected when running)
+            # 1 = /clear Stop hook only (agent idle → no in-flight prev-task hook)
             slots = 2 if agent_explicitly_running else 1
             state = queue_mgr._get_or_create_state(session_id)
             state.stop_notify_skip_count += slots
