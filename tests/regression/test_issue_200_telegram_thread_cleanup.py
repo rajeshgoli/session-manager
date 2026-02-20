@@ -241,6 +241,13 @@ async def test_cleanup_notification_failure_still_cleans_mappings(
     # Should not raise
     await monitor.cleanup_session(forum_session)
 
+    # send_with_fallback was still called even though it returned None
+    tg.send_with_fallback.assert_called_once_with(
+        chat_id=chat_id,
+        message=f"Session stopped [{forum_session.id}]",
+        thread_id=thread_id,
+    )
+
     # Mappings cleaned up despite notification failure
     assert (chat_id, thread_id) not in tg._topic_sessions
     assert forum_session.id not in tg._session_threads

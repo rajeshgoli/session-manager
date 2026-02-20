@@ -107,7 +107,11 @@ async def test_monitor_detects_tmux_death(output_monitor, mock_session, mock_ses
     mock_session_manager._save_state.assert_called()
 
     # "Session stopped" notification should have been sent (try-and-fallback, #200)
-    mock_session_manager.notifier.telegram.send_with_fallback.assert_called()
+    mock_session_manager.notifier.telegram.send_with_fallback.assert_called_once_with(
+        chat_id=12345,
+        message=f"Session stopped [{mock_session.id}]",
+        thread_id=67890,
+    )
 
     # Monitoring should have stopped
     assert mock_session.id not in output_monitor._tasks
@@ -143,7 +147,11 @@ async def test_cleanup_session_full_workflow(output_monitor, mock_session, mock_
     assert (12345, 67890) not in mock_session_manager.notifier.telegram._topic_sessions
     assert mock_session.id not in mock_session_manager.notifier.telegram._session_threads
     # "Session stopped" sent via try-and-fallback (#200); delete_forum_topic no longer used
-    mock_session_manager.notifier.telegram.send_with_fallback.assert_called()
+    mock_session_manager.notifier.telegram.send_with_fallback.assert_called_once_with(
+        chat_id=12345,
+        message=f"Session stopped [{mock_session.id}]",
+        thread_id=67890,
+    )
 
     # Hook output cache cleanup
     assert mock_session.id not in mock_session_manager.app.state.last_claude_output
