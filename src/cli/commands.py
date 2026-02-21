@@ -211,6 +211,46 @@ def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str
         return 1
 
 
+def cmd_role(client: SessionManagerClient, session_id: Optional[str], role: Optional[str], clear: bool = False) -> int:
+    """
+    Set or clear role tag for the current session.
+
+    Exit codes:
+        0: Success
+        1: Validation/API error
+        2: Session manager unavailable or unmanaged session
+    """
+    if not session_id:
+        print("Error: sm role requires a managed session (CLAUDE_SESSION_MANAGER_ID not set)", file=sys.stderr)
+        return 2
+
+    if clear:
+        success, unavailable = client.clear_role(session_id)
+        if success:
+            print("Role cleared")
+            return 0
+        if unavailable:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        print("Error: Failed to clear role", file=sys.stderr)
+        return 1
+
+    normalized_role = (role or "").strip()
+    if not normalized_role:
+        print("Error: role is required (or use --clear)", file=sys.stderr)
+        return 1
+
+    success, unavailable = client.set_role(session_id, normalized_role)
+    if success:
+        print(f"Role set: {normalized_role}")
+        return 0
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    print("Error: Failed to set role", file=sys.stderr)
+    return 1
+
+
 def cmd_me(client: SessionManagerClient, session_id: str) -> int:
     """
     Show current session info.
@@ -819,22 +859,48 @@ def cmd_dispatch(
         print(expanded)
         return 0
 
+    # Resolve target once so clear/send/role-update all operate on same session.
+    target_session_id, _ = resolve_session_id(client, agent_id)
+    if target_session_id is None:
+        sessions = client.list_sessions()
+        if sessions is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        print(f"Error: Session '{agent_id}' not found", file=sys.stderr)
+        return 1
+
     # Clear target before dispatch unless opted out (#234).
     if not no_clear:
-        rc = cmd_clear(client, em_id, agent_id)
+        rc = cmd_clear(client, em_id, target_session_id)
         if rc != 0:
             return rc
 
     # Auto-arm periodic remind and parent wake on every dispatch (#225-A, #225-C).
     soft_threshold, hard_threshold = get_auto_remind_config(os.getcwd())
 
-    return cmd_send(
-        client, agent_id, expanded, delivery_mode,
+    send_rc = cmd_send(
+        client, target_session_id, expanded, delivery_mode,
         notify_on_stop=notify_on_stop,
         remind_soft_threshold=soft_threshold,
         remind_hard_threshold=hard_threshold,
         parent_session_id=em_id,
     )
+    if send_rc != 0:
+        return send_rc
+
+    role_result = client.set_role(target_session_id, role)
+    if isinstance(role_result, tuple):
+        success, unavailable = role_result
+    else:
+        success = bool(role_result)
+        unavailable = False
+    if not success:
+        if unavailable:
+            print("Warning: Dispatch sent, but failed to set role (session manager unavailable).", file=sys.stderr)
+        else:
+            print("Warning: Dispatch sent, but failed to set role tag.", file=sys.stderr)
+
+    return 0
 
 
 def cmd_agent_status(client: SessionManagerClient, session_id: str, text: str) -> int:

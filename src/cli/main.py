@@ -66,6 +66,11 @@ def main():
     name_parser.add_argument("name_or_session", help="Name for self, or session identifier to rename a child")
     name_parser.add_argument("new_name", nargs="?", help="New name when renaming a child session")
 
+    # sm role <role> OR sm role --clear
+    role_parser = subparsers.add_parser("role", help="Set or clear role tag for current session")
+    role_parser.add_argument("role", nargs="?", default=None, help="Role tag (e.g., engineer)")
+    role_parser.add_argument("--clear", action="store_true", help="Clear current role tag")
+
     # sm me
     subparsers.add_parser("me", help="Show current session info")
 
@@ -429,6 +434,8 @@ def main():
     # Dispatch to command handler
     if args.command == "name":
         sys.exit(commands.cmd_name(client, session_id, args.name_or_session, args.new_name))
+    elif args.command == "role":
+        sys.exit(commands.cmd_role(client, session_id, args.role, clear=args.clear))
     elif args.command == "me":
         sys.exit(commands.cmd_me(client, session_id))
     elif args.command == "who":

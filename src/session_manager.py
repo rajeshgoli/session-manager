@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import subprocess
 import uuid
 from datetime import datetime
@@ -19,6 +20,16 @@ from .codex_request_ledger import CodexRequestLedger
 from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_pr_repo_from_git
 
 logger = logging.getLogger(__name__)
+
+ROLE_KEYWORDS = (
+    "engineer",
+    "architect",
+    "scout",
+    "reviewer",
+    "product",
+    "director",
+    "ux",
+)
 
 
 def _coerce_rollout_flag(value: Any, default: bool = True) -> bool:
@@ -646,12 +657,41 @@ class SessionManager:
                 return session
         return None
 
+    def set_role(self, session_id: str, role: str) -> bool:
+        """Set the role tag for a session."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+        session.role = role
+        self._save_state()
+        return True
+
+    def clear_role(self, session_id: str) -> bool:
+        """Clear the role tag for a session."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+        session.role = None
+        self._save_state()
+        return True
+
     def list_sessions(self, include_stopped: bool = False) -> list[Session]:
         """List all sessions."""
         sessions = list(self.sessions.values())
         if not include_stopped:
             sessions = [s for s in sessions if s.status != SessionStatus.STOPPED]
         return sessions
+
+    @staticmethod
+    def detect_role_from_prompt(text: str) -> Optional[str]:
+        """Best-effort role detection from initial prompt text."""
+        if not text:
+            return None
+        snippet = text[:200].lower()
+        for keyword in ROLE_KEYWORDS:
+            if re.search(rf"\bas\s+{re.escape(keyword)}\b", snippet):
+                return keyword
+        return None
 
     def update_session_status(self, session_id: str, status: SessionStatus, error_message: Optional[str] = None):
         """Update a session's status."""
@@ -711,6 +751,12 @@ class SessionManager:
         if not session:
             logger.error(f"Session not found: {session_id}")
             return DeliveryResult.FAILED
+
+        if session.role is None:
+            detected_role = self.detect_role_from_prompt(text)
+            if detected_role:
+                session.role = detected_role
+                self._save_state()
 
         # For permission responses, bypass queue and send directly
         if bypass_queue:

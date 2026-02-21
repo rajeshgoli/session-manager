@@ -751,12 +751,15 @@ class TestUpdateSession:
         assert response.status_code == 200
         data = response.json()
         assert data["is_em"] is True
+        assert data["role"] == "em"
         assert sample_session.is_em is True
+        assert sample_session.role == "em"
         mock_session_manager._save_state.assert_called()
 
     def test_patch_is_em_false_clears_flag(self, test_client, mock_session_manager, sample_session):
         """PATCH /sessions/{id} with is_em=false clears flag if previously set (#256)."""
         sample_session.is_em = True
+        sample_session.role = "em"
         mock_session_manager.get_session.return_value = sample_session
         mock_session_manager._save_state = MagicMock()
 
@@ -768,6 +771,7 @@ class TestUpdateSession:
         data = response.json()
         assert data["is_em"] is False
         assert sample_session.is_em is False
+        assert sample_session.role is None
 
     def test_patch_mixed_friendly_name_and_is_em(self, test_client, mock_session_manager, sample_session):
         """PATCH /sessions/{id} with both friendly_name and is_em updates both fields (#256)."""
@@ -787,6 +791,7 @@ class TestUpdateSession:
     def test_get_session_includes_is_em(self, test_client, mock_session_manager, sample_session):
         """GET /sessions/{id} response includes is_em field (#256)."""
         sample_session.is_em = True
+        sample_session.role = "architect"
         mock_session_manager.get_session.return_value = sample_session
 
         response = test_client.get("/sessions/test123")
@@ -794,6 +799,46 @@ class TestUpdateSession:
         data = response.json()
         assert "is_em" in data
         assert data["is_em"] is True
+        assert data["role"] == "architect"
+
+    def test_put_role_sets_role(self, test_client, mock_session_manager, sample_session):
+        """PUT /sessions/{id}/role sets free-form role tag."""
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.set_role = None  # fallback path mutates session directly
+        mock_session_manager._save_state = MagicMock()
+
+        response = test_client.put("/sessions/test123/role", json={"role": "engineer"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["role"] == "engineer"
+        assert sample_session.role == "engineer"
+
+    def test_put_role_rejects_em(self, test_client, mock_session_manager, sample_session):
+        """PUT /sessions/{id}/role rejects em role (must go through sm em path)."""
+        mock_session_manager.get_session.return_value = sample_session
+        response = test_client.put("/sessions/test123/role", json={"role": "em"})
+        assert response.status_code == 400
+
+    def test_put_role_rejects_when_session_is_em(self, test_client, mock_session_manager, sample_session):
+        """PUT /sessions/{id}/role cannot override role while is_em=true."""
+        sample_session.is_em = True
+        sample_session.role = "em"
+        mock_session_manager.get_session.return_value = sample_session
+        response = test_client.put("/sessions/test123/role", json={"role": "engineer"})
+        assert response.status_code == 400
+
+    def test_delete_role_clears_role(self, test_client, mock_session_manager, sample_session):
+        """DELETE /sessions/{id}/role clears role tag."""
+        sample_session.role = "engineer"
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.clear_role = None  # fallback path mutates session directly
+        mock_session_manager._save_state = MagicMock()
+
+        response = test_client.delete("/sessions/test123/role")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["role"] is None
+        assert sample_session.role is None
 
     def test_update_task(self, test_client, mock_session_manager, sample_session):
         """PUT /sessions/{id}/task updates current task."""

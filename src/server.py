@@ -93,6 +93,7 @@ class SessionResponse(BaseModel):
     agent_status_text: Optional[str] = None  # Self-reported agent status text (#188)
     agent_status_at: Optional[str] = None  # When agent_status_text was last set (#188)
     is_em: bool = False  # EM role flag (#256)
+    role: Optional[str] = None  # Role tag (#287)
     activity_state: str = "idle"  # Computed operational state (working/thinking/idle/etc)
 
 
@@ -126,6 +127,11 @@ class PeriodicRemindRequest(BaseModel):
 class AgentStatusRequest(BaseModel):
     """Request from an agent to self-report its current status (#188). text=None clears status (#283)."""
     text: Optional[str] = None
+
+
+class SetRoleRequest(BaseModel):
+    """Request to set a session role tag."""
+    role: str
 
 
 class ClearSessionRequest(BaseModel):
@@ -515,6 +521,7 @@ def create_app(
             agent_status_text=session.agent_status_text,
             agent_status_at=session.agent_status_at.isoformat() if session.agent_status_at else None,
             is_em=session.is_em,
+            role=getattr(session, "role", None),
             activity_state=_get_activity_state(session),
         )
 
@@ -1199,10 +1206,13 @@ def create_app(
             session.is_em = is_em
 
             if is_em:
+                session.role = "em"
                 # Clear is_em from any other session (only one EM at a time)
                 for sid, s in app.state.session_manager.sessions.items():
                     if sid != session_id and s.is_em:
                         s.is_em = False
+                        if getattr(s, "role", None) == "em":
+                            s.role = None
 
                 # Handle EM topic inheritance (Fix B: sm#271)
                 notifier = getattr(app.state, 'notifier', None)
@@ -1211,6 +1221,8 @@ def create_app(
                     await _handle_em_topic_inheritance(
                         session, app.state.session_manager, telegram_bot
                     )
+            elif getattr(session, "role", None) == "em":
+                session.role = None
 
         if friendly_name is not None or is_em is not None:
             app.state.session_manager._save_state()
@@ -1224,6 +1236,55 @@ def create_app(
                 success = await app.state.notifier.rename_session_topic(session, friendly_name)
                 if not success:
                     logger.warning(f"Failed to rename Telegram topic for session {session_id}")
+
+        return _session_to_response(session)
+
+    @app.put("/sessions/{session_id}/role", response_model=SessionResponse)
+    async def set_session_role(session_id: str, request: SetRoleRequest):
+        """Set a session role tag."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        role = (request.role or "").strip()
+        if not role:
+            raise HTTPException(status_code=400, detail="role cannot be empty")
+        if role.lower() == "em":
+            raise HTTPException(status_code=400, detail='role "em" must be set via sm em')
+        if session.is_em:
+            raise HTTPException(
+                status_code=400,
+                detail="cannot override role for active EM session; use PATCH /sessions/{id} with is_em=false first",
+            )
+
+        setter = getattr(app.state.session_manager, "set_role", None)
+        if callable(setter):
+            setter(session_id, role)
+        else:
+            session.role = role
+            app.state.session_manager._save_state()
+
+        return _session_to_response(session)
+
+    @app.delete("/sessions/{session_id}/role", response_model=SessionResponse)
+    async def clear_session_role(session_id: str):
+        """Clear a session role tag."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        clearer = getattr(app.state.session_manager, "clear_role", None)
+        if callable(clearer):
+            clearer(session_id)
+        else:
+            session.role = None
+            app.state.session_manager._save_state()
 
         return _session_to_response(session)
 
