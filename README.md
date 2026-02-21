@@ -164,6 +164,10 @@ Every managed session gets the `sm` command. This is how agents coordinate.
 | `sm kill <id>` | Terminate an agent |
 | `sm output <id>` | See agent's recent output |
 
+Model override semantics for `sm spawn --model`:
+- `provider=claude`: validates `opus|sonnet|haiku`
+- `provider=codex` or `provider=codex-app`: accepts provider model IDs (for example `codex-5.1`)
+
 ### Coordination Commands
 
 | Command | Purpose |

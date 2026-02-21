@@ -169,7 +169,13 @@ def main():
     spawn_parser.add_argument("prompt", help="Initial prompt for the child agent")
     spawn_parser.add_argument("--name", help="Friendly name for the child session")
     spawn_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Monitor child and notify when complete or idle for N seconds")
-    spawn_parser.add_argument("--model", choices=["opus", "sonnet", "haiku"], help="Override default model")
+    spawn_parser.add_argument(
+        "--model",
+        help=(
+            "Override model (provider-aware: claude accepts opus|sonnet|haiku; "
+            "codex/codex-app accept provider model IDs, e.g. codex-5.1)"
+        ),
+    )
     spawn_parser.add_argument("--working-dir", help="Override working directory (defaults to parent's directory)")
     spawn_parser.add_argument("--json", action="store_true", help="Output JSON")
 

@@ -222,6 +222,74 @@ class TestEmSpawnAutoRegister:
         assert "Warning" in err
         assert "stop notification" in err
 
+
+class TestSpawnProviderAwareModel:
+    """Provider-aware model handling for sm spawn (#290)."""
+
+    @pytest.fixture(autouse=True)
+    def patch_remind_config(self):
+        with patch(
+            "src.cli.dispatch.get_auto_remind_config",
+            return_value=(DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD),
+        ):
+            yield
+
+    def test_claude_invalid_model_rejected(self, capsys):
+        client = _make_client(parent_session=_make_non_em_session())
+
+        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X", model="codex-5.1\x1b[31m")
+
+        assert rc == 1
+        err = capsys.readouterr().err.lower()
+        assert "invalid claude model" in err
+        assert "\x1b" not in err
+        client.spawn_child.assert_not_called()
+
+    def test_codex_model_forwarded(self):
+        spawn_result = dict(_SPAWN_RESULT_CLAUDE)
+        spawn_result["provider"] = "codex"
+        spawn_result["name"] = "codex-child001"
+        spawn_result["tmux_session"] = "codex-child001"
+        client = _make_client(parent_session=_make_non_em_session(), spawn_result=spawn_result)
+
+        rc = cmd_spawn(client, "eng111bb", "codex", "Implement feature X", model="codex-5.1")
+
+        assert rc == 0
+        client.spawn_child.assert_called_once_with(
+            parent_session_id="eng111bb",
+            prompt="Implement feature X",
+            name=None,
+            wait=None,
+            model="codex-5.1",
+            working_dir=None,
+            provider="codex",
+        )
+
+    def test_codex_app_model_forwarded(self):
+        client = _make_client(parent_session=_make_non_em_session(), spawn_result=_SPAWN_RESULT_CODEX_APP)
+
+        rc = cmd_spawn(client, "eng111bb", "codex-app", "Implement feature X", model="codex-5.1")
+
+        assert rc == 0
+        client.spawn_child.assert_called_once_with(
+            parent_session_id="eng111bb",
+            prompt="Implement feature X",
+            name=None,
+            wait=None,
+            model="codex-5.1",
+            working_dir=None,
+            provider="codex-app",
+        )
+
+    def test_codex_model_rejects_shell_metacharacters(self, capsys):
+        client = _make_client(parent_session=_make_non_em_session())
+
+        rc = cmd_spawn(client, "eng111bb", "codex", "Implement feature X", model="codex-5.1;touch_/tmp/pwned")
+
+        assert rc == 1
+        assert "invalid codex model" in capsys.readouterr().err.lower()
+        client.spawn_child.assert_not_called()
+
     def test_codex_app_em_parent_also_registers(self):
         """EM registration also fires for codex-app spawned children."""
         client = _make_client(

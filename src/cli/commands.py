@@ -1126,6 +1126,19 @@ def cmd_spawn(
         2: Session manager unavailable
     """
     import json as json_lib
+    safe_model_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+    if provider == "claude" and model is not None and model not in {"opus", "sonnet", "haiku"}:
+        print(
+            "Error: Invalid Claude model. Choose one of: opus, sonnet, haiku",
+            file=sys.stderr,
+        )
+        return 1
+    if provider in {"codex", "codex-app"} and model is not None and not safe_model_pattern.match(model):
+        print(
+            "Error: Invalid Codex model. Allowed characters: letters, numbers, ., _, :, /, -",
+            file=sys.stderr,
+        )
+        return 1
 
     # Spawn child session
     result = client.spawn_child(
