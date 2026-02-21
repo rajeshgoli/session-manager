@@ -82,9 +82,9 @@ class CodexRequestLedger:
                     resolution_source = 'policy',
                     error_code = 'server_restarted',
                     error_message = 'server restarted before request resolution'
-                WHERE status IN ('pending', 'expired')
+                WHERE status IN ('pending', 'expired') AND process_generation != ?
                 """,
-                (now,),
+                (now, self.process_generation),
             )
             conn.commit()
 

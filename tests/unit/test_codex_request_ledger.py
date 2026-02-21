@@ -82,6 +82,33 @@ async def test_startup_orphans_unresolved_pending_rows(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_startup_does_not_orphan_same_generation_rows(tmp_path):
+    db_path = tmp_path / "codex_requests.db"
+    first = CodexRequestLedger(db_path=str(db_path), process_generation="gen-same")
+
+    pending = await first.register_request(
+        session_id="sess-same",
+        rpc_request_id=11,
+        request_method="item/commandExecution/requestApproval",
+        request_payload={"turnId": "turn-same"},
+        thread_id="thread-same",
+        turn_id="turn-same",
+        item_id="item-same",
+        request_type="request_approval",
+        timeout_seconds=600,
+        policy_payload={"decision": "decline"},
+    )
+
+    second = CodexRequestLedger(db_path=str(db_path), process_generation="gen-same")
+    rows = second.list_requests("sess-same", include_orphaned=True)
+    assert len(rows) == 1
+    assert rows[0]["request_id"] == pending["request_id"]
+    assert rows[0]["status"] == "pending"
+
+    first.orphan_pending_for_session("sess-same")
+
+
+@pytest.mark.asyncio
 async def test_expired_then_policy_resolved_lifecycle(tmp_path):
     ledger = CodexRequestLedger(db_path=str(tmp_path / "codex_requests.db"), process_generation="gen-exp")
 
