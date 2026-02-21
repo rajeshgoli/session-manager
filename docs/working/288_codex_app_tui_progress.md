@@ -249,7 +249,7 @@ Scope boundary:
 
 This is first-class for session operations, not full desktop UI parity.
 
-- `Approval and request-input UX are supported but less structured.`
+- `Approval and request-input UX are supported but less ergonomic than desktop.`
 - Desktop can present richer approval/input interactions with stronger visual context. TUI supports full response semantics, but without desktop-level widgets.
 - EM impact: you can still keep delegation moving from terminal, but high-risk approvals are easier to review in desktop.
 - `User-input requests are less guided.`
@@ -287,7 +287,7 @@ This should be delivered as an epic with sequenced tickets.
 - Add read adapter for `sm children`, `sm tail`, and parent wake summaries.
 - Ensure Codex sessions report recent actionable tool activity with command/file-change distinction.
 5. `#288-E` Input-capable `sm codex-tui`
-- Add attachable tmux TUI with state panel, event feed, and in-pane composer.
+- Add attachable terminal TUI (runs in current terminal/tmux pane) with state panel, event feed, and in-pane composer.
 - Add pending-request queue and structured response actions for approval/user-input requests.
 - Route chat input through existing input endpoint and structured replies through codex-request response endpoint.
 6. `#288-F` Docs, rollout guardrails, and operational defaults
@@ -302,6 +302,194 @@ Dependency order:
 - `#288-E` after control + data planes are stable.
 - `#288-F` final hardening and rollout guidance.
 
+## Implementation breakdown (concrete per-ticket scope)
+
+This section is the engineering breakdown needed to execute the epic without design drift.
+
+### `#288-A` Activity state + durable lifecycle event stream
+
+Primary code touch points:
+
+- `src/codex_app_server.py`
+- `src/session_manager.py`
+- `src/server.py`
+- `src/models.py`
+- new module: `src/codex_event_store.py`
+
+Implementation tasks:
+
+- Add a normalized lifecycle callback path from `CodexAppServerSession` into `SessionManager` (turn start/delta/complete + explicit wait states).
+- Add `CodexEventStore` with:
+- persistent SQLite table for per-session sequence events
+- in-memory ring buffer for low-latency reads
+- transactional `seq` assignment (`session_id`, `seq` unique)
+- Add `GET /sessions/{id}/codex-events?since_seq=<n>&limit=<n>` in `server.py` with `history_gap` and `gap_reason`.
+- Add computed `activity_state` to `SessionResponse` and `/sessions` list response for `provider=codex-app`.
+- Ensure degraded persistence behavior emits `persisted=false` ring events plus explicit telemetry/marker events.
+
+Test slice:
+
+- Unit tests for sequence assignment, cursor paging, and `history_gap` rules.
+- Unit tests for `activity_state` transitions (`thinking`, `working`, `waiting_input`, `idle`, `stopped`).
+- Integration test for restart catch-up from persisted events.
+
+Definition of done:
+
+- Restart does not lose timeline continuity for retained window.
+- `activity_state` for `codex-app` is event-driven, not tmux-driven.
+
+### `#288-B` Structured request ledger + response APIs
+
+Primary code touch points:
+
+- `src/codex_app_server.py`
+- `src/session_manager.py`
+- `src/server.py`
+- `src/cli/client.py`
+- new module: `src/codex_request_ledger.py`
+
+Implementation tasks:
+
+- Remove direct auto-response logic in `CodexAppServerSession._handle_server_request` for:
+- `item/commandExecution/requestApproval`
+- `item/fileChange/requestApproval`
+- `item/tool/requestUserInput`
+- Persist incoming structured requests to `codex_pending_requests` before exposure.
+- Add resolver APIs:
+- `GET /sessions/{id}/codex-pending-requests`
+- `POST /sessions/{id}/codex-requests/{request_id}/respond`
+- Enforce idempotent resolve on `request_id` and replay stored resolution for duplicates.
+- Add restart reconciliation (`pending -> orphaned` with explicit error code when process generation is gone).
+- Gate `POST /sessions/{id}/input` with `409` and `error_code=pending_structured_request` while unresolved rows exist.
+
+Test slice:
+
+- Unit tests for ledger state machine (`pending/resolved/expired/orphaned`).
+- Integration tests for response idempotency and `input` gate behavior.
+- Regression test that legacy auto-approval/auto-input no longer occurs for `provider=codex-app`.
+
+Definition of done:
+
+- Structured requests can be listed and resolved via API only.
+- Normal chat input is explicitly blocked until structured backlog is cleared.
+
+### `#288-C` Codex observability DB + ingestion
+
+Primary code touch points:
+
+- `src/main.py`
+- `src/session_manager.py`
+- new module: `src/codex_observability_logger.py`
+- new module (if separated): `src/codex_observability_pruner.py`
+
+Implementation tasks:
+
+- Add `codex_observability.db` (SQLite WAL) and logger lifecycle wiring in `main.py`.
+- Ingest normalized app-server lifecycle into:
+- `codex_tool_events`
+- `codex_turn_events`
+- Add payload bounding for `raw_payload_json`.
+- Implement mandatory retention policy (age + per-session row caps) on startup and hourly prune loop.
+- Emit metrics/logging for insert/prune failures and prune duration.
+
+Test slice:
+
+- Unit tests for event mapping (request, decision, delta, completed/failed/interrupted/cancelled/timeout).
+- Unit tests for payload truncation and retention pruning.
+- Integration test proving prune jobs do not block normal ingestion.
+
+Definition of done:
+
+- Observability DB growth is bounded by policy.
+- Tool/turn outcomes are queryable with status fidelity.
+
+### `#288-D` Compatibility projection into EM surfaces
+
+Primary code touch points:
+
+- `src/server.py`
+- `src/cli/client.py`
+- `src/cli/commands.py`
+- new module: `src/codex_projection.py`
+
+Implementation tasks:
+
+- Add a read adapter that projects Codex observability rows to provider-neutral activity summaries (`action_kind`, `summary_text`, `status`, timestamps, identifiers).
+- Wire `sm children` and `sm tail` codex-app paths to consume projection data instead of tmux/raw fallback.
+- Keep existing Claude `tool_usage.db` path unchanged.
+- Ensure parent-wake/summary messages can consume the same adapter output.
+
+Test slice:
+
+- Unit tests for projection mapping and sort ordering.
+- Unit tests for CLI output paths (`sm children`, `sm tail`) on `provider=codex-app`.
+- Regression tests that Claude behavior remains unchanged.
+
+Definition of done:
+
+- `sm children` and `sm tail` show meaningful recent Codex actions without tmux heuristics.
+
+### `#288-E` Input-capable `sm codex-tui`
+
+Primary code touch points:
+
+- `src/cli/main.py`
+- `src/cli/client.py`
+- new module: `src/cli/codex_tui.py`
+
+Implementation tasks:
+
+- Add `sm codex-tui <session_id>` CLI command.
+- Build terminal TUI with three panes:
+- state + turn summary
+- event timeline (polling `codex-events`)
+- pending structured requests queue
+- Add composer modes: `chat`, `approval`, `input`.
+- Route sends:
+- chat -> `POST /sessions/{id}/input`
+- structured responses -> `POST /sessions/{id}/codex-requests/{request_id}/respond`
+- Handle `409 pending_structured_request` by disabling chat send and surfacing mode switch hint.
+- Support polling resume from `since_seq` for efficient refresh.
+
+Test slice:
+
+- Unit tests for mode-switch/send routing logic.
+- Client API tests for pending-request and respond endpoints.
+- Manual smoke test matrix (normal turn, approval flow, user-input flow, restart with catch-up).
+
+Definition of done:
+
+- Operator can manage progress + interventions from one terminal pane without fallback to raw API calls.
+
+### `#288-F` Docs, rollout guardrails, and defaults
+
+Primary code/doc touch points:
+
+- `README.md`
+- `CLAUDE.md`
+- `docs/working/288_codex_app_tui_progress.md` (this doc)
+- config loading in `src/main.py` / `src/session_manager.py` for new feature flags and DB paths
+
+Implementation tasks:
+
+- Document new endpoints, error codes, retention defaults, and restart behavior.
+- Add operator config keys with defaults (DB paths, retention window/caps, prune interval).
+- Add rollout flags for safe enablement:
+- enable durable events + activity state
+- enable structured request ledger and `/input` gating
+- enable codex observability ingestion/projection
+- add `sm codex-tui`
+- Add rollback/runbook notes for persistence error windows and orphaned request handling.
+
+Test slice:
+
+- Docs sanity check with curl/CLI examples.
+- Config parsing tests for new keys/defaults.
+
+Definition of done:
+
+- New behavior is operable with explicit defaults and recovery guidance.
+
 ## Implementation shape (epic summary)
 
 - Add computed `activity_state` on session responses for Codex.
@@ -309,7 +497,7 @@ Dependency order:
 - Add durable structured-request ledger with idempotent response API and restart orphan reconciliation.
 - Add Codex observability logger and `codex_observability.db` with command/file-change lifecycle capture.
 - Add projection adapter so `sm children` and `sm tail` work for Codex sessions with no user workflow break.
-- Add `sm codex-tui <session_id>` attach flow in tmux with:
+- Add `sm codex-tui <session_id>` attach flow in terminal (typically a tmux pane) with:
 - live state panel
 - event/delta pane
 - direct composer mode for chat turns (Enter sends via existing input API)
