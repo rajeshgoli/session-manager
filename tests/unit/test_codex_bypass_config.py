@@ -95,3 +95,20 @@ class TestCodexBypassConfig:
             assert sm.is_codex_rollout_enabled("enable_structured_requests") is False
             assert sm.is_codex_rollout_enabled("enable_observability_projection") is True
             assert sm.is_codex_rollout_enabled("enable_codex_tui") is False
+
+    def test_codex_rollout_string_bool_parsing(self):
+        """String booleans in config are parsed as expected (no truthy-string bug)."""
+        config = {
+            "codex_rollout": {
+                "enable_durable_events": "false",
+                "enable_structured_requests": "0",
+                "enable_observability_projection": "true",
+                "enable_codex_tui": "on",
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sm = SessionManager(log_dir=tmpdir, state_file=f"{tmpdir}/state.json", config=config)
+            assert sm.is_codex_rollout_enabled("enable_durable_events") is False
+            assert sm.is_codex_rollout_enabled("enable_structured_requests") is False
+            assert sm.is_codex_rollout_enabled("enable_observability_projection") is True
+            assert sm.is_codex_rollout_enabled("enable_codex_tui") is True

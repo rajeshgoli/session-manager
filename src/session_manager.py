@@ -21,6 +21,23 @@ from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_p
 logger = logging.getLogger(__name__)
 
 
+def _coerce_rollout_flag(value: Any, default: bool = True) -> bool:
+    """Parse rollout config values robustly (supports bools and common string forms)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return default
+
+
 class SessionManager:
     """Manages the lifecycle of Claude Code sessions."""
 
@@ -59,10 +76,18 @@ class SessionManager:
         codex_app_config = self.config.get("codex_app_server", codex_config)
         codex_rollout = self.config.get("codex_rollout", {})
         self.codex_rollout_flags = {
-            "enable_durable_events": bool(codex_rollout.get("enable_durable_events", True)),
-            "enable_structured_requests": bool(codex_rollout.get("enable_structured_requests", True)),
-            "enable_observability_projection": bool(codex_rollout.get("enable_observability_projection", True)),
-            "enable_codex_tui": bool(codex_rollout.get("enable_codex_tui", True)),
+            "enable_durable_events": _coerce_rollout_flag(
+                codex_rollout.get("enable_durable_events"), default=True
+            ),
+            "enable_structured_requests": _coerce_rollout_flag(
+                codex_rollout.get("enable_structured_requests"), default=True
+            ),
+            "enable_observability_projection": _coerce_rollout_flag(
+                codex_rollout.get("enable_observability_projection"), default=True
+            ),
+            "enable_codex_tui": _coerce_rollout_flag(
+                codex_rollout.get("enable_codex_tui"), default=True
+            ),
         }
 
         self.codex_cli_command = codex_config.get("command", "codex")
