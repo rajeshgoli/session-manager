@@ -90,6 +90,8 @@ class TestSessionEndpoints:
         """GET /sessions returns session list."""
         mock_session_manager.list_sessions.return_value = [sample_session]
         mock_session_manager.get_activity_state.return_value = "working"
+        sample_session.agent_status_text = "running tests"
+        sample_session.agent_status_at = datetime(2024, 1, 15, 11, 5, 0)
 
         response = test_client.get("/sessions")
         assert response.status_code == 200
@@ -100,6 +102,8 @@ class TestSessionEndpoints:
         assert data["sessions"][0]["id"] == "test123"
         assert data["sessions"][0]["friendly_name"] == "Test Session"
         assert data["sessions"][0]["activity_state"] == "working"
+        assert data["sessions"][0]["agent_status_text"] == "running tests"
+        assert data["sessions"][0]["agent_status_at"] == "2024-01-15T11:05:00"
 
     def test_list_sessions_empty(self, test_client, mock_session_manager):
         """GET /sessions returns empty list when no sessions."""
@@ -115,6 +119,8 @@ class TestSessionEndpoints:
         """GET /sessions/{id} returns session details."""
         mock_session_manager.get_session.return_value = sample_session
         mock_session_manager.get_activity_state.return_value = "thinking"
+        sample_session.agent_status_text = "reviewing logs"
+        sample_session.agent_status_at = datetime(2024, 1, 15, 11, 7, 0)
 
         response = test_client.get("/sessions/test123")
         assert response.status_code == 200
@@ -125,6 +131,8 @@ class TestSessionEndpoints:
         assert data["status"] == "running"
         assert data["friendly_name"] == "Test Session"
         assert data["activity_state"] == "thinking"
+        assert data["agent_status_text"] == "reviewing logs"
+        assert data["agent_status_at"] == "2024-01-15T11:07:00"
 
     def test_get_session_not_found(self, test_client, mock_session_manager):
         """GET /sessions/{id} returns 404 for unknown session."""
