@@ -1,17 +1,19 @@
-# sm#288 — Codex as a first-class session citizen (user narrative)
+# sm#288 — Codex app-server as a first-class session citizen (user narrative)
 
 ## The user experience we are building
 
+Scope note: in this doc, "Codex sessions" means `provider=codex-app` unless explicitly stated otherwise.
+
 You are running multiple sessions and delegating work. You should not have to guess whether Codex is busy, blocked, waiting, or done. You should not have to choose between native Codex usability and session-manager observability.
 
-With this change, Codex sessions behave like real managed workers:
+With this change, Codex app-server sessions behave like real managed workers:
 
 - attachable in terminal
 - observable in real time
 - input-capable from the same pane
 - measurable for progress and idle state
 
-This makes Codex usable in the same operational model as Claude sessions, instead of a side path with weaker controls.
+This makes `provider=codex-app` usable in the same operational model as Claude sessions, instead of a side path with weaker controls.
 
 ## What you get as a user
 
@@ -60,9 +62,27 @@ This preserves the non-blocking EM model while restoring confidence in child pro
 - Cleaner handoffs because current state is explicit
 - Less context waste from manual polling and guesswork
 
+## Evidence baseline from current implementation
+
+- `src/codex_app_server.py` currently auto-responds to `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/tool/requestUserInput` immediately, including an explicit "avoid blocking" path for user input.
+- `src/session_manager.py` treats `provider=codex-app` through a dedicated JSON-RPC path; tmux-based `provider=codex` uses a different delivery/control surface.
+- `src/tool_logger.py` currently has no retention/prune job for its SQLite event table, which is evidence that retention policy must be explicit in the new Codex observability DB design.
+
 ## Interactive control model (required, in scope)
 
 Approval and request-user-input response are in scope for this epic. The control plane is intentionally split into two explicit channels:
+
+Required migration from legacy behavior:
+
+- `provider=codex-app` currently auto-responds to structured server requests inside `CodexAppServerSession._handle_server_request`.
+- This epic requires removing that direct auto-response behavior for:
+- `item/commandExecution/requestApproval`
+- `item/fileChange/requestApproval`
+- `item/tool/requestUserInput`
+- New behavior: server requests are first persisted into `codex_pending_requests`, then resolved only through:
+- `POST /sessions/{id}/codex-requests/{request_id}/respond` (user/API path), or
+- explicit policy resolution (timeout/restart path) recorded in the same ledger.
+- This cutover is mandatory before enabling TUI/API structured-response UX.
 
 - Turn input channel (existing semantics):
 - `POST /sessions/{id}/input`
@@ -93,6 +113,7 @@ Durability/restart requirements:
 - `request_id` (unique), `session_id`, `thread_id`, `turn_id`, `item_id`, `request_type`
 - `requested_at`, `expires_at` (optional), `status` (`pending|resolved|expired|orphaned`)
 - `request_payload_json`, `resolved_payload_json` (nullable), `resolved_at` (nullable), `resolution_source` (`tui|api|policy`)
+- `error_code` (nullable), `error_message` (nullable) for explicit expiry/orphaned/restart outcomes
 - Resolver path is transactional:
 - `POST .../respond` atomically transitions `pending -> resolved` and stores the response payload used for idempotent replay.
 - App-server response dispatch is driven from that stored resolution (never from unstored transient state).
@@ -102,12 +123,25 @@ Durability/restart requirements:
 - If Codex re-emits the same logical request after resume, it is recorded as a new pending row with a new `request_id`.
 - No unresolved request may remain silently pending across restart.
 
+Timeout/unblock rules (required):
+
+- `POST /sessions/{id}/input` gating checks `status=pending` only. `resolved|expired|orphaned` rows never block normal chat input.
+- On expiry while the app-server process generation is alive, resolver transitions:
+- `pending -> expired` with `error_code=request_expired`
+- then immediately applies policy response from persisted state:
+- approval expiry default payload: `{ "decision": "decline" }`
+- request-user-input expiry payload: `{ "answers": {} }`
+- on successful dispatch, transition `expired -> resolved` with `resolution_source=policy`.
+- If dispatch cannot be completed because the originating app-server process generation is gone, transition `expired -> orphaned` with explicit restart/unavailable error code.
+- End-state contract: no request remains `pending` after expiry/restart reconciliation.
+
 TUI behavior:
 
 - Displays pending structured requests in a dedicated queue with focus shortcuts.
 - Composer has explicit mode (`chat`, `approval`, `input`) so Enter semantics are unambiguous.
 - Normal chat text never attempts to satisfy structured requests automatically.
 - When pending structured requests exist, chat mode send is disabled and the UI shows an explicit action hint to switch to `approval` or `input` mode.
+- This structured-request queue and send-gating behavior is for `provider=codex-app`.
 
 ## Durable event history (required, not optional)
 
@@ -128,7 +162,7 @@ Process restart dropping event history is not acceptable for EM workflows. This 
 - keep recent window per session (count and age caps) so storage growth is controlled
 - API cursor model:
 - `GET /sessions/{id}/codex-events?since_seq=<n>&limit=<n>`
-- response includes `{ events, earliest_seq, latest_seq, next_seq, history_gap }`
+- response includes `{ events, earliest_seq, latest_seq, next_seq, history_gap, gap_reason }` (`gap_reason` nullable)
 - after restart, client resumes from last seen `seq` and backfills missed events from disk
 - if `since_seq < earliest_seq - 1`, server returns oldest retained page and `history_gap=true` (explicit gap; never silent truncation)
 - Failure model:
@@ -161,6 +195,15 @@ Storage:
 - `codex_tool_events`: one row per lifecycle event.
 - `codex_turn_events`: turn state and timing events.
 - `codex_event_checkpoints`: optional replay/checkpoint metadata for resumable consumers.
+
+Retention/size controls (required):
+
+- `codex_observability.db` retention is mandatory in this epic (not deferred).
+- Default retention envelope (operator-configurable):
+- age cap: 14 days for tool/turn events
+- per-session row cap: 20,000 rows in `codex_tool_events`, 5,000 rows in `codex_turn_events`
+- payload cap: `raw_payload_json` is stored as a compact excerpt (bounded length), not unbounded raw blobs
+- Pruning runs on startup and periodically in-process (hourly), with explicit metrics/logging for deleted rows and prune duration.
 
 `codex_tool_events` minimum shape:
 
@@ -200,6 +243,7 @@ Scope boundary:
 
 - Full real-time parity target is for `provider=codex-app`.
 - `provider=codex` (tmux CLI) remains a separate effort (rollout file parsing or other ingestion path).
+- All endpoint contracts in this doc (`codex-events`, `codex-pending-requests`, `codex-requests/*/respond`, `pending_structured_request`) apply to `provider=codex-app`.
 
 ## What is still not equivalent to native desktop Codex
 
@@ -233,10 +277,12 @@ This should be delivered as an epic with sequenced tickets.
 - Add `GET /sessions/{id}/codex-pending-requests` and `POST /sessions/{id}/codex-requests/{request_id}/respond`.
 - Implement idempotent response replay and restart orphaning policy.
 - Gate `POST /sessions/{id}/input` with explicit `409 pending_structured_request` when unresolved structured requests exist.
+- Remove legacy direct auto-response path in `codex_app_server.py` and route all structured responses through the ledger resolver.
 3. `#288-C` Codex observability DB + app-server ingestion
 - Introduce `codex_observability.db` and logger.
 - Ingest `commandExecution` / `fileChange` / approval / delta / completion events from app-server.
 - Persist raw payload excerpts and normalized fields for analytics, including failure/interruption outcomes.
+- Implement retention/pruning and payload bounding as part of the initial schema rollout.
 4. `#288-D` Compatibility projection into EM surfaces
 - Add read adapter for `sm children`, `sm tail`, and parent wake summaries.
 - Ensure Codex sessions report recent actionable tool activity with command/file-change distinction.
@@ -270,13 +316,14 @@ Dependency order:
 - pending request panel for approval/user-input requests (respond via structured request endpoint)
 - Keep existing `sm send` behavior unchanged.
 
-## Acceptance criteria from user perspective
+## Acceptance criteria from user perspective (provider=codex-app)
 
-- I can attach to a Codex session in terminal and see real progress states.
+- I can attach to a Codex app-server session in terminal and see real progress states.
 - I can type and send input directly from that pane.
 - `sm send` and in-pane send both work and are consistent.
 - I can approve/decline tool/file-change requests and submit request-user-input answers from TUI or API with deterministic request IDs.
 - If unresolved approval/input requests exist, normal chat send is rejected with explicit `pending_structured_request` guidance instead of being silently queued.
+- Legacy automatic approval/input responses are disabled for `provider=codex-app`; structured responses flow through the pending-request ledger.
 - I can tell whether a child is progressing, waiting, blocked, or done without guessing.
 - If session-manager restarts, I can resume and fetch missed Codex events using cursor-based replay from persistent history.
 - If I resume with an old cursor beyond retention, I get an explicit `history_gap` signal (not silent truncation).
@@ -284,7 +331,7 @@ Dependency order:
 - For `codex-app` sessions, `sm children` and `sm tail` show DB-backed recent tool activity sourced from Codex observability projection.
 - I can distinguish command execution vs file change activity in logs, timeline, and summaries.
 - I can distinguish success vs failed/interrupted/cancelled/timeout outcomes for tool actions and turns.
-- EM-style delegation is practical with Codex sessions at the same operational quality bar as Claude session management.
+- EM-style delegation is practical with `provider=codex-app` sessions at the same operational quality bar as Claude session management.
 
 ## Ticket classification
 
