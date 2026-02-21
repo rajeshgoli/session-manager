@@ -177,9 +177,6 @@ class CodexTui:
                 if line is None:
                     self.sync(initial=False)
                     continue
-                if line == "":
-                    self.running = False
-                    continue
                 line = line.strip()
                 if line:
                     self.handle_line(line)
@@ -465,8 +462,19 @@ class CodexTui:
         self.stream_out.flush()
 
     def _read_line_with_timeout(self, timeout_s: float) -> Optional[str]:
-        if not hasattr(self.stream_in, "fileno"):
-            return self.stream_in.readline()
+        supports_select = hasattr(self.stream_in, "fileno")
+        if supports_select:
+            try:
+                self.stream_in.fileno()
+            except Exception:
+                supports_select = False
+
+        if not supports_select:
+            line = self.stream_in.readline()
+            if line == "":
+                self.running = False
+                return None
+            return line
         try:
             ready, _, _ = select.select([self.stream_in], [], [], timeout_s)
         except Exception:

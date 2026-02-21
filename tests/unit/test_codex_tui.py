@@ -141,3 +141,21 @@ def test_select_command_by_index():
 
     assert tui.state.selected_request_id == "req-b"
 
+
+def test_read_line_with_timeout_treats_eof_as_stop():
+    tui, _ = _make_tui()
+
+    line = tui._read_line_with_timeout(0.1)
+
+    assert line is None
+    assert tui.running is False
+
+
+def test_read_line_with_timeout_keeps_blank_line_as_input():
+    tui, _ = _make_tui()
+    tui.stream_in = StringIO("\n")
+
+    line = tui._read_line_with_timeout(0.1)
+
+    assert line == "\n"
+    assert tui.running is True
