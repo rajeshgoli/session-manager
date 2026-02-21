@@ -1126,6 +1126,12 @@ def cmd_spawn(
         2: Session manager unavailable
     """
     import json as json_lib
+    if provider == "claude" and model is not None and model not in {"opus", "sonnet", "haiku"}:
+        print(
+            f"Error: Invalid Claude model '{model}'. Choose one of: opus, sonnet, haiku",
+            file=sys.stderr,
+        )
+        return 1
 
     # Spawn child session
     result = client.spawn_child(

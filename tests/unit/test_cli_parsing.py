@@ -44,7 +44,7 @@ class TestCliParsing:
         spawn_parser.add_argument("prompt")
         spawn_parser.add_argument("--name")
         spawn_parser.add_argument("--wait", type=int, metavar="SECONDS")
-        spawn_parser.add_argument("--model", choices=["opus", "sonnet", "haiku"])
+        spawn_parser.add_argument("--model")
         spawn_parser.add_argument("--working-dir")
         spawn_parser.add_argument("--json", action="store_true")
 
@@ -179,13 +179,24 @@ class TestSpawnCommand:
         assert args.model == "opus"
 
     def test_spawn_model_choices(self):
-        """sm spawn --model validates choices."""
+        """sm spawn --model accepts known Claude models."""
         parser = TestCliParsing()
 
-        # Valid choices
         for model in ["opus", "sonnet", "haiku"]:
             args = parser._get_parsed_args(["spawn", "claude", "--model", model, "Test"])
             assert args.model == model
+
+    def test_spawn_codex_custom_model(self):
+        """sm spawn codex accepts free-form model IDs."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "codex", "--model", "codex-5.1", "Test"])
+        assert args.model == "codex-5.1"
+
+    def test_spawn_codex_app_custom_model(self):
+        """sm spawn codex-app accepts free-form model IDs."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "codex-app", "--model", "codex-5.1", "Test"])
+        assert args.model == "codex-5.1"
 
     def test_spawn_name_flag(self):
         """sm spawn --name sets friendly name."""
