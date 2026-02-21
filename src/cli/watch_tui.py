@@ -33,6 +33,15 @@ def _repo_label(working_dir: str) -> str:
     return f"{os.path.basename(normalized) or normalized}/"
 
 
+def _repo_key(working_dir: str) -> str:
+    if not working_dir:
+        return "unknown"
+    try:
+        return str(Path(working_dir).expanduser().resolve())
+    except Exception:
+        return os.path.normpath(working_dir)
+
+
 def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
         return None
@@ -120,11 +129,15 @@ def build_watch_rows(sessions: list[dict], spinner_index: int = 0) -> tuple[list
     groups: dict[str, list[dict]] = {}
 
     for session in sessions:
-        groups.setdefault(_repo_label(session.get("working_dir", "")), []).append(session)
+        key = _repo_key(session.get("working_dir", ""))
+        groups.setdefault(key, []).append(session)
 
-    for repo_label in sorted(groups.keys()):
-        group_sessions = groups[repo_label]
-        rows.append(WatchRow(kind="repo", text=repo_label))
+    for repo_key in sorted(groups.keys()):
+        group_sessions = groups[repo_key]
+        repo_header = _repo_label(repo_key) if repo_key != "unknown" else "unknown/"
+        if repo_key not in ("unknown",):
+            repo_header = f"{repo_header} ({repo_key})"
+        rows.append(WatchRow(kind="repo", text=repo_header))
         by_id = {s["id"]: s for s in group_sessions}
         children: dict[str, list[dict]] = {}
         roots: list[dict] = []
@@ -210,6 +223,7 @@ def _render(
     stdscr,
     rows: list[WatchRow],
     selected_session_id: Optional[str],
+    scroll_offset: int,
     total_sessions: int,
     repo_count: int,
     filter_text: Optional[str],
@@ -223,7 +237,7 @@ def _render(
     stdscr.addnstr(0, 0, header, max(0, width - 1), curses.A_BOLD)
 
     max_rows = max(0, height - 3)
-    display_rows = rows[:max_rows]
+    display_rows = rows[scroll_offset:scroll_offset + max_rows]
     y = 1
     for row in display_rows:
         if row.kind == "session":
@@ -268,6 +282,7 @@ def run_watch_tui(
         repo_count = 0
         total_sessions = 0
         spinner_index = 0
+        scroll_offset = 0
         next_refresh = 0.0
 
         while True:
@@ -290,10 +305,29 @@ def run_watch_tui(
             if flash_message and now >= flash_until:
                 flash_message = None
 
+            # Keep selected session visible in viewport when row count exceeds screen height.
+            max_rows = max(0, stdscr.getmaxyx()[0] - 3)
+            selected_row_idx = None
+            if selected_session_id:
+                for idx, row in enumerate(rows):
+                    if row.kind == "session" and row.session_id == selected_session_id:
+                        selected_row_idx = idx
+                        break
+            if selected_row_idx is not None and max_rows > 0:
+                if selected_row_idx < scroll_offset:
+                    scroll_offset = selected_row_idx
+                elif selected_row_idx >= scroll_offset + max_rows:
+                    scroll_offset = selected_row_idx - max_rows + 1
+                max_offset = max(0, len(rows) - max_rows)
+                scroll_offset = max(0, min(scroll_offset, max_offset))
+            else:
+                scroll_offset = 0
+
             _render(
                 stdscr,
                 rows=rows,
                 selected_session_id=selected_session_id,
+                scroll_offset=scroll_offset,
                 total_sessions=total_sessions,
                 repo_count=repo_count,
                 filter_text=text_filter,

@@ -36,8 +36,8 @@ def test_build_rows_groups_by_repo():
 
     repo_rows = [row.text for row in rows if row.kind == "repo"]
     assert repo_count == 2
-    assert "repo-a/" in repo_rows
-    assert "repo-b/" in repo_rows
+    assert any(row.startswith("repo-a/") for row in repo_rows)
+    assert any(row.startswith("repo-b/") for row in repo_rows)
     assert selectable == ["a1", "b1"]
 
 
@@ -66,6 +66,22 @@ def test_unparented_sessions_are_roots():
     session_rows = [row for row in rows if row.kind == "session"]
     assert len(session_rows) == 2
     assert selectable == ["r1", "r2"]
+
+
+def test_build_rows_does_not_merge_same_basename_paths():
+    sessions = [
+        _session("a1", "alpha", "/tmp/a/repo"),
+        _session("b1", "beta", "/tmp/b/repo"),
+    ]
+    rows, selectable, repo_count = build_watch_rows(sessions)
+
+    repo_rows = [row.text for row in rows if row.kind == "repo"]
+    assert repo_count == 2
+    assert len(repo_rows) == 2
+    assert repo_rows[0] != repo_rows[1]
+    assert all(row.startswith("repo/") for row in repo_rows)
+    assert all("(" in row and ")" in row for row in repo_rows)
+    assert selectable == ["a1", "b1"]
 
 
 def test_filter_by_role():
