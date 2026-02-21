@@ -245,6 +245,37 @@ class TestReviewLifecycleNotifications:
         codex_session.on_review_complete.assert_not_awaited()
 
 
+class TestServerRequestCallbacks:
+    """Ensure server-request callbacks are emitted for lifecycle tracking."""
+
+    @pytest.mark.asyncio
+    async def test_server_request_callback_invoked(self, config):
+        callback = AsyncMock()
+        session = CodexAppServerSession(
+            session_id="test-server-request",
+            working_dir="/tmp",
+            config=config,
+            on_turn_complete=AsyncMock(),
+            on_server_request=callback,
+        )
+        session._send = AsyncMock()
+
+        message = {
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"turnId": "turn-1"},
+        }
+        await session._handle_server_request(message)
+
+        callback.assert_awaited_once_with(
+            "test-server-request",
+            42,
+            "item/commandExecution/requestApproval",
+            {"turnId": "turn-1"},
+        )
+
+
 # ---------------------------------------------------------------------------
 # SessionManager.start_review() — codex-app wiring
 # ---------------------------------------------------------------------------

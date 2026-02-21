@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
 
-from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi import FastAPI, HTTPException, Body, Request, Query
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -93,6 +93,7 @@ class SessionResponse(BaseModel):
     agent_status_text: Optional[str] = None  # Self-reported agent status text (#188)
     agent_status_at: Optional[str] = None  # When agent_status_text was last set (#188)
     is_em: bool = False  # EM role flag (#256)
+    activity_state: str = "idle"  # Computed operational state (working/thinking/idle/etc)
 
 
 class SendInputRequest(BaseModel):
@@ -455,6 +456,47 @@ def create_app(
     # Wire _app back-reference so _execute_handoff can clear server-side caches (#196)
     if session_manager:
         session_manager._app = app
+
+    def _fallback_activity_state(session: Session) -> str:
+        if session.status == SessionStatus.STOPPED:
+            return "stopped"
+        if session.status == SessionStatus.RUNNING:
+            return "working"
+        return "idle"
+
+    def _get_activity_state(session: Session) -> str:
+        sm = app.state.session_manager
+        if not sm:
+            return _fallback_activity_state(session)
+        getter = getattr(sm, "get_activity_state", None)
+        if not callable(getter):
+            return _fallback_activity_state(session)
+        try:
+            state = getter(session)
+        except Exception:
+            return _fallback_activity_state(session)
+        if isinstance(state, str):
+            return state
+        return _fallback_activity_state(session)
+
+    def _session_to_response(session: Session) -> SessionResponse:
+        return SessionResponse(
+            id=session.id,
+            name=session.name,
+            working_dir=session.working_dir,
+            status=session.status.value,
+            created_at=session.created_at.isoformat(),
+            last_activity=session.last_activity.isoformat(),
+            tmux_session=session.tmux_session,
+            provider=getattr(session, "provider", "claude"),
+            friendly_name=session.friendly_name,
+            current_task=session.current_task,
+            git_remote_url=session.git_remote_url,
+            parent_session_id=session.parent_session_id,
+            last_handoff_path=session.last_handoff_path,
+            is_em=session.is_em,
+            activity_state=_get_activity_state(session),
+        )
 
     @app.get("/")
     async def root():
@@ -899,22 +941,7 @@ def create_app(
         if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
             await app.state.output_monitor.start_monitoring(session)
 
-        return SessionResponse(
-            id=session.id,
-            name=session.name,
-            working_dir=session.working_dir,
-            status=session.status.value,
-            created_at=session.created_at.isoformat(),
-            last_activity=session.last_activity.isoformat(),
-            tmux_session=session.tmux_session,
-            provider=getattr(session, "provider", "claude"),
-            friendly_name=session.friendly_name,
-            current_task=session.current_task,
-            git_remote_url=session.git_remote_url,
-            parent_session_id=session.parent_session_id,
-            last_handoff_path=session.last_handoff_path,
-            is_em=session.is_em,
-        )
+        return _session_to_response(session)
 
     @app.post("/sessions/create")
     async def create_session_endpoint(working_dir: str, provider: str = "claude"):
@@ -957,22 +984,7 @@ def create_app(
 
         return {
             "sessions": [
-                SessionResponse(
-                    id=s.id,
-                    name=s.name,
-                    working_dir=s.working_dir,
-                    status=s.status.value,
-                    created_at=s.created_at.isoformat(),
-                    last_activity=s.last_activity.isoformat(),
-                    tmux_session=s.tmux_session,
-                    provider=getattr(s, "provider", "claude"),
-                    friendly_name=s.friendly_name,
-                    current_task=s.current_task,
-                    git_remote_url=s.git_remote_url,
-                    parent_session_id=s.parent_session_id,
-                    last_handoff_path=s.last_handoff_path,
-                    is_em=s.is_em,
-                )
+                _session_to_response(s)
                 for s in sessions
             ]
         }
@@ -1004,22 +1016,29 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        return SessionResponse(
-            id=session.id,
-            name=session.name,
-            working_dir=session.working_dir,
-            status=session.status.value,
-            created_at=session.created_at.isoformat(),
-            last_activity=session.last_activity.isoformat(),
-            tmux_session=session.tmux_session,
-            provider=getattr(session, "provider", "claude"),
-            friendly_name=session.friendly_name,
-            current_task=session.current_task,
-            git_remote_url=session.git_remote_url,
-            parent_session_id=session.parent_session_id,
-            last_handoff_path=session.last_handoff_path,
-            is_em=session.is_em,
-        )
+        return _session_to_response(session)
+
+    @app.get("/sessions/{session_id}/codex-events")
+    async def get_codex_events(
+        session_id: str,
+        since_seq: Optional[int] = Query(default=None, ge=0),
+        limit: int = Query(default=200, ge=1, le=500),
+    ):
+        """Get persisted codex lifecycle events for a codex-app session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if getattr(session, "provider", "claude") != "codex-app":
+            raise HTTPException(status_code=400, detail="codex-events supported only for provider=codex-app")
+
+        getter = getattr(app.state.session_manager, "get_codex_events", None)
+        if not callable(getter):
+            raise HTTPException(status_code=503, detail="Codex events store not configured")
+
+        return getter(session_id=session_id, since_seq=since_seq, limit=limit)
 
     @app.patch("/sessions/{session_id}", response_model=SessionResponse)
     async def update_session(
@@ -1073,22 +1092,7 @@ def create_app(
                 if not success:
                     logger.warning(f"Failed to rename Telegram topic for session {session_id}")
 
-        return SessionResponse(
-            id=session.id,
-            name=session.name,
-            working_dir=session.working_dir,
-            status=session.status.value,
-            created_at=session.created_at.isoformat(),
-            last_activity=session.last_activity.isoformat(),
-            tmux_session=session.tmux_session,
-            provider=getattr(session, "provider", "claude"),
-            friendly_name=session.friendly_name,
-            current_task=session.current_task,
-            git_remote_url=session.git_remote_url,
-            parent_session_id=session.parent_session_id,
-            last_handoff_path=session.last_handoff_path,
-            is_em=session.is_em,
-        )
+        return _session_to_response(session)
 
     @app.post("/sessions/{session_id}/context-monitor")
     async def set_context_monitor(session_id: str, request: ContextMonitorRequest):

@@ -11,6 +11,7 @@ from typing import Optional, Callable, Awaitable
 from .models import Session, SessionStatus, NotificationEvent, DeliveryResult, ReviewConfig
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
+from .codex_event_store import CodexEventStore
 from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_pr_repo_from_git
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,12 @@ class SessionManager:
         self._event_handlers: list[Callable[[NotificationEvent], Awaitable[None]]] = []
         self.codex_sessions: dict[str, CodexAppServerSession] = {}
         self.codex_turns_in_flight: set[str] = set()
+        self.codex_active_turn_ids: dict[str, str] = {}
+        self.codex_last_delta_at: dict[str, datetime] = {}
+        self.codex_wait_states: dict[str, tuple[str, datetime]] = {}
+        self.codex_working_delta_window_seconds = float(
+            self.config.get("codex_events", {}).get("working_delta_window_seconds", 2.5)
+        )
         self.hook_output_store: Optional[dict] = None
 
         # Telegram topic auto-sync
@@ -61,6 +68,17 @@ class SessionManager:
             client_name=codex_app_config.get("client_name", "session-manager"),
             client_title=codex_app_config.get("client_title", "Claude Session Manager"),
             client_version=codex_app_config.get("client_version", "0.1.0"),
+        )
+
+        codex_events_config = self.config.get("codex_events", {})
+        default_events_db = str(self.state_file.with_name("codex_events.db"))
+        self.codex_event_store = CodexEventStore(
+            db_path=codex_events_config.get("db_path", default_events_db),
+            ring_size=codex_events_config.get("ring_size", 1000),
+            retention_max_events_per_session=codex_events_config.get("retention_max_events_per_session", 5000),
+            retention_max_age_days=codex_events_config.get("retention_max_age_days", 14),
+            prune_every_writes=codex_events_config.get("prune_every_writes", 200),
+            payload_preview_chars=codex_events_config.get("payload_preview_chars", 1500),
         )
 
         # Message queue manager (set by main app)
@@ -365,6 +383,7 @@ class SessionManager:
                     on_turn_started=self._handle_codex_turn_started,
                     on_turn_delta=self._handle_codex_turn_delta,
                     on_review_complete=self._handle_codex_review_complete,
+                    on_server_request=self._handle_codex_server_request,
                 )
                 thread_id = await codex_session.start(thread_id=session.codex_thread_id, model=model)
                 session.codex_thread_id = thread_id
@@ -822,6 +841,7 @@ class SessionManager:
                 on_turn_started=self._handle_codex_turn_started,
                 on_turn_delta=self._handle_codex_turn_delta,
                 on_review_complete=self._handle_codex_review_complete,
+                on_server_request=self._handle_codex_server_request,
             )
             thread_id = await codex_session.start(thread_id=session.codex_thread_id, model=model)
             session.codex_thread_id = thread_id
@@ -881,6 +901,20 @@ class SessionManager:
             return
 
         self.codex_turns_in_flight.discard(session_id)
+        turn_id = self.codex_active_turn_ids.pop(session_id, None)
+        self.codex_wait_states.pop(session_id, None)
+        self.codex_last_delta_at.pop(session_id, None)
+
+        self.codex_event_store.append_event(
+            session_id=session_id,
+            event_type="turn_completed",
+            turn_id=turn_id,
+            payload={
+                "status": status,
+                "output_preview": text[:400] if text else "",
+                "output_chars": len(text or ""),
+            },
+        )
 
         # Store last output (for /status, /last-message)
         if text and self.hook_output_store is not None:
@@ -944,6 +978,15 @@ class SessionManager:
     async def _handle_codex_turn_started(self, session_id: str, turn_id: str):
         """Mark Codex turn as active and update activity timestamps."""
         self.codex_turns_in_flight.add(session_id)
+        self.codex_active_turn_ids[session_id] = turn_id
+        self.codex_wait_states.pop(session_id, None)
+        self.codex_last_delta_at.pop(session_id, None)
+        self.codex_event_store.append_event(
+            session_id=session_id,
+            event_type="turn_started",
+            turn_id=turn_id,
+            payload={},
+        )
         session = self.sessions.get(session_id)
         if not session:
             return
@@ -956,6 +999,17 @@ class SessionManager:
 
     async def _handle_codex_turn_delta(self, session_id: str, turn_id: str, delta: str):
         """Update activity on Codex streaming deltas."""
+        self.codex_last_delta_at[session_id] = datetime.now()
+        self.codex_wait_states.pop(session_id, None)
+        self.codex_event_store.append_event(
+            session_id=session_id,
+            event_type="turn_delta",
+            turn_id=turn_id,
+            payload={
+                "delta_preview": delta[:240],
+                "delta_chars": len(delta),
+            },
+        )
         session = self.sessions.get(session_id)
         if not session:
             return
@@ -981,6 +1035,16 @@ class SessionManager:
             self.hook_output_store["latest"] = review_text
             self.hook_output_store[session_id] = review_text
 
+        self.codex_event_store.append_event(
+            session_id=session_id,
+            event_type="review_completed",
+            turn_id=None,
+            payload={
+                "output_preview": review_text[:400] if review_text else "",
+                "output_chars": len(review_text or ""),
+            },
+        )
+
         # Emit review_complete notification
         if review_text and session.review_config and hasattr(self, "notifier") and self.notifier:
             try:
@@ -1003,6 +1067,75 @@ class SessionManager:
         """Check if a Codex turn is currently in flight."""
         return session_id in self.codex_turns_in_flight
 
+    async def _handle_codex_server_request(
+        self,
+        session_id: str,
+        request_id: int,
+        method: str,
+        params: dict,
+    ):
+        """Track codex-app server requests as lifecycle events for observability/activity state."""
+        now = datetime.now()
+        state_name = None
+        event_type = "server_request"
+        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+            state_name = "waiting_permission"
+            event_type = "request_approval"
+        elif method == "item/tool/requestUserInput":
+            state_name = "waiting_input"
+            event_type = "request_user_input"
+
+        if state_name:
+            self.codex_wait_states[session_id] = (state_name, now)
+
+        self.codex_event_store.append_event(
+            session_id=session_id,
+            event_type=event_type,
+            turn_id=params.get("turnId"),
+            payload={
+                "request_id": request_id,
+                "method": method,
+            },
+        )
+
+    def get_activity_state(self, session_or_id: Session | str) -> str:
+        """Get computed activity state for API consumers."""
+        session: Optional[Session]
+        if isinstance(session_or_id, Session):
+            session = session_or_id
+        else:
+            session = self.sessions.get(session_or_id)
+            if not session:
+                return "stopped"
+
+        if session.status == SessionStatus.STOPPED:
+            return "stopped"
+
+        if session.provider != "codex-app":
+            return "working" if session.status == SessionStatus.RUNNING else "idle"
+
+        if session.completion_status is not None:
+            return "waiting_input"
+
+        wait_state = self.codex_wait_states.get(session.id)
+        if wait_state:
+            state_name, at = wait_state
+            if (datetime.now() - at).total_seconds() <= 10:
+                return state_name
+            self.codex_wait_states.pop(session.id, None)
+
+        if session.id in self.codex_turns_in_flight:
+            delta_at = self.codex_last_delta_at.get(session.id)
+            if delta_at and (datetime.now() - delta_at).total_seconds() <= self.codex_working_delta_window_seconds:
+                return "working"
+            return "thinking"
+
+        return "idle"
+
+    def get_codex_events(self, session_id: str, since_seq: Optional[int] = None, limit: int = 200) -> dict:
+        """Read persisted codex event timeline for one session."""
+        return self.codex_event_store.get_events(session_id=session_id, since_seq=since_seq, limit=limit)
+
     async def clear_session(self, session_id: str, new_prompt: Optional[str] = None) -> bool:
         """Clear/reset a session's context (Claude: /clear, Codex: /new, Codex app: new thread)."""
         session = self.sessions.get(session_id)
@@ -1014,6 +1147,10 @@ class SessionManager:
             if not codex_session:
                 return False
             try:
+                self.codex_turns_in_flight.discard(session_id)
+                self.codex_active_turn_ids.pop(session_id, None)
+                self.codex_last_delta_at.pop(session_id, None)
+                self.codex_wait_states.pop(session_id, None)
                 await codex_session.start_new_thread()
                 session.codex_thread_id = codex_session.thread_id
                 session.status = SessionStatus.IDLE
@@ -1154,6 +1291,10 @@ class SessionManager:
                     loop.create_task(codex_session.close())
                 except RuntimeError:
                     asyncio.run(codex_session.close())
+            self.codex_turns_in_flight.discard(session_id)
+            self.codex_active_turn_ids.pop(session_id, None)
+            self.codex_last_delta_at.pop(session_id, None)
+            self.codex_wait_states.pop(session_id, None)
         else:
             self.tmux.kill_session(session.tmux_session)
         session.status = SessionStatus.STOPPED

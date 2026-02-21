@@ -48,6 +48,7 @@ class CodexAppServerSession:
         on_turn_started: Optional[Callable[[str, str], Awaitable[None]]] = None,
         on_turn_delta: Optional[Callable[[str, str, str], Awaitable[None]]] = None,
         on_review_complete: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_server_request: Optional[Callable[[str, int, str, dict[str, Any]], Awaitable[None]]] = None,
     ):
         self.session_id = session_id
         self.working_dir = working_dir
@@ -56,6 +57,7 @@ class CodexAppServerSession:
         self.on_turn_started = on_turn_started
         self.on_turn_delta = on_turn_delta
         self.on_review_complete = on_review_complete
+        self.on_server_request = on_server_request
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
@@ -385,6 +387,9 @@ class CodexAppServerSession:
         req_id = message.get("id")
         method = message.get("method")
         params = message.get("params", {})
+
+        if self.on_server_request and isinstance(req_id, int):
+            await self.on_server_request(self.session_id, req_id, method, params)
 
         # Auto-handle approval requests
         if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
