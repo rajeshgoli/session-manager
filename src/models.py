@@ -50,6 +50,16 @@ class CompletionStatus(Enum):
     KILLED = "killed"
 
 
+class ActivityState(Enum):
+    """Computed activity state exposed by session APIs."""
+    WORKING = "working"
+    THINKING = "thinking"
+    IDLE = "idle"
+    WAITING_PERMISSION = "waiting_permission"
+    WAITING_INPUT = "waiting_input"
+    STOPPED = "stopped"
+
+
 @dataclass
 class ReviewConfig:
     """Configuration for a Codex review session."""
@@ -484,3 +494,12 @@ class SessionDeliveryState:
     pending_handoff_path: Optional[str] = None  # File path for pending handoff (#196)
     paste_buffered_notify_sender_id: Optional[str] = None  # Staged stop-notify for mid-turn paste; promoted on first idle (sm#244)
     paste_buffered_notify_sender_name: Optional[str] = None  # Sender name for the above (sm#244)
+
+
+@dataclass
+class MonitorState:
+    """Live output-monitor state used for activity projection."""
+    last_output_at: Optional[datetime] = None
+    is_output_flowing: bool = False
+    last_pattern: Optional[str] = None  # permission, error, completion, or None
+    output_bytes_last_10s: int = 0

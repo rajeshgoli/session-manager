@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
 
-from .models import Session, SessionStatus, NotificationEvent
+from .models import MonitorState, NotificationEvent, Session, SessionStatus
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,9 @@ class OutputMonitor:
         self._pending_crash_recovery: set[str] = set()  # Sessions needing deferred recovery
         self._last_crash_recovery: dict[str, tuple[datetime, bool]] = {}  # (timestamp, succeeded)
         self._awaiting_permission: dict[str, bool] = {}  # Sessions at a permission prompt
+        self._monitor_states: dict[str, MonitorState] = {}  # Activity projection state (#288)
+        self._no_output_cycles: dict[str, int] = {}  # Consecutive polls without output (#288)
+        self._output_history: dict[str, list[tuple[datetime, int]]] = {}  # Output bytes timestamps (#288)
 
         # Load timeout configuration with fallbacks
         timeouts = self.config.get("timeouts", {})
@@ -144,6 +147,9 @@ class OutputMonitor:
 
         self._last_activity[session.id] = datetime.now()
         self._file_positions[session.id] = 0
+        self._monitor_states[session.id] = MonitorState()
+        self._no_output_cycles[session.id] = 0
+        self._output_history[session.id] = []
 
         # For restored sessions, set a grace period before sending idle notifications
         # This prevents spamming idle notifications after server restart
@@ -177,6 +183,9 @@ class OutputMonitor:
         self._pending_crash_recovery.discard(session_id)
         self._last_crash_recovery.pop(session_id, None)
         self._awaiting_permission.pop(session_id, None)
+        self._monitor_states.pop(session_id, None)
+        self._no_output_cycles.pop(session_id, None)
+        self._output_history.pop(session_id, None)
 
     async def stop_all(self):
         """Stop all monitoring tasks."""
@@ -218,6 +227,11 @@ class OutputMonitor:
                     self._file_positions[session.id] = current_size
                     now = datetime.now()
                     self._last_activity[session.id] = now
+                    monitor_state = self._monitor_states.setdefault(session.id, MonitorState())
+                    monitor_state.last_output_at = now
+                    monitor_state.is_output_flowing = True
+                    self._no_output_cycles[session.id] = 0
+                    self._record_output_bytes(session.id, len(new_content.encode("utf-8", errors="ignore")), now)
                     # Also update the Session model's last_activity
                     session.last_activity = now
                     # Save state to persist the update
@@ -230,6 +244,11 @@ class OutputMonitor:
                     await self._analyze_content(session, new_content)
 
                 else:
+                    self._refresh_output_bytes_window(session.id, datetime.now())
+                    state = self._monitor_states.setdefault(session.id, MonitorState())
+                    self._no_output_cycles[session.id] = self._no_output_cycles.get(session.id, 0) + 1
+                    if self._no_output_cycles[session.id] >= 2:
+                        state.is_output_flowing = False
                     # No new content - check for idle
                     await self._check_idle(session)
 
@@ -249,25 +268,35 @@ class OutputMonitor:
 
     async def _analyze_content(self, session: Session, content: str):
         """Analyze new content for patterns."""
+        matched_pattern = None
+        state = self._monitor_states.setdefault(session.id, MonitorState())
+
         # New content means session moved past any permission prompt state
         self._awaiting_permission.pop(session.id, None)
 
         # Check for harness crash (highest priority - triggers recovery)
         if _crash_re.search(content):
+            state.last_pattern = "error"
             await self._handle_crash(session, content)
             return  # Don't process other patterns during crash
 
         # Check for permission prompts
         if _permission_re.search(content):
+            matched_pattern = "permission"
             await self._handle_permission_prompt(session, content)
 
         # Check for errors
         if _error_re.search(content):
+            if matched_pattern is None:
+                matched_pattern = "error"
             await self._handle_error(session, content)
 
         # Check for completion
         if _completion_re.search(content):
+            matched_pattern = "completion"
             await self._handle_completion(session, content)
+
+        state.last_pattern = matched_pattern
 
     async def _handle_permission_prompt(self, session: Session, content: str):
         """Handle detected permission prompt."""
@@ -608,6 +637,9 @@ class OutputMonitor:
         self._pending_crash_recovery.discard(session_id)
         self._last_crash_recovery.pop(session_id, None)
         self._awaiting_permission.pop(session_id, None)
+        self._monitor_states.pop(session_id, None)
+        self._no_output_cycles.pop(session_id, None)
+        self._output_history.pop(session_id, None)
         self._tasks.pop(session_id, None)
         logger.info(f"Completed cleanup for session {session_id}")
 
@@ -646,3 +678,21 @@ class OutputMonitor:
         self._last_activity[session_id] = datetime.now()
         notified_key = f"{session_id}_idle"
         self._notified_permissions.pop(notified_key, None)
+
+    def _record_output_bytes(self, session_id: str, output_bytes: int, now: datetime):
+        """Track rolling output throughput over the last 10 seconds."""
+        history = self._output_history.setdefault(session_id, [])
+        history.append((now, output_bytes))
+        self._refresh_output_bytes_window(session_id, now)
+
+    def _refresh_output_bytes_window(self, session_id: str, now: datetime):
+        """Refresh output_bytes_last_10s from rolling history."""
+        history = self._output_history.setdefault(session_id, [])
+        cutoff = now - timedelta(seconds=10)
+        history[:] = [(ts, n) for ts, n in history if ts >= cutoff]
+        state = self._monitor_states.setdefault(session_id, MonitorState())
+        state.output_bytes_last_10s = sum(n for _, n in history)
+
+    def get_session_state(self, session_id: str) -> Optional[MonitorState]:
+        """Return live monitor state for a session when monitoring is active."""
+        return self._monitor_states.get(session_id)

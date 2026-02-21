@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Awaitable, Any
 
-from .models import Session, SessionStatus, NotificationEvent, DeliveryResult, ReviewConfig
+from .models import ActivityState, DeliveryResult, NotificationEvent, ReviewConfig, Session, SessionStatus
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
 from .codex_activity_projection import CodexActivityProjection
@@ -77,6 +77,7 @@ class SessionManager:
             self.config.get("codex_events", {}).get("working_delta_window_seconds", 2.5)
         )
         self.hook_output_store: Optional[dict] = None
+        self.output_monitor = None  # Set by main app for activity projection (#288)
 
         # Telegram topic auto-sync
         self.orphaned_topics: list[tuple[int, int]] = []  # (chat_id, thread_id) from dead sessions
@@ -1445,31 +1446,57 @@ class SessionManager:
         else:
             session = self.sessions.get(session_or_id)
             if not session:
-                return "stopped"
+                return ActivityState.STOPPED.value
 
         if session.status == SessionStatus.STOPPED:
-            return "stopped"
+            return ActivityState.STOPPED.value
 
-        if session.provider != "codex-app":
-            return "working" if session.status == SessionStatus.RUNNING else "idle"
+        if session.provider == "codex-app":
+            return self._compute_codex_app_activity(session)
+
+        queue_mgr = self.message_queue_manager
+        delivery_state = queue_mgr.delivery_states.get(session.id) if queue_mgr else None
+        is_idle = delivery_state.is_idle if delivery_state is not None else None
+
+        monitor_state = None
+        if self.output_monitor:
+            getter = getattr(self.output_monitor, "get_session_state", None)
+            if callable(getter):
+                monitor_state = getter(session.id)
+
+        if monitor_state and monitor_state.last_pattern == "permission":
+            return ActivityState.WAITING_PERMISSION.value
 
         if session.completion_status is not None:
-            return "waiting_input"
+            return ActivityState.WAITING_INPUT.value
 
-        wait_state = self.codex_wait_states.get(session.id)
-        if wait_state:
-            state_name, at = wait_state
-            if (datetime.now() - at).total_seconds() <= 10:
-                return state_name
-            self.codex_wait_states.pop(session.id, None)
+        if is_idle is True:
+            return ActivityState.IDLE.value
 
-        if session.id in self.codex_turns_in_flight:
-            delta_at = self.codex_last_delta_at.get(session.id)
-            if delta_at and (datetime.now() - delta_at).total_seconds() <= self.codex_working_delta_window_seconds:
-                return "working"
-            return "thinking"
+        if is_idle is False:
+            if monitor_state and monitor_state.is_output_flowing:
+                return ActivityState.WORKING.value
+            return ActivityState.THINKING.value
 
-        return "idle"
+        idle_seconds = (datetime.now() - session.last_activity).total_seconds()
+        if idle_seconds < 30:
+            return ActivityState.THINKING.value
+        return ActivityState.IDLE.value
+
+    def _compute_codex_app_activity(self, session: Session) -> str:
+        """Compute activity state for codex-app sessions (no tmux/output monitor)."""
+        if session.completion_status is not None:
+            return ActivityState.WAITING_INPUT.value
+
+        queue_mgr = self.message_queue_manager
+        delivery_state = queue_mgr.delivery_states.get(session.id) if queue_mgr else None
+        if delivery_state is not None:
+            return ActivityState.IDLE.value if delivery_state.is_idle else ActivityState.WORKING.value
+
+        idle_seconds = (datetime.now() - session.last_activity).total_seconds()
+        if idle_seconds > 30:
+            return ActivityState.IDLE.value
+        return ActivityState.THINKING.value
 
     def get_codex_events(self, session_id: str, since_seq: Optional[int] = None, limit: int = 200) -> dict:
         """Read persisted codex event timeline for one session."""
