@@ -21,8 +21,8 @@ You get a single workflow where control and visibility live together.
 - what turn is running
 - whether the model is thinking, actively emitting, waiting for input, waiting for permission, idle, or stopped
 - event timeline and recent delta output
-2. You can type directly in that pane and send input with Enter.
-3. You can still use `sm send` from any shell, because both flows hit the same input endpoint and queue lifecycle.
+2. You can type directly in that pane and either send a normal follow-up turn or respond to a pending approval/input request.
+3. You can still use `sm send` from any shell for normal turns; TUI and `sm send` share the same turn-input endpoint and queue lifecycle.
 4. You can trust idle/working transitions because they are computed from Codex app events (`turn/started`, deltas, `turn/completed`) instead of tmux heuristics.
 
 Result: less babysitting, fewer blind spots, faster intervention when a session stalls or needs a nudge.
@@ -60,6 +60,36 @@ This preserves the non-blocking EM model while restoring confidence in child pro
 - Cleaner handoffs because current state is explicit
 - Less context waste from manual polling and guesswork
 
+## Interactive control model (required, in scope)
+
+Approval and request-user-input response are in scope for this epic. The control plane is intentionally split into two explicit channels:
+
+- Turn input channel (existing semantics):
+- `POST /sessions/{id}/input`
+- Used by `sm send` and TUI chat composer mode.
+- Enqueues normal user turns and respects current queue lifecycle.
+- Structured request-response channel (new, required):
+- `GET /sessions/{id}/codex-pending-requests`
+- `POST /sessions/{id}/codex-requests/{request_id}/respond`
+- Used for `requestApproval` and `requestUserInput` items only.
+- Payload supports:
+- approval: `{ "decision": "accept" | "acceptForSession" | "decline" | "cancel" }`
+- user input: `{ "answers": { ... } }`
+
+Correlation/idempotency requirements:
+
+- Every pending request carries `request_id`, `session_id`, `thread_id`, `turn_id`, `item_id`, `request_type`, `requested_at`, `expires_at` (optional).
+- `POST .../respond` is idempotent on `request_id`:
+- first successful response resolves the request
+- repeated submissions return the stored resolved result
+- unknown/expired request returns 404 with explicit error code
+
+TUI behavior:
+
+- Displays pending structured requests in a dedicated queue with focus shortcuts.
+- Composer has explicit mode (`chat`, `approval`, `input`) so Enter semantics are unambiguous.
+- Normal chat text never attempts to satisfy structured requests automatically.
+
 ## Durable event history (required, not optional)
 
 Process restart dropping event history is not acceptable for EM workflows. This epic includes durable event history so timeline continuity survives server restarts.
@@ -69,15 +99,20 @@ Process restart dropping event history is not acceptable for EM workflows. This 
 - a hot in-memory ring for low-latency updates
 - durable storage for catch-up and restart recovery
 - Event schema includes at least:
-- `session_id`, monotonic `seq`, timestamp, event type, turn id (if present), compact payload preview
+- `session_id`, per-session strictly increasing `seq`, timestamp, event type, turn id (if present), compact payload preview
+- `seq` contract:
+- `seq` is unique for `(session_id, seq)` and starts at `1` for each session
+- assignment is transactional at write time (no duplicate or out-of-order persisted sequence after restart)
 - Retention policy is bounded:
 - keep recent window per session (count and age caps) so storage growth is controlled
 - API cursor model:
 - `GET /sessions/{id}/codex-events?since_seq=<n>&limit=<n>`
+- response includes `{ events, earliest_seq, latest_seq, next_seq, history_gap }`
 - after restart, client resumes from last seen `seq` and backfills missed events from disk
+- if `since_seq < earliest_seq - 1`, server returns oldest retained page and `history_gap=true` (explicit gap; never silent truncation)
 - Failure model:
 - if persistence write fails, event is still kept in memory and an explicit `event_persist_error` metric/log entry is emitted
-- no silent loss
+- no silent loss; gap is explicitly detectable via `history_gap` and error telemetry
 
 EM benefit:
 
@@ -106,28 +141,35 @@ Storage:
 `codex_tool_events` minimum shape:
 
 - `session_id`, `thread_id`, `turn_id`, `item_id`
-- `event_type` (`request_approval`, `started`, `output_delta`, `completed`, `request_user_input`)
+- `request_id` (for server-request lifecycle correlation)
+- `event_type` (`request_approval`, `approval_decision`, `request_user_input`, `user_input_submitted`, `started`, `output_delta`, `completed`, `failed`, `interrupted`, `cancelled`, `timeout`)
 - `item_type` (`commandExecution`, `fileChange`, `tool`)
 - `phase` (`pre`, `running`, `post`)
 - `command`, `cwd`, `exit_code`
 - `file_path`, `diff_summary`
 - `approval_decision`, `latency_ms`
+- `final_status`, `error_code`, `error_message`
 - `raw_payload_json`, `created_at`
 
 App-server mapping:
 
 - `item/commandExecution/requestApproval` -> `event_type=request_approval`, `item_type=commandExecution`, `phase=pre`
 - `item/fileChange/requestApproval` -> `event_type=request_approval`, `item_type=fileChange`, `phase=pre`
+- `POST /sessions/{id}/codex-requests/{request_id}/respond` (approval payload) -> `event_type=approval_decision`, `phase=post`
 - `item/started` -> `event_type=started`, `phase=running`
 - `item/commandExecution/outputDelta` and `item/fileChange/outputDelta` -> `event_type=output_delta`
-- `item/completed` -> `event_type=completed`, `phase=post`
+- `item/completed` -> one of `completed|failed|interrupted|cancelled|timeout` based on item status, `phase=post`
 - `item/tool/requestUserInput` -> `event_type=request_user_input`
+- `POST /sessions/{id}/codex-requests/{request_id}/respond` (answers payload) -> `event_type=user_input_submitted`, `phase=post`
+- app-server stream/process failure -> synthetic terminal event with explicit `final_status` + `error_code`
 
 Compatibility projection for existing commands:
 
-- Add a lightweight read adapter that projects Codex rows into existing summary semantics:
+- Add a server-side read adapter that projects Codex rows into provider-neutral summary semantics used by existing EM surfaces:
 - last activity tool/action for `sm children`
 - recent action list for `sm tail`
+- projection output shape includes at least: `source_provider`, `action_kind`, `summary_text`, `status`, `started_at`, `ended_at`, `session_id`, `turn_id`, `item_id`
+- `sm children` and `sm tail` consume this adapter for `provider=codex-app` and keep current `tool_usage.db` path for Claude sessions
 - The projection is read-only and does not backfill Claude `tool_usage.db`.
 
 Scope boundary:
@@ -139,8 +181,8 @@ Scope boundary:
 
 This is first-class for session operations, not full desktop UI parity.
 
-- `Approval UX is less structured.`
-- Desktop can present richer approval interactions with stronger visual context. TUI will surface approval state and let you respond, but without desktop-level widgets.
+- `Approval and request-input UX are supported but less structured.`
+- Desktop can present richer approval/input interactions with stronger visual context. TUI supports full response semantics, but without desktop-level widgets.
 - EM impact: you can still keep delegation moving from terminal, but high-risk approvals are easier to review in desktop.
 - `User-input requests are less guided.`
 - Desktop can provide more guided interaction patterns for input prompts. TUI v0 is text-composer centric and does not aim to replicate every guided input control.
@@ -161,17 +203,18 @@ This should be delivered as an epic with sequenced tickets.
 1. `#288-A` Codex activity state + durable lifecycle event stream
 - Add `activity_state` computation for `codex-app` sessions.
 - Add durable event persistence and cursor replay API (`since_seq` model).
-- Guarantee restart continuity for turn-level timeline.
+- Guarantee restart continuity for turn-level timeline with explicit `history_gap` contract.
 2. `#288-B` Codex observability DB + app-server ingestion
 - Introduce `codex_observability.db` and logger.
 - Ingest `commandExecution` / `fileChange` / approval / delta / completion events from app-server.
-- Persist raw payload excerpts and normalized fields for analytics.
+- Persist raw payload excerpts and normalized fields for analytics, including failure/interruption outcomes.
 3. `#288-C` Compatibility projection into EM surfaces
 - Add read adapter for `sm children`, `sm tail`, and parent wake summaries.
 - Ensure Codex sessions report recent actionable tool activity with command/file-change distinction.
 4. `#288-D` Input-capable `sm codex-tui`
 - Add attachable tmux TUI with state panel, event feed, and in-pane composer.
-- Submit input through the same session input endpoint used by `sm send`.
+- Add pending-request queue and structured response actions for approval/user-input requests.
+- Route chat input through existing input endpoint and structured replies through codex-request response endpoint.
 5. `#288-E` Docs, rollout guardrails, and operational defaults
 - Document flags, retention, failure modes, and recovery behavior.
 - Add operator-facing examples for EM workflows and escalation paths.
@@ -192,7 +235,8 @@ Dependency order:
 - Add `sm codex-tui <session_id>` attach flow in tmux with:
 - live state panel
 - event/delta pane
-- direct text composer (Enter to send via existing input API)
+- direct composer mode for chat turns (Enter sends via existing input API)
+- pending request panel for approval/user-input requests (respond via structured request endpoint)
 - Keep existing `sm send` behavior unchanged.
 
 ## Acceptance criteria from user perspective
@@ -200,10 +244,13 @@ Dependency order:
 - I can attach to a Codex session in terminal and see real progress states.
 - I can type and send input directly from that pane.
 - `sm send` and in-pane send both work and are consistent.
+- I can approve/decline tool/file-change requests and submit request-user-input answers from TUI or API with deterministic request IDs.
 - I can tell whether a child is progressing, waiting, blocked, or done without guessing.
 - If session-manager restarts, I can resume and fetch missed Codex events using cursor-based replay from persistent history.
+- If I resume with an old cursor beyond retention, I get an explicit `history_gap` signal (not silent truncation).
 - For `codex-app` sessions, `sm children` and `sm tail` show DB-backed recent tool activity sourced from Codex observability projection.
 - I can distinguish command execution vs file change activity in logs, timeline, and summaries.
+- I can distinguish success vs failed/interrupted/cancelled/timeout outcomes for tool actions and turns.
 - EM-style delegation is practical with Codex sessions at the same operational quality bar as Claude session management.
 
 ## Ticket classification
