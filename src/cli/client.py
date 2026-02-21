@@ -142,6 +142,33 @@ class SessionManagerClient:
         )
         return success, unavailable
 
+    def set_role(self, session_id: str, role: str) -> tuple[bool, bool]:
+        """
+        Set session role tag.
+
+        Returns:
+            Tuple of (success, unavailable)
+        """
+        data, success, unavailable = self._request(
+            "PUT",
+            f"/sessions/{session_id}/role",
+            {"role": role},
+        )
+        return success, unavailable
+
+    def clear_role(self, session_id: str) -> tuple[bool, bool]:
+        """
+        Clear session role tag.
+
+        Returns:
+            Tuple of (success, unavailable)
+        """
+        data, success, unavailable = self._request(
+            "DELETE",
+            f"/sessions/{session_id}/role",
+        )
+        return success, unavailable
+
     def update_task(self, session_id: str, task: str) -> tuple[bool, bool]:
         """
         Update session current task.

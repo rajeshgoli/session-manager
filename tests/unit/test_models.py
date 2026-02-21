@@ -107,6 +107,7 @@ class TestSession:
         assert session.tools_used == {}
         assert session.touched_repos == set()
         assert session.worktrees == []
+        assert session.role is None
 
     def test_tmux_session_auto_generated(self):
         """tmux_session defaults to claude-{id}."""
@@ -397,6 +398,24 @@ class TestSessionIsEmField:
         session = Session(is_em=True)
         assert session.is_em is True
 
+    def test_role_roundtrips_through_to_dict_from_dict(self):
+        """role survives to_dict()/from_dict() round-trip."""
+        session = Session(
+            id="role1234",
+            name="claude-role1234",
+            working_dir="/tmp",
+            tmux_session="claude-role1234",
+            log_file="/tmp/role.log",
+            status=SessionStatus.RUNNING,
+            created_at=datetime(2024, 1, 15, 10, 0, 0),
+            last_activity=datetime(2024, 1, 15, 11, 0, 0),
+            role="architect",
+        )
+        as_dict = session.to_dict()
+        assert as_dict["role"] == "architect"
+        restored = Session.from_dict(as_dict)
+        assert restored.role == "architect"
+
     def test_is_em_roundtrips_through_to_dict_from_dict(self):
         """is_em=True survives to_dict() / from_dict() round-trip."""
         original = Session(
@@ -448,6 +467,23 @@ class TestSessionIsEmField:
         }
         session = Session.from_dict(data)
         assert session.is_em is False
+
+    def test_from_dict_backward_compat_is_em_true_sets_role_em(self):
+        """Legacy state with is_em=true and no role infers role='em'."""
+        data = {
+            "id": "legacyem1",
+            "name": "claude-legacyem1",
+            "working_dir": "/tmp",
+            "tmux_session": "claude-legacyem1",
+            "log_file": "/tmp/legacy-em.log",
+            "status": "running",
+            "created_at": "2024-01-15T10:00:00",
+            "last_activity": "2024-01-15T11:00:00",
+            "is_em": True,
+        }
+        session = Session.from_dict(data)
+        assert session.is_em is True
+        assert session.role == "em"
 
 
 class TestSessionDeliveryState:

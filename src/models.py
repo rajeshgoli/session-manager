@@ -220,6 +220,7 @@ class Session:
 
     # EM role flag (#256): gates directional notify-on-stop
     is_em: bool = False  # Set by sm em; True means only EM→agent sends arm stop notification
+    role: Optional[str] = None  # Session role tag (engineer, architect, scout, em, ...)
 
     # sm remind: self-reported status (#188)
     agent_status_text: Optional[str] = None  # Last sm status "<text>" from agent
@@ -286,6 +287,8 @@ class Session:
             "agent_status_at": self.agent_status_at.isoformat() if self.agent_status_at else None,
             # EM role flag (#256)
             "is_em": self.is_em,
+            # Role tag (#287)
+            "role": self.role,
         }
 
     @classmethod
@@ -361,6 +364,8 @@ class Session:
             agent_status_at=datetime.fromisoformat(data["agent_status_at"]) if data.get("agent_status_at") else None,
             # EM role flag (#256)
             is_em=data.get("is_em", False),
+            # Role tag (#287): backward compat infers em role from legacy is_em
+            role=data.get("role") if data.get("role") is not None else ("em" if data.get("is_em") else None),
         )
 
 
