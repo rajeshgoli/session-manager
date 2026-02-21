@@ -819,6 +819,14 @@ class TestUpdateSession:
         response = test_client.put("/sessions/test123/role", json={"role": "em"})
         assert response.status_code == 400
 
+    def test_put_role_rejects_when_session_is_em(self, test_client, mock_session_manager, sample_session):
+        """PUT /sessions/{id}/role cannot override role while is_em=true."""
+        sample_session.is_em = True
+        sample_session.role = "em"
+        mock_session_manager.get_session.return_value = sample_session
+        response = test_client.put("/sessions/test123/role", json={"role": "engineer"})
+        assert response.status_code == 400
+
     def test_delete_role_clears_role(self, test_client, mock_session_manager, sample_session):
         """DELETE /sessions/{id}/role clears role tag."""
         sample_session.role = "engineer"

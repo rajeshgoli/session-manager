@@ -1254,6 +1254,11 @@ def create_app(
             raise HTTPException(status_code=400, detail="role cannot be empty")
         if role.lower() == "em":
             raise HTTPException(status_code=400, detail='role "em" must be set via sm em')
+        if session.is_em:
+            raise HTTPException(
+                status_code=400,
+                detail="cannot override role for active EM session; use PATCH /sessions/{id} with is_em=false first",
+            )
 
         setter = getattr(app.state.session_manager, "set_role", None)
         if callable(setter):

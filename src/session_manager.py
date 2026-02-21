@@ -29,7 +29,6 @@ ROLE_KEYWORDS = (
     "product",
     "director",
     "ux",
-    "em",
 )
 
 

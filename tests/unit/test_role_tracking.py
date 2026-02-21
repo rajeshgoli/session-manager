@@ -45,6 +45,7 @@ def test_set_role_and_clear_role_roundtrip():
 def test_detect_role_from_prompt_case_insensitive():
     assert SessionManager.detect_role_from_prompt("As engineer, handle this task.") == "engineer"
     assert SessionManager.detect_role_from_prompt("please act As Architect and review") == "architect"
+    assert SessionManager.detect_role_from_prompt("As em, coordinate this") is None
     assert SessionManager.detect_role_from_prompt("no role here") is None
 
 
