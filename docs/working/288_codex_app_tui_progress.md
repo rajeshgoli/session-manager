@@ -68,6 +68,8 @@ Approval and request-user-input response are in scope for this epic. The control
 - `POST /sessions/{id}/input`
 - Used by `sm send` and TUI chat composer mode.
 - Enqueues normal user turns and respects current queue lifecycle.
+- Hard gate: if unresolved structured requests exist for the session, this endpoint returns `409` with explicit error code `pending_structured_request`.
+- `409` payload includes at least the oldest pending item summary: `request_id`, `request_type`, `requested_at`.
 - Structured request-response channel (new, required):
 - `GET /sessions/{id}/codex-pending-requests`
 - `POST /sessions/{id}/codex-requests/{request_id}/respond`
@@ -84,11 +86,28 @@ Correlation/idempotency requirements:
 - repeated submissions return the stored resolved result
 - unknown/expired request returns 404 with explicit error code
 
+Durability/restart requirements:
+
+- Pending structured requests are persisted in SQLite (`codex_pending_requests`) before they are exposed to API/TUI.
+- Minimum stored fields:
+- `request_id` (unique), `session_id`, `thread_id`, `turn_id`, `item_id`, `request_type`
+- `requested_at`, `expires_at` (optional), `status` (`pending|resolved|expired|orphaned`)
+- `request_payload_json`, `resolved_payload_json` (nullable), `resolved_at` (nullable), `resolution_source` (`tui|api|policy`)
+- Resolver path is transactional:
+- `POST .../respond` atomically transitions `pending -> resolved` and stores the response payload used for idempotent replay.
+- App-server response dispatch is driven from that stored resolution (never from unstored transient state).
+- Restart reconciliation:
+- On process start, unresolved rows from prior app-server process generations are marked `orphaned` with explicit `error_code=server_restarted`.
+- `GET .../codex-pending-requests` excludes `orphaned` by default and supports `include_orphaned=true` for audit/debug.
+- If Codex re-emits the same logical request after resume, it is recorded as a new pending row with a new `request_id`.
+- No unresolved request may remain silently pending across restart.
+
 TUI behavior:
 
 - Displays pending structured requests in a dedicated queue with focus shortcuts.
 - Composer has explicit mode (`chat`, `approval`, `input`) so Enter semantics are unambiguous.
 - Normal chat text never attempts to satisfy structured requests automatically.
+- When pending structured requests exist, chat mode send is disabled and the UI shows an explicit action hint to switch to `approval` or `input` mode.
 
 ## Durable event history (required, not optional)
 
@@ -103,6 +122,8 @@ Process restart dropping event history is not acceptable for EM workflows. This 
 - `seq` contract:
 - `seq` is unique for `(session_id, seq)` and starts at `1` for each session
 - assignment is transactional at write time (no duplicate or out-of-order persisted sequence after restart)
+- `seq` exists only for persisted events (`persisted=true`)
+- in-memory-only fallback events use `persisted=false` and `seq=null`
 - Retention policy is bounded:
 - keep recent window per session (count and age caps) so storage growth is controlled
 - API cursor model:
@@ -111,8 +132,11 @@ Process restart dropping event history is not acceptable for EM workflows. This 
 - after restart, client resumes from last seen `seq` and backfills missed events from disk
 - if `since_seq < earliest_seq - 1`, server returns oldest retained page and `history_gap=true` (explicit gap; never silent truncation)
 - Failure model:
-- if persistence write fails, event is still kept in memory and an explicit `event_persist_error` metric/log entry is emitted
-- no silent loss; gap is explicitly detectable via `history_gap` and error telemetry
+- if persistence write fails, event is still emitted to the hot ring with `persisted=false`, `seq=null`, and an explicit `event_persist_error` metric/log entry is emitted
+- cursor API (`since_seq`) returns persisted events only; it never fabricates sequence numbers for unpersisted events
+- while any unpersisted event exists after client cursor, response sets `history_gap=true` with `gap_reason=persistence_error`
+- once persistence recovers, server writes a synthetic persisted marker event (`event_persist_recovered`) so clients can anchor the degraded window in timeline audit
+- no silent loss: degraded windows are explicitly detectable via `history_gap`, `gap_reason`, and telemetry
 
 EM benefit:
 
@@ -204,32 +228,39 @@ This should be delivered as an epic with sequenced tickets.
 - Add `activity_state` computation for `codex-app` sessions.
 - Add durable event persistence and cursor replay API (`since_seq` model).
 - Guarantee restart continuity for turn-level timeline with explicit `history_gap` contract.
-2. `#288-B` Codex observability DB + app-server ingestion
+2. `#288-B` Structured request ledger + response APIs
+- Add persistent `codex_pending_requests` store and request lifecycle state machine.
+- Add `GET /sessions/{id}/codex-pending-requests` and `POST /sessions/{id}/codex-requests/{request_id}/respond`.
+- Implement idempotent response replay and restart orphaning policy.
+- Gate `POST /sessions/{id}/input` with explicit `409 pending_structured_request` when unresolved structured requests exist.
+3. `#288-C` Codex observability DB + app-server ingestion
 - Introduce `codex_observability.db` and logger.
 - Ingest `commandExecution` / `fileChange` / approval / delta / completion events from app-server.
 - Persist raw payload excerpts and normalized fields for analytics, including failure/interruption outcomes.
-3. `#288-C` Compatibility projection into EM surfaces
+4. `#288-D` Compatibility projection into EM surfaces
 - Add read adapter for `sm children`, `sm tail`, and parent wake summaries.
 - Ensure Codex sessions report recent actionable tool activity with command/file-change distinction.
-4. `#288-D` Input-capable `sm codex-tui`
+5. `#288-E` Input-capable `sm codex-tui`
 - Add attachable tmux TUI with state panel, event feed, and in-pane composer.
 - Add pending-request queue and structured response actions for approval/user-input requests.
 - Route chat input through existing input endpoint and structured replies through codex-request response endpoint.
-5. `#288-E` Docs, rollout guardrails, and operational defaults
+6. `#288-F` Docs, rollout guardrails, and operational defaults
 - Document flags, retention, failure modes, and recovery behavior.
 - Add operator-facing examples for EM workflows and escalation paths.
 
 Dependency order:
 
-- `#288-A` and `#288-B` first (data plane).
-- `#288-C` next (CLI/EM integration).
-- `#288-D` after data plane is stable.
-- `#288-E` final hardening and rollout guidance.
+- `#288-A` and `#288-B` first (state/control plane correctness).
+- `#288-C` next (observability ingestion).
+- `#288-D` after observability schema is stable.
+- `#288-E` after control + data planes are stable.
+- `#288-F` final hardening and rollout guidance.
 
 ## Implementation shape (epic summary)
 
 - Add computed `activity_state` on session responses for Codex.
 - Add Codex event stream with durable storage plus hot in-memory ring for low-latency rendering.
+- Add durable structured-request ledger with idempotent response API and restart orphan reconciliation.
 - Add Codex observability logger and `codex_observability.db` with command/file-change lifecycle capture.
 - Add projection adapter so `sm children` and `sm tail` work for Codex sessions with no user workflow break.
 - Add `sm codex-tui <session_id>` attach flow in tmux with:
@@ -245,9 +276,11 @@ Dependency order:
 - I can type and send input directly from that pane.
 - `sm send` and in-pane send both work and are consistent.
 - I can approve/decline tool/file-change requests and submit request-user-input answers from TUI or API with deterministic request IDs.
+- If unresolved approval/input requests exist, normal chat send is rejected with explicit `pending_structured_request` guidance instead of being silently queued.
 - I can tell whether a child is progressing, waiting, blocked, or done without guessing.
 - If session-manager restarts, I can resume and fetch missed Codex events using cursor-based replay from persistent history.
 - If I resume with an old cursor beyond retention, I get an explicit `history_gap` signal (not silent truncation).
+- If session-manager restarts while structured requests are open, I get explicit orphaned-request visibility (no silent hanging pending state).
 - For `codex-app` sessions, `sm children` and `sm tail` show DB-backed recent tool activity sourced from Codex observability projection.
 - I can distinguish command execution vs file change activity in logs, timeline, and summaries.
 - I can distinguish success vs failed/interrupted/cancelled/timeout outcomes for tool actions and turns.
