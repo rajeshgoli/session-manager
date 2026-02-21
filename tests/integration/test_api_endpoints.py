@@ -88,6 +88,7 @@ class TestSessionEndpoints:
     def test_list_sessions(self, test_client, mock_session_manager, sample_session):
         """GET /sessions returns session list."""
         mock_session_manager.list_sessions.return_value = [sample_session]
+        mock_session_manager.get_activity_state.return_value = "working"
 
         response = test_client.get("/sessions")
         assert response.status_code == 200
@@ -97,6 +98,7 @@ class TestSessionEndpoints:
         assert len(data["sessions"]) == 1
         assert data["sessions"][0]["id"] == "test123"
         assert data["sessions"][0]["friendly_name"] == "Test Session"
+        assert data["sessions"][0]["activity_state"] == "working"
 
     def test_list_sessions_empty(self, test_client, mock_session_manager):
         """GET /sessions returns empty list when no sessions."""
@@ -111,6 +113,7 @@ class TestSessionEndpoints:
     def test_get_session(self, test_client, mock_session_manager, sample_session):
         """GET /sessions/{id} returns session details."""
         mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.get_activity_state.return_value = "thinking"
 
         response = test_client.get("/sessions/test123")
         assert response.status_code == 200
@@ -120,6 +123,7 @@ class TestSessionEndpoints:
         assert data["name"] == "test-session"
         assert data["status"] == "running"
         assert data["friendly_name"] == "Test Session"
+        assert data["activity_state"] == "thinking"
 
     def test_get_session_not_found(self, test_client, mock_session_manager):
         """GET /sessions/{id} returns 404 for unknown session."""
@@ -127,6 +131,47 @@ class TestSessionEndpoints:
 
         response = test_client.get("/sessions/unknown")
         assert response.status_code == 404
+
+    def test_get_codex_events_success(self, test_client, mock_session_manager):
+        """GET /sessions/{id}/codex-events returns codex event page."""
+        codex_session = Session(
+            id="codex123",
+            name="codex-app-codex123",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = codex_session
+        mock_session_manager.get_codex_events.return_value = {
+            "events": [
+                {
+                    "session_id": "codex123",
+                    "seq": 1,
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                    "event_type": "turn_started",
+                    "turn_id": "turn-1",
+                    "payload_preview": {},
+                    "persisted": True,
+                }
+            ],
+            "earliest_seq": 1,
+            "latest_seq": 1,
+            "next_seq": 2,
+            "history_gap": False,
+            "gap_reason": None,
+        }
+
+        response = test_client.get("/sessions/codex123/codex-events?since_seq=0&limit=50")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["latest_seq"] == 1
+        assert data["events"][0]["event_type"] == "turn_started"
+
+    def test_get_codex_events_rejects_non_codex_app(self, test_client, mock_session_manager, sample_session):
+        """GET /sessions/{id}/codex-events rejects non-codex-app sessions."""
+        mock_session_manager.get_session.return_value = sample_session
+        response = test_client.get("/sessions/test123/codex-events")
+        assert response.status_code == 400
 
     def test_create_session(self, test_client, mock_session_manager, sample_session):
         """POST /sessions creates new session."""
