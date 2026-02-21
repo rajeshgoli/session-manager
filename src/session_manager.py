@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
@@ -12,6 +13,7 @@ from .models import Session, SessionStatus, NotificationEvent, DeliveryResult, R
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
 from .codex_event_store import CodexEventStore
+from .codex_request_ledger import CodexRequestLedger
 from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_pr_repo_from_git
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,7 @@ class SessionManager:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = Path(state_file)
         self.config = config or {}
+        self.process_generation = uuid.uuid4().hex[:12]
 
         self.tmux = TmuxController(log_dir=log_dir)
         self.sessions: dict[str, Session] = {}
@@ -79,6 +82,12 @@ class SessionManager:
             retention_max_age_days=codex_events_config.get("retention_max_age_days", 14),
             prune_every_writes=codex_events_config.get("prune_every_writes", 200),
             payload_preview_chars=codex_events_config.get("payload_preview_chars", 1500),
+        )
+
+        default_requests_db = str(self.state_file.with_name("codex_requests.db"))
+        self.codex_request_ledger = CodexRequestLedger(
+            db_path=self.config.get("codex_requests", {}).get("db_path", default_requests_db),
+            process_generation=self.process_generation,
         )
 
         # Message queue manager (set by main app)
@@ -1073,20 +1082,49 @@ class SessionManager:
         request_id: int,
         method: str,
         params: dict,
-    ):
+    ) -> Optional[dict]:
         """Track codex-app server requests as lifecycle events for observability/activity state."""
         now = datetime.now()
         state_name = None
         event_type = "server_request"
+        request_type = "server_request"
+        policy_payload: Optional[dict] = None
         if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
             state_name = "waiting_permission"
             event_type = "request_approval"
+            request_type = "request_approval"
+            policy_payload = {"decision": "decline"}
         elif method == "item/tool/requestUserInput":
             state_name = "waiting_input"
             event_type = "request_user_input"
+            request_type = "request_user_input"
+            policy_payload = {"answers": {}}
 
         if state_name:
             self.codex_wait_states[session_id] = (state_name, now)
+
+        codex_session = self.codex_sessions.get(session_id)
+        thread_id = codex_session.thread_id if codex_session else None
+        item = params.get("item", {}) if isinstance(params.get("item"), dict) else {}
+        turn_id = params.get("turnId")
+        item_id = item.get("id")
+
+        if policy_payload is not None:
+            pending = await self.codex_request_ledger.register_request(
+                session_id=session_id,
+                rpc_request_id=request_id,
+                request_method=method,
+                request_payload=params,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item_id,
+                request_type=request_type,
+                timeout_seconds=self.codex_config.request_timeout_seconds,
+                policy_payload=policy_payload,
+            )
+            request_ledger_id = pending["request_id"]
+        else:
+            request_ledger_id = None
 
         self.codex_event_store.append_event(
             session_id=session_id,
@@ -1094,9 +1132,17 @@ class SessionManager:
             turn_id=params.get("turnId"),
             payload={
                 "request_id": request_id,
+                "ledger_request_id": request_ledger_id,
                 "method": method,
             },
         )
+
+        if request_ledger_id:
+            resolved = await self.codex_request_ledger.wait_for_resolution(request_ledger_id)
+            self.codex_wait_states.pop(session_id, None)
+            return resolved
+
+        return None
 
     def get_activity_state(self, session_or_id: Session | str) -> str:
         """Get computed activity state for API consumers."""
@@ -1136,6 +1182,34 @@ class SessionManager:
         """Read persisted codex event timeline for one session."""
         return self.codex_event_store.get_events(session_id=session_id, since_seq=since_seq, limit=limit)
 
+    def list_codex_pending_requests(self, session_id: str, include_orphaned: bool = False) -> list[dict]:
+        """List pending structured requests for a codex-app session."""
+        return self.codex_request_ledger.list_requests(session_id=session_id, include_orphaned=include_orphaned)
+
+    async def respond_codex_request(self, session_id: str, request_id: str, response_payload: dict) -> dict:
+        """Resolve one structured request for a codex-app session."""
+        request = self.codex_request_ledger.get_request(request_id)
+        if not request or request.get("session_id") != session_id:
+            return {
+                "ok": False,
+                "http_status": 404,
+                "error_code": "request_not_found",
+                "error_message": "request id not found for session",
+            }
+        return await self.codex_request_ledger.resolve_request(
+            request_id=request_id,
+            response_payload=response_payload,
+            resolution_source="api",
+        )
+
+    def has_pending_codex_requests(self, session_id: str) -> bool:
+        """Return True when unresolved structured codex requests block chat input."""
+        return self.codex_request_ledger.has_pending_requests(session_id=session_id)
+
+    def oldest_pending_codex_request(self, session_id: str) -> Optional[dict]:
+        """Return oldest pending request summary for explicit input-gate error payloads."""
+        return self.codex_request_ledger.oldest_pending_summary(session_id=session_id)
+
     async def clear_session(self, session_id: str, new_prompt: Optional[str] = None) -> bool:
         """Clear/reset a session's context (Claude: /clear, Codex: /new, Codex app: new thread)."""
         session = self.sessions.get(session_id)
@@ -1147,6 +1221,7 @@ class SessionManager:
             if not codex_session:
                 return False
             try:
+                self.codex_request_ledger.orphan_pending_for_session(session_id, error_code="thread_reset")
                 self.codex_turns_in_flight.discard(session_id)
                 self.codex_active_turn_ids.pop(session_id, None)
                 self.codex_last_delta_at.pop(session_id, None)
@@ -1291,6 +1366,7 @@ class SessionManager:
                     loop.create_task(codex_session.close())
                 except RuntimeError:
                     asyncio.run(codex_session.close())
+            self.codex_request_ledger.orphan_pending_for_session(session_id)
             self.codex_turns_in_flight.discard(session_id)
             self.codex_active_turn_ids.pop(session_id, None)
             self.codex_last_delta_at.pop(session_id, None)

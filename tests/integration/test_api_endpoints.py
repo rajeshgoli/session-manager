@@ -173,6 +173,77 @@ class TestSessionEndpoints:
         response = test_client.get("/sessions/test123/codex-events")
         assert response.status_code == 400
 
+    def test_list_codex_pending_requests(self, test_client, mock_session_manager):
+        """GET /sessions/{id}/codex-pending-requests lists pending structured requests."""
+        codex_session = Session(
+            id="codexpending",
+            name="codex-app-codexpending",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = codex_session
+        mock_session_manager.list_codex_pending_requests.return_value = [
+            {
+                "request_id": "req-123",
+                "request_type": "request_approval",
+                "status": "pending",
+                "requested_at": "2026-02-21T00:00:00+00:00",
+            }
+        ]
+
+        response = test_client.get("/sessions/codexpending/codex-pending-requests")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["requests"]) == 1
+        assert data["requests"][0]["request_id"] == "req-123"
+
+    def test_respond_codex_request(self, test_client, mock_session_manager):
+        """POST /sessions/{id}/codex-requests/{request_id}/respond resolves request."""
+        codex_session = Session(
+            id="codexresp",
+            name="codex-app-codexresp",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = codex_session
+        mock_session_manager.respond_codex_request = AsyncMock(
+            return_value={
+                "ok": True,
+                "idempotent": False,
+                "request": {
+                    "request_id": "req-55",
+                    "resolved_payload": {"decision": "accept"},
+                    "status": "resolved",
+                },
+            }
+        )
+
+        response = test_client.post(
+            "/sessions/codexresp/codex-requests/req-55/respond",
+            json={"decision": "accept"},
+        )
+        assert response.status_code == 200
+        assert response.json()["request"]["status"] == "resolved"
+
+    def test_respond_codex_request_rejects_ambiguous_payload(self, test_client, mock_session_manager):
+        """POST /sessions/{id}/codex-requests/{request_id}/respond requires one payload shape."""
+        codex_session = Session(
+            id="codexresp2",
+            name="codex-app-codexresp2",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = codex_session
+
+        response = test_client.post(
+            "/sessions/codexresp2/codex-requests/req-99/respond",
+            json={"decision": "accept", "answers": {"k": "v"}},
+        )
+        assert response.status_code == 422
+
     def test_create_session(self, test_client, mock_session_manager, sample_session):
         """POST /sessions creates new session."""
         mock_session_manager.create_session = AsyncMock(return_value=sample_session)
@@ -230,6 +301,29 @@ class TestSessionEndpoints:
         data = response.json()
         assert data["status"] == "delivered"
         assert data["session_id"] == "test123"
+
+    def test_send_input_codex_app_with_pending_structured_request_returns_409(self, test_client, mock_session_manager):
+        """POST /sessions/{id}/input is blocked for codex-app when structured requests are pending."""
+        codex_session = Session(
+            id="codexpend",
+            name="codex-app-codexpend",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = codex_session
+        mock_session_manager.has_pending_codex_requests.return_value = True
+        mock_session_manager.oldest_pending_codex_request.return_value = {
+            "request_id": "req-1",
+            "request_type": "request_approval",
+            "requested_at": "2026-02-21T00:00:00+00:00",
+        }
+
+        response = test_client.post("/sessions/codexpend/input", json={"text": "continue"})
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "pending_structured_request"
+        assert detail["pending_request"]["request_id"] == "req-1"
 
     def test_send_input_queued(self, test_client, mock_session_manager, sample_session):
         """POST /sessions/{id}/input returns queued status."""

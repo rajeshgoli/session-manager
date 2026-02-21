@@ -249,8 +249,9 @@ class TestServerRequestCallbacks:
     """Ensure server-request callbacks are emitted for lifecycle tracking."""
 
     @pytest.mark.asyncio
-    async def test_server_request_callback_invoked(self, config):
+    async def test_server_request_callback_response_is_forwarded(self, config):
         callback = AsyncMock()
+        callback.return_value = {"decision": "accept"}
         session = CodexAppServerSession(
             session_id="test-server-request",
             working_dir="/tmp",
@@ -274,6 +275,30 @@ class TestServerRequestCallbacks:
             "item/commandExecution/requestApproval",
             {"turnId": "turn-1"},
         )
+        session._send.assert_awaited_once_with(
+            {"jsonrpc": "2.0", "id": 42, "result": {"decision": "accept"}}
+        )
+
+    @pytest.mark.asyncio
+    async def test_server_request_without_callback_response_returns_error(self, config):
+        session = CodexAppServerSession(
+            session_id="test-server-request-error",
+            working_dir="/tmp",
+            config=config,
+            on_turn_complete=AsyncMock(),
+        )
+        session._send = AsyncMock()
+
+        message = {
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "item/tool/requestUserInput",
+            "params": {"turnId": "turn-2"},
+        }
+        await session._handle_server_request(message)
+        sent = session._send.call_args.args[0]
+        assert sent["id"] == 77
+        assert sent["error"]["code"] == -32601
 
 
 # ---------------------------------------------------------------------------

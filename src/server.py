@@ -111,6 +111,12 @@ class SendInputRequest(BaseModel):
     parent_session_id: Optional[str] = None  # EM session to wake periodically after delivery (#225-C)
 
 
+class CodexRequestRespondRequest(BaseModel):
+    """Structured response payload for codex request resolution."""
+    decision: Optional[Literal["accept", "acceptForSession", "decline", "cancel"]] = None
+    answers: Optional[Dict[str, Any]] = None
+
+
 class PeriodicRemindRequest(BaseModel):
     """Request to register a periodic remind for a session (#188)."""
     soft_threshold: int
@@ -1040,6 +1046,77 @@ def create_app(
 
         return getter(session_id=session_id, since_seq=since_seq, limit=limit)
 
+    @app.get("/sessions/{session_id}/codex-pending-requests")
+    async def list_codex_pending_requests(
+        session_id: str,
+        include_orphaned: bool = Query(default=False),
+    ):
+        """List pending structured codex requests for a codex-app session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if getattr(session, "provider", "claude") != "codex-app":
+            raise HTTPException(status_code=400, detail="codex requests supported only for provider=codex-app")
+
+        lister = getattr(app.state.session_manager, "list_codex_pending_requests", None)
+        if not callable(lister):
+            raise HTTPException(status_code=503, detail="Codex request ledger not configured")
+
+        return {
+            "requests": lister(session_id=session_id, include_orphaned=include_orphaned),
+        }
+
+    @app.post("/sessions/{session_id}/codex-requests/{request_id}/respond")
+    async def respond_codex_request(
+        session_id: str,
+        request_id: str,
+        request: CodexRequestRespondRequest,
+    ):
+        """Resolve one pending codex structured request by request id."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if getattr(session, "provider", "claude") != "codex-app":
+            raise HTTPException(status_code=400, detail="codex requests supported only for provider=codex-app")
+
+        resolver = getattr(app.state.session_manager, "respond_codex_request", None)
+        if not callable(resolver):
+            raise HTTPException(status_code=503, detail="Codex request ledger not configured")
+
+        response_payload: Optional[dict[str, Any]] = None
+        if request.decision is not None and request.answers is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="response payload must include exactly one of decision or answers",
+            )
+        if request.decision is not None:
+            response_payload = {"decision": request.decision}
+        elif request.answers is not None:
+            response_payload = {"answers": request.answers}
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="response payload must include exactly one of decision or answers",
+            )
+
+        result = await resolver(session_id=session_id, request_id=request_id, response_payload=response_payload)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=result.get("http_status", 400),
+                detail={
+                    "error_code": result.get("error_code", "request_resolution_failed"),
+                    "message": result.get("error_message", "failed to resolve request"),
+                },
+            )
+
+        return result
+
     @app.patch("/sessions/{session_id}", response_model=SessionResponse)
     async def update_session(
         session_id: str,
@@ -1214,6 +1291,20 @@ def create_app(
         session = app.state.session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        if getattr(session, "provider", "claude") == "codex-app":
+            has_pending = getattr(app.state.session_manager, "has_pending_codex_requests", None)
+            oldest_pending = getattr(app.state.session_manager, "oldest_pending_codex_request", None)
+            if callable(has_pending) and has_pending(session_id):
+                summary = oldest_pending(session_id) if callable(oldest_pending) else None
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": "pending_structured_request",
+                        "message": "structured codex request pending; resolve request before chat input",
+                        "pending_request": summary,
+                    },
+                )
 
         result = await app.state.session_manager.send_input(
             session_id,

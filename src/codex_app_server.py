@@ -48,7 +48,7 @@ class CodexAppServerSession:
         on_turn_started: Optional[Callable[[str, str], Awaitable[None]]] = None,
         on_turn_delta: Optional[Callable[[str, str, str], Awaitable[None]]] = None,
         on_review_complete: Optional[Callable[[str, str], Awaitable[None]]] = None,
-        on_server_request: Optional[Callable[[str, int, str, dict[str, Any]], Awaitable[None]]] = None,
+        on_server_request: Optional[Callable[[str, int, str, dict[str, Any]], Awaitable[Optional[dict[str, Any]]]]] = None,
     ):
         self.session_id = session_id
         self.working_dir = working_dir
@@ -389,20 +389,10 @@ class CodexAppServerSession:
         params = message.get("params", {})
 
         if self.on_server_request and isinstance(req_id, int):
-            await self.on_server_request(self.session_id, req_id, method, params)
-
-        # Auto-handle approval requests
-        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-            decision = self.config.approval_decision
-            response = {"decision": decision}
-            await self._send({"jsonrpc": "2.0", "id": req_id, "result": response})
-            return
-
-        if method == "item/tool/requestUserInput":
-            # Respond with empty answers to avoid blocking
-            response = {"answers": {}}
-            await self._send({"jsonrpc": "2.0", "id": req_id, "result": response})
-            return
+            response = await self.on_server_request(self.session_id, req_id, method, params)
+            if response is not None:
+                await self._send({"jsonrpc": "2.0", "id": req_id, "result": response})
+                return
 
         # Unknown / unsupported request: return error
         error = {
