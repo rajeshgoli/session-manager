@@ -316,6 +316,18 @@ class SessionManagerClient:
             return None
         return data
 
+    def get_activity_actions(self, session_id: str, limit: int = 10) -> Optional[dict]:
+        """
+        Get projected activity actions for a codex-app session.
+
+        Returns:
+            Dict with actions list or None if unavailable/API error
+        """
+        data, success, unavailable = self._request("GET", f"/sessions/{session_id}/activity-actions?limit={limit}")
+        if unavailable or not success:
+            return None
+        return data
+
     def kill_session(
         self,
         requester_session_id: Optional[str],

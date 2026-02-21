@@ -173,6 +173,60 @@ class TestSessionEndpoints:
         response = test_client.get("/sessions/test123/codex-events")
         assert response.status_code == 400
 
+    def test_get_codex_activity_actions_success(self, test_client, mock_session_manager):
+        """GET /sessions/{id}/activity-actions returns projected actions for codex-app."""
+        codex_session = Session(
+            id="codexproj",
+            name="codex-app-codexproj",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = codex_session
+        mock_session_manager.get_codex_activity_actions.return_value = [
+            {
+                "source_provider": "codex-app",
+                "action_kind": "command",
+                "summary_text": "Started: pytest -q",
+                "status": "running",
+                "started_at": "2026-02-21T00:00:00+00:00",
+                "ended_at": None,
+                "session_id": "codexproj",
+                "turn_id": "turn-1",
+                "item_id": "item-1",
+            }
+        ]
+
+        response = test_client.get("/sessions/codexproj/activity-actions?limit=5")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["actions"]) == 1
+        assert data["actions"][0]["action_kind"] == "command"
+
+    def test_list_children_includes_codex_activity_projection(self, test_client, mock_session_manager):
+        """GET /sessions/{parent}/children includes activity projection for codex-app children."""
+        child = Session(
+            id="childcodex1",
+            name="codex-app-childcodex1",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+            parent_session_id="parent123",
+        )
+        mock_session_manager.list_sessions.return_value = [child]
+        mock_session_manager.get_codex_latest_activity_action.return_value = {
+            "summary_text": "Started: pytest -q",
+            "status": "running",
+            "started_at": "2026-02-21T00:00:00+00:00",
+            "ended_at": None,
+        }
+
+        response = test_client.get("/sessions/parent123/children")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["children"]) == 1
+        assert data["children"][0]["activity_projection"]["summary_text"] == "Started: pytest -q"
+
     def test_list_codex_pending_requests(self, test_client, mock_session_manager):
         """GET /sessions/{id}/codex-pending-requests lists pending structured requests."""
         codex_session = Session(

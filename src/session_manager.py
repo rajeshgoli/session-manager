@@ -12,6 +12,7 @@ from typing import Optional, Callable, Awaitable, Any
 from .models import Session, SessionStatus, NotificationEvent, DeliveryResult, ReviewConfig
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
+from .codex_activity_projection import CodexActivityProjection
 from .codex_event_store import CodexEventStore
 from .codex_observability_logger import CodexObservabilityLogger
 from .codex_request_ledger import CodexRequestLedger
@@ -105,6 +106,7 @@ class SessionManager:
             payload_max_chars=codex_observability_config.get("payload_max_chars", 4000),
             prune_interval_seconds=codex_observability_config.get("prune_interval_seconds", 3600),
         )
+        self.codex_activity_projection = CodexActivityProjection(self.codex_observability_logger)
 
         # Message queue manager (set by main app)
         self.message_queue_manager = None
@@ -1390,6 +1392,14 @@ class SessionManager:
     def get_codex_events(self, session_id: str, since_seq: Optional[int] = None, limit: int = 200) -> dict:
         """Read persisted codex event timeline for one session."""
         return self.codex_event_store.get_events(session_id=session_id, since_seq=since_seq, limit=limit)
+
+    def get_codex_activity_actions(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Return provider-neutral projected codex-app actions for CLI surfaces."""
+        return self.codex_activity_projection.recent_actions(session_id=session_id, limit=limit)
+
+    def get_codex_latest_activity_action(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return latest provider-neutral projected codex-app action summary."""
+        return self.codex_activity_projection.latest_action(session_id=session_id)
 
     def list_codex_pending_requests(self, session_id: str, include_orphaned: bool = False) -> list[dict]:
         """List pending structured requests for a codex-app session."""

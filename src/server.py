@@ -1046,6 +1046,27 @@ def create_app(
 
         return getter(session_id=session_id, since_seq=since_seq, limit=limit)
 
+    @app.get("/sessions/{session_id}/activity-actions")
+    async def get_codex_activity_actions(
+        session_id: str,
+        limit: int = Query(default=20, ge=1, le=200),
+    ):
+        """Get provider-neutral projected activity actions for a codex-app session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if getattr(session, "provider", "claude") != "codex-app":
+            raise HTTPException(status_code=400, detail="activity actions supported only for provider=codex-app")
+
+        getter = getattr(app.state.session_manager, "get_codex_activity_actions", None)
+        if not callable(getter):
+            raise HTTPException(status_code=503, detail="Codex activity projection not configured")
+
+        return {"actions": getter(session_id=session_id, limit=limit)}
+
     @app.get("/sessions/{session_id}/codex-pending-requests")
     async def list_codex_pending_requests(
         session_id: str,
@@ -2359,9 +2380,14 @@ Or continue working if not done yet."""
                 all_descendants.extend(grandchildren)
             children = all_descendants
 
-        return {
-            "parent_session_id": parent_session_id,
-            "children": [
+        latest_action_getter = getattr(app.state.session_manager, "get_codex_latest_activity_action", None)
+        children_payload = []
+        for s in children:
+            provider = getattr(s, "provider", "claude")
+            activity_projection = None
+            if provider == "codex-app" and callable(latest_action_getter):
+                activity_projection = latest_action_getter(s.id)
+            children_payload.append(
                 {
                     "id": s.id,
                     "name": s.name,
@@ -2375,10 +2401,14 @@ Or continue working if not done yet."""
                     # sm remind: self-reported status (#188)
                     "agent_status_text": s.agent_status_text,
                     "agent_status_at": s.agent_status_at.isoformat() if s.agent_status_at else None,
-                    "provider": getattr(s, "provider", "claude"),
+                    "provider": provider,
+                    "activity_projection": activity_projection,
                 }
-                for s in children
-            ],
+            )
+
+        return {
+            "parent_session_id": parent_session_id,
+            "children": children_payload,
         }
 
     @app.post("/sessions/{target_session_id}/kill")

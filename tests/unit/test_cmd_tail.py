@@ -322,3 +322,39 @@ class TestStructuredModeOutput:
         captured = capsys.readouterr()
         assert "test-agent" in captured.out
         assert "abc12345" in captured.out  # 8-char prefix of session_id
+
+
+class TestCodexAppProjection:
+    def test_codex_app_structured_mode_uses_activity_projection(self, capsys):
+        client, session = _make_client(session_id="codexapp1", friendly_name="codex-worker")
+        session["provider"] = "codex-app"
+        client.get_session.return_value = session
+        client.list_sessions.return_value = [session]
+        client.get_activity_actions.return_value = {
+            "actions": [
+                {
+                    "summary_text": "Started: pytest -q",
+                    "status": "running",
+                    "started_at": datetime.utcnow().isoformat(),
+                    "ended_at": None,
+                }
+            ]
+        }
+
+        rc = cmd_tail(client, "codexapp1", n=5)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Started: pytest -q" in out
+        assert "[running]" in out
+
+    def test_codex_app_structured_mode_no_actions(self, capsys):
+        client, session = _make_client(session_id="codexapp2", friendly_name="codex-worker")
+        session["provider"] = "codex-app"
+        client.get_session.return_value = session
+        client.list_sessions.return_value = [session]
+        client.get_activity_actions.return_value = {"actions": []}
+
+        rc = cmd_tail(client, "codexapp2", n=5)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "No activity data" in out

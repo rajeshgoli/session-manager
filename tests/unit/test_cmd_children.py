@@ -77,6 +77,7 @@ def _child(
     agent_status_text: str = None,
     agent_status_at: str = None,
     completion_message: str = None,
+    activity_projection: dict = None,
 ) -> dict:
     if last_activity is None:
         last_activity = datetime.utcnow().isoformat()
@@ -91,6 +92,7 @@ def _child(
         "agent_status_text": agent_status_text,
         "agent_status_at": agent_status_at,
         "completion_message": completion_message,
+        "activity_projection": activity_projection,
     }
 
 
@@ -259,8 +261,27 @@ class TestCmdChildrenOutput:
         assert "last tool: n/a (no hooks)" in out
         assert "thinking" in out
 
-    def test_codex_app_session_skips_signals(self, tmp_path, capsys):
-        child = _child(child_id="ccc00000003", provider="codex-app", status="running")
+    def test_codex_app_session_uses_activity_projection(self, tmp_path, capsys):
+        child = _child(
+            child_id="ccc00000003",
+            provider="codex-app",
+            status="running",
+            activity_projection={
+                "summary_text": "Started: git status",
+                "started_at": datetime.utcnow().isoformat(),
+            },
+        )
+        client = _make_client([child])
+
+        rc = cmd_children(client, "parent1", db_path=str(tmp_path / "tool_usage.db"))
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "thinking" in out
+        assert "last action: Started: git status" in out
+
+    def test_codex_app_without_projection_skips_signals(self, tmp_path, capsys):
+        child = _child(child_id="ccc00000004", provider="codex-app", status="running", activity_projection=None)
         client = _make_client([child])
 
         rc = cmd_children(client, "parent1", db_path=str(tmp_path / "tool_usage.db"))
@@ -268,7 +289,7 @@ class TestCmdChildrenOutput:
 
         assert rc == 0
         assert "thinking" not in out
-        assert "last tool" not in out
+        assert "last action" not in out
 
     def test_idle_session_no_thinking_columns(self, tmp_path, capsys):
         child = _child(child_id="ddd00000004", provider="claude", status="idle")

@@ -1333,7 +1333,16 @@ def cmd_children(
         resolved_db = str(Path(db_path or _TOOL_DB_DEFAULT).expanduser())
         db_warned = False
 
-        now_utc = datetime.utcnow()
+        def _seconds_since(ts: str) -> Optional[int]:
+            try:
+                parsed = datetime.fromisoformat(ts)
+                if parsed.tzinfo is None:
+                    now = datetime.utcnow()
+                else:
+                    now = datetime.now(parsed.tzinfo)
+                return max(0, int((now - parsed).total_seconds()))
+            except Exception:
+                return None
 
         for child in children:
             name = child.get("friendly_name") or child["name"]
@@ -1361,6 +1370,7 @@ def cmd_children(
             if raw_status == "running":
                 thinking_str = None
                 last_tool_str = None
+                last_label = "last tool"
 
                 if provider == "claude":
                     db_ok = Path(resolved_db).exists()
@@ -1381,9 +1391,8 @@ def cmd_children(
                                 db_warned = True
                         elif row:
                             ts = row["timestamp_str"]
-                            try:
-                                last_ts = datetime.fromisoformat(ts)
-                                delta_s = max(0, int((now_utc - last_ts).total_seconds()))
+                            delta_s = _seconds_since(ts)
+                            if delta_s is not None:
                                 thinking_str = _format_thinking_duration(delta_s)
                                 # Format last tool detail
                                 tool_name = row["tool_name"]
@@ -1394,8 +1403,6 @@ def cmd_children(
                                     last_tool_str = f"{tool_name} {row['target_file']} ({_format_thinking_duration(delta_s)} ago)"
                                 else:
                                     last_tool_str = f"{tool_name} ({_format_thinking_duration(delta_s)} ago)"
-                            except Exception:
-                                pass
 
                 elif provider == "codex":
                     tmux_name = f"codex-{child_id}"
@@ -1405,12 +1412,24 @@ def cmd_children(
                         thinking_str = _format_thinking_duration(delta_s)
                     last_tool_str = "n/a (no hooks)"
 
-                # codex-app: skip both signals
+                elif provider == "codex-app":
+                    projection = child.get("activity_projection")
+                    if isinstance(projection, dict):
+                        summary = projection.get("summary_text")
+                        ts = projection.get("ended_at") or projection.get("started_at")
+                        if isinstance(summary, str) and summary:
+                            delta_s = _seconds_since(ts) if isinstance(ts, str) else None
+                            if delta_s is not None:
+                                thinking_str = _format_thinking_duration(delta_s)
+                                last_tool_str = f"{summary} ({_format_thinking_duration(delta_s)} ago)"
+                            else:
+                                last_tool_str = summary
+                            last_label = "last action"
 
                 if thinking_str is not None:
                     line += f" | thinking {thinking_str}"
                 if last_tool_str is not None:
-                    line += f" | last tool: {last_tool_str}"
+                    line += f" | {last_label}: {last_tool_str}"
 
             # Append agent status / completion (unchanged #188 logic)
             if agent_status_text:
@@ -1772,6 +1791,24 @@ def cmd_tail(
     name = session.get("friendly_name") or session.get("name") or session_id
     provider = session.get("provider", "claude")
 
+    def _relative_age(ts_str: Optional[str]) -> str:
+        if not ts_str:
+            return "?"
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                now = datetime.utcnow()
+            else:
+                now = datetime.now(ts.tzinfo)
+            delta_s = int((now - ts).total_seconds())
+            if delta_s < 60:
+                return f"{delta_s}s"
+            if delta_s < 3600:
+                return f"{delta_s // 60}m{delta_s % 60:02d}s"
+            return f"{delta_s // 3600}h{(delta_s % 3600) // 60}m"
+        except Exception:
+            return "?"
+
     # --- Raw mode ---
     if raw:
         if provider == "codex-app":
@@ -1798,6 +1835,25 @@ def cmd_tail(
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         clean = ansi_escape.sub('', output)
         print(clean, end="")
+        return 0
+
+    if provider == "codex-app":
+        projected = client.get_activity_actions(session_id, limit=n)
+        if projected is None:
+            print("Error: Failed to fetch codex-app activity projection", file=sys.stderr)
+            return 1
+        actions = projected.get("actions", [])
+        if not actions:
+            print(f"No activity data for {name} ({session_id})")
+            return 0
+
+        print(f"Last {len(actions)} actions ({name} {session_id[:8]}):")
+        for action in actions:
+            elapsed = _relative_age(action.get("ended_at") or action.get("started_at"))
+            summary = action.get("summary_text") or action.get("action_kind") or "activity"
+            status = action.get("status")
+            status_suffix = f" [{status}]" if status else ""
+            print(f"  [{elapsed} ago] {summary}{status_suffix}")
         return 0
 
     # --- Structured mode: query tool_usage.db ---
@@ -1829,25 +1885,10 @@ def cmd_tail(
         print("(Hooks may not be active for this session, or it's a Codex agent)")
         return 0
 
-    # Format output — compute relative time against UTC (DB stores UTC naive strings)
-    now_utc = datetime.utcnow()
     print(f"Last {len(rows)} actions ({name} {session_id[:8]}):")
 
-    def _rel(ts_str: str) -> str:
-        try:
-            ts = datetime.fromisoformat(ts_str)  # naive UTC
-            delta_s = int((now_utc - ts).total_seconds())
-            if delta_s < 60:
-                return f"{delta_s}s"
-            elif delta_s < 3600:
-                return f"{delta_s // 60}m{delta_s % 60:02d}s"
-            else:
-                return f"{delta_s // 3600}h{(delta_s % 3600) // 60}m"
-        except Exception:
-            return "?"
-
     for ts_str, tool_name, target_file, bash_command in reversed(rows):
-        elapsed = _rel(ts_str)
+        elapsed = _relative_age(ts_str)
 
         # Format action description
         if tool_name == "Bash" and bash_command:
