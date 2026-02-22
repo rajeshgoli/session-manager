@@ -303,6 +303,28 @@ def main():
         help="Max event page size per poll (default: 100)"
     )
 
+    # sm watch [--repo PATH] [--role ROLE] [--interval SECONDS]
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Interactive dashboard for sessions",
+    )
+    watch_parser.add_argument(
+        "--repo",
+        default=None,
+        help="Filter sessions by repository/workdir root",
+    )
+    watch_parser.add_argument(
+        "--role",
+        default=None,
+        help="Filter sessions by role tag",
+    )
+    watch_parser.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Refresh interval seconds (default: 2.0)",
+    )
+
     # sm tail <session> [-n N] [--raw] [--db-path PATH]
     tail_parser = subparsers.add_parser(
         "tail",
@@ -415,7 +437,7 @@ def main():
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-app", "codex-server",
-        "attach", "output", "codex-tui", "tail", "clear", "review", "context-monitor", "remind", "setup", None
+        "attach", "output", "codex-tui", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
@@ -532,6 +554,13 @@ def main():
             args.session,
             poll_interval=args.poll_interval,
             event_limit=args.event_limit,
+        ))
+    elif args.command == "watch":
+        sys.exit(commands.cmd_watch(
+            client,
+            repo=args.repo,
+            role=args.role,
+            interval=args.interval,
         ))
     elif args.command == "tail":
         sys.exit(commands.cmd_tail(

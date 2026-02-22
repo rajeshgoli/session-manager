@@ -72,6 +72,12 @@ class TestCliParsing:
         codex_tui_parser.add_argument("--poll-interval", type=float, default=1.0)
         codex_tui_parser.add_argument("--event-limit", type=int, default=100)
 
+        # sm watch
+        watch_parser = subparsers.add_parser("watch")
+        watch_parser.add_argument("--repo", default=None)
+        watch_parser.add_argument("--role", default=None)
+        watch_parser.add_argument("--interval", type=float, default=2.0)
+
         return parser.parse_args(args_list)
 
 
@@ -231,6 +237,29 @@ class TestWaitCommand:
         assert args.command == "wait"
         assert args.session_id == "session123"
         assert args.seconds == 60
+
+
+class TestWatchCommand:
+    """Tests for 'sm watch' parsing."""
+
+    def test_watch_defaults(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["watch"])
+
+        assert args.command == "watch"
+        assert args.repo is None
+        assert args.role is None
+        assert args.interval == 2.0
+
+    def test_watch_flags(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(
+            ["watch", "--repo", "/tmp/repo", "--role", "engineer", "--interval", "3.5"]
+        )
+
+        assert args.repo == "/tmp/repo"
+        assert args.role == "engineer"
+        assert args.interval == 3.5
 
 
 class TestChildrenCommand:

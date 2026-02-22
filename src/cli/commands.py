@@ -1876,6 +1876,27 @@ def cmd_codex_tui(
     )
 
 
+def cmd_watch(
+    client: SessionManagerClient,
+    repo: Optional[str] = None,
+    role: Optional[str] = None,
+    interval: float = 2.0,
+) -> int:
+    """Launch interactive watch dashboard."""
+    if interval <= 0:
+        print("Error: --interval must be > 0", file=sys.stderr)
+        return 1
+
+    from .watch_tui import run_watch_tui
+
+    return run_watch_tui(
+        client=client,
+        repo_filter=repo,
+        role_filter=role,
+        interval=interval,
+    )
+
+
 def cmd_tail(
     client: SessionManagerClient,
     identifier: str,
