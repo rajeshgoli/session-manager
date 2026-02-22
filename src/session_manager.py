@@ -1754,7 +1754,18 @@ class SessionManager:
 
         if session.provider == "codex-app":
             if self.hook_output_store:
-                return self.hook_output_store.get(session_id)
+                output = self.hook_output_store.get(session_id)
+                if output is None:
+                    return None
+                if lines <= 0:
+                    return ""
+                chunks = output.splitlines()
+                tail = chunks[-lines:] if chunks else []
+                if not tail:
+                    return ""
+                # Preserve trailing newline semantics from tmux capture where possible.
+                suffix = "\n" if output.endswith("\n") else ""
+                return "\n".join(tail) + suffix
             return None
 
         return self.tmux.capture_pane(session.tmux_session, lines)

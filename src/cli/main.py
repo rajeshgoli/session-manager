@@ -433,6 +433,14 @@ def main():
 
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
+    if args.command == "watch" and session_id:
+        print(
+            "Error: sm watch is operator-only. Run it from a non-managed shell "
+            "(without CLAUDE_SESSION_MANAGER_ID).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, new, attach, output, clear
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",

@@ -584,6 +584,38 @@ class SessionManagerClient:
             return data.get("message")
         return None
 
+    def get_output(
+        self,
+        session_id: str,
+        lines: int = 10,
+        timeout: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Get recent output payload for a session."""
+        data, success, unavailable = self._request(
+            "GET",
+            f"/sessions/{session_id}/output?lines={lines}",
+            timeout=timeout,
+        )
+        if unavailable or not success:
+            return None
+        return data
+
+    def get_tool_calls(
+        self,
+        session_id: str,
+        limit: int = 10,
+        timeout: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Get last tool calls for a session (Claude hook-backed)."""
+        data, success, unavailable = self._request(
+            "GET",
+            f"/sessions/{session_id}/tool-calls?limit={limit}",
+            timeout=timeout,
+        )
+        if unavailable or not success:
+            return None
+        return data
+
     def watch_session(
         self,
         target_session_id: str,

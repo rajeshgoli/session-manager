@@ -95,6 +95,12 @@ class SessionResponse(BaseModel):
     is_em: bool = False  # EM role flag (#256)
     role: Optional[str] = None  # Role tag (#287)
     activity_state: str = "idle"  # Computed operational state (working/thinking/idle/etc)
+    last_tool_call: Optional[str] = None
+    last_tool_name: Optional[str] = None
+    last_action_summary: Optional[str] = None
+    last_action_at: Optional[str] = None
+    tokens_used: int = 0
+    context_monitor_enabled: bool = False
 
 
 class SendInputRequest(BaseModel):
@@ -504,6 +510,17 @@ def create_app(
         return _fallback_activity_state(session)
 
     def _session_to_response(session: Session) -> SessionResponse:
+        provider = getattr(session, "provider", "claude")
+        last_action_summary: Optional[str] = None
+        last_action_at: Optional[str] = None
+        if provider == "codex-app" and _codex_rollout_enabled("enable_observability_projection"):
+            latest_action_getter = getattr(app.state.session_manager, "get_codex_latest_activity_action", None)
+            if callable(latest_action_getter):
+                action = latest_action_getter(session.id)
+                if action:
+                    last_action_summary = action.get("summary_text")
+                    last_action_at = action.get("ended_at") or action.get("started_at")
+
         return SessionResponse(
             id=session.id,
             name=session.name,
@@ -512,7 +529,7 @@ def create_app(
             created_at=session.created_at.isoformat(),
             last_activity=session.last_activity.isoformat(),
             tmux_session=session.tmux_session,
-            provider=getattr(session, "provider", "claude"),
+            provider=provider,
             friendly_name=session.friendly_name,
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
@@ -523,6 +540,12 @@ def create_app(
             is_em=session.is_em,
             role=getattr(session, "role", None),
             activity_state=_get_activity_state(session),
+            last_tool_call=session.last_tool_call.isoformat() if session.last_tool_call else None,
+            last_tool_name=getattr(session, "last_tool_name", None),
+            last_action_summary=last_action_summary,
+            last_action_at=last_action_at,
+            tokens_used=getattr(session, "tokens_used", 0),
+            context_monitor_enabled=bool(getattr(session, "context_monitor_enabled", False)),
         )
 
     def _codex_rollout_enabled(flag_name: str) -> bool:
@@ -1607,6 +1630,68 @@ def create_app(
         output = app.state.session_manager.capture_output(session_id, lines)
 
         return {"session_id": session_id, "output": output}
+
+    @app.get("/sessions/{session_id}/tool-calls")
+    async def get_tool_calls(
+        session_id: str,
+        limit: int = Query(default=10, ge=1, le=100),
+    ):
+        """Return recent PreToolUse tool calls for a session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        tool_logger = getattr(app.state, "tool_logger", None)
+        db_path = None
+        if tool_logger is not None:
+            db_path_value = getattr(tool_logger, "db_path", None)
+            if db_path_value:
+                db_path = Path(db_path_value).expanduser()
+        if not db_path:
+            configured = (app.state.config or {}).get("tool_logging", {}).get(
+                "db_path",
+                "~/.local/share/claude-sessions/tool_usage.db",
+            )
+            db_path = Path(configured).expanduser()
+
+        if not db_path.exists():
+            return {"session_id": session_id, "tool_calls": []}
+
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT timestamp, tool_name, hook_type
+                FROM tool_usage
+                WHERE session_id = ? AND hook_type = 'PreToolUse'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+        except Exception as exc:
+            logger.warning("Failed to read tool-calls for %s: %s", session_id, exc)
+            return {"session_id": session_id, "tool_calls": []}
+
+        return {
+            "session_id": session_id,
+            "tool_calls": [
+                {
+                    "timestamp": ts,
+                    "tool_name": tool,
+                    "hook_type": hook_type,
+                }
+                for ts, tool, hook_type in rows
+            ],
+        }
 
     @app.get("/sessions/{session_id}/last-message")
     async def get_last_message(session_id: str):
@@ -2826,6 +2911,9 @@ Or continue working if not done yet."""
             queue_mgr = app.state.session_manager.message_queue_manager if app.state.session_manager else None
             if queue_mgr:
                 queue_mgr.mark_session_active(session_manager_id)
+            if session is not None:
+                session.last_tool_call = datetime.now()
+                session.last_tool_name = tool_name
 
         # Auto-acquire lock on file write (PreToolUse for Edit/Write/NotebookEdit)
         if hook_type == "PreToolUse" and tool_name in ("Edit", "Write", "NotebookEdit"):

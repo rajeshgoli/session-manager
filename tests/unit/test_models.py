@@ -47,6 +47,7 @@ class TestSession:
             tokens_used=5000,
             tools_used={"Read": 10, "Write": 5},
             last_tool_call=datetime(2024, 1, 15, 11, 30, 0),
+            last_tool_name="Read",
             touched_repos={"/repo1", "/repo2"},
             worktrees=["/worktree1", "/worktree2"],
         )
@@ -80,6 +81,7 @@ class TestSession:
         assert restored.tokens_used == original.tokens_used
         assert restored.tools_used == original.tools_used
         assert restored.last_tool_call == original.last_tool_call
+        assert restored.last_tool_name == original.last_tool_name
         assert restored.touched_repos == original.touched_repos
         assert restored.worktrees == original.worktrees
 

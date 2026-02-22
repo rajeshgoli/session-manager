@@ -76,3 +76,21 @@ def test_get_rollout_flags_success():
     with patch.object(client, "_request", return_value=(payload, True, False)):
         result = client.get_rollout_flags()
     assert result == {"enable_codex_tui": False}
+
+
+def test_get_output_success_with_timeout():
+    client = _make_client()
+    payload = {"session_id": "abc123", "output": "line1\\nline2"}
+    with patch.object(client, "_request", return_value=(payload, True, False)) as req:
+        result = client.get_output("abc123", lines=7, timeout=4)
+    assert result == payload
+    req.assert_called_once_with("GET", "/sessions/abc123/output?lines=7", timeout=4)
+
+
+def test_get_tool_calls_success_with_timeout():
+    client = _make_client()
+    payload = {"session_id": "abc123", "tool_calls": []}
+    with patch.object(client, "_request", return_value=(payload, True, False)) as req:
+        result = client.get_tool_calls("abc123", limit=12, timeout=3)
+    assert result == payload
+    req.assert_called_once_with("GET", "/sessions/abc123/tool-calls?limit=12", timeout=3)

@@ -1883,6 +1883,14 @@ def cmd_watch(
     interval: float = 2.0,
 ) -> int:
     """Launch interactive watch dashboard."""
+    if os.environ.get("CLAUDE_SESSION_MANAGER_ID"):
+        print(
+            "Error: sm watch is operator-only. Run it from a non-managed shell "
+            "(without CLAUDE_SESSION_MANAGER_ID).",
+            file=sys.stderr,
+        )
+        return 1
+
     if interval <= 0:
         print("Error: --interval must be > 0", file=sys.stderr)
         return 1
