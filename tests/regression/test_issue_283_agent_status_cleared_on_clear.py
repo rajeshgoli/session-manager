@@ -38,6 +38,7 @@ def _make_session(session_id: str = "abc12345", provider: str = "claude") -> Ses
     )
     s.agent_status_text = "doing task A"
     s.agent_status_at = datetime(2024, 1, 1, 12, 0, 0)
+    s.agent_task_completed_at = datetime(2024, 1, 1, 12, 5, 0)
     return s
 
 
@@ -88,6 +89,11 @@ class TestContextResetClearsAgentStatus:
         _post_event(client, session.id, event="context_reset")
         assert session.agent_status_at is None
 
+    def test_context_reset_clears_agent_task_completed_at(self, client, session):
+        assert session.agent_task_completed_at is not None
+        _post_event(client, session.id, event="context_reset")
+        assert session.agent_task_completed_at is None
+
     def test_context_reset_saves_state(self, client, mock_session_manager, session):
         _post_event(client, session.id, event="context_reset")
         mock_session_manager._save_state.assert_called()
@@ -137,6 +143,13 @@ class TestClearEndpointClearsAgentStatus:
         c = TestClient(app)
         c.post(f"/sessions/{session.id}/clear", json={})
         assert session.agent_status_at is None
+
+    def test_clear_endpoint_clears_agent_task_completed_at(self, app_with_async_clear, session):
+        app, _ = app_with_async_clear
+        assert session.agent_task_completed_at is not None
+        c = TestClient(app)
+        c.post(f"/sessions/{session.id}/clear", json={})
+        assert session.agent_task_completed_at is None
 
     def test_clear_endpoint_saves_state(self, app_with_async_clear, session):
         app, mock_sm = app_with_async_clear
@@ -272,6 +285,7 @@ class TestInvalidateCacheCanonicalReset:
         assert session.completion_status is None
         assert session.agent_status_text is None
         assert session.agent_status_at is None
+        assert session.agent_task_completed_at is None
         mock_sm._save_state.assert_called()
 
     def test_invalidate_cache_arm_skip_true_does_not_reset_fields(self):
@@ -292,6 +306,7 @@ class TestInvalidateCacheCanonicalReset:
         assert session.completion_status == CompletionStatus.COMPLETED
         assert session.agent_status_text == "doing task A"
         assert session.agent_status_at == datetime(2024, 1, 1, 12, 0, 0)
+        assert session.agent_task_completed_at == datetime(2024, 1, 1, 12, 5, 0)
 
 
 # ---------------------------------------------------------------------------

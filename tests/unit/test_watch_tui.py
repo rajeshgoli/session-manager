@@ -31,6 +31,9 @@ def _session(
     last_action_at: str | None = None,
     context_monitor_enabled: bool = False,
     tokens_used: int = 0,
+    agent_status_text: str | None = None,
+    agent_status_at: str | None = None,
+    agent_task_completed_at: str | None = None,
 ):
     return {
         "id": session_id,
@@ -49,7 +52,9 @@ def _session(
         "last_action_at": last_action_at,
         "context_monitor_enabled": context_monitor_enabled,
         "tokens_used": tokens_used,
-        "agent_status_text": None,
+        "agent_status_text": agent_status_text,
+        "agent_status_at": agent_status_at,
+        "agent_task_completed_at": agent_task_completed_at,
     }
 
 
@@ -101,6 +106,38 @@ def test_main_columns_include_provider_status_and_last():
     assert session_row.columns["Provider"] == "claude"
     assert session_row.columns["Status"] == "running"
     assert "Read" in session_row.columns["Last"]
+
+
+def test_status_row_shows_text_and_age():
+    rows, _, _ = build_watch_rows(
+        [
+            _session(
+                "s1",
+                "agent",
+                "/tmp/repo",
+                agent_status_text="investigating queue race",
+                agent_status_at="2026-02-21T22:59:00",
+            )
+        ]
+    )
+    status_rows = [row for row in rows if row.kind == "status"]
+    assert any('status: "investigating queue race"' in row.text for row in status_rows)
+    assert any("(" in row.text and ")" in row.text for row in status_rows)
+
+
+def test_task_completed_row_shows_age():
+    rows, _, _ = build_watch_rows(
+        [
+            _session(
+                "s1",
+                "agent",
+                "/tmp/repo",
+                agent_task_completed_at="2026-02-21T22:58:00",
+            )
+        ]
+    )
+    status_rows = [row for row in rows if row.kind == "status"]
+    assert any("task: completed (" in row.text for row in status_rows)
 
 
 def test_session_line_truncates_deterministically():
