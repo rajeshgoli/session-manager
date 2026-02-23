@@ -254,6 +254,22 @@ def _age_from_iso(ts: Optional[str]) -> str:
     return _elapsed_label(seconds)
 
 
+def _status_line(session: dict) -> Optional[str]:
+    status_text = session.get("agent_status_text")
+    if not status_text:
+        return None
+    status_at = session.get("agent_status_at")
+    age_suffix = f" ({_age_from_iso(status_at)})" if status_at else ""
+    return f'status: "{status_text}"{age_suffix}'
+
+
+def _task_completion_line(session: dict) -> Optional[str]:
+    completed_at = session.get("agent_task_completed_at")
+    if not completed_at:
+        return None
+    return f"task: completed ({_age_from_iso(completed_at)})"
+
+
 def _format_age(last_activity: Optional[str], activity_state: str) -> str:
     parsed = _parse_iso(last_activity)
     if not parsed:
@@ -485,9 +501,13 @@ def build_watch_rows(
             if session_id:
                 selectable.append(session_id)
 
-            status_text = session.get("agent_status_text")
-            if status_text:
-                rows.append(WatchRow(kind="status", text=f'"{status_text}"', session_id=session_id))
+            status_line = _status_line(session)
+            if status_line:
+                rows.append(WatchRow(kind="status", text=status_line, session_id=session_id))
+
+            task_line = _task_completion_line(session)
+            if task_line:
+                rows.append(WatchRow(kind="status", text=task_line, session_id=session_id))
 
             if session_id and session_id in expanded:
                 detail = detail_cache.get(session_id) if detail_cache else None
@@ -654,9 +674,9 @@ def _activity_attr(activity_state: str, palette: dict[str, int]) -> int:
     if activity_state == "waiting_permission":
         return palette["waiting"]
     if activity_state == "stopped":
-        return palette["stopped"] | curses.A_DIM
+        return palette["stopped"]
     if activity_state == "idle":
-        return palette["idle"] | curses.A_DIM
+        return palette["idle"]
     return curses.A_NORMAL
 
 
@@ -711,9 +731,9 @@ def _render(
         elif row.kind == "repo":
             stdscr.addnstr(y, 2, row.text, max(0, width - 3), curses.A_BOLD | palette["repo"])
         elif row.kind == "status":
-            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_DIM)
+            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_NORMAL)
         else:
-            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_DIM)
+            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_NORMAL)
 
         y += 1
 

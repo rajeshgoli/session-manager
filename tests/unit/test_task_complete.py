@@ -82,6 +82,8 @@ class TestTaskCompleteCancelsRemind:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "completed"
+        assert data.get("agent_task_completed_at")
+        assert mq.session_manager.get_session("abc12345").agent_task_completed_at is not None
 
         # remind should be cancelled
         assert "abc12345" not in mq._remind_registrations

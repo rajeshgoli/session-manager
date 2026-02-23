@@ -92,6 +92,7 @@ class SessionResponse(BaseModel):
     last_handoff_path: Optional[str] = None  # Last executed handoff doc path (#203)
     agent_status_text: Optional[str] = None  # Self-reported agent status text (#188)
     agent_status_at: Optional[str] = None  # When agent_status_text was last set (#188)
+    agent_task_completed_at: Optional[str] = None  # Last self-reported task completion timestamp
     is_em: bool = False  # EM role flag (#256)
     role: Optional[str] = None  # Role tag (#287)
     activity_state: str = "idle"  # Computed operational state (working/thinking/idle/etc)
@@ -302,6 +303,7 @@ def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = Fa
             session.completion_status = None
             session.agent_status_text = None
             session.agent_status_at = None
+            session.agent_task_completed_at = None
             app.state.session_manager._save_state()
 
     queue_mgr = (
@@ -537,6 +539,11 @@ def create_app(
             last_handoff_path=session.last_handoff_path,
             agent_status_text=session.agent_status_text,
             agent_status_at=session.agent_status_at.isoformat() if session.agent_status_at else None,
+            agent_task_completed_at=(
+                session.agent_task_completed_at.isoformat()
+                if session.agent_task_completed_at
+                else None
+            ),
             is_em=session.is_em,
             role=getattr(session, "role", None),
             activity_state=_get_activity_state(session),
@@ -1546,6 +1553,7 @@ def create_app(
         # Clear stale agent status from previous task (#283)
         session.agent_status_text = None
         session.agent_status_at = None
+        session.agent_task_completed_at = None
         app.state.session_manager._save_state()
 
         return {"status": "cleared", "session_id": session_id}
@@ -2714,6 +2722,10 @@ Or continue working if not done yet."""
         queue_mgr.cancel_remind(session_id)
         queue_mgr.cancel_parent_wake(session_id)
 
+        # Persist self-reported completion metadata for watch surfaces.
+        session.agent_task_completed_at = datetime.now()
+        app.state.session_manager._save_state()
+
         # 5. Notify EM if found
         em_notified = False
         if em_id:
@@ -2728,7 +2740,12 @@ Or continue working if not done yet."""
         else:
             logger.warning(f"task-complete: no EM found for {session_id}, skipping notification")
 
-        return {"status": "completed", "session_id": session_id, "em_notified": em_notified}
+        return {
+            "status": "completed",
+            "session_id": session_id,
+            "em_notified": em_notified,
+            "agent_task_completed_at": session.agent_task_completed_at.isoformat(),
+        }
 
     @app.get("/sessions/{session_id}/send-queue")
     async def get_send_queue(session_id: str):
@@ -3082,6 +3099,7 @@ Or continue working if not done yet."""
             # Clear stale status from previous task (#283)
             session.agent_status_text = None
             session.agent_status_at = None
+            session.agent_task_completed_at = None
             app.state.session_manager._save_state()
             if queue_mgr:
                 queue_mgr.cancel_context_monitor_messages_from(session_id)
