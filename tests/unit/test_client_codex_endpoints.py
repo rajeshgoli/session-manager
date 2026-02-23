@@ -1,8 +1,10 @@
 """Unit tests for codex-specific SessionManagerClient helpers used by codex-tui."""
 
+import urllib.request
 from unittest.mock import patch
 
 from src.cli.client import SessionManagerClient
+from src.cli.client import KILL_TIMEOUT
 
 
 def _make_client() -> SessionManagerClient:
@@ -94,3 +96,45 @@ def test_get_tool_calls_success_with_timeout():
         result = client.get_tool_calls("abc123", limit=12, timeout=3)
     assert result == payload
     req.assert_called_once_with("GET", "/sessions/abc123/tool-calls?limit=12", timeout=3)
+
+
+def test_kill_session_uses_longer_timeout():
+    client = _make_client()
+    payload = {"status": "killed", "session_id": "abc123"}
+    with patch.object(client, "_request", return_value=(payload, True, False)) as req:
+        result = client.kill_session(requester_session_id=None, target_session_id="abc123")
+    assert result == payload
+    req.assert_called_once_with(
+        "POST",
+        "/sessions/abc123/kill",
+        {},
+        timeout=KILL_TIMEOUT,
+    )
+
+
+def test_request_sends_explicit_empty_json_body():
+    client = SessionManagerClient(api_url="http://127.0.0.1:8420")
+
+    def _fake_urlopen(req: urllib.request.Request, timeout: int | None = None):
+        assert req.data == b"{}"
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        return _Resp()
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+        data, success, unavailable = client._request("POST", "/noop", data={})
+
+    assert data == {}
+    assert success is True
+    assert unavailable is False

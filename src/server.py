@@ -2638,9 +2638,18 @@ Or continue working if not done yet."""
         if not success:
             return {"error": "Failed to kill session"}
 
-        # Perform full cleanup (Telegram, monitoring, state)
+        # Perform full cleanup (Telegram, monitoring, state) in background.
+        # cleanup_session may involve network I/O (Telegram); do not block the kill response.
         if app.state.output_monitor:
-            await app.state.output_monitor.cleanup_session(target_session)
+            import asyncio
+
+            async def _cleanup():
+                try:
+                    await app.state.output_monitor.cleanup_session(target_session)
+                except Exception:
+                    logger.exception(f"cleanup_session failed for {target_session_id}")
+
+            asyncio.create_task(_cleanup())
 
         return {"status": "killed", "session_id": target_session_id}
 
