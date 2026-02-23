@@ -473,6 +473,7 @@ def build_watch_rows(
             for ancestor_is_last in ancestors_last:
                 prefix_parts.append("   " if ancestor_is_last else "|  ")
             tree_prefix = "".join(prefix_parts) + connector
+            status_prefix = "".join(prefix_parts) + "  "
 
             role = session.get("role") or "-"
             provider = session.get("provider", "claude")
@@ -503,11 +504,23 @@ def build_watch_rows(
 
             status_line = _status_line(session)
             if status_line:
-                rows.append(WatchRow(kind="status", text=status_line, session_id=session_id))
+                rows.append(
+                    WatchRow(
+                        kind="status",
+                        text=f"{status_prefix}{status_line}",
+                        session_id=session_id,
+                    )
+                )
 
             task_line = _task_completion_line(session)
             if task_line:
-                rows.append(WatchRow(kind="status", text=task_line, session_id=session_id))
+                rows.append(
+                    WatchRow(
+                        kind="status",
+                        text=f"{status_prefix}{task_line}",
+                        session_id=session_id,
+                    )
+                )
 
             if session_id and session_id in expanded:
                 detail = detail_cache.get(session_id) if detail_cache else None
