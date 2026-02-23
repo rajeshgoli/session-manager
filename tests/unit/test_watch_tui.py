@@ -140,6 +140,33 @@ def test_task_completed_row_shows_age():
     assert any("task: completed (" in row.text for row in status_rows)
 
 
+def test_status_rows_follow_tree_indentation():
+    rows, _, _ = build_watch_rows(
+        [
+            _session(
+                "p1",
+                "parent",
+                "/tmp/repo",
+                agent_status_text="parent status",
+                agent_status_at="2026-02-21T22:59:00",
+            ),
+            _session(
+                "c1",
+                "child",
+                "/tmp/repo",
+                parent_session_id="p1",
+                agent_status_text="child status",
+                agent_status_at="2026-02-21T22:58:00",
+            ),
+        ]
+    )
+
+    parent_status = next(row for row in rows if row.kind == "status" and "parent status" in row.text)
+    child_status = next(row for row in rows if row.kind == "status" and "child status" in row.text)
+    assert parent_status.text.startswith("  status:")
+    assert child_status.text.startswith("     status:")
+
+
 def test_session_line_truncates_deterministically():
     rows, _, _ = build_watch_rows(
         [
