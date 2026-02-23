@@ -11,6 +11,7 @@ import json
 # Default API endpoint
 DEFAULT_API_URL = "http://127.0.0.1:8420"
 API_TIMEOUT = 2  # seconds
+KILL_TIMEOUT = 30  # seconds (kill triggers cleanup that may involve network I/O)
 
 
 class SessionManagerClient:
@@ -47,7 +48,8 @@ class SessionManagerClient:
 
         try:
             headers = {"Content-Type": "application/json"}
-            body = json.dumps(data).encode() if data else None
+            # Important: some endpoints require an explicit JSON body even when empty ({}).
+            body = json.dumps(data).encode() if data is not None else None
 
             req = urllib.request.Request(url, data=body, headers=headers, method=method)
             with urllib.request.urlopen(req, timeout=request_timeout) as response:
@@ -56,6 +58,17 @@ class SessionManagerClient:
                 # API responded but with error status
                 return None, False, False
 
+        except urllib.error.HTTPError as e:
+            payload = e.read() if hasattr(e, "read") else b""
+            if payload:
+                try:
+                    decoded = json.loads(payload.decode())
+                    if isinstance(decoded, dict):
+                        return decoded, False, False
+                    return {"value": decoded}, False, False
+                except Exception:
+                    return {"error": payload.decode(errors="replace")}, False, False
+            return {"error": f"HTTP {getattr(e, 'code', 'error')}"}, False, False
         except urllib.error.URLError as e:
             # Connection refused, timeout, etc. - session manager unavailable
             return None, False, True
@@ -79,7 +92,7 @@ class SessionManagerClient:
         url = f"{self.api_url}{path}"
         request_timeout = timeout if timeout is not None else API_TIMEOUT
         headers = {"Content-Type": "application/json"}
-        body = json.dumps(data).encode() if data else None
+        body = json.dumps(data).encode() if data is not None else None
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
         def _decode(payload: bytes) -> Optional[dict]:
@@ -530,7 +543,8 @@ class SessionManagerClient:
         data, success, unavailable = self._request(
             "POST",
             f"/sessions/{target_session_id}/kill",
-            payload
+            payload,
+            timeout=KILL_TIMEOUT,
         )
         if unavailable:
             return None

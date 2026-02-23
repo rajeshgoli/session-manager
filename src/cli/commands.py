@@ -1567,6 +1567,15 @@ def cmd_kill(
         print(f"Error: {result['error']}", file=sys.stderr)
         return 1
 
+    if result.get("status") != "killed":
+        # FastAPI validation errors commonly return {"detail": ...}
+        detail = result.get("detail")
+        if detail:
+            print(f"Error: {detail}", file=sys.stderr)
+        else:
+            print("Error: Failed to kill session", file=sys.stderr)
+        return 1
+
     # Success - show friendly name if available
     name = session.get("friendly_name") or session.get("name") or target_session_id
     print(f"Session {name} ({target_session_id}) terminated")

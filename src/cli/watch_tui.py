@@ -932,6 +932,10 @@ def run_watch_tui(
                         flash_message = f"Killed {selected_session_id}"
                     elif result is None:
                         flash_message = "Session manager unavailable"
+                    elif isinstance(result, dict) and result.get("error"):
+                        flash_message = str(result.get("error"))
+                    elif isinstance(result, dict) and result.get("detail"):
+                        flash_message = str(result.get("detail"))
                     else:
                         flash_message = "Failed to kill session"
                     flash_until = time.monotonic() + 2.5

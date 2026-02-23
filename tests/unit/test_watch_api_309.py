@@ -171,3 +171,21 @@ def test_capture_output_codex_app_respects_lines(tmp_path):
 
     assert sm.capture_output(session.id, lines=2) == "line2\nline3\n"
     assert sm.capture_output(session.id, lines=1) == "line3\n"
+
+
+def test_kill_endpoint_returns_error_when_cleanup_fails():
+    session = _make_session("kill1234")
+    sm = _make_sm(session)
+    sm.kill_session = MagicMock(return_value=True)
+
+    class _SlowCleanup:
+        async def cleanup_session(self, _session: Session):
+            raise RuntimeError("boom")
+
+    app = create_app(session_manager=sm, output_monitor=_SlowCleanup())
+    client = TestClient(app)
+
+    resp = client.post(f"/sessions/{session.id}/kill", json={})
+
+    assert resp.status_code == 200
+    assert resp.json()["error"] == "Failed to finalize session cleanup"

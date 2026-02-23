@@ -2640,7 +2640,11 @@ Or continue working if not done yet."""
 
         # Perform full cleanup (Telegram, monitoring, state)
         if app.state.output_monitor:
-            await app.state.output_monitor.cleanup_session(target_session)
+            try:
+                await app.state.output_monitor.cleanup_session(target_session)
+            except Exception:
+                logger.exception(f"cleanup_session failed for {target_session_id}")
+                return {"error": "Failed to finalize session cleanup"}
 
         return {"status": "killed", "session_id": target_session_id}
 
