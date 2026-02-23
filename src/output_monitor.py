@@ -111,6 +111,7 @@ class OutputMonitor:
         monitor_timeouts = timeouts.get("output_monitor", {})
         self._idle_cooldown = monitor_timeouts.get("idle_cooldown_seconds", 300)
         self._permission_debounce = monitor_timeouts.get("permission_debounce_seconds", 30)
+        self._cleanup_notify_timeout = monitor_timeouts.get("cleanup_notify_timeout_seconds", 2)
 
     def set_event_callback(self, callback: Callable[[NotificationEvent], Awaitable[None]]):
         """Set the callback for notification events."""
@@ -593,13 +594,25 @@ class OutputMonitor:
                 thread_id = session.telegram_thread_id
                 chat_id = session.telegram_chat_id
 
-                # Try forum-topic delivery first; fall back to reply-thread on failure.
-                # send_with_fallback() returns the forum msg_id if forum succeeded, None otherwise.
-                msg_id = await telegram_bot.send_with_fallback(
-                    chat_id=chat_id,
-                    message=stopped_msg,
-                    thread_id=thread_id,
-                )
+                msg_id = None
+                try:
+                    # Try forum-topic delivery first; fall back to reply-thread on failure.
+                    # send_with_fallback() returns the forum msg_id if forum succeeded, None otherwise.
+                    msg_id = await asyncio.wait_for(
+                        telegram_bot.send_with_fallback(
+                            chat_id=chat_id,
+                            message=stopped_msg,
+                            thread_id=thread_id,
+                        ),
+                        timeout=self._cleanup_notify_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Timed out sending cleanup notification for session {session_id} "
+                        f"after {self._cleanup_notify_timeout}s"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not send cleanup notification for {session_id}: {e}")
 
                 if msg_id is not None:
                     # Confirmed forum topic — close it (keeps history visible, marks resolved)

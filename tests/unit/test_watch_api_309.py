@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import threading
-import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -175,28 +173,19 @@ def test_capture_output_codex_app_respects_lines(tmp_path):
     assert sm.capture_output(session.id, lines=1) == "line3\n"
 
 
-def test_kill_endpoint_does_not_block_on_cleanup():
-    import asyncio
-
+def test_kill_endpoint_returns_error_when_cleanup_fails():
     session = _make_session("kill1234")
     sm = _make_sm(session)
     sm.kill_session = MagicMock(return_value=True)
 
-    started = threading.Event()
-
     class _SlowCleanup:
         async def cleanup_session(self, _session: Session):
-            started.set()
-            await asyncio.sleep(0.3)
+            raise RuntimeError("boom")
 
     app = create_app(session_manager=sm, output_monitor=_SlowCleanup())
     client = TestClient(app)
 
-    t0 = time.monotonic()
     resp = client.post(f"/sessions/{session.id}/kill", json={})
-    elapsed = time.monotonic() - t0
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "killed"
-    assert elapsed < 0.25
-    assert started.wait(timeout=1.0) is True
+    assert resp.json()["error"] == "Failed to finalize session cleanup"
