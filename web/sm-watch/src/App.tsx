@@ -412,13 +412,19 @@ export default function App() {
       window.navigator.vibrate(35);
     }
 
+    const opened = window.open(link, '_blank');
+    if (!opened) {
+      showToast('Unable to open Telegram link. Check popup blocker settings.');
+    }
+
     window.setTimeout(() => {
-      window.open(link, '_blank');
       setIsOpeningTelegram(null);
     }, 150);
   };
 
-  const postKill = async (id: string): Promise<{ ok: boolean; status?: number }> => {
+  const postKill = async (
+    id: string,
+  ): Promise<{ ok: boolean; httpStatus?: number; killed?: boolean; error?: string }> => {
     const path = KILL_PATH.replace('{id}', encodeURIComponent(id));
     try {
       const response = await fetch(path, {
@@ -428,7 +434,20 @@ export default function App() {
         },
         body: JSON.stringify({}),
       });
-      return { ok: response.ok, status: response.status };
+
+      let payload: { status?: string; error?: string } | null = null;
+      try {
+        payload = (await response.json()) as { status?: string; error?: string };
+      } catch {
+        payload = null;
+      }
+
+      return {
+        ok: response.ok,
+        httpStatus: response.status,
+        killed: payload?.status === 'killed',
+        error: payload?.error,
+      };
     } catch (error) {
       return { ok: false };
     }
@@ -439,13 +458,19 @@ export default function App() {
     try {
       const result = await postKill(id);
       if (!result.ok) {
-        if (result.status === 422) {
+        if (result.httpStatus === 422) {
           showToast('Kill request rejected by API payload validation.');
           return;
         }
         showToast('Kill request failed. Session manager endpoint not reachable.');
         return;
       }
+
+      if (!result.killed) {
+        showToast(result.error || 'Kill request failed.');
+        return;
+      }
+
       setSessions((prev) => prev.filter((session) => session.id !== id));
       setExpandedSessions((prev) => {
         const next = new Set(prev);
