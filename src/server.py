@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Literal
 
 from fastapi import FastAPI, HTTPException, Body, Request, Query
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -86,6 +88,8 @@ class SessionResponse(BaseModel):
     tmux_session: str
     provider: Optional[str] = "claude"
     friendly_name: Optional[str] = None
+    telegram_chat_id: Optional[int] = None
+    telegram_thread_id: Optional[int] = None
     current_task: Optional[str] = None
     git_remote_url: Optional[str] = None
     parent_session_id: Optional[str] = None
@@ -533,6 +537,8 @@ def create_app(
             tmux_session=session.tmux_session,
             provider=provider,
             friendly_name=session.friendly_name,
+            telegram_chat_id=session.telegram_chat_id,
+            telegram_thread_id=session.telegram_thread_id,
             current_task=session.current_task,
             git_remote_url=session.git_remote_url,
             parent_session_id=session.parent_session_id,
@@ -554,6 +560,35 @@ def create_app(
             tokens_used=getattr(session, "tokens_used", 0),
             context_monitor_enabled=bool(getattr(session, "context_monitor_enabled", False)),
         )
+
+    def _configure_watch_frontend() -> None:
+        """Serve the mobile dashboard if static assets exist in web/sm-watch/dist."""
+        project_root = Path(__file__).resolve().parents[1]
+        watch_dist = project_root / "web" / "sm-watch" / "dist"
+
+        if not watch_dist.is_dir():
+            detail = (
+                "sm-watch frontend is not built. "
+                "Build with: (cd web/sm-watch && npm install && npm run build)"
+            )
+
+            @app.get("/watch", include_in_schema=False)
+            async def watch_frontend_not_available():
+                return JSONResponse(status_code=503, content={"error": detail})
+
+            @app.get("/watch/{_path:path}", include_in_schema=False)
+            async def watch_frontend_not_available_path(_path: str):
+                return JSONResponse(status_code=503, content={"error": detail})
+
+            return
+
+        @app.get("/watch", include_in_schema=False)
+        async def watch_frontend_root():
+            return RedirectResponse(url="/watch/")
+
+        app.mount("/watch", StaticFiles(directory=str(watch_dist), html=True), name="sm_watch")
+
+    _configure_watch_frontend()
 
     def _codex_rollout_enabled(flag_name: str) -> bool:
         """Read codex rollout gate from SessionManager when available."""
