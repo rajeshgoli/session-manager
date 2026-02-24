@@ -1,4 +1,4 @@
-export type SessionStatus = "running" | "idle" | "error" | "detached" | "active";
+export type SessionStatus = "running" | "idle" | "stopped";
 export type ActivityState = "working" | "thinking" | "idle" | "waiting" | "stopped";
 
 export interface Session {

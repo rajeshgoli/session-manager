@@ -19,13 +19,12 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Session } from './types';
 
 type SessionTreeNode = Session & { children: SessionTreeNode[] };
+type StatusFilter = 'all' | Session['status'];
 
 const STATUS_COLORS: Record<Session['status'], string> = {
-  active: 'bg-emerald-100 text-emerald-700 border-emerald-200',
-  running: 'bg-blue-100 text-blue-700 border-blue-200',
+  running: 'bg-emerald-100 text-emerald-700 border-emerald-200',
   idle: 'bg-slate-100 text-slate-600 border-slate-200',
-  error: 'bg-rose-100 text-rose-700 border-rose-200',
-  detached: 'bg-amber-100 text-amber-700 border-amber-200',
+  stopped: 'bg-rose-100 text-rose-700 border-rose-200',
 };
 
 const ACTIVITY_STATE_BADGE: Record<string, string> = {
@@ -37,7 +36,7 @@ const ACTIVITY_STATE_BADGE: Record<string, string> = {
 };
 
 const API_PATHS = ['/sessions', '/api/sessions'];
-const KILL_PATHS = ['/sessions/{id}/kill', '/api/sessions/{id}/kill'];
+const KILL_PATH = '/sessions/{id}/kill';
 const POLL_MS = 4000;
 
 interface SessionCardProps {
@@ -82,7 +81,7 @@ function telegramDeepLink(chatId?: number | null, threadId?: number | null): str
   return `https://t.me/c/${normalizedChatId}`;
 }
 
-function SessionCard({
+const SessionCard: React.FC<SessionCardProps> = ({
   session,
   expandedSessions,
   isPaused,
@@ -91,7 +90,7 @@ function SessionCard({
   onOpenTelegram,
   onKillSession,
   depth = 0,
-}: SessionCardProps) {
+}) => {
   const isExpanded = expandedSessions.has(session.id);
 
   return (
@@ -110,9 +109,9 @@ function SessionCard({
             <div className="flex items-center gap-2">
               <div
                 className={`w-2 h-2 rounded-full ${
-                  session.status === 'active'
+                  session.status === 'running'
                     ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]'
-                    : session.status === 'error'
+                    : session.status === 'stopped'
                       ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.5)]'
                       : 'bg-slate-300'
                 }`}
@@ -235,7 +234,7 @@ function SessionCard({
       )}
     </div>
   );
-}
+};
 
 function buildSessionTree(sessions: Session[]): SessionTreeNode[] {
   const nodes = new Map<string, SessionTreeNode>();
@@ -264,7 +263,7 @@ function buildSessionTree(sessions: Session[]): SessionTreeNode[] {
 
 function filterTree(
   nodes: SessionTreeNode[],
-  statusFilter: string,
+  statusFilter: StatusFilter,
   query: string,
 ): SessionTreeNode[] {
   const normalizedQuery = query.trim().toLowerCase();
@@ -325,7 +324,7 @@ async function fetchJson<T>(paths: string[]): Promise<T | null> {
 export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [filter, setFilter] = useState<string>('all');
+  const [filter, setFilter] = useState<StatusFilter>('all');
   const [isPaused, setIsPaused] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
@@ -383,11 +382,9 @@ export default function App() {
 
   const stats = useMemo(() => {
     return {
-      active: sessions.filter((session) => session.status === 'active').length,
       running: sessions.filter((session) => session.status === 'running').length,
       idle: sessions.filter((session) => session.status === 'idle').length,
-      error: sessions.filter((session) => session.status === 'error').length,
-      detached: sessions.filter((session) => session.status === 'detached').length,
+      stopped: sessions.filter((session) => session.status === 'stopped').length,
       total: sessions.length,
     };
   }, [sessions]);
@@ -421,28 +418,31 @@ export default function App() {
     }, 150);
   };
 
-  const postKill = async (id: string): Promise<boolean> => {
-    for (const template of KILL_PATHS) {
-      const path = template.replace('{id}', encodeURIComponent(id));
-      try {
-        const response = await fetch(path, {
-          method: 'POST',
-        });
-        if (response.ok) {
-          return true;
-        }
-      } catch (error) {
-        continue;
-      }
+  const postKill = async (id: string): Promise<{ ok: boolean; status?: number }> => {
+    const path = KILL_PATH.replace('{id}', encodeURIComponent(id));
+    try {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+      });
+      return { ok: response.ok, status: response.status };
+    } catch (error) {
+      return { ok: false };
     }
-    return false;
   };
 
   const handleKillSession = async (id: string, event: React.MouseEvent) => {
     event.stopPropagation();
     try {
-      const success = await postKill(id);
-      if (!success) {
+      const result = await postKill(id);
+      if (!result.ok) {
+        if (result.status === 422) {
+          showToast('Kill request rejected by API payload validation.');
+          return;
+        }
         showToast('Kill request failed. Session manager endpoint not reachable.');
         return;
       }
@@ -498,11 +498,9 @@ export default function App() {
         <div className="px-4 py-4 overflow-x-auto no-scrollbar flex gap-3">
           {[
             { label: 'Total', count: stats.total, filter: 'all' },
-            { label: 'Active', count: stats.active, filter: 'active' },
             { label: 'Running', count: stats.running, filter: 'running' },
             { label: 'Idle', count: stats.idle, filter: 'idle' },
-            { label: 'Error', count: stats.error, filter: 'error' },
-            { label: 'Detached', count: stats.detached, filter: 'detached' },
+            { label: 'Stopped', count: stats.stopped, filter: 'stopped' },
           ].map((item) => (
             <button
               key={item.label}
@@ -536,7 +534,7 @@ export default function App() {
         </div>
 
         <div className="px-4 mt-3 flex gap-2 overflow-x-auto no-scrollbar">
-          {['all', 'active', 'running', 'idle', 'error', 'detached'].map((candidate) => (
+          {(['all', 'running', 'idle', 'stopped'] as StatusFilter[]).map((candidate) => (
             <button
               key={candidate}
               onClick={() => setFilter(candidate)}
