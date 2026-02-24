@@ -1,0 +1,5 @@
+{
+  "name": "sm watch",
+  "description": "Mobile-first PWA dashboard for monitoring Claude session manager sessions with Telegram integration.",
+  "requestFramePermissions": []
+}
