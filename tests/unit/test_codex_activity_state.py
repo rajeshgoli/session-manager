@@ -128,3 +128,110 @@ def test_codex_app_fallback_without_hook_data():
 
     session.last_activity = datetime.now() - timedelta(seconds=40)
     assert manager.get_activity_state(session.id) == "idle"
+
+
+def test_codex_fork_running_state_prevents_false_idle():
+    manager = _make_manager()
+    session = Session(
+        id="cf1",
+        name="codex-fork-cf1",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    session.last_activity = datetime.now() - timedelta(minutes=5)
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnStarted",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+
+    assert manager.get_activity_state(session.id) == "working"
+
+
+def test_codex_fork_reducer_overrides_stale_stopped_status():
+    manager = _make_manager()
+    session = Session(
+        id="cf2",
+        name="codex-fork-cf2",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.STOPPED,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnStarted",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+
+    assert manager.get_activity_state(session.id) == "working"
+
+
+def test_codex_fork_waiting_transitions_and_cause_tracking():
+    manager = _make_manager()
+    session = Session(
+        id="cf3",
+        name="codex-fork-cf3",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnStarted",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "ExecApprovalRequest",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    assert manager.get_activity_state(session.id) == "waiting_permission"
+    lifecycle = manager.get_codex_fork_lifecycle_state(session.id)
+    assert lifecycle is not None
+    assert lifecycle["state"] == "waiting_on_approval"
+    assert lifecycle["cause_event_type"] == "approval_request"
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "approval_decision",
+            "seq": 3,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    assert manager.get_activity_state(session.id) == "working"
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnComplete",
+            "seq": 4,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    assert manager.get_activity_state(session.id) == "idle"

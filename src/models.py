@@ -182,7 +182,7 @@ class Session:
     name: str = ""  # Internal identifier (auto-generated: claude-{id})
     working_dir: str = ""
     tmux_session: str = ""
-    provider: str = "claude"  # "claude", "codex" (tmux), or "codex-app" (app-server)
+    provider: str = "claude"  # "claude", "codex"/"codex-fork" (tmux), or "codex-app" (app-server)
     log_file: str = ""
     status: SessionStatus = SessionStatus.RUNNING
     created_at: datetime = field(default_factory=datetime.now)
@@ -244,10 +244,12 @@ class Session:
                 prefix = "claude"
             elif self.provider == "codex":
                 prefix = "codex"
+            elif self.provider == "codex-fork":
+                prefix = "codex-fork"
             else:
                 prefix = "codex-app"
             self.name = f"{prefix}-{self.id}"
-        if not self.tmux_session and self.provider in ("claude", "codex"):
+        if not self.tmux_session and self.provider in ("claude", "codex", "codex-fork"):
             # IMPORTANT: tmux_session should ALWAYS be {provider}-{id}, not name
             self.tmux_session = f"{self.provider}-{self.id}"
 

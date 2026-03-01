@@ -1178,7 +1178,7 @@ def cmd_spawn(
     Args:
         client: API client
         parent_session_id: Parent session ID (current session)
-        provider: "claude", "codex", or "codex-app"
+        provider: "claude", "codex", "codex-fork", or "codex-app"
         prompt: Initial prompt for the child agent
         name: Friendly name for the child session
         wait: Monitor child and notify when complete or idle for N seconds
@@ -1199,7 +1199,7 @@ def cmd_spawn(
             file=sys.stderr,
         )
         return 1
-    if provider in {"codex", "codex-app"} and model is not None and not safe_model_pattern.match(model):
+    if provider in {"codex", "codex-fork", "codex-app"} and model is not None and not safe_model_pattern.match(model):
         print(
             "Error: Invalid Codex model. Allowed characters: letters, numbers, ., _, :, /, -",
             file=sys.stderr,
@@ -1490,6 +1490,13 @@ def cmd_children(
                         delta_s = max(0, int(time.time() - epoch))
                         thinking_str = _format_thinking_duration(delta_s)
                     last_tool_str = "n/a (no hooks)"
+                elif provider == "codex-fork":
+                    tmux_name = f"codex-fork-{child_id}"
+                    epoch = _get_tmux_session_activity(tmux_name)
+                    if epoch is not None:
+                        delta_s = max(0, int(time.time() - epoch))
+                        thinking_str = _format_thinking_duration(delta_s)
+                    last_tool_str = "n/a (event-stream lifecycle)"
 
                 elif provider == "codex-app":
                     projection = child.get("activity_projection")
@@ -1589,7 +1596,7 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, pro
     Args:
         client: API client
         working_dir: Working directory (optional, defaults to $PWD)
-        provider: "claude", "codex", or "codex-app"
+        provider: "claude", "codex", "codex-fork", or "codex-app"
 
     Exit codes:
         0: Successfully created (and attached for Claude/Codex)
@@ -2432,7 +2439,7 @@ def cmd_clear(
         print(f"Error: Session {target_session_id} has no tmux session", file=sys.stderr)
         return 1
 
-    clear_command = "/new" if provider == "codex" else "/clear"
+    clear_command = "/new" if provider in ("codex", "codex-fork") else "/clear"
 
     # Invalidate server-side caches and arm skip_count BEFORE tmux operations,
     # so the /clear Stop hook is absorbed even if it arrives late (#174).
@@ -2539,7 +2546,7 @@ def cmd_clear(
 
         # Best-effort clear of stale agent status for codex tmux sessions,
         # which have no context_reset hook (#283). Non-critical — /new already succeeded.
-        if provider == "codex":
+        if provider in ("codex", "codex-fork"):
             client.clear_agent_status(target_session_id)
 
         return 0

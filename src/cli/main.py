@@ -168,7 +168,7 @@ def main():
     spawn_parser = subparsers.add_parser("spawn", help="Spawn a child agent session")
     spawn_parser.add_argument(
         "provider",
-        choices=["claude", "codex", "codex-app"],
+        choices=["claude", "codex", "codex-fork", "codex-app"],
         help="Provider for the child session",
     )
     spawn_parser.add_argument("prompt", help="Initial prompt for the child agent")
@@ -178,7 +178,7 @@ def main():
         "--model",
         help=(
             "Override model (provider-aware: claude accepts opus|sonnet|haiku; "
-            "codex/codex-app accept provider model IDs, e.g. codex-5.1)"
+            "codex/codex-fork/codex-app accept provider model IDs, e.g. codex-5.1)"
         ),
     )
     spawn_parser.add_argument("--working-dir", help="Override working directory (defaults to parent's directory)")
@@ -226,6 +226,18 @@ def main():
         help="Create a new Codex session and attach to it"
     )
     parser_codex.add_argument(
+        "working_dir",
+        nargs="?",
+        help="Working directory (defaults to current directory)"
+    )
+
+    # sm codex-fork [working_dir]
+    parser_codex_fork = subparsers.add_parser(
+        "codex-fork",
+        aliases=["codex_fork"],
+        help="Create a new Codex-fork session and attach to it"
+    )
+    parser_codex_fork.add_argument(
         "working_dir",
         nargs="?",
         help="Working directory (defaults to current directory)"
@@ -444,7 +456,8 @@ def main():
     # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, new, attach, output, clear
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
-        "subagents", "children", "kill", "new", "claude", "codex", "codex-app", "codex-server",
+        "subagents", "children", "kill", "new", "claude", "codex", "codex-fork", "codex_fork",
+        "codex-app", "codex-server",
         "attach", "output", "codex-tui", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
@@ -548,6 +561,8 @@ def main():
         sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
     elif args.command == "codex":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex"))
+    elif args.command in ("codex-fork", "codex_fork"):
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork"))
     elif args.command in ("codex-app", "codex-server"):
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app"))
     elif args.command == "new":
