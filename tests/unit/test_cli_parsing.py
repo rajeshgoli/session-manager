@@ -40,7 +40,7 @@ class TestCliParsing:
 
         # sm spawn
         spawn_parser = subparsers.add_parser("spawn")
-        spawn_parser.add_argument("provider", choices=["claude", "codex", "codex-app"])
+        spawn_parser.add_argument("provider", choices=["claude", "codex", "codex-fork", "codex-app"])
         spawn_parser.add_argument("prompt")
         spawn_parser.add_argument("--name")
         spawn_parser.add_argument("--wait", type=int, metavar="SECONDS")
@@ -202,6 +202,12 @@ class TestSpawnCommand:
         """sm spawn codex-app accepts free-form model IDs."""
         parser = TestCliParsing()
         args = parser._get_parsed_args(["spawn", "codex-app", "--model", "codex-5.1", "Test"])
+        assert args.model == "codex-5.1"
+
+    def test_spawn_codex_fork_custom_model(self):
+        """sm spawn codex-fork accepts free-form model IDs."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "codex-fork", "--model", "codex-5.1", "Test"])
         assert args.model == "codex-5.1"
 
     def test_spawn_name_flag(self):

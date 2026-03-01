@@ -2024,7 +2024,7 @@ class MessageQueueManager:
                 await self._wait_for_claude_prompt_async(tmux_session)
 
                 # 4. Send /clear (with settle delay before Enter)
-                clear_command = "/new" if session.provider == "codex" else "/clear"
+                clear_command = "/new" if session.provider in ("codex", "codex-fork") else "/clear"
                 proc = await asyncio.create_subprocess_exec(
                     "tmux", "send-keys", "-t", tmux_session, "--", clear_command,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -2124,15 +2124,26 @@ class MessageQueueManager:
                     )
                     return
 
+                provider = getattr(session, "provider", "claude")
+                codex_fork_state = None
+                if provider == "codex-fork":
+                    lifecycle_getter = getattr(self.session_manager, "get_codex_fork_lifecycle_state", None)
+                    if callable(lifecycle_getter):
+                        lifecycle = lifecycle_getter(target_session_id)
+                        if isinstance(lifecycle, dict):
+                            codex_fork_state = lifecycle.get("state")
+
                 # Phase 1: Check in-memory idle state
-                state = self.delivery_states.get(target_session_id)
-                mem_idle = state.is_idle if state else False
+                if provider == "codex-fork" and codex_fork_state is not None:
+                    mem_idle = codex_fork_state in ("idle", "shutdown", "error")
+                else:
+                    state = self.delivery_states.get(target_session_id)
+                    mem_idle = state.is_idle if state else False
 
                 # Phase 2: If NOT idle per memory, try tmux prompt fallback
                 # Handles RCA #1 (hook failure). Extends existing Codex fallback to Claude.
-                if not mem_idle:
+                if not mem_idle and provider != "codex-fork":
                     if session.tmux_session:
-                        provider = getattr(session, "provider", "claude")
                         if provider in ("codex", "claude"):
                             prompt_visible = await self._check_idle_prompt(
                                 session.tmux_session
@@ -2148,7 +2159,7 @@ class MessageQueueManager:
                         pending_idle_count = 0
 
                 # Phase 3: Session.status fallback (weak — only catches in-memory corruption)
-                if not mem_idle:
+                if not mem_idle and provider != "codex-fork":
                     if session.status == SessionStatus.IDLE:
                         mem_idle = True
 
@@ -2156,10 +2167,18 @@ class MessageQueueManager:
                 # ALL idle sources go through this — no skip flags.
                 is_idle = mem_idle
                 if is_idle and self.get_pending_messages(target_session_id):
+                    if provider == "codex-fork":
+                        # For codex-fork, lifecycle reducer is source of truth.
+                        # Keep terminal states as complete even with pending queue artifacts.
+                        if codex_fork_state in ("shutdown", "error"):
+                            is_idle = True
+                        else:
+                            is_idle = False
+                        pending_idle_count = 0
                     # Pending messages exist. Use tmux prompt as tiebreaker to
                     # distinguish stuck (delivery failed) from in-flight.
                     # Handles RCA #2 (is_idle=True + stuck pending messages).
-                    if session.tmux_session:
+                    elif session.tmux_session:
                         prompt_visible = await self._check_idle_prompt(
                             session.tmux_session
                         )
@@ -2206,9 +2225,14 @@ class MessageQueueManager:
                     if target_session:
                         target_name = target_session.friendly_name or target_session.name or target_session_id
 
-                    notification = (
-                        f"[sm wait] {target_name} is now idle (waited {int(elapsed)}s)"
-                    )
+                    if provider == "codex-fork" and codex_fork_state in ("shutdown", "error"):
+                        notification = (
+                            f"[sm wait] {target_name} reached {codex_fork_state} (waited {int(elapsed)}s)"
+                        )
+                    else:
+                        notification = (
+                            f"[sm wait] {target_name} is now idle (waited {int(elapsed)}s)"
+                        )
                     self.queue_message(
                         target_session_id=watcher_session_id,
                         text=notification,

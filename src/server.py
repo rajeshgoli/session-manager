@@ -32,6 +32,8 @@ def _normalize_provider(provider: Optional[str]) -> str:
     provider = provider.lower()
     if provider in ("codex-app", "codex_app", "codex-server", "codex-app-server"):
         return "codex-app"
+    if provider in ("codex-fork", "codex_fork", "codexfork"):
+        return "codex-fork"
     if provider in ("claude", "codex"):
         return provider
     raise HTTPException(status_code=400, detail=f"Invalid provider: {provider}")

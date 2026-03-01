@@ -105,6 +105,23 @@ class SessionManager:
         self.codex_cli_command = codex_config.get("command", "codex")
         self.codex_cli_args = codex_config.get("args", [])
         self.codex_default_model = codex_config.get("default_model")
+        codex_fork_config = self.config.get("codex_fork", codex_config)
+        self.codex_fork_command = codex_fork_config.get("command", self.codex_cli_command)
+        self.codex_fork_args = codex_fork_config.get("args", self.codex_cli_args)
+        self.codex_fork_default_model = codex_fork_config.get("default_model", self.codex_default_model)
+        self.codex_fork_event_schema_version = int(codex_fork_config.get("event_schema_version", 2))
+        self.codex_fork_event_poll_interval_seconds = float(
+            codex_fork_config.get("event_poll_interval_seconds", 0.5)
+        )
+        self.codex_fork_event_monitors: dict[str, asyncio.Task] = {}
+        self.codex_fork_event_offsets: dict[str, int] = {}
+        self.codex_fork_event_buffers: dict[str, str] = {}
+        self.codex_fork_lifecycle: dict[str, dict[str, Any]] = {}
+        self.codex_fork_turns_in_flight: set[str] = set()
+        self.codex_fork_wait_resume_state: dict[str, str] = {}
+        self.codex_fork_wait_kind: dict[str, str] = {}
+        self.codex_fork_last_seq: dict[str, int] = {}
+        self.codex_fork_session_epoch: dict[str, Any] = {}
 
         # App-server config (can be overridden by codex_app_server section)
         self.codex_config = CodexAppServerConfig(
@@ -365,6 +382,279 @@ class SessionManager:
             logger.debug(f"Failed to get git remote for {working_dir}: {e}")
             return None
 
+    def _codex_fork_event_stream_path(self, session: Session) -> Path:
+        """Return event-stream JSONL path for one codex-fork session."""
+        return self.log_dir / f"{session.id}.codex-fork.events.jsonl"
+
+    @staticmethod
+    def _normalize_codex_fork_event_type(event_type: Any) -> str:
+        """Normalize codex-fork event types to a stable reducer vocabulary."""
+        if not event_type:
+            return ""
+        raw = str(event_type).strip()
+        if not raw:
+            return ""
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", raw).replace("-", "_").lower()
+        aliases = {
+            "task_started": "turn_started",
+            "task_complete": "turn_complete",
+            "turn_completed": "turn_complete",
+            "exec_approval_request": "approval_request",
+            "patch_approval_request": "approval_request",
+            "request_approval": "approval_request",
+            "request_user_input": "user_input_request",
+            "approval_decision": "approval_resolved",
+            "approval_submitted": "approval_resolved",
+            "user_input_submitted": "user_input_resolved",
+            "user_input_response": "user_input_resolved",
+            "stream_error": "error",
+            "runtime_error": "error",
+            "fatal_error": "error",
+        }
+        return aliases.get(snake, snake)
+
+    def _set_codex_fork_lifecycle_state(
+        self,
+        session_id: str,
+        state: str,
+        cause_event_type: str,
+        seq: Optional[int] = None,
+        session_epoch: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Persist current lifecycle state and append transition-audit event."""
+        previous = self.codex_fork_lifecycle.get(session_id, {})
+        previous_state = previous.get("state")
+        now = datetime.now()
+        snapshot = {
+            "state": state,
+            "cause_event_type": cause_event_type,
+            "seq": seq,
+            "session_epoch": session_epoch,
+            "updated_at": now.isoformat(),
+        }
+        self.codex_fork_lifecycle[session_id] = snapshot
+
+        if previous_state != state:
+            self.codex_event_store.append_event(
+                session_id=session_id,
+                event_type="lifecycle_transition",
+                payload={
+                    "from_state": previous_state,
+                    "to_state": state,
+                    "cause_event_type": cause_event_type,
+                    "seq": seq,
+                    "session_epoch": session_epoch,
+                },
+            )
+
+        session = self.sessions.get(session_id)
+        if session:
+            status_before = session.status
+            if state == "idle":
+                session.status = SessionStatus.IDLE
+            elif state in ("shutdown", "error"):
+                session.status = SessionStatus.STOPPED
+            else:
+                session.status = SessionStatus.RUNNING
+            session.last_activity = now
+
+            if self.message_queue_manager:
+                if state in ("running", "waiting_on_approval", "waiting_on_user_input"):
+                    self.message_queue_manager.mark_session_active(session_id)
+                else:
+                    self.message_queue_manager.mark_session_idle(session_id)
+
+            if session.status != status_before:
+                self._save_state()
+
+        return snapshot
+
+    def _reduce_codex_fork_lifecycle(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: Optional[dict[str, Any]] = None,
+        seq: Optional[int] = None,
+        session_epoch: Optional[Any] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Apply one codex-fork lifecycle event to deterministic reducer state."""
+        normalized = self._normalize_codex_fork_event_type(event_type)
+        if not normalized:
+            return None
+
+        if seq is not None:
+            last_seq = self.codex_fork_last_seq.get(session_id)
+            if last_seq is not None and seq <= last_seq:
+                return self.codex_fork_lifecycle.get(session_id)
+            self.codex_fork_last_seq[session_id] = seq
+
+        previous_epoch = self.codex_fork_session_epoch.get(session_id)
+        if session_epoch is not None and previous_epoch is not None and session_epoch != previous_epoch:
+            self.codex_fork_turns_in_flight.discard(session_id)
+            self.codex_fork_wait_resume_state.pop(session_id, None)
+            self.codex_fork_wait_kind.pop(session_id, None)
+        if session_epoch is not None:
+            self.codex_fork_session_epoch[session_id] = session_epoch
+
+        current_state = self.codex_fork_lifecycle.get(session_id, {}).get("state", "idle")
+        next_state = current_state
+
+        if normalized == "turn_started":
+            self.codex_fork_turns_in_flight.add(session_id)
+            next_state = "running"
+        elif normalized in {"turn_complete", "turn_aborted"}:
+            self.codex_fork_turns_in_flight.discard(session_id)
+            self.codex_fork_wait_resume_state.pop(session_id, None)
+            self.codex_fork_wait_kind.pop(session_id, None)
+            next_state = "idle"
+        elif normalized == "approval_request":
+            resume_state = "running" if session_id in self.codex_fork_turns_in_flight else "idle"
+            self.codex_fork_wait_resume_state[session_id] = resume_state
+            self.codex_fork_wait_kind[session_id] = "approval"
+            next_state = "waiting_on_approval"
+        elif normalized == "user_input_request":
+            resume_state = "running" if session_id in self.codex_fork_turns_in_flight else "idle"
+            self.codex_fork_wait_resume_state[session_id] = resume_state
+            self.codex_fork_wait_kind[session_id] = "user_input"
+            next_state = "waiting_on_user_input"
+        elif normalized in {"approval_resolved", "user_input_resolved"}:
+            self.codex_fork_wait_resume_state.pop(session_id, None)
+            self.codex_fork_wait_kind.pop(session_id, None)
+            next_state = "running" if session_id in self.codex_fork_turns_in_flight else "idle"
+        elif normalized == "turn_delta":
+            if session_id in self.codex_fork_turns_in_flight:
+                next_state = "running"
+        elif normalized == "shutdown_complete":
+            self.codex_fork_turns_in_flight.discard(session_id)
+            self.codex_fork_wait_resume_state.pop(session_id, None)
+            self.codex_fork_wait_kind.pop(session_id, None)
+            next_state = "shutdown"
+        elif normalized == "error":
+            self.codex_fork_turns_in_flight.discard(session_id)
+            self.codex_fork_wait_resume_state.pop(session_id, None)
+            self.codex_fork_wait_kind.pop(session_id, None)
+            next_state = "error"
+
+        return self._set_codex_fork_lifecycle_state(
+            session_id=session_id,
+            state=next_state,
+            cause_event_type=normalized,
+            seq=seq,
+            session_epoch=session_epoch,
+        )
+
+    def ingest_codex_fork_event(self, session_id: str, event: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Ingest one codex-fork bridge event record."""
+        event_type = event.get("event_type") or event.get("type")
+        if not event_type:
+            return None
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        seq_raw = event.get("seq")
+        seq = int(seq_raw) if isinstance(seq_raw, int) or (isinstance(seq_raw, str) and seq_raw.isdigit()) else None
+        session_epoch = event.get("session_epoch")
+        normalized = self._normalize_codex_fork_event_type(event_type)
+        turn_id = payload.get("turn_id") or event.get("turn_id")
+        self.codex_event_store.append_event(
+            session_id=session_id,
+            event_type=f"codex_fork_{normalized}",
+            turn_id=turn_id,
+            payload={
+                "schema_version": event.get("schema_version"),
+                "seq": seq,
+                "session_epoch": session_epoch,
+                "payload": payload,
+            },
+        )
+        return self._reduce_codex_fork_lifecycle(
+            session_id=session_id,
+            event_type=normalized,
+            payload=payload,
+            seq=seq,
+            session_epoch=session_epoch,
+        )
+
+    def get_codex_fork_lifecycle_state(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return current codex-fork lifecycle reducer snapshot."""
+        state = self.codex_fork_lifecycle.get(session_id)
+        if state is None:
+            return None
+        return dict(state)
+
+    def _start_codex_fork_event_monitor(self, session: Session):
+        """Start background JSONL event monitor for one codex-fork session."""
+        if session.id in self.codex_fork_event_monitors:
+            return
+        if session.provider != "codex-fork":
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._monitor_codex_fork_event_stream(session.id))
+        self.codex_fork_event_monitors[session.id] = task
+
+    async def _stop_codex_fork_event_monitor(self, session_id: str):
+        """Stop one codex-fork event monitor task."""
+        task = self.codex_fork_event_monitors.pop(session_id, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _monitor_codex_fork_event_stream(self, session_id: str):
+        """Tail codex-fork event-stream file and feed reducer."""
+        buffer = self.codex_fork_event_buffers.get(session_id, "")
+        try:
+            while True:
+                session = self.sessions.get(session_id)
+                if not session or session.provider != "codex-fork":
+                    return
+
+                stream_path = self._codex_fork_event_stream_path(session)
+                offset = self.codex_fork_event_offsets.get(session_id, 0)
+                if stream_path.exists():
+                    with open(stream_path, "r", encoding="utf-8", errors="ignore") as handle:
+                        handle.seek(offset)
+                        chunk = handle.read()
+                        offset = handle.tell()
+                    self.codex_fork_event_offsets[session_id] = offset
+
+                    if chunk:
+                        buffer = buffer + chunk
+                        lines = buffer.splitlines()
+                        if buffer and not buffer.endswith("\n"):
+                            buffer = lines.pop() if lines else buffer
+                        else:
+                            buffer = ""
+                        self.codex_fork_event_buffers[session_id] = buffer
+
+                        for line in lines:
+                            raw = line.strip()
+                            if not raw:
+                                continue
+                            try:
+                                event = json.loads(raw)
+                            except json.JSONDecodeError:
+                                logger.debug("Skipping non-JSON codex-fork event line for %s", session_id)
+                                continue
+                            self.ingest_codex_fork_event(session_id, event)
+
+                await asyncio.sleep(self.codex_fork_event_poll_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Codex-fork event monitor failed for %s: %s", session_id, exc)
+            self._set_codex_fork_lifecycle_state(
+                session_id=session_id,
+                state="error",
+                cause_event_type="event_stream_monitor_error",
+            )
+        finally:
+            self.codex_fork_event_monitors.pop(session_id, None)
+            self.codex_fork_event_buffers.pop(session_id, None)
+
     async def _create_session_common(
         self,
         working_dir: str,
@@ -412,7 +702,7 @@ class SessionManager:
         session.git_remote_url = await self._get_git_remote_url_async(working_dir)
 
         # Set up log file path and tmux session for CLI providers
-        if provider in ("claude", "codex"):
+        if provider in ("claude", "codex", "codex-fork"):
             session.log_file = str(self.log_dir / f"{session.name}.log")
 
             if provider == "claude":
@@ -421,11 +711,28 @@ class SessionManager:
                 command = claude_config.get("command", "claude")
                 args = claude_config.get("args", [])
                 default_model = claude_config.get("default_model", "sonnet")
-            else:
+            elif provider == "codex":
                 # Codex CLI config
                 command = self.codex_cli_command
                 args = self.codex_cli_args
                 default_model = self.codex_default_model
+            else:
+                # Codex-fork config with explicit lifecycle bridge flags
+                command = self.codex_fork_command
+                args = list(self.codex_fork_args)
+                default_model = self.codex_fork_default_model
+                event_stream_path = self._codex_fork_event_stream_path(session)
+                event_stream_path.parent.mkdir(parents=True, exist_ok=True)
+                if event_stream_path.exists():
+                    event_stream_path.unlink()
+                args.extend(
+                    [
+                        "--event-stream",
+                        str(event_stream_path),
+                        "--event-schema-version",
+                        str(self.codex_fork_event_schema_version),
+                    ]
+                )
 
             # Select model (override or default)
             selected_model = model or default_model
@@ -485,6 +792,14 @@ class SessionManager:
             session.status = SessionStatus.RUNNING
         self.sessions[session.id] = session
         self._save_state()
+
+        if provider == "codex-fork":
+            self._set_codex_fork_lifecycle_state(
+                session_id=session.id,
+                state="running" if initial_prompt else "idle",
+                cause_event_type="session_created",
+            )
+            self._start_codex_fork_event_monitor(session)
 
         # Auto-create Telegram topic for this session
         await self._ensure_telegram_topic(session, telegram_chat_id)
@@ -799,7 +1114,7 @@ class SessionManager:
 
         # Handle steer delivery mode — direct Enter-based injection, bypasses queue
         if delivery_mode == "steer":
-            if session.provider != "codex":
+            if session.provider not in ("codex", "codex-fork"):
                 logger.error(f"Steer delivery only supported for Codex CLI sessions, not {session.provider}")
                 return DeliveryResult.FAILED
             success = await self.tmux.send_steer_text(session.tmux_session, text)
@@ -937,10 +1252,15 @@ class SessionManager:
     async def start_background_tasks(self):
         """Start periodic maintenance tasks owned by SessionManager."""
         await self.codex_observability_logger.start_periodic_prune()
+        for session in self.sessions.values():
+            if session.provider == "codex-fork" and session.status != SessionStatus.STOPPED:
+                self._start_codex_fork_event_monitor(session)
 
     async def stop_background_tasks(self):
         """Stop periodic maintenance tasks owned by SessionManager."""
         await self.codex_observability_logger.stop_periodic_prune()
+        for session_id in list(self.codex_fork_event_monitors.keys()):
+            await self._stop_codex_fork_event_monitor(session_id)
 
     async def _ensure_codex_session(self, session: Session, model: Optional[str] = None) -> Optional[CodexAppServerSession]:
         """Ensure a Codex app-server session is running for this session."""
@@ -1448,6 +1768,9 @@ class SessionManager:
             if not session:
                 return ActivityState.STOPPED.value
 
+        if session.provider == "codex-fork":
+            return self._compute_codex_fork_activity(session)
+
         if session.status == SessionStatus.STOPPED:
             return ActivityState.STOPPED.value
 
@@ -1482,6 +1805,29 @@ class SessionManager:
         if idle_seconds < 30:
             return ActivityState.THINKING.value
         return ActivityState.IDLE.value
+
+    def _compute_codex_fork_activity(self, session: Session) -> str:
+        """Compute activity state for codex-fork sessions from reducer state."""
+        lifecycle = self.codex_fork_lifecycle.get(session.id)
+        if not lifecycle:
+            if session.status == SessionStatus.STOPPED:
+                return ActivityState.STOPPED.value
+            if session.status == SessionStatus.IDLE:
+                return ActivityState.IDLE.value
+            return ActivityState.THINKING.value
+
+        state_name = lifecycle.get("state")
+        if state_name == "running":
+            return ActivityState.WORKING.value
+        if state_name == "idle":
+            return ActivityState.IDLE.value
+        if state_name == "waiting_on_approval":
+            return ActivityState.WAITING_PERMISSION.value
+        if state_name == "waiting_on_user_input":
+            return ActivityState.WAITING_INPUT.value
+        if state_name in ("shutdown", "error"):
+            return ActivityState.STOPPED.value
+        return ActivityState.THINKING.value
 
     def _compute_codex_app_activity(self, session: Session) -> str:
         """Compute activity state for codex-app sessions (no tmux/output monitor)."""
@@ -1597,7 +1943,7 @@ class SessionManager:
                 logger.error(f"Failed to clear Codex app session {session_id}: {e}")
                 return False
 
-        if session.provider == "codex":
+        if session.provider in ("codex", "codex-fork"):
             return await self._clear_tmux_session(session, new_prompt, clear_command="/new")
 
         return await self._clear_tmux_session(session, new_prompt, clear_command="/clear")
@@ -1726,6 +2072,22 @@ class SessionManager:
             self.codex_last_delta_at.pop(session_id, None)
             self.codex_wait_states.pop(session_id, None)
         else:
+            if session.provider == "codex-fork":
+                monitor_task = self.codex_fork_event_monitors.pop(session_id, None)
+                if monitor_task:
+                    monitor_task.cancel()
+                self.codex_fork_event_offsets.pop(session_id, None)
+                self.codex_fork_event_buffers.pop(session_id, None)
+                self.codex_fork_turns_in_flight.discard(session_id)
+                self.codex_fork_wait_resume_state.pop(session_id, None)
+                self.codex_fork_wait_kind.pop(session_id, None)
+                self.codex_fork_last_seq.pop(session_id, None)
+                self.codex_fork_session_epoch.pop(session_id, None)
+                self._set_codex_fork_lifecycle_state(
+                    session_id=session_id,
+                    state="shutdown",
+                    cause_event_type="session_killed",
+                )
             self.tmux.kill_session(session.tmux_session)
         session.status = SessionStatus.STOPPED
         self._save_state()
@@ -1787,7 +2149,7 @@ class SessionManager:
         Start a Codex /review on an existing session.
 
         Args:
-            session_id: Target session ID (must be a Codex CLI or codex-app session)
+            session_id: Target session ID (must be a Codex CLI/codex-fork/codex-app session)
             mode: Review mode (branch, uncommitted, commit, custom)
             base_branch: Target branch for branch mode
             commit_sha: Target SHA for commit mode
@@ -1803,8 +2165,8 @@ class SessionManager:
         if not session:
             return {"error": f"Session {session_id} not found"}
 
-        if session.provider not in ("codex", "codex-app"):
-            return {"error": "Review requires a Codex session (provider=codex or codex-app)"}
+        if session.provider not in ("codex", "codex-fork", "codex-app"):
+            return {"error": "Review requires a Codex session (provider=codex, codex-fork, or codex-app)"}
 
         # Validate session is idle before sending /review
         if self.message_queue_manager:
