@@ -39,6 +39,8 @@ def test_log_tool_and_turn_events_with_bounded_payload(tmp_path):
     assert len(tool_events) == 1
     assert len(turn_events) == 1
     assert tool_events[0]["event_type"] == "started"
+    assert tool_events[0]["provider"] == "codex-app"
+    assert tool_events[0]["schema_version"] is None
     assert tool_events[0]["raw_payload_json"] is not None
     assert "truncated" in tool_events[0]["raw_payload_json"]
     assert turn_events[0]["event_type"] == "turn_completed"
@@ -73,3 +75,34 @@ def test_prune_applies_age_and_per_session_caps(tmp_path):
     assert tool_events[-1]["event_type"] == "failed"
     assert len(turn_events) == 1
     assert turn_events[0]["turn_id"] == "t2"
+
+
+def test_prune_uses_provider_specific_age_boundary(tmp_path):
+    logger = CodexObservabilityLogger(
+        db_path=str(tmp_path / "codex_observability.db"),
+        retention_max_age_days=1,
+        retention_codex_fork_max_age_days=30,
+        retention_tool_events_per_session=20,
+    )
+    now = datetime.now(timezone.utc)
+    older_than_default = now - timedelta(days=10)
+
+    logger.log_tool_event(
+        session_id="sess3",
+        event_type="started",
+        provider="codex-app",
+        created_at=older_than_default,
+    )
+    logger.log_tool_event(
+        session_id="sess3",
+        event_type="started",
+        provider="codex-fork",
+        created_at=older_than_default,
+    )
+
+    logger.prune()
+    tool_events = logger.list_recent_tool_events("sess3", limit=10)
+    providers = [row["provider"] for row in tool_events]
+
+    assert "codex-fork" in providers
+    assert "codex-app" not in providers

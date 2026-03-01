@@ -6,7 +6,7 @@ import logging
 import re
 import subprocess
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable, Awaitable, Any
 
@@ -29,6 +29,15 @@ ROLE_KEYWORDS = (
     "product",
     "director",
     "ux",
+)
+
+SECRET_FIELD_PATTERN = re.compile(
+    r"(token|secret|password|passwd|authorization|cookie|api[_-]?key|access[_-]?key|session[_-]?key)",
+    re.IGNORECASE,
+)
+BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{6,}")
+INLINE_SECRET_PATTERN = re.compile(
+    r"(?i)\b(token|secret|password|api[_-]?key|access[_-]?key)\b\s*[:=]\s*([^\s,;]+)"
 )
 
 
@@ -113,6 +122,15 @@ class SessionManager:
         self.codex_fork_event_poll_interval_seconds = float(
             codex_fork_config.get("event_poll_interval_seconds", 0.5)
         )
+        self.codex_fork_tool_input_max_chars = max(
+            200, int(codex_fork_config.get("tool_input_max_chars", 2000))
+        )
+        self.codex_fork_output_preview_max_chars = max(
+            100, int(codex_fork_config.get("tool_output_preview_max_chars", 1200))
+        )
+        self.codex_fork_tool_payload_max_items = max(
+            10, int(codex_fork_config.get("tool_payload_max_items", 100))
+        )
         self.codex_fork_event_monitors: dict[str, asyncio.Task] = {}
         self.codex_fork_event_offsets: dict[str, int] = {}
         self.codex_fork_event_buffers: dict[str, str] = {}
@@ -154,10 +172,22 @@ class SessionManager:
             process_generation=self.process_generation,
         )
         codex_observability_config = self.config.get("codex_observability", {})
+        retention_max_age_days = codex_observability_config.get("retention_max_age_days")
+        if retention_max_age_days is None:
+            retention_max_age_days = 14
+        retention_codex_fork_max_age_days = codex_observability_config.get(
+            "retention_codex_fork_max_age_days"
+        )
+        if retention_codex_fork_max_age_days is None:
+            if "retention_max_age_days" in codex_observability_config:
+                retention_codex_fork_max_age_days = retention_max_age_days
+            else:
+                retention_codex_fork_max_age_days = 30
         default_observability_db = str(self.state_file.with_name("codex_observability.db"))
         self.codex_observability_logger = CodexObservabilityLogger(
             db_path=codex_observability_config.get("db_path", default_observability_db),
-            retention_max_age_days=codex_observability_config.get("retention_max_age_days", 14),
+            retention_max_age_days=retention_max_age_days,
+            retention_codex_fork_max_age_days=retention_codex_fork_max_age_days,
             retention_tool_events_per_session=codex_observability_config.get(
                 "retention_tool_events_per_session", 20000
             ),
@@ -544,6 +574,171 @@ class SessionManager:
             session_epoch=session_epoch,
         )
 
+    def _sanitize_codex_fork_text(self, value: Any, max_chars: int) -> Any:
+        text = str(value)
+        if any((ord(ch) < 32 and ch not in "\n\r\t") or ord(ch) == 127 for ch in text):
+            return {
+                "redacted": True,
+                "reason": "binary_payload_omitted",
+                "original_chars": len(text),
+            }
+        text = BEARER_TOKEN_PATTERN.sub("Bearer [REDACTED]", text)
+        text = INLINE_SECRET_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", text)
+        if len(text) <= max_chars:
+            return text
+        return {
+            "truncated": True,
+            "preview": text[:max_chars],
+            "original_chars": len(text),
+        }
+
+    def _sanitize_codex_fork_value(self, value: Any, *, max_chars: int, depth: int = 0) -> Any:
+        if depth >= 8:
+            return {"truncated": True, "reason": "max_depth"}
+        if isinstance(value, dict):
+            items = list(value.items())
+            sanitized: dict[str, Any] = {}
+            for key, nested_value in items[: self.codex_fork_tool_payload_max_items]:
+                key_str = str(key)
+                if SECRET_FIELD_PATTERN.search(key_str):
+                    sanitized[key_str] = "[REDACTED]"
+                else:
+                    sanitized[key_str] = self._sanitize_codex_fork_value(
+                        nested_value, max_chars=max_chars, depth=depth + 1
+                    )
+            if len(items) > self.codex_fork_tool_payload_max_items:
+                sanitized["_truncated_items"] = len(items) - self.codex_fork_tool_payload_max_items
+            return sanitized
+        if isinstance(value, (list, tuple)):
+            bounded = [
+                self._sanitize_codex_fork_value(item, max_chars=max_chars, depth=depth + 1)
+                for item in list(value)[: self.codex_fork_tool_payload_max_items]
+            ]
+            if len(value) > self.codex_fork_tool_payload_max_items:
+                bounded.append({"truncated_items": len(value) - self.codex_fork_tool_payload_max_items})
+            return bounded
+        if isinstance(value, bytes):
+            return {
+                "redacted": True,
+                "reason": "binary_payload_omitted",
+                "original_bytes": len(value),
+            }
+        if isinstance(value, str):
+            return self._sanitize_codex_fork_text(value, max_chars=max_chars)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return self._sanitize_codex_fork_text(value, max_chars=max_chars)
+
+    def _sanitize_codex_fork_tool_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        sanitized: dict[str, Any] = {}
+        for key in (
+            "turn_id",
+            "call_id",
+            "tool_name",
+            "tool_kind",
+            "executed",
+            "success",
+            "duration_ms",
+            "mutating",
+            "sandbox",
+            "sandbox_metadata",
+            "failure_behavior",
+            "hook_error",
+        ):
+            if key in payload:
+                sanitized[key] = payload.get(key)
+
+        if "duration_ms" in sanitized:
+            try:
+                sanitized["duration_ms"] = int(sanitized["duration_ms"])
+            except (TypeError, ValueError):
+                sanitized["duration_ms"] = None
+
+        if "tool_input" in payload:
+            sanitized["tool_input"] = self._sanitize_codex_fork_value(
+                payload.get("tool_input"), max_chars=self.codex_fork_tool_input_max_chars
+            )
+        if "output_preview" in payload:
+            sanitized["output_preview"] = self._sanitize_codex_fork_text(
+                payload.get("output_preview"),
+                max_chars=self.codex_fork_output_preview_max_chars,
+            )
+        if "error_message" in payload:
+            sanitized["error_message"] = self._sanitize_codex_fork_text(
+                payload.get("error_message"),
+                max_chars=self.codex_fork_output_preview_max_chars,
+            )
+        return sanitized
+
+    @staticmethod
+    def _parse_codex_fork_timestamp(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _ingest_codex_fork_tool_use_event(
+        self,
+        session_id: str,
+        event: dict[str, Any],
+        sanitized_payload: dict[str, Any],
+    ) -> None:
+        schema_version = event.get("schema_version")
+        if isinstance(schema_version, str) and schema_version.isdigit():
+            schema_version = int(schema_version)
+        if not isinstance(schema_version, int):
+            schema_version = None
+
+        executed = sanitized_payload.get("executed")
+        success = sanitized_payload.get("success")
+        if executed is False:
+            final_status = "skipped"
+        elif success is True:
+            final_status = "completed"
+        elif success is False:
+            final_status = "failed"
+        else:
+            final_status = None
+
+        created_at = self._parse_codex_fork_timestamp(event.get("ts"))
+        tool_name = sanitized_payload.get("tool_name")
+        if isinstance(tool_name, str):
+            session = self.sessions.get(session_id)
+            if session is not None:
+                session.last_tool_name = tool_name
+                session.last_tool_call = created_at.replace(tzinfo=None) if created_at else datetime.now()
+
+        self._safe_log_codex_tool_event(
+            session_id=session_id,
+            thread_id=str(event.get("session_id")) if event.get("session_id") else None,
+            turn_id=sanitized_payload.get("turn_id"),
+            item_id=sanitized_payload.get("call_id"),
+            event_type="after_tool_use",
+            item_type=sanitized_payload.get("tool_kind"),
+            phase="post",
+            latency_ms=sanitized_payload.get("duration_ms"),
+            final_status=final_status,
+            error_message=sanitized_payload.get("error_message"),
+            raw_payload=sanitized_payload,
+            created_at=created_at,
+            provider="codex-fork",
+            schema_version=schema_version,
+        )
+
     def ingest_codex_fork_event(self, session_id: str, event: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Ingest one codex-fork bridge event record."""
         event_type = event.get("event_type") or event.get("type")
@@ -554,7 +749,15 @@ class SessionManager:
         seq = int(seq_raw) if isinstance(seq_raw, int) or (isinstance(seq_raw, str) and seq_raw.isdigit()) else None
         session_epoch = event.get("session_epoch")
         normalized = self._normalize_codex_fork_event_type(event_type)
-        turn_id = payload.get("turn_id") or event.get("turn_id")
+        payload_for_store = payload
+        if normalized == "after_tool_use":
+            payload_for_store = self._sanitize_codex_fork_tool_payload(payload)
+            self._ingest_codex_fork_tool_use_event(
+                session_id=session_id,
+                event=event,
+                sanitized_payload=payload_for_store,
+            )
+        turn_id = payload_for_store.get("turn_id") or event.get("turn_id")
         self.codex_event_store.append_event(
             session_id=session_id,
             event_type=f"codex_fork_{normalized}",
@@ -563,13 +766,13 @@ class SessionManager:
                 "schema_version": event.get("schema_version"),
                 "seq": seq,
                 "session_epoch": session_epoch,
-                "payload": payload,
+                "payload": payload_for_store,
             },
         )
         return self._reduce_codex_fork_lifecycle(
             session_id=session_id,
             event_type=normalized,
-            payload=payload,
+            payload=payload_for_store,
             seq=seq,
             session_epoch=session_epoch,
         )
