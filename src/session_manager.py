@@ -1,6 +1,7 @@
 """Session registry and lifecycle management."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -122,6 +123,13 @@ class SessionManager:
         self.codex_fork_event_poll_interval_seconds = float(
             codex_fork_config.get("event_poll_interval_seconds", 0.5)
         )
+        self.codex_fork_control_timeout_seconds = float(
+            codex_fork_config.get("control_timeout_seconds", 5.0)
+        )
+        self.codex_fork_control_tmux_fallback_enabled = _coerce_rollout_flag(
+            codex_fork_config.get("control_tmux_fallback_enabled"),
+            default=True,
+        )
         self.codex_fork_tool_input_max_chars = max(
             200, int(codex_fork_config.get("tool_input_max_chars", 2000))
         )
@@ -140,6 +148,8 @@ class SessionManager:
         self.codex_fork_wait_kind: dict[str, str] = {}
         self.codex_fork_last_seq: dict[str, int] = {}
         self.codex_fork_session_epoch: dict[str, Any] = {}
+        self.codex_fork_control_epoch: dict[str, str] = {}
+        self.codex_fork_control_degraded: dict[str, str] = {}
 
         # App-server config (can be overridden by codex_app_server section)
         self.codex_config = CodexAppServerConfig(
@@ -415,6 +425,10 @@ class SessionManager:
     def _codex_fork_event_stream_path(self, session: Session) -> Path:
         """Return event-stream JSONL path for one codex-fork session."""
         return self.log_dir / f"{session.id}.codex-fork.events.jsonl"
+
+    def _codex_fork_control_socket_path(self, session: Session) -> Path:
+        """Return control-socket path for one codex-fork session."""
+        return self.log_dir / f"{session.id}.codex-fork.control.sock"
 
     @staticmethod
     def _normalize_codex_fork_event_type(event_type: Any) -> str:
@@ -943,15 +957,20 @@ class SessionManager:
                 args = list(self.codex_fork_args)
                 default_model = self.codex_fork_default_model
                 event_stream_path = self._codex_fork_event_stream_path(session)
+                control_socket_path = self._codex_fork_control_socket_path(session)
                 event_stream_path.parent.mkdir(parents=True, exist_ok=True)
                 if event_stream_path.exists():
                     event_stream_path.unlink()
+                if control_socket_path.exists():
+                    control_socket_path.unlink()
                 args.extend(
                     [
                         "--event-stream",
                         str(event_stream_path),
                         "--event-schema-version",
                         str(self.codex_fork_event_schema_version),
+                        "--control-socket",
+                        str(control_socket_path),
                     ]
                 )
 
@@ -1511,6 +1530,131 @@ class SessionManager:
             logger.error(f"Failed to ensure Codex session for {session.id}: {e}")
             return None
 
+    async def _codex_fork_control_roundtrip(self, socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+        timeout = max(0.5, self.codex_fork_control_timeout_seconds)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(socket_path)),
+            timeout=timeout,
+        )
+        try:
+            writer.write((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
+            await asyncio.wait_for(writer.drain(), timeout=timeout)
+            raw_response = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not raw_response:
+                raise RuntimeError("control socket closed without response")
+            try:
+                return json.loads(raw_response.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"control socket returned invalid JSON: {exc}") from exc
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    async def _refresh_codex_fork_control_epoch(self, session: Session, socket_path: Path) -> tuple[bool, str]:
+        request = {
+            "request_id": uuid.uuid4().hex,
+            "command": "get_epoch",
+        }
+        try:
+            response = await self._codex_fork_control_roundtrip(socket_path, request)
+        except Exception as exc:
+            return False, f"failed to read control epoch: {exc}"
+        if not response.get("ok"):
+            error = response.get("error") if isinstance(response.get("error"), dict) else {}
+            code = error.get("code", "unknown_error")
+            message = error.get("message", "failed to fetch epoch")
+            return False, f"{code}: {message}"
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        epoch = result.get("epoch")
+        if not isinstance(epoch, str) or not epoch:
+            fallback_epoch = response.get("epoch")
+            if isinstance(fallback_epoch, str) and fallback_epoch:
+                epoch = fallback_epoch
+        if not isinstance(epoch, str) or not epoch:
+            return False, "control epoch missing from response"
+        self.codex_fork_control_epoch[session.id] = epoch
+        return True, epoch
+
+    async def _send_codex_fork_control_command(
+        self,
+        session: Session,
+        command: str,
+        payload: dict[str, Any],
+    ) -> tuple[bool, str]:
+        socket_path = self._codex_fork_control_socket_path(session)
+        if not socket_path.exists():
+            return False, f"control socket not found: {socket_path}"
+
+        epoch = self.codex_fork_control_epoch.get(session.id)
+        if not epoch:
+            ok, epoch_or_error = await self._refresh_codex_fork_control_epoch(session, socket_path)
+            if not ok:
+                return False, epoch_or_error
+            epoch = epoch_or_error
+
+        async def send_with_epoch(expected_epoch: str) -> dict[str, Any]:
+            request = {
+                "request_id": uuid.uuid4().hex,
+                "expected_epoch": expected_epoch,
+                "command": command,
+                **payload,
+            }
+            return await self._codex_fork_control_roundtrip(socket_path, request)
+
+        try:
+            response = await send_with_epoch(epoch)
+        except Exception as exc:
+            return False, f"control command failed: {exc}"
+
+        if not response.get("ok"):
+            error = response.get("error") if isinstance(response.get("error"), dict) else {}
+            error_code = error.get("code", "unknown_error")
+            if error_code == "stale_epoch":
+                ok, epoch_or_error = await self._refresh_codex_fork_control_epoch(session, socket_path)
+                if not ok:
+                    return False, epoch_or_error
+                try:
+                    response = await send_with_epoch(epoch_or_error)
+                except Exception as exc:
+                    return False, f"control command failed after epoch refresh: {exc}"
+            if not response.get("ok"):
+                error = response.get("error") if isinstance(response.get("error"), dict) else {}
+                code = error.get("code", "unknown_error")
+                message = error.get("message", "control command failed")
+                return False, f"{code}: {message}"
+
+        response_epoch = response.get("epoch")
+        if isinstance(response_epoch, str) and response_epoch:
+            self.codex_fork_control_epoch[session.id] = response_epoch
+        return True, ""
+
+    def _set_codex_fork_control_degraded(self, session: Session, reason: str) -> None:
+        normalized_reason = reason.strip() or "unknown_control_error"
+        previous = self.codex_fork_control_degraded.get(session.id)
+        self.codex_fork_control_degraded[session.id] = normalized_reason
+        session.error_message = f"codex_fork_control_degraded: {normalized_reason}"
+        if previous != normalized_reason:
+            self.codex_event_store.append_event(
+                session_id=session.id,
+                event_type="codex_fork_control_degraded",
+                payload={"reason": normalized_reason},
+            )
+        self._save_state()
+
+    def _clear_codex_fork_control_degraded(self, session: Session) -> None:
+        if session.id not in self.codex_fork_control_degraded:
+            return
+        self.codex_fork_control_degraded.pop(session.id, None)
+        if session.error_message and session.error_message.startswith("codex_fork_control_degraded:"):
+            session.error_message = None
+        self.codex_event_store.append_event(
+            session_id=session.id,
+            event_type="codex_fork_control_restored",
+            payload={},
+        )
+        self._save_state()
+
     async def _deliver_direct(self, session: Session, text: str, model: Optional[str] = None) -> bool:
         """Deliver a message directly to a session (no queue)."""
         if session.provider == "codex-app":
@@ -1528,6 +1672,32 @@ class SessionManager:
             except Exception as e:
                 logger.error(f"Codex app send failed for {session.id}: {e}")
                 return False
+
+        if session.provider == "codex-fork":
+            success, reason = await self._send_codex_fork_control_command(
+                session=session,
+                command="submit_message",
+                payload={"message": text},
+            )
+            if success:
+                self._clear_codex_fork_control_degraded(session)
+                session.status = SessionStatus.RUNNING
+                session.last_activity = datetime.now()
+                self._save_state()
+                if self.message_queue_manager:
+                    self.message_queue_manager.mark_session_active(session.id)
+                return True
+
+            logger.warning("Codex-fork control send failed for %s: %s", session.id, reason)
+            self._set_codex_fork_control_degraded(session, reason)
+            if not self.codex_fork_control_tmux_fallback_enabled:
+                return False
+
+            logger.warning("Falling back to tmux input path for codex-fork session %s", session.id)
+            fallback_success = await self.tmux.send_input_async(session.tmux_session, text)
+            if fallback_success and self.message_queue_manager:
+                self.message_queue_manager.mark_session_active(session.id)
+            return fallback_success
 
         success = await self.tmux.send_input_async(session.tmux_session, text)
         if success and self.message_queue_manager:
@@ -2304,6 +2474,11 @@ class SessionManager:
                 self.codex_fork_wait_kind.pop(session_id, None)
                 self.codex_fork_last_seq.pop(session_id, None)
                 self.codex_fork_session_epoch.pop(session_id, None)
+                self.codex_fork_control_epoch.pop(session_id, None)
+                self.codex_fork_control_degraded.pop(session_id, None)
+                control_socket_path = self._codex_fork_control_socket_path(session)
+                if control_socket_path.exists():
+                    control_socket_path.unlink()
                 self._set_codex_fork_lifecycle_state(
                     session_id=session_id,
                     state="shutdown",
