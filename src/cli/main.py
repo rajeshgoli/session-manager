@@ -336,6 +336,17 @@ def main():
         help="Output JSON",
     )
 
+    # sm codex-rollout-gates [--json]
+    codex_rollout_gates_parser = subparsers.add_parser(
+        "codex-rollout-gates",
+        help="Show codex launch/cutover gate status",
+    )
+    codex_rollout_gates_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON",
+    )
+
     # sm watch [--repo PATH] [--role ROLE] [--interval SECONDS]
     watch_parser = subparsers.add_parser(
         "watch",
@@ -479,7 +490,7 @@ def main():
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-fork", "codex_fork",
         "codex-app", "codex-server",
-        "attach", "output", "codex-tui", "codex-fork-info", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
+        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
@@ -603,6 +614,8 @@ def main():
         ))
     elif args.command == "codex-fork-info":
         sys.exit(commands.cmd_codex_fork_info(client, json_output=args.json))
+    elif args.command == "codex-rollout-gates":
+        sys.exit(commands.cmd_codex_rollout_gates(client, json_output=args.json))
     elif args.command == "watch":
         sys.exit(commands.cmd_watch(
             client,

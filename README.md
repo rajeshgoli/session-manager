@@ -417,6 +417,16 @@ Rollback and recovery:
    - Run the configured rollback command from `sm codex-fork-info` (default `sm codex`).
    - If needed, update `codex_fork.artifact_ref` to the previous known-good release and restart.
 
+### Codex Launch Gate Checks
+
+Use `sm codex-rollout-gates` (or `--json`) to verify launch readiness gates:
+
+1. `a0_event_schema_contract` (schema compatibility floor)
+2. `launch_rollout_flags` (durable events + structured requests + projection enabled)
+3. `launch_artifact_pin` (immutable codex-fork ref configured)
+4. `launch_codex_app_drain` (no active codex-app sessions)
+5. `launch_provider_mapping_phase` (`migration_window` or `post_cutover`)
+
 ---
 
 ## Testing

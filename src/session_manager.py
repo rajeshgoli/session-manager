@@ -2190,6 +2190,68 @@ class SessionManager:
             "is_pinned": self.codex_fork_artifact_ref != "local-unpinned",
         }
 
+    def get_codex_launch_gates(self) -> dict[str, Any]:
+        """Compute codex-fork launch gate status for operator cutover checks."""
+        runtime = self.get_codex_fork_runtime_info()
+        policy = self.get_codex_provider_policy()
+        provider_counts = {
+            "claude": 0,
+            "codex": 0,
+            "codex-fork": 0,
+            "codex-app": 0,
+            "other": 0,
+        }
+        for session in self.sessions.values():
+            if getattr(session, "status", SessionStatus.RUNNING) == SessionStatus.STOPPED:
+                continue
+            provider = getattr(session, "provider", "claude")
+            if provider in provider_counts:
+                provider_counts[provider] += 1
+            else:
+                provider_counts["other"] += 1
+
+        rollout_flags = {
+            "enable_durable_events": self.is_codex_rollout_enabled("enable_durable_events"),
+            "enable_structured_requests": self.is_codex_rollout_enabled("enable_structured_requests"),
+            "enable_observability_projection": self.is_codex_rollout_enabled("enable_observability_projection"),
+            "enable_codex_tui": self.is_codex_rollout_enabled("enable_codex_tui"),
+        }
+        rollout_ready = (
+            rollout_flags["enable_durable_events"]
+            and rollout_flags["enable_structured_requests"]
+            and rollout_flags["enable_observability_projection"]
+        )
+
+        gates = {
+            "a0_event_schema_contract": {
+                "ok": runtime["event_schema_version"] >= 2,
+                "details": f"event_schema_version={runtime['event_schema_version']}",
+            },
+            "launch_rollout_flags": {
+                "ok": rollout_ready,
+                "details": rollout_flags,
+            },
+            "launch_artifact_pin": {
+                "ok": bool(runtime["is_pinned"]),
+                "details": f"artifact_ref={runtime['artifact_ref']}",
+            },
+            "launch_codex_app_drain": {
+                "ok": provider_counts["codex-app"] == 0,
+                "details": f"active_codex_app_sessions={provider_counts['codex-app']}",
+            },
+            "launch_provider_mapping_phase": {
+                "ok": policy.get("phase") in {"migration_window", "post_cutover"},
+                "details": f"phase={policy.get('phase')}",
+            },
+        }
+        return {
+            "gates": gates,
+            "rollout_flags": rollout_flags,
+            "provider_counts": provider_counts,
+            "codex_fork_runtime": runtime,
+            "codex_provider_policy": policy,
+        }
+
     def get_activity_state(self, session_or_id: Session | str) -> str:
         """Get computed activity state for API consumers."""
         session: Optional[Session]

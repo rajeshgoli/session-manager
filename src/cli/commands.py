@@ -1984,6 +1984,44 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
     return 0
 
 
+def cmd_codex_rollout_gates(client: SessionManagerClient, json_output: bool = False) -> int:
+    """
+    Show codex launch/cutover gate status.
+
+    Exit codes:
+        0: Success
+        1: Gate snapshot unavailable
+    """
+    import json as json_lib
+
+    payload = client.get_codex_launch_gates()
+    if payload is None:
+        print("Error: Failed to fetch codex launch gate snapshot", file=sys.stderr)
+        return 1
+
+    if json_output:
+        print(json_lib.dumps(payload, indent=2))
+        return 0
+
+    print("Codex launch gate snapshot")
+    gates = payload.get("gates", {})
+    for gate_name in sorted(gates):
+        gate = gates.get(gate_name, {})
+        status = "PASS" if gate.get("ok") else "FAIL"
+        details = gate.get("details")
+        print(f"- [{status}] {gate_name}: {details}")
+
+    provider_counts = payload.get("provider_counts", {})
+    if provider_counts:
+        print("- provider_counts:", provider_counts)
+
+    policy = payload.get("codex_provider_policy", {})
+    if policy:
+        print("- provider_mapping_phase:", policy.get("phase"))
+
+    return 0
+
+
 def cmd_watch(
     client: SessionManagerClient,
     repo: Optional[str] = None,

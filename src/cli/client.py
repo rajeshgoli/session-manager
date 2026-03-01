@@ -883,6 +883,16 @@ class SessionManagerClient:
             return payload
         return None
 
+    def get_codex_launch_gates(self) -> Optional[dict]:
+        """Get codex launch/cutover gate snapshot."""
+        data, success, unavailable = self._request("GET", "/admin/codex-launch-gates")
+        if unavailable or not success or not data:
+            return None
+        payload = data.get("codex_launch_gates")
+        if isinstance(payload, dict):
+            return payload
+        return None
+
     def schedule_reminder(self, session_id: str, delay_seconds: int, message: str) -> Optional[dict]:
         """Schedule a one-shot self-reminder (calls POST /scheduler/remind)."""
         query = (

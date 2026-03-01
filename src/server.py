@@ -2695,6 +2695,20 @@ Or continue working if not done yet."""
             raise HTTPException(status_code=500, detail="invalid codex-fork runtime metadata")
         return {"codex_fork": payload}
 
+    @app.get("/admin/codex-launch-gates")
+    async def get_codex_launch_gates():
+        """Expose codex launch/cutover gate status for operators."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        getter = getattr(sm, "get_codex_launch_gates", None)
+        if not callable(getter):
+            raise HTTPException(status_code=503, detail="codex launch gates unavailable")
+        payload = getter()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=500, detail="invalid codex launch gates payload")
+        return {"codex_launch_gates": payload}
+
     @app.post("/sessions/{target_session_id}/kill")
     async def kill_session_with_check(target_session_id: str, request: KillSessionRequest):
         """Kill a session with parent-child ownership check."""
