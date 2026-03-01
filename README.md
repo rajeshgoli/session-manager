@@ -347,6 +347,14 @@ codex_rollout:
   enable_observability_projection: true
   enable_codex_tui: true
 
+codex_fork:
+  artifact_release: "v0.1.0-sm"
+  artifact_ref: "8f00aa11b22cc33dd44ee55ff66778899aabbccd"
+  artifact_platforms: ["darwin-arm64", "darwin-x86_64", "linux-x86_64"]
+  rollback_provider: "codex"
+  rollback_command: "sm codex"
+  event_schema_version: 2
+
 codex_events:
   db_path: "~/.local/share/claude-sessions/codex_events.db"
   retention_max_events_per_session: 5000
@@ -394,6 +402,20 @@ Rollback and recovery:
 - Immediate rollback:
   - Set relevant `codex_rollout` flag(s) to `false` and restart service
   - Existing sessions continue, but gated APIs/CLI paths return explicit `503`/disabled errors
+
+### Codex-Fork Artifact Pin + Rollback Runbook
+
+1. Build/publish pinned artifacts:
+   - Use `scripts/codex_fork/release_artifacts.sh` from a checked-out codex-fork repo.
+   - Produce artifacts for `darwin-arm64`, `darwin-x86_64`, and `linux-x86_64`.
+2. Pin Session Manager to the released fork:
+   - Set `codex_fork.artifact_release` and immutable `codex_fork.artifact_ref` in `config.yaml`.
+   - Restart Session Manager to apply runtime metadata.
+3. Operator verification:
+   - Run `sm codex-fork-info` to confirm active pin + schema version.
+4. Rollback:
+   - Run the configured rollback command from `sm codex-fork-info` (default `sm codex`).
+   - If needed, update `codex_fork.artifact_ref` to the previous known-good release and restart.
 
 ---
 

@@ -325,6 +325,17 @@ def main():
         help="Max event page size per poll (default: 100)"
     )
 
+    # sm codex-fork-info [--json]
+    codex_fork_info_parser = subparsers.add_parser(
+        "codex-fork-info",
+        help="Show codex-fork artifact pinning + schema metadata",
+    )
+    codex_fork_info_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON",
+    )
+
     # sm watch [--repo PATH] [--role ROLE] [--interval SECONDS]
     watch_parser = subparsers.add_parser(
         "watch",
@@ -468,7 +479,7 @@ def main():
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-fork", "codex_fork",
         "codex-app", "codex-server",
-        "attach", "output", "codex-tui", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
+        "attach", "output", "codex-tui", "codex-fork-info", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
     requires_session_id = ["spawn"]
@@ -590,6 +601,8 @@ def main():
             poll_interval=args.poll_interval,
             event_limit=args.event_limit,
         ))
+    elif args.command == "codex-fork-info":
+        sys.exit(commands.cmd_codex_fork_info(client, json_output=args.json))
     elif args.command == "watch":
         sys.exit(commands.cmd_watch(
             client,

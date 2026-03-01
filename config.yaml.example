@@ -163,6 +163,22 @@ codex_rollout:
   enable_observability_projection: true
   enable_codex_tui: true
 
+# Codex fork runtime metadata + pinning contract
+codex_fork:
+  # Pinned release channel + immutable commit/tag ref consumed by operators.
+  artifact_release: "v0.1.0-sm"
+  artifact_ref: "8f00aa11b22cc33dd44ee55ff66778899aabbccd"
+  # Target platforms expected for published release assets.
+  artifact_platforms:
+    - "darwin-arm64"
+    - "darwin-x86_64"
+    - "linux-x86_64"
+  # Rollback guidance surfaced in sm codex-fork-info.
+  rollback_provider: "codex"
+  rollback_command: "sm codex"
+  # Control client/runtime contract pin.
+  event_schema_version: 2
+
 # Durable codex lifecycle event stream (for /codex-events + activity_state)
 codex_events:
   db_path: "~/.local/share/claude-sessions/codex_events.db"

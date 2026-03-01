@@ -1941,6 +1941,49 @@ def cmd_codex_tui(
     )
 
 
+def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False) -> int:
+    """
+    Show active codex-fork artifact pin, schema version, and rollback metadata.
+
+    Exit codes:
+        0: Success
+        1: Metadata unavailable
+        2: Session manager unavailable
+    """
+    import json as json_lib
+
+    payload = client.get_codex_fork_runtime()
+    if payload is None:
+        print("Error: Failed to fetch codex-fork runtime metadata (endpoint unavailable or incompatible)", file=sys.stderr)
+        return 1
+
+    if json_output:
+        print(json_lib.dumps(payload, indent=2))
+        return 0
+
+    artifact_ref = payload.get("artifact_ref", "unknown")
+    artifact_release = payload.get("artifact_release", "unknown")
+    event_schema_version = payload.get("event_schema_version", "unknown")
+    is_pinned = bool(payload.get("is_pinned", False))
+    rollback_command = payload.get("rollback_command", "sm codex")
+    rollback_provider = payload.get("rollback_provider", "codex")
+    command = payload.get("command", "codex")
+    args = payload.get("args", [])
+    platforms = payload.get("artifact_platforms", [])
+
+    print("Codex-fork runtime metadata")
+    print(f"- command: {command}")
+    print(f"- args: {args}")
+    print(f"- artifact_release: {artifact_release}")
+    print(f"- artifact_ref: {artifact_ref}")
+    print(f"- pinned: {is_pinned}")
+    print(f"- event_schema_version: {event_schema_version}")
+    print(f"- artifact_platforms: {platforms}")
+    print(f"- rollback_provider: {rollback_provider}")
+    print(f"- rollback_command: {rollback_command}")
+    return 0
+
+
 def cmd_watch(
     client: SessionManagerClient,
     repo: Optional[str] = None,

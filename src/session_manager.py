@@ -124,6 +124,22 @@ class SessionManager:
         self.codex_fork_args = codex_fork_config.get("args", self.codex_cli_args)
         self.codex_fork_default_model = codex_fork_config.get("default_model", self.codex_default_model)
         self.codex_fork_event_schema_version = int(codex_fork_config.get("event_schema_version", 2))
+        raw_artifact_ref = codex_fork_config.get("artifact_ref", "local-unpinned")
+        artifact_ref = str(raw_artifact_ref).strip() if raw_artifact_ref is not None else ""
+        if not artifact_ref or artifact_ref.lower() in {"none", "null"}:
+            artifact_ref = "local-unpinned"
+        self.codex_fork_artifact_ref = artifact_ref
+        self.codex_fork_artifact_release = str(codex_fork_config.get("artifact_release", "local"))
+        artifact_platforms = codex_fork_config.get(
+            "artifact_platforms",
+            ["darwin-arm64", "darwin-x86_64", "linux-x86_64"],
+        )
+        if isinstance(artifact_platforms, list):
+            self.codex_fork_artifact_platforms = [str(item) for item in artifact_platforms if str(item).strip()]
+        else:
+            self.codex_fork_artifact_platforms = ["darwin-arm64", "darwin-x86_64", "linux-x86_64"]
+        self.codex_fork_rollback_provider = str(codex_fork_config.get("rollback_provider", "codex"))
+        self.codex_fork_rollback_command = str(codex_fork_config.get("rollback_command", "sm codex"))
         self.codex_fork_event_poll_interval_seconds = float(
             codex_fork_config.get("event_poll_interval_seconds", 0.5)
         )
@@ -2159,6 +2175,20 @@ class SessionManager:
     def get_codex_provider_policy(self) -> dict[str, Any]:
         """Expose codex provider mapping policy for API/operator surfaces."""
         return get_codex_app_policy(self.codex_provider_mapping_phase)
+
+    def get_codex_fork_runtime_info(self) -> dict[str, Any]:
+        """Expose codex-fork artifact pinning/runtime metadata for operators."""
+        return {
+            "command": self.codex_fork_command,
+            "args": list(self.codex_fork_args),
+            "event_schema_version": self.codex_fork_event_schema_version,
+            "artifact_ref": self.codex_fork_artifact_ref,
+            "artifact_release": self.codex_fork_artifact_release,
+            "artifact_platforms": list(self.codex_fork_artifact_platforms),
+            "rollback_provider": self.codex_fork_rollback_provider,
+            "rollback_command": self.codex_fork_rollback_command,
+            "is_pinned": self.codex_fork_artifact_ref != "local-unpinned",
+        }
 
     def get_activity_state(self, session_or_id: Session | str) -> str:
         """Get computed activity state for API consumers."""

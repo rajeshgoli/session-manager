@@ -2681,6 +2681,20 @@ Or continue working if not done yet."""
             }
         }
 
+    @app.get("/admin/codex-fork-runtime")
+    async def get_codex_fork_runtime():
+        """Expose codex-fork artifact pinning/runtime metadata for operators."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        getter = getattr(sm, "get_codex_fork_runtime_info", None)
+        if not callable(getter):
+            raise HTTPException(status_code=503, detail="codex-fork runtime metadata unavailable")
+        payload = getter()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=500, detail="invalid codex-fork runtime metadata")
+        return {"codex_fork": payload}
+
     @app.post("/sessions/{target_session_id}/kill")
     async def kill_session_with_check(target_session_id: str, request: KillSessionRequest):
         """Kill a session with parent-child ownership check."""

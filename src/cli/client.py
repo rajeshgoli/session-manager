@@ -873,6 +873,16 @@ class SessionManagerClient:
             return None
         return data.get("codex_rollout", {})
 
+    def get_codex_fork_runtime(self) -> Optional[dict]:
+        """Get codex-fork artifact/runtime metadata."""
+        data, success, unavailable = self._request("GET", "/admin/codex-fork-runtime")
+        if unavailable or not success or not data:
+            return None
+        payload = data.get("codex_fork")
+        if isinstance(payload, dict):
+            return payload
+        return None
+
     def schedule_reminder(self, session_id: str, delay_seconds: int, message: str) -> Optional[dict]:
         """Schedule a one-shot self-reminder (calls POST /scheduler/remind)."""
         query = (
