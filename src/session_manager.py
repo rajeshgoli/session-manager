@@ -2446,6 +2446,14 @@ class SessionManager:
             return None
 
         provider = getattr(session, "provider", "claude")
+        if session.status == SessionStatus.STOPPED:
+            return {
+                "session_id": session.id,
+                "provider": provider,
+                "attach_supported": False,
+                "runtime_mode": "stopped",
+                "message": "Session is stopped and no live runtime is available for attach.",
+            }
         if provider == "codex-fork":
             lifecycle = self.get_codex_fork_lifecycle_state(session_id) or {}
             return {

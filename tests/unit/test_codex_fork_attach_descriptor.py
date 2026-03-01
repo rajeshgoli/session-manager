@@ -56,3 +56,25 @@ def test_codex_app_attach_descriptor_is_headless(tmp_path):
     assert descriptor["attach_supported"] is False
     assert descriptor["runtime_mode"] == "headless"
 
+
+def test_stopped_codex_fork_attach_descriptor_is_not_attachable(tmp_path):
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+        config={},
+    )
+    session = Session(
+        id="forkstopped",
+        name="codex-fork-forkstopped",
+        provider="codex-fork",
+        working_dir=str(tmp_path),
+        tmux_session="codex-fork-forkstopped",
+        log_file="",
+        status=SessionStatus.STOPPED,
+    )
+    manager.sessions[session.id] = session
+
+    descriptor = manager.get_attach_descriptor(session.id)
+    assert descriptor is not None
+    assert descriptor["attach_supported"] is False
+    assert descriptor["runtime_mode"] == "stopped"
