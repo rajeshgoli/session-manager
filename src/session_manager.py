@@ -17,6 +17,7 @@ from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, Codex
 from .codex_activity_projection import CodexActivityProjection
 from .codex_event_store import CodexEventStore
 from .codex_observability_logger import CodexObservabilityLogger
+from .codex_provider_policy import get_codex_app_policy, normalize_provider_mapping_phase
 from .codex_request_ledger import CodexRequestLedger
 from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_pr_repo_from_git
 
@@ -111,6 +112,9 @@ class SessionManager:
                 codex_rollout.get("enable_codex_tui"), default=True
             ),
         }
+        self.codex_provider_mapping_phase = normalize_provider_mapping_phase(
+            codex_rollout.get("provider_mapping_phase")
+        )
 
         self.codex_cli_command = codex_config.get("command", "codex")
         self.codex_cli_args = codex_config.get("args", [])
@@ -2151,6 +2155,10 @@ class SessionManager:
     def is_codex_rollout_enabled(self, flag_name: str) -> bool:
         """Read codex rollout feature gate (defaults to True for unknown flags)."""
         return bool(self.codex_rollout_flags.get(flag_name, True))
+
+    def get_codex_provider_policy(self) -> dict[str, Any]:
+        """Expose codex provider mapping policy for API/operator surfaces."""
+        return get_codex_app_policy(self.codex_provider_mapping_phase)
 
     def get_activity_state(self, session_or_id: Session | str) -> str:
         """Get computed activity state for API consumers."""
