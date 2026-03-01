@@ -715,6 +715,11 @@ class SessionManager:
             final_status = None
 
         created_at = self._parse_codex_fork_timestamp(event.get("ts"))
+        error_message = sanitized_payload.get("error_message")
+        if isinstance(error_message, (dict, list)):
+            error_message = json.dumps(error_message, separators=(",", ":"), default=str)
+        elif error_message is not None and not isinstance(error_message, str):
+            error_message = str(error_message)
         tool_name = sanitized_payload.get("tool_name")
         if isinstance(tool_name, str):
             session = self.sessions.get(session_id)
@@ -732,7 +737,7 @@ class SessionManager:
             phase="post",
             latency_ms=sanitized_payload.get("duration_ms"),
             final_status=final_status,
-            error_message=sanitized_payload.get("error_message"),
+            error_message=error_message,
             raw_payload=sanitized_payload,
             created_at=created_at,
             provider="codex-fork",
