@@ -1153,6 +1153,19 @@ def create_app(
             ]
         }
 
+    @app.get("/sessions/{session_id}/attach-descriptor")
+    async def get_attach_descriptor(session_id: str):
+        """Get provider-specific attach metadata for detached-runtime reattach."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        getter = getattr(app.state.session_manager, "get_attach_descriptor", None)
+        if not callable(getter):
+            raise HTTPException(status_code=503, detail="attach descriptor unavailable")
+        descriptor = getter(session_id)
+        if descriptor is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {"attach": descriptor}
+
     @app.get("/sessions/context-monitor")
     async def get_context_monitor_status():
         """List sessions with context monitoring enabled (#206)."""

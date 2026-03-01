@@ -182,6 +182,7 @@ class SessionManager:
         self.codex_fork_session_epoch: dict[str, Any] = {}
         self.codex_fork_control_epoch: dict[str, str] = {}
         self.codex_fork_control_degraded: dict[str, str] = {}
+        self.codex_fork_runtime_owner: dict[str, str] = {}
 
         # App-server config (can be overridden by codex_app_server section)
         self.codex_config = CodexAppServerConfig(
@@ -312,6 +313,8 @@ class SessionManager:
                     # Verify tmux session still exists (Claude/Codex CLI)
                     if self.tmux.session_exists(session.tmux_session):
                         self.sessions[session.id] = session
+                        if session.provider == "codex-fork":
+                            self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
                         logger.info(f"Restored session: {session.name}")
                     else:
                         logger.warning(f"Session {session.name} no longer exists in tmux")
@@ -1082,6 +1085,7 @@ class SessionManager:
         self._save_state()
 
         if provider == "codex-fork":
+            self.codex_fork_runtime_owner[session.id] = parent_session_id or session.id
             self._set_codex_fork_lifecycle_state(
                 session_id=session.id,
                 state="running" if initial_prompt else "idle",
@@ -2435,6 +2439,48 @@ class SessionManager:
             return ActivityState.IDLE.value
         return ActivityState.THINKING.value
 
+    def get_attach_descriptor(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return provider-specific attach metadata for detached-runtime reattach."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+
+        provider = getattr(session, "provider", "claude")
+        if provider == "codex-fork":
+            lifecycle = self.get_codex_fork_lifecycle_state(session_id) or {}
+            return {
+                "session_id": session.id,
+                "provider": provider,
+                "attach_supported": True,
+                "attach_transport": "tmux",
+                "tmux_session": session.tmux_session,
+                "runtime_mode": "detached_runtime",
+                "runtime_id": f"codex-fork:{session.id}",
+                "runtime_owner": self.codex_fork_runtime_owner.get(session.id),
+                "lifecycle_state": lifecycle.get("state", "idle"),
+                "lifecycle_cause": lifecycle.get("cause_event_type"),
+                "control_socket_path": str(self._codex_fork_control_socket_path(session)),
+                "event_stream_path": str(self._codex_fork_event_stream_path(session)),
+            }
+
+        if provider == "codex-app":
+            return {
+                "session_id": session.id,
+                "provider": provider,
+                "attach_supported": False,
+                "runtime_mode": "headless",
+                "message": "provider=codex-app is headless; use watch/status APIs instead of attach.",
+            }
+
+        return {
+            "session_id": session.id,
+            "provider": provider,
+            "attach_supported": True,
+            "attach_transport": "tmux",
+            "tmux_session": session.tmux_session,
+            "runtime_mode": "tmux",
+        }
+
     def get_codex_events(self, session_id: str, since_seq: Optional[int] = None, limit: int = 200) -> dict:
         """Read persisted codex event timeline for one session."""
         return self.codex_event_store.get_events(session_id=session_id, since_seq=since_seq, limit=limit)
@@ -2676,6 +2722,7 @@ class SessionManager:
                 self.codex_fork_session_epoch.pop(session_id, None)
                 self.codex_fork_control_epoch.pop(session_id, None)
                 self.codex_fork_control_degraded.pop(session_id, None)
+                self.codex_fork_runtime_owner.pop(session_id, None)
                 control_socket_path = self._codex_fork_control_socket_path(session)
                 if control_socket_path.exists():
                     control_socket_path.unlink()

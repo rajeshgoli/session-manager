@@ -1730,27 +1730,27 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
     """
     import subprocess
 
-    # Case 1: Direct attach with identifier
-    if identifier:
-        # Resolve identifier to session
-        session_id, session = resolve_session_id(client, identifier)
-
-        if session_id is None:
-            sessions = client.list_sessions()
-            if sessions is None:
-                print("Error: Session manager unavailable", file=sys.stderr)
-                return 2
-            else:
-                print(f"Error: Session '{identifier}' not found", file=sys.stderr)
+    def _attach_with_descriptor(session: dict) -> int:
+        session_id = session.get("id")
+        descriptor = client.get_attach_descriptor(session_id) if session_id else None
+        if descriptor:
+            if not descriptor.get("attach_supported", True):
+                message = descriptor.get("message") or "Attach not supported for this session"
+                print(f"Error: {message}", file=sys.stderr)
                 return 1
+            provider = descriptor.get("provider", session.get("provider", "claude"))
+            if provider == "codex-fork":
+                runtime_id = descriptor.get("runtime_id") or f"codex-fork:{session_id}"
+                lifecycle_state = descriptor.get("lifecycle_state", "unknown")
+                print(f"Reattaching to detached codex-fork runtime {runtime_id} (state={lifecycle_state})...")
+            tmux_session = descriptor.get("tmux_session") or session.get("tmux_session")
+        else:
+            tmux_session = session.get("tmux_session")
 
-        # Extract tmux session name
-        tmux_session = session.get("tmux_session")
         if not tmux_session:
             print("Error: Session has no tmux session", file=sys.stderr)
             return 1
 
-        # Attach
         try:
             subprocess.run(["tmux", "attach", "-t", tmux_session], check=True)
             return 0
@@ -1760,6 +1760,20 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
         except FileNotFoundError:
             print("Error: tmux not found. Is tmux installed?", file=sys.stderr)
             return 1
+
+    # Case 1: Direct attach with identifier
+    if identifier:
+        session_id, session = resolve_session_id(client, identifier)
+
+        if session_id is None:
+            sessions = client.list_sessions()
+            if sessions is None:
+                print("Error: Session manager unavailable", file=sys.stderr)
+                return 2
+            print(f"Error: Session '{identifier}' not found", file=sys.stderr)
+            return 1
+
+        return _attach_with_descriptor(session)
 
     # Case 2: Interactive menu
     sessions = client.list_sessions()
@@ -1780,15 +1794,7 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
 
     # Single session - attach directly
     if len(active_sessions) == 1:
-        session = active_sessions[0]
-        tmux_session = session.get("tmux_session")
-
-        try:
-            subprocess.run(["tmux", "attach", "-t", tmux_session], check=True)
-            return 0
-        except subprocess.CalledProcessError:
-            print(f"Error: Failed to attach to tmux session {tmux_session}", file=sys.stderr)
-            return 1
+        return _attach_with_descriptor(active_sessions[0])
 
     # Multiple sessions - show menu
     print("Available sessions:")
@@ -1825,21 +1831,7 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
             print(f"Error: Session '{selection}' not found", file=sys.stderr)
             return 1
 
-    # Attach to selected session
-    tmux_session = session.get("tmux_session")
-    if not tmux_session:
-        print("Error: Session has no tmux session", file=sys.stderr)
-        return 1
-
-    try:
-        subprocess.run(["tmux", "attach", "-t", tmux_session], check=True)
-        return 0
-    except subprocess.CalledProcessError:
-        print(f"Error: Failed to attach to tmux session {tmux_session}", file=sys.stderr)
-        return 1
-    except FileNotFoundError:
-        print("Error: tmux not found. Is tmux installed?", file=sys.stderr)
-        return 1
+    return _attach_with_descriptor(session)
 
 
 def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int:

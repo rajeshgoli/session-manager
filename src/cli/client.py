@@ -598,6 +598,19 @@ class SessionManagerClient:
             return data.get("message")
         return None
 
+    def get_attach_descriptor(self, session_id: str) -> Optional[dict]:
+        """Get attach descriptor for a session."""
+        data, success, unavailable = self._request(
+            "GET",
+            f"/sessions/{session_id}/attach-descriptor",
+        )
+        if unavailable or not success or not data:
+            return None
+        payload = data.get("attach")
+        if isinstance(payload, dict):
+            return payload
+        return None
+
     def get_output(
         self,
         session_id: str,

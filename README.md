@@ -437,6 +437,19 @@ When `codex_rollout.provider_mapping_phase=post_cutover`:
 3. Mutating actions (`input`, structured `respond`, `clear`) return `410` with migration guidance.
 4. Pending codex requests and queued message artifacts are cleaned with explicit retirement reason.
 
+### Codex-Fork Detached Runtime Reattach
+
+`sm attach` now uses `GET /sessions/{id}/attach-descriptor` to reattach to the same live codex-fork runtime.
+
+Descriptor payload includes:
+
+1. runtime ID and owner
+2. lifecycle state/cause snapshot
+3. control socket and event-stream paths
+4. attach transport metadata
+
+This keeps turn execution/control/event stream continuity while reattaching.
+
 ---
 
 ## Testing
