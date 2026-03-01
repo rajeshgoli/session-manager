@@ -1643,11 +1643,14 @@ class SessionManager:
         self._save_state()
 
     def _clear_codex_fork_control_degraded(self, session: Session) -> None:
-        if session.id not in self.codex_fork_control_degraded:
-            return
-        self.codex_fork_control_degraded.pop(session.id, None)
-        if session.error_message and session.error_message.startswith("codex_fork_control_degraded:"):
+        had_runtime_degraded = self.codex_fork_control_degraded.pop(session.id, None) is not None
+        had_persisted_degraded_error = bool(
+            session.error_message and session.error_message.startswith("codex_fork_control_degraded:")
+        )
+        if had_persisted_degraded_error:
             session.error_message = None
+        if not had_runtime_degraded and not had_persisted_degraded_error:
+            return
         self.codex_event_store.append_event(
             session_id=session.id,
             event_type="codex_fork_control_restored",
