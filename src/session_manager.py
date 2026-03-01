@@ -581,12 +581,16 @@ class SessionManager:
             return None
         return dict(state)
 
-    def _start_codex_fork_event_monitor(self, session: Session):
+    def _start_codex_fork_event_monitor(self, session: Session, from_eof: bool = False):
         """Start background JSONL event monitor for one codex-fork session."""
         if session.id in self.codex_fork_event_monitors:
             return
         if session.provider != "codex-fork":
             return
+        if from_eof:
+            stream_path = self._codex_fork_event_stream_path(session)
+            if stream_path.exists():
+                self.codex_fork_event_offsets[session.id] = stream_path.stat().st_size
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1255,7 +1259,7 @@ class SessionManager:
         await self.codex_observability_logger.start_periodic_prune()
         for session in self.sessions.values():
             if session.provider == "codex-fork" and session.status != SessionStatus.STOPPED:
-                self._start_codex_fork_event_monitor(session)
+                self._start_codex_fork_event_monitor(session, from_eof=True)
 
     async def stop_background_tasks(self):
         """Stop periodic maintenance tasks owned by SessionManager."""
