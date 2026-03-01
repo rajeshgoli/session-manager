@@ -246,13 +246,23 @@ def main():
     # sm codex-app [working_dir]
     parser_codex_app = subparsers.add_parser(
         "codex-app",
-        aliases=["codex-server"],
         help="Create a new Codex app-server session (headless)"
     )
     parser_codex_app.add_argument(
         "working_dir",
         nargs="?",
         help="Working directory (defaults to current directory)"
+    )
+
+    # sm codex-server [working_dir] (removed entrypoint)
+    parser_codex_server = subparsers.add_parser(
+        "codex-server",
+        help="Removed entrypoint (use sm codex-app or sm codex)"
+    )
+    parser_codex_server.add_argument(
+        "working_dir",
+        nargs="?",
+        help="Working directory (ignored; command is removed)"
     )
 
     # sm new (deprecated alias)
@@ -563,8 +573,10 @@ def main():
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex"))
     elif args.command in ("codex-fork", "codex_fork"):
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork"))
-    elif args.command in ("codex-app", "codex-server"):
+    elif args.command == "codex-app":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app"))
+    elif args.command == "codex-server":
+        sys.exit(commands.cmd_removed_entrypoint("codex-server"))
     elif args.command == "new":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
     elif args.command == "attach":

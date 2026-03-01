@@ -15,12 +15,56 @@ _BASH_DISPLAY_WIDTH = 80
 from .client import SessionManagerClient
 from .formatting import format_session_line, format_relative_time, format_status_list
 from ..lock_manager import LockManager
+from ..codex_provider_policy import (
+    REMOVED_CODEX_SERVER_ENTRYPOINT_MESSAGE,
+    get_codex_app_policy,
+)
 
 # Settle delay between tmux send-keys calls to avoid paste detection.
 # Mirrors TmuxController.send_keys_settle_seconds (default 0.3s).
 # Claude Code (Node.js TUI in raw mode) treats a rapid character burst as pasted
 # text; Enter must arrive as a separate event after the paste mode ends.
 _SEND_KEYS_SETTLE_SECONDS = 0.3
+
+
+def _get_codex_app_policy_for_cli(client: SessionManagerClient) -> dict:
+    """Get codex-app migration policy from rollout flags (or local defaults)."""
+    rollout_flags = client.get_rollout_flags() or {}
+    phase = rollout_flags.get("provider_mapping_phase")
+    fallback = get_codex_app_policy(phase)
+    return {
+        "phase": rollout_flags.get("provider_mapping_phase", fallback["phase"]),
+        "allow_create": rollout_flags.get("codex_app_allow_create", fallback["allow_create"]),
+        "warning": rollout_flags.get("codex_app_warning", fallback["warning"]),
+        "rejection_error": rollout_flags.get("codex_app_rejection_error", fallback["rejection_error"]),
+    }
+
+
+def _print_codex_app_guidance_for_create(client: SessionManagerClient) -> bool:
+    """
+    Print codex-app migration guidance for create/spawn commands.
+
+    Returns True when codex-app session creation is currently allowed.
+    """
+    policy = _get_codex_app_policy_for_cli(client)
+    if not policy.get("allow_create", True):
+        message = policy.get("rejection_error") or "provider=codex-app is not available"
+        print(f"Error: {message}", file=sys.stderr)
+        return False
+    warning = policy.get("warning")
+    if warning:
+        print(f"Warning: {warning}", file=sys.stderr)
+    return True
+
+
+def cmd_removed_entrypoint(entrypoint: str) -> int:
+    """Return actionable error text for removed legacy commands."""
+    normalized = (entrypoint or "").strip().lower()
+    if normalized in {"codex-server", "codex-app-server"}:
+        print(f"Error: {REMOVED_CODEX_SERVER_ENTRYPOINT_MESSAGE}", file=sys.stderr)
+        return 1
+    print(f"Error: Command '{entrypoint}' has been removed", file=sys.stderr)
+    return 1
 
 
 def parse_duration(duration_str: str) -> int:
@@ -1205,6 +1249,8 @@ def cmd_spawn(
             file=sys.stderr,
         )
         return 1
+    if provider == "codex-app" and not _print_codex_app_guidance_for_create(client):
+        return 1
 
     # Spawn child session
     result = client.spawn_child(
@@ -1624,6 +1670,9 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, pro
         working_dir = str(path)
     except Exception as e:
         print(f"Error: Invalid path: {e}", file=sys.stderr)
+        return 1
+
+    if provider == "codex-app" and not _print_codex_app_guidance_for_create(client):
         return 1
 
     # Create session via API

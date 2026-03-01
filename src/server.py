@@ -14,6 +14,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .codex_provider_policy import (
+    REMOVED_CODEX_SERVER_ENTRYPOINT_MESSAGE,
+    get_codex_app_policy,
+)
 from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus, DeliveryResult
 from .cli.commands import validate_friendly_name
 
@@ -30,7 +34,9 @@ def _normalize_provider(provider: Optional[str]) -> str:
     if not provider:
         return "claude"
     provider = provider.lower()
-    if provider in ("codex-app", "codex_app", "codex-server", "codex-app-server"):
+    if provider in ("codex-server", "codex-app-server"):
+        raise HTTPException(status_code=400, detail=REMOVED_CODEX_SERVER_ENTRYPOINT_MESSAGE)
+    if provider in ("codex-app", "codex_app"):
         return "codex-app"
     if provider in ("codex-fork", "codex_fork", "codexfork"):
         return "codex-fork"
@@ -604,6 +610,22 @@ def create_app(
             return bool(getter(flag_name))
         except Exception:
             return True
+
+    def _codex_provider_policy() -> Dict[str, Any]:
+        """Read codex provider mapping policy from SessionManager when available."""
+        sm = app.state.session_manager
+        if not sm:
+            return get_codex_app_policy()
+        getter = getattr(sm, "get_codex_provider_policy", None)
+        if not callable(getter):
+            return get_codex_app_policy()
+        try:
+            policy = getter()
+        except Exception:
+            return get_codex_app_policy()
+        if isinstance(policy, dict):
+            return policy
+        return get_codex_app_policy()
 
     @app.get("/")
     async def root():
@@ -2645,12 +2667,17 @@ Or continue working if not done yet."""
     @app.get("/admin/rollout-flags")
     async def get_rollout_flags():
         """Expose codex rollout feature gates for CLI and operator checks."""
+        policy = _codex_provider_policy()
         return {
             "codex_rollout": {
                 "enable_durable_events": _codex_rollout_enabled("enable_durable_events"),
                 "enable_structured_requests": _codex_rollout_enabled("enable_structured_requests"),
                 "enable_observability_projection": _codex_rollout_enabled("enable_observability_projection"),
                 "enable_codex_tui": _codex_rollout_enabled("enable_codex_tui"),
+                "provider_mapping_phase": policy.get("phase"),
+                "codex_app_allow_create": policy.get("allow_create"),
+                "codex_app_warning": policy.get("warning"),
+                "codex_app_rejection_error": policy.get("rejection_error"),
             }
         }
 
