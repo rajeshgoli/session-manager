@@ -730,7 +730,10 @@ class SessionManager:
             session = self.sessions.get(session_id)
             if session is not None:
                 session.last_tool_name = tool_name
-                session.last_tool_call = created_at.replace(tzinfo=None) if created_at else datetime.now()
+                if created_at:
+                    session.last_tool_call = created_at.astimezone().replace(tzinfo=None)
+                else:
+                    session.last_tool_call = datetime.now()
 
         self._safe_log_codex_tool_event(
             session_id=session_id,
