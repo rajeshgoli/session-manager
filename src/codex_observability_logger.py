@@ -1,4 +1,4 @@
-"""Codex app observability storage for tool and turn lifecycle events."""
+"""Codex observability storage for tool and turn lifecycle events."""
 
 from __future__ import annotations
 
@@ -16,12 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class CodexObservabilityLogger:
-    """Persists codex-app observability events with bounded retention."""
+    """Persists codex observability events with bounded retention."""
 
     def __init__(
         self,
         db_path: str,
         retention_max_age_days: int = 14,
+        retention_codex_fork_max_age_days: Optional[int] = None,
         retention_tool_events_per_session: int = 20000,
         retention_turn_events_per_session: int = 5000,
         payload_max_chars: int = 4000,
@@ -31,6 +32,9 @@ class CodexObservabilityLogger:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.retention_max_age_days = max(1, int(retention_max_age_days))
+        if retention_codex_fork_max_age_days is None:
+            retention_codex_fork_max_age_days = retention_max_age_days
+        self.retention_codex_fork_max_age_days = max(1, int(retention_codex_fork_max_age_days))
         self.retention_tool_events_per_session = max(1, int(retention_tool_events_per_session))
         self.retention_turn_events_per_session = max(1, int(retention_turn_events_per_session))
         self.payload_max_chars = max(200, int(payload_max_chars))
@@ -76,6 +80,8 @@ class CodexObservabilityLogger:
                     error_code TEXT,
                     error_message TEXT,
                     raw_payload_json TEXT,
+                    provider TEXT NOT NULL DEFAULT 'codex-app',
+                    schema_version INTEGER,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -94,9 +100,35 @@ class CodexObservabilityLogger:
                     error_code TEXT,
                     error_message TEXT,
                     raw_payload_json TEXT,
+                    provider TEXT NOT NULL DEFAULT 'codex-app',
+                    schema_version INTEGER,
                     created_at TEXT NOT NULL
                 )
                 """
+            )
+            self._ensure_column(
+                cursor=cursor,
+                table="codex_tool_events",
+                column="provider",
+                definition="TEXT NOT NULL DEFAULT 'codex-app'",
+            )
+            self._ensure_column(
+                cursor=cursor,
+                table="codex_tool_events",
+                column="schema_version",
+                definition="INTEGER",
+            )
+            self._ensure_column(
+                cursor=cursor,
+                table="codex_turn_events",
+                column="provider",
+                definition="TEXT NOT NULL DEFAULT 'codex-app'",
+            )
+            self._ensure_column(
+                cursor=cursor,
+                table="codex_turn_events",
+                column="schema_version",
+                definition="INTEGER",
             )
 
             cursor.execute(
@@ -109,15 +141,34 @@ class CodexObservabilityLogger:
                 "CREATE INDEX IF NOT EXISTS idx_codex_tool_events_turn ON codex_tool_events(turn_id, created_at)"
             )
             cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_codex_tool_events_session_call ON codex_tool_events(session_id, item_id, created_at, id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_codex_tool_events_session_turn_call ON codex_tool_events(session_id, turn_id, item_id, created_at, id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_codex_tool_events_provider_schema ON codex_tool_events(provider, schema_version, created_at, id)"
+            )
+            cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_codex_turn_events_session_created ON codex_turn_events(session_id, created_at, id)"
             )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_codex_turn_events_turn ON codex_turn_events(turn_id, created_at)"
             )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_codex_turn_events_provider_schema ON codex_turn_events(provider, schema_version, created_at, id)"
+            )
 
             conn.commit()
 
         self.prune()
+
+    def _ensure_column(self, *, cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in cursor.fetchall()}
+        if column in columns:
+            return
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _bounded_payload_json(self, payload: Optional[dict[str, Any]]) -> Optional[str]:
         if payload is None:
@@ -159,6 +210,8 @@ class CodexObservabilityLogger:
         final_status: Optional[str] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        provider: str = "codex-app",
+        schema_version: Optional[int] = None,
         raw_payload: Optional[dict[str, Any]] = None,
         created_at: Optional[datetime] = None,
     ) -> None:
@@ -173,8 +226,8 @@ class CodexObservabilityLogger:
                     session_id, thread_id, turn_id, item_id, request_id,
                     event_type, item_type, phase, command, cwd, exit_code, file_path,
                     diff_summary, approval_decision, latency_ms, final_status,
-                    error_code, error_message, raw_payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_code, error_message, raw_payload_json, provider, schema_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -196,6 +249,8 @@ class CodexObservabilityLogger:
                     error_code,
                     error_message,
                     raw_payload_json,
+                    provider,
+                    schema_version,
                     ts,
                 ),
             )
@@ -213,6 +268,8 @@ class CodexObservabilityLogger:
         output_preview: Optional[str] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        provider: str = "codex-app",
+        schema_version: Optional[int] = None,
         raw_payload: Optional[dict[str, Any]] = None,
         created_at: Optional[datetime] = None,
     ) -> None:
@@ -225,8 +282,8 @@ class CodexObservabilityLogger:
                 """
                 INSERT INTO codex_turn_events (
                     session_id, thread_id, turn_id, event_type, status, delta_chars,
-                    output_preview, error_code, error_message, raw_payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    output_preview, error_code, error_message, raw_payload_json, provider, schema_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -239,6 +296,8 @@ class CodexObservabilityLogger:
                     error_code,
                     error_message,
                     raw_payload_json,
+                    provider,
+                    schema_version,
                     ts,
                 ),
             )
@@ -252,17 +311,38 @@ class CodexObservabilityLogger:
         deleted_tool_cap = 0
         deleted_turn_cap = 0
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_max_age_days)
-        cutoff_iso = cutoff.isoformat()
+        cutoff_default_iso = (
+            datetime.now(timezone.utc) - timedelta(days=self.retention_max_age_days)
+        ).isoformat()
+        cutoff_fork_iso = (
+            datetime.now(timezone.utc) - timedelta(days=self.retention_codex_fork_max_age_days)
+        ).isoformat()
 
         with self._db_lock:
             conn = self._get_conn()
             cursor = conn.cursor()
 
-            cursor.execute("DELETE FROM codex_tool_events WHERE created_at < ?", (cutoff_iso,))
+            cursor.execute(
+                "DELETE FROM codex_tool_events WHERE COALESCE(provider, 'codex-app') = 'codex-fork' AND created_at < ?",
+                (cutoff_fork_iso,),
+            )
             deleted_tool_age = cursor.rowcount
-            cursor.execute("DELETE FROM codex_turn_events WHERE created_at < ?", (cutoff_iso,))
+            cursor.execute(
+                "DELETE FROM codex_tool_events WHERE COALESCE(provider, 'codex-app') != 'codex-fork' AND created_at < ?",
+                (cutoff_default_iso,),
+            )
+            deleted_tool_age += cursor.rowcount
+
+            cursor.execute(
+                "DELETE FROM codex_turn_events WHERE COALESCE(provider, 'codex-app') = 'codex-fork' AND created_at < ?",
+                (cutoff_fork_iso,),
+            )
             deleted_turn_age = cursor.rowcount
+            cursor.execute(
+                "DELETE FROM codex_turn_events WHERE COALESCE(provider, 'codex-app') != 'codex-fork' AND created_at < ?",
+                (cutoff_default_iso,),
+            )
+            deleted_turn_age += cursor.rowcount
 
             deleted_tool_cap = self._prune_table_by_session_cap(
                 cursor=cursor,
@@ -296,11 +376,16 @@ class CodexObservabilityLogger:
     def _prune_table_by_session_cap(self, *, cursor: sqlite3.Cursor, table: str, cap: int) -> int:
         deleted = 0
         cursor.execute(
-            f"SELECT session_id, COUNT(*) FROM {table} GROUP BY session_id HAVING COUNT(*) > ?",
+            f"""
+            SELECT COALESCE(provider, 'codex-app') AS provider_name, session_id, COUNT(*)
+            FROM {table}
+            GROUP BY provider_name, session_id
+            HAVING COUNT(*) > ?
+            """,
             (cap,),
         )
         overflow_rows = cursor.fetchall()
-        for session_id, count in overflow_rows:
+        for provider_name, session_id, count in overflow_rows:
             overflow = int(count) - cap
             cursor.execute(
                 f"""
@@ -308,12 +393,12 @@ class CodexObservabilityLogger:
                 WHERE id IN (
                     SELECT id
                     FROM {table}
-                    WHERE session_id = ?
+                    WHERE session_id = ? AND COALESCE(provider, 'codex-app') = ?
                     ORDER BY created_at ASC, id ASC
                     LIMIT ?
                 )
                 """,
-                (session_id, overflow),
+                (session_id, provider_name, overflow),
             )
             deleted += cursor.rowcount
         return deleted
@@ -354,7 +439,8 @@ class CodexObservabilityLogger:
                 """
                 SELECT session_id, thread_id, turn_id, item_id, request_id, event_type, item_type, phase,
                        command, cwd, exit_code, file_path, diff_summary, approval_decision,
-                       latency_ms, final_status, error_code, error_message, raw_payload_json, created_at
+                       latency_ms, final_status, error_code, error_message, raw_payload_json,
+                       provider, schema_version, created_at
                 FROM codex_tool_events
                 WHERE session_id = ?
                 ORDER BY id DESC
@@ -387,7 +473,9 @@ class CodexObservabilityLogger:
                     "error_code": row[16],
                     "error_message": row[17],
                     "raw_payload_json": row[18],
-                    "created_at": row[19],
+                    "provider": row[19],
+                    "schema_version": row[20],
+                    "created_at": row[21],
                 }
             )
         return events
@@ -400,7 +488,8 @@ class CodexObservabilityLogger:
             cursor.execute(
                 """
                 SELECT session_id, thread_id, turn_id, event_type, status, delta_chars,
-                       output_preview, error_code, error_message, raw_payload_json, created_at
+                       output_preview, error_code, error_message, raw_payload_json,
+                       provider, schema_version, created_at
                 FROM codex_turn_events
                 WHERE session_id = ?
                 ORDER BY id DESC
@@ -424,7 +513,9 @@ class CodexObservabilityLogger:
                     "error_code": row[7],
                     "error_message": row[8],
                     "raw_payload_json": row[9],
-                    "created_at": row[10],
+                    "provider": row[10],
+                    "schema_version": row[11],
+                    "created_at": row[12],
                 }
             )
         return events
