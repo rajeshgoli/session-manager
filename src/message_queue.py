@@ -2142,7 +2142,7 @@ class MessageQueueManager:
 
                 # Phase 2: If NOT idle per memory, try tmux prompt fallback
                 # Handles RCA #1 (hook failure). Extends existing Codex fallback to Claude.
-                if not mem_idle and provider != "codex-fork":
+                if not mem_idle and (provider != "codex-fork" or codex_fork_state is None):
                     if session.tmux_session:
                         if provider in ("codex", "claude"):
                             prompt_visible = await self._check_idle_prompt(
@@ -2159,7 +2159,7 @@ class MessageQueueManager:
                         pending_idle_count = 0
 
                 # Phase 3: Session.status fallback (weak — only catches in-memory corruption)
-                if not mem_idle and provider != "codex-fork":
+                if not mem_idle and (provider != "codex-fork" or codex_fork_state is None):
                     if session.status == SessionStatus.IDLE:
                         mem_idle = True
 

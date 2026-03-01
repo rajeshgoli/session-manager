@@ -482,19 +482,20 @@ class SessionManager:
         if not normalized:
             return None
 
-        if seq is not None:
-            last_seq = self.codex_fork_last_seq.get(session_id)
-            if last_seq is not None and seq <= last_seq:
-                return self.codex_fork_lifecycle.get(session_id)
-            self.codex_fork_last_seq[session_id] = seq
-
         previous_epoch = self.codex_fork_session_epoch.get(session_id)
         if session_epoch is not None and previous_epoch is not None and session_epoch != previous_epoch:
             self.codex_fork_turns_in_flight.discard(session_id)
             self.codex_fork_wait_resume_state.pop(session_id, None)
             self.codex_fork_wait_kind.pop(session_id, None)
+            self.codex_fork_last_seq.pop(session_id, None)
         if session_epoch is not None:
             self.codex_fork_session_epoch[session_id] = session_epoch
+
+        if seq is not None:
+            last_seq = self.codex_fork_last_seq.get(session_id)
+            if last_seq is not None and seq <= last_seq:
+                return self.codex_fork_lifecycle.get(session_id)
+            self.codex_fork_last_seq[session_id] = seq
 
         current_state = self.codex_fork_lifecycle.get(session_id, {}).get("state", "idle")
         next_state = current_state
