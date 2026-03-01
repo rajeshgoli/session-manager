@@ -65,6 +65,9 @@ def test_post_cutover_load_retires_restored_codex_app_session(tmp_path):
     assert restored is not None
     assert restored.status == SessionStatus.STOPPED
     assert restored.error_message == "provider_retired_codex_app"
+    state_after = state_file.read_text()
+    assert '"status": "stopped"' in state_after
+    assert '"error_message": "provider_retired_codex_app"' in state_after
 
 
 def test_retire_codex_app_sessions_cleans_queue_for_already_retired(tmp_path):

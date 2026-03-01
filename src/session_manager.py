@@ -268,6 +268,7 @@ class SessionManager:
                     data = json.load(f)
                 legacy_codex_sessions: list[dict] = []
                 cleaned_sessions: list[dict] = []
+                retired_codex_app_sessions = False
                 for session_data in data.get("sessions", []):
                     raw_provider = session_data.get("provider")
                     raw_tmux_session = session_data.get("tmux_session")
@@ -291,12 +292,19 @@ class SessionManager:
                     session = Session.from_dict(session_data)
                     # Codex app-server sessions are restored without tmux
                     if session.provider == "codex-app":
-                        if self.codex_provider_mapping_phase == "post_cutover":
+                        if (
+                            self.codex_provider_mapping_phase == "post_cutover"
+                            and not (
+                                session.status == SessionStatus.STOPPED
+                                and session.error_message == CODEX_APP_RETIRED_SESSION_REASON
+                            )
+                        ):
                             self._retire_codex_app_session_state(
                                 session,
                                 reason=CODEX_APP_RETIRED_SESSION_REASON,
                                 cleanup_queue=False,
                             )
+                            retired_codex_app_sessions = True
                         self.sessions[session.id] = session
                         logger.info(f"Restored codex app session: {session.name}")
                         continue
@@ -329,6 +337,8 @@ class SessionManager:
 
                 # Load EM topic continuity field (backward compat: missing = None)
                 self.em_topic = data.get("em_topic")
+                if retired_codex_app_sessions:
+                    self._save_state()
 
                 return True
             except Exception as e:
