@@ -631,28 +631,33 @@ class SessionManager:
 
     def _sanitize_codex_fork_tool_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         sanitized: dict[str, Any] = {}
-        for key in (
-            "turn_id",
-            "call_id",
-            "tool_name",
-            "tool_kind",
-            "executed",
-            "success",
-            "duration_ms",
-            "mutating",
-            "sandbox",
-            "sandbox_metadata",
-            "failure_behavior",
-            "hook_error",
-        ):
+        for key in ("turn_id", "call_id", "tool_name", "tool_kind", "failure_behavior"):
             if key in payload:
-                sanitized[key] = payload.get(key)
+                sanitized[key] = self._sanitize_codex_fork_text(
+                    payload.get(key), max_chars=200
+                )
 
-        if "duration_ms" in sanitized:
+        for key in ("executed", "success", "mutating"):
+            if key in payload:
+                value = payload.get(key)
+                if isinstance(value, bool):
+                    sanitized[key] = value
+                elif value is None:
+                    sanitized[key] = None
+                else:
+                    sanitized[key] = bool(value)
+
+        if "duration_ms" in payload:
             try:
-                sanitized["duration_ms"] = int(sanitized["duration_ms"])
+                sanitized["duration_ms"] = int(payload.get("duration_ms"))
             except (TypeError, ValueError):
                 sanitized["duration_ms"] = None
+
+        for key in ("sandbox", "sandbox_metadata", "hook_error"):
+            if key in payload:
+                sanitized[key] = self._sanitize_codex_fork_value(
+                    payload.get(key), max_chars=self.codex_fork_output_preview_max_chars
+                )
 
         if "tool_input" in payload:
             sanitized["tool_input"] = self._sanitize_codex_fork_value(
