@@ -2273,8 +2273,11 @@ Provide ONLY the summary, no preamble or questions."""
 
                     # Inject cleanup prompt if needed
                     if cleanup_needed:
+                        dirty_worktree_paths = sorted(repo_root for repo_root, _ in cleanup_needed)
+                        paths_str = "\n".join(f"- {path}" for path in dirty_worktree_paths)
                         cleanup_prompt = (
-                            "[sm info] Uncommitted changes in this worktree. "
+                            "[sm info] Uncommitted changes in worktree(s):\n"
+                            f"{paths_str}\n"
                             "If work has completed, consider checking in."
                         )
 

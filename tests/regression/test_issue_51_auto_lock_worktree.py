@@ -418,8 +418,46 @@ class TestStopHookCleanup:
                     mock_send.assert_called_once()
                     call_args = mock_send.call_args
                     assert call_args[0][1].startswith("[sm info]")
-                    assert "uncommitted changes in this worktree" in call_args[0][1].lower()
+                    assert "uncommitted changes in worktree(s)" in call_args[0][1].lower()
+                    assert str(worktree) in call_args[0][1]
                     assert call_args[1]["delivery_mode"] == "important"
+
+    def test_stop_hook_cleanup_prompt_includes_all_dirty_worktree_paths(self, test_client, session_manager, tmp_path):
+        """Stop hook prompt includes every dirty worktree path in a single notification."""
+        session = Session(id="test", working_dir=str(tmp_path))
+        session_manager.sessions["test"] = session
+
+        worktree1 = tmp_path / "worktree-1"
+        worktree2 = tmp_path / "worktree-2"
+        for wt in (worktree1, worktree2):
+            wt.mkdir()
+            (wt / ".git").write_text("gitdir: /main/.git/worktrees/branch")
+            session.touched_repos.add(str(wt))
+
+        def mock_status_hash(repo_root: str):
+            if repo_root == str(worktree1):
+                return "hash-1"
+            if repo_root == str(worktree2):
+                return "hash-2"
+            return None
+
+        with patch("src.lock_manager.is_worktree", return_value=True):
+            with patch("src.lock_manager.get_worktree_status_hash", side_effect=mock_status_hash):
+                with patch("src.session_manager.SessionManager.send_input", new_callable=AsyncMock) as mock_send:
+                    test_client.post(
+                        "/hooks/claude",
+                        json={
+                            "hook_event_name": "Stop",
+                            "session_manager_id": "test",
+                            "transcript_path": "/tmp/transcript.jsonl",
+                        }
+                    )
+
+                    mock_send.assert_called_once()
+                    cleanup_prompt = mock_send.call_args[0][1]
+                    assert cleanup_prompt.startswith("[sm info]")
+                    assert str(worktree1) in cleanup_prompt
+                    assert str(worktree2) in cleanup_prompt
 
     def test_stop_hook_does_not_repeat_cleanup_prompt_for_same_changes(self, test_client, session_manager, tmp_path):
         """Stop hook should not resend cleanup prompt for unchanged dirty worktree."""
