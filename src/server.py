@@ -2273,16 +2273,10 @@ Provide ONLY the summary, no preamble or questions."""
 
                     # Inject cleanup prompt if needed
                     if cleanup_needed:
-                        paths_str = "\n".join(f"  - {p}" for p, _ in cleanup_needed)
-                        cleanup_prompt = f"""You have uncommitted changes in worktree(s):
-{paths_str}
-
-Please choose:
-1. Push to branch and create PR: git push -u origin HEAD && gh pr create
-2. Push branch only: git push -u origin HEAD
-3. Abandon changes: git worktree remove <path>
-
-Or continue working if not done yet."""
+                        cleanup_prompt = (
+                            "[sm info] Uncommitted changes in this worktree. "
+                            "If work has completed, consider checking in."
+                        )
 
                         # Send cleanup prompt to session
                         await app.state.session_manager.send_input(

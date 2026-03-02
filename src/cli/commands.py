@@ -1715,6 +1715,53 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, pro
         return 1
 
 
+def cmd_codex_2(client: SessionManagerClient, working_dir: Optional[str] = None) -> int:
+    """
+    Create a new codex-fork session and immediately attach via attach-descriptor flow.
+
+    Args:
+        client: API client
+        working_dir: Working directory (optional, defaults to $PWD)
+
+    Exit codes:
+        0: Successfully created and attached
+        1: Failed to create session or attach
+        2: Session manager unavailable
+    """
+    import os
+    from pathlib import Path
+
+    if working_dir is None:
+        working_dir = os.getcwd()
+
+    try:
+        path = Path(working_dir).expanduser().resolve()
+        if not path.exists():
+            print(f"Error: Directory does not exist: {working_dir}", file=sys.stderr)
+            return 1
+        if not path.is_dir():
+            print(f"Error: Not a directory: {working_dir}", file=sys.stderr)
+            return 1
+        working_dir = str(path)
+    except Exception as e:
+        print(f"Error: Invalid path: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Creating codex-fork session in {working_dir}...")
+    session = client.create_session(working_dir, provider="codex-fork")
+    if session is None:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+
+    session_id = session.get("id")
+    if not session_id:
+        print("Error: Failed to create codex-fork session", file=sys.stderr)
+        return 1
+
+    print(f"Session created: {session_id}")
+    return cmd_attach(client, session_id)
+
+
 def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -> int:
     """
     Attach to an existing Claude Code session.

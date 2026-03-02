@@ -243,6 +243,17 @@ def main():
         help="Working directory (defaults to current directory)"
     )
 
+    # sm codex-2 [working_dir]
+    parser_codex_2 = subparsers.add_parser(
+        "codex-2",
+        help="Create a new Codex-fork session and attach via sm attach flow"
+    )
+    parser_codex_2.add_argument(
+        "working_dir",
+        nargs="?",
+        help="Working directory (defaults to current directory)"
+    )
+
     # sm codex-app [working_dir]
     parser_codex_app = subparsers.add_parser(
         "codex-app",
@@ -489,7 +500,7 @@ def main():
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-fork", "codex_fork",
-        "codex-app", "codex-server",
+        "codex-2", "codex-app", "codex-server",
         "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
     ]
     # Commands that require session_id: spawn (needs to set parent_session_id)
@@ -580,7 +591,8 @@ def main():
     elif args.command == "wait":
         sys.exit(commands.cmd_wait(client, args.session_id, args.seconds))
     elif args.command == "spawn":
-        sys.exit(commands.cmd_spawn(client, session_id, args.provider, args.prompt, args.name, args.wait, args.model, args.working_dir, args.json))
+        provider = "codex-fork" if args.provider == "codex" else args.provider
+        sys.exit(commands.cmd_spawn(client, session_id, provider, args.prompt, args.name, args.wait, args.model, args.working_dir, args.json))
     elif args.command == "children":
         # Use current session if not specified
         parent_id = args.session_id if args.session_id else session_id
@@ -595,6 +607,8 @@ def main():
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex"))
     elif args.command in ("codex-fork", "codex_fork"):
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork"))
+    elif args.command == "codex-2":
+        sys.exit(commands.cmd_codex_2(client, args.working_dir))
     elif args.command == "codex-app":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app"))
     elif args.command == "codex-server":

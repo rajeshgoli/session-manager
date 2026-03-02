@@ -417,8 +417,8 @@ class TestStopHookCleanup:
                     # Should have sent cleanup prompt
                     mock_send.assert_called_once()
                     call_args = mock_send.call_args
-                    assert "uncommitted changes" in call_args[0][1]
-                    assert "git push" in call_args[0][1]
+                    assert call_args[0][1].startswith("[sm info]")
+                    assert "uncommitted changes in this worktree" in call_args[0][1].lower()
                     assert call_args[1]["delivery_mode"] == "important"
 
     def test_stop_hook_does_not_repeat_cleanup_prompt_for_same_changes(self, test_client, session_manager, tmp_path):
