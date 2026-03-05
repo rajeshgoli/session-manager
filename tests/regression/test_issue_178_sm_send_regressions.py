@@ -104,6 +104,7 @@ class TestRegression1_TwoCallSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-session", "test payload")
@@ -136,6 +137,7 @@ class TestRegression1_TwoCallSendInput:
             event_log.append(f"sleep:{secs}")
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", side_effect=mock_sleep):
             await tmux_controller.send_input_async("claude-session", "hello")
@@ -159,6 +161,7 @@ class TestRegression1_TwoCallSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-session", "msg")
@@ -184,6 +187,7 @@ class TestRegression1_TwoCallSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-session", "msg")

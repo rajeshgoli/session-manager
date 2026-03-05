@@ -314,6 +314,7 @@ class TestBugB_TwoCallSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-test", "hello world")
@@ -359,6 +360,7 @@ class TestBugB_TwoCallSendInput:
             sleep_args.append(seconds)
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", side_effect=mock_sleep):
             await tmux_controller.send_input_async("claude-test", "hello world")
@@ -389,6 +391,7 @@ class TestBugB_TwoCallSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-test", "test message")
@@ -417,6 +420,7 @@ class TestBugB_TwoCallSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
             result = await tmux_controller.send_input_async("claude-test", "test message")
@@ -434,6 +438,7 @@ class TestBugB_TwoCallSendInput:
             return proc
 
         with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
             result = await tmux_controller.send_input_async("claude-test", "test message")
 

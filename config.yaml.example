@@ -21,6 +21,11 @@ monitor:
     completion: false          # Notify when task appears complete
     idle: true                 # Notify when session is idle
 
+# Worktree cleanup prompts (Stop-hook time)
+worktree_cleanup:
+  # Send "[sm info] Uncommitted changes in worktree(s)" notices after turns
+  notify_dirty: true
+
 # Timeout and delay configuration (all values in seconds unless specified)
 timeouts:
   # Tmux session creation and interaction timeouts

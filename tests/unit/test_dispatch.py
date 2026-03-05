@@ -496,6 +496,22 @@ class TestParseDispatchArgs:
         )
         assert notify is False
 
+    def test_parses_dynamic_equals_syntax(self):
+        """Dynamic args support --key=value inline form."""
+        _, _, _, _, _, _, params = parse_dispatch_args(
+            ["agent1", "--role", "engineer", "--issue=42", "--spec=docs/spec.md"]
+        )
+        assert params == {"issue": "42", "spec": "docs/spec.md"}
+
+    def test_rejects_dynamic_missing_value_when_next_is_flag(self, capsys):
+        """--key value form rejects when value token is another flag."""
+        with pytest.raises(SystemExit):
+            parse_dispatch_args(
+                ["agent1", "--role", "engineer", "--issue", "--task=123"]
+            )
+        captured = capsys.readouterr()
+        assert "Flag '--issue' requires a value" in captured.err
+
 
 # ---------------------------------------------------------------------------
 # 14. Auto-remind integration (sm#225-A)

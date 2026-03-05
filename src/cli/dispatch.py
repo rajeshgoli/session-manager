@@ -300,17 +300,27 @@ def parse_dispatch_args(argv: list[str]) -> tuple:
     notify_on_stop = not known.no_notify_on_stop
 
     # Phase 2: Parse remaining dynamic args as --key value pairs
+    # Supports both --key value and --key=value syntax.
     dynamic_params = {}
     i = 0
     while i < len(remaining):
         arg = remaining[i]
         if arg.startswith("--"):
-            key = arg[2:]  # strip --
-            if i + 1 < len(remaining) and not remaining[i + 1].startswith("--"):
-                dynamic_params[key] = remaining[i + 1]
+            raw = arg[2:]  # strip --
+            if "=" in raw:
+                # --key=value inline syntax
+                key, value = raw.split("=", 1)
+                dynamic_params[key] = value
+                i += 1
+            elif i + 1 < len(remaining):
+                next_token = remaining[i + 1]
+                if next_token.startswith("--"):
+                    print(f"Error: Flag '--{raw}' requires a value", file=sys.stderr)
+                    sys.exit(1)
+                dynamic_params[raw] = next_token
                 i += 2
             else:
-                print(f"Error: Flag '--{key}' requires a value", file=sys.stderr)
+                print(f"Error: Flag '--{raw}' requires a value", file=sys.stderr)
                 sys.exit(1)
         else:
             print(f"Error: Unexpected argument: {arg}", file=sys.stderr)

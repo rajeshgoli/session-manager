@@ -2251,6 +2251,9 @@ Provide ONLY the summary, no preamble or questions."""
                         lock_mgr.release_lock(repo_root, session_manager_id)
                         logger.info(f"Released lock on {repo_root} for session {session_manager_id}")
 
+                    worktree_cleanup_config = (app.state.config or {}).get("worktree_cleanup", {})
+                    notify_dirty = bool(worktree_cleanup_config.get("notify_dirty", True))
+
                     # Check for worktrees with uncommitted changes
                     cleanup_needed = []
                     prompt_state_changed = False
@@ -2271,8 +2274,8 @@ Provide ONLY the summary, no preamble or questions."""
 
                         cleanup_needed.append((repo_root, status_hash))
 
-                    # Inject cleanup prompt if needed
-                    if cleanup_needed:
+                    # Inject cleanup prompt if needed (configurable noise control).
+                    if cleanup_needed and notify_dirty:
                         dirty_worktree_paths = sorted(repo_root for repo_root, _ in cleanup_needed)
                         paths_str = "\n".join(f"- {path}" for path in dirty_worktree_paths)
                         cleanup_prompt = (
@@ -2291,6 +2294,11 @@ Provide ONLY the summary, no preamble or questions."""
                             session.cleanup_prompted[repo_root] = status_hash
                         app.state.session_manager._save_state()
                         logger.info(f"Sent cleanup prompt for {len(cleanup_needed)} worktree(s)")
+                    elif cleanup_needed and not notify_dirty:
+                        # Track hashes even when muted so we don't repeatedly evaluate/signal.
+                        for repo_root, status_hash in cleanup_needed:
+                            session.cleanup_prompted[repo_root] = status_hash
+                        app.state.session_manager._save_state()
                     elif prompt_state_changed:
                         app.state.session_manager._save_state()
 

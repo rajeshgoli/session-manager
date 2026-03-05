@@ -28,12 +28,92 @@ class TmuxController:
         self.claude_init_no_prompt_seconds = tmux_timeouts.get("claude_init_no_prompt_seconds", 1)
         self.send_keys_timeout_seconds = tmux_timeouts.get("send_keys_timeout_seconds", 5)
         self.send_keys_settle_seconds = tmux_timeouts.get("send_keys_settle_seconds", 0.3)
+        self.send_keys_settle_max_seconds = tmux_timeouts.get("send_keys_settle_max_seconds", 0.9)
+        self.send_keys_settle_per_ki_chars = tmux_timeouts.get("send_keys_settle_per_ki_chars", 0.06)
+        self.send_keys_settle_per_extra_line = tmux_timeouts.get("send_keys_settle_per_extra_line", 0.015)
 
     def _run_tmux(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run a tmux command."""
         cmd = ["tmux"] + list(args)
         logger.debug(f"Running tmux command: {' '.join(cmd)}")
         return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+    def _compute_settle_delay_seconds(self, text: str) -> float:
+        """Compute adaptive settle delay before Enter to reduce paste-mode races."""
+        base = float(self.send_keys_settle_seconds)
+        max_delay = max(base, float(self.send_keys_settle_max_seconds))
+        text_len = len(text or "")
+        line_count = (text or "").count("\n") + 1
+        if text_len <= 512 and line_count <= 1:
+            return base
+        extra = (
+            (max(0, text_len - 512) / 1024.0) * float(self.send_keys_settle_per_ki_chars)
+            + max(0, line_count - 1) * float(self.send_keys_settle_per_extra_line)
+        )
+        return max(base, min(max_delay, base + extra))
+
+    def _get_pane_in_mode(self, session_name: str) -> Optional[int]:
+        """Return tmux pane_in_mode (1 copy-mode, 0 normal) for active pane."""
+        try:
+            result = self._run_tmux(
+                "display-message", "-p", "-t", session_name, "#{pane_in_mode}",
+                check=False,
+            )
+            if result.returncode != 0:
+                return None
+            raw = (result.stdout or "").strip()
+            return int(raw) if raw in {"0", "1"} else None
+        except Exception:
+            return None
+
+    def _exit_copy_mode_if_needed(self, session_name: str) -> tuple[Optional[int], Optional[int]]:
+        """Exit tmux copy-mode on active pane when present."""
+        before = self._get_pane_in_mode(session_name)
+        if before != 1:
+            return before, before
+        try:
+            self._run_tmux("send-keys", "-t", session_name, "-X", "cancel", check=False)
+        except Exception:
+            # Non-fatal: we still attempt delivery.
+            pass
+        after = self._get_pane_in_mode(session_name)
+        return before, after
+
+    async def _get_pane_in_mode_async(self, session_name: str) -> Optional[int]:
+        """Async variant of pane mode query."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "display-message", "-p", "-t", session_name, "#{pane_in_mode}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=self.send_keys_timeout_seconds
+            )
+            if proc.returncode != 0:
+                return None
+            raw = stdout.decode(errors="ignore").strip()
+            return int(raw) if raw in {"0", "1"} else None
+        except Exception:
+            return None
+
+    async def _exit_copy_mode_if_needed_async(self, session_name: str) -> tuple[Optional[int], Optional[int]]:
+        """Async variant of copy-mode exit."""
+        before = await self._get_pane_in_mode_async(session_name)
+        if before != 1:
+            return before, before
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", session_name, "-X", "cancel",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=self.send_keys_timeout_seconds)
+        except Exception:
+            # Non-fatal: continue with send path.
+            pass
+        after = await self._get_pane_in_mode_async(session_name)
+        return before, after
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a tmux session exists."""
@@ -308,6 +388,8 @@ class TmuxController:
 
         try:
             import time
+            mode_before, mode_after = self._exit_copy_mode_if_needed(session_name)
+            settle_delay = self._compute_settle_delay_seconds(text)
             # Use subprocess with list arguments to prevent shell injection
             # Note: -l flag causes issues with Claude Code, so we don't use it
             # Small delay between send-keys calls to avoid paste detection
@@ -318,7 +400,7 @@ class TmuxController:
                 text=True,
                 timeout=self.send_keys_timeout_seconds
             )
-            time.sleep(self.send_keys_settle_seconds)
+            time.sleep(settle_delay)
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
                 check=True,
@@ -326,7 +408,20 @@ class TmuxController:
                 text=True,
                 timeout=self.send_keys_timeout_seconds
             )
-            logger.info(f"Sent input to {session_name}: {text[:50]}...")
+            line_count = (text or "").count("\n") + 1
+            if mode_before == 1 or settle_delay > self.send_keys_settle_seconds:
+                logger.info(
+                    "Sent input to %s (copy_mode %s->%s, settle=%.3fs, len=%d, lines=%d): %s...",
+                    session_name,
+                    mode_before,
+                    mode_after,
+                    settle_delay,
+                    len(text or ""),
+                    line_count,
+                    (text or "")[:50],
+                )
+            else:
+                logger.debug(f"Sent input to {session_name}: {(text or '')[:50]}...")
             return True
 
         except subprocess.CalledProcessError as e:
@@ -354,6 +449,9 @@ class TmuxController:
             return False
 
         try:
+            mode_before, mode_after = await self._exit_copy_mode_if_needed_async(session_name)
+            settle_delay = self._compute_settle_delay_seconds(text)
+
             # Send text first
             proc = await asyncio.create_subprocess_exec(
                 'tmux', 'send-keys', '-t', session_name, '--', text,
@@ -371,7 +469,7 @@ class TmuxController:
             # Claude Code (Node.js TUI in raw mode) treats a rapid character burst
             # as pasted text, in which \r is a literal byte not a submit command.
             # The gap lets paste mode end before Enter arrives as a separate event.
-            await asyncio.sleep(self.send_keys_settle_seconds)
+            await asyncio.sleep(settle_delay)
 
             # Send Enter as a separate keystroke
             proc = await asyncio.create_subprocess_exec(
@@ -386,7 +484,20 @@ class TmuxController:
                 logger.error(f"Failed to send Enter: {stderr.decode()}")
                 return False
 
-            logger.info(f"Sent input (async) to {session_name}: {text[:50]}...")
+            line_count = (text or "").count("\n") + 1
+            if mode_before == 1 or settle_delay > self.send_keys_settle_seconds:
+                logger.info(
+                    "Sent input (async) to %s (copy_mode %s->%s, settle=%.3fs, len=%d, lines=%d): %s...",
+                    session_name,
+                    mode_before,
+                    mode_after,
+                    settle_delay,
+                    len(text or ""),
+                    line_count,
+                    (text or "")[:50],
+                )
+            else:
+                logger.debug(f"Sent input (async) to {session_name}: {(text or '')[:50]}...")
             return True
 
         except asyncio.TimeoutError:
