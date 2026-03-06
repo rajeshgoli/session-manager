@@ -58,6 +58,24 @@ class TestDirectionalNotifyOnStop:
     """Tests for the is_em guard in session_manager.send_input()."""
 
     @pytest.mark.asyncio
+    async def test_em_self_send_suppresses_notify_on_stop(self):
+        """Self-sends must never arm stop-notify, even when the sender is EM."""
+        em = _make_session("em01", is_em=True)
+        sm = _make_session_manager({"em01": em})
+
+        with patch("asyncio.create_task", noop_create_task):
+            await sm.send_input(
+                session_id="em01",
+                text="wake me later",
+                sender_session_id="em01",
+                delivery_mode="sequential",
+                notify_on_stop=True,
+            )
+
+        call_kwargs = sm.message_queue_manager.queue_message.call_args[1]
+        assert call_kwargs["notify_on_stop"] is False
+
+    @pytest.mark.asyncio
     async def test_em_sender_preserves_notify_on_stop(self):
         """EM sender (is_em=True) → notify_on_stop=True preserved (queue called with True)."""
         em = _make_session("em01", is_em=True)
