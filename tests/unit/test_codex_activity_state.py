@@ -5,8 +5,10 @@ from __future__ import annotations
 import tempfile
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
 
 from src.models import CompletionStatus, MonitorState, Session, SessionDeliveryState, SessionStatus
+from src.message_queue import MessageQueueManager
 from src.session_manager import SessionManager
 
 
@@ -15,6 +17,12 @@ def _make_manager() -> SessionManager:
     manager = SessionManager(log_dir=tmpdir.name, state_file=f"{tmpdir.name}/state.json")
     manager._tmpdir = tmpdir  # keep alive for test scope
     return manager
+
+
+def _noop_create_task(coro):
+    """Close scheduled coroutines immediately for deterministic unit tests."""
+    coro.close()
+    return MagicMock()
 
 
 def test_non_codex_activity_uses_queue_and_monitor_signals():
@@ -235,3 +243,129 @@ def test_codex_fork_waiting_transitions_and_cause_tracking():
         },
     )
     assert manager.get_activity_state(session.id) == "idle"
+
+
+def test_codex_fork_non_transition_events_do_not_mark_idle_again():
+    manager = _make_manager()
+    session = Session(
+        id="cf4",
+        name="codex-fork-cf4",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    calls = {"idle": 0, "active": 0}
+    manager.message_queue_manager = SimpleNamespace(
+        mark_session_idle=lambda _sid: calls.__setitem__("idle", calls["idle"] + 1),
+        mark_session_active=lambda _sid: calls.__setitem__("active", calls["active"] + 1),
+    )
+
+    manager.codex_fork_lifecycle[session.id] = {"state": "idle", "updated_at": datetime.now().isoformat()}
+    manager.codex_fork_last_seq[session.id] = 10
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "session_configured",
+            "seq": 11,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+
+    assert calls["idle"] == 0
+    assert calls["active"] == 0
+
+
+def test_codex_fork_marks_queue_on_real_state_transitions_only():
+    manager = _make_manager()
+    session = Session(
+        id="cf5",
+        name="codex-fork-cf5",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    calls = {"idle": 0, "active": 0}
+    manager.message_queue_manager = SimpleNamespace(
+        mark_session_idle=lambda _sid: calls.__setitem__("idle", calls["idle"] + 1),
+        mark_session_active=lambda _sid: calls.__setitem__("active", calls["active"] + 1),
+    )
+
+    manager.codex_fork_lifecycle[session.id] = {"state": "idle", "updated_at": datetime.now().isoformat()}
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "turn_started",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "turn_delta",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "turn_complete",
+            "seq": 3,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+
+    assert calls["active"] == 1
+    assert calls["idle"] == 1
+
+
+def test_codex_fork_non_transition_event_does_not_consume_stop_notify():
+    manager = _make_manager()
+    manager.message_queue_manager = MessageQueueManager(
+        session_manager=manager,
+        db_path=f"{manager._tmpdir.name}/mq_test.db",
+        config={},
+        notifier=None,
+    )
+    session = Session(
+        id="cf6",
+        name="codex-fork-cf6",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    # Prime lifecycle and queued stop-notify state.
+    manager.codex_fork_lifecycle[session.id] = {"state": "idle", "updated_at": datetime.now().isoformat()}
+    manager.codex_fork_last_seq[session.id] = 20
+    state = manager.message_queue_manager._get_or_create_state(session.id)
+    state.stop_notify_sender_id = "em-parent"
+    state.stop_notify_sender_name = "em"
+
+    with patch("asyncio.create_task", _noop_create_task), \
+         patch.object(manager.message_queue_manager, "_send_stop_notification") as mock_notify:
+        manager.ingest_codex_fork_event(
+            session.id,
+            {
+                "event_type": "session_configured",
+                "seq": 21,
+                "session_epoch": 1,
+                "payload": {},
+            },
+        )
+        mock_notify.assert_not_called()
+
+    # Stop notification must remain armed until a real idle transition.
+    assert state.stop_notify_sender_id == "em-parent"

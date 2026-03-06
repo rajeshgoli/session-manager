@@ -553,7 +553,10 @@ class SessionManager:
                 session.status = SessionStatus.RUNNING
             session.last_activity = now
 
-            if self.message_queue_manager:
+            # Keep queue idle/active state in sync only on lifecycle transitions.
+            # Replaying non-transition events while already idle can otherwise
+            # spuriously trigger stop-notify side effects (issue #341).
+            if self.message_queue_manager and previous_state != state:
                 if state in ("running", "waiting_on_approval", "waiting_on_user_input"):
                     self.message_queue_manager.mark_session_active(session_id)
                 else:
