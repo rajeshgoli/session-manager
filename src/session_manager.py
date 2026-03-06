@@ -1390,6 +1390,11 @@ class SessionManager:
         else:
             formatted_text = text
 
+        # Self-sends must never arm stop-notify: they are used for deferred wakeups
+        # and should not immediately wake the same agent on its next stop hook.
+        if notify_on_stop and sender_session_id == session_id:
+            notify_on_stop = False
+
         # Directional notify-on-stop (#256): only EM→agent sends should enroll recipient.
         # Fail-closed: unknown sender treated as non-EM.
         if notify_on_stop and sender_session_id:

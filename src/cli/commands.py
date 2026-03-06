@@ -1062,6 +1062,10 @@ def cmd_send(
     # Get sender session ID from environment (if available)
     sender_session_id = client.session_id  # Set from CLAUDE_SESSION_MANAGER_ID in __init__
 
+    # Self-sends are commonly used as delayed wakeups; do not advertise or request
+    # stop-notify because it would wake the same agent on its next stop hook.
+    effective_notify_on_stop = notify_on_stop and sender_session_id != session_id
+
     # Use wait_seconds if provided, otherwise use notify_after_seconds
     effective_notify_after = wait_seconds if wait_seconds is not None else notify_after_seconds
 
@@ -1075,7 +1079,7 @@ def cmd_send(
         timeout_seconds=timeout_seconds,
         notify_on_delivery=notify_on_delivery,
         notify_after_seconds=effective_notify_after,
-        notify_on_stop=notify_on_stop,
+        notify_on_stop=effective_notify_on_stop,
         remind_soft_threshold=remind_soft_threshold,
         remind_hard_threshold=remind_hard_threshold,
         parent_session_id=parent_session_id,
@@ -1106,7 +1110,7 @@ def cmd_send(
         extras.append("notify-on-delivery")
     if effective_notify_after:
         extras.append(f"wait={effective_notify_after}s")
-    if notify_on_stop:
+    if effective_notify_on_stop:
         extras.append("notify-on-stop")
     if remind_soft_threshold:
         extras.append(f"remind={remind_soft_threshold}s soft"

@@ -727,6 +727,19 @@ class TestCmdSendRemindParams:
         assert call_kwargs["remind_soft_threshold"] is None
         assert call_kwargs["remind_hard_threshold"] is None
 
+    def test_self_send_suppresses_notify_on_stop(self, capsys):
+        """Self-send must not request or print notify-on-stop."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+        mock_client.session_id = "sess1"
+
+        cmd_send(mock_client, "sess1", "hello")
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["notify_on_stop"] is False
+        captured = capsys.readouterr()
+        assert "notify-on-stop" not in captured.out
+
 
 # ---------------------------------------------------------------------------
 # sm setup tests (sm#225-D)
