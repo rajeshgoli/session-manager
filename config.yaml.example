@@ -114,6 +114,9 @@ telegram:
   # allowed_chat_ids:
   #   - 123456789
   #   - 987654321
+  topic_cleanup:
+    enabled: false
+    interval_seconds: 900
 
 email:
   # Paths to email harness config files

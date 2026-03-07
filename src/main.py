@@ -164,6 +164,12 @@ class SessionManagerApp:
             )
             self._setup_telegram_handlers()
             self._setup_topic_creator()
+        topic_cleanup_config = telegram_config.get("topic_cleanup", {})
+        self.telegram_topic_cleanup_enabled = bool(topic_cleanup_config.get("enabled", False))
+        self.telegram_topic_cleanup_interval_seconds = max(
+            60, int(topic_cleanup_config.get("interval_seconds", 900))
+        )
+        self._telegram_topic_cleanup_task: Optional[asyncio.Task] = None
 
         # Notifier
         self.notifier = Notifier(
@@ -428,6 +434,73 @@ class SessionManagerApp:
             if session.telegram_chat_id and not session.telegram_thread_id:
                 await self.session_manager._ensure_telegram_topic(session)
 
+    async def _cleanup_stale_telegram_topics_once(self) -> dict[str, int]:
+        """Delete Telegram topics for non-EM sessions whose tmux runtime is gone."""
+        if not self.telegram_bot or not self.telegram_topic_cleanup_enabled:
+            return {"deleted": 0, "skipped": 0}
+
+        default_chat_id = self.session_manager.default_forum_chat_id
+        if not default_chat_id:
+            return {"deleted": 0, "skipped": 0}
+
+        deleted = 0
+        skipped = 0
+        changed = False
+
+        for session in list(self.session_manager.sessions.values()):
+            if session.is_em or not session.telegram_thread_id or session.telegram_chat_id != default_chat_id:
+                skipped += 1
+                continue
+
+            if not session.tmux_session:
+                skipped += 1
+                continue
+
+            if self.session_manager.tmux.session_exists(session.tmux_session):
+                skipped += 1
+                continue
+
+            thread_id = session.telegram_thread_id
+            if await self.telegram_bot.delete_forum_topic(session.telegram_chat_id, thread_id):
+                session.telegram_thread_id = None
+                deleted += 1
+                changed = True
+                logger.info(
+                    "Deleted stale Telegram topic for session %s because tmux runtime %s no longer exists",
+                    session.id,
+                    session.tmux_session,
+                )
+            else:
+                skipped += 1
+
+        if changed:
+            self.session_manager._save_state()
+        return {"deleted": deleted, "skipped": skipped}
+
+    async def _run_telegram_topic_cleanup_loop(self):
+        """Periodically delete stale Telegram topics for inactive sessions."""
+        try:
+            await self._cleanup_stale_telegram_topics_once()
+            while True:
+                await asyncio.sleep(self.telegram_topic_cleanup_interval_seconds)
+                await self._cleanup_stale_telegram_topics_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Telegram topic cleanup loop failed")
+
+    def _start_telegram_topic_cleanup_task(self):
+        """Start the periodic Telegram topic cleanup loop if enabled."""
+        if (
+            not self.telegram_bot
+            or not self.telegram_topic_cleanup_enabled
+            or self._telegram_topic_cleanup_task is not None
+        ):
+            return
+        self._telegram_topic_cleanup_task = asyncio.create_task(
+            self._run_telegram_topic_cleanup_loop()
+        )
+
     async def _post_bind_startup(self):
         """Run side-effect-bearing startup work after uvicorn binds the port.
 
@@ -437,6 +510,7 @@ class SessionManagerApp:
         # Reconcile Telegram topics
         if self.telegram_bot:
             await self._reconcile_telegram_topics()
+            self._start_telegram_topic_cleanup_task()
 
         # Restore monitoring for existing sessions
         await self._restore_monitoring()
@@ -536,6 +610,14 @@ class SessionManagerApp:
 
         # Stop SessionManager background maintenance
         await self.session_manager.stop_background_tasks()
+
+        if self._telegram_topic_cleanup_task:
+            self._telegram_topic_cleanup_task.cancel()
+            try:
+                await self._telegram_topic_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._telegram_topic_cleanup_task = None
 
         # Stop Telegram bot
         if self.telegram_bot:
