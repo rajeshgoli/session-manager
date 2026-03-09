@@ -60,6 +60,13 @@ class ActivityState(Enum):
     STOPPED = "stopped"
 
 
+class AdoptionProposalStatus(Enum):
+    """Lifecycle state for explicit agent adoption proposals."""
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
 @dataclass
 class TelegramTopicRecord:
     """Durable registry entry for a Telegram forum topic."""
@@ -100,6 +107,43 @@ class TelegramTopicRecord:
             last_seen_at=datetime.fromisoformat(data["last_seen_at"]),
             deleted_at=datetime.fromisoformat(data["deleted_at"]) if data.get("deleted_at") else None,
             is_em_topic=bool(data.get("is_em_topic", False)),
+        )
+
+
+@dataclass
+class AdoptionProposal:
+    """A pending request for one session to adopt another as its child."""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    proposer_session_id: str = ""
+    target_session_id: str = ""
+    created_at: datetime = field(default_factory=datetime.now)
+    status: AdoptionProposalStatus = AdoptionProposalStatus.PENDING
+    decided_at: Optional[datetime] = None
+
+    def to_dict(self) -> dict:
+        """Convert proposal to a JSON-serializable dictionary."""
+        return {
+            "id": self.id,
+            "proposer_session_id": self.proposer_session_id,
+            "target_session_id": self.target_session_id,
+            "created_at": self.created_at.isoformat(),
+            "status": self.status.value,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AdoptionProposal":
+        """Restore a proposal from persisted state."""
+        status = data.get("status", AdoptionProposalStatus.PENDING.value)
+        if isinstance(status, str):
+            status = AdoptionProposalStatus(status)
+        return cls(
+            id=data["id"],
+            proposer_session_id=data["proposer_session_id"],
+            target_session_id=data["target_session_id"],
+            created_at=datetime.fromisoformat(data["created_at"]),
+            status=status,
+            decided_at=datetime.fromisoformat(data["decided_at"]) if data.get("decided_at") else None,
         )
 
 

@@ -255,6 +255,49 @@ def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str
         return 1
 
 
+def cmd_adopt(client: SessionManagerClient, session_id: Optional[str], target_identifier: str) -> int:
+    """
+    Propose adopting an existing session. Requires explicit approval in sm watch.
+
+    Exit codes:
+        0: Proposal submitted
+        1: Validation or API failure
+        2: Session manager unavailable / not in managed session
+    """
+    if not session_id:
+        print("Error: CLAUDE_SESSION_MANAGER_ID environment variable not set", file=sys.stderr)
+        return 2
+
+    target_session_id, _ = resolve_session_id(client, target_identifier)
+    if target_session_id is None:
+        sessions = client.list_sessions()
+        if sessions is None:
+            print("Error: Session manager unavailable", file=sys.stderr)
+            return 2
+        print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
+        return 1
+
+    result = client.propose_adoption(target_session_id, session_id)
+    if result.get("unavailable"):
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to submit adoption proposal"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    proposal = (result.get("data") or {}).get("proposal") or {}
+    proposal_id = proposal.get("id")
+    if proposal_id:
+        print(
+            f"Adoption proposal submitted for {target_session_id} "
+            f"({proposal_id}). Approve or reject it in sm watch."
+        )
+    else:
+        print(f"Adoption proposal submitted for {target_session_id}. Approve or reject it in sm watch.")
+    return 0
+
+
 def cmd_role(client: SessionManagerClient, session_id: Optional[str], role: Optional[str], clear: bool = False) -> int:
     """
     Set or clear role tag for the current session.

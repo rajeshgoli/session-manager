@@ -13,6 +13,8 @@ from typing import Optional, Callable, Awaitable, Any
 
 from .models import (
     ActivityState,
+    AdoptionProposal,
+    AdoptionProposalStatus,
     CompletionStatus,
     DeliveryResult,
     NotificationEvent,
@@ -114,6 +116,7 @@ class SessionManager:
         self.telegram_topic_registry_path.parent.mkdir(parents=True, exist_ok=True)
         self.telegram_topic_registry: dict[tuple[int, int], TelegramTopicRecord] = {}
         self._topic_creator: Optional[Callable[..., Awaitable[Optional[int]]]] = None
+        self.adoption_proposals: dict[str, AdoptionProposal] = {}
 
         codex_config = self.config.get("codex", {})
         codex_app_config = self.config.get("codex_app_server", codex_config)
@@ -399,6 +402,113 @@ class SessionManager:
             return None
         return max(matches, key=lambda record: record.last_seen_at)
 
+    def list_adoption_proposals(
+        self,
+        *,
+        target_session_id: Optional[str] = None,
+        status: Optional[AdoptionProposalStatus] = None,
+    ) -> list[AdoptionProposal]:
+        """Return adoption proposals filtered by target and/or status."""
+        proposals = list(self.adoption_proposals.values())
+        if target_session_id is not None:
+            proposals = [proposal for proposal in proposals if proposal.target_session_id == target_session_id]
+        if status is not None:
+            proposals = [proposal for proposal in proposals if proposal.status == status]
+        return sorted(proposals, key=lambda proposal: (proposal.created_at, proposal.id))
+
+    def create_adoption_proposal(
+        self,
+        proposer_session_id: str,
+        target_session_id: str,
+    ) -> AdoptionProposal:
+        """Create or return a pending adoption proposal for an EM session."""
+        proposer = self.sessions.get(proposer_session_id)
+        if proposer is None:
+            raise ValueError(f"Proposer session {proposer_session_id} not found")
+        if not proposer.is_em:
+            raise ValueError("Only EM sessions may propose adoption")
+        if proposer.status == SessionStatus.STOPPED:
+            raise ValueError("Stopped sessions cannot propose adoption")
+
+        target = self.sessions.get(target_session_id)
+        if target is None:
+            raise ValueError(f"Target session {target_session_id} not found")
+        if target.status == SessionStatus.STOPPED:
+            raise ValueError("Stopped sessions cannot be adopted")
+        if proposer_session_id == target_session_id:
+            raise ValueError("A session cannot adopt itself")
+        if target.parent_session_id == proposer_session_id:
+            raise ValueError(f"Session {target_session_id} is already managed by {proposer_session_id}")
+
+        pending = self.list_adoption_proposals(
+            target_session_id=target_session_id,
+            status=AdoptionProposalStatus.PENDING,
+        )
+        if pending:
+            existing = pending[0]
+            if existing.proposer_session_id == proposer_session_id:
+                return existing
+            raise ValueError(
+                f"Session {target_session_id} already has a pending adoption proposal "
+                f"from {existing.proposer_session_id}"
+            )
+
+        proposal = AdoptionProposal(
+            proposer_session_id=proposer_session_id,
+            target_session_id=target_session_id,
+        )
+        self.adoption_proposals[proposal.id] = proposal
+        self._save_state()
+        return proposal
+
+    def decide_adoption_proposal(
+        self,
+        proposal_id: str,
+        *,
+        accepted: bool,
+    ) -> AdoptionProposal:
+        """Accept or reject a pending adoption proposal."""
+        proposal = self.adoption_proposals.get(proposal_id)
+        if proposal is None:
+            raise ValueError(f"Adoption proposal {proposal_id} not found")
+        if proposal.status != AdoptionProposalStatus.PENDING:
+            raise ValueError(f"Adoption proposal {proposal_id} is already {proposal.status.value}")
+
+        target = self.sessions.get(proposal.target_session_id)
+        proposer = self.sessions.get(proposal.proposer_session_id)
+
+        if accepted:
+            if proposer is None:
+                raise ValueError(f"Proposer session {proposal.proposer_session_id} no longer exists")
+            if not proposer.is_em:
+                raise ValueError(f"Proposer session {proposal.proposer_session_id} is no longer an EM")
+            if proposer.status == SessionStatus.STOPPED:
+                raise ValueError(f"Proposer session {proposal.proposer_session_id} is stopped")
+            if target is None:
+                raise ValueError(f"Target session {proposal.target_session_id} no longer exists")
+            if target.status == SessionStatus.STOPPED:
+                raise ValueError(f"Target session {proposal.target_session_id} is stopped")
+            target.parent_session_id = proposal.proposer_session_id
+
+        proposal.status = (
+            AdoptionProposalStatus.ACCEPTED if accepted else AdoptionProposalStatus.REJECTED
+        )
+        proposal.decided_at = datetime.now()
+
+        if accepted:
+            for other in self.adoption_proposals.values():
+                if other.id == proposal.id:
+                    continue
+                if (
+                    other.target_session_id == proposal.target_session_id
+                    and other.status == AdoptionProposalStatus.PENDING
+                ):
+                    other.status = AdoptionProposalStatus.REJECTED
+                    other.decided_at = proposal.decided_at
+
+        self._save_state()
+        return proposal
+
     def _load_state(self) -> bool:
         """
         Load session state from disk.
@@ -491,12 +601,17 @@ class SessionManager:
                                 f"thread={session.telegram_thread_id} from dead session {session.name}"
                             )
                 if legacy_codex_sessions:
-                    self._rewrite_state_raw(cleaned_sessions)
+                    preserved_state = {key: value for key, value in data.items() if key != "sessions"}
+                    self._rewrite_state_raw(cleaned_sessions, extra_state=preserved_state)
                 if registry_backfilled:
                     self._save_telegram_topic_registry()
 
                 # Load EM topic continuity field (backward compat: missing = None)
                 self.em_topic = data.get("em_topic")
+                self.adoption_proposals = {}
+                for proposal_data in data.get("adoption_proposals", []):
+                    proposal = AdoptionProposal.from_dict(proposal_data)
+                    self.adoption_proposals[proposal.id] = proposal
                 if retired_codex_app_sessions:
                     self._save_state()
 
@@ -507,10 +622,12 @@ class SessionManager:
                 return False
         return True  # No state file is not an error
 
-    def _rewrite_state_raw(self, sessions_data: list[dict]) -> bool:
+    def _rewrite_state_raw(self, sessions_data: list[dict], extra_state: Optional[dict] = None) -> bool:
         """Rewrite state file with provided session data (used for one-time cleanup)."""
         try:
             data = {"sessions": sessions_data}
+            if extra_state:
+                data.update(extra_state)
             state_path = Path(self.state_file)
             temp_file = state_path.with_suffix(".tmp")
 
@@ -538,6 +655,13 @@ class SessionManager:
             data = {
                 "sessions": [s.to_dict() for s in self.sessions.values()],
                 "em_topic": self.em_topic,
+                "adoption_proposals": [
+                    proposal.to_dict()
+                    for proposal in sorted(
+                        self.adoption_proposals.values(),
+                        key=lambda proposal: (proposal.created_at, proposal.id),
+                    )
+                ],
             }
 
             # Write to temporary file first

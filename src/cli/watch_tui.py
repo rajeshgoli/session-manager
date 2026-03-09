@@ -289,6 +289,23 @@ def _task_completion_line(session: dict) -> Optional[str]:
     return f"task: completed ({_age_from_iso(completed_at)})"
 
 
+def _pending_adoption_lines(session: dict) -> list[str]:
+    proposals = session.get("pending_adoption_proposals") or []
+    lines: list[str] = []
+    for proposal in proposals:
+        if proposal.get("status") != "pending":
+            continue
+        proposer_name = proposal.get("proposer_name") or proposal.get("proposer_session_id") or "unknown"
+        proposer_id = proposal.get("proposer_session_id") or "unknown"
+        created_at = proposal.get("created_at")
+        age = _age_from_iso(created_at)
+        age_suffix = f" ({age})" if age != "-" else ""
+        lines.append(
+            f"adopt: pending from {proposer_name} [{proposer_id}]{age_suffix}  [A accept / X reject]"
+        )
+    return lines
+
+
 def _format_age(last_activity: Optional[str], activity_state: str) -> str:
     parsed = _parse_iso(last_activity)
     if not parsed:
@@ -541,6 +558,15 @@ def build_watch_rows(
                     )
                 )
 
+            for adoption_line in _pending_adoption_lines(session):
+                rows.append(
+                    WatchRow(
+                        kind="status",
+                        text=f"{status_prefix}{adoption_line}",
+                        session_id=session_id,
+                    )
+                )
+
             if session_id and session_id in expanded:
                 detail = detail_cache.get(session_id) if detail_cache else None
                 for line in _detail_lines(session, detail, codex_projection_enabled):
@@ -778,7 +804,7 @@ def _render(
             _flash_attr(flash_message, palette),
         )
 
-    footer = "j/k: move  Enter: attach  s: send  K: kill  n: rename  Tab: details  /: filter  r: refresh  q: quit"
+    footer = "j/k: move  Enter: attach  s: send  K: kill  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, max(0, width - 1))
     stdscr.refresh()
 
@@ -1011,6 +1037,46 @@ def run_watch_tui(
                         flash_message = "Session manager unavailable"
                     else:
                         flash_message = "Failed to rename session"
+                    flash_until = time.monotonic() + 2.5
+                    next_refresh = 0.0
+                    continue
+
+                if key in (ord("A"), ord("X")):
+                    if not selected:
+                        flash_message = "No session selected"
+                        flash_until = time.monotonic() + 2.0
+                        continue
+
+                    proposals = [
+                        proposal
+                        for proposal in (selected.get("pending_adoption_proposals") or [])
+                        if proposal.get("status") == "pending"
+                    ]
+                    if not proposals:
+                        flash_message = "No pending adoption proposal"
+                        flash_until = time.monotonic() + 2.0
+                        continue
+
+                    proposal = proposals[0]
+                    proposal_id = proposal.get("id")
+                    if not proposal_id:
+                        flash_message = "Pending adoption proposal is missing an id"
+                        flash_until = time.monotonic() + 2.0
+                        continue
+
+                    if key == ord("A"):
+                        result = client.accept_adoption_proposal(proposal_id)
+                        action = "accepted"
+                    else:
+                        result = client.reject_adoption_proposal(proposal_id)
+                        action = "rejected"
+
+                    if result.get("unavailable"):
+                        flash_message = "Session manager unavailable"
+                    elif result.get("ok"):
+                        flash_message = f"Adoption {action} for {selected_session_id}"
+                    else:
+                        flash_message = str(result.get("detail") or f"Failed to {action} adoption proposal")
                     flash_until = time.monotonic() + 2.5
                     next_refresh = 0.0
                     continue
