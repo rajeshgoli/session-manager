@@ -14,7 +14,7 @@ def test_codex_fork_runtime_metadata_uses_config_pin(tmp_path):
                 "artifact_ref": "f00dbabe1234",
                 "artifact_platforms": ["darwin-arm64"],
                 "rollback_provider": "codex",
-                "rollback_command": "sm codex",
+                "rollback_command": "sm codex-legacy",
             }
         },
     )
@@ -27,7 +27,7 @@ def test_codex_fork_runtime_metadata_uses_config_pin(tmp_path):
     assert metadata["artifact_ref"] == "f00dbabe1234"
     assert metadata["artifact_platforms"] == ["darwin-arm64"]
     assert metadata["rollback_provider"] == "codex"
-    assert metadata["rollback_command"] == "sm codex"
+    assert metadata["rollback_command"] == "sm codex-legacy"
     assert metadata["is_pinned"] is True
 
 
@@ -40,5 +40,5 @@ def test_codex_fork_runtime_metadata_defaults_to_unpinned(tmp_path):
 
     metadata = manager.get_codex_fork_runtime_info()
     assert metadata["artifact_ref"] == "local-unpinned"
+    assert metadata["rollback_command"] == "sm codex-legacy"
     assert metadata["is_pinned"] is False
-

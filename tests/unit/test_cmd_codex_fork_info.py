@@ -24,7 +24,7 @@ def test_cmd_codex_fork_info_text_output(capsys):
             "event_schema_version": 2,
             "artifact_platforms": ["darwin-arm64", "linux-x86_64"],
             "rollback_provider": "codex",
-            "rollback_command": "sm codex",
+            "rollback_command": "sm codex-legacy",
         }
     )
     rc = commands.cmd_codex_fork_info(client)

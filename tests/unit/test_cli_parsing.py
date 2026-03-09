@@ -245,6 +245,30 @@ class TestWaitCommand:
         assert args.seconds == 60
 
 
+class TestCodexCommandRouting:
+    """Tests for user-facing Codex command routing."""
+
+    def test_main_codex_routes_to_codex_fork(self):
+        with patch("sys.argv", ["sm", "codex", "/tmp/repo"]):
+            with patch("src.cli.main.commands.cmd_new", return_value=0) as mock_cmd_new:
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+
+        assert exc_info.value.code == 0
+        mock_cmd_new.assert_called_once()
+        assert mock_cmd_new.call_args.kwargs["provider"] == "codex-fork"
+
+    def test_main_codex_legacy_routes_to_legacy_provider(self):
+        with patch("sys.argv", ["sm", "codex-legacy", "/tmp/repo"]):
+            with patch("src.cli.main.commands.cmd_new", return_value=0) as mock_cmd_new:
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+
+        assert exc_info.value.code == 0
+        mock_cmd_new.assert_called_once()
+        assert mock_cmd_new.call_args.kwargs["provider"] == "codex"
+
+
 class TestWatchCommand:
     """Tests for 'sm watch' parsing."""
 

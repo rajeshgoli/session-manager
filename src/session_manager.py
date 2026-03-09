@@ -162,7 +162,7 @@ class SessionManager:
         else:
             self.codex_fork_artifact_platforms = ["darwin-arm64", "darwin-x86_64", "linux-x86_64"]
         self.codex_fork_rollback_provider = str(codex_fork_config.get("rollback_provider", "codex"))
-        self.codex_fork_rollback_command = str(codex_fork_config.get("rollback_command", "sm codex"))
+        self.codex_fork_rollback_command = str(codex_fork_config.get("rollback_command", "sm codex-legacy"))
         self.codex_fork_event_poll_interval_seconds = float(
             codex_fork_config.get("event_poll_interval_seconds", 0.5)
         )

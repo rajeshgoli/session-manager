@@ -189,7 +189,7 @@ codex_fork:
     - "linux-x86_64"
   # Rollback guidance surfaced in sm codex-fork-info.
   rollback_provider: "codex"
-  rollback_command: "sm codex"
+  rollback_command: "sm codex-legacy"
   # Control client/runtime contract pin.
   event_schema_version: 2
 

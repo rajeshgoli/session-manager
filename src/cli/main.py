@@ -223,9 +223,20 @@ def main():
     # sm codex [working_dir]
     parser_codex = subparsers.add_parser(
         "codex",
-        help="Create a new Codex session and attach to it"
+        help="Create a new Codex session (codex-fork runtime) and attach to it"
     )
     parser_codex.add_argument(
+        "working_dir",
+        nargs="?",
+        help="Working directory (defaults to current directory)"
+    )
+
+    # sm codex-legacy [working_dir]
+    parser_codex_legacy = subparsers.add_parser(
+        "codex-legacy",
+        help="Create a legacy Codex tmux session and attach to it"
+    )
+    parser_codex_legacy.add_argument(
         "working_dir",
         nargs="?",
         help="Working directory (defaults to current directory)"
@@ -523,7 +534,7 @@ def main():
     # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, new, attach, output, clear
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
-        "subagents", "children", "kill", "new", "claude", "codex", "codex-fork", "codex_fork",
+        "subagents", "children", "kill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server",
         "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", None
     ]
@@ -628,6 +639,8 @@ def main():
     elif args.command == "claude":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
     elif args.command == "codex":
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork"))
+    elif args.command == "codex-legacy":
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex"))
     elif args.command in ("codex-fork", "codex_fork"):
         sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork"))
