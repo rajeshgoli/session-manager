@@ -258,7 +258,7 @@ def test_codex_fork_non_transition_events_do_not_mark_idle_again():
 
     calls = {"idle": 0, "active": 0}
     manager.message_queue_manager = SimpleNamespace(
-        mark_session_idle=lambda _sid: calls.__setitem__("idle", calls["idle"] + 1),
+        mark_session_idle=lambda _sid, **_kwargs: calls.__setitem__("idle", calls["idle"] + 1),
         mark_session_active=lambda _sid: calls.__setitem__("active", calls["active"] + 1),
     )
 
@@ -292,7 +292,7 @@ def test_codex_fork_marks_queue_idle_on_real_transitions_and_active_on_running_e
 
     calls = {"idle": 0, "active": 0}
     manager.message_queue_manager = SimpleNamespace(
-        mark_session_idle=lambda _sid: calls.__setitem__("idle", calls["idle"] + 1),
+        mark_session_idle=lambda _sid, **_kwargs: calls.__setitem__("idle", calls["idle"] + 1),
         mark_session_active=lambda _sid: calls.__setitem__("active", calls["active"] + 1),
     )
 
@@ -406,3 +406,37 @@ def test_codex_fork_non_transition_running_event_reactivates_stale_queue_state()
     )
 
     assert manager.message_queue_manager.is_session_idle(session.id) is False
+
+
+def test_codex_fork_turn_diff_reasserts_running_after_restart_without_turn_started():
+    manager = _make_manager()
+    session = Session(
+        id="cf8",
+        name="codex-fork-cf8",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.codex_fork_lifecycle[session.id] = {
+        "state": "idle",
+        "cause_event_type": "session_created",
+        "updated_at": datetime.now().isoformat(),
+    }
+    manager.codex_fork_last_seq[session.id] = 10
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "turn_diff",
+            "seq": 11,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+
+    lifecycle = manager.get_codex_fork_lifecycle_state(session.id)
+    assert lifecycle is not None
+    assert lifecycle["state"] == "running"
+    assert lifecycle["cause_event_type"] == "turn_diff"
+    assert manager.get_activity_state(session.id) == "working"

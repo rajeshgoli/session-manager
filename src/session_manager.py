@@ -980,6 +980,15 @@ class SessionManager:
         elif normalized == "turn_delta":
             if session_id in self.codex_fork_turns_in_flight:
                 next_state = "running"
+        elif current_state not in {"waiting_on_approval", "waiting_on_user_input"} and (
+            normalized == "turn_diff"
+            or normalized in {"item_started", "item_completed", "agent_message", "exec_command_end"}
+            or normalized.endswith("_begin")
+            or normalized.endswith("_delta")
+        ):
+            # After restart we may resume monitoring mid-turn without re-seeing the original
+            # turn_started event. Fresh deltas/tool events must still reassert active work.
+            next_state = "running"
         elif normalized == "shutdown_complete":
             self.codex_fork_turns_in_flight.discard(session_id)
             self.codex_fork_wait_resume_state.pop(session_id, None)

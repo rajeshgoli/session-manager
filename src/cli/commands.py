@@ -1718,7 +1718,8 @@ def cmd_children(
         for child in children:
             name = child.get("friendly_name") or child["name"]
             child_id = child["id"]
-            status = child.get("completion_status") or child["status"]
+            activity_state = child.get("activity_state")
+            status = child.get("completion_status") or activity_state or child["status"]
             last_activity = child.get("last_activity", "")
             completion_msg = child.get("completion_message", "")
             provider = child.get("provider", "claude")
@@ -1738,7 +1739,7 @@ def cmd_children(
 
             # Thinking duration + last tool — only for running sessions
             raw_status = child.get("status", "")
-            if raw_status == "running":
+            if activity_state in {"working", "thinking"} or raw_status == "running":
                 thinking_str = None
                 last_tool_str = None
                 last_label = "last tool"

@@ -3026,6 +3026,7 @@ Provide ONLY the summary, no preamble or questions."""
                     "name": s.name,
                     "friendly_name": s.friendly_name,
                     "status": s.status.value,
+                    "activity_state": _get_activity_state(s),
                     "completion_status": s.completion_status.value if s.completion_status else None,
                     "completion_message": s.completion_message,
                     "last_activity": s.last_activity.isoformat(),

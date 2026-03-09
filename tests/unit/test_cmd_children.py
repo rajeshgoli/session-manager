@@ -78,6 +78,7 @@ def _child(
     agent_status_at: str = None,
     completion_message: str = None,
     activity_projection: dict = None,
+    activity_state: str = None,
 ) -> dict:
     if last_activity is None:
         last_activity = datetime.utcnow().isoformat()
@@ -93,6 +94,7 @@ def _child(
         "agent_status_at": agent_status_at,
         "completion_message": completion_message,
         "activity_projection": activity_projection,
+        "activity_state": activity_state,
     }
 
 
@@ -261,6 +263,25 @@ class TestCmdChildrenOutput:
         assert "last tool: n/a (no hooks)" in out
         assert "thinking" in out
         assert " | codex | " in out
+
+    def test_codex_fork_prefers_activity_state_over_raw_status(self, tmp_path, capsys):
+        child = _child(
+            child_id="fork0000002",
+            provider="codex-fork",
+            status="idle",
+            activity_state="working",
+        )
+        client = _make_client([child])
+
+        epoch = int(time.time()) - 90
+        with patch("src.cli.commands._get_tmux_session_activity", return_value=epoch):
+            rc = cmd_children(client, "parent1", db_path=str(tmp_path / "tool_usage.db"))
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert " | codex-fork | working | " in out
+        assert "thinking" in out
+        assert "last tool: n/a (event-stream lifecycle)" in out
 
     def test_codex_app_session_uses_activity_projection(self, tmp_path, capsys):
         child = _child(
