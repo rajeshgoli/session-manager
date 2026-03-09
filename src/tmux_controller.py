@@ -346,11 +346,17 @@ class TmuxController:
                 cmd_parts.append("--")
                 cmd_parts.append(shlex.quote(initial_prompt))
 
-            # Start Claude Code in the session
+            launch_command = " ".join(cmd_parts)
             self._run_tmux(
                 "send-keys",
                 "-t", session_name,
-                " ".join(cmd_parts),
+                "--",
+                launch_command,
+            )
+            time.sleep(self._compute_settle_delay_seconds(launch_command))
+            self._run_tmux(
+                "send-keys",
+                "-t", session_name,
                 "Enter",
             )
 
