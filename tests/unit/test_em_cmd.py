@@ -34,8 +34,14 @@ def _make_client(
     return client
 
 
-def _make_child(child_id: str, friendly_name: str) -> dict:
-    return {"id": child_id, "friendly_name": friendly_name, "name": f"claude-{child_id}"}
+def _make_child(child_id: str, friendly_name: str, status: str = "running", completion_status=None) -> dict:
+    return {
+        "id": child_id,
+        "friendly_name": friendly_name,
+        "name": f"claude-{child_id}",
+        "status": status,
+        "completion_status": completion_status,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +164,16 @@ def test_child_remind_failure_is_warning(capsys):
     out = capsys.readouterr().out
     assert "remind registration failed" in out
     assert "0 succeeded, 1 failed" in out
+
+
+def test_idle_children_are_skipped_without_rearming_remind(capsys):
+    child1 = _make_child("b2c3d4e5", "scout-1465", status="idle")
+    client = _make_client(children_data={"children": [child1]})
+    rc = cmd_em(client, "a1b2c3d4", "test")
+    assert rc == 0
+    client.register_remind.assert_not_called()
+    out = capsys.readouterr().out
+    assert "skipped (not actively running)" in out
 
 
 def test_no_session_id(capsys):

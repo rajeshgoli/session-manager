@@ -358,3 +358,37 @@ class TestCodexAppProjection:
         assert rc == 0
         out = capsys.readouterr().out
         assert "No activity data" in out
+
+
+class TestCodexForkTail:
+    def test_codex_fork_structured_mode_uses_tool_calls_api(self, capsys):
+        client, session = _make_client(session_id="forktail1", friendly_name="fork-worker")
+        session["provider"] = "codex-fork"
+        client.get_session.return_value = session
+        client.list_sessions.return_value = [session]
+        client.get_tool_calls.return_value = {
+            "tool_calls": [
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "tool_name": "exec_command",
+                    "hook_type": "CodexForkToolCall",
+                }
+            ]
+        }
+
+        rc = cmd_tail(client, "forktail1", n=5)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "exec_command" in out
+
+    def test_codex_fork_structured_mode_no_actions(self, capsys):
+        client, session = _make_client(session_id="forktail2", friendly_name="fork-worker")
+        session["provider"] = "codex-fork"
+        client.get_session.return_value = session
+        client.list_sessions.return_value = [session]
+        client.get_tool_calls.return_value = {"tool_calls": []}
+
+        rc = cmd_tail(client, "forktail2", n=5)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "No codex-fork activity data" in out

@@ -180,11 +180,17 @@ class CodexObservabilityLogger:
         if len(raw) <= self.payload_max_chars:
             return raw
         excerpt = raw[: self.payload_max_chars]
+        preserved_fields: dict[str, Any] = {}
+        for key in ("tool_name", "turn_id", "call_id", "event_type"):
+            value = payload.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                preserved_fields[key] = value
         return json.dumps(
             {
                 "truncated": True,
                 "preview": excerpt,
                 "original_chars": len(raw),
+                **preserved_fields,
             },
             separators=(",", ":"),
         )

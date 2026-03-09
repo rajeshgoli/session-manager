@@ -214,6 +214,37 @@ def test_tab_expansion_renders_details_for_selected_session():
     assert any("line one" in line for line in detail_rows)
 
 
+def test_detail_worker_fetches_codex_fork_actions():
+    client = type(
+        "_Client",
+        (),
+        {
+            "get_tool_calls": staticmethod(
+                lambda session_id, limit, timeout: {
+                    "tool_calls": [
+                        {"tool_name": "exec_command", "timestamp": "2026-02-21T22:59:55"},
+                        {"tool_name": "sm_send", "timestamp": "2026-02-21T22:59:58"},
+                    ]
+                }
+            )
+        },
+    )()
+    worker = DetailFetchWorker(client=client, codex_projection_enabled=True)
+
+    lines = worker._fetch_actions("fork1234", "codex-fork")
+
+    assert len(lines) == 2
+    assert lines[0].startswith("exec_command")
+    assert lines[1].startswith("sm_send")
+
+
+def test_detail_worker_handles_codex_fork_unavailable():
+    client = type("_Client", (), {"get_tool_calls": staticmethod(lambda session_id, limit, timeout: None)})()
+    worker = DetailFetchWorker(client=client, codex_projection_enabled=True)
+
+    assert worker._fetch_actions("fork1234", "codex-fork") == ["n/a (unavailable)"]
+
+
 def test_multi_expanded_sessions_render_independent_details():
     sessions = [
         _session("s1", "agent-1", "/tmp/repo", context_monitor_enabled=True, tokens_used=10),

@@ -260,6 +260,7 @@ class TestCmdChildrenOutput:
         assert rc == 0
         assert "last tool: n/a (no hooks)" in out
         assert "thinking" in out
+        assert " | codex | " in out
 
     def test_codex_app_session_uses_activity_projection(self, tmp_path, capsys):
         child = _child(

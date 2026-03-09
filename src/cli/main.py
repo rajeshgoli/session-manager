@@ -428,6 +428,9 @@ def main():
     # sm task-complete
     subparsers.add_parser("task-complete", help="Signal task completion: cancels remind + notifies EM")
 
+    # sm turn-complete
+    subparsers.add_parser("turn-complete", help="Signal turn completion: cancels periodic remind only")
+
     # sm context-monitor <enable|disable|status> [session-id]
     ctx_parser = subparsers.add_parser(
         "context-monitor",
@@ -648,6 +651,8 @@ def main():
         sys.exit(commands.cmd_handoff(client, session_id, args.file_path))
     elif args.command == "task-complete":
         sys.exit(commands.cmd_task_complete(client, session_id))
+    elif args.command == "turn-complete":
+        sys.exit(commands.cmd_turn_complete(client, session_id))
     elif args.command == "context-monitor":
         sys.exit(commands.cmd_context_monitor(client, session_id, args.action, args.target))
     elif args.command == "em":

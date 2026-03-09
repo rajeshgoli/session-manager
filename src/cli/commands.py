@@ -1492,7 +1492,7 @@ def cmd_children(
                 status_age = f" ({format_relative_time(agent_status_at)})"
 
             # Build the base line
-            line = f"{name} ({child_id}) | {status} | {elapsed}"
+            line = f"{name} ({child_id}) | {provider} | {status} | {elapsed}"
 
             # Thinking duration + last tool — only for running sessions
             raw_status = child.get("status", "")
@@ -2196,6 +2196,24 @@ def cmd_tail(
             print(f"  [{elapsed} ago] {summary}{status_suffix}")
         return 0
 
+    if provider == "codex-fork":
+        payload = client.get_tool_calls(session_id, limit=n, timeout=2)
+        if payload is None:
+            print("Error: Failed to fetch codex-fork activity", file=sys.stderr)
+            return 1
+
+        rows = payload.get("tool_calls") or []
+        if not rows:
+            print(f"No codex-fork activity data for {name} ({session_id})")
+            return 0
+
+        print(f"Last {len(rows)} actions ({name} {session_id[:8]}):")
+        for row in rows:
+            tool_name = row.get("tool_name") or "tool"
+            elapsed = _relative_age(row.get("timestamp"))
+            print(f"  [{elapsed} ago] {tool_name}")
+        return 0
+
     # --- Structured mode: query tool_usage.db ---
     db_path = Path(db_path_override or _TOOL_DB_DEFAULT).expanduser()
     if not db_path.exists():
@@ -2817,6 +2835,33 @@ def cmd_task_complete(client: SessionManagerClient, session_id: str) -> int:
     return 0
 
 
+def cmd_turn_complete(client: SessionManagerClient, session_id: str) -> int:
+    """
+    Signal that the calling agent has completed its current turn.
+
+    Cancels the periodic remind loop for this session without notifying the EM
+    that the entire task is complete.
+    """
+    if not session_id:
+        print(
+            "Error: CLAUDE_SESSION_MANAGER_ID not set. sm turn-complete can only be called from within a session.",
+            file=sys.stderr,
+        )
+        return 2
+
+    success, unavailable = client.turn_complete(session_id)
+
+    if unavailable:
+        print("Error: Session manager unavailable", file=sys.stderr)
+        return 2
+    if not success:
+        print("Error: Failed to mark turn complete", file=sys.stderr)
+        return 1
+
+    print("Turn complete. Remind cancelled until new work is assigned.")
+    return 0
+
+
 def cmd_context_monitor(
     client: SessionManagerClient,
     session_id: Optional[str],
@@ -2970,6 +3015,13 @@ def cmd_em(
         for child in children:
             child_id = child["id"]
             child_name = child.get("friendly_name") or child.get("name") or child_id
+            child_status = child.get("status")
+            child_completion_status = child.get("completion_status")
+            if child_status != "running" or child_completion_status:
+                child_lines.append(
+                    f"    {child_name} ({child_id}) → skipped (not actively running)"
+                )
+                continue
             line_parts = []
             ok = True
 

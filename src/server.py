@@ -1801,6 +1801,37 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
+        provider = getattr(session, "provider", "claude")
+        if provider == "codex-fork":
+            observability = getattr(app.state.session_manager, "codex_observability_logger", None)
+            if observability is None:
+                return {"session_id": session_id, "tool_calls": []}
+
+            tool_events = observability.list_recent_tool_events(session_id, limit=limit * 4)
+            normalized_rows: list[dict[str, Any]] = []
+            for row in reversed(tool_events):
+                raw_payload = row.get("raw_payload_json")
+                tool_name = None
+                if isinstance(raw_payload, str) and raw_payload:
+                    try:
+                        parsed = json.loads(raw_payload)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    tool_name = parsed.get("tool_name") if isinstance(parsed, dict) else None
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+                normalized_rows.append(
+                    {
+                        "timestamp": row.get("created_at"),
+                        "tool_name": tool_name,
+                        "hook_type": "CodexForkToolCall",
+                    }
+                )
+                if len(normalized_rows) >= limit:
+                    break
+            normalized_rows.reverse()
+            return {"session_id": session_id, "tool_calls": normalized_rows}
+
         tool_logger = getattr(app.state, "tool_logger", None)
         db_path = None
         if tool_logger is not None:
@@ -2936,6 +2967,31 @@ Provide ONLY the summary, no preamble or questions."""
             "session_id": session_id,
             "em_notified": em_notified,
             "agent_task_completed_at": session.agent_task_completed_at.isoformat(),
+        }
+
+    @app.post("/sessions/{session_id}/turn-complete")
+    async def turn_complete(session_id: str, request: TaskCompleteRequest):
+        """Mark a session's current turn as complete and suppress periodic remind."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        if request.requester_session_id != session_id:
+            return {"error": "sm turn-complete is self-directed only — requester must equal target session"}
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            return {"error": f"Session {session_id} not found"}
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            return {"error": "Message queue manager not available"}
+
+        queue_mgr.cancel_remind(session_id)
+        logger.info("turn-complete: cancelled periodic remind for %s", session_id)
+
+        return {
+            "status": "turn_completed",
+            "session_id": session_id,
         }
 
     @app.get("/sessions/{session_id}/send-queue")

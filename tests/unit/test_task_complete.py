@@ -90,7 +90,32 @@ class TestTaskCompleteCancelsRemind:
 
 
 # ---------------------------------------------------------------------------
-# 2. cancel_parent_wake is called after task-complete
+# 2. cancel_remind is called after turn-complete, without task-complete metadata
+# ---------------------------------------------------------------------------
+
+class TestTurnCompleteCancelsRemind:
+    def test_turn_complete_cancels_only_remind(self, app_client):
+        client, mq = app_client
+
+        with patch("asyncio.create_task") as mock_ct:
+            mock_ct.return_value = MagicMock()
+            mq.register_periodic_remind("abc12345", soft_threshold=210, hard_threshold=420)
+            mq.register_parent_wake("abc12345", "em000001")
+
+        resp = client.post(
+            "/sessions/abc12345/turn-complete",
+            json={"requester_session_id": "abc12345"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "turn_completed"
+        assert "abc12345" not in mq._remind_registrations
+        assert "abc12345" in mq._parent_wake_registrations
+        assert mq.session_manager.get_session("abc12345").agent_task_completed_at is None
+
+
+# ---------------------------------------------------------------------------
+# 3. cancel_parent_wake is called after task-complete
 # ---------------------------------------------------------------------------
 
 class TestTaskCompleteCancelsParentWake:
@@ -115,7 +140,7 @@ class TestTaskCompleteCancelsParentWake:
 
 
 # ---------------------------------------------------------------------------
-# 3. EM notified via parent_wake_registrations
+# 4. EM notified via parent_wake_registrations
 # ---------------------------------------------------------------------------
 
 class TestTaskCompleteNotifiesEmViaParentWake:
@@ -147,7 +172,7 @@ class TestTaskCompleteNotifiesEmViaParentWake:
 
 
 # ---------------------------------------------------------------------------
-# 4. Falls back to session.parent_session_id when no parent_wake_registration
+# 5. Falls back to session.parent_session_id when no parent_wake_registration
 # ---------------------------------------------------------------------------
 
 class TestTaskCompleteFallsBackToSessionParent:
@@ -193,7 +218,7 @@ class TestTaskCompleteFallsBackToSessionParent:
 
 
 # ---------------------------------------------------------------------------
-# 5. No EM found — endpoint returns success with em_notified=false, no crash
+# 6. No EM found — endpoint returns success with em_notified=false, no crash
 # ---------------------------------------------------------------------------
 
 class TestTaskCompleteNoEm:
@@ -235,7 +260,7 @@ class TestTaskCompleteNoEm:
 
 
 # ---------------------------------------------------------------------------
-# 6. Self-auth enforced — wrong requester is rejected
+# 7. Self-auth enforced — wrong requester is rejected
 # ---------------------------------------------------------------------------
 
 class TestTaskCompleteSelfAuth:
@@ -251,9 +276,21 @@ class TestTaskCompleteSelfAuth:
         assert "error" in data
         assert "self-directed" in data["error"]
 
+    def test_turn_complete_self_auth_enforced(self, app_client):
+        client, _ = app_client
+
+        resp = client.post(
+            "/sessions/abc12345/turn-complete",
+            json={"requester_session_id": "other999"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "error" in data
+        assert "self-directed" in data["error"]
+
 
 # ---------------------------------------------------------------------------
-# 7. Remind message includes task-complete hint
+# 8. Remind message includes task-complete hint
 # ---------------------------------------------------------------------------
 
 class TestRemindMessageIncludesTaskCompleteHint:
@@ -276,7 +313,7 @@ class TestRemindMessageIncludesTaskCompleteHint:
 
 
 # ---------------------------------------------------------------------------
-# 8. CLI: cmd_task_complete requires CLAUDE_SESSION_MANAGER_ID
+# 9. CLI: cmd_task_complete / cmd_turn_complete require CLAUDE_SESSION_MANAGER_ID
 # ---------------------------------------------------------------------------
 
 class TestCliTaskCompleteRequiresSessionId:
@@ -325,9 +362,44 @@ class TestCliTaskCompleteRequiresSessionId:
         captured = capsys.readouterr()
         assert "Failed" in captured.err
 
+    def test_turn_complete_error_when_session_id_not_set(self, capsys):
+        from src.cli.commands import cmd_turn_complete
+        client = MagicMock()
+        result = cmd_turn_complete(client, None)
+        assert result == 2
+        captured = capsys.readouterr()
+        assert "CLAUDE_SESSION_MANAGER_ID" in captured.err
+
+    def test_turn_complete_success(self, capsys):
+        from src.cli.commands import cmd_turn_complete
+        client = MagicMock()
+        client.turn_complete.return_value = (True, False)
+        result = cmd_turn_complete(client, "abc12345")
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Turn complete" in captured.out
+
+    def test_turn_complete_unavailable_returns_2(self, capsys):
+        from src.cli.commands import cmd_turn_complete
+        client = MagicMock()
+        client.turn_complete.return_value = (False, True)
+        result = cmd_turn_complete(client, "abc12345")
+        assert result == 2
+        captured = capsys.readouterr()
+        assert "unavailable" in captured.err
+
+    def test_turn_complete_server_error_returns_failure(self, capsys):
+        from src.cli.commands import cmd_turn_complete
+        client = MagicMock()
+        client.turn_complete.return_value = (False, False)
+        result = cmd_turn_complete(client, "abc12345")
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Failed" in captured.err
+
 
 # ---------------------------------------------------------------------------
-# 9. client.task_complete() handles error body in HTTP 200 response
+# 10. client.task_complete() / client.turn_complete() handle error body in HTTP 200 response
 # ---------------------------------------------------------------------------
 
 class TestClientTaskCompleteHandlesErrorBody:
@@ -361,3 +433,29 @@ class TestClientTaskCompleteHandlesErrorBody:
         assert success is True
         assert unavailable is False
         assert em_notified is True
+
+    def test_turn_complete_error_body_returns_false_success(self):
+        from src.cli.client import SessionManagerClient
+
+        sm_client = SessionManagerClient.__new__(SessionManagerClient)
+        sm_client._request = MagicMock(
+            return_value=({"error": "Session nonexistent not found"}, True, False)
+        )
+
+        success, unavailable = sm_client.turn_complete("nonexistent")
+
+        assert success is False
+        assert unavailable is False
+
+    def test_turn_complete_success_body_returns_true(self):
+        from src.cli.client import SessionManagerClient
+
+        sm_client = SessionManagerClient.__new__(SessionManagerClient)
+        sm_client._request = MagicMock(
+            return_value=({"status": "turn_completed", "session_id": "abc12345"}, True, False)
+        )
+
+        success, unavailable = sm_client.turn_complete("abc12345")
+
+        assert success is True
+        assert unavailable is False

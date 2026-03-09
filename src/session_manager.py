@@ -885,8 +885,8 @@ class SessionManager:
                 )
 
         if "tool_input" in payload:
-            sanitized["tool_input"] = self._sanitize_codex_fork_value(
-                payload.get("tool_input"), max_chars=self.codex_fork_tool_input_max_chars
+            sanitized["tool_input"] = self._sanitize_codex_fork_tool_input_value(
+                payload.get("tool_input")
             )
         if "output_preview" in payload:
             sanitized["output_preview"] = self._sanitize_codex_fork_text(
@@ -899,6 +899,19 @@ class SessionManager:
                 max_chars=self.codex_fork_output_preview_max_chars,
             )
         return sanitized
+
+    def _sanitize_codex_fork_tool_input_value(self, value: Any) -> Any:
+        """Sanitize tool input, parsing JSON-encoded argument strings when possible."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError:
+                    pass
+        return self._sanitize_codex_fork_value(
+            value, max_chars=self.codex_fork_tool_input_max_chars
+        )
 
     @staticmethod
     def _parse_codex_fork_timestamp(value: Any) -> Optional[datetime]:
@@ -977,6 +990,138 @@ class SessionManager:
             schema_version=schema_version,
         )
 
+    def _ingest_codex_fork_raw_response_item(
+        self,
+        session_id: str,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        """Project codex-fork raw response items into observability rows."""
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            return
+
+        schema_version = event.get("schema_version")
+        if isinstance(schema_version, str) and schema_version.isdigit():
+            schema_version = int(schema_version)
+        if not isinstance(schema_version, int):
+            schema_version = None
+
+        created_at = self._parse_codex_fork_timestamp(event.get("ts"))
+        turn_id = payload.get("turn_id") or item.get("turn_id")
+        thread_id = str(event.get("session_id")) if event.get("session_id") else None
+
+        if item_type == "function_call":
+            tool_name = item.get("name")
+            if not isinstance(tool_name, str) or not tool_name:
+                return
+            raw_payload = {
+                "tool_name": tool_name,
+                "tool_input": self._sanitize_codex_fork_tool_input_value(item.get("arguments")),
+            }
+            self._safe_log_codex_tool_event(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item.get("call_id"),
+                event_type="submitted",
+                item_type="tool",
+                phase="pre",
+                raw_payload=raw_payload,
+                created_at=created_at,
+                provider="codex-fork",
+                schema_version=schema_version,
+            )
+            session = self.sessions.get(session_id)
+            if session is not None:
+                session.last_tool_name = tool_name
+                if created_at:
+                    session.last_tool_call = created_at.astimezone().replace(tzinfo=None)
+                else:
+                    session.last_tool_call = datetime.now()
+            return
+
+        if item_type != "message":
+            return
+
+        role = item.get("role")
+        if role != "assistant":
+            return
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            return
+
+        text_parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "output_text":
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text)
+
+        if not text_parts:
+            return
+
+        joined_text = "\n\n".join(text_parts)
+        self._safe_log_codex_turn_event(
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            event_type="raw_response_item",
+            status="streaming",
+            output_preview=joined_text[:400],
+            raw_payload={
+                "role": role,
+                "content_types": [part.get("type") for part in content if isinstance(part, dict)],
+            },
+            created_at=created_at,
+            provider="codex-fork",
+            schema_version=schema_version,
+        )
+
+    async def _handle_codex_fork_turn_complete(
+        self,
+        session_id: str,
+        last_message: str,
+        event: dict[str, Any],
+    ) -> None:
+        """Persist and notify on codex-fork turn completion output."""
+        if not last_message:
+            return
+
+        if self.hook_output_store is not None:
+            self.hook_output_store["latest"] = last_message
+            self.hook_output_store[session_id] = last_message
+
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        session.last_activity = datetime.now()
+        session.status = SessionStatus.IDLE
+        self._save_state()
+
+        if self.message_queue_manager:
+            self.message_queue_manager.mark_session_idle(session_id)
+
+        if not getattr(self, "notifier", None):
+            return
+        if not session.telegram_chat_id:
+            return
+
+        event_obj = NotificationEvent(
+            session_id=session.id,
+            event_type="response",
+            message="Codex responded",
+            context=last_message,
+            urgent=False,
+        )
+        await self.notifier.notify(event_obj, session)
+
     def ingest_codex_fork_event(self, session_id: str, event: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Ingest one codex-fork bridge event record."""
         event_type = event.get("event_type") or event.get("type")
@@ -994,6 +1139,28 @@ class SessionManager:
                 session_id=session_id,
                 event=event,
                 sanitized_payload=payload_for_store,
+            )
+        elif normalized == "raw_response_item":
+            self._ingest_codex_fork_raw_response_item(
+                session_id=session_id,
+                event=event,
+                payload=payload,
+            )
+        elif normalized in {"turn_started", "turn_complete", "turn_aborted"}:
+            payload_message = payload.get("last_agent_message")
+            payload_preview = payload_message if isinstance(payload_message, str) else ""
+            created_at = self._parse_codex_fork_timestamp(event.get("ts"))
+            self._safe_log_codex_turn_event(
+                session_id=session_id,
+                thread_id=str(event.get("session_id")) if event.get("session_id") else None,
+                turn_id=payload.get("turn_id") or event.get("turn_id"),
+                event_type=normalized,
+                status="completed" if normalized == "turn_complete" else None,
+                output_preview=payload_preview[:400] if payload_preview else None,
+                raw_payload=payload,
+                created_at=created_at,
+                provider="codex-fork",
+                schema_version=event.get("schema_version") if isinstance(event.get("schema_version"), int) else None,
             )
         turn_id = payload_for_store.get("turn_id") or event.get("turn_id")
         self.codex_event_store.append_event(
@@ -1086,6 +1253,18 @@ class SessionManager:
                                 logger.debug("Skipping non-JSON codex-fork event line for %s", session_id)
                                 continue
                             self.ingest_codex_fork_event(session_id, event)
+                            normalized = self._normalize_codex_fork_event_type(
+                                event.get("event_type") or event.get("type")
+                            )
+                            if normalized == "turn_complete":
+                                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                                last_message = payload.get("last_agent_message")
+                                if isinstance(last_message, str) and last_message.strip():
+                                    await self._handle_codex_fork_turn_complete(
+                                        session_id=session_id,
+                                        last_message=last_message,
+                                        event=event,
+                                    )
 
                 await asyncio.sleep(self.codex_fork_event_poll_interval_seconds)
         except asyncio.CancelledError:

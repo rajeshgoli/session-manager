@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from types import SimpleNamespace
@@ -137,6 +138,45 @@ def test_tool_calls_endpoint_reads_pretooluse_rows(tmp_path):
     payload = client.get(f"/sessions/{session.id}/tool-calls?limit=10").json()
     names = [row["tool_name"] for row in payload["tool_calls"]]
     assert names == ["Write", "Read"]
+
+
+def test_tool_calls_endpoint_reads_codex_fork_observability(tmp_path):
+    session = _make_session("fork1234", provider="codex-fork")
+    sm = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    sm.codex_observability_logger.payload_max_chars = 80
+    sm.sessions[session.id] = session
+    sm.ingest_codex_fork_event(
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "raw_response_item",
+            "session_id": "thread-fork1234",
+            "seq": 7,
+            "session_epoch": 1,
+            "ts": "2026-03-09T08:55:00Z",
+            "payload": {
+                "turn_id": "turn-fork1234",
+                "item": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "pwd", "notes": "x" * 5000}),
+                    "call_id": "call-fork1234",
+                },
+            },
+        },
+    )
+
+    app = create_app(session_manager=sm)
+    client = TestClient(app)
+
+    payload = client.get(f"/sessions/{session.id}/tool-calls?limit=10").json()
+    assert payload["tool_calls"] == [
+        {
+            "timestamp": "2026-03-09T08:55:00+00:00",
+            "tool_name": "exec_command",
+            "hook_type": "CodexForkToolCall",
+        }
+    ]
 
 
 def test_hook_tool_use_updates_last_tool_fields():

@@ -969,6 +969,19 @@ class SessionManagerClient:
         em_notified = bool(data.get("em_notified")) if data else False
         return True, False, em_notified
 
+    def turn_complete(self, session_id: str) -> tuple[bool, bool]:
+        """Call POST /sessions/{session_id}/turn-complete. Returns (success, unavailable)."""
+        data, success, unavailable = self._request(
+            "POST",
+            f"/sessions/{session_id}/turn-complete",
+            {"requester_session_id": session_id},
+        )
+        if unavailable:
+            return False, True
+        if not success or (data and data.get("error")):
+            return False, False
+        return True, False
+
     def arm_stop_notify(
         self,
         session_id: str,

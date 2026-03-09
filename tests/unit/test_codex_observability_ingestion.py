@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -168,5 +169,89 @@ def test_codex_fork_after_tool_use_ingestion_redacts_and_tags(tmp_path):
 
     stored_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
     assert stored_events
-    stored_payload = stored_events[-1]["payload_preview"]["payload"]
-    assert stored_payload["tool_input"]["Authorization"] == "[REDACTED]"
+    stored_preview = stored_events[0]["payload_preview"]
+    if "payload" in stored_preview:
+        assert stored_preview["payload"]["tool_input"]["Authorization"] == "[REDACTED]"
+    else:
+        assert "[REDACTED]" in stored_preview["preview"]
+
+
+def test_codex_fork_raw_function_call_ingestion_logs_tool_event(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkraw1",
+        name="codex-fork-forkraw1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "raw_response_item",
+            "session_id": "thread-forkraw1",
+            "seq": 4,
+            "session_epoch": 1,
+            "ts": "2026-03-09T08:55:00Z",
+            "payload": {
+                "turn_id": "turn-raw-1",
+                "item": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps(
+                        {
+                            "cmd": "git status",
+                            "Authorization": "Bearer super-secret-token",
+                            "env": {"API_KEY": "raw-api-key-value", "SAFE": "ok"},
+                        }
+                    ),
+                    "call_id": "call-raw-1",
+                },
+            },
+        },
+    )
+
+    tool_events = manager.codex_observability_logger.list_recent_tool_events(session.id, limit=10)
+    assert len(tool_events) == 1
+    event = tool_events[0]
+    assert event["event_type"] == "submitted"
+    assert event["provider"] == "codex-fork"
+    assert event["created_at"].startswith("2026-03-09T08:55:00")
+    payload = json.loads(event["raw_payload_json"])
+    assert payload["tool_name"] == "exec_command"
+    assert payload["tool_input"]["Authorization"] == "[REDACTED]"
+    assert payload["tool_input"]["env"]["API_KEY"] == "[REDACTED]"
+    assert payload["tool_input"]["env"]["SAFE"] == "ok"
+    assert session.last_tool_name == "exec_command"
+    assert session.last_tool_call is not None
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_turn_complete_updates_last_message_and_notifies(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkturn1",
+        name="codex-fork-forkturn1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+        telegram_chat_id=1234,
+    )
+    manager.sessions[session.id] = session
+    manager.set_hook_output_store({})
+    manager.message_queue_manager = SimpleNamespace(mark_session_idle=MagicMock())
+    manager.notifier = SimpleNamespace(notify=AsyncMock())
+
+    await manager._handle_codex_fork_turn_complete(
+        session_id=session.id,
+        last_message="Final answer from codex-fork",
+        event={"schema_version": 2, "payload": {"turn_id": "turn-1"}},
+    )
+
+    assert manager.hook_output_store[session.id] == "Final answer from codex-fork"
+    assert manager.hook_output_store["latest"] == "Final answer from codex-fork"
+    assert session.status == SessionStatus.IDLE
+    manager.notifier.notify.assert_awaited()

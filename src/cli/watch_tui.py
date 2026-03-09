@@ -151,6 +151,25 @@ class DetailFetchWorker:
         if provider == "codex":
             return ["n/a (no hooks)"]
 
+        if provider == "codex-fork":
+            payload = self.client.get_tool_calls(session_id, limit=10, timeout=2)
+            if payload is None:
+                return ["n/a (unavailable)"]
+
+            calls = payload.get("tool_calls") or []
+            if not calls:
+                return ["-"]
+
+            lines: list[str] = []
+            for row in calls[:10]:
+                tool = row.get("tool_name") or "-"
+                age = _age_from_iso(row.get("timestamp"))
+                if age != "-":
+                    lines.append(f"{tool} ({age})")
+                else:
+                    lines.append(tool)
+            return lines
+
         if provider == "codex-app":
             if not self.codex_projection_enabled:
                 return ["n/a (projection disabled)"]
