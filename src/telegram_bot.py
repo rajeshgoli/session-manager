@@ -944,8 +944,8 @@ Provide ONLY the summary, no preamble or questions."""
                 asyncio.create_task(self._monitor_progress(session_id, chat_id, msg.message_id))
             elif result == DeliveryResult.QUEUED:
                 msg = await update.message.reply_text(
-                    f"[{session_id}] ⏳ Queued (session working)\n"
-                    f"Reply /force to deliver immediately"
+                    f"[{session_id}] ⏳ Queued (delivery deferred)\n"
+                    f"Reply /force to interrupt instead"
                 )
                 # Track queued message for potential /force promotion
                 self._pending_input_msgs[session_id] = (chat_id, msg.message_id)

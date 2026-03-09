@@ -1628,7 +1628,7 @@ def create_app(
             if queue_mgr:
                 queue_len = queue_mgr.get_queue_length(session_id)
                 response["queue_position"] = queue_len
-                response["estimated_delivery"] = "waiting_for_idle"
+                response["estimated_delivery"] = "deferred"
 
         return response
 

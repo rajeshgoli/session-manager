@@ -1765,13 +1765,10 @@ class SessionManager:
 
         # Handle delivery modes using the message queue manager
         if self.message_queue_manager:
-            # Check if session is idle (will be delivered immediately)
-            state = self.message_queue_manager.delivery_states.get(session_id)
-            is_idle = state.is_idle if state else True  # Assume idle if no state yet
-
-            # For sequential mode, always queue (queue manager handles idle detection)
+            # For sequential mode, queue first, then report whether the immediate
+            # delivery attempt actually injected the message.
             if delivery_mode == "sequential":
-                self.message_queue_manager.queue_message(
+                msg = self.message_queue_manager.queue_message(
                     target_session_id=session_id,
                     text=formatted_text,
                     sender_session_id=sender_session_id,
@@ -1784,6 +1781,7 @@ class SessionManager:
                     remind_soft_threshold=remind_soft_threshold,
                     remind_hard_threshold=remind_hard_threshold,
                     parent_session_id=parent_session_id,
+                    trigger_delivery=False,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
@@ -1791,11 +1789,44 @@ class SessionManager:
                     sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
                     sender_state.last_outgoing_sm_send_target = session_id
                     sender_state.last_outgoing_sm_send_at = datetime.now()
-                # Return DELIVERED if idle (will be delivered immediately), else QUEUED
-                return DeliveryResult.DELIVERED if is_idle else DeliveryResult.QUEUED
+                delivered = await self.message_queue_manager.deliver_queued_message_now(
+                    session_id=session_id,
+                    message_id=msg.id,
+                    delivery_mode=delivery_mode,
+                )
+                return DeliveryResult.DELIVERED if delivered else DeliveryResult.QUEUED
 
-            # For important/urgent, queue handles delivery logic
-            if delivery_mode in ("important", "urgent"):
+            # For important, queue first, then report the real immediate-delivery outcome.
+            if delivery_mode == "important":
+                msg = self.message_queue_manager.queue_message(
+                    target_session_id=session_id,
+                    text=formatted_text,
+                    sender_session_id=sender_session_id,
+                    sender_name=sender_name,
+                    delivery_mode=delivery_mode,
+                    timeout_seconds=timeout_seconds,
+                    notify_on_delivery=notify_on_delivery,
+                    notify_after_seconds=notify_after_seconds,
+                    notify_on_stop=notify_on_stop,
+                    remind_soft_threshold=remind_soft_threshold,
+                    remind_hard_threshold=remind_hard_threshold,
+                    parent_session_id=parent_session_id,
+                    trigger_delivery=False,
+                )
+                # Record outgoing sm send for deferred stop notification suppression (#182)
+                if from_sm_send and sender_session_id:
+                    sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
+                    sender_state.last_outgoing_sm_send_target = session_id
+                    sender_state.last_outgoing_sm_send_at = datetime.now()
+                delivered = await self.message_queue_manager.deliver_queued_message_now(
+                    session_id=session_id,
+                    message_id=msg.id,
+                    delivery_mode=delivery_mode,
+                )
+                return DeliveryResult.DELIVERED if delivered else DeliveryResult.QUEUED
+
+            # Urgent always delivers (sends Escape first).
+            if delivery_mode == "urgent":
                 self.message_queue_manager.queue_message(
                     target_session_id=session_id,
                     text=formatted_text,
@@ -1810,15 +1841,11 @@ class SessionManager:
                     remind_hard_threshold=remind_hard_threshold,
                     parent_session_id=parent_session_id,
                 )
-                # Record outgoing sm send for deferred stop notification suppression (#182)
                 if from_sm_send and sender_session_id:
                     sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
                     sender_state.last_outgoing_sm_send_target = session_id
                     sender_state.last_outgoing_sm_send_at = datetime.now()
-                # Urgent always delivers (sends Escape first), important waits
-                if delivery_mode == "urgent":
-                    return DeliveryResult.DELIVERED
-                return DeliveryResult.DELIVERED if is_idle else DeliveryResult.QUEUED
+                return DeliveryResult.DELIVERED
 
         # Fallback: send immediately (no queue manager or unknown mode)
         success = await self._deliver_direct(session, formatted_text)

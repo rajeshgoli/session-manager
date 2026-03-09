@@ -523,6 +523,7 @@ class MessageQueueManager:
         remind_hard_threshold: Optional[int] = None,
         parent_session_id: Optional[str] = None,
         message_category: Optional[str] = None,
+        trigger_delivery: bool = True,
     ) -> QueuedMessage:
         """
         Queue a message for delivery.
@@ -541,6 +542,7 @@ class MessageQueueManager:
             remind_hard_threshold: Seconds after delivery before hard remind fires (#188)
             parent_session_id: EM session to wake periodically after delivery (#225-C)
             message_category: Optional category tag, e.g. 'context_monitor', for scoped cancellation (#241)
+            trigger_delivery: If True, queue_message schedules immediate delivery based on mode.
 
         Returns:
             QueuedMessage with assigned ID
@@ -591,6 +593,37 @@ class MessageQueueManager:
         queue_len = self.get_queue_length(target_session_id)
         logger.info(f"Queued message {msg.id} for {target_session_id} (mode={delivery_mode}, queue={queue_len})")
 
+        if trigger_delivery:
+            self._trigger_delivery(target_session_id, delivery_mode, msg)
+
+        return msg
+
+    def _prepare_nonurgent_delivery(self, target_session_id: str) -> None:
+        """Apply provider-specific state needed before non-urgent direct delivery."""
+        session = self.session_manager.get_session(target_session_id)
+        is_codex = session and getattr(session, "provider", "claude") == "codex"
+        if not is_codex:
+            return
+
+        # Codex: set idle flag and deliver immediately, but skip the
+        # stop-notification side effects of mark_session_idle() since
+        # this isn't a real stop event.
+        # Reset any stale idle status from prior work cycle BEFORE setting is_idle=True.
+        # Without this, _watch_for_idle Phase 3 can see session.status=IDLE from
+        # OutputMonitor and fire a false idle during the delivery window. (#193)
+        # Mirror the urgent path: skip mark_session_active if session is paused for recovery.
+        if target_session_id not in self._paused_sessions:
+            self.mark_session_active(target_session_id)
+        state = self._get_or_create_state(target_session_id)
+        state.is_idle = True  # re-set: mark_session_active clears is_idle; need True to gate delivery
+
+    def _trigger_delivery(
+        self,
+        target_session_id: str,
+        delivery_mode: str,
+        msg: Optional[QueuedMessage] = None,
+    ) -> None:
+        """Schedule immediate delivery work for a queued message."""
         # Codex CLI sessions have no hooks so idle detection never triggers.
         # Force immediate delivery for all non-urgent modes.
         session = self.session_manager.get_session(target_session_id)
@@ -600,19 +633,12 @@ class MessageQueueManager:
         if delivery_mode == "urgent":
             if target_session_id not in self._paused_sessions:
                 self.mark_session_active(target_session_id)
+            if msg is None:
+                logger.warning("Urgent delivery requested without queued message for %s", target_session_id)
+                return
             asyncio.create_task(self._deliver_urgent(target_session_id, msg))
         elif is_codex:
-            # Codex: set idle flag and deliver immediately, but skip the
-            # stop-notification side effects of mark_session_idle() since
-            # this isn't a real stop event.
-            # Reset any stale idle status from prior work cycle BEFORE setting is_idle=True.
-            # Without this, _watch_for_idle Phase 3 can see session.status=IDLE from
-            # OutputMonitor and fire a false idle during the delivery window. (#193)
-            # Mirror the urgent path: skip mark_session_active if session is paused for recovery.
-            if target_session_id not in self._paused_sessions:
-                self.mark_session_active(target_session_id)
-            state = self._get_or_create_state(target_session_id)
-            state.is_idle = True  # re-set: mark_session_active clears is_idle; need True to gate delivery
+            self._prepare_nonurgent_delivery(target_session_id)
             asyncio.create_task(self._try_deliver_messages(target_session_id))
         # If important mode, trigger delivery directly (tty buffer handles ordering, sm#244)
         elif delivery_mode == "important":
@@ -621,7 +647,27 @@ class MessageQueueManager:
         elif delivery_mode == "sequential":
             asyncio.create_task(self._try_deliver_messages(target_session_id))
 
-        return msg
+    def was_message_delivered(self, message_id: str) -> bool:
+        """Return True when a queued message has been marked delivered."""
+        rows = self._execute_query(
+            "SELECT delivered_at FROM message_queue WHERE id = ? LIMIT 1",
+            (message_id,),
+        )
+        return bool(rows and rows[0][0])
+
+    async def deliver_queued_message_now(
+        self,
+        session_id: str,
+        message_id: str,
+        delivery_mode: str,
+    ) -> bool:
+        """Attempt immediate delivery for a specific queued message and report the result."""
+        self._prepare_nonurgent_delivery(session_id)
+        await self._try_deliver_messages(
+            session_id,
+            important_only=(delivery_mode == "important"),
+        )
+        return self.was_message_delivered(message_id)
 
     def get_pending_messages(self, session_id: str) -> List[QueuedMessage]:
         """Get all pending (undelivered) messages for a session."""

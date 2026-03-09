@@ -1096,7 +1096,7 @@ def cmd_send(
     # Success - show different message based on delivery mode
     name = session.get("friendly_name") or session.get("name") or session_id
     if delivery_mode == "sequential":
-        print(f"Queued for {name} ({session_id}) (will inject when idle)")
+        print(f"Input sent to {name} ({session_id})")
     elif delivery_mode == "urgent":
         print(f"Input sent to {name} ({session_id}) (interrupted)")
     else:  # important

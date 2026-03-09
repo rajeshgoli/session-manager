@@ -78,7 +78,8 @@ def mock_message_queue():
     """Create a mock MessageQueueManager."""
     mock = MagicMock()
     mock.delivery_states = {}
-    mock.queue_message = MagicMock()
+    mock.queue_message = MagicMock(return_value=MagicMock(id="msg-123"))
+    mock.deliver_queued_message_now = AsyncMock(return_value=True)
     mock.is_session_idle = MagicMock(return_value=True)
     mock.get_queue_length = MagicMock(return_value=0)
     return mock
@@ -162,21 +163,23 @@ class TestSendInputDeliveryResult:
         session_manager.sessions["test123"] = session
         session_manager.message_queue_manager = mock_message_queue
 
-        # Set up idle state
-        from src.message_queue import SessionDeliveryState
-        mock_message_queue.delivery_states["test123"] = MagicMock()
-        mock_message_queue.delivery_states["test123"].is_idle = True
-
         result = await session_manager.send_input(
             session_id="test123",
             text="hello",
             delivery_mode="sequential",
         )
         assert result == DeliveryResult.DELIVERED
+        mock_message_queue.queue_message.assert_called_once()
+        assert mock_message_queue.queue_message.call_args.kwargs["trigger_delivery"] is False
+        mock_message_queue.deliver_queued_message_now.assert_awaited_once_with(
+            session_id="test123",
+            message_id="msg-123",
+            delivery_mode="sequential",
+        )
 
     @pytest.mark.asyncio
-    async def test_returns_queued_when_session_busy(self, session_manager, mock_message_queue):
-        """Verify QUEUED is returned when session is busy."""
+    async def test_returns_queued_when_immediate_delivery_defers(self, session_manager, mock_message_queue):
+        """Verify QUEUED is returned when the queued message was not injected immediately."""
         session = Session(
             id="test123",
             name="test-session",
@@ -186,9 +189,7 @@ class TestSendInputDeliveryResult:
         session_manager.sessions["test123"] = session
         session_manager.message_queue_manager = mock_message_queue
 
-        # Set up busy state
-        mock_message_queue.delivery_states["test123"] = MagicMock()
-        mock_message_queue.delivery_states["test123"].is_idle = False
+        mock_message_queue.deliver_queued_message_now.return_value = False
 
         result = await session_manager.send_input(
             session_id="test123",
@@ -242,10 +243,6 @@ class TestAPIDeliveryResult:
         )
         session_manager.sessions["test123"] = session
 
-        # Set up idle state
-        mock_message_queue.delivery_states["test123"] = MagicMock()
-        mock_message_queue.delivery_states["test123"].is_idle = True
-
         response = test_client.post(
             "/sessions/test123/input",
             json={"text": "hello", "delivery_mode": "sequential"},
@@ -255,8 +252,8 @@ class TestAPIDeliveryResult:
         data = response.json()
         assert data["status"] == "delivered"
 
-    def test_api_returns_queued_status(self, test_client, session_manager, mock_message_queue):
-        """Verify API returns queued status when session busy."""
+    def test_api_returns_queued_status_when_delivery_is_deferred(self, test_client, session_manager, mock_message_queue):
+        """Verify API returns queued status when immediate delivery does not inject the message."""
         session = Session(
             id="test123",
             name="test-session",
@@ -265,9 +262,7 @@ class TestAPIDeliveryResult:
         )
         session_manager.sessions["test123"] = session
 
-        # Set up busy state
-        mock_message_queue.delivery_states["test123"] = MagicMock()
-        mock_message_queue.delivery_states["test123"].is_idle = False
+        mock_message_queue.deliver_queued_message_now.return_value = False
         mock_message_queue.get_queue_length.return_value = 2
 
         response = test_client.post(
@@ -279,6 +274,7 @@ class TestAPIDeliveryResult:
         data = response.json()
         assert data["status"] == "queued"
         assert data["queue_position"] == 2
+        assert data["estimated_delivery"] == "deferred"
 
     def test_api_returns_404_for_nonexistent_session(self, test_client):
         """Verify API returns 404 for nonexistent session."""
