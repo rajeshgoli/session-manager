@@ -274,6 +274,9 @@ class TestParentWakeRecovery:
             config={},
             notifier=None,
         )
+        active_child = _make_session("child_r", provider="claude", tmux_session="claude-child_r")
+        mock_session_manager.get_session.return_value = active_child
+        mock_session_manager.tmux.session_exists.return_value = True
         with patch("asyncio.create_task", noop_create_task):
             await mq2._recover_parent_wake_registrations()
 
@@ -307,6 +310,85 @@ class TestParentWakeRecovery:
             await mq2._recover_parent_wake_registrations()
 
         assert "child_x" not in mq2._parent_wake_registrations
+
+    @pytest.mark.asyncio
+    async def test_recovery_cancels_dead_child_registrations(
+        self, mock_session_manager, temp_db_path
+    ):
+        """Recovered parent-wake rows are auto-cancelled when the child runtime is already gone."""
+        mq1 = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={},
+            notifier=None,
+        )
+        with patch("asyncio.create_task", noop_create_task):
+            mq1.register_parent_wake("child_dead", "parent_dead", period_seconds=300)
+
+        dead_child = _make_session("child_dead", provider="claude", tmux_session="claude-child_dead")
+        mock_session_manager.get_session.return_value = dead_child
+        mock_session_manager.tmux.session_exists.return_value = False
+
+        mq2 = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={},
+            notifier=None,
+        )
+        with patch("asyncio.create_task", noop_create_task):
+            await mq2._recover_parent_wake_registrations()
+
+        assert "child_dead" not in mq2._parent_wake_registrations
+
+        conn = sqlite3.connect(temp_db_path)
+        rows = conn.execute(
+            "SELECT is_active FROM parent_wake_registrations WHERE child_session_id = 'child_dead'"
+        ).fetchall()
+        conn.close()
+        assert rows[0][0] == 0
+
+
+class TestParentWakeDeadChildCancellation:
+
+    @pytest.mark.asyncio
+    async def test_parent_wake_task_cancels_missing_child_before_digest(self, mock_session_manager, temp_db_path):
+        """A missing child session stops the periodic wake loop instead of emitting <unknown> digests."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={},
+            notifier=None,
+        )
+        reg = ParentWakeRegistration(
+            id="dead_reg",
+            child_session_id="child_missing",
+            parent_session_id="parent_dead",
+            period_seconds=1,
+            registered_at=datetime.now() - timedelta(minutes=5),
+            last_wake_at=None,
+            last_status_at_prev_wake=None,
+        )
+        mq._parent_wake_registrations["child_missing"] = reg
+        mock_session_manager.get_session.return_value = None
+
+        queue_calls = []
+
+        async def fake_sleep(_seconds):
+            return None
+
+        with patch("asyncio.sleep", side_effect=fake_sleep), \
+             patch.object(mq, "queue_message", side_effect=lambda **kwargs: queue_calls.append(kwargs)):
+            await mq._run_parent_wake_task("child_missing")
+
+        assert queue_calls == []
+        assert "child_missing" not in mq._parent_wake_registrations
+
+        conn = sqlite3.connect(temp_db_path)
+        rows = conn.execute(
+            "SELECT is_active FROM parent_wake_registrations WHERE child_session_id = 'child_missing'"
+        ).fetchall()
+        conn.close()
+        assert rows == []
 
 
 # ---------------------------------------------------------------------------

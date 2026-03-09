@@ -1714,6 +1714,14 @@ class MessageQueueManager:
                 if not reg or not reg.is_active:
                     return
 
+                if not self._is_parent_wake_child_alive(child_session_id):
+                    logger.info(
+                        "Parent wake auto-cancelled for dead child=%s before digest dispatch",
+                        child_session_id,
+                    )
+                    self.cancel_parent_wake(child_session_id)
+                    return
+
                 # Assemble and queue digest
                 digest = await self._assemble_parent_wake_digest(child_session_id, reg)
                 self.queue_message(
@@ -1761,6 +1769,21 @@ class MessageQueueManager:
             logger.info(f"Parent wake task cancelled for child={child_session_id}")
         finally:
             self._parent_wake_tasks.pop(child_session_id, None)
+
+    def _is_parent_wake_child_alive(self, child_session_id: str) -> bool:
+        """Return True only while a parent-wake child still has a live runtime."""
+        child_session = self.session_manager.get_session(child_session_id)
+        if not child_session:
+            return False
+
+        if getattr(child_session, "provider", "claude") == "codex-app":
+            return True
+
+        tmux_session = getattr(child_session, "tmux_session", None)
+        if not tmux_session:
+            return False
+
+        return bool(self.session_manager.tmux.session_exists(tmux_session))
 
     async def _assemble_parent_wake_digest(
         self, child_session_id: str, reg: "ParentWakeRegistration"
@@ -1887,6 +1910,18 @@ class MessageQueueManager:
         for row in rows:
             (reg_id, child_session_id, parent_session_id, period_seconds,
              registered_at_str, last_wake_at_str, last_status_at_str, escalated) = row
+
+            if not self._is_parent_wake_child_alive(child_session_id):
+                self._execute(
+                    "UPDATE parent_wake_registrations SET is_active = 0 WHERE child_session_id = ?",
+                    (child_session_id,),
+                )
+                logger.info(
+                    "Skipped recovery for dead parent wake registration %s: child=%s",
+                    reg_id,
+                    child_session_id,
+                )
+                continue
 
             reg = ParentWakeRegistration(
                 id=reg_id,
