@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any, Literal
 from fastapi import FastAPI, HTTPException, Body, Request, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .codex_provider_policy import (
@@ -20,7 +20,15 @@ from .codex_provider_policy import (
     REMOVED_CODEX_SERVER_ENTRYPOINT_MESSAGE,
     get_codex_app_policy,
 )
-from .models import Session, SessionStatus, NotificationChannel, Subagent, SubagentStatus, DeliveryResult
+from .models import (
+    AdoptionProposal,
+    Session,
+    SessionStatus,
+    NotificationChannel,
+    Subagent,
+    SubagentStatus,
+    DeliveryResult,
+)
 from .cli.commands import validate_friendly_name
 
 logger = logging.getLogger(__name__)
@@ -87,6 +95,17 @@ class CreateSessionRequest(BaseModel):
     provider: Optional[str] = "claude"
 
 
+class AdoptionProposalResponse(BaseModel):
+    """Response payload for a pending or resolved adoption proposal."""
+    id: str
+    proposer_session_id: str
+    proposer_name: Optional[str] = None
+    target_session_id: str
+    created_at: str
+    status: str
+    decided_at: Optional[str] = None
+
+
 class SessionResponse(BaseModel):
     """Response containing session info."""
     id: str
@@ -116,6 +135,7 @@ class SessionResponse(BaseModel):
     last_action_at: Optional[str] = None
     tokens_used: int = 0
     context_monitor_enabled: bool = False
+    pending_adoption_proposals: list[AdoptionProposalResponse] = Field(default_factory=list)
 
 
 class SendInputRequest(BaseModel):
@@ -229,6 +249,11 @@ class HandoffRequest(BaseModel):
 
 class TaskCompleteRequest(BaseModel):
     """Request to mark a session's task as complete (self-directed)."""
+    requester_session_id: str
+
+
+class CreateAdoptionProposalRequest(BaseModel):
+    """Request for an EM session to propose adopting another session."""
     requester_session_id: str
 
 
@@ -552,6 +577,7 @@ def create_app(
         provider = getattr(session, "provider", "claude")
         last_action_summary: Optional[str] = None
         last_action_at: Optional[str] = None
+        pending_adoption_proposals: list[AdoptionProposalResponse] = []
         if provider == "codex-app" and _codex_rollout_enabled("enable_observability_projection"):
             latest_action_getter = getattr(app.state.session_manager, "get_codex_latest_activity_action", None)
             if callable(latest_action_getter):
@@ -559,6 +585,13 @@ def create_app(
                 if action:
                     last_action_summary = action.get("summary_text")
                     last_action_at = action.get("ended_at") or action.get("started_at")
+
+        proposal_getter = getattr(app.state.session_manager, "list_adoption_proposals", None)
+        if callable(proposal_getter):
+            for proposal in proposal_getter(target_session_id=session.id, status=None):
+                if proposal.status.value != "pending":
+                    continue
+                pending_adoption_proposals.append(_proposal_to_response(proposal))
 
         return SessionResponse(
             id=session.id,
@@ -592,7 +625,29 @@ def create_app(
             last_action_at=last_action_at,
             tokens_used=getattr(session, "tokens_used", 0),
             context_monitor_enabled=bool(getattr(session, "context_monitor_enabled", False)),
+            pending_adoption_proposals=pending_adoption_proposals,
         )
+
+    def _proposal_to_response(proposal: AdoptionProposal) -> AdoptionProposalResponse:
+        proposer = app.state.session_manager.get_session(proposal.proposer_session_id)
+        proposer_name = None
+        if proposer is not None:
+            proposer_name = proposer.friendly_name or proposer.name or proposer.id
+        return AdoptionProposalResponse(
+            id=proposal.id,
+            proposer_session_id=proposal.proposer_session_id,
+            proposer_name=proposer_name,
+            target_session_id=proposal.target_session_id,
+            created_at=proposal.created_at.isoformat(),
+            status=proposal.status.value,
+            decided_at=proposal.decided_at.isoformat() if proposal.decided_at else None,
+        )
+
+    def _response_dict(model: BaseModel) -> dict:
+        dumper = getattr(model, "model_dump", None)
+        if callable(dumper):
+            return dumper()
+        return model.dict()
 
     def _configure_watch_frontend() -> None:
         """Serve the mobile dashboard if static assets exist in web/sm-watch/dist."""
@@ -2906,6 +2961,66 @@ Provide ONLY the summary, no preamble or questions."""
         state.pending_handoff_path = request.file_path
         logger.info(f"Handoff scheduled for {session_id}: {request.file_path}")
         return {"status": "scheduled"}
+
+    @app.post("/sessions/{target_session_id}/adoption-proposals")
+    async def create_adoption_proposal(target_session_id: str, request: CreateAdoptionProposalRequest):
+        """Create an explicit adoption proposal for user approval in sm watch."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        creator = getattr(app.state.session_manager, "create_adoption_proposal", None)
+        if not callable(creator):
+            raise HTTPException(status_code=503, detail="Adoption proposals unavailable")
+
+        try:
+            proposal = creator(request.requester_session_id, target_session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "status": "pending",
+            "proposal": _response_dict(_proposal_to_response(proposal)),
+        }
+
+    @app.post("/adoption-proposals/{proposal_id}/accept")
+    async def accept_adoption_proposal(proposal_id: str):
+        """Accept an adoption proposal from the operator watch UI."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        decider = getattr(app.state.session_manager, "decide_adoption_proposal", None)
+        if not callable(decider):
+            raise HTTPException(status_code=503, detail="Adoption proposals unavailable")
+
+        try:
+            proposal = decider(proposal_id, accepted=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "status": "accepted",
+            "proposal": _response_dict(_proposal_to_response(proposal)),
+        }
+
+    @app.post("/adoption-proposals/{proposal_id}/reject")
+    async def reject_adoption_proposal(proposal_id: str):
+        """Reject an adoption proposal from the operator watch UI."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        decider = getattr(app.state.session_manager, "decide_adoption_proposal", None)
+        if not callable(decider):
+            raise HTTPException(status_code=503, detail="Adoption proposals unavailable")
+
+        try:
+            proposal = decider(proposal_id, accepted=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "status": "rejected",
+            "proposal": _response_dict(_proposal_to_response(proposal)),
+        }
 
     @app.post("/sessions/{session_id}/task-complete")
     async def task_complete(session_id: str, request: TaskCompleteRequest):

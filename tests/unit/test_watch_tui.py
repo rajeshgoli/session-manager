@@ -34,6 +34,7 @@ def _session(
     agent_status_text: str | None = None,
     agent_status_at: str | None = None,
     agent_task_completed_at: str | None = None,
+    pending_adoption_proposals: list[dict] | None = None,
 ):
     return {
         "id": session_id,
@@ -55,6 +56,7 @@ def _session(
         "agent_status_text": agent_status_text,
         "agent_status_at": agent_status_at,
         "agent_task_completed_at": agent_task_completed_at,
+        "pending_adoption_proposals": pending_adoption_proposals or [],
     }
 
 
@@ -138,6 +140,33 @@ def test_task_completed_row_shows_age():
     )
     status_rows = [row for row in rows if row.kind == "status"]
     assert any("task: completed (" in row.text for row in status_rows)
+
+
+def test_pending_adoption_row_shows_proposer_and_actions():
+    rows, _, _ = build_watch_rows(
+        [
+            _session(
+                "s1",
+                "agent",
+                "/tmp/repo",
+                pending_adoption_proposals=[
+                    {
+                        "id": "proposal123",
+                        "proposer_session_id": "em123456",
+                        "proposer_name": "em-ops",
+                        "target_session_id": "s1",
+                        "created_at": "2026-02-21T22:58:00",
+                        "status": "pending",
+                        "decided_at": None,
+                    }
+                ],
+            )
+        ]
+    )
+
+    status_rows = [row for row in rows if row.kind == "status"]
+    assert any("adopt: pending from em-ops [em123456]" in row.text for row in status_rows)
+    assert any("[A accept / X reject]" in row.text for row in status_rows)
 
 
 def test_status_rows_follow_tree_indentation():

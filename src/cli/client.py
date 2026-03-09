@@ -127,6 +127,45 @@ class SessionManagerClient:
             return data.get("sessions", [])
         return None
 
+    def propose_adoption(self, target_session_id: str, requester_session_id: str) -> dict:
+        """Create an adoption proposal for explicit operator approval."""
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/sessions/{target_session_id}/adoption-proposals",
+            {"requester_session_id": requester_session_id},
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def accept_adoption_proposal(self, proposal_id: str) -> dict:
+        """Accept a pending adoption proposal."""
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/adoption-proposals/{proposal_id}/accept",
+            {},
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def reject_adoption_proposal(self, proposal_id: str) -> dict:
+        """Reject a pending adoption proposal."""
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/adoption-proposals/{proposal_id}/reject",
+            {},
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
     def update_friendly_name(self, session_id: str, friendly_name: str) -> tuple[bool, bool]:
         """
         Update session friendly name.
