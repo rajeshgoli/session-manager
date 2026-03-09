@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from types import SimpleNamespace
@@ -142,6 +143,7 @@ def test_tool_calls_endpoint_reads_pretooluse_rows(tmp_path):
 def test_tool_calls_endpoint_reads_codex_fork_observability(tmp_path):
     session = _make_session("fork1234", provider="codex-fork")
     sm = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    sm.codex_observability_logger.payload_max_chars = 80
     sm.sessions[session.id] = session
     sm.ingest_codex_fork_event(
         session.id,
@@ -157,7 +159,7 @@ def test_tool_calls_endpoint_reads_codex_fork_observability(tmp_path):
                 "item": {
                     "type": "function_call",
                     "name": "exec_command",
-                    "arguments": "{\"cmd\":\"pwd\"}",
+                    "arguments": json.dumps({"cmd": "pwd", "notes": "x" * 5000}),
                     "call_id": "call-fork1234",
                 },
             },

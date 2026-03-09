@@ -885,8 +885,8 @@ class SessionManager:
                 )
 
         if "tool_input" in payload:
-            sanitized["tool_input"] = self._sanitize_codex_fork_value(
-                payload.get("tool_input"), max_chars=self.codex_fork_tool_input_max_chars
+            sanitized["tool_input"] = self._sanitize_codex_fork_tool_input_value(
+                payload.get("tool_input")
             )
         if "output_preview" in payload:
             sanitized["output_preview"] = self._sanitize_codex_fork_text(
@@ -899,6 +899,19 @@ class SessionManager:
                 max_chars=self.codex_fork_output_preview_max_chars,
             )
         return sanitized
+
+    def _sanitize_codex_fork_tool_input_value(self, value: Any) -> Any:
+        """Sanitize tool input, parsing JSON-encoded argument strings when possible."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError:
+                    pass
+        return self._sanitize_codex_fork_value(
+            value, max_chars=self.codex_fork_tool_input_max_chars
+        )
 
     @staticmethod
     def _parse_codex_fork_timestamp(value: Any) -> Optional[datetime]:
@@ -1005,7 +1018,7 @@ class SessionManager:
                 return
             raw_payload = {
                 "tool_name": tool_name,
-                "tool_input": item.get("arguments"),
+                "tool_input": self._sanitize_codex_fork_tool_input_value(item.get("arguments")),
             }
             self._safe_log_codex_tool_event(
                 session_id=session_id,

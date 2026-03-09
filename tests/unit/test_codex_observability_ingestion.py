@@ -201,7 +201,13 @@ def test_codex_fork_raw_function_call_ingestion_logs_tool_event(tmp_path):
                 "item": {
                     "type": "function_call",
                     "name": "exec_command",
-                    "arguments": "{\"cmd\":\"git status\"}",
+                    "arguments": json.dumps(
+                        {
+                            "cmd": "git status",
+                            "Authorization": "Bearer super-secret-token",
+                            "env": {"API_KEY": "raw-api-key-value", "SAFE": "ok"},
+                        }
+                    ),
                     "call_id": "call-raw-1",
                 },
             },
@@ -216,6 +222,9 @@ def test_codex_fork_raw_function_call_ingestion_logs_tool_event(tmp_path):
     assert event["created_at"].startswith("2026-03-09T08:55:00")
     payload = json.loads(event["raw_payload_json"])
     assert payload["tool_name"] == "exec_command"
+    assert payload["tool_input"]["Authorization"] == "[REDACTED]"
+    assert payload["tool_input"]["env"]["API_KEY"] == "[REDACTED]"
+    assert payload["tool_input"]["env"]["SAFE"] == "ok"
     assert session.last_tool_name == "exec_command"
     assert session.last_tool_call is not None
 
