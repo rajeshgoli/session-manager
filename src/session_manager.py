@@ -841,7 +841,10 @@ class SessionManager:
                 if state not in ("idle", "shutdown", "error"):
                     self.message_queue_manager.mark_session_active(session_id)
                 elif previous_state != state:
-                    self.message_queue_manager.mark_session_idle(session_id)
+                    self.message_queue_manager.mark_session_idle(
+                        session_id,
+                        completion_transition=True,
+                    )
 
             if session.status != status_before:
                 self._save_state()
@@ -1230,7 +1233,10 @@ class SessionManager:
         self._save_state()
 
         if self.message_queue_manager:
-            self.message_queue_manager.mark_session_idle(session_id)
+            self.message_queue_manager.mark_session_idle(
+                session_id,
+                completion_transition=True,
+            )
 
         if not getattr(self, "notifier", None):
             return
@@ -2323,7 +2329,10 @@ class SessionManager:
 
         # Mark idle for message queue delivery
         if self.message_queue_manager:
-            self.message_queue_manager.mark_session_idle(session_id)
+            self.message_queue_manager.mark_session_idle(
+                session_id,
+                completion_transition=True,
+            )
 
         # Send notification similar to Claude Stop hook
         if text and hasattr(self, "notifier") and self.notifier:
@@ -2441,7 +2450,10 @@ class SessionManager:
         self._save_state()
 
         if self.message_queue_manager:
-            self.message_queue_manager.mark_session_idle(session_id)
+            self.message_queue_manager.mark_session_idle(
+                session_id,
+                completion_transition=True,
+            )
 
         # Store review output
         if review_text and self.hook_output_store is not None:

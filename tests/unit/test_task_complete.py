@@ -290,26 +290,28 @@ class TestTaskCompleteSelfAuth:
 
 
 # ---------------------------------------------------------------------------
-# 8. Remind message includes task-complete hint
+# 8. Remind message includes turn-complete and task-complete hints
 # ---------------------------------------------------------------------------
 
 class TestRemindMessageIncludesTaskCompleteHint:
-    def test_soft_remind_message_contains_task_complete(self, mq):
-        """The soft remind message contains 'sm task-complete'."""
+    def test_soft_remind_message_contains_turn_and_task_complete(self, mq):
+        """The soft remind message contains both waiting and completion hints."""
         # Queue a message and check text directly by triggering the remind queue
         # We verify the constant text used in _run_remind_task
         import inspect
         import src.message_queue as mq_module
         source = inspect.getsource(mq_module.MessageQueueManager._run_remind_task)
         assert "sm task-complete" in source
+        assert "sm turn-complete" in source
 
-    def test_hard_remind_message_contains_task_complete(self, mq):
-        """The hard remind message contains 'sm task-complete'."""
+    def test_hard_remind_message_contains_turn_and_task_complete(self, mq):
+        """The hard remind message contains both waiting and completion hints."""
         import inspect
         import src.message_queue as mq_module
         source = inspect.getsource(mq_module.MessageQueueManager._run_remind_task)
         # Both soft and hard messages should have the hint
         assert source.count("sm task-complete") >= 2
+        assert source.count("sm turn-complete") >= 2
 
 
 # ---------------------------------------------------------------------------

@@ -255,3 +255,7 @@ async def test_codex_fork_turn_complete_updates_last_message_and_notifies(tmp_pa
     assert manager.hook_output_store["latest"] == "Final answer from codex-fork"
     assert session.status == SessionStatus.IDLE
     manager.notifier.notify.assert_awaited()
+    manager.message_queue_manager.mark_session_idle.assert_called_once_with(
+        session.id,
+        completion_transition=True,
+    )

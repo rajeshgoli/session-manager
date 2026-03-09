@@ -130,6 +130,13 @@ class TestParentWakeRegistration:
             mq.mark_session_idle("child7", from_stop_hook=False)
         assert "child7" in mq._parent_wake_registrations
 
+    def test_completion_transition_cancels_parent_wake(self, mq):
+        """Provider-native turn completion cancels parent wake like a real stop."""
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_parent_wake("child7b", "parent7b")
+            mq.mark_session_idle("child7b", completion_transition=True)
+        assert "child7b" not in mq._parent_wake_registrations
+
 
 # ---------------------------------------------------------------------------
 # TestQueueMessageParentSessionId

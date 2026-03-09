@@ -335,7 +335,13 @@ class MessageQueueManager:
     # IDLE State Management (called by Stop hook handler)
     # =========================================================================
 
-    def mark_session_idle(self, session_id: str, last_output: Optional[str] = None, from_stop_hook: bool = False):
+    def mark_session_idle(
+        self,
+        session_id: str,
+        last_output: Optional[str] = None,
+        from_stop_hook: bool = False,
+        completion_transition: bool = False,
+    ):
         """
         Mark a session as idle (called when Stop hook fires).
 
@@ -347,6 +353,10 @@ class MessageQueueManager:
             last_output: Output from this specific Stop hook invocation
             from_stop_hook: True when called from the Stop hook handler;
                 only Stop hook invocations may consume skip_count slots (#174)
+            completion_transition: True when the provider has completed a real turn
+                and become idle, but there is no Claude Stop hook (codex-app /
+                codex-fork). This should cancel remind/parent-wake like a genuine
+                stop, without engaging skip-fence logic.
         """
         state = self._get_or_create_state(session_id)
         logger.info(f"Session {session_id} marked idle")
@@ -394,7 +404,7 @@ class MessageQueueManager:
 
         # NOT absorbed — agent genuinely completed a task.
         # Cancel periodic remind and parent wake (#188, #225-C, sm#263).
-        if from_stop_hook:
+        if from_stop_hook or completion_transition:
             self.cancel_remind(session_id)
             self.cancel_parent_wake(session_id)
 
@@ -1585,7 +1595,7 @@ class MessageQueueManager:
                     if not has_pending_remind:
                         self.queue_message(
                             target_session_id=target_session_id,
-                            text='[sm remind] Update your status: sm status "message" — or if done: sm task-complete',
+                            text='[sm remind] Update your status: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete',
                             delivery_mode="important",
                         )
                     reg.soft_fired = True
@@ -1595,7 +1605,7 @@ class MessageQueueManager:
                 if elapsed >= reg.hard_threshold_seconds:
                     self.queue_message(
                         target_session_id=target_session_id,
-                        text='[sm remind] Status overdue. Run: sm status "message" — or if done: sm task-complete',
+                        text='[sm remind] Status overdue. Run: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete',
                         delivery_mode="urgent",
                     )
                     # Reset cycle so it restarts

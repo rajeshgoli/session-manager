@@ -321,6 +321,18 @@ class TestIdleCancelsRemind:
 
         assert "agent6" in mq._remind_registrations
 
+    def test_completion_transition_idle_cancels_remind(self, mq):
+        """Provider-native turn completion cancels remind even without a Claude Stop hook."""
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind("agent6b", soft_threshold=10, hard_threshold=20)
+
+        assert "agent6b" in mq._remind_registrations
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.mark_session_idle("agent6b", completion_transition=True)
+
+        assert "agent6b" not in mq._remind_registrations
+
 
 # ===========================================================================
 # 6 & 7 — Clear / Kill cancels remind
