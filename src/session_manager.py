@@ -3293,6 +3293,11 @@ class SessionManager:
                 return ActivityState.WORKING.value
             return ActivityState.THINKING.value
 
+        if session.status == SessionStatus.IDLE:
+            if monitor_state and monitor_state.is_output_flowing:
+                return ActivityState.WORKING.value
+            return ActivityState.IDLE.value
+
         idle_seconds = (datetime.now() - session.last_activity).total_seconds()
         if idle_seconds < 30:
             return ActivityState.THINKING.value
