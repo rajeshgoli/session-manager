@@ -97,6 +97,24 @@ def test_non_codex_fallback_without_hook_data_uses_last_activity():
     assert manager.get_activity_state(session.id) == "idle"
 
 
+def test_non_codex_idle_status_beats_recent_last_activity_without_queue_state():
+    manager = _make_manager()
+    session = Session(
+        id="idle1",
+        name="claude-idle1",
+        working_dir="/tmp",
+        provider="claude",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.output_monitor = SimpleNamespace(
+        get_session_state=lambda _sid: MonitorState(is_output_flowing=False)
+    )
+
+    session.last_activity = datetime.now() - timedelta(seconds=5)
+    assert manager.get_activity_state(session.id) == "idle"
+
+
 def test_codex_app_uses_queue_tristate_and_completion():
     manager = _make_manager()
     session = Session(
