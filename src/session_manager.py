@@ -1684,7 +1684,8 @@ class SessionManager:
 
         # 2. Create topic if chat_id is set but thread_id is missing
         if session.telegram_chat_id and not session.telegram_thread_id and self._topic_creator:
-            topic_name = f"{session.friendly_name or 'session'} [{session.id}]"
+            display_name = self.get_effective_session_name(session) or "session"
+            topic_name = f"{display_name} [{session.id}]"
             try:
                 thread_id = await self._topic_creator(
                     session.id, session.telegram_chat_id, topic_name
@@ -2086,6 +2087,43 @@ class SessionManager:
         ]
         return sorted(aliases)
 
+    def get_primary_session_alias(self, session_id: str) -> Optional[str]:
+        """Return the canonical registry alias for one session, if any."""
+        aliases = self.get_session_aliases(session_id)
+        return aliases[0] if aliases else None
+
+    def get_effective_session_name(self, session_or_id: Session | str | None) -> Optional[str]:
+        """Return canonical display identity: registry alias > friendly_name > internal name."""
+        if session_or_id is None:
+            return None
+        if isinstance(session_or_id, Session):
+            session = session_or_id
+        else:
+            session = self.sessions.get(session_or_id)
+            if session is None:
+                return None
+
+        primary_alias = self.get_primary_session_alias(session.id)
+        if primary_alias:
+            return primary_alias
+        return session.friendly_name or session.name or session.id
+
+    def validate_friendly_name_update(self, session_id: str, friendly_name: str) -> Optional[str]:
+        """Return an error when a friendly name conflicts with canonical registry identity."""
+        normalized_name = self.normalize_agent_role(friendly_name)
+        primary_alias = self.get_primary_session_alias(session_id)
+        if primary_alias and friendly_name != primary_alias:
+            return f'Session identity is controlled by registry role "{primary_alias}"'
+
+        reserved_aliases = {"maintainer"}
+        self._prune_agent_registrations(persist=True)
+        reserved_aliases.update(self.agent_registrations.keys())
+
+        if normalized_name in reserved_aliases and normalized_name != primary_alias:
+            return f'Name "{friendly_name}" is reserved for registry identity "{normalized_name}"'
+
+        return None
+
     def list_sessions(self, include_stopped: bool = False) -> list[Session]:
         """List all sessions."""
         sessions = list(self.sessions.values())
@@ -2184,7 +2222,7 @@ class SessionManager:
         if sender_session_id:
             sender_session = self.sessions.get(sender_session_id)
             if sender_session:
-                sender_name = sender_session.friendly_name or sender_session.name or sender_session_id
+                sender_name = self.get_effective_session_name(sender_session) or sender_session_id
                 formatted_text = f"[Input from: {sender_name} ({sender_session_id[:8]}) via sm send]\n{text}"
             else:
                 # Sender session not found, send without metadata
@@ -2349,7 +2387,7 @@ class SessionManager:
             return
 
         # Get sender friendly name
-        sender_name = sender_session.friendly_name or sender_session.name or sender_session_id
+        sender_name = self.get_effective_session_name(sender_session) or sender_session_id
 
         # Format delivery mode with icon
         mode_icons = {

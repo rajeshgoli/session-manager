@@ -1,6 +1,7 @@
 """Main entry point - orchestrates all components."""
 
 import asyncio
+import copy
 import logging
 import os
 import signal
@@ -24,6 +25,7 @@ from .server import create_app
 from .child_monitor import ChildMonitor
 from .message_queue import MessageQueueManager
 from .tool_logger import ToolLogger
+from .cli.commands import validate_friendly_name
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +178,7 @@ class SessionManagerApp:
             telegram_bot=self.telegram_bot,
             email_handler=self.email_handler,
         )
+        self.notifier.session_manager = self.session_manager
 
         # Set notifier reference in session manager for sm_send notifications
         self.session_manager.notifier = self.notifier
@@ -256,7 +259,16 @@ class SessionManagerApp:
             return session
 
         async def on_list_sessions() -> list[Session]:
-            return self.session_manager.list_sessions()
+            sessions = self.session_manager.list_sessions()
+            getter = getattr(self.session_manager, "get_effective_session_name", None)
+            if not callable(getter):
+                return sessions
+            display_sessions: list[Session] = []
+            for session in sessions:
+                display_session = copy.copy(session)
+                display_session.friendly_name = getter(session)
+                display_sessions.append(display_session)
+            return display_sessions
 
         async def on_kill_session(session_id: str) -> bool:
             await self.output_monitor.stop_monitoring(session_id)
@@ -274,7 +286,15 @@ class SessionManagerApp:
             return result
 
         async def on_session_status(session_id: str) -> Optional[Session]:
-            return self.session_manager.get_session(session_id)
+            session = self.session_manager.get_session(session_id)
+            if session is None:
+                return None
+            getter = getattr(self.session_manager, "get_effective_session_name", None)
+            if not callable(getter):
+                return session
+            display_session = copy.copy(session)
+            display_session.friendly_name = getter(session)
+            return display_session
 
         async def on_open_terminal(session_id: str) -> bool:
             return self.session_manager.open_terminal(session_id)
@@ -291,12 +311,27 @@ class SessionManagerApp:
             if not session:
                 return False
 
+            valid, _ = validate_friendly_name(name)
+            if not valid:
+                return False
+
+            validator = getattr(self.session_manager, "validate_friendly_name_update", None)
+            identity_error = validator(session_id, name) if callable(validator) else None
+            if identity_error:
+                logger.warning("Rejected Telegram name update for %s: %s", session_id, identity_error)
+                return False
+
             session.friendly_name = name
             self.session_manager._save_state()
 
             # Update tmux status bar to show friendly name
             if session.provider != "codex-app":
-                self.session_manager.tmux.set_status_bar(session.tmux_session, name)
+                display_name = self.session_manager.get_effective_session_name(session) or name
+                self.session_manager.tmux.set_status_bar(session.tmux_session, display_name)
+
+            if session.telegram_thread_id and self.notifier:
+                display_name = self.session_manager.get_effective_session_name(session) or name
+                await self.notifier.rename_session_topic(session, display_name)
 
             return True
 
@@ -561,9 +596,9 @@ class SessionManagerApp:
                     await self.output_monitor.start_monitoring(session, is_restored=True)
                     logger.info(f"Restored monitoring for session {session.name}")
 
-                    # Update tmux status bar if friendly name exists
-                    if session.friendly_name:
-                        self.session_manager.tmux.set_status_bar(session.tmux_session, session.friendly_name)
+                    display_name = self.session_manager.get_effective_session_name(session)
+                    if display_name:
+                        self.session_manager.tmux.set_status_bar(session.tmux_session, display_name)
 
     async def _handle_monitor_event(self, event: NotificationEvent):
         """Handle events from the output monitor."""

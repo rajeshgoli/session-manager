@@ -39,6 +39,16 @@ TRANSCRIPT_RETRY_DELAY_SECONDS = 0.3
 EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS = 0.5
 
 
+def _canonical_session_name(session_manager, session: Session, fallback: str) -> str:
+    """Return canonical display identity for a session when the manager can resolve one."""
+    getter = getattr(session_manager, "get_effective_session_name", None) if session_manager else None
+    if callable(getter):
+        display_name = getter(session)
+        if isinstance(display_name, str) and display_name:
+            return display_name
+    return fallback
+
+
 def _normalize_provider(provider: Optional[str]) -> str:
     """Normalize/validate provider string."""
     if not provider:
@@ -480,7 +490,9 @@ async def _handle_em_topic_inheritance(session, session_manager, telegram_bot):
             f"EM topic inheritance: failed to reopen old topic {old_thread_id}. "
             "Creating a new topic as EM thread."
         )
-        topic_name = f"{session.friendly_name or 'em'} [{session.id}]"
+        topic_name = (
+            f"{_canonical_session_name(session_manager, session, session.friendly_name or 'em')} [{session.id}]"
+        )
         brand_new_id = await telegram_bot.create_forum_topic(new_chat_id, topic_name)
         if brand_new_id:
             _set_session_topic(session, new_chat_id, brand_new_id)
@@ -572,6 +584,8 @@ def create_app(
     app.state.child_monitor = child_monitor
     app.state.last_claude_output = {}  # Store last output per session from hooks
     app.state.pending_stop_notifications = set()  # Sessions where Stop hook had empty transcript
+    if notifier is not None:
+        setattr(notifier, "session_manager", session_manager)
 
     # Wire _app back-reference so _execute_handoff can clear server-side caches (#196)
     if session_manager:
@@ -608,6 +622,16 @@ def create_app(
             return state
         return _fallback_activity_state(session)
 
+    def _effective_session_name(session: Session) -> str:
+        sm = app.state.session_manager
+        if sm:
+            getter = getattr(sm, "get_effective_session_name", None)
+            if callable(getter):
+                display_name = getter(session)
+                if isinstance(display_name, str) and display_name:
+                    return display_name
+        return session.friendly_name or session.name or session.id
+
     def _session_to_response(session: Session) -> SessionResponse:
         provider = getattr(session, "provider", "claude")
         last_action_summary: Optional[str] = None
@@ -640,7 +664,7 @@ def create_app(
             last_activity=session.last_activity.isoformat(),
             tmux_session=session.tmux_session,
             provider=provider,
-            friendly_name=session.friendly_name,
+            friendly_name=_effective_session_name(session),
             telegram_chat_id=session.telegram_chat_id,
             telegram_thread_id=session.telegram_thread_id,
             current_task=session.current_task,
@@ -672,7 +696,7 @@ def create_app(
         proposer = app.state.session_manager.get_session(proposal.proposer_session_id)
         proposer_name = None
         if proposer is not None:
-            proposer_name = proposer.friendly_name or proposer.name or proposer.id
+            proposer_name = _effective_session_name(proposer)
         return AdoptionProposalResponse(
             id=proposal.id,
             proposer_session_id=proposal.proposer_session_id,
@@ -690,7 +714,7 @@ def create_app(
         return AgentRegistrationResponse(
             role=registration.role,
             session_id=registration.session_id,
-            friendly_name=session.friendly_name or session.name or session.id,
+            friendly_name=_effective_session_name(session),
             provider=getattr(session, "provider", "claude"),
             status=session.status.value,
             activity_state=_get_activity_state(session),
@@ -702,6 +726,16 @@ def create_app(
         if callable(dumper):
             return dumper()
         return model.dict()
+
+    async def _sync_session_display_identity(session: Session) -> None:
+        """Propagate the canonical display name to tmux and Telegram surfaces."""
+        display_name = _effective_session_name(session)
+        if getattr(session, "provider", "claude") != "codex-app":
+            app.state.session_manager.tmux.set_status_bar(session.tmux_session, display_name)
+        if session.telegram_thread_id and app.state.notifier:
+            success = await app.state.notifier.rename_session_topic(session, display_name)
+            if not success:
+                logger.warning(f"Failed to rename Telegram topic for session {session.id}")
 
     def _configure_watch_frontend() -> None:
         """Serve the mobile dashboard if static assets exist in web/sm-watch/dist."""
@@ -1469,6 +1503,12 @@ def create_app(
             if not valid:
                 raise HTTPException(status_code=400, detail=error)
 
+            validator = getattr(app.state.session_manager, "validate_friendly_name_update", None)
+            if callable(validator):
+                identity_error = validator(session_id, friendly_name)
+                if identity_error:
+                    raise HTTPException(status_code=400, detail=identity_error)
+
             session.friendly_name = friendly_name
 
         if is_em is not None:
@@ -1497,14 +1537,7 @@ def create_app(
             app.state.session_manager._save_state()
 
         if friendly_name is not None:
-            # Update tmux status bar
-            if getattr(session, "provider", "claude") != "codex-app":
-                app.state.session_manager.tmux.set_status_bar(session.tmux_session, friendly_name)
-            # Update Telegram topic name if applicable
-            if session.telegram_thread_id and app.state.notifier:
-                success = await app.state.notifier.rename_session_topic(session, friendly_name)
-                if not success:
-                    logger.warning(f"Failed to rename Telegram topic for session {session_id}")
+            await _sync_session_display_identity(session)
 
         return _session_to_response(session)
 
@@ -1575,6 +1608,7 @@ def create_app(
             raise HTTPException(status_code=503, detail="Maintainer registry unavailable")
         if not setter(session_id):
             raise HTTPException(status_code=400, detail="Failed to register maintainer")
+        await _sync_session_display_identity(session)
         return _session_to_response(session)
 
     @app.delete("/sessions/{session_id}/maintainer", response_model=SessionResponse)
@@ -1593,6 +1627,7 @@ def create_app(
         clearer = getattr(app.state.session_manager, "clear_maintainer_session", None)
         if not callable(clearer) or not clearer(session_id):
             raise HTTPException(status_code=400, detail="Session is not the active maintainer")
+        await _sync_session_display_identity(session)
         return _session_to_response(session)
 
     @app.post("/maintainer/ensure", response_model=EnsureMaintainerResponse)
@@ -1614,6 +1649,7 @@ def create_app(
 
         if created and app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
             await app.state.output_monitor.start_monitoring(session)
+        await _sync_session_display_identity(session)
 
         return EnsureMaintainerResponse(
             created=created,
@@ -1669,6 +1705,7 @@ def create_app(
             registration = registrar(session_id, request.role)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await _sync_session_display_identity(session)
         return _registration_to_response(registration)
 
     @app.delete("/sessions/{session_id}/registry", response_model=AgentRegistrationResponse)
@@ -1696,6 +1733,7 @@ def create_app(
             raise HTTPException(status_code=409, detail="Role is not owned by this session")
         response = _registration_to_response(registration)
         clearer(session_id, request.role)
+        await _sync_session_display_identity(session)
         return response
 
     @app.post("/sessions/{session_id}/context-monitor")
@@ -1785,7 +1823,7 @@ def create_app(
         if not queue_mgr:
             raise HTTPException(status_code=503, detail="Message queue not configured")
 
-        sender_name = sender.friendly_name or sender.name or request.sender_session_id
+        sender_name = _effective_session_name(sender)
         queue_mgr.arm_stop_notify(
             session_id=session_id,
             sender_session_id=request.sender_session_id,
@@ -2836,7 +2874,7 @@ Provide ONLY the summary, no preamble or questions."""
         return {
             "session_id": child_session.id,
             "name": child_session.name,
-            "friendly_name": child_session.friendly_name,
+            "friendly_name": _effective_session_name(child_session),
             "working_dir": child_session.working_dir,
             "parent_session_id": child_session.parent_session_id,
             "tmux_session": child_session.tmux_session,
@@ -2952,7 +2990,7 @@ Provide ONLY the summary, no preamble or questions."""
         return {
             "session_id": session.id,
             "name": session.name,
-            "friendly_name": session.friendly_name,
+            "friendly_name": _effective_session_name(session),
             "review_mode": request.mode,
             "base_branch": request.base_branch,
             "status": "started",
@@ -3024,7 +3062,7 @@ Provide ONLY the summary, no preamble or questions."""
                 {
                     "id": s.id,
                     "name": s.name,
-                    "friendly_name": s.friendly_name,
+                    "friendly_name": _effective_session_name(s),
                     "status": s.status.value,
                     "activity_state": _get_activity_state(s),
                     "completion_status": s.completion_status.value if s.completion_status else None,
@@ -3262,7 +3300,7 @@ Provide ONLY the summary, no preamble or questions."""
         # 5. Notify EM if found
         em_notified = False
         if em_id:
-            friendly = session.friendly_name or session_id
+            friendly = _effective_session_name(session)
             queue_mgr.queue_message(
                 target_session_id=em_id,
                 text=f"[sm task-complete] agent {session_id}({friendly}) completed its task. Clear context with: sm clear {session_id}",
@@ -3443,7 +3481,7 @@ Provide ONLY the summary, no preamble or questions."""
 
         watch_id = await queue_mgr.watch_session(target_session_id, watcher_session_id, timeout_seconds)
 
-        target_name = target_session.friendly_name or target_session.name or target_session_id
+        target_name = _effective_session_name(target_session)
 
         return {
             "status": "watching",
@@ -3522,7 +3560,11 @@ Provide ONLY the summary, no preamble or questions."""
                         if app.state.session_manager:
                             other_session = app.state.session_manager.get_session(lock_result.owner_session_id)
 
-                        other_name = other_session.friendly_name if other_session and other_session.friendly_name else lock_result.owner_session_id
+                        other_name = (
+                            _effective_session_name(other_session)
+                            if other_session is not None
+                            else lock_result.owner_session_id
+                        )
 
                         return {
                             "status": "error",
@@ -3560,7 +3602,7 @@ Provide ONLY the summary, no preamble or questions."""
             asyncio.create_task(app.state.tool_logger.log(
                 session_id=session_manager_id,
                 claude_session_id=claude_session_id,
-                session_name=session.friendly_name if session else None,
+                session_name=_effective_session_name(session) if session else None,
                 parent_session_id=session.parent_session_id if session else None,
                 hook_type=hook_type,
                 tool_name=tool_name,
@@ -3606,7 +3648,7 @@ Provide ONLY the summary, no preamble or questions."""
         if data.get("event") == "compaction":
             trigger = data.get("trigger", "unknown")
             logger.warning(
-                f"Compaction fired for {session.friendly_name or session_id} (trigger={trigger})"
+                f"Compaction fired for {_effective_session_name(session)} (trigger={trigger})"
             )
             # Set compaction flag — suppress remind delivery until compaction_complete (#249).
             session._is_compacting = True
@@ -3622,7 +3664,7 @@ Provide ONLY the summary, no preamble or questions."""
             notify_target = session.context_monitor_notify or session.parent_session_id
             if notify_target and queue_mgr:
                 msg = (
-                    f"[sm context] Compaction fired for {session.friendly_name or session_id}. "
+                    f"[sm context] Compaction fired for {_effective_session_name(session)}. "
                     "Context was compacted — agent is still running."
                 )
                 queue_mgr.queue_message(
@@ -3642,7 +3684,7 @@ Provide ONLY the summary, no preamble or questions."""
             if queue_mgr:
                 queue_mgr.reset_remind(session_id)
             logger.info(
-                f"Compaction complete for {session.friendly_name or session_id}, remind timer reset"
+                f"Compaction complete for {_effective_session_name(session)}, remind timer reset"
             )
             return {"status": "compaction_complete_logged"}
 
@@ -3691,7 +3733,7 @@ Provide ONLY the summary, no preamble or questions."""
                             "Compaction is imminent."
                         )
                     else:
-                        child_label = session.friendly_name or session.id
+                        child_label = _effective_session_name(session)
                         msg = (
                             f"[sm context] Child {child_label} ({session.id}) context at {used_pct}% — critically high. "
                             "Compaction is imminent."
@@ -3715,7 +3757,7 @@ Provide ONLY the summary, no preamble or questions."""
                             "Consider writing a handoff doc and running `sm handoff <path>`."
                         )
                     else:
-                        child_label = session.friendly_name or session.id
+                        child_label = _effective_session_name(session)
                         msg = f"[sm context] Child {child_label} ({session.id}) context at {used_pct}%."
                     queue_mgr.queue_message(
                         target_session_id=session.context_monitor_notify,

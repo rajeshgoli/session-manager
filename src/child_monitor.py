@@ -32,6 +32,17 @@ class ChildMonitor:
         """Set reference to OutputMonitor for topic cleanup on completion."""
         self._output_monitor = output_monitor
 
+    def _get_display_name(self, session) -> Optional[str]:
+        """Return canonical display identity for a session when available."""
+        if session is None:
+            return None
+        getter = getattr(self.session_manager, "get_effective_session_name", None)
+        if callable(getter):
+            display_name = getter(session)
+            if isinstance(display_name, str) and display_name:
+                return display_name
+        return getattr(session, "friendly_name", None) or getattr(session, "name", None) or getattr(session, "id", None)
+
     async def start(self):
         """Start the monitoring service."""
         self._running = True
@@ -232,7 +243,7 @@ class ChildMonitor:
         if not child_session:
             return
 
-        child_name = child_session.friendly_name or child_session.name or child_session_id
+        child_name = self._get_display_name(child_session) or child_session_id
 
         # Format notification message
         notification = f"Child {child_name} ({child_session_id[:8]}) completed: {completion_message}"

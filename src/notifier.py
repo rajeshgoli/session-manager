@@ -50,6 +50,19 @@ class Notifier:
         self.default_channel = default_channel
         # Track last response message ID per session (for idle replies)
         self._last_response_msg: dict[str, tuple[int, int]] = {}  # session_id -> (chat_id, msg_id)
+        self.session_manager = None
+
+    def _get_display_name(self, session: Optional[Session]) -> Optional[str]:
+        """Return canonical display identity for a session when available."""
+        if session is None:
+            return None
+        session_manager = getattr(self, "session_manager", None)
+        getter = getattr(session_manager, "get_effective_session_name", None) if session_manager else None
+        if callable(getter):
+            display_name = getter(session)
+            if isinstance(display_name, str) and display_name:
+                return display_name
+        return session.friendly_name or session.name or session.id
 
     async def notify(
         self,
@@ -177,7 +190,7 @@ class Notifier:
 
         # Build session label: "friendly-name [id]" or just "[id]"
         session_id = event.session_id
-        friendly_name = session.friendly_name if session else None
+        friendly_name = self._get_display_name(session)
 
         # For response events, use markdown formatting
         if event.event_type == "response":
@@ -238,7 +251,7 @@ class Notifier:
         # Header
         session_label = ""
         if session:
-            name = session.friendly_name or session.id
+            name = self._get_display_name(session) or session.id
             session_label = f" [{name}]"
         lines.append(f"Review Complete{session_label}")
         lines.append("")

@@ -208,6 +208,17 @@ class MessageQueueManager:
         self._db_conn.commit()
         logger.info(f"Message queue database initialized at {self.db_path} (WAL mode enabled)")
 
+    def _get_display_name(self, session) -> Optional[str]:
+        """Return canonical display identity for a session when available."""
+        if session is None:
+            return None
+        getter = getattr(self.session_manager, "get_effective_session_name", None)
+        if callable(getter):
+            display_name = getter(session)
+            if isinstance(display_name, str) and display_name:
+                return display_name
+        return getattr(session, "friendly_name", None) or getattr(session, "name", None) or getattr(session, "id", None)
+
     def _execute(self, query: str, params=()) -> sqlite3.Cursor:
         """
         Execute a database query with thread-safety.
@@ -1266,10 +1277,7 @@ class MessageQueueManager:
         """
         # Get recipient name for the notification
         recipient_session = self.session_manager.get_session(recipient_session_id)
-        recipient_name = (
-            recipient_session.friendly_name or recipient_session.name or recipient_session_id
-            if recipient_session else recipient_session_id
-        )
+        recipient_name = self._get_display_name(recipient_session) or recipient_session_id
 
         # Build notification with last output if available
         if last_output:
@@ -1858,7 +1866,7 @@ class MessageQueueManager:
         no_progress = False
 
         if child_session:
-            child_name = child_session.friendly_name or child_session.name or child_session_id
+            child_name = self._get_display_name(child_session) or child_session_id
 
             # Status text and age
             if child_session.agent_status_text:
@@ -2335,7 +2343,7 @@ class MessageQueueManager:
                     target_session = self.session_manager.get_session(target_session_id)
                     target_name = "unknown"
                     if target_session:
-                        target_name = target_session.friendly_name or target_session.name or target_session_id
+                        target_name = self._get_display_name(target_session) or target_session_id
 
                     if provider == "codex-fork" and codex_fork_state in ("shutdown", "error"):
                         notification = (
@@ -2368,7 +2376,7 @@ class MessageQueueManager:
             target_session = self.session_manager.get_session(target_session_id)
             target_name = "unknown"
             if target_session:
-                target_name = target_session.friendly_name or target_session.name or target_session_id
+                target_name = self._get_display_name(target_session) or target_session_id
 
             notification = (
                 f"[sm wait] Timeout: {target_name} still active after {timeout_seconds}s"
