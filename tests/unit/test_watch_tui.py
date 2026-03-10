@@ -8,6 +8,7 @@ from src.cli.watch_tui import (
     DetailFetchWorker,
     DetailSnapshot,
     _compute_column_widths,
+    _render_columns,
     _session_line,
     build_watch_rows,
     can_attach_session,
@@ -264,6 +265,13 @@ def test_session_line_truncates_deterministically():
     rendered = _session_line(session_row, widths)
     assert len(rendered) >= 20
     assert "..." in rendered
+
+
+def test_render_columns_uses_full_visible_width_except_reserved_footer_cell():
+    assert _render_columns(80, 0) == 80
+    assert _render_columns(80, 2) == 78
+    assert _render_columns(80, 4) == 76
+    assert _render_columns(80, 0, reserve_last_cell=True) == 79
 
 
 def test_tab_expansion_renders_details_for_selected_session():

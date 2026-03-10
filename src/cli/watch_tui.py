@@ -818,6 +818,14 @@ def _flash_attr(flash_message: str, palette: dict[str, int]) -> int:
     return palette["flash_success"] | curses.A_BOLD
 
 
+def _render_columns(total_width: int, start_col: int, reserve_last_cell: bool = False) -> int:
+    """Return the number of visible columns available from start_col."""
+    usable = total_width - start_col
+    if reserve_last_cell:
+        usable -= 1
+    return max(0, usable)
+
+
 def _render(
     stdscr,
     rows: list[WatchRow],
@@ -835,11 +843,11 @@ def _render(
     title = f"sm watch  {total_sessions} agents - {repo_count} repos"
     if filter_text:
         title += f" - filter: {filter_text}"
-    stdscr.addnstr(0, 0, title, max(0, width - 1), curses.A_BOLD | palette["header"])
+    stdscr.addnstr(0, 0, title, _render_columns(width, 0), curses.A_BOLD | palette["header"])
 
-    content_width = max(1, width - 2)
+    content_width = max(1, _render_columns(width, 2))
     widths = _compute_column_widths(content_width)
-    stdscr.addnstr(1, 2, _header_line(widths), max(0, width - 3), curses.A_BOLD | palette["header"])
+    stdscr.addnstr(1, 2, _header_line(widths), _render_columns(width, 2), curses.A_BOLD | palette["header"])
 
     max_rows = max(0, height - _RESERVED_SCREEN_ROWS)
     display_rows = rows[scroll_offset: scroll_offset + max_rows]
@@ -856,15 +864,15 @@ def _render(
             attr = base_attr
             if is_selected:
                 attr = base_attr | curses.A_REVERSE | curses.A_BOLD
-            stdscr.addnstr(y, 0, f"{marker} {_session_line(row, widths)}", max(0, width - 1), attr)
+            stdscr.addnstr(y, 0, f"{marker} {_session_line(row, widths)}", _render_columns(width, 0), attr)
         elif row.kind == "repo":
-            stdscr.addnstr(y, 2, row.text, max(0, width - 3), curses.A_BOLD | palette["repo"])
+            stdscr.addnstr(y, 2, row.text, _render_columns(width, 2), curses.A_BOLD | palette["repo"])
         elif row.kind == "repo_ref":
-            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_BOLD)
+            stdscr.addnstr(y, 4, row.text, _render_columns(width, 4), curses.A_BOLD)
         elif row.kind == "status":
-            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_NORMAL)
+            stdscr.addnstr(y, 4, row.text, _render_columns(width, 4), curses.A_NORMAL)
         else:
-            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_NORMAL)
+            stdscr.addnstr(y, 4, row.text, _render_columns(width, 4), curses.A_NORMAL)
 
         y += 1
 
@@ -873,12 +881,12 @@ def _render(
             height - 2,
             0,
             flash_message,
-            max(0, width - 1),
+            _render_columns(width, 0),
             _flash_attr(flash_message, palette),
         )
 
     footer = "j/k: move  Enter: attach  s: send  K: kill  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
-    stdscr.addnstr(height - 1, 0, footer, max(0, width - 1))
+    stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
     stdscr.refresh()
 
 
