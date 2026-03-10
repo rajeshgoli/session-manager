@@ -39,7 +39,7 @@ _COLUMN_SEP = "  "
 class WatchRow:
     """A render row in sm watch."""
 
-    kind: str  # repo, session, status, detail
+    kind: str  # repo, session, status, detail, repo_ref
     text: str = ""
     session_id: Optional[str] = None
     activity_state: str = "idle"
@@ -487,113 +487,168 @@ def build_watch_rows(
     """Build grouped rows and selectable session IDs."""
     rows: list[WatchRow] = []
     selectable: list[str] = []
-    groups: dict[str, list[dict]] = {}
     expanded = expanded_session_ids or set()
     sessions_by_id = {session["id"]: session for session in sessions if session.get("id")}
+    groups: dict[str, list[dict]] = {}
+    roots_by_repo: dict[str, list[dict]] = {}
+    same_repo_children: dict[str, list[dict]] = {}
+    cross_repo_children: dict[str, dict[str, list[dict]]] = {}
 
     for session in sessions:
         key = _repo_key(session.get("working_dir", ""))
         groups.setdefault(key, []).append(session)
+        parent_id = session.get("parent_session_id")
+        if not parent_id:
+            roots_by_repo.setdefault(key, []).append(session)
+            continue
+
+        parent = sessions_by_id.get(parent_id)
+        if parent is None:
+            roots_by_repo.setdefault(key, []).append(session)
+            continue
+
+        parent_repo_key = _repo_key(parent.get("working_dir", ""))
+        if parent_repo_key == key:
+            same_repo_children.setdefault(parent_id, []).append(session)
+            continue
+
+        cross_repo_children.setdefault(parent_id, {}).setdefault(key, []).append(session)
+
+    sort_key = lambda s: (_session_name(s).lower(), s.get("id", ""))
+    for root_list in roots_by_repo.values():
+        root_list.sort(key=sort_key)
+    for child_list in same_repo_children.values():
+        child_list.sort(key=sort_key)
+    for repo_map in cross_repo_children.values():
+        for child_list in repo_map.values():
+            child_list.sort(key=sort_key)
+
+    def _tree_prefix(ancestors_last: list[bool], is_last: bool) -> str:
+        connector = "`-" if is_last else "|-"
+        prefix_parts = []
+        for ancestor_is_last in ancestors_last:
+            prefix_parts.append("   " if ancestor_is_last else "|  ")
+        return "".join(prefix_parts) + connector
+
+    def _status_prefix(ancestors_last: list[bool]) -> str:
+        prefix_parts = []
+        for ancestor_is_last in ancestors_last:
+            prefix_parts.append("   " if ancestor_is_last else "|  ")
+        return "".join(prefix_parts) + "  "
+
+    def render_session(session: dict, ancestors_last: list[bool], is_last: bool):
+        tree_prefix = _tree_prefix(ancestors_last, is_last)
+        status_prefix = _status_prefix(ancestors_last)
+
+        role = session.get("role") or "-"
+        provider = session.get("provider", "claude")
+        activity_state = session.get("activity_state", "idle")
+        status = session.get("status") or "-"
+
+        columns = {
+            "Session": f"{tree_prefix}{_session_name(session)} [{session.get('id', '')}]",
+            "Parent": _parent_label(session, sessions_by_id),
+            "Role": role,
+            "Provider": provider,
+            "Activity": _state_label(activity_state, spinner_index),
+            "Status": status,
+            "Last": _last_column(session, codex_projection_enabled),
+            "Age": _format_age(session.get("last_activity"), activity_state),
+        }
+
+        session_id = session.get("id")
+        rows.append(
+            WatchRow(
+                kind="session",
+                session_id=session_id,
+                activity_state=activity_state,
+                columns=columns,
+            )
+        )
+        if session_id:
+            selectable.append(session_id)
+
+        status_line = _status_line(session)
+        if status_line:
+            rows.append(
+                WatchRow(
+                    kind="status",
+                    text=f"{status_prefix}{status_line}",
+                    session_id=session_id,
+                )
+            )
+
+        task_line = _task_completion_line(session)
+        if task_line:
+            rows.append(
+                WatchRow(
+                    kind="status",
+                    text=f"{status_prefix}{task_line}",
+                    session_id=session_id,
+                )
+            )
+
+        for adoption_line in _pending_adoption_lines(session):
+            rows.append(
+                WatchRow(
+                    kind="status",
+                    text=f"{status_prefix}{adoption_line}",
+                    session_id=session_id,
+                )
+            )
+
+        if session_id and session_id in expanded:
+            detail = detail_cache.get(session_id) if detail_cache else None
+            for line in _detail_lines(session, detail, codex_projection_enabled):
+                rows.append(WatchRow(kind="detail", text=line, session_id=session_id))
+
+        child_entries: list[tuple[str, object, str]] = []
+        for child in same_repo_children.get(session.get("id", ""), []):
+            child_entries.append(("session", child, _session_name(child).lower()))
+        for child_repo_key in sorted(cross_repo_children.get(session.get("id", ""), {}).keys()):
+            child_entries.append(("repo", child_repo_key, _repo_label(child_repo_key).lower()))
+        child_entries.sort(key=lambda item: (item[2], item[0]))
+
+        for idx, (entry_kind, entry_payload, _) in enumerate(child_entries):
+            entry_is_last = idx == len(child_entries) - 1
+            if entry_kind == "session":
+                render_session(entry_payload, ancestors_last + [is_last], entry_is_last)
+            else:
+                render_cross_repo_group(
+                    parent_session_id=session.get("id", ""),
+                    repo_key=entry_payload,
+                    ancestors_last=ancestors_last + [is_last],
+                    is_last=entry_is_last,
+                )
+
+    def render_cross_repo_group(
+        parent_session_id: str,
+        repo_key: str,
+        ancestors_last: list[bool],
+        is_last: bool,
+    ):
+        tree_prefix = _tree_prefix(ancestors_last, is_last)
+        repo_label = _repo_label(repo_key) if repo_key != "unknown" else "unknown/"
+        if repo_key not in ("unknown",):
+            repo_label = f"{repo_label} ({repo_key})"
+        rows.append(WatchRow(kind="repo_ref", text=f"{tree_prefix}{repo_label}"))
+
+        remote_children = cross_repo_children.get(parent_session_id, {}).get(repo_key, [])
+        for idx, child in enumerate(remote_children):
+            render_session(child, ancestors_last + [is_last], idx == len(remote_children) - 1)
 
     for repo_key in sorted(groups.keys()):
-        group_sessions = groups[repo_key]
+        top_level_roots = roots_by_repo.get(repo_key, [])
+        if not top_level_roots:
+            continue
+
         repo_header = _repo_label(repo_key) if repo_key != "unknown" else "unknown/"
         if repo_key not in ("unknown",):
             repo_header = f"{repo_header} ({repo_key})"
         rows.append(WatchRow(kind="repo", text=repo_header))
 
-        by_id = {s["id"]: s for s in group_sessions if s.get("id")}
-        children: dict[str, list[dict]] = {}
-        roots: list[dict] = []
-
-        for session in group_sessions:
-            parent_id = session.get("parent_session_id")
-            if parent_id and parent_id in by_id:
-                children.setdefault(parent_id, []).append(session)
-            else:
-                roots.append(session)
-
-        sort_key = lambda s: (_session_name(s).lower(), s.get("id", ""))
-        roots.sort(key=sort_key)
-        for kid_list in children.values():
-            kid_list.sort(key=sort_key)
-
-        def walk(session: dict, ancestors_last: list[bool], is_last: bool):
-            connector = "`-" if is_last else "|-"
-            prefix_parts = []
-            for ancestor_is_last in ancestors_last:
-                prefix_parts.append("   " if ancestor_is_last else "|  ")
-            tree_prefix = "".join(prefix_parts) + connector
-            status_prefix = "".join(prefix_parts) + "  "
-
-            role = session.get("role") or "-"
-            provider = session.get("provider", "claude")
-            activity_state = session.get("activity_state", "idle")
-            status = session.get("status") or "-"
-
-            columns = {
-                "Session": f"{tree_prefix}{_session_name(session)} [{session.get('id', '')}]",
-                "Parent": _parent_label(session, sessions_by_id),
-                "Role": role,
-                "Provider": provider,
-                "Activity": _state_label(activity_state, spinner_index),
-                "Status": status,
-                "Last": _last_column(session, codex_projection_enabled),
-                "Age": _format_age(session.get("last_activity"), activity_state),
-            }
-
-            session_id = session.get("id")
-            rows.append(
-                WatchRow(
-                    kind="session",
-                    session_id=session_id,
-                    activity_state=activity_state,
-                    columns=columns,
-                )
-            )
-            if session_id:
-                selectable.append(session_id)
-
-            status_line = _status_line(session)
-            if status_line:
-                rows.append(
-                    WatchRow(
-                        kind="status",
-                        text=f"{status_prefix}{status_line}",
-                        session_id=session_id,
-                    )
-                )
-
-            task_line = _task_completion_line(session)
-            if task_line:
-                rows.append(
-                    WatchRow(
-                        kind="status",
-                        text=f"{status_prefix}{task_line}",
-                        session_id=session_id,
-                    )
-                )
-
-            for adoption_line in _pending_adoption_lines(session):
-                rows.append(
-                    WatchRow(
-                        kind="status",
-                        text=f"{status_prefix}{adoption_line}",
-                        session_id=session_id,
-                    )
-                )
-
-            if session_id and session_id in expanded:
-                detail = detail_cache.get(session_id) if detail_cache else None
-                for line in _detail_lines(session, detail, codex_projection_enabled):
-                    rows.append(WatchRow(kind="detail", text=line, session_id=session_id))
-
-            kid_sessions = children.get(session.get("id", ""), [])
-            for idx, child in enumerate(kid_sessions):
-                walk(child, ancestors_last + [is_last], idx == len(kid_sessions) - 1)
-
-        for idx, root in enumerate(roots):
-            walk(root, [], idx == len(roots) - 1)
+        for idx, root in enumerate(top_level_roots):
+            render_session(root, [], idx == len(top_level_roots) - 1)
 
     return rows, selectable, len(groups)
 
@@ -804,6 +859,8 @@ def _render(
             stdscr.addnstr(y, 0, f"{marker} {_session_line(row, widths)}", max(0, width - 1), attr)
         elif row.kind == "repo":
             stdscr.addnstr(y, 2, row.text, max(0, width - 3), curses.A_BOLD | palette["repo"])
+        elif row.kind == "repo_ref":
+            stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_BOLD)
         elif row.kind == "status":
             stdscr.addnstr(y, 4, row.text, max(0, width - 5), curses.A_NORMAL)
         else:

@@ -133,6 +133,33 @@ def test_parent_column_survives_cross_repo_grouping():
     assert child_row.columns["Parent"] == "em-parent [p1]"
 
 
+def test_cross_repo_child_renders_as_nested_repo_subtree():
+    rows, selectable, repo_count = build_watch_rows(
+        [
+            _session("p1", "em-parent", "/tmp/repo-a"),
+            _session("c1", "child", "/tmp/repo-b", parent_session_id="p1"),
+        ]
+    )
+
+    repo_rows = [row for row in rows if row.kind == "repo"]
+    nested_repo_rows = [row for row in rows if row.kind == "repo_ref"]
+    session_rows = [row for row in rows if row.kind == "session"]
+
+    assert repo_count == 2
+    assert len(repo_rows) == 1
+    assert repo_rows[0].text.startswith("repo-a/")
+    assert len(nested_repo_rows) == 1
+    assert "repo-b/" in nested_repo_rows[0].text
+    assert nested_repo_rows[0].text.startswith("   `-")
+
+    parent_idx = next(i for i, row in enumerate(rows) if row.kind == "session" and row.session_id == "p1")
+    nested_repo_idx = next(i for i, row in enumerate(rows) if row.kind == "repo_ref")
+    child_idx = next(i for i, row in enumerate(rows) if row.kind == "session" and row.session_id == "c1")
+    assert parent_idx < nested_repo_idx < child_idx
+    assert selectable == ["p1", "c1"]
+    assert session_rows[1].columns["Session"].startswith("      `-child [c1]")
+
+
 def test_status_row_shows_text_and_age():
     rows, _, _ = build_watch_rows(
         [
