@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from src.cli.commands import cmd_spawn, _register_em_monitoring
+from src.cli.commands import cmd_spawn, _register_em_monitoring, _EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS
 from src.cli.dispatch import DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD
 from src.message_queue import MessageQueueManager
 from src.models import Session, SessionStatus
@@ -115,6 +115,7 @@ class TestEmSpawnAutoRegister:
             "child001",
             sender_session_id="em0000aa",
             requester_session_id="em0000aa",
+            delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
         )
 
     def test_em_parent_calls_get_session_to_check_is_em(self):
@@ -388,6 +389,7 @@ class TestRegisterEmMonitoring:
             "childXXX",
             sender_session_id="emYYY",
             requester_session_id="emYYY",
+            delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
         )
 
 
@@ -492,7 +494,7 @@ class TestArmStopNotifyEndpoint:
         tc, mock_sm = app_client
         response = tc.post(
             "/sessions/child001/notify-on-stop",
-            json={"sender_session_id": "em001", "requester_session_id": "em001"},
+            json={"sender_session_id": "em001", "requester_session_id": "em001", "delay_seconds": 8},
         )
         assert response.status_code == 200
         data = response.json()
@@ -573,10 +575,11 @@ class TestArmStopNotifyEndpoint:
 
         tc.post(
             "/sessions/child001/notify-on-stop",
-            json={"sender_session_id": "em001", "requester_session_id": "em001"},
+            json={"sender_session_id": "em001", "requester_session_id": "em001", "delay_seconds": 8},
         )
         mock_sm.message_queue_manager.arm_stop_notify.assert_called_once()
         call_kwargs = mock_sm.message_queue_manager.arm_stop_notify.call_args
         assert call_kwargs.kwargs["session_id"] == "child001"
         assert call_kwargs.kwargs["sender_session_id"] == "em001"
         assert call_kwargs.kwargs["sender_name"] == "em"  # friendly_name takes precedence
+        assert call_kwargs.kwargs["delay_seconds"] == 8

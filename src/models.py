@@ -693,6 +693,7 @@ class SessionDeliveryState:
     pending_handoff_path: Optional[str] = None  # File path for pending handoff (#196)
     paste_buffered_notify_sender_id: Optional[str] = None  # Staged stop-notify for mid-turn paste; promoted on first idle (sm#244)
     paste_buffered_notify_sender_name: Optional[str] = None  # Sender name for the above (sm#244)
+    stop_notify_delay_seconds: float = 0.0  # Delay spawn-armed stop notify so real dispatch can supersede it (#379)
 
 
 @dataclass

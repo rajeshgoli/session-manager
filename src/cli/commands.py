@@ -1540,6 +1540,9 @@ def cmd_spawn(
     return 0
 
 
+_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS = 8
+
+
 def _register_em_monitoring(
     client: SessionManagerClient,
     child_id: str,
@@ -1576,6 +1579,7 @@ def _register_em_monitoring(
         child_id,
         sender_session_id=em_session_id,
         requester_session_id=em_session_id,
+        delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
     )
     if not ns_ok:
         print(f"  Warning: Failed to arm stop notification for {child_id}", file=sys.stderr)

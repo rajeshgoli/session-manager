@@ -114,6 +114,7 @@ class MessageQueueManager:
         # Key: (recipient_session_id, sender_session_id) — (target, watcher)
         # Value: datetime when stop notification was sent
         self._recent_stop_notifications: Dict[Tuple[str, str], datetime] = {}
+        self._pending_stop_notify_tasks: Dict[str, asyncio.Task] = {}
 
         # Notification callback (set by main app)
         self._notify_callback: Optional[Callable] = None
@@ -855,6 +856,9 @@ class MessageQueueManager:
         for task in self._job_watch_tasks.values():
             task.cancel()
         self._job_watch_tasks.clear()
+        for task in self._pending_stop_notify_tasks.values():
+            task.cancel()
+        self._pending_stop_notify_tasks.clear()
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
@@ -958,33 +962,34 @@ class MessageQueueManager:
 
         # Suppress redundant stop notification if agent recently sm-sent to the
         # same target that would receive the notification (#182)
-        SUPPRESSION_WINDOW_SECONDS = 30
-        if state.stop_notify_sender_id and state.last_outgoing_sm_send_target:
-            if (state.stop_notify_sender_id == state.last_outgoing_sm_send_target
-                    and state.last_outgoing_sm_send_at
-                    and (datetime.now() - state.last_outgoing_sm_send_at).total_seconds()
-                        < SUPPRESSION_WINDOW_SECONDS):
-                logger.info(
-                    f"Suppressing stop notification for {session_id}: "
-                    f"agent sm-sent to {state.stop_notify_sender_id} "
-                    f"{(datetime.now() - state.last_outgoing_sm_send_at).total_seconds():.1f}s ago (#182)"
-                )
-                state.stop_notify_sender_id = None
-                state.stop_notify_sender_name = None
-                state.last_outgoing_sm_send_target = None
-                state.last_outgoing_sm_send_at = None
+        if self._suppress_recent_outgoing_stop_notify(session_id, state):
+            state.stop_notify_sender_id = None
+            state.stop_notify_sender_name = None
+            state.stop_notify_delay_seconds = 0
+            state.last_outgoing_sm_send_target = None
+            state.last_outgoing_sm_send_at = None
 
         # Send stop notification if a sender is waiting
         if state.stop_notify_sender_id:
-            asyncio.create_task(self._send_stop_notification(
-                recipient_session_id=session_id,
-                sender_session_id=state.stop_notify_sender_id,
-                sender_name=state.stop_notify_sender_name,
-                last_output=last_output,
-            ))
-            # Clear after sending
-            state.stop_notify_sender_id = None
-            state.stop_notify_sender_name = None
+            if state.stop_notify_delay_seconds > 0:
+                self._schedule_delayed_stop_notification(
+                    session_id=session_id,
+                    sender_session_id=state.stop_notify_sender_id,
+                    sender_name=state.stop_notify_sender_name,
+                    last_output=last_output,
+                    delay_seconds=state.stop_notify_delay_seconds,
+                )
+            else:
+                asyncio.create_task(self._send_stop_notification(
+                    recipient_session_id=session_id,
+                    sender_session_id=state.stop_notify_sender_id,
+                    sender_name=state.stop_notify_sender_name,
+                    last_output=last_output,
+                ))
+                # Clear after scheduling
+                state.stop_notify_sender_id = None
+                state.stop_notify_sender_name = None
+                state.stop_notify_delay_seconds = 0
 
         # Promote paste-buffered stop notification (sm#244).
         # If a message was pasted mid-turn (is_idle=False at paste time), the sender was
@@ -994,6 +999,7 @@ class MessageQueueManager:
         if state.paste_buffered_notify_sender_id:
             state.stop_notify_sender_id = state.paste_buffered_notify_sender_id
             state.stop_notify_sender_name = state.paste_buffered_notify_sender_name
+            state.stop_notify_delay_seconds = 0
             state.paste_buffered_notify_sender_id = None
             state.paste_buffered_notify_sender_name = None
             logger.debug(
@@ -1008,6 +1014,11 @@ class MessageQueueManager:
         """Mark a session as active (not idle)."""
         state = self._get_or_create_state(session_id)
         state.is_idle = False
+        self._cancel_pending_stop_notification(session_id)
+        if state.stop_notify_delay_seconds > 0:
+            state.stop_notify_sender_id = None
+            state.stop_notify_sender_name = None
+            state.stop_notify_delay_seconds = 0
         # Sync session.status with in-memory state to prevent Phase 3 false positives (#191).
         # session.status stays IDLE after Stop hook; mark_session_active must clear it so
         # _watch_for_idle Phase 3 doesn't fire false idle immediately after urgent dispatch.
@@ -1574,6 +1585,11 @@ class MessageQueueManager:
             if success:
                 # Mark session as active
                 state.is_idle = False
+                if state.stop_notify_delay_seconds > 0:
+                    self._cancel_pending_stop_notification(session_id)
+                    state.stop_notify_sender_id = None
+                    state.stop_notify_sender_name = None
+                    state.stop_notify_delay_seconds = 0
 
                 # Mark messages as delivered
                 for msg in batch:
@@ -1602,9 +1618,11 @@ class MessageQueueManager:
                     # If pasted when idle (was_idle=True), arm stop_notify_sender_id directly:
                     # the agent consumes the paste immediately, so the next Stop hook IS Task Y.
                     if msg.notify_on_stop and msg.sender_session_id:
+                        self._cancel_pending_stop_notification(session_id)
                         if was_idle:
                             state.stop_notify_sender_id = msg.sender_session_id
                             state.stop_notify_sender_name = msg.sender_name
+                            state.stop_notify_delay_seconds = 0
                         else:
                             state.paste_buffered_notify_sender_id = msg.sender_session_id
                             state.paste_buffered_notify_sender_name = msg.sender_name
@@ -1648,6 +1666,11 @@ class MessageQueueManager:
                     self._mark_delivered(msg.id)
                     state = self._get_or_create_state(session_id)
                     state.is_idle = False
+                    if state.stop_notify_delay_seconds > 0:
+                        self._cancel_pending_stop_notification(session_id)
+                        state.stop_notify_sender_id = None
+                        state.stop_notify_sender_name = None
+                        state.stop_notify_delay_seconds = 0
                     logger.info(f"Urgent message {msg.id} delivered to {session_id} (codex-app)")
 
                     # Handle notifications
@@ -1656,8 +1679,10 @@ class MessageQueueManager:
 
                     # Track sender for stop notification
                     if msg.notify_on_stop and msg.sender_session_id:
+                        self._cancel_pending_stop_notification(session_id)
                         state.stop_notify_sender_id = msg.sender_session_id
                         state.stop_notify_sender_name = msg.sender_name
+                        state.stop_notify_delay_seconds = 0
 
                     # Start periodic remind if requested (#188)
                     if msg.remind_soft_threshold is not None:
@@ -1713,6 +1738,11 @@ class MessageQueueManager:
                     self._mark_delivered(msg.id)
                     state = self._get_or_create_state(session_id)
                     state.is_idle = False
+                    if state.stop_notify_delay_seconds > 0:
+                        self._cancel_pending_stop_notification(session_id)
+                        state.stop_notify_sender_id = None
+                        state.stop_notify_sender_name = None
+                        state.stop_notify_delay_seconds = 0
                     logger.info(f"Urgent message {msg.id} delivered to {session_id}")
 
                     # Handle notifications
@@ -1721,8 +1751,10 @@ class MessageQueueManager:
 
                     # Track sender for stop notification
                     if msg.notify_on_stop and msg.sender_session_id:
+                        self._cancel_pending_stop_notification(session_id)
                         state.stop_notify_sender_id = msg.sender_session_id
                         state.stop_notify_sender_name = msg.sender_name
+                        state.stop_notify_delay_seconds = 0
 
                     # Start periodic remind if requested (#188)
                     if msg.remind_soft_threshold is not None:
@@ -2046,6 +2078,7 @@ class MessageQueueManager:
         session_id: str,
         sender_session_id: str,
         sender_name: str = "",
+        delay_seconds: int = 0,
     ) -> None:
         """Directly arm stop notification for a session without a message delivery (sm#277).
 
@@ -2056,13 +2089,107 @@ class MessageQueueManager:
             session_id: Session to arm stop notification for
             sender_session_id: Session to notify when session_id stops
             sender_name: Optional friendly name of sender session
+            delay_seconds: Optional delay before the first stop notification fires
         """
         state = self._get_or_create_state(session_id)
+        self._cancel_pending_stop_notification(session_id)
         state.stop_notify_sender_id = sender_session_id
         state.stop_notify_sender_name = sender_name
+        state.stop_notify_delay_seconds = max(0.0, float(delay_seconds))
         logger.info(
-            f"Stop notify armed for {session_id}: will notify {sender_session_id} on stop (sm#277)"
+            f"Stop notify armed for {session_id}: will notify {sender_session_id} on stop "
+            f"(delay={state.stop_notify_delay_seconds}s, sm#277/sm#379)"
         )
+
+    def _cancel_pending_stop_notification(self, session_id: str) -> None:
+        """Cancel any delayed stop notification task for a session."""
+        task = self._pending_stop_notify_tasks.pop(session_id, None)
+        if task:
+            task.cancel()
+
+    def _schedule_delayed_stop_notification(
+        self,
+        session_id: str,
+        sender_session_id: str,
+        sender_name: Optional[str],
+        last_output: Optional[str],
+        delay_seconds: float,
+    ) -> None:
+        """Delay a stop notification so a follow-up dispatch can supersede it (#379)."""
+        self._cancel_pending_stop_notification(session_id)
+        task = asyncio.create_task(
+            self._run_delayed_stop_notification(
+                session_id=session_id,
+                sender_session_id=sender_session_id,
+                sender_name=sender_name,
+                last_output=last_output,
+                delay_seconds=delay_seconds,
+            )
+        )
+        self._pending_stop_notify_tasks[session_id] = task
+
+    async def _run_delayed_stop_notification(
+        self,
+        session_id: str,
+        sender_session_id: str,
+        sender_name: Optional[str],
+        last_output: Optional[str],
+        delay_seconds: float,
+    ) -> None:
+        """Send a delayed stop notification if the original arm is still current."""
+        try:
+            await asyncio.sleep(delay_seconds)
+            state = self.delivery_states.get(session_id)
+            if not state:
+                return
+            if not state.is_idle:
+                return
+            if state.stop_notify_sender_id != sender_session_id:
+                return
+            if state.stop_notify_delay_seconds != delay_seconds:
+                return
+            if self._suppress_recent_outgoing_stop_notify(session_id, state):
+                state.stop_notify_sender_id = None
+                state.stop_notify_sender_name = None
+                state.stop_notify_delay_seconds = 0
+                state.last_outgoing_sm_send_target = None
+                state.last_outgoing_sm_send_at = None
+                return
+
+            await self._send_stop_notification(
+                recipient_session_id=session_id,
+                sender_session_id=sender_session_id,
+                sender_name=sender_name,
+                last_output=last_output,
+            )
+            if state.stop_notify_sender_id == sender_session_id:
+                state.stop_notify_sender_id = None
+                state.stop_notify_sender_name = None
+                state.stop_notify_delay_seconds = 0
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current = self._pending_stop_notify_tasks.get(session_id)
+            if current is asyncio.current_task():
+                self._pending_stop_notify_tasks.pop(session_id, None)
+
+    def _suppress_recent_outgoing_stop_notify(self, session_id: str, state: SessionDeliveryState) -> bool:
+        """Return True when a recent outgoing sm send makes stop notify redundant (#182)."""
+        suppression_window_seconds = 30
+        if not state.stop_notify_sender_id or not state.last_outgoing_sm_send_target:
+            return False
+        if state.stop_notify_sender_id != state.last_outgoing_sm_send_target:
+            return False
+        if not state.last_outgoing_sm_send_at:
+            return False
+        age_seconds = (datetime.now() - state.last_outgoing_sm_send_at).total_seconds()
+        if age_seconds >= suppression_window_seconds:
+            return False
+        logger.info(
+            f"Suppressing stop notification for {session_id}: "
+            f"agent sm-sent to {state.stop_notify_sender_id} {age_seconds:.1f}s ago (#182)"
+        )
+        return True
 
     def cancel_remind(self, target_session_id: str):
         """
@@ -2654,8 +2781,10 @@ class MessageQueueManager:
                 state = self._get_or_create_state(session_id)
                 state.stop_notify_skip_count += 1
                 state.skip_count_armed_at = datetime.now()  # sm#232
+                self._cancel_pending_stop_notification(session_id)
                 state.stop_notify_sender_id = None
                 state.stop_notify_sender_name = None
+                state.stop_notify_delay_seconds = 0
                 state.last_outgoing_sm_send_target = None
                 state.last_outgoing_sm_send_at = None
                 # Also clear server-side caches: stale last_claude_output or

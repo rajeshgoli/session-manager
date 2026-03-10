@@ -108,6 +108,29 @@ def test_main_columns_include_provider_status_and_last():
     assert session_row.columns["Provider"] == "claude"
     assert session_row.columns["Status"] == "running"
     assert "Read" in session_row.columns["Last"]
+    assert session_row.columns["Parent"] == "-"
+
+
+def test_parent_column_shows_parent_name_and_id():
+    rows, _, _ = build_watch_rows(
+        [
+            _session("p1", "em-parent", "/tmp/repo"),
+            _session("c1", "child", "/tmp/repo", parent_session_id="p1"),
+        ]
+    )
+    child_row = next(row for row in rows if row.kind == "session" and row.session_id == "c1")
+    assert child_row.columns["Parent"] == "em-parent [p1]"
+
+
+def test_parent_column_survives_cross_repo_grouping():
+    rows, _, _ = build_watch_rows(
+        [
+            _session("p1", "em-parent", "/tmp/repo-a"),
+            _session("c1", "child", "/tmp/repo-b", parent_session_id="p1"),
+        ]
+    )
+    child_row = next(row for row in rows if row.kind == "session" and row.session_id == "c1")
+    assert child_row.columns["Parent"] == "em-parent [p1]"
 
 
 def test_status_row_shows_text_and_age():

@@ -1183,6 +1183,7 @@ class SessionManagerClient:
         session_id: str,
         sender_session_id: str,
         requester_session_id: str,
+        delay_seconds: int = 0,
     ) -> tuple[bool, bool]:
         """Arm stop notification for a session without a queued message (sm#277).
 
@@ -1195,6 +1196,7 @@ class SessionManagerClient:
             {
                 "sender_session_id": sender_session_id,
                 "requester_session_id": requester_session_id,
+                "delay_seconds": delay_seconds,
             },
         )
         return success, unavailable

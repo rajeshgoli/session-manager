@@ -1849,9 +1849,17 @@ class SessionManager:
         normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
         return re.sub(r"-{2,}", "-", normalized)
 
+    def _get_agent_registration_map(self) -> dict[str, AgentRegistration]:
+        """Return the registry map, tolerating partially constructed test instances."""
+        registrations = getattr(self, "agent_registrations", None)
+        if registrations is None:
+            registrations = {}
+            self.agent_registrations = registrations
+        return registrations
+
     def _synchronize_maintainer_alias(self) -> None:
         """Keep the legacy maintainer compatibility field in sync with the registry."""
-        registration = self.agent_registrations.get("maintainer")
+        registration = self._get_agent_registration_map().get("maintainer")
         self.maintainer_session_id = registration.session_id if registration else None
 
     def _get_live_registered_session(self, session_id: str) -> Optional[Session]:
@@ -1863,11 +1871,12 @@ class SessionManager:
 
     def _prune_agent_registrations(self, persist: bool = True) -> bool:
         """Drop registrations whose owning sessions no longer exist or are no longer live."""
+        registration_map = self._get_agent_registration_map()
         removed = False
-        for role, registration in list(self.agent_registrations.items()):
+        for role, registration in list(registration_map.items()):
             if self._get_live_registered_session(registration.session_id):
                 continue
-            self.agent_registrations.pop(role, None)
+            registration_map.pop(role, None)
             removed = True
         if removed:
             self._synchronize_maintainer_alias()
@@ -1887,8 +1896,9 @@ class SessionManager:
         if session.status == SessionStatus.STOPPED:
             raise ValueError("Stopped sessions cannot register roles")
 
+        registration_map = self._get_agent_registration_map()
         self._prune_agent_registrations(persist=False)
-        existing = self.agent_registrations.get(normalized_role)
+        existing = registration_map.get(normalized_role)
         if existing and existing.session_id != session_id:
             live_owner = self._get_live_registered_session(existing.session_id)
             if live_owner:
@@ -1898,7 +1908,7 @@ class SessionManager:
 
         registration = existing or AgentRegistration(role=normalized_role, session_id=session_id)
         registration.session_id = session_id
-        self.agent_registrations[normalized_role] = registration
+        registration_map[normalized_role] = registration
         self._synchronize_maintainer_alias()
         self._save_state()
         return registration
@@ -1908,25 +1918,27 @@ class SessionManager:
         normalized_role = self.normalize_agent_role(role)
         if not normalized_role:
             return False
-        registration = self.agent_registrations.get(normalized_role)
+        registration_map = self._get_agent_registration_map()
+        registration = registration_map.get(normalized_role)
         if not registration or registration.session_id != session_id:
             return False
-        self.agent_registrations.pop(normalized_role, None)
+        registration_map.pop(normalized_role, None)
         self._synchronize_maintainer_alias()
         self._save_state()
         return True
 
     def unregister_session_roles(self, session_id: str, persist: bool = True) -> list[str]:
         """Remove all registry roles owned by one session."""
+        registration_map = self._get_agent_registration_map()
         removed_roles = [
             role
-            for role, registration in self.agent_registrations.items()
+            for role, registration in registration_map.items()
             if registration.session_id == session_id
         ]
         if not removed_roles:
             return []
         for role in removed_roles:
-            self.agent_registrations.pop(role, None)
+            registration_map.pop(role, None)
         self._synchronize_maintainer_alias()
         if persist:
             self._save_state()
@@ -1937,12 +1949,13 @@ class SessionManager:
         normalized_role = self.normalize_agent_role(role)
         if not normalized_role:
             return None
+        registration_map = self._get_agent_registration_map()
         self._prune_agent_registrations(persist=True)
-        registration = self.agent_registrations.get(normalized_role)
+        registration = registration_map.get(normalized_role)
         if not registration:
             return None
         if not self._get_live_registered_session(registration.session_id):
-            self.agent_registrations.pop(normalized_role, None)
+            registration_map.pop(normalized_role, None)
             self._synchronize_maintainer_alias()
             self._save_state()
             return None
@@ -1950,8 +1963,9 @@ class SessionManager:
 
     def list_agent_registrations(self) -> list[AgentRegistration]:
         """List all live registry roles."""
+        registration_map = self._get_agent_registration_map()
         self._prune_agent_registrations(persist=True)
-        registrations = list(self.agent_registrations.values())
+        registrations = list(registration_map.values())
         registrations.sort(key=lambda registration: registration.role)
         return registrations
 
@@ -2079,10 +2093,11 @@ class SessionManager:
 
     def get_session_aliases(self, session_id: str) -> list[str]:
         """Return durable aliases that should resolve to this session."""
+        registration_map = self._get_agent_registration_map()
         self._prune_agent_registrations(persist=True)
         aliases = [
             role
-            for role, registration in self.agent_registrations.items()
+            for role, registration in registration_map.items()
             if registration.session_id == session_id
         ]
         return sorted(aliases)
@@ -2116,8 +2131,9 @@ class SessionManager:
             return f'Session identity is controlled by registry role "{primary_alias}"'
 
         reserved_aliases = {"maintainer"}
+        registration_map = self._get_agent_registration_map()
         self._prune_agent_registrations(persist=True)
-        reserved_aliases.update(self.agent_registrations.keys())
+        reserved_aliases.update(registration_map.keys())
 
         if normalized_name in reserved_aliases and normalized_name != primary_alias:
             return f'Name "{friendly_name}" is reserved for registry identity "{normalized_name}"'

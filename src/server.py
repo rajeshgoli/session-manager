@@ -403,6 +403,7 @@ class ArmStopNotifyRequest(BaseModel):
     """Request to arm stop notification for a session without a queued message (sm#277)."""
     sender_session_id: str  # Session to notify when target stops
     requester_session_id: str  # Must be is_em=True (EM sessions only)
+    delay_seconds: int = 0  # Optional delay before the first stop notification fires
 
 
 def _invalidate_session_cache(app: FastAPI, session_id: str, arm_skip: bool = False) -> None:
@@ -1893,6 +1894,7 @@ def create_app(
             session_id=session_id,
             sender_session_id=request.sender_session_id,
             sender_name=sender_name,
+            delay_seconds=max(0, int(request.delay_seconds)),
         )
 
         return {"status": "ok", "session_id": session_id, "sender_session_id": request.sender_session_id}

@@ -23,6 +23,7 @@ _RESERVED_SCREEN_ROWS = 4
 # name, min_width, weight, align
 _COLUMN_SPECS = [
     ("Session", 22, 3, "left"),
+    ("Parent", 18, 2, "left"),
     ("Role", 8, 1, "left"),
     ("Provider", 10, 1, "left"),
     ("Activity", 11, 1, "left"),
@@ -228,6 +229,19 @@ class DetailFetchWorker:
 
 def _session_name(session: dict) -> str:
     return session.get("friendly_name") or session.get("name") or session.get("id", "unknown")
+
+
+def _parent_label(session: dict, sessions_by_id: dict[str, dict]) -> str:
+    parent_id = session.get("parent_session_id")
+    if not parent_id:
+        return "-"
+    parent = sessions_by_id.get(parent_id)
+    if not parent:
+        return parent_id
+    parent_name = _session_name(parent)
+    if parent_name == parent_id:
+        return parent_id
+    return f"{parent_name} [{parent_id}]"
 
 
 def _repo_label(working_dir: str) -> str:
@@ -475,6 +489,7 @@ def build_watch_rows(
     selectable: list[str] = []
     groups: dict[str, list[dict]] = {}
     expanded = expanded_session_ids or set()
+    sessions_by_id = {session["id"]: session for session in sessions if session.get("id")}
 
     for session in sessions:
         key = _repo_key(session.get("working_dir", ""))
@@ -518,6 +533,7 @@ def build_watch_rows(
 
             columns = {
                 "Session": f"{tree_prefix}{_session_name(session)} [{session.get('id', '')}]",
+                "Parent": _parent_label(session, sessions_by_id),
                 "Role": role,
                 "Provider": provider,
                 "Activity": _state_label(activity_state, spinner_index),
@@ -623,8 +639,8 @@ def _compute_column_widths(content_width: int) -> dict[str, int]:
         return widths
 
     deficit = min_total - content_width
-    shrink_order = ["Last", "Session", "Activity", "Role", "Provider", "Status", "Age"]
-    floor = {"Session": 8, "Last": 8, "Age": 3, "Role": 4, "Provider": 6, "Activity": 7, "Status": 5}
+    shrink_order = ["Last", "Session", "Parent", "Activity", "Role", "Provider", "Status", "Age"]
+    floor = {"Session": 8, "Parent": 8, "Last": 8, "Age": 3, "Role": 4, "Provider": 6, "Activity": 7, "Status": 5}
     while deficit > 0:
         changed = False
         for name in shrink_order:
