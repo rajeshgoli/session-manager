@@ -263,6 +263,44 @@ def test_codex_fork_waiting_transitions_and_cause_tracking():
     assert manager.get_activity_state(session.id) == "idle"
 
 
+def test_codex_fork_stream_error_does_not_stop_active_runtime():
+    manager = _make_manager()
+    session = Session(
+        id="cf-stream",
+        name="codex-fork-cf-stream",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnStarted",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "stream_error",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {"message": "Reconnecting... 1/5"},
+        },
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert manager.get_activity_state(session.id) == "working"
+    lifecycle = manager.get_codex_fork_lifecycle_state(session.id)
+    assert lifecycle is not None
+    assert lifecycle["state"] == "running"
+    assert lifecycle["cause_event_type"] == "stream_error"
+
+
 def test_codex_fork_non_transition_events_do_not_mark_idle_again():
     manager = _make_manager()
     session = Session(

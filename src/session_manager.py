@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import textwrap
 import uuid
@@ -631,6 +632,18 @@ class SessionManager:
 
                     # Verify tmux session still exists (Claude/Codex CLI)
                     if self.tmux.session_exists(session.tmux_session):
+                        if (
+                            session.provider == "codex-fork"
+                            and session.status == SessionStatus.STOPPED
+                            and self._codex_fork_runtime_reachable(session)
+                        ):
+                            session.status = SessionStatus.IDLE
+                            session.completion_status = None
+                            session.completion_message = None
+                            logger.info(
+                                "Healed stopped codex-fork session %s because detached runtime is still reachable",
+                                session.name,
+                            )
                         self.sessions[session.id] = session
                         if session.provider == "codex-fork":
                             self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
@@ -856,11 +869,31 @@ class SessionManager:
             "approval_submitted": "approval_resolved",
             "user_input_submitted": "user_input_resolved",
             "user_input_response": "user_input_resolved",
-            "stream_error": "error",
             "runtime_error": "error",
             "fatal_error": "error",
         }
         return aliases.get(snake, snake)
+
+    def _codex_fork_runtime_reachable(self, session: Session) -> bool:
+        """Return True when a codex-fork detached runtime still answers on its control socket."""
+        if getattr(session, "provider", "") != "codex-fork":
+            return False
+        if not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
+            return False
+        socket_path = self._codex_fork_control_socket_path(session)
+        if not socket_path.exists():
+            return False
+
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(min(0.25, max(0.05, self.codex_fork_control_timeout_seconds)))
+        try:
+            client.connect(str(socket_path))
+            return True
+        except OSError:
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
 
     def _set_codex_fork_lifecycle_state(
         self,
@@ -977,6 +1010,10 @@ class SessionManager:
             self.codex_fork_wait_resume_state.pop(session_id, None)
             self.codex_fork_wait_kind.pop(session_id, None)
             next_state = "running" if session_id in self.codex_fork_turns_in_flight else "idle"
+        elif normalized == "stream_error":
+            # Reconnect churn is noisy but non-terminal; preserve the live lifecycle.
+            if session_id in self.codex_fork_turns_in_flight:
+                next_state = "running"
         elif normalized == "turn_delta":
             if session_id in self.codex_fork_turns_in_flight:
                 next_state = "running"
