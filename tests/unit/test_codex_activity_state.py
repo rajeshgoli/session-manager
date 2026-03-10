@@ -301,6 +301,53 @@ def test_codex_fork_stream_error_does_not_stop_active_runtime():
     assert lifecycle["cause_event_type"] == "stream_error"
 
 
+def test_codex_fork_stream_error_preserves_waiting_states():
+    manager = _make_manager()
+    session = Session(
+        id="cf-stream-wait",
+        name="codex-fork-cf-stream-wait",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnStarted",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "ExecApprovalRequest",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "stream_error",
+            "seq": 3,
+            "session_epoch": 1,
+            "payload": {"message": "Reconnecting... 1/5"},
+        },
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert manager.get_activity_state(session.id) == "waiting_permission"
+    lifecycle = manager.get_codex_fork_lifecycle_state(session.id)
+    assert lifecycle is not None
+    assert lifecycle["state"] == "waiting_on_approval"
+    assert lifecycle["cause_event_type"] == "stream_error"
+
+
 def test_codex_fork_non_transition_events_do_not_mark_idle_again():
     manager = _make_manager()
     session = Session(

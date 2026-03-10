@@ -1011,8 +1011,10 @@ class SessionManager:
             self.codex_fork_wait_kind.pop(session_id, None)
             next_state = "running" if session_id in self.codex_fork_turns_in_flight else "idle"
         elif normalized == "stream_error":
-            # Reconnect churn is noisy but non-terminal; preserve the live lifecycle.
-            if session_id in self.codex_fork_turns_in_flight:
+            # Reconnect churn is noisy but non-terminal; preserve blocked wait states.
+            if current_state in {"waiting_on_approval", "waiting_on_user_input"}:
+                next_state = current_state
+            elif session_id in self.codex_fork_turns_in_flight:
                 next_state = "running"
         elif normalized == "turn_delta":
             if session_id in self.codex_fork_turns_in_flight:
