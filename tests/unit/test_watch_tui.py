@@ -87,7 +87,8 @@ def test_build_rows_parent_before_child_with_tree_prefix():
     child_idx = next(i for i, row in enumerate(session_rows) if row.session_id == "c1")
     assert parent_idx < child_idx
     assert session_rows[parent_idx].columns["Session"].startswith(("|-", "`-"))
-    assert "[c1]" in session_rows[child_idx].columns["Session"]
+    assert session_rows[child_idx].columns["ID"] == "c1"
+    assert "[c1]" not in session_rows[child_idx].columns["Session"]
 
 
 def test_main_columns_include_provider_status_and_last():
@@ -106,6 +107,7 @@ def test_main_columns_include_provider_status_and_last():
     )
     session_row = next(row for row in rows if row.kind == "session")
 
+    assert session_row.columns["ID"] == "s1"
     assert session_row.columns["Provider"] == "claude"
     assert session_row.columns["Status"] == "running"
     assert "Read" in session_row.columns["Last"]
@@ -158,7 +160,8 @@ def test_cross_repo_child_renders_as_nested_repo_subtree():
     child_idx = next(i for i, row in enumerate(rows) if row.kind == "session" and row.session_id == "c1")
     assert parent_idx < nested_repo_idx < child_idx
     assert selectable == ["p1", "c1"]
-    assert session_rows[1].columns["Session"].startswith("      `-child [c1]")
+    assert session_rows[1].columns["Session"].startswith("      `-child")
+    assert session_rows[1].columns["ID"] == "c1"
 
 
 def test_status_row_shows_text_and_age():

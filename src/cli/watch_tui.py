@@ -22,7 +22,8 @@ _RESERVED_SCREEN_ROWS = 4
 
 # name, min_width, weight, align
 _COLUMN_SPECS = [
-    ("Session", 22, 3, "left"),
+    ("Session", 16, 3, "left"),
+    ("ID", 8, 0, "left"),
     ("Parent", 18, 2, "left"),
     ("Role", 8, 1, "left"),
     ("Provider", 10, 1, "left"),
@@ -546,7 +547,8 @@ def build_watch_rows(
         status = session.get("status") or "-"
 
         columns = {
-            "Session": f"{tree_prefix}{_session_name(session)} [{session.get('id', '')}]",
+            "Session": f"{tree_prefix}{_session_name(session)}",
+            "ID": session.get("id", ""),
             "Parent": _parent_label(session, sessions_by_id),
             "Role": role,
             "Provider": provider,
