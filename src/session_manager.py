@@ -991,11 +991,27 @@ class SessionManager:
         if normalized == "turn_started":
             self.codex_fork_turns_in_flight.add(session_id)
             next_state = "running"
-        elif normalized in {"turn_complete", "turn_aborted"}:
+        elif normalized == "turn_complete":
             self.codex_fork_turns_in_flight.discard(session_id)
             self.codex_fork_wait_resume_state.pop(session_id, None)
             self.codex_fork_wait_kind.pop(session_id, None)
             next_state = "idle"
+        elif normalized == "turn_aborted":
+            reason = str(payload.get("reason", "")).strip().lower() if payload else ""
+            if reason == "interrupted":
+                # Codex-fork emits interrupted aborts during prompt injection / runtime restarts.
+                # They are not task completion and must not fire stop-notify side effects (#393).
+                if current_state in {"waiting_on_approval", "waiting_on_user_input"}:
+                    next_state = current_state
+                elif session_id not in self.codex_fork_turns_in_flight:
+                    next_state = current_state
+                else:
+                    next_state = "running"
+            else:
+                self.codex_fork_turns_in_flight.discard(session_id)
+                self.codex_fork_wait_resume_state.pop(session_id, None)
+                self.codex_fork_wait_kind.pop(session_id, None)
+                next_state = "idle"
         elif normalized == "approval_request":
             resume_state = "running" if session_id in self.codex_fork_turns_in_flight else "idle"
             self.codex_fork_wait_resume_state[session_id] = resume_state
@@ -1029,10 +1045,9 @@ class SessionManager:
             # turn_started event. Fresh deltas/tool events must still reassert active work.
             next_state = "running"
         elif normalized == "shutdown_complete":
-            self.codex_fork_turns_in_flight.discard(session_id)
-            self.codex_fork_wait_resume_state.pop(session_id, None)
-            self.codex_fork_wait_kind.pop(session_id, None)
-            next_state = "shutdown"
+            # Detached runtime shutdown is emitted after normal completions and interrupted
+            # turn restarts. It is transport churn, not a terminal SM session stop (#393).
+            next_state = current_state
         elif normalized == "error":
             self.codex_fork_turns_in_flight.discard(session_id)
             self.codex_fork_wait_resume_state.pop(session_id, None)
