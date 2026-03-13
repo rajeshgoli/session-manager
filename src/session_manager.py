@@ -1003,6 +1003,8 @@ class SessionManager:
                 # They are not task completion and must not fire stop-notify side effects (#393).
                 if current_state in {"waiting_on_approval", "waiting_on_user_input"}:
                     next_state = current_state
+                elif session_id not in self.codex_fork_turns_in_flight:
+                    next_state = current_state
                 else:
                     next_state = "running"
             else:

@@ -393,6 +393,60 @@ def test_codex_fork_interrupted_turn_abort_does_not_mark_idle():
     assert calls["idle"] == 0
 
 
+def test_codex_fork_interrupted_abort_after_completion_preserves_idle():
+    manager = _make_manager()
+    session = Session(
+        id="cf-abort-idle",
+        name="codex-fork-cf-abort-idle",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    calls = {"idle": 0, "active": 0}
+    manager.message_queue_manager = SimpleNamespace(
+        mark_session_idle=lambda _sid, **_kwargs: calls.__setitem__("idle", calls["idle"] + 1),
+        mark_session_active=lambda _sid: calls.__setitem__("active", calls["active"] + 1),
+    )
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnStarted",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {"turn_id": "t1"},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "TurnComplete",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {"turn_id": "t1"},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "turn_aborted",
+            "seq": 3,
+            "session_epoch": 1,
+            "payload": {"turn_id": "t1", "reason": "interrupted"},
+        },
+    )
+
+    assert session.status == SessionStatus.IDLE
+    assert manager.get_activity_state(session.id) == "idle"
+    lifecycle = manager.get_codex_fork_lifecycle_state(session.id)
+    assert lifecycle is not None
+    assert lifecycle["state"] == "idle"
+    assert lifecycle["cause_event_type"] == "turn_aborted"
+    assert calls["idle"] == 1
+
+
 def test_codex_fork_shutdown_complete_preserves_idle_completion_state():
     manager = _make_manager()
     session = Session(
