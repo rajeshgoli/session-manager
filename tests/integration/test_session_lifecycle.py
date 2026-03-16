@@ -101,6 +101,18 @@ class TestSessionLifecycle:
         assert session_manager.get_session(session.id) == session
 
     @pytest.mark.asyncio
+    async def test_create_session_flow_preserves_parent_ownership(self, session_manager):
+        """Direct create path records parent ownership when launched from a managed session."""
+        session = await session_manager.create_session(
+            working_dir="/tmp/test-workspace",
+            parent_session_id="parent123",
+        )
+
+        assert session is not None
+        assert session.parent_session_id == "parent123"
+        assert session.spawned_at is not None
+
+    @pytest.mark.asyncio
     async def test_kill_session_flow(self, session_manager, mock_tmux, temp_state_file):
         """Full session kill: tmux killed, state updated."""
         # First create a session

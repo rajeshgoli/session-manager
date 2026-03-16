@@ -677,23 +677,32 @@ class SessionManagerClient:
             return None
         return data
 
-    def create_session(self, working_dir: str, provider: Optional[str] = None) -> Optional[dict]:
+    def create_session(
+        self,
+        working_dir: str,
+        provider: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+    ) -> Optional[dict]:
         """
         Create a new Claude Code session.
 
         Args:
             working_dir: Working directory path
+            provider: Session provider
+            parent_session_id: Optional owning session for direct creates
 
         Returns:
             Session dict or None if unavailable
         """
-        encoded_dir = urllib.parse.quote(working_dir)
-        query = f"working_dir={encoded_dir}"
+        payload = {"working_dir": working_dir}
         if provider:
-            query += f"&provider={provider}"
+            payload["provider"] = provider
+        if parent_session_id is not None:
+            payload["parent_session_id"] = parent_session_id
         data, success, unavailable = self._request(
             "POST",
-            f"/sessions/create?{query}",
+            "/sessions",
+            payload,
             timeout=10
         )
         return data if success else None

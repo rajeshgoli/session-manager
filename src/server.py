@@ -103,6 +103,7 @@ class CreateSessionRequest(BaseModel):
     working_dir: str = "~"
     name: Optional[str] = None
     provider: Optional[str] = "claude"
+    parent_session_id: Optional[str] = None
 
 
 class AdoptionProposalResponse(BaseModel):
@@ -1316,6 +1317,7 @@ def create_app(
             working_dir=request.working_dir,
             name=request.name,
             provider=provider,
+            parent_session_id=request.parent_session_id,
         )
 
         if not session:
@@ -1328,7 +1330,11 @@ def create_app(
         return _session_to_response(session)
 
     @app.post("/sessions/create")
-    async def create_session_endpoint(working_dir: str, provider: str = "claude"):
+    async def create_session_endpoint(
+        working_dir: str,
+        provider: str = "claude",
+        parent_session_id: Optional[str] = None,
+    ):
         """
         Create a new Claude Code session.
 
@@ -1350,6 +1356,7 @@ def create_app(
             working_dir=working_dir,
             telegram_chat_id=None,  # No Telegram association
             provider=provider,
+            parent_session_id=parent_session_id,
         )
 
         if not session:

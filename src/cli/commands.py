@@ -1886,7 +1886,12 @@ def cmd_kill(
     return 0
 
 
-def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, provider: str = "claude") -> int:
+def cmd_new(
+    client: SessionManagerClient,
+    working_dir: Optional[str] = None,
+    provider: str = "claude",
+    parent_session_id: Optional[str] = None,
+) -> int:
     """
     Create a new session (Claude/Codex attach; Codex app is headless).
 
@@ -1894,6 +1899,7 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, pro
         client: API client
         working_dir: Working directory (optional, defaults to $PWD)
         provider: "claude", "codex", "codex-fork", or "codex-app"
+        parent_session_id: Owning session for direct creates launched from a managed session
 
     Exit codes:
         0: Successfully created (and attached for Claude/Codex)
@@ -1928,7 +1934,11 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, pro
 
     # Create session via API
     print(f"Creating session in {working_dir}...")
-    session = client.create_session(working_dir, provider=provider)
+    session = client.create_session(
+        working_dir,
+        provider=provider,
+        parent_session_id=parent_session_id,
+    )
 
     if session is None:
         print("Error: Session manager unavailable", file=sys.stderr)
@@ -1966,13 +1976,18 @@ def cmd_new(client: SessionManagerClient, working_dir: Optional[str] = None, pro
         return 1
 
 
-def cmd_codex_2(client: SessionManagerClient, working_dir: Optional[str] = None) -> int:
+def cmd_codex_2(
+    client: SessionManagerClient,
+    working_dir: Optional[str] = None,
+    parent_session_id: Optional[str] = None,
+) -> int:
     """
     Create a new codex-fork session and immediately attach via attach-descriptor flow.
 
     Args:
         client: API client
         working_dir: Working directory (optional, defaults to $PWD)
+        parent_session_id: Owning session for direct creates launched from a managed session
 
     Exit codes:
         0: Successfully created and attached
@@ -1999,7 +2014,11 @@ def cmd_codex_2(client: SessionManagerClient, working_dir: Optional[str] = None)
         return 1
 
     print(f"Creating codex-fork session in {working_dir}...")
-    session = client.create_session(working_dir, provider="codex-fork")
+    session = client.create_session(
+        working_dir,
+        provider="codex-fork",
+        parent_session_id=parent_session_id,
+    )
     if session is None:
         print("Error: Session manager unavailable", file=sys.stderr)
         return 2
