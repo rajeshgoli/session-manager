@@ -10,6 +10,7 @@ from src.cli.watch_tui import (
     _create_watch_session,
     _compute_column_widths,
     _default_create_working_dir,
+    _normalize_create_working_dir,
     _render_columns,
     _resolve_create_provider,
     _session_line,
@@ -407,6 +408,24 @@ def test_default_create_working_dir_prefers_selected_session_then_repo_filter(mo
     assert _default_create_working_dir(_session("s1", "agent", "/tmp/selected"), None) == "/tmp/selected"
     assert _default_create_working_dir(None, "/tmp/filter") == "/tmp/filter"
     assert _default_create_working_dir(None, None) == str(tmp_path)
+
+
+def test_normalize_create_working_dir_resolves_relative_paths(monkeypatch, tmp_path):
+    child = tmp_path / "child"
+    child.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    normalized, error = _normalize_create_working_dir("./child")
+
+    assert error is None
+    assert normalized == str(child.resolve())
+
+
+def test_normalize_create_working_dir_rejects_missing_path(tmp_path):
+    normalized, error = _normalize_create_working_dir(str(tmp_path / "missing"))
+
+    assert normalized is None
+    assert error == f"Working dir does not exist: {tmp_path / 'missing'}"
 
 
 def test_resolve_create_provider_maps_supported_aliases():

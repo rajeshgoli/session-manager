@@ -748,13 +748,40 @@ def _default_create_working_dir(
     repo_filter: Optional[str],
 ) -> str:
     """Choose the default working directory for watch-side session creation."""
+    candidate: Optional[str] = None
     if selected_session:
         working_dir = selected_session.get("working_dir")
         if working_dir:
-            return str(working_dir)
-    if repo_filter:
-        return str(repo_filter)
-    return os.getcwd()
+            candidate = str(working_dir)
+    if candidate is None and repo_filter:
+        candidate = str(repo_filter)
+    if candidate is None:
+        candidate = os.getcwd()
+
+    normalized, _ = _normalize_create_working_dir(candidate)
+    return normalized or candidate
+
+
+def _normalize_create_working_dir(working_dir: str) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a watch create path into a validated absolute directory."""
+    raw_value = (working_dir or "").strip()
+    if not raw_value:
+        return None, "Working dir is required"
+
+    try:
+        candidate = Path(raw_value).expanduser()
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve(strict=False)
+        else:
+            candidate = candidate.resolve(strict=False)
+    except Exception as exc:
+        return None, f"Invalid working dir: {exc}"
+
+    if not candidate.exists():
+        return None, f"Working dir does not exist: {candidate}"
+    if not candidate.is_dir():
+        return None, f"Working dir is not a directory: {candidate}"
+    return str(candidate), None
 
 
 def _resolve_create_provider(choice: str) -> Optional[str]:
@@ -1154,10 +1181,16 @@ def run_watch_tui(
                         continue
 
                     working_dir = working_dir_input or default_dir
+                    normalized_working_dir, working_dir_error = _normalize_create_working_dir(working_dir)
+                    if working_dir_error:
+                        flash_message = working_dir_error
+                        flash_until = time.monotonic() + 2.5
+                        continue
+
                     session, tmux_session, error = _create_watch_session(
                         client,
                         provider=provider,
-                        working_dir=working_dir,
+                        working_dir=normalized_working_dir,
                     )
                     if error:
                         flash_message = error
