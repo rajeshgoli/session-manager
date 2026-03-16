@@ -740,6 +740,24 @@ class TestCmdSendRemindParams:
         captured = capsys.readouterr()
         assert "notify-on-stop" not in captured.out
 
+    def test_codex_fork_target_suppresses_notify_on_stop(self, capsys):
+        """Codex-fork targets must not request or print notify-on-stop."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+        mock_client.get_session.return_value = {
+            "id": "fork1",
+            "friendly_name": "fork-agent",
+            "status": "idle",
+            "provider": "codex-fork",
+        }
+
+        cmd_send(mock_client, "fork1", "hello")
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["notify_on_stop"] is False
+        captured = capsys.readouterr()
+        assert "notify-on-stop" not in captured.out
+
 
 # ---------------------------------------------------------------------------
 # sm setup tests (sm#225-D)

@@ -1896,6 +1896,14 @@ def create_app(
         if not queue_mgr:
             raise HTTPException(status_code=503, detail="Message queue not configured")
 
+        if getattr(session, "provider", "claude") == "codex-fork":
+            return {
+                "status": "suppressed",
+                "session_id": session_id,
+                "sender_session_id": request.sender_session_id,
+                "reason": "notify_on_stop disabled for codex-fork sessions",
+            }
+
         sender_name = _effective_session_name(sender)
         queue_mgr.arm_stop_notify(
             session_id=session_id,

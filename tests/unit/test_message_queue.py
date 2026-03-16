@@ -190,6 +190,29 @@ class TestStateManagement:
         message_queue.mark_session_active("session123")
         assert message_queue.is_session_idle("session123") is False
 
+    @pytest.mark.asyncio
+    async def test_codex_fork_mark_session_idle_drops_stop_notify(self, mock_session_manager, temp_db_path):
+        """Codex-fork idle transitions must not emit stop notifications to the sender."""
+        mq = MessageQueueManager(session_manager=mock_session_manager, db_path=temp_db_path, notifier=None)
+        session = MagicMock()
+        session.id = "fork400"
+        session.provider = "codex-fork"
+        mock_session_manager.get_session = MagicMock(return_value=session)
+
+        state = mq._get_or_create_state("fork400")
+        state.stop_notify_sender_id = "em400"
+        state.stop_notify_sender_name = "em"
+        state.stop_notify_delay_seconds = 0
+
+        with patch.object(mq, "_send_stop_notification", new=AsyncMock()) as mock_notify:
+            mq.mark_session_idle("fork400")
+            await asyncio.sleep(0)
+
+        mock_notify.assert_not_awaited()
+        assert state.stop_notify_sender_id is None
+        assert state.stop_notify_sender_name is None
+        assert state.stop_notify_delay_seconds == 0
+
     def test_is_session_idle_false_by_default(self, message_queue):
         """is_session_idle returns False for unknown sessions."""
         assert message_queue.is_session_idle("unknown") is False
