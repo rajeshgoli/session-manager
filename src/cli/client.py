@@ -677,6 +677,50 @@ class SessionManagerClient:
             return None
         return data
 
+    def create_session_result(
+        self,
+        working_dir: str,
+        provider: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Create a new Claude Code session and preserve API error details.
+
+        Args:
+            working_dir: Working directory path
+            provider: Session provider
+            parent_session_id: Optional owning session for direct creates
+
+        Returns:
+            Dict with ok/unavailable/status_code/data/detail
+        """
+        payload = {"working_dir": working_dir}
+        if provider:
+            payload["provider"] = provider
+        if parent_session_id is not None:
+            payload["parent_session_id"] = parent_session_id
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            "/sessions",
+            payload,
+            timeout=10,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+
+        ok = status_code in (200, 201)
+        detail = None
+        if isinstance(data, dict):
+            detail = data.get("detail") or data.get("error") or data.get("raw")
+
+        return {
+            "ok": ok,
+            "unavailable": False,
+            "status_code": status_code,
+            "data": data,
+            "detail": detail,
+        }
+
     def create_session(
         self,
         working_dir: str,
@@ -692,20 +736,14 @@ class SessionManagerClient:
             parent_session_id: Optional owning session for direct creates
 
         Returns:
-            Session dict or None if unavailable
+            Session dict or None if unavailable or rejected
         """
-        payload = {"working_dir": working_dir}
-        if provider:
-            payload["provider"] = provider
-        if parent_session_id is not None:
-            payload["parent_session_id"] = parent_session_id
-        data, success, unavailable = self._request(
-            "POST",
-            "/sessions",
-            payload,
-            timeout=10
+        result = self.create_session_result(
+            working_dir,
+            provider=provider,
+            parent_session_id=parent_session_id,
         )
-        return data if success else None
+        return result.get("data") if result.get("ok") else None
 
     def get_queue_status(self, session_id: str) -> Optional[dict]:
         """

@@ -800,13 +800,19 @@ def _create_watch_session(
     working_dir: str,
 ) -> tuple[Optional[dict], Optional[str], Optional[str]]:
     """Create a session from sm watch and return its attach target."""
-    session = client.create_session(
+    result = client.create_session_result(
         working_dir,
         provider=provider,
         parent_session_id=getattr(client, "session_id", None),
     )
-    if session is None:
+    if result.get("unavailable"):
         return None, None, "Session manager unavailable"
+    if not result.get("ok"):
+        return None, None, result.get("detail") or "Failed to create session"
+
+    session = result.get("data")
+    if not isinstance(session, dict):
+        return None, None, "Failed to create session"
 
     session_id = session.get("id")
     descriptor = client.get_attach_descriptor(session_id) if session_id else None
