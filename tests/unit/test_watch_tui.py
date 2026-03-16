@@ -7,8 +7,11 @@ import time
 from src.cli.watch_tui import (
     DetailFetchWorker,
     DetailSnapshot,
+    _create_watch_session,
     _compute_column_widths,
+    _default_create_working_dir,
     _render_columns,
+    _resolve_create_provider,
     _session_line,
     build_watch_rows,
     can_attach_session,
@@ -396,6 +399,75 @@ def test_filter_by_repo_prefix():
 def test_codex_app_rows_are_not_attachable():
     session = _session("app1", "codex-app", "/tmp/repo", provider="codex-app")
     assert can_attach_session(session) is False
+
+
+def test_default_create_working_dir_prefers_selected_session_then_repo_filter(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    assert _default_create_working_dir(_session("s1", "agent", "/tmp/selected"), None) == "/tmp/selected"
+    assert _default_create_working_dir(None, "/tmp/filter") == "/tmp/filter"
+    assert _default_create_working_dir(None, None) == str(tmp_path)
+
+
+def test_resolve_create_provider_maps_supported_aliases():
+    assert _resolve_create_provider("") == "codex-fork"
+    assert _resolve_create_provider("codex") == "codex-fork"
+    assert _resolve_create_provider("co") == "codex-fork"
+    assert _resolve_create_provider("claude") == "claude"
+    assert _resolve_create_provider("cl") == "claude"
+    assert _resolve_create_provider("weird") is None
+
+
+def test_create_watch_session_passes_parent_session_id_and_returns_attach_target():
+    client = type(
+        "_Client",
+        (),
+        {
+            "session_id": "parent123",
+            "create_session": staticmethod(
+                lambda working_dir, provider, parent_session_id: {
+                    "id": "child456",
+                    "tmux_session": "codex-fork-child456",
+                }
+                if (working_dir, provider, parent_session_id) == ("/tmp/repo", "codex-fork", "parent123")
+                else None
+            ),
+            "get_attach_descriptor": staticmethod(
+                lambda session_id: {"tmux_session": "descriptor-child456"} if session_id == "child456" else None
+            ),
+        },
+    )()
+
+    session, tmux_session, error = _create_watch_session(client, "codex-fork", "/tmp/repo")
+
+    assert error is None
+    assert session["id"] == "child456"
+    assert tmux_session == "descriptor-child456"
+
+
+def test_create_watch_session_returns_attach_error_when_not_supported():
+    client = type(
+        "_Client",
+        (),
+        {
+            "session_id": "parent123",
+            "create_session": staticmethod(
+                lambda working_dir, provider, parent_session_id: {
+                    "id": "app789",
+                    "tmux_session": None,
+                }
+            ),
+            "get_attach_descriptor": staticmethod(
+                lambda session_id: {"attach_supported": False, "message": "No terminal for this provider"}
+            ),
+        },
+    )()
+
+    session, tmux_session, error = _create_watch_session(client, "claude", "/tmp/repo")
+
+    assert session["id"] == "app789"
+    assert tmux_session is None
+    assert error == "No terminal for this provider"
 
 
 class _SlowClient:

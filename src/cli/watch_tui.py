@@ -743,6 +743,57 @@ def _prompt_input(stdscr, prompt: str) -> str:
     return text
 
 
+def _default_create_working_dir(
+    selected_session: Optional[dict],
+    repo_filter: Optional[str],
+) -> str:
+    """Choose the default working directory for watch-side session creation."""
+    if selected_session:
+        working_dir = selected_session.get("working_dir")
+        if working_dir:
+            return str(working_dir)
+    if repo_filter:
+        return str(repo_filter)
+    return os.getcwd()
+
+
+def _resolve_create_provider(choice: str) -> Optional[str]:
+    """Map watch create prompt input to a concrete provider."""
+    normalized = (choice or "").strip().lower()
+    if normalized in ("", "codex", "codex-fork", "co", "2"):
+        return "codex-fork"
+    if normalized in ("claude", "cl", "1"):
+        return "claude"
+    return None
+
+
+def _create_watch_session(
+    client,
+    provider: str,
+    working_dir: str,
+) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Create a session from sm watch and return its attach target."""
+    session = client.create_session(
+        working_dir,
+        provider=provider,
+        parent_session_id=getattr(client, "session_id", None),
+    )
+    if session is None:
+        return None, None, "Session manager unavailable"
+
+    session_id = session.get("id")
+    descriptor = client.get_attach_descriptor(session_id) if session_id else None
+    if descriptor and not descriptor.get("attach_supported", True):
+        message = descriptor.get("message") or "Attach not supported for this session"
+        return session, None, message
+
+    tmux_session = (descriptor or {}).get("tmux_session") or session.get("tmux_session")
+    if not tmux_session:
+        return session, None, "Created session has no tmux target"
+
+    return session, tmux_session, None
+
+
 def _attach_tmux(stdscr, tmux_session: str):
     curses.def_prog_mode()
     curses.endwin()
@@ -887,7 +938,7 @@ def _render(
             _flash_attr(flash_message, palette),
         )
 
-    footer = "j/k: move  Enter: attach  s: send  K: kill  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
+    footer = "j/k: move  +: create  Enter: attach  s: send  K: kill  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
     stdscr.refresh()
 
@@ -1074,6 +1125,50 @@ def run_watch_tui(
                         flash_message = "Session manager unavailable"
                     else:
                         flash_message = "Failed to send"
+                    flash_until = time.monotonic() + 2.5
+                    next_refresh = 0.0
+                    continue
+
+                if key in (ord("+"),):
+                    provider_choice = _prompt_input(
+                        stdscr,
+                        "provider [codex/claude] (blank=codex, cancel=cancel): ",
+                    )
+                    if provider_choice.strip().lower() in ("cancel", "q", "quit"):
+                        flash_message = "Create canceled"
+                        flash_until = time.monotonic() + 2.0
+                        continue
+
+                    provider = _resolve_create_provider(provider_choice)
+                    if provider is None:
+                        flash_message = "Invalid provider (use codex or claude)"
+                        flash_until = time.monotonic() + 2.5
+                        continue
+
+                    default_dir = _default_create_working_dir(selected, repo_filter)
+                    working_dir_prompt = f"working dir (blank={default_dir}, cancel=cancel): "
+                    working_dir_input = _prompt_input(stdscr, working_dir_prompt)
+                    if working_dir_input.strip().lower() in ("cancel", "q", "quit"):
+                        flash_message = "Create canceled"
+                        flash_until = time.monotonic() + 2.0
+                        continue
+
+                    working_dir = working_dir_input or default_dir
+                    session, tmux_session, error = _create_watch_session(
+                        client,
+                        provider=provider,
+                        working_dir=working_dir,
+                    )
+                    if error:
+                        flash_message = error
+                        flash_until = time.monotonic() + 2.5
+                        next_refresh = 0.0
+                        continue
+
+                    selected_session_id = session.get("id") or selected_session_id
+                    next_refresh = 0.0
+                    _attach_tmux(stdscr, tmux_session)
+                    flash_message = f"Created {selected_session_id}"
                     flash_until = time.monotonic() + 2.5
                     next_refresh = 0.0
                     continue
