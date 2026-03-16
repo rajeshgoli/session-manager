@@ -359,6 +359,22 @@ class TestSessionEndpoints:
         assert data["id"] == "test123"
         assert data["working_dir"] == "/tmp/test"
 
+    def test_create_session_with_parent_ownership(self, test_client, mock_session_manager, sample_session):
+        """POST /sessions forwards parent_session_id for direct creates from managed sessions."""
+        mock_session_manager.create_session = AsyncMock(return_value=sample_session)
+
+        response = test_client.post(
+            "/sessions",
+            json={"working_dir": "/tmp/test", "provider": "codex-fork", "parent_session_id": "parent123"},
+        )
+        assert response.status_code == 200
+        mock_session_manager.create_session.assert_awaited_once_with(
+            working_dir="/tmp/test",
+            name=None,
+            provider="codex-fork",
+            parent_session_id="parent123",
+        )
+
     def test_create_session_failure(self, test_client, mock_session_manager):
         """POST /sessions returns 500 on creation failure."""
         mock_session_manager.create_session = AsyncMock(return_value=None)

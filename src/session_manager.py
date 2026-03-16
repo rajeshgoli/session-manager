@@ -1769,6 +1769,7 @@ class SessionManager:
         name: Optional[str] = None,
         telegram_chat_id: Optional[int] = None,
         provider: str = "claude",
+        parent_session_id: Optional[str] = None,
     ) -> Optional[Session]:
         """
         Create a new Claude Code session (async, non-blocking).
@@ -1777,6 +1778,7 @@ class SessionManager:
             working_dir: Directory to run Claude in
             name: Optional session name (generated if not provided)
             telegram_chat_id: Telegram chat to associate with session
+            parent_session_id: Optional parent owner for direct creates from managed sessions
 
         Returns:
             Created Session or None on failure
@@ -1786,6 +1788,7 @@ class SessionManager:
             name=name,
             telegram_chat_id=telegram_chat_id,
             provider=provider,
+            parent_session_id=parent_session_id,
         )
 
     async def spawn_child_session(

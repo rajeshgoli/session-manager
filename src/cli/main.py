@@ -734,21 +734,21 @@ def main():
     elif args.command == "clean":
         sys.exit(commands.cmd_clean(client, session_ids=getattr(args, 'session_ids', None)))
     elif args.command == "claude":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude", parent_session_id=session_id))
     elif args.command == "codex":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork"))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork", parent_session_id=session_id))
     elif args.command == "codex-legacy":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex"))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex", parent_session_id=session_id))
     elif args.command in ("codex-fork", "codex_fork"):
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork"))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork", parent_session_id=session_id))
     elif args.command == "codex-2":
-        sys.exit(commands.cmd_codex_2(client, args.working_dir))
+        sys.exit(commands.cmd_codex_2(client, args.working_dir, parent_session_id=session_id))
     elif args.command == "codex-app":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app"))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app", parent_session_id=session_id))
     elif args.command == "codex-server":
         sys.exit(commands.cmd_removed_entrypoint("codex-server"))
     elif args.command == "new":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude"))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude", parent_session_id=session_id))
     elif args.command == "attach":
         sys.exit(commands.cmd_attach(client, args.session))
     elif args.command == "output":
