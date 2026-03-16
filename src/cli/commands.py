@@ -1307,6 +1307,8 @@ def cmd_send(
     # Self-sends are commonly used as delayed wakeups; do not advertise or request
     # stop-notify because it would wake the same agent on its next stop hook.
     effective_notify_on_stop = notify_on_stop and sender_session_id != session_id
+    if effective_notify_on_stop and session.get("provider") == "codex-fork":
+        effective_notify_on_stop = False
 
     # Use wait_seconds if provided, otherwise use notify_after_seconds
     effective_notify_after = wait_seconds if wait_seconds is not None else notify_after_seconds

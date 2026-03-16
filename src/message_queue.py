@@ -969,6 +969,18 @@ class MessageQueueManager:
             state.last_outgoing_sm_send_target = None
             state.last_outgoing_sm_send_at = None
 
+        session = self.session_manager.get_session(session_id) if self.session_manager else None
+        if session and getattr(session, "provider", "claude") == "codex-fork":
+            # Codex-fork turn boundaries are not reliable completion signals for parent
+            # wakeups. Drop any armed stop-notify state so live agents stop paging EMs
+            # mid-assignment (#400).
+            self._cancel_pending_stop_notification(session_id)
+            state.stop_notify_sender_id = None
+            state.stop_notify_sender_name = None
+            state.stop_notify_delay_seconds = 0
+            state.paste_buffered_notify_sender_id = None
+            state.paste_buffered_notify_sender_name = None
+
         # Send stop notification if a sender is waiting
         if state.stop_notify_sender_id:
             if state.stop_notify_delay_seconds > 0:

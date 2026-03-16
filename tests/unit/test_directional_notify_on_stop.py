@@ -19,7 +19,7 @@ from src.session_manager import SessionManager
 # ---------------------------------------------------------------------------
 
 
-def _make_session(session_id: str, is_em: bool = False) -> Session:
+def _make_session(session_id: str, is_em: bool = False, provider: str = "claude") -> Session:
     return Session(
         id=session_id,
         name=f"claude-{session_id}",
@@ -28,6 +28,7 @@ def _make_session(session_id: str, is_em: bool = False) -> Session:
         log_file=f"/tmp/{session_id}.log",
         status=SessionStatus.IDLE,
         is_em=is_em,
+        provider=provider,
     )
 
 
@@ -37,6 +38,7 @@ def _make_session_manager(sessions: dict[str, Session]) -> SessionManager:
     sm.sessions = sessions
     sm.message_queue_manager = MagicMock()
     sm.message_queue_manager.queue_message = MagicMock()
+    sm.message_queue_manager.deliver_queued_message_now = AsyncMock(return_value=True)
     sm.message_queue_manager.delivery_states = {}
     sm.message_queue_manager._get_or_create_state = MagicMock(return_value=MagicMock())
     sm.config = {}
@@ -206,6 +208,25 @@ class TestDirectionalNotifyOnStop:
 
         call_kwargs = sm.message_queue_manager.queue_message.call_args[1]
         assert call_kwargs["notify_on_stop"] is True
+
+    @pytest.mark.asyncio
+    async def test_codex_fork_target_suppresses_notify_on_stop(self):
+        """Codex-fork targets never arm notify_on_stop because turn boundaries are noisy."""
+        em = _make_session("em01", is_em=True)
+        target = _make_session("fork1", provider="codex-fork")
+        sm = _make_session_manager({"em01": em, "fork1": target})
+
+        with patch("asyncio.create_task", noop_create_task):
+            await sm.send_input(
+                session_id="fork1",
+                text="do task",
+                sender_session_id="em01",
+                delivery_mode="urgent",
+                notify_on_stop=True,
+            )
+
+        call_kwargs = sm.message_queue_manager.queue_message.call_args[1]
+        assert call_kwargs["notify_on_stop"] is False
 
     @pytest.mark.asyncio
     async def test_non_em_sender_important_mode_suppressed(self):

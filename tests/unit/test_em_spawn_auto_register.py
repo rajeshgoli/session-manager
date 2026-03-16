@@ -583,3 +583,26 @@ class TestArmStopNotifyEndpoint:
         assert call_kwargs.kwargs["sender_session_id"] == "em001"
         assert call_kwargs.kwargs["sender_name"] == "em"  # friendly_name takes precedence
         assert call_kwargs.kwargs["delay_seconds"] == 8
+
+    def test_arm_stop_notify_codex_fork_target_is_suppressed(self, app_client):
+        """POST /sessions/{id}/notify-on-stop returns suppressed for codex-fork targets."""
+        tc, mock_sm = app_client
+
+        child_session = MagicMock()
+        child_session.parent_session_id = "em001"
+        child_session.provider = "codex-fork"
+        mock_sm.get_session.side_effect = lambda sid: {
+            "em001": MagicMock(is_em=True, friendly_name="em", name="claude-em001"),
+            "child001": child_session,
+        }.get(sid)
+
+        response = tc.post(
+            "/sessions/child001/notify-on-stop",
+            json={"sender_session_id": "em001", "requester_session_id": "em001", "delay_seconds": 8},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "suppressed"
+        assert data["reason"] == "notify_on_stop disabled for codex-fork sessions"
+        mock_sm.message_queue_manager.arm_stop_notify.assert_not_called()

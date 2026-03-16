@@ -2314,6 +2314,11 @@ class SessionManager:
             if not sender_session or not sender_session.is_em:
                 notify_on_stop = False
 
+        # Codex-fork turn boundaries are not trustworthy as parent completion signals.
+        # Require explicit sm send / task-complete instead of arming stop-notify (#400).
+        if notify_on_stop and session.provider == "codex-fork":
+            notify_on_stop = False
+
         # Send Telegram notification if from sm send
         # Note: notifier will be set by server when calling send_input
         if from_sm_send and sender_session_id and hasattr(self, 'notifier'):
