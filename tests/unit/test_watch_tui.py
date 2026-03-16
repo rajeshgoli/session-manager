@@ -7,8 +7,12 @@ import time
 from src.cli.watch_tui import (
     DetailFetchWorker,
     DetailSnapshot,
+    _create_watch_session,
     _compute_column_widths,
+    _default_create_working_dir,
+    _normalize_create_working_dir,
     _render_columns,
+    _resolve_create_provider,
     _session_line,
     build_watch_rows,
     can_attach_session,
@@ -396,6 +400,131 @@ def test_filter_by_repo_prefix():
 def test_codex_app_rows_are_not_attachable():
     session = _session("app1", "codex-app", "/tmp/repo", provider="codex-app")
     assert can_attach_session(session) is False
+
+
+def test_default_create_working_dir_prefers_selected_session_then_repo_filter(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    assert _default_create_working_dir(_session("s1", "agent", "/tmp/selected"), None) == "/tmp/selected"
+    assert _default_create_working_dir(None, "/tmp/filter") == "/tmp/filter"
+    assert _default_create_working_dir(None, None) == str(tmp_path)
+
+
+def test_normalize_create_working_dir_resolves_relative_paths(monkeypatch, tmp_path):
+    child = tmp_path / "child"
+    child.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    normalized, error = _normalize_create_working_dir("./child")
+
+    assert error is None
+    assert normalized == str(child.resolve())
+
+
+def test_normalize_create_working_dir_rejects_missing_path(tmp_path):
+    normalized, error = _normalize_create_working_dir(str(tmp_path / "missing"))
+
+    assert normalized is None
+    assert error == f"Working dir does not exist: {tmp_path / 'missing'}"
+
+
+def test_resolve_create_provider_maps_supported_aliases():
+    assert _resolve_create_provider("") == "codex-fork"
+    assert _resolve_create_provider("codex") == "codex-fork"
+    assert _resolve_create_provider("co") == "codex-fork"
+    assert _resolve_create_provider("claude") == "claude"
+    assert _resolve_create_provider("cl") == "claude"
+    assert _resolve_create_provider("weird") is None
+
+
+def test_create_watch_session_passes_parent_session_id_and_returns_attach_target():
+    client = type(
+        "_Client",
+        (),
+        {
+            "session_id": "parent123",
+            "create_session_result": staticmethod(
+                lambda working_dir, provider, parent_session_id: {
+                    "ok": True,
+                    "unavailable": False,
+                    "status_code": 200,
+                    "detail": None,
+                    "data": {
+                        "id": "child456",
+                        "tmux_session": "codex-fork-child456",
+                    },
+                }
+                if (working_dir, provider, parent_session_id) == ("/tmp/repo", "codex-fork", "parent123")
+                else {"ok": False, "unavailable": False, "status_code": 400, "detail": "bad request", "data": None}
+            ),
+            "get_attach_descriptor": staticmethod(
+                lambda session_id: {"tmux_session": "descriptor-child456"} if session_id == "child456" else None
+            ),
+        },
+    )()
+
+    session, tmux_session, error = _create_watch_session(client, "codex-fork", "/tmp/repo")
+
+    assert error is None
+    assert session["id"] == "child456"
+    assert tmux_session == "descriptor-child456"
+
+
+def test_create_watch_session_returns_attach_error_when_not_supported():
+    client = type(
+        "_Client",
+        (),
+        {
+            "session_id": "parent123",
+            "create_session_result": staticmethod(
+                lambda working_dir, provider, parent_session_id: {
+                    "ok": True,
+                    "unavailable": False,
+                    "status_code": 200,
+                    "detail": None,
+                    "data": {
+                        "id": "app789",
+                        "tmux_session": None,
+                    },
+                }
+            ),
+            "get_attach_descriptor": staticmethod(
+                lambda session_id: {"attach_supported": False, "message": "No terminal for this provider"}
+            ),
+        },
+    )()
+
+    session, tmux_session, error = _create_watch_session(client, "claude", "/tmp/repo")
+
+    assert session["id"] == "app789"
+    assert tmux_session is None
+    assert error == "No terminal for this provider"
+
+
+def test_create_watch_session_preserves_api_error_detail():
+    client = type(
+        "_Client",
+        (),
+        {
+            "session_id": "parent123",
+            "create_session_result": staticmethod(
+                lambda working_dir, provider, parent_session_id: {
+                    "ok": False,
+                    "unavailable": False,
+                    "status_code": 422,
+                    "detail": "Provider not enabled",
+                    "data": {"detail": "Provider not enabled"},
+                }
+            ),
+            "get_attach_descriptor": staticmethod(lambda session_id: None),
+        },
+    )()
+
+    session, tmux_session, error = _create_watch_session(client, "codex-fork", "/tmp/repo")
+
+    assert session is None
+    assert tmux_session is None
+    assert error == "Provider not enabled"
 
 
 class _SlowClient:
