@@ -397,6 +397,88 @@ def test_filter_by_repo_prefix():
     assert [s["id"] for s in filtered] == ["x1", "x2"]
 
 
+def test_filter_by_repo_includes_cross_repo_ancestors_for_context():
+    sessions = [
+        _session("p1", "em-parent", "/tmp/repo-a"),
+        _session("c1", "child", "/tmp/repo-b", parent_session_id="p1"),
+    ]
+
+    filtered = filter_sessions(sessions, repo_filter="/tmp/repo-b")
+
+    assert [s["id"] for s in filtered] == ["p1", "c1"]
+
+    rows, _, repo_count = build_watch_rows(filtered)
+    assert repo_count == 2
+    assert any(row.kind == "repo_ref" and "repo-b/" in row.text for row in rows)
+    child_row = next(row for row in rows if row.kind == "session" and row.session_id == "c1")
+    assert child_row.columns["Parent"] == "em-parent [p1]"
+
+
+def test_filter_by_repo_includes_cross_repo_descendants_for_context():
+    sessions = [
+        _session("p1", "em-parent", "/tmp/repo-a"),
+        _session("c1", "child", "/tmp/repo-b", parent_session_id="p1"),
+    ]
+
+    filtered = filter_sessions(sessions, repo_filter="/tmp/repo-a")
+
+    assert [s["id"] for s in filtered] == ["p1", "c1"]
+
+    rows, selectable, repo_count = build_watch_rows(filtered)
+    assert repo_count == 2
+    parent_idx = next(i for i, row in enumerate(rows) if row.kind == "session" and row.session_id == "p1")
+    nested_repo_idx = next(i for i, row in enumerate(rows) if row.kind == "repo_ref")
+    child_idx = next(i for i, row in enumerate(rows) if row.kind == "session" and row.session_id == "c1")
+    assert parent_idx < nested_repo_idx < child_idx
+    assert selectable == ["p1", "c1"]
+
+
+def test_filter_by_role_does_not_pull_hierarchy_context():
+    sessions = [
+        _session("p1", "architect-parent", "/tmp/repo-a", role="architect"),
+        _session("c1", "engineer-child", "/tmp/repo-b", parent_session_id="p1", role="engineer"),
+    ]
+
+    filtered_engineers = filter_sessions(sessions, role_filter="engineer")
+    filtered_architects = filter_sessions(sessions, role_filter="architect")
+
+    assert [s["id"] for s in filtered_engineers] == ["c1"]
+    assert [s["id"] for s in filtered_architects] == ["p1"]
+
+
+def test_filter_by_text_does_not_pull_hierarchy_context():
+    sessions = [
+        _session("p1", "architect-parent", "/tmp/repo-a"),
+        _session("c1", "engineer-child", "/tmp/repo-b", parent_session_id="p1"),
+    ]
+
+    filtered = filter_sessions(sessions, text_filter="engineer-child")
+
+    assert [s["id"] for s in filtered] == ["c1"]
+
+
+def test_filter_by_repo_and_role_does_not_pull_hierarchy_context():
+    sessions = [
+        _session("p1", "architect-parent", "/tmp/repo-a", role="architect"),
+        _session("c1", "engineer-child", "/tmp/repo-b", parent_session_id="p1", role="engineer"),
+    ]
+
+    filtered = filter_sessions(sessions, repo_filter="/tmp/repo-b", role_filter="engineer")
+
+    assert [s["id"] for s in filtered] == ["c1"]
+
+
+def test_filter_by_repo_and_text_does_not_pull_hierarchy_context():
+    sessions = [
+        _session("p1", "architect-parent", "/tmp/repo-a"),
+        _session("c1", "engineer-child", "/tmp/repo-b", parent_session_id="p1"),
+    ]
+
+    filtered = filter_sessions(sessions, repo_filter="/tmp/repo-b", text_filter="engineer-child")
+
+    assert [s["id"] for s in filtered] == ["c1"]
+
+
 def test_codex_app_rows_are_not_attachable():
     session = _session("app1", "codex-app", "/tmp/repo", provider="codex-app")
     assert can_attach_session(session) is False

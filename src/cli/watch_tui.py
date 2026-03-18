@@ -396,7 +396,7 @@ def filter_sessions(
     text_filter: Optional[str] = None,
 ) -> list[dict]:
     """Apply repo/role/text filters for watch rows."""
-    filtered = []
+    filtered_ids: list[str] = []
     repo_root = None
     if repo_filter:
         try:
@@ -405,6 +405,14 @@ def filter_sessions(
             repo_root = None
     role_filter_norm = role_filter.lower() if role_filter else None
     text_filter_norm = text_filter.lower() if text_filter else None
+
+    sessions_by_id = {session.get("id"): session for session in sessions if session.get("id")}
+    children_by_parent: dict[str, list[str]] = {}
+    for session in sessions:
+        session_id = session.get("id")
+        parent_id = session.get("parent_session_id")
+        if session_id and parent_id:
+            children_by_parent.setdefault(parent_id, []).append(session_id)
 
     for session in sessions:
         working_dir = session.get("working_dir") or ""
@@ -431,9 +439,42 @@ def filter_sessions(
             if text_filter_norm not in haystack:
                 continue
 
-        filtered.append(session)
+        session_id = session.get("id")
+        if session_id:
+            filtered_ids.append(session_id)
 
-    return filtered
+    if not filtered_ids:
+        return []
+
+    filtered_id_set = set(filtered_ids)
+    if not repo_filter or role_filter_norm or text_filter_norm:
+        return [session for session in sessions if session.get("id") in filtered_id_set]
+
+    included_ids = set(filtered_id_set)
+
+    # Pure repo-scoped watch views should preserve tree context so cross-worktree
+    # children remain visibly attached to their parent session.
+    for session_id in filtered_ids:
+        parent_id = sessions_by_id.get(session_id, {}).get("parent_session_id")
+        while parent_id:
+            if parent_id in included_ids:
+                break
+            parent = sessions_by_id.get(parent_id)
+            if not parent:
+                break
+            included_ids.add(parent_id)
+            parent_id = parent.get("parent_session_id")
+
+    stack = list(filtered_ids)
+    while stack:
+        current_id = stack.pop()
+        for child_id in children_by_parent.get(current_id, []):
+            if child_id in included_ids:
+                continue
+            included_ids.add(child_id)
+            stack.append(child_id)
+
+    return [session for session in sessions if session.get("id") in included_ids]
 
 
 def _detail_lines(
