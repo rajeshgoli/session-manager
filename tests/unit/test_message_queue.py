@@ -1343,6 +1343,7 @@ class TestTelegramMirroring:
             if call[0][0].event_type == "message_delivered"
         ]
         assert len(delivered_calls) >= 1
+        await mq.stop()
 
     @pytest.mark.asyncio
     async def test_stop_notification_mirrors_to_telegram(self, mock_session_manager, temp_db_path):
@@ -1391,6 +1392,7 @@ class TestTelegramMirroring:
         assert len(stop_notify_calls) == 1
         event = stop_notify_calls[0][0][0]
         assert "🛑" in event.message
+        await mq.stop()
 
     @pytest.mark.asyncio
     async def test_delivery_does_not_wait_for_slow_telegram_mirror(self, mock_session_manager, temp_db_path):
@@ -1431,6 +1433,48 @@ class TestTelegramMirroring:
 
         mirror_release.set()
         await asyncio.sleep(0)
+        await mq.stop()
+
+    @pytest.mark.asyncio
+    async def test_telegram_mirror_worker_preserves_fifo(self, mock_session_manager, temp_db_path):
+        """Background Telegram mirroring must remain serialized and ordered."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=MagicMock(),
+        )
+
+        session = MagicMock()
+        session.id = "target123"
+        session.telegram_chat_id = 12345
+
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_started = asyncio.Event()
+        seen: list[str] = []
+
+        async def ordered_mirror(text, _session, _event_type):
+            seen.append(text)
+            if text == "first":
+                first_started.set()
+                await first_release.wait()
+            if text == "second":
+                second_started.set()
+
+        mq._mirror_to_telegram = AsyncMock(side_effect=ordered_mirror)
+
+        mq._enqueue_telegram_mirror("first", session, "message_delivered", "first")
+        mq._enqueue_telegram_mirror("second", session, "message_delivered", "second")
+
+        await asyncio.wait_for(first_started.wait(), timeout=0.1)
+        await asyncio.sleep(0.05)
+        assert not second_started.is_set()
+        assert seen == ["first"]
+
+        first_release.set()
+        await asyncio.wait_for(second_started.wait(), timeout=0.1)
+        assert seen == ["first", "second"]
+        await mq.stop()
 
 
 class TestDirectDelivery244:
