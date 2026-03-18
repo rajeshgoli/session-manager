@@ -3837,7 +3837,7 @@ Provide ONLY the summary, no preamble or questions."""
         if data.get("event") == "compaction_complete":
             session._is_compacting = False
             if queue_mgr:
-                queue_mgr.reset_remind(session_id)
+                queue_mgr.reset_remind(session_id, force_tracked=True)
             logger.info(
                 f"Compaction complete for {_effective_session_name(session)}, remind timer reset"
             )

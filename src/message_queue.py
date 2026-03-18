@@ -2261,6 +2261,7 @@ class MessageQueueManager:
                 sender_session_id,
                 cancel_on_reply_session_id=self._serialize_cancel_on_reply_session_ids(reg.cancel_on_reply_session_ids),
             )
+            self.cancel_queued_track_reminds(sender_session_id, recipient_session_id)
             logger.info(
                 "Tracked remind owner %s cleared for %s; remaining owners=%s",
                 recipient_session_id,
@@ -2268,6 +2269,7 @@ class MessageQueueManager:
                 reg.cancel_on_reply_session_ids,
             )
         else:
+            self.cancel_queued_track_reminds(sender_session_id, recipient_session_id)
             self.cancel_remind(sender_session_id)
             logger.info(
                 "Tracked remind auto-cancelled for %s after reply to %s",
@@ -2276,7 +2278,7 @@ class MessageQueueManager:
             )
         return True
 
-    def reset_remind(self, target_session_id: str):
+    def reset_remind(self, target_session_id: str, *, force_tracked: bool = False):
         """
         Reset the remind timer for a session (called when agent reports sm status).
 
@@ -2285,6 +2287,12 @@ class MessageQueueManager:
         reg = self._remind_registrations.get(target_session_id)
         if not reg or not reg.is_active:
             return
+        if reg.cancel_on_reply_session_ids and not force_tracked:
+            logger.debug(
+                "Ignoring reset_remind for tracked session %s; tracking cadence is requester-facing (#408)",
+                target_session_id,
+            )
+            return
 
         now = datetime.now()
         reg.last_reset_at = now
@@ -2292,6 +2300,81 @@ class MessageQueueManager:
 
         self._update_remind_db(target_session_id, last_reset_at=now, soft_fired=False)
         logger.info(f"Remind timer reset for {target_session_id}")
+
+    def cancel_queued_track_reminds(self, tracked_session_id: str, owner_session_id: str) -> int:
+        """Delete undelivered requester-facing track reminders for one tracked-session/owner pair."""
+        rows = self._execute_query(
+            "SELECT COUNT(*) FROM message_queue "
+            "WHERE target_session_id = ? AND sender_session_id = ? "
+            "AND message_category = 'track_remind' AND delivered_at IS NULL",
+            (owner_session_id, tracked_session_id),
+        )
+        count = rows[0][0] if rows else 0
+        if count:
+            self._execute(
+                "DELETE FROM message_queue "
+                "WHERE target_session_id = ? AND sender_session_id = ? "
+                "AND message_category = 'track_remind' AND delivered_at IS NULL",
+                (owner_session_id, tracked_session_id),
+            )
+            logger.info(
+                "Cancelled %s queued track reminder(s) for owner=%s tracked=%s",
+                count,
+                owner_session_id,
+                tracked_session_id,
+            )
+        return count
+
+    def _build_tracked_remind_text(self, target_session_id: str, reg: RemindRegistration, urgent: bool) -> str:
+        """Build requester-facing tracked reminder text for one target session (#408)."""
+        session = self.session_manager.get_session(target_session_id) if self.session_manager else None
+        display_name = self._get_display_name(session) or target_session_id
+        status_text = getattr(session, "agent_status_text", None) if session else None
+        status_at = getattr(session, "agent_status_at", None) if session else None
+        lines = [f"[sm track] Waiting on {display_name} ({target_session_id[:8]})"]
+        if urgent:
+            lines[0] += " — overdue"
+        if status_text:
+            if isinstance(status_at, datetime):
+                age_minutes = max(0, int((datetime.now() - status_at).total_seconds() // 60))
+                lines.append(f'Status ({age_minutes}m ago): "{status_text}"')
+            else:
+                lines.append(f'Status: "{status_text}"')
+        else:
+            lines.append("Status: (no agent status reported)")
+        lines.append(f"Awaiting explicit reply from {target_session_id[:8]}.")
+        return "\n".join(lines)
+
+    def _queue_tracked_remind_notifications(
+        self,
+        target_session_id: str,
+        reg: RemindRegistration,
+        *,
+        urgent: bool,
+    ) -> None:
+        """Queue requester-facing tracked reminders for every outstanding owner (#408)."""
+        if not reg.cancel_on_reply_session_ids:
+            return
+        text = self._build_tracked_remind_text(target_session_id, reg, urgent=urgent)
+        delivery_mode = "urgent" if urgent else "important"
+        dedup_prefix = f"[sm track] Waiting on"
+        for owner_session_id in reg.cancel_on_reply_session_ids:
+            if not urgent:
+                pending = self.get_pending_messages(owner_session_id)
+                if any(
+                    m.message_category == "track_remind"
+                    and m.text.startswith(dedup_prefix)
+                    and f"({target_session_id[:8]})" in m.text
+                    for m in pending
+                ):
+                    continue
+            self.queue_message(
+                target_session_id=owner_session_id,
+                sender_session_id=target_session_id,
+                text=text,
+                delivery_mode=delivery_mode,
+                message_category="track_remind",
+            )
 
     def arm_stop_notify(
         self,
@@ -2477,25 +2560,39 @@ class MessageQueueManager:
 
                 # Soft threshold: fire important remind
                 if not reg.soft_fired and elapsed >= reg.soft_threshold_seconds:
-                    # Dedup guard: skip if a remind is already pending
-                    pending = self.get_pending_messages(target_session_id)
-                    has_pending_remind = any(m.text.startswith(REMIND_PREFIX) for m in pending)
-                    if not has_pending_remind:
-                        self.queue_message(
-                            target_session_id=target_session_id,
-                            text='[sm remind] Update your status: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete',
-                            delivery_mode="important",
+                    if reg.cancel_on_reply_session_ids:
+                        self._queue_tracked_remind_notifications(
+                            target_session_id,
+                            reg,
+                            urgent=False,
                         )
+                    else:
+                        # Dedup guard: skip if a remind is already pending
+                        pending = self.get_pending_messages(target_session_id)
+                        has_pending_remind = any(m.text.startswith(REMIND_PREFIX) for m in pending)
+                        if not has_pending_remind:
+                            self.queue_message(
+                                target_session_id=target_session_id,
+                                text='[sm remind] Update your status: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete',
+                                delivery_mode="important",
+                            )
                     reg.soft_fired = True
                     self._update_remind_db(target_session_id, soft_fired=True)
 
                 # Hard threshold: fire urgent remind and reset cycle
                 if elapsed >= reg.hard_threshold_seconds:
-                    self.queue_message(
-                        target_session_id=target_session_id,
-                        text='[sm remind] Status overdue. Run: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete',
-                        delivery_mode="urgent",
-                    )
+                    if reg.cancel_on_reply_session_ids:
+                        self._queue_tracked_remind_notifications(
+                            target_session_id,
+                            reg,
+                            urgent=True,
+                        )
+                    else:
+                        self.queue_message(
+                            target_session_id=target_session_id,
+                            text='[sm remind] Status overdue. Run: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete',
+                            delivery_mode="urgent",
+                        )
                     # Reset cycle so it restarts
                     now = datetime.now()
                     reg.last_reset_at = now
