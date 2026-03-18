@@ -2249,6 +2249,7 @@ class SessionManager:
         bypass_queue: bool = False,
         remind_soft_threshold: Optional[int] = None,
         remind_hard_threshold: Optional[int] = None,
+        remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
     ) -> DeliveryResult:
         """
@@ -2267,6 +2268,7 @@ class SessionManager:
             bypass_queue: If True, send directly to tmux (for permission responses)
             remind_soft_threshold: Seconds after delivery before soft remind fires (#188)
             remind_hard_threshold: Seconds after delivery before hard remind fires (#188)
+            remind_cancel_on_reply_session_id: Cancel remind when target replies to this session (#406)
 
         Returns:
             DeliveryResult indicating whether message was DELIVERED, QUEUED, or FAILED
@@ -2340,6 +2342,11 @@ class SessionManager:
 
         # Handle delivery modes using the message queue manager
         if self.message_queue_manager:
+            if from_sm_send and sender_session_id:
+                self.message_queue_manager.cancel_tracked_remind_on_reply(
+                    sender_session_id=sender_session_id,
+                    recipient_session_id=session_id,
+                )
             # For sequential mode, queue first, then report whether the immediate
             # delivery attempt actually injected the message.
             if delivery_mode == "sequential":
@@ -2355,6 +2362,7 @@ class SessionManager:
                     notify_on_stop=notify_on_stop,
                     remind_soft_threshold=remind_soft_threshold,
                     remind_hard_threshold=remind_hard_threshold,
+                    remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
                 )
@@ -2385,6 +2393,7 @@ class SessionManager:
                     notify_on_stop=notify_on_stop,
                     remind_soft_threshold=remind_soft_threshold,
                     remind_hard_threshold=remind_hard_threshold,
+                    remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
                 )
@@ -2414,6 +2423,7 @@ class SessionManager:
                     notify_on_stop=notify_on_stop,
                     remind_soft_threshold=remind_soft_threshold,
                     remind_hard_threshold=remind_hard_threshold,
+                    remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                 )
                 if from_sm_send and sender_session_id:

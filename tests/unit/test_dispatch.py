@@ -727,6 +727,30 @@ class TestCmdSendRemindParams:
         assert call_kwargs["remind_soft_threshold"] is None
         assert call_kwargs["remind_hard_threshold"] is None
 
+    def test_track_sets_reply_cancelled_thresholds(self):
+        """--track maps to periodic remind thresholds and reply-cancel metadata."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+
+        cmd_send(mock_client, "sess1", "hello", track_seconds=300)
+
+        call_kwargs = mock_client.send_input.call_args[1]
+        assert call_kwargs["remind_soft_threshold"] == 300
+        assert call_kwargs["remind_hard_threshold"] == 600
+        assert call_kwargs["remind_cancel_on_reply_session_id"] == "sender1"
+
+    def test_track_requires_managed_sender(self, capsys):
+        """--track fails outside a managed session because auto-cancel needs a sender ID."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+        mock_client.session_id = None
+
+        rc = cmd_send(mock_client, "sess1", "hello", track_seconds=300)
+
+        assert rc == 2
+        mock_client.send_input.assert_not_called()
+        assert "CLAUDE_SESSION_MANAGER_ID" in capsys.readouterr().err
+
     def test_self_send_suppresses_notify_on_stop(self, capsys):
         """Self-send must not request or print notify-on-stop."""
         from src.cli.commands import cmd_send

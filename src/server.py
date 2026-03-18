@@ -180,6 +180,7 @@ class SendInputRequest(BaseModel):
     notify_on_stop: bool = False  # Notify sender when receiver's Stop hook fires
     remind_soft_threshold: Optional[int] = None  # Seconds for soft remind after delivery (#188)
     remind_hard_threshold: Optional[int] = None  # Seconds for hard remind after delivery (#188)
+    remind_cancel_on_reply_session_id: Optional[str] = None  # Cancel remind when target replies to this session (#406)
     parent_session_id: Optional[str] = None  # EM session to wake periodically after delivery (#225-C)
 
 
@@ -193,6 +194,7 @@ class PeriodicRemindRequest(BaseModel):
     """Request to register a periodic remind for a session (#188)."""
     soft_threshold: int
     hard_threshold: int
+    cancel_on_reply_session_id: Optional[str] = None
 
 
 class JobWatchCreateRequest(BaseModel):
@@ -1976,6 +1978,7 @@ def create_app(
             notify_on_stop=request.notify_on_stop,
             remind_soft_threshold=request.remind_soft_threshold,
             remind_hard_threshold=request.remind_hard_threshold,
+            remind_cancel_on_reply_session_id=request.remind_cancel_on_reply_session_id,
             parent_session_id=request.parent_session_id,
         )
 
@@ -3486,6 +3489,7 @@ Provide ONLY the summary, no preamble or questions."""
             target_session_id=session_id,
             soft_threshold=request.soft_threshold,
             hard_threshold=request.hard_threshold,
+            cancel_on_reply_session_id=request.cancel_on_reply_session_id,
         )
         return {
             "status": "registered",
@@ -3493,6 +3497,7 @@ Provide ONLY the summary, no preamble or questions."""
             "session_id": session_id,
             "soft_threshold": request.soft_threshold,
             "hard_threshold": request.hard_threshold,
+            "cancel_on_reply_session_id": request.cancel_on_reply_session_id,
         }
 
     @app.delete("/sessions/{session_id}/remind")

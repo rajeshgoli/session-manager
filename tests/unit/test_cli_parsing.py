@@ -37,6 +37,7 @@ class TestCliParsing:
         send_parser.add_argument("--important", action="store_true")
         send_parser.add_argument("--urgent", action="store_true")
         send_parser.add_argument("--wait", type=int, metavar="SECONDS")
+        send_parser.add_argument("--track", nargs="?", const=300, type=int, metavar="SECONDS")
 
         # sm spawn
         spawn_parser = subparsers.add_parser("spawn")
@@ -47,6 +48,7 @@ class TestCliParsing:
         spawn_parser.add_argument("--model")
         spawn_parser.add_argument("--working-dir")
         spawn_parser.add_argument("--json", action="store_true")
+        spawn_parser.add_argument("--track", nargs="?", const=300, type=int, metavar="SECONDS")
 
         # sm wait
         wait_parser = subparsers.add_parser("wait")
@@ -179,6 +181,20 @@ class TestSendCommand:
 
         assert args.wait == 60
 
+    def test_send_track_default_flag(self):
+        """sm send --track defaults to 300 seconds."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["send", "target123", "Test", "--track"])
+
+        assert args.track == 300
+
+    def test_send_track_custom_flag(self):
+        """sm send --track N parses correctly."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["send", "target123", "Test", "--track", "420"])
+
+        assert args.track == 420
+
 
 class TestSpawnCommand:
     """Tests for 'sm spawn' command parsing."""
@@ -203,6 +219,20 @@ class TestSpawnCommand:
         args = parser._get_parsed_args(["spawn", "claude", "--wait", "300", "Test prompt"])
 
         assert args.wait == 300
+
+    def test_spawn_track_default_flag(self):
+        """sm spawn --track defaults to 300 seconds."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "claude", "Test prompt", "--track"])
+
+        assert args.track == 300
+
+    def test_spawn_track_custom_flag(self):
+        """sm spawn --track N parses correctly."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "claude", "Test prompt", "--track", "420"])
+
+        assert args.track == 420
 
     def test_spawn_model_flag(self):
         """sm spawn --model opus sets model."""

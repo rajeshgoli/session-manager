@@ -403,6 +403,7 @@ class SessionManagerClient:
         notify_on_stop: bool = False,
         remind_soft_threshold: Optional[int] = None,
         remind_hard_threshold: Optional[int] = None,
+        remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
     ) -> tuple[bool, bool]:
         """
@@ -437,6 +438,8 @@ class SessionManagerClient:
             payload["remind_soft_threshold"] = remind_soft_threshold
         if remind_hard_threshold is not None:
             payload["remind_hard_threshold"] = remind_hard_threshold
+        if remind_cancel_on_reply_session_id is not None:
+            payload["remind_cancel_on_reply_session_id"] = remind_cancel_on_reply_session_id
         if parent_session_id is not None:
             payload["parent_session_id"] = parent_session_id
 
@@ -460,6 +463,7 @@ class SessionManagerClient:
         notify_on_stop: bool = False,
         remind_soft_threshold: Optional[int] = None,
         remind_hard_threshold: Optional[int] = None,
+        remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
     ) -> dict:
         """Send input and return full API result metadata."""
@@ -478,6 +482,8 @@ class SessionManagerClient:
             payload["remind_soft_threshold"] = remind_soft_threshold
         if remind_hard_threshold is not None:
             payload["remind_hard_threshold"] = remind_hard_threshold
+        if remind_cancel_on_reply_session_id is not None:
+            payload["remind_cancel_on_reply_session_id"] = remind_cancel_on_reply_session_id
         if parent_session_id is not None:
             payload["parent_session_id"] = parent_session_id
 
@@ -1179,12 +1185,21 @@ class SessionManagerClient:
         )
         return success, unavailable
 
-    def register_remind(self, target_session_id: str, soft_threshold: int, hard_threshold: int) -> Optional[dict]:
+    def register_remind(
+        self,
+        target_session_id: str,
+        soft_threshold: int,
+        hard_threshold: int,
+        cancel_on_reply_session_id: Optional[str] = None,
+    ) -> Optional[dict]:
         """Register a periodic remind for a session (#188)."""
+        payload = {"soft_threshold": soft_threshold, "hard_threshold": hard_threshold}
+        if cancel_on_reply_session_id is not None:
+            payload["cancel_on_reply_session_id"] = cancel_on_reply_session_id
         data, success, unavailable = self._request(
             "POST",
             f"/sessions/{target_session_id}/remind",
-            {"soft_threshold": soft_threshold, "hard_threshold": hard_threshold},
+            payload,
         )
         if unavailable:
             return None

@@ -540,6 +540,7 @@ class QueuedMessage:
     delivered_at: Optional[datetime] = None  # None = pending
     remind_soft_threshold: Optional[int] = None  # Seconds for soft remind after delivery (#188)
     remind_hard_threshold: Optional[int] = None  # Seconds for hard remind after delivery (#188)
+    remind_cancel_on_reply_session_id: Optional[str] = None  # Cancel remind when target sm-sends back to this session (#406)
     parent_session_id: Optional[str] = None  # EM to wake periodically after delivery (#225-C)
     message_category: Optional[str] = None  # e.g. 'context_monitor' for cancellation scoping (#241)
 
@@ -560,6 +561,7 @@ class QueuedMessage:
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
             "remind_soft_threshold": self.remind_soft_threshold,
             "remind_hard_threshold": self.remind_hard_threshold,
+            "remind_cancel_on_reply_session_id": self.remind_cancel_on_reply_session_id,
             "parent_session_id": self.parent_session_id,
             "message_category": self.message_category,
         }
@@ -571,9 +573,10 @@ class RemindRegistration:
     id: str
     target_session_id: str
     soft_threshold_seconds: int
-    hard_threshold_seconds: int  # soft + hard_gap
+    hard_threshold_seconds: int
     registered_at: datetime
     last_reset_at: datetime  # updated by sm status; initialized on delivery
+    cancel_on_reply_session_id: Optional[str] = None
     soft_fired: bool = False
     is_active: bool = True
 
