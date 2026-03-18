@@ -1333,6 +1333,7 @@ class TestTelegramMirroring:
 
         # Trigger delivery
         await mq._try_deliver_messages("target123")
+        await asyncio.sleep(0)
 
         # Verify Telegram mirroring was called (message delivered)
         assert mock_notifier.notify.call_count >= 1
@@ -1342,6 +1343,7 @@ class TestTelegramMirroring:
             if call[0][0].event_type == "message_delivered"
         ]
         assert len(delivered_calls) >= 1
+        await mq.stop()
 
     @pytest.mark.asyncio
     async def test_stop_notification_mirrors_to_telegram(self, mock_session_manager, temp_db_path):
@@ -1380,6 +1382,7 @@ class TestTelegramMirroring:
             sender_session_id="sender456",
             sender_name="Agent B",
         )
+        await asyncio.sleep(0)
 
         # Verify Telegram mirroring was called for stop notification
         stop_notify_calls = [
@@ -1389,6 +1392,142 @@ class TestTelegramMirroring:
         assert len(stop_notify_calls) == 1
         event = stop_notify_calls[0][0][0]
         assert "🛑" in event.message
+        await mq.stop()
+
+    @pytest.mark.asyncio
+    async def test_delivery_does_not_wait_for_slow_telegram_mirror(self, mock_session_manager, temp_db_path):
+        """Slow Telegram mirroring must not block message delivery."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=MagicMock(),
+        )
+
+        mock_session = MagicMock()
+        mock_session.id = "target123"
+        mock_session.tmux_session = "tmux-test"
+        mock_session.telegram_chat_id = 12345
+        mock_session.status = SessionStatus.IDLE
+        mock_session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=mock_session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+
+        mirror_started = asyncio.Event()
+        mirror_release = asyncio.Event()
+
+        async def slow_mirror(*args, **kwargs):
+            mirror_started.set()
+            await mirror_release.wait()
+
+        mq._mirror_to_telegram = AsyncMock(side_effect=slow_mirror)
+        mq.queue_message(
+            target_session_id="target123",
+            text="Hello from sender",
+            sender_session_id="sender456",
+            sender_name="Agent X",
+        )
+        mq.mark_session_idle("target123")
+
+        await asyncio.wait_for(mq._try_deliver_messages("target123"), timeout=0.1)
+        await asyncio.wait_for(mirror_started.wait(), timeout=0.1)
+
+        mirror_release.set()
+        await asyncio.sleep(0)
+        await mq.stop()
+
+    @pytest.mark.asyncio
+    async def test_telegram_mirror_worker_preserves_fifo(self, mock_session_manager, temp_db_path):
+        """Background Telegram mirroring must remain serialized and ordered."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=MagicMock(),
+        )
+
+        session = MagicMock()
+        session.id = "target123"
+        session.telegram_chat_id = 12345
+
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_started = asyncio.Event()
+        seen: list[str] = []
+
+        async def ordered_mirror(text, _session, _event_type):
+            seen.append(text)
+            if text == "first":
+                first_started.set()
+                await first_release.wait()
+            if text == "second":
+                second_started.set()
+
+        mq._mirror_to_telegram = AsyncMock(side_effect=ordered_mirror)
+
+        mq._enqueue_telegram_mirror("first", session, "message_delivered", "first")
+        mq._enqueue_telegram_mirror("second", session, "message_delivered", "second")
+
+        await asyncio.wait_for(first_started.wait(), timeout=0.1)
+        await asyncio.sleep(0.05)
+        assert not second_started.is_set()
+        assert seen == ["first"]
+
+        first_release.set()
+        await asyncio.wait_for(second_started.wait(), timeout=0.1)
+        assert seen == ["first", "second"]
+        await mq.stop()
+
+    def test_telegram_mirror_queue_drops_oldest_when_full(self, mock_session_manager, temp_db_path):
+        """Mirror backlog must be bounded so Telegram outages cannot grow memory unbounded."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"sm_send": {"telegram_mirror_max_queue": 1}},
+            notifier=MagicMock(),
+        )
+
+        session = MagicMock()
+        session.id = "target123"
+        session.telegram_chat_id = 12345
+        session.telegram_thread_id = 678
+
+        mq._telegram_mirror_queue = asyncio.Queue(maxsize=1)
+        mq._telegram_mirror_worker_task = MagicMock()
+        mq._telegram_mirror_worker_task.done.return_value = False
+
+        mq._enqueue_telegram_mirror("first", session, "message_delivered", "first")
+        mq._enqueue_telegram_mirror("second", session, "message_delivered", "second")
+
+        assert mq._telegram_mirror_queue.qsize() == 1
+        queued = mq._telegram_mirror_queue.get_nowait()
+        assert queued[0] == "second"
+        assert queued[3] == "second"
+        mq._telegram_mirror_queue.task_done()
+
+    def test_telegram_mirror_queue_snapshots_routing(self, mock_session_manager, temp_db_path):
+        """Queued mirror work must use Telegram routing captured at enqueue time."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=MagicMock(),
+        )
+
+        session = MagicMock()
+        session.id = "target123"
+        session.telegram_chat_id = 12345
+        session.telegram_thread_id = 678
+
+        mq._telegram_mirror_queue = asyncio.Queue(maxsize=4)
+        mq._telegram_mirror_worker_task = MagicMock()
+        mq._telegram_mirror_worker_task.done.return_value = False
+
+        mq._enqueue_telegram_mirror("snapshot-test", session, "message_delivered", "snapshot")
+        session.telegram_chat_id = 99999
+        session.telegram_thread_id = 111
+
+        _, snapshot, _, _ = mq._telegram_mirror_queue.get_nowait()
+        assert snapshot.telegram_chat_id == 12345
+        assert snapshot.telegram_thread_id == 678
+        mq._telegram_mirror_queue.task_done()
 
 
 class TestDirectDelivery244:
