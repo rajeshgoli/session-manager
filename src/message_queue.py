@@ -2261,6 +2261,7 @@ class MessageQueueManager:
                 sender_session_id,
                 cancel_on_reply_session_id=self._serialize_cancel_on_reply_session_ids(reg.cancel_on_reply_session_ids),
             )
+            self.cancel_queued_track_reminds(sender_session_id, recipient_session_id)
             logger.info(
                 "Tracked remind owner %s cleared for %s; remaining owners=%s",
                 recipient_session_id,
@@ -2268,6 +2269,7 @@ class MessageQueueManager:
                 reg.cancel_on_reply_session_ids,
             )
         else:
+            self.cancel_queued_track_reminds(sender_session_id, recipient_session_id)
             self.cancel_remind(sender_session_id)
             logger.info(
                 "Tracked remind auto-cancelled for %s after reply to %s",
@@ -2276,7 +2278,7 @@ class MessageQueueManager:
             )
         return True
 
-    def reset_remind(self, target_session_id: str):
+    def reset_remind(self, target_session_id: str, *, force_tracked: bool = False):
         """
         Reset the remind timer for a session (called when agent reports sm status).
 
@@ -2285,7 +2287,7 @@ class MessageQueueManager:
         reg = self._remind_registrations.get(target_session_id)
         if not reg or not reg.is_active:
             return
-        if reg.cancel_on_reply_session_ids:
+        if reg.cancel_on_reply_session_ids and not force_tracked:
             logger.debug(
                 "Ignoring reset_remind for tracked session %s; tracking cadence is requester-facing (#408)",
                 target_session_id,
@@ -2298,6 +2300,30 @@ class MessageQueueManager:
 
         self._update_remind_db(target_session_id, last_reset_at=now, soft_fired=False)
         logger.info(f"Remind timer reset for {target_session_id}")
+
+    def cancel_queued_track_reminds(self, tracked_session_id: str, owner_session_id: str) -> int:
+        """Delete undelivered requester-facing track reminders for one tracked-session/owner pair."""
+        rows = self._execute_query(
+            "SELECT COUNT(*) FROM message_queue "
+            "WHERE target_session_id = ? AND sender_session_id = ? "
+            "AND message_category = 'track_remind' AND delivered_at IS NULL",
+            (owner_session_id, tracked_session_id),
+        )
+        count = rows[0][0] if rows else 0
+        if count:
+            self._execute(
+                "DELETE FROM message_queue "
+                "WHERE target_session_id = ? AND sender_session_id = ? "
+                "AND message_category = 'track_remind' AND delivered_at IS NULL",
+                (owner_session_id, tracked_session_id),
+            )
+            logger.info(
+                "Cancelled %s queued track reminder(s) for owner=%s tracked=%s",
+                count,
+                owner_session_id,
+                tracked_session_id,
+            )
+        return count
 
     def _build_tracked_remind_text(self, target_session_id: str, reg: RemindRegistration, urgent: bool) -> str:
         """Build requester-facing tracked reminder text for one target session (#408)."""
@@ -2344,6 +2370,7 @@ class MessageQueueManager:
                     continue
             self.queue_message(
                 target_session_id=owner_session_id,
+                sender_session_id=target_session_id,
                 text=text,
                 delivery_mode=delivery_mode,
                 message_category="track_remind",

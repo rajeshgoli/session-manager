@@ -278,6 +278,26 @@ class TestStatusReset:
         assert reg.last_reset_at == old_reset
         assert reg.soft_fired is True
 
+    def test_reset_remind_force_resets_tracked_registration(self, mq):
+        """Compaction-complete can still force a fresh grace window for tracked reminders."""
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                "tracked-target-force",
+                soft_threshold=10,
+                hard_threshold=20,
+                cancel_on_reply_session_id="owner408",
+            )
+
+        reg = mq._remind_registrations["tracked-target-force"]
+        old_reset = datetime.now() - timedelta(seconds=30)
+        reg.last_reset_at = old_reset
+        reg.soft_fired = True
+
+        mq.reset_remind("tracked-target-force", force_tracked=True)
+
+        assert reg.last_reset_at > old_reset
+        assert reg.soft_fired is False
+
     def test_reset_remind_persists_to_db(self, mq):
         """reset_remind updates DB row."""
         with patch("asyncio.create_task", noop_create_task):
@@ -1084,6 +1104,29 @@ class TestTrackedReplyCancellation:
         assert reg.soft_threshold_seconds == 240
         assert reg.hard_threshold_seconds == 480
 
+    def test_cancel_tracked_remind_drops_queued_track_messages_for_owner(self, mq):
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                "child406queued",
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id="parent406queued",
+            )
+            mq.queue_message(
+                target_session_id="parent406queued",
+                sender_session_id="child406queued",
+                text="[sm track] Waiting on child406queued (child406)",
+                delivery_mode="important",
+                message_category="track_remind",
+                trigger_delivery=False,
+            )
+
+        cancelled = mq.cancel_tracked_remind_on_reply("child406queued", "parent406queued")
+
+        assert cancelled is True
+        pending = mq.get_pending_messages("parent406queued")
+        assert pending == []
+
     @pytest.mark.asyncio
     async def test_send_input_cancels_tracked_remind_on_reply(self, mq):
         """SessionManager.send_input auto-cancels tracked remind when the child replies to the owner."""
@@ -1174,6 +1217,7 @@ class TestTrackedReminderDelivery:
         target_pending = mq.get_pending_messages(target.id)
         assert len(owner_pending) == 1
         assert owner_pending[0].message_category == "track_remind"
+        assert owner_pending[0].sender_session_id == target.id
         assert owner_pending[0].delivery_mode == "important"
         assert "[sm track] Waiting on eng-target (target40)" in owner_pending[0].text
         assert "Awaiting explicit reply from target40." in owner_pending[0].text
