@@ -115,6 +115,7 @@ class MessageQueueManager:
         # Value: datetime when stop notification was sent
         self._recent_stop_notifications: Dict[Tuple[str, str], datetime] = {}
         self._pending_stop_notify_tasks: Dict[str, asyncio.Task] = {}
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Notification callback (set by main app)
         self._notify_callback: Optional[Callable] = None
@@ -807,6 +808,22 @@ class MessageQueueManager:
         except Exception as e:
             logger.warning(f"Telegram mirror failed (non-fatal): {e}")
 
+    def _start_background_task(self, coro: Awaitable, description: str) -> None:
+        """Run best-effort async work without holding up the caller."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _done(done_task: asyncio.Task):
+            self._background_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning(f"Background task failed ({description}): {exc}")
+
+        task.add_done_callback(_done)
+
     async def start(self):
         """Start the queue monitoring service."""
         self._running = True
@@ -865,6 +882,11 @@ class MessageQueueManager:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+        self._background_tasks.clear()
         # Cancel all scheduled tasks
         for task in self._scheduled_tasks.values():
             task.cancel()
@@ -1614,7 +1636,10 @@ class MessageQueueManager:
                         # Truncate message text for display
                         text_preview = msg.text[:200] if len(msg.text) > 200 else msg.text
                         mirror_text = f"📨 [{sender_display}] {text_preview}"
-                        await self._mirror_to_telegram(mirror_text, session, "message_delivered")
+                        self._start_background_task(
+                            self._mirror_to_telegram(mirror_text, session, "message_delivered"),
+                            f"message_delivered:{session_id}",
+                        )
 
                     # Handle delivery notifications
                     if msg.notify_on_delivery and msg.sender_session_id:
@@ -1834,7 +1859,10 @@ class MessageQueueManager:
         sender_session = self.session_manager.get_session(msg.sender_session_id)
         if sender_session:
             mirror_text = f"✅ {notification}"
-            await self._mirror_to_telegram(mirror_text, sender_session, "delivery_confirm")
+            self._start_background_task(
+                self._mirror_to_telegram(mirror_text, sender_session, "delivery_confirm"),
+                f"delivery_confirm:{msg.sender_session_id}",
+            )
 
     async def _send_stop_notification(
         self,
@@ -1880,7 +1908,10 @@ class MessageQueueManager:
         sender_session = self.session_manager.get_session(sender_session_id)
         if sender_session:
             mirror_text = f"🛑 {notification}"
-            await self._mirror_to_telegram(mirror_text, sender_session, "stop_notify")
+            self._start_background_task(
+                self._mirror_to_telegram(mirror_text, sender_session, "stop_notify"),
+                f"stop_notify:{sender_session_id}",
+            )
 
     async def _schedule_followup_notification(self, msg: QueuedMessage):
         """Schedule a follow-up notification after delivery."""
@@ -3038,7 +3069,10 @@ class MessageQueueManager:
                     watcher_session = self.session_manager.get_session(watcher_session_id)
                     if watcher_session:
                         mirror_text = f"💤 {notification}"
-                        await self._mirror_to_telegram(mirror_text, watcher_session, "idle_notify")
+                        self._start_background_task(
+                            self._mirror_to_telegram(mirror_text, watcher_session, "idle_notify"),
+                            f"idle_notify:{watcher_session_id}",
+                        )
 
                     return
 
@@ -3066,7 +3100,10 @@ class MessageQueueManager:
             watcher_session = self.session_manager.get_session(watcher_session_id)
             if watcher_session:
                 mirror_text = f"💤 {notification}"
-                await self._mirror_to_telegram(mirror_text, watcher_session, "timeout_notify")
+                self._start_background_task(
+                    self._mirror_to_telegram(mirror_text, watcher_session, "timeout_notify"),
+                    f"timeout_notify:{watcher_session_id}",
+                )
 
         except asyncio.CancelledError:
             logger.info(f"Watch {watch_id} cancelled")

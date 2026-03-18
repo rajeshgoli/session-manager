@@ -1333,6 +1333,7 @@ class TestTelegramMirroring:
 
         # Trigger delivery
         await mq._try_deliver_messages("target123")
+        await asyncio.sleep(0)
 
         # Verify Telegram mirroring was called (message delivered)
         assert mock_notifier.notify.call_count >= 1
@@ -1380,6 +1381,7 @@ class TestTelegramMirroring:
             sender_session_id="sender456",
             sender_name="Agent B",
         )
+        await asyncio.sleep(0)
 
         # Verify Telegram mirroring was called for stop notification
         stop_notify_calls = [
@@ -1389,6 +1391,46 @@ class TestTelegramMirroring:
         assert len(stop_notify_calls) == 1
         event = stop_notify_calls[0][0][0]
         assert "🛑" in event.message
+
+    @pytest.mark.asyncio
+    async def test_delivery_does_not_wait_for_slow_telegram_mirror(self, mock_session_manager, temp_db_path):
+        """Slow Telegram mirroring must not block message delivery."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=MagicMock(),
+        )
+
+        mock_session = MagicMock()
+        mock_session.id = "target123"
+        mock_session.tmux_session = "tmux-test"
+        mock_session.telegram_chat_id = 12345
+        mock_session.status = SessionStatus.IDLE
+        mock_session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=mock_session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+
+        mirror_started = asyncio.Event()
+        mirror_release = asyncio.Event()
+
+        async def slow_mirror(*args, **kwargs):
+            mirror_started.set()
+            await mirror_release.wait()
+
+        mq._mirror_to_telegram = AsyncMock(side_effect=slow_mirror)
+        mq.queue_message(
+            target_session_id="target123",
+            text="Hello from sender",
+            sender_session_id="sender456",
+            sender_name="Agent X",
+        )
+        mq.mark_session_idle("target123")
+
+        await asyncio.wait_for(mq._try_deliver_messages("target123"), timeout=0.1)
+        await asyncio.wait_for(mirror_started.wait(), timeout=0.1)
+
+        mirror_release.set()
+        await asyncio.sleep(0)
 
 
 class TestDirectDelivery244:
