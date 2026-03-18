@@ -223,6 +223,42 @@ class TestEmSpawnAutoRegister:
         assert "Warning" in err
         assert "stop notification" in err
 
+    def test_track_registers_reply_cancelled_remind_for_non_em_parent(self):
+        """--track registers remind even when the parent is not EM."""
+        client = _make_client(parent_session=_make_non_em_session())
+
+        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X", track_seconds=300)
+
+        assert rc == 0
+        client.register_remind.assert_called_once_with(
+            "child001",
+            soft_threshold=300,
+            hard_threshold=600,
+            cancel_on_reply_session_id="eng111bb",
+        )
+
+    def test_track_overrides_em_remind_registration_but_keeps_em_monitoring(self):
+        """--track replaces the default remind thresholds while leaving EM monitoring intact."""
+        client = _make_client(parent_session=_make_em_session())
+
+        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X", track_seconds=300)
+
+        assert rc == 0
+        assert client.register_remind.call_count == 2
+        assert client.register_remind.call_args_list[0] == call(
+            "child001",
+            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
+            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
+        )
+        assert client.register_remind.call_args_list[1] == call(
+            "child001",
+            soft_threshold=300,
+            hard_threshold=600,
+            cancel_on_reply_session_id="em0000aa",
+        )
+        client.set_context_monitor.assert_called_once()
+        client.arm_stop_notify.assert_called_once()
+
 
 class TestSpawnProviderAwareModel:
     """Provider-aware model handling for sm spawn (#290)."""

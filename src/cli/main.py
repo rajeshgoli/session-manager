@@ -136,6 +136,14 @@ def main():
     send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
     send_parser.add_argument("--steer", action="store_true", help="Inject via Enter-based mid-turn steering (for Codex reviews)")
     send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
+    send_parser.add_argument(
+        "--track",
+        nargs="?",
+        const=300,
+        type=int,
+        metavar="SECONDS",
+        help="Track the recipient with periodic remind until it replies (default: 300s)",
+    )
 
     # sm remind <delay> <message>  (one-shot self-reminder)
     # sm remind <session-id> --stop  (cancel periodic remind)
@@ -213,6 +221,14 @@ def main():
     )
     spawn_parser.add_argument("--working-dir", help="Override working directory (defaults to parent's directory)")
     spawn_parser.add_argument("--json", action="store_true", help="Output JSON")
+    spawn_parser.add_argument(
+        "--track",
+        nargs="?",
+        const=300,
+        type=int,
+        metavar="SECONDS",
+        help="Track the child with periodic remind until it replies (default: 300s)",
+    )
 
     # sm children [session-id]
     children_parser = subparsers.add_parser("children", help="List child sessions")
@@ -672,6 +688,7 @@ def main():
         sys.exit(commands.cmd_send(
             client, args.session_id, args.text, delivery_mode,
             wait_seconds=wait_seconds, notify_on_stop=notify_on_stop,
+            track_seconds=getattr(args, "track", None),
         ))
     elif args.command == "remind":
         if args.stop:
@@ -724,7 +741,18 @@ def main():
         sys.exit(2)
     elif args.command == "spawn":
         provider = "codex-fork" if args.provider == "codex" else args.provider
-        sys.exit(commands.cmd_spawn(client, session_id, provider, args.prompt, args.name, args.wait, args.model, args.working_dir, args.json))
+        sys.exit(commands.cmd_spawn(
+            client,
+            session_id,
+            provider,
+            args.prompt,
+            args.name,
+            args.wait,
+            args.model,
+            args.working_dir,
+            args.json,
+            getattr(args, "track", None),
+        ))
     elif args.command == "children":
         # Use current session if not specified
         parent_id = args.session_id if args.session_id else session_id

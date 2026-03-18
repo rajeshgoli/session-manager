@@ -1,6 +1,7 @@
 """Message queue manager for reliable inter-agent messaging (sm-send-v2)."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -148,6 +149,7 @@ class MessageQueueManager:
                 sender_name TEXT,
                 text TEXT NOT NULL,
                 delivery_mode TEXT DEFAULT 'sequential',
+                from_sm_send INTEGER DEFAULT 0,
                 queued_at TIMESTAMP NOT NULL,
                 timeout_at TIMESTAMP,
                 notify_on_delivery INTEGER DEFAULT 0,
@@ -156,6 +158,7 @@ class MessageQueueManager:
                 delivered_at TIMESTAMP,
                 remind_soft_threshold INTEGER,
                 remind_hard_threshold INTEGER,
+                remind_cancel_on_reply_session_id TEXT,
                 parent_session_id TEXT,
                 message_category TEXT DEFAULT NULL
             )
@@ -182,12 +185,18 @@ class MessageQueueManager:
         if "notify_on_stop" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN notify_on_stop INTEGER DEFAULT 0")
             logger.info("Migrated message_queue: added notify_on_stop column")
+        if "from_sm_send" not in columns:
+            cursor.execute("ALTER TABLE message_queue ADD COLUMN from_sm_send INTEGER DEFAULT 0")
+            logger.info("Migrated message_queue: added from_sm_send column")
         if "remind_soft_threshold" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN remind_soft_threshold INTEGER")
             logger.info("Migrated message_queue: added remind_soft_threshold column")
         if "remind_hard_threshold" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN remind_hard_threshold INTEGER")
             logger.info("Migrated message_queue: added remind_hard_threshold column")
+        if "remind_cancel_on_reply_session_id" not in columns:
+            cursor.execute("ALTER TABLE message_queue ADD COLUMN remind_cancel_on_reply_session_id TEXT")
+            logger.info("Migrated message_queue: added remind_cancel_on_reply_session_id column")
         if "parent_session_id" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN parent_session_id TEXT")
             logger.info("Migrated message_queue: added parent_session_id column")
@@ -204,10 +213,16 @@ class MessageQueueManager:
                 hard_threshold_seconds INTEGER NOT NULL,
                 registered_at TIMESTAMP NOT NULL,
                 last_reset_at TIMESTAMP NOT NULL,
+                cancel_on_reply_session_id TEXT,
                 soft_fired INTEGER DEFAULT 0,
                 is_active INTEGER DEFAULT 1
             )
         """)
+        cursor.execute("PRAGMA table_info(remind_registrations)")
+        remind_columns = [col[1] for col in cursor.fetchall()]
+        if "cancel_on_reply_session_id" not in remind_columns:
+            cursor.execute("ALTER TABLE remind_registrations ADD COLUMN cancel_on_reply_session_id TEXT")
+            logger.info("Migrated remind_registrations: added cancel_on_reply_session_id column")
 
         # Parent wake-up registrations table (#225-C)
         cursor.execute("""
@@ -1140,6 +1155,28 @@ class MessageQueueManager:
             self.delivery_states[session_id] = SessionDeliveryState(session_id=session_id)
         return self.delivery_states[session_id]
 
+    @staticmethod
+    def _serialize_cancel_on_reply_session_ids(session_ids: tuple[str, ...]) -> Optional[str]:
+        """Persist tracked reply owners as a JSON array."""
+        if not session_ids:
+            return None
+        return json.dumps(sorted(set(session_ids)))
+
+    @staticmethod
+    def _deserialize_cancel_on_reply_session_ids(raw_value: Optional[str]) -> tuple[str, ...]:
+        """Restore tracked reply owners from JSON, with scalar fallback for older rows."""
+        if not raw_value:
+            return ()
+        try:
+            decoded = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError):
+            return (str(raw_value),)
+        if isinstance(decoded, list):
+            return tuple(str(item) for item in decoded if item)
+        if isinstance(decoded, str) and decoded:
+            return (decoded,)
+        return ()
+
     # =========================================================================
     # Message Queueing
     # =========================================================================
@@ -1151,12 +1188,14 @@ class MessageQueueManager:
         sender_session_id: Optional[str] = None,
         sender_name: Optional[str] = None,
         delivery_mode: str = "sequential",
+        from_sm_send: bool = False,
         timeout_seconds: Optional[int] = None,
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
         notify_on_stop: bool = False,
         remind_soft_threshold: Optional[int] = None,
         remind_hard_threshold: Optional[int] = None,
+        remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
         message_category: Optional[str] = None,
         trigger_delivery: bool = True,
@@ -1170,12 +1209,14 @@ class MessageQueueManager:
             sender_session_id: Sender session ID
             sender_name: Sender friendly name
             delivery_mode: sequential, important, or urgent
+            from_sm_send: True when the message originated from the sm send CLI
             timeout_seconds: Drop message if not delivered in this time
             notify_on_delivery: Notify sender when delivered
             notify_after_seconds: Notify sender N seconds after delivery
             notify_on_stop: Notify sender when receiver's Stop hook fires
             remind_soft_threshold: Seconds after delivery before soft remind fires (#188)
             remind_hard_threshold: Seconds after delivery before hard remind fires (#188)
+            remind_cancel_on_reply_session_id: Cancel remind when the target replies to this session (#406)
             parent_session_id: EM session to wake periodically after delivery (#225-C)
             message_category: Optional category tag, e.g. 'context_monitor', for scoped cancellation (#241)
             trigger_delivery: If True, queue_message schedules immediate delivery based on mode.
@@ -1189,6 +1230,7 @@ class MessageQueueManager:
             sender_name=sender_name,
             text=text,
             delivery_mode=delivery_mode,
+            from_sm_send=from_sm_send,
             queued_at=datetime.now(),
             timeout_at=datetime.now() + timedelta(seconds=timeout_seconds) if timeout_seconds else None,
             notify_on_delivery=notify_on_delivery,
@@ -1196,6 +1238,7 @@ class MessageQueueManager:
             notify_on_stop=notify_on_stop,
             remind_soft_threshold=remind_soft_threshold,
             remind_hard_threshold=remind_hard_threshold,
+            remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
             parent_session_id=parent_session_id,
             message_category=message_category,
         )
@@ -1204,10 +1247,10 @@ class MessageQueueManager:
         self._execute("""
             INSERT INTO message_queue
             (id, target_session_id, sender_session_id, sender_name, text,
-             delivery_mode, queued_at, timeout_at, notify_on_delivery, notify_after_seconds,
-             notify_on_stop, remind_soft_threshold, remind_hard_threshold, parent_session_id,
-             message_category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery, notify_after_seconds,
+             notify_on_stop, remind_soft_threshold, remind_hard_threshold,
+             remind_cancel_on_reply_session_id, parent_session_id, message_category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id,
             msg.target_session_id,
@@ -1215,6 +1258,7 @@ class MessageQueueManager:
             msg.sender_name,
             msg.text,
             msg.delivery_mode,
+            1 if msg.from_sm_send else 0,
             msg.queued_at.isoformat(),
             msg.timeout_at.isoformat() if msg.timeout_at else None,
             1 if msg.notify_on_delivery else 0,
@@ -1222,6 +1266,7 @@ class MessageQueueManager:
             1 if msg.notify_on_stop else 0,
             msg.remind_soft_threshold,
             msg.remind_hard_threshold,
+            msg.remind_cancel_on_reply_session_id,
             msg.parent_session_id,
             msg.message_category,
         ))
@@ -1309,10 +1354,10 @@ class MessageQueueManager:
         """Get all pending (undelivered) messages for a session."""
         rows = self._execute_query("""
             SELECT id, target_session_id, sender_session_id, sender_name, text,
-                   delivery_mode, queued_at, timeout_at, notify_on_delivery,
+                   delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery,
                    notify_after_seconds, notify_on_stop, delivered_at,
-                   remind_soft_threshold, remind_hard_threshold, parent_session_id,
-                   message_category
+                   remind_soft_threshold, remind_hard_threshold,
+                   remind_cancel_on_reply_session_id, parent_session_id, message_category
             FROM message_queue
             WHERE target_session_id = ? AND delivered_at IS NULL
             ORDER BY queued_at ASC
@@ -1327,16 +1372,18 @@ class MessageQueueManager:
                 sender_name=row[3],
                 text=row[4],
                 delivery_mode=row[5],
-                queued_at=datetime.fromisoformat(row[6]),
-                timeout_at=datetime.fromisoformat(row[7]) if row[7] else None,
-                notify_on_delivery=bool(row[8]),
-                notify_after_seconds=row[9],
-                notify_on_stop=bool(row[10]),
-                delivered_at=datetime.fromisoformat(row[11]) if row[11] else None,
-                remind_soft_threshold=row[12],
-                remind_hard_threshold=row[13],
-                parent_session_id=row[14],
-                message_category=row[15],
+                from_sm_send=bool(row[6]),
+                queued_at=datetime.fromisoformat(row[7]),
+                timeout_at=datetime.fromisoformat(row[8]) if row[8] else None,
+                notify_on_delivery=bool(row[9]),
+                notify_after_seconds=row[10],
+                notify_on_stop=bool(row[11]),
+                delivered_at=datetime.fromisoformat(row[12]) if row[12] else None,
+                remind_soft_threshold=row[13],
+                remind_hard_threshold=row[14],
+                remind_cancel_on_reply_session_id=row[15],
+                parent_session_id=row[16],
+                message_category=row[17],
             )
             # Skip expired messages
             if msg.timeout_at and datetime.now() > msg.timeout_at:
@@ -1667,6 +1714,12 @@ class MessageQueueManager:
                     self._mark_delivered(msg.id)
                     logger.info(f"Delivered message {msg.id}")
 
+                    if msg.sender_session_id and msg.message_category is None:
+                        self.cancel_tracked_remind_on_reply(
+                            sender_session_id=msg.sender_session_id,
+                            recipient_session_id=msg.target_session_id,
+                        )
+
                     # Mirror to Telegram (fire-and-forget)
                     if self.notifier:
                         sender_display = msg.sender_name or (msg.sender_session_id[:8] if msg.sender_session_id else "system")
@@ -1709,6 +1762,8 @@ class MessageQueueManager:
                             target_session_id=msg.target_session_id,
                             soft_threshold=msg.remind_soft_threshold,
                             hard_threshold=msg.remind_hard_threshold or (msg.remind_soft_threshold + self.remind_hard_gap_seconds),
+                            cancel_on_reply_session_id=msg.remind_cancel_on_reply_session_id,
+                            merge_with_existing=msg.remind_cancel_on_reply_session_id is not None,
                         )
 
                     # Start parent wake-up if requested (#225-C)
@@ -1749,6 +1804,12 @@ class MessageQueueManager:
                         state.stop_notify_delay_seconds = 0
                     logger.info(f"Urgent message {msg.id} delivered to {session_id} (codex-app)")
 
+                    if msg.sender_session_id and msg.message_category is None:
+                        self.cancel_tracked_remind_on_reply(
+                            sender_session_id=msg.sender_session_id,
+                            recipient_session_id=msg.target_session_id,
+                        )
+
                     # Handle notifications
                     if msg.notify_on_delivery and msg.sender_session_id:
                         await self._send_delivery_notification(msg)
@@ -1766,6 +1827,8 @@ class MessageQueueManager:
                             target_session_id=msg.target_session_id,
                             soft_threshold=msg.remind_soft_threshold,
                             hard_threshold=msg.remind_hard_threshold or (msg.remind_soft_threshold + self.remind_hard_gap_seconds),
+                            cancel_on_reply_session_id=msg.remind_cancel_on_reply_session_id,
+                            merge_with_existing=msg.remind_cancel_on_reply_session_id is not None,
                         )
 
                     # Start parent wake-up if requested (#225-C)
@@ -1821,6 +1884,12 @@ class MessageQueueManager:
                         state.stop_notify_delay_seconds = 0
                     logger.info(f"Urgent message {msg.id} delivered to {session_id}")
 
+                    if msg.sender_session_id and msg.message_category is None:
+                        self.cancel_tracked_remind_on_reply(
+                            sender_session_id=msg.sender_session_id,
+                            recipient_session_id=msg.target_session_id,
+                        )
+
                     # Handle notifications
                     if msg.notify_on_delivery and msg.sender_session_id:
                         await self._send_delivery_notification(msg)
@@ -1838,6 +1907,8 @@ class MessageQueueManager:
                             target_session_id=msg.target_session_id,
                             soft_threshold=msg.remind_soft_threshold,
                             hard_threshold=msg.remind_hard_threshold or (msg.remind_soft_threshold + self.remind_hard_gap_seconds),
+                            cancel_on_reply_session_id=msg.remind_cancel_on_reply_session_id,
+                            merge_with_existing=msg.remind_cancel_on_reply_session_id is not None,
                         )
 
                     # Start parent wake-up if requested (#225-C)
@@ -2087,26 +2158,57 @@ class MessageQueueManager:
         target_session_id: str,
         soft_threshold: int,
         hard_threshold: int,
+        cancel_on_reply_session_id: Optional[str] = None,
+        merge_with_existing: bool = False,
     ) -> str:
         """
-        Register (or replace) a periodic remind for a target session.
-
-        One-active-per-target: if a registration already exists for this session,
-        it is cancelled and replaced.
+        Register (or replace/merge) a periodic remind for a target session.
 
         Args:
             target_session_id: Session to remind
             soft_threshold: Seconds after last reset before soft (important) remind fires
             hard_threshold: Seconds after last reset before hard (urgent) remind fires
+            cancel_on_reply_session_id: Optional session ID that cancels the remind when the
+                target replies to it via sm send (#406)
+            merge_with_existing: Preserve existing tracked reply owners for this target (#406)
 
         Returns:
             Registration ID
         """
+        now = datetime.now()
+        existing = self._remind_registrations.get(target_session_id)
+        if merge_with_existing and existing and existing.is_active:
+            owners = set(existing.cancel_on_reply_session_ids)
+            if cancel_on_reply_session_id:
+                owners.add(cancel_on_reply_session_id)
+            existing.soft_threshold_seconds = min(existing.soft_threshold_seconds, soft_threshold)
+            existing.hard_threshold_seconds = min(existing.hard_threshold_seconds, hard_threshold)
+            existing.last_reset_at = now
+            existing.soft_fired = False
+            existing.cancel_on_reply_session_ids = tuple(sorted(owners))
+            self._update_remind_db(
+                target_session_id,
+                soft_threshold_seconds=existing.soft_threshold_seconds,
+                hard_threshold_seconds=existing.hard_threshold_seconds,
+                last_reset_at=now,
+                soft_fired=False,
+                cancel_on_reply_session_id=self._serialize_cancel_on_reply_session_ids(existing.cancel_on_reply_session_ids),
+            )
+            logger.info(
+                "Periodic remind merged for %s (soft=%ss, hard=%ss, owners=%s, id=%s)",
+                target_session_id,
+                existing.soft_threshold_seconds,
+                existing.hard_threshold_seconds,
+                existing.cancel_on_reply_session_ids,
+                existing.id,
+            )
+            return existing.id
+
         # Cancel any existing registration for this target
         self.cancel_remind(target_session_id)
 
         reg_id = uuid.uuid4().hex[:12]
-        now = datetime.now()
+        cancel_on_reply_session_ids = (cancel_on_reply_session_id,) if cancel_on_reply_session_id else ()
         reg = RemindRegistration(
             id=reg_id,
             target_session_id=target_session_id,
@@ -2114,6 +2216,7 @@ class MessageQueueManager:
             hard_threshold_seconds=hard_threshold,
             registered_at=now,
             last_reset_at=now,
+            cancel_on_reply_session_ids=cancel_on_reply_session_ids,
         )
         self._remind_registrations[target_session_id] = reg
 
@@ -2121,8 +2224,8 @@ class MessageQueueManager:
         self._execute("""
             INSERT OR REPLACE INTO remind_registrations
             (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
-             registered_at, last_reset_at, soft_fired, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 1)
+             registered_at, last_reset_at, cancel_on_reply_session_id, soft_fired, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)
         """, (
             reg_id,
             target_session_id,
@@ -2130,6 +2233,7 @@ class MessageQueueManager:
             hard_threshold,
             now.isoformat(),
             now.isoformat(),
+            self._serialize_cancel_on_reply_session_ids(cancel_on_reply_session_ids),
         ))
 
         # Start async task
@@ -2138,9 +2242,39 @@ class MessageQueueManager:
 
         logger.info(
             f"Periodic remind registered for {target_session_id} "
-            f"(soft={soft_threshold}s, hard={hard_threshold}s, id={reg_id})"
+            f"(soft={soft_threshold}s, hard={hard_threshold}s, cancel_on_reply={cancel_on_reply_session_ids}, id={reg_id})"
         )
         return reg_id
+
+    def cancel_tracked_remind_on_reply(self, sender_session_id: str, recipient_session_id: str) -> bool:
+        """Cancel a tracked remind when the tracked agent replies to the owning session (#406)."""
+        reg = self._remind_registrations.get(sender_session_id)
+        if not reg or not reg.is_active:
+            return False
+        owners = set(reg.cancel_on_reply_session_ids)
+        if recipient_session_id not in owners:
+            return False
+        owners.discard(recipient_session_id)
+        if owners:
+            reg.cancel_on_reply_session_ids = tuple(sorted(owners))
+            self._update_remind_db(
+                sender_session_id,
+                cancel_on_reply_session_id=self._serialize_cancel_on_reply_session_ids(reg.cancel_on_reply_session_ids),
+            )
+            logger.info(
+                "Tracked remind owner %s cleared for %s; remaining owners=%s",
+                recipient_session_id,
+                sender_session_id,
+                reg.cancel_on_reply_session_ids,
+            )
+        else:
+            self.cancel_remind(sender_session_id)
+            logger.info(
+                "Tracked remind auto-cancelled for %s after reply to %s",
+                sender_session_id,
+                recipient_session_id,
+            )
+        return True
 
     def reset_remind(self, target_session_id: str):
         """
@@ -2381,13 +2515,22 @@ class MessageQueueManager:
         """Recover active remind registrations on server restart."""
         rows = self._execute_query("""
             SELECT id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
-                   registered_at, last_reset_at, soft_fired
+                   registered_at, last_reset_at, cancel_on_reply_session_id, soft_fired
             FROM remind_registrations
             WHERE is_active = 1
         """)
 
         for row in rows:
-            reg_id, target_session_id, soft, hard, registered_at_str, last_reset_at_str, soft_fired = row
+            (
+                reg_id,
+                target_session_id,
+                soft,
+                hard,
+                registered_at_str,
+                last_reset_at_str,
+                cancel_on_reply_session_id,
+                soft_fired,
+            ) = row
             last_reset_at = datetime.fromisoformat(last_reset_at_str)
 
             reg = RemindRegistration(
@@ -2397,6 +2540,7 @@ class MessageQueueManager:
                 hard_threshold_seconds=hard,
                 registered_at=datetime.fromisoformat(registered_at_str),
                 last_reset_at=last_reset_at,
+                cancel_on_reply_session_ids=self._deserialize_cancel_on_reply_session_ids(cancel_on_reply_session_id),
                 soft_fired=bool(soft_fired),
                 is_active=True,
             )

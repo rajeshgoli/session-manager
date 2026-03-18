@@ -1246,6 +1246,7 @@ def cmd_send(
     remind_soft_threshold: Optional[int] = None,
     remind_hard_threshold: Optional[int] = None,
     parent_session_id: Optional[str] = None,
+    track_seconds: Optional[int] = None,
 ) -> int:
     """
     Send input text to a session.
@@ -1263,6 +1264,7 @@ def cmd_send(
         remind_soft_threshold: Soft remind threshold in seconds; only set by sm dispatch (#225-A)
         remind_hard_threshold: Hard remind threshold in seconds; only set by sm dispatch (#225-A)
         parent_session_id: EM session to receive periodic wake digests; only set by sm dispatch (#225-C)
+        track_seconds: Auto-track the recipient with periodic remind until it replies (#406)
 
     Exit codes:
         0: Success
@@ -1270,6 +1272,18 @@ def cmd_send(
         2: Session manager unavailable
     """
     sender_session_id = client.session_id  # Set from CLAUDE_SESSION_MANAGER_ID in __init__
+    if track_seconds is not None:
+        if track_seconds <= 0:
+            print("Error: --track interval must be > 0", file=sys.stderr)
+            return 1
+        if not sender_session_id:
+            print("Error: --track requires a managed session (CLAUDE_SESSION_MANAGER_ID not set)", file=sys.stderr)
+            return 2
+        if delivery_mode == "steer":
+            print("Error: --track is not supported with --steer", file=sys.stderr)
+            return 1
+        remind_soft_threshold = track_seconds
+        remind_hard_threshold = _track_hard_threshold_seconds(track_seconds)
 
     # Resolve identifier to session ID and get session details
     session_id, session = resolve_session_id(client, identifier)
@@ -1326,6 +1340,7 @@ def cmd_send(
         notify_on_stop=effective_notify_on_stop,
         remind_soft_threshold=remind_soft_threshold,
         remind_hard_threshold=remind_hard_threshold,
+        remind_cancel_on_reply_session_id=sender_session_id if track_seconds is not None else None,
         parent_session_id=parent_session_id,
     )
 
@@ -1359,6 +1374,8 @@ def cmd_send(
     if remind_soft_threshold:
         extras.append(f"remind={remind_soft_threshold}s soft"
                       + (f"/{remind_hard_threshold}s hard" if remind_hard_threshold else ""))
+    if track_seconds:
+        extras.append(f"track={track_seconds}s")
     if extras:
         print(f"  Options: {', '.join(extras)}")
 
@@ -1457,6 +1474,7 @@ def cmd_spawn(
     model: Optional[str] = None,
     working_dir: Optional[str] = None,
     json_output: bool = False,
+    track_seconds: Optional[int] = None,
 ) -> int:
     """
     Spawn a child agent session.
@@ -1477,6 +1495,7 @@ def cmd_spawn(
         model: Model override (opus, sonnet, haiku)
         working_dir: Working directory override
         json_output: Output JSON format
+        track_seconds: Auto-track the child with periodic remind until it replies (#406)
 
     Exit codes:
         0: Success
@@ -1485,6 +1504,9 @@ def cmd_spawn(
     """
     import json as json_lib
     safe_model_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+    if track_seconds is not None and track_seconds <= 0:
+        print("Error: --track interval must be > 0", file=sys.stderr)
+        return 1
     if provider == "claude" and model is not None and model not in {"opus", "sonnet", "haiku"}:
         print(
             "Error: Invalid Claude model. Choose one of: opus, sonnet, haiku",
@@ -1538,11 +1560,18 @@ def cmd_spawn(
         from .dispatch import get_auto_remind_config
         soft_threshold, hard_threshold = get_auto_remind_config(os.getcwd())
         _register_em_monitoring(client, child_id, parent_session_id, soft_threshold, hard_threshold)
+    if track_seconds is not None:
+        _register_tracked_remind(client, child_id, parent_session_id, track_seconds)
 
     return 0
 
 
 _EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS = 8
+
+
+def _track_hard_threshold_seconds(track_seconds: int) -> int:
+    """Return the hard-threshold cadence for --track (#406)."""
+    return track_seconds * 2
 
 
 def _register_em_monitoring(
@@ -1585,6 +1614,23 @@ def _register_em_monitoring(
     )
     if not ns_ok:
         print(f"  Warning: Failed to arm stop notification for {child_id}", file=sys.stderr)
+
+
+def _register_tracked_remind(
+    client: SessionManagerClient,
+    child_id: str,
+    requester_session_id: str,
+    track_seconds: int,
+) -> None:
+    """Register reply-cancelled remind tracking for spawn/send workflows (#406)."""
+    remind_result = client.register_remind(
+        child_id,
+        soft_threshold=track_seconds,
+        hard_threshold=_track_hard_threshold_seconds(track_seconds),
+        cancel_on_reply_session_id=requester_session_id,
+    )
+    if remind_result is None:
+        print(f"  Warning: Failed to register tracked remind for {child_id}", file=sys.stderr)
 
 
 _TOOL_DB_DEFAULT = "~/.local/share/claude-sessions/tool_usage.db"
