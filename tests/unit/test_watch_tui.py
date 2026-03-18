@@ -433,6 +433,30 @@ def test_filter_by_repo_includes_cross_repo_descendants_for_context():
     assert selectable == ["p1", "c1"]
 
 
+def test_filter_by_role_does_not_pull_hierarchy_context():
+    sessions = [
+        _session("p1", "architect-parent", "/tmp/repo-a", role="architect"),
+        _session("c1", "engineer-child", "/tmp/repo-b", parent_session_id="p1", role="engineer"),
+    ]
+
+    filtered_engineers = filter_sessions(sessions, role_filter="engineer")
+    filtered_architects = filter_sessions(sessions, role_filter="architect")
+
+    assert [s["id"] for s in filtered_engineers] == ["c1"]
+    assert [s["id"] for s in filtered_architects] == ["p1"]
+
+
+def test_filter_by_text_does_not_pull_hierarchy_context():
+    sessions = [
+        _session("p1", "architect-parent", "/tmp/repo-a"),
+        _session("c1", "engineer-child", "/tmp/repo-b", parent_session_id="p1"),
+    ]
+
+    filtered = filter_sessions(sessions, text_filter="engineer-child")
+
+    assert [s["id"] for s in filtered] == ["c1"]
+
+
 def test_codex_app_rows_are_not_attachable():
     session = _session("app1", "codex-app", "/tmp/repo", provider="codex-app")
     assert can_attach_session(session) is False
