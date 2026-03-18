@@ -578,7 +578,7 @@ class RemindRegistration:
     hard_threshold_seconds: int
     registered_at: datetime
     last_reset_at: datetime  # updated by sm status; initialized on delivery
-    cancel_on_reply_session_id: Optional[str] = None
+    cancel_on_reply_session_ids: tuple[str, ...] = field(default_factory=tuple)
     soft_fired: bool = False
     is_active: bool = True
 
