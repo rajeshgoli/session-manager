@@ -532,6 +532,7 @@ class QueuedMessage:
     sender_name: Optional[str] = None
     text: str = ""
     delivery_mode: str = "sequential"  # sequential, important, urgent
+    from_sm_send: bool = False  # True when enqueued by sm send (#406)
     queued_at: datetime = field(default_factory=datetime.now)
     timeout_at: Optional[datetime] = None  # None = no timeout
     notify_on_delivery: bool = False
@@ -553,6 +554,7 @@ class QueuedMessage:
             "sender_name": self.sender_name,
             "text": self.text,
             "delivery_mode": self.delivery_mode,
+            "from_sm_send": self.from_sm_send,
             "queued_at": self.queued_at.isoformat(),
             "timeout_at": self.timeout_at.isoformat() if self.timeout_at else None,
             "notify_on_delivery": self.notify_on_delivery,

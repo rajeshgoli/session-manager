@@ -148,6 +148,7 @@ class MessageQueueManager:
                 sender_name TEXT,
                 text TEXT NOT NULL,
                 delivery_mode TEXT DEFAULT 'sequential',
+                from_sm_send INTEGER DEFAULT 0,
                 queued_at TIMESTAMP NOT NULL,
                 timeout_at TIMESTAMP,
                 notify_on_delivery INTEGER DEFAULT 0,
@@ -183,6 +184,9 @@ class MessageQueueManager:
         if "notify_on_stop" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN notify_on_stop INTEGER DEFAULT 0")
             logger.info("Migrated message_queue: added notify_on_stop column")
+        if "from_sm_send" not in columns:
+            cursor.execute("ALTER TABLE message_queue ADD COLUMN from_sm_send INTEGER DEFAULT 0")
+            logger.info("Migrated message_queue: added from_sm_send column")
         if "remind_soft_threshold" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN remind_soft_threshold INTEGER")
             logger.info("Migrated message_queue: added remind_soft_threshold column")
@@ -1161,6 +1165,7 @@ class MessageQueueManager:
         sender_session_id: Optional[str] = None,
         sender_name: Optional[str] = None,
         delivery_mode: str = "sequential",
+        from_sm_send: bool = False,
         timeout_seconds: Optional[int] = None,
         notify_on_delivery: bool = False,
         notify_after_seconds: Optional[int] = None,
@@ -1181,6 +1186,7 @@ class MessageQueueManager:
             sender_session_id: Sender session ID
             sender_name: Sender friendly name
             delivery_mode: sequential, important, or urgent
+            from_sm_send: True when the message originated from the sm send CLI
             timeout_seconds: Drop message if not delivered in this time
             notify_on_delivery: Notify sender when delivered
             notify_after_seconds: Notify sender N seconds after delivery
@@ -1201,6 +1207,7 @@ class MessageQueueManager:
             sender_name=sender_name,
             text=text,
             delivery_mode=delivery_mode,
+            from_sm_send=from_sm_send,
             queued_at=datetime.now(),
             timeout_at=datetime.now() + timedelta(seconds=timeout_seconds) if timeout_seconds else None,
             notify_on_delivery=notify_on_delivery,
@@ -1217,10 +1224,10 @@ class MessageQueueManager:
         self._execute("""
             INSERT INTO message_queue
             (id, target_session_id, sender_session_id, sender_name, text,
-             delivery_mode, queued_at, timeout_at, notify_on_delivery, notify_after_seconds,
+             delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery, notify_after_seconds,
              notify_on_stop, remind_soft_threshold, remind_hard_threshold,
              remind_cancel_on_reply_session_id, parent_session_id, message_category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id,
             msg.target_session_id,
@@ -1228,6 +1235,7 @@ class MessageQueueManager:
             msg.sender_name,
             msg.text,
             msg.delivery_mode,
+            1 if msg.from_sm_send else 0,
             msg.queued_at.isoformat(),
             msg.timeout_at.isoformat() if msg.timeout_at else None,
             1 if msg.notify_on_delivery else 0,
@@ -1323,7 +1331,7 @@ class MessageQueueManager:
         """Get all pending (undelivered) messages for a session."""
         rows = self._execute_query("""
             SELECT id, target_session_id, sender_session_id, sender_name, text,
-                   delivery_mode, queued_at, timeout_at, notify_on_delivery,
+                   delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery,
                    notify_after_seconds, notify_on_stop, delivered_at,
                    remind_soft_threshold, remind_hard_threshold,
                    remind_cancel_on_reply_session_id, parent_session_id, message_category
@@ -1341,17 +1349,18 @@ class MessageQueueManager:
                 sender_name=row[3],
                 text=row[4],
                 delivery_mode=row[5],
-                queued_at=datetime.fromisoformat(row[6]),
-                timeout_at=datetime.fromisoformat(row[7]) if row[7] else None,
-                notify_on_delivery=bool(row[8]),
-                notify_after_seconds=row[9],
-                notify_on_stop=bool(row[10]),
-                delivered_at=datetime.fromisoformat(row[11]) if row[11] else None,
-                remind_soft_threshold=row[12],
-                remind_hard_threshold=row[13],
-                remind_cancel_on_reply_session_id=row[14],
-                parent_session_id=row[15],
-                message_category=row[16],
+                from_sm_send=bool(row[6]),
+                queued_at=datetime.fromisoformat(row[7]),
+                timeout_at=datetime.fromisoformat(row[8]) if row[8] else None,
+                notify_on_delivery=bool(row[9]),
+                notify_after_seconds=row[10],
+                notify_on_stop=bool(row[11]),
+                delivered_at=datetime.fromisoformat(row[12]) if row[12] else None,
+                remind_soft_threshold=row[13],
+                remind_hard_threshold=row[14],
+                remind_cancel_on_reply_session_id=row[15],
+                parent_session_id=row[16],
+                message_category=row[17],
             )
             # Skip expired messages
             if msg.timeout_at and datetime.now() > msg.timeout_at:
@@ -1682,6 +1691,12 @@ class MessageQueueManager:
                     self._mark_delivered(msg.id)
                     logger.info(f"Delivered message {msg.id}")
 
+                    if msg.from_sm_send and msg.sender_session_id:
+                        self.cancel_tracked_remind_on_reply(
+                            sender_session_id=msg.sender_session_id,
+                            recipient_session_id=msg.target_session_id,
+                        )
+
                     # Mirror to Telegram (fire-and-forget)
                     if self.notifier:
                         sender_display = msg.sender_name or (msg.sender_session_id[:8] if msg.sender_session_id else "system")
@@ -1765,6 +1780,12 @@ class MessageQueueManager:
                         state.stop_notify_delay_seconds = 0
                     logger.info(f"Urgent message {msg.id} delivered to {session_id} (codex-app)")
 
+                    if msg.from_sm_send and msg.sender_session_id:
+                        self.cancel_tracked_remind_on_reply(
+                            sender_session_id=msg.sender_session_id,
+                            recipient_session_id=msg.target_session_id,
+                        )
+
                     # Handle notifications
                     if msg.notify_on_delivery and msg.sender_session_id:
                         await self._send_delivery_notification(msg)
@@ -1837,6 +1858,12 @@ class MessageQueueManager:
                         state.stop_notify_sender_name = None
                         state.stop_notify_delay_seconds = 0
                     logger.info(f"Urgent message {msg.id} delivered to {session_id}")
+
+                    if msg.from_sm_send and msg.sender_session_id:
+                        self.cancel_tracked_remind_on_reply(
+                            sender_session_id=msg.sender_session_id,
+                            recipient_session_id=msg.target_session_id,
+                        )
 
                     # Handle notifications
                     if msg.notify_on_delivery and msg.sender_session_id:

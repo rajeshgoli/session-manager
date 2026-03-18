@@ -751,6 +751,17 @@ class TestCmdSendRemindParams:
         mock_client.send_input.assert_not_called()
         assert "CLAUDE_SESSION_MANAGER_ID" in capsys.readouterr().err
 
+    def test_track_rejects_steer_mode(self, capsys):
+        """--track must fail fast with steer because steer bypasses remind registration."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+
+        rc = cmd_send(mock_client, "sess1", "hello", delivery_mode="steer", track_seconds=300)
+
+        assert rc == 1
+        mock_client.send_input.assert_not_called()
+        assert "--steer" in capsys.readouterr().err
+
     def test_self_send_suppresses_notify_on_stop(self, capsys):
         """Self-send must not request or print notify-on-stop."""
         from src.cli.commands import cmd_send

@@ -1087,3 +1087,56 @@ class TestTrackedReplyCancellation:
 
         assert result == DeliveryResult.DELIVERED
         assert child.id not in mq._remind_registrations
+
+    @pytest.mark.asyncio
+    async def test_send_input_keeps_tracked_remind_when_reply_is_queued(self, mq):
+        """Queued replies must not cancel tracking until the reply actually delivers."""
+        parent = Session(
+            id="parent406q",
+            name="parent406q",
+            working_dir="/tmp",
+            tmux_session="claude-parent406q",
+            status=SessionStatus.RUNNING,
+        )
+        child = Session(
+            id="child406q",
+            name="child406q",
+            working_dir="/tmp",
+            tmux_session="claude-child406q",
+            status=SessionStatus.RUNNING,
+        )
+        mq.session_manager.sessions = {parent.id: parent, child.id: child}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+        mq._get_or_create_state(parent.id).is_idle = False
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                child.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id=parent.id,
+            )
+
+        sm = SessionManager.__new__(SessionManager)
+        sm.sessions = mq.session_manager.sessions
+        sm.message_queue_manager = mq
+        sm.notifier = None
+        sm._save_state = MagicMock()
+        sm._deliver_direct = AsyncMock(return_value=True)
+
+        with patch("asyncio.create_task", noop_create_task), patch.object(
+            mq,
+            "_get_pending_user_input_async",
+            AsyncMock(return_value="still typing"),
+        ):
+            result = await sm.send_input(
+                session_id=parent.id,
+                text="done",
+                sender_session_id=child.id,
+                delivery_mode="sequential",
+                from_sm_send=True,
+            )
+
+        assert result == DeliveryResult.QUEUED
+        assert child.id in mq._remind_registrations
+        assert mq._remind_registrations[child.id].is_active is True

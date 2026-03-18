@@ -1279,6 +1279,9 @@ def cmd_send(
         if not sender_session_id:
             print("Error: --track requires a managed session (CLAUDE_SESSION_MANAGER_ID not set)", file=sys.stderr)
             return 2
+        if delivery_mode == "steer":
+            print("Error: --track is not supported with --steer", file=sys.stderr)
+            return 1
         remind_soft_threshold = track_seconds
         remind_hard_threshold = _track_hard_threshold_seconds(track_seconds)
 

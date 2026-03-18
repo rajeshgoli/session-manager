@@ -2342,11 +2342,6 @@ class SessionManager:
 
         # Handle delivery modes using the message queue manager
         if self.message_queue_manager:
-            if from_sm_send and sender_session_id:
-                self.message_queue_manager.cancel_tracked_remind_on_reply(
-                    sender_session_id=sender_session_id,
-                    recipient_session_id=session_id,
-                )
             # For sequential mode, queue first, then report whether the immediate
             # delivery attempt actually injected the message.
             if delivery_mode == "sequential":
@@ -2356,6 +2351,7 @@ class SessionManager:
                     sender_session_id=sender_session_id,
                     sender_name=sender_name,
                     delivery_mode=delivery_mode,
+                    from_sm_send=from_sm_send,
                     timeout_seconds=timeout_seconds,
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
@@ -2387,6 +2383,7 @@ class SessionManager:
                     sender_session_id=sender_session_id,
                     sender_name=sender_name,
                     delivery_mode=delivery_mode,
+                    from_sm_send=from_sm_send,
                     timeout_seconds=timeout_seconds,
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
@@ -2417,6 +2414,7 @@ class SessionManager:
                     sender_session_id=sender_session_id,
                     sender_name=sender_name,
                     delivery_mode=delivery_mode,
+                    from_sm_send=from_sm_send,
                     timeout_seconds=timeout_seconds,
                     notify_on_delivery=notify_on_delivery,
                     notify_after_seconds=notify_after_seconds,
