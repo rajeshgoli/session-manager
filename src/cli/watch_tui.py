@@ -446,12 +446,13 @@ def filter_sessions(
     if not filtered_ids:
         return []
 
-    if not repo_filter:
-        return [session for session in sessions if session.get("id") in set(filtered_ids)]
+    filtered_id_set = set(filtered_ids)
+    if not repo_filter or role_filter_norm or text_filter_norm:
+        return [session for session in sessions if session.get("id") in filtered_id_set]
 
-    included_ids = set(filtered_ids)
+    included_ids = set(filtered_id_set)
 
-    # Repo-scoped watch views should preserve tree context so cross-worktree
+    # Pure repo-scoped watch views should preserve tree context so cross-worktree
     # children remain visibly attached to their parent session.
     for session_id in filtered_ids:
         parent_id = sessions_by_id.get(session_id, {}).get("parent_session_id")
