@@ -12,6 +12,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, Dict, List, Callable, Awaitable, Tuple
 
 from .models import (
@@ -68,6 +69,7 @@ class MessageQueueManager:
         self.input_stale_timeout = sm_send_config.get("input_stale_timeout", 120)  # seconds
         self.max_batch_size = sm_send_config.get("max_batch_size", 10)
         self.urgent_delay_ms = sm_send_config.get("urgent_delay_ms", 500)
+        self.telegram_mirror_max_queue = sm_send_config.get("telegram_mirror_max_queue", 256)
 
         # Remind configuration (#188)
         remind_config = config.get("remind", {})
@@ -809,11 +811,32 @@ class MessageQueueManager:
         except Exception as e:
             logger.warning(f"Telegram mirror failed (non-fatal): {e}")
 
+    def _snapshot_telegram_session(self, session):
+        """Capture Telegram routing at enqueue time to avoid later mutation races."""
+        if not session or not getattr(session, "telegram_chat_id", None):
+            return None
+        return SimpleNamespace(
+            id=getattr(session, "id", "unknown"),
+            telegram_chat_id=getattr(session, "telegram_chat_id", None),
+            telegram_thread_id=getattr(session, "telegram_thread_id", None),
+        )
+
     def _enqueue_telegram_mirror(self, text: str, session, event_type: str, description: str) -> None:
         """Queue a Telegram mirror without blocking the caller."""
+        if not self.notifier:
+            return
+        snapshot = self._snapshot_telegram_session(session)
+        if snapshot is None:
+            return
         if self._telegram_mirror_queue is None:
-            self._telegram_mirror_queue = asyncio.Queue()
-        self._telegram_mirror_queue.put_nowait((text, session, event_type, description))
+            self._telegram_mirror_queue = asyncio.Queue(maxsize=self.telegram_mirror_max_queue)
+        if self._telegram_mirror_queue.full():
+            dropped = self._telegram_mirror_queue.get_nowait()
+            self._telegram_mirror_queue.task_done()
+            logger.warning(
+                f"Telegram mirror queue full; dropped oldest mirror ({dropped[3]})"
+            )
+        self._telegram_mirror_queue.put_nowait((text, snapshot, event_type, description))
         if self._telegram_mirror_worker_task is None or self._telegram_mirror_worker_task.done():
             self._telegram_mirror_worker_task = asyncio.create_task(self._telegram_mirror_worker())
 

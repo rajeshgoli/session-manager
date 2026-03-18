@@ -1476,6 +1476,59 @@ class TestTelegramMirroring:
         assert seen == ["first", "second"]
         await mq.stop()
 
+    def test_telegram_mirror_queue_drops_oldest_when_full(self, mock_session_manager, temp_db_path):
+        """Mirror backlog must be bounded so Telegram outages cannot grow memory unbounded."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"sm_send": {"telegram_mirror_max_queue": 1}},
+            notifier=MagicMock(),
+        )
+
+        session = MagicMock()
+        session.id = "target123"
+        session.telegram_chat_id = 12345
+        session.telegram_thread_id = 678
+
+        mq._telegram_mirror_queue = asyncio.Queue(maxsize=1)
+        mq._telegram_mirror_worker_task = MagicMock()
+        mq._telegram_mirror_worker_task.done.return_value = False
+
+        mq._enqueue_telegram_mirror("first", session, "message_delivered", "first")
+        mq._enqueue_telegram_mirror("second", session, "message_delivered", "second")
+
+        assert mq._telegram_mirror_queue.qsize() == 1
+        queued = mq._telegram_mirror_queue.get_nowait()
+        assert queued[0] == "second"
+        assert queued[3] == "second"
+        mq._telegram_mirror_queue.task_done()
+
+    def test_telegram_mirror_queue_snapshots_routing(self, mock_session_manager, temp_db_path):
+        """Queued mirror work must use Telegram routing captured at enqueue time."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=MagicMock(),
+        )
+
+        session = MagicMock()
+        session.id = "target123"
+        session.telegram_chat_id = 12345
+        session.telegram_thread_id = 678
+
+        mq._telegram_mirror_queue = asyncio.Queue(maxsize=4)
+        mq._telegram_mirror_worker_task = MagicMock()
+        mq._telegram_mirror_worker_task.done.return_value = False
+
+        mq._enqueue_telegram_mirror("snapshot-test", session, "message_delivered", "snapshot")
+        session.telegram_chat_id = 99999
+        session.telegram_thread_id = 111
+
+        _, snapshot, _, _ = mq._telegram_mirror_queue.get_nowait()
+        assert snapshot.telegram_chat_id == 12345
+        assert snapshot.telegram_thread_id == 678
+        mq._telegram_mirror_queue.task_done()
+
 
 class TestDirectDelivery244:
     """sm#244: Direct delivery — no idle gate for sequential/important; paste_buffered_notify."""
