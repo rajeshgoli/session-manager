@@ -2715,7 +2715,11 @@ class SessionManager:
                 self.message_queue_manager.mark_session_active(session.id)
             return fallback_success
 
-        success = await self.tmux.send_input_async(session.tmux_session, text)
+        success = await self.tmux.send_input_async(
+            session.tmux_session,
+            text,
+            verify_claude_submit=(session.provider == "claude"),
+        )
         if success and self.message_queue_manager:
             self.message_queue_manager.mark_session_active(session.id)
         return success
