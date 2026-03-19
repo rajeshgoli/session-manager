@@ -21,6 +21,10 @@ from .models import Session, UserInput, NotificationChannel, DeliveryResult
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_MESSAGE_CHAR_LIMIT = 4096
+TELEGRAM_CHUNK_CHAR_LIMIT = 3900
+MARKDOWN_V2_ESCAPE_CHARS = r'\_*[]()~`>#+-=|{}.!'
+
 # Stall detection thresholds
 _POLLING_CHECK_INTERVAL = 30   # seconds between health checks
 _POLLING_STALL_THRESHOLD = 45  # seconds without a getUpdates before restart
@@ -87,7 +91,7 @@ def escape_markdown_v2(text: str) -> str:
     """Escape special characters for Telegram MarkdownV2, preserving formatting."""
     # Characters that need escaping in MarkdownV2 (outside of code blocks)
     # We'll escape conservatively to avoid breaking formatting
-    escape_chars = r'\_[]()~`>#+-=|{}.!'
+    escape_chars = MARKDOWN_V2_ESCAPE_CHARS
 
     result = []
     i = 0
@@ -319,6 +323,155 @@ class TelegramBot:
                 return False
 
         return True
+
+    def _split_message_chunks(self, message: str, limit: int = TELEGRAM_CHUNK_CHAR_LIMIT) -> list[str]:
+        """Split oversized Telegram text into readable chunks."""
+        if len(message) <= limit:
+            return [message]
+
+        chunks: list[str] = []
+        remaining = message
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+
+            split_at = remaining.rfind("\n", 0, limit + 1)
+            if split_at <= 0:
+                split_at = remaining.rfind(" ", 0, limit + 1)
+            if split_at <= 0:
+                split_at = limit
+
+            chunk = remaining[:split_at].rstrip()
+            if not chunk:
+                chunk = remaining[:limit]
+                split_at = limit
+
+            chunks.append(chunk)
+            if split_at < len(remaining) and remaining[split_at] in {"\n", " "}:
+                remaining = remaining[split_at + 1:]
+            else:
+                remaining = remaining[split_at:]
+
+        return chunks
+
+    def _markdown_v2_to_plain_text(self, message: str) -> str:
+        """Convert MarkdownV2 text to readable plain text without losing literal backslashes."""
+        result: list[str] = []
+        i = 0
+        while i < len(message):
+            if message[i:i+3] == "```":
+                end = message.find("```", i + 3)
+                if end != -1:
+                    result.append(message[i:end + 3])
+                    i = end + 3
+                    continue
+
+            if message[i] == "`":
+                end = message.find("`", i + 1)
+                if end != -1:
+                    result.append(message[i:end + 1])
+                    i = end + 1
+                    continue
+
+            char = message[i]
+            if char == "\\" and i + 1 < len(message) and message[i + 1] in MARKDOWN_V2_ESCAPE_CHARS:
+                result.append(message[i + 1])
+                i += 2
+                continue
+            result.append(char)
+            i += 1
+        return "".join(result)
+
+    def _markdown_v2_rendered_text(self, message: str) -> str:
+        """Approximate the rendered Telegram text after MarkdownV2 entity parsing."""
+        result: list[str] = []
+        i = 0
+        while i < len(message):
+            if message[i:i+3] == "```":
+                end = message.find("```", i + 3)
+                if end != -1:
+                    result.append(message[i + 3:end])
+                    i = end + 3
+                    continue
+
+            if message[i] == "`":
+                end = message.find("`", i + 1)
+                if end != -1:
+                    result.append(message[i + 1:end])
+                    i = end + 1
+                    continue
+
+            if message[i] == "[":
+                close_bracket = message.find("]", i + 1)
+                if close_bracket != -1 and message[close_bracket:close_bracket + 2] == "](":
+                    close_paren = message.find(")", close_bracket + 2)
+                    if close_paren != -1:
+                        result.append(
+                            self._markdown_v2_rendered_text(message[i + 1:close_bracket])
+                        )
+                        i = close_paren + 1
+                        continue
+
+            if message[i:i+2] == "||":
+                end = message.find("||", i + 2)
+                if end != -1:
+                    result.append(self._markdown_v2_rendered_text(message[i + 2:end]))
+                    i = end + 2
+                    continue
+
+            if message[i] in {"*", "_", "~"}:
+                end = message.find(message[i], i + 1)
+                if end != -1:
+                    result.append(self._markdown_v2_rendered_text(message[i + 1:end]))
+                    i = end + 1
+                    continue
+
+            if message[i] == "\\" and i + 1 < len(message) and message[i + 1] in MARKDOWN_V2_ESCAPE_CHARS:
+                result.append(message[i + 1])
+                i += 2
+                continue
+
+            result.append(message[i])
+            i += 1
+
+        return "".join(result)
+
+    def _telegram_length_basis(self, message: str, parse_mode: Optional[str]) -> str:
+        """Return the text basis used to decide if Telegram chunking is necessary."""
+        if parse_mode == "MarkdownV2":
+            return self._markdown_v2_rendered_text(message)
+        return message
+
+    async def _send_chunked_notification(
+        self,
+        chat_id: int,
+        message: str,
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> Optional[int]:
+        """Send an oversized Telegram message as numbered plain-text chunks."""
+        if not self.bot:
+            return None
+
+        chunks = self._split_message_chunks(message)
+        total = len(chunks)
+        first_message_id: Optional[int] = None
+
+        for index, chunk in enumerate(chunks, start=1):
+            prefix = f"[{index}/{total}]\n" if total > 1 else ""
+            msg = await self.bot.send_message(
+                chat_id=chat_id,
+                text=f"{prefix}{chunk}",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+                reply_markup=reply_markup if index == 1 else None,
+            )
+            if first_message_id is None:
+                first_message_id = msg.message_id
+
+        return first_message_id
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
@@ -987,6 +1140,24 @@ Provide ONLY the summary, no preamble or questions."""
                 logger.error("Bot not initialized")
             return None
 
+        length_basis = self._telegram_length_basis(message, parse_mode)
+        if len(length_basis) > TELEGRAM_MESSAGE_CHAR_LIMIT:
+            plain_message = length_basis if parse_mode else message
+            try:
+                return await self._send_chunked_notification(
+                    chat_id=chat_id,
+                    message=plain_message,
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message_thread_id,
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                if silent:
+                    logger.warning(f"Failed to send chunked Telegram message (expected): {e}")
+                else:
+                    logger.error(f"Failed to send chunked Telegram message: {e}")
+                return None
+
         try:
             msg = await self.bot.send_message(
                 chat_id=chat_id,
@@ -1004,7 +1175,15 @@ Provide ONLY the summary, no preamble or questions."""
                 logger.warning(f"Markdown parsing failed, retrying as plain text: {e}")
                 try:
                     # Strip markdown escape chars for plain text fallback
-                    plain_message = message.replace('\\', '')
+                    plain_message = self._markdown_v2_to_plain_text(message)
+                    if len(plain_message) > TELEGRAM_MESSAGE_CHAR_LIMIT:
+                        return await self._send_chunked_notification(
+                            chat_id=chat_id,
+                            message=plain_message,
+                            reply_to_message_id=reply_to_message_id,
+                            message_thread_id=message_thread_id,
+                            reply_markup=reply_markup,
+                        )
                     msg = await self.bot.send_message(
                         chat_id=chat_id,
                         text=plain_message,

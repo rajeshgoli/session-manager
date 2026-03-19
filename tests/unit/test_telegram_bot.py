@@ -6,8 +6,9 @@ whole-function boundary.
 
 import pytest
 from unittest.mock import Mock, AsyncMock, MagicMock, call, patch
+from types import SimpleNamespace
 
-from src.telegram_bot import TelegramBot
+from src.telegram_bot import TelegramBot, TELEGRAM_MESSAGE_CHAR_LIMIT
 
 
 # ============================================================================
@@ -46,6 +47,144 @@ async def test_send_notification_noisy_logs_error():
 
     assert result is None
     mock_logger.error.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_notification_chunks_oversized_plain_text():
+    """Oversized plain-text messages should be sent as numbered chunks."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=101),
+            SimpleNamespace(message_id=102),
+        ]
+    )
+
+    message = ("a" * (TELEGRAM_MESSAGE_CHAR_LIMIT - 100)) + "\n" + ("b" * 300)
+    result = await tg.send_notification(chat_id=10000, message=message, message_thread_id=50000)
+
+    assert result == 101
+    assert tg.bot.send_message.await_count == 2
+    first_call = tg.bot.send_message.await_args_list[0]
+    second_call = tg.bot.send_message.await_args_list[1]
+    assert first_call.kwargs["message_thread_id"] == 50000
+    assert first_call.kwargs["text"].startswith("[1/2]\n")
+    assert second_call.kwargs["text"].startswith("[2/2]\n")
+
+
+@pytest.mark.asyncio
+async def test_send_notification_chunks_oversized_markdown_as_plain_text():
+    """Oversized Markdown messages should degrade to plain-text chunks, not fail."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=201),
+            SimpleNamespace(message_id=202),
+            SimpleNamespace(message_id=203),
+        ]
+    )
+
+    message = ("\\*hello\\* " * 1000)
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 201
+    assert tg.bot.send_message.await_count >= 2
+    for call_args in tg.bot.send_message.await_args_list:
+        assert "parse_mode" not in call_args.kwargs
+        assert "\\" not in call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_notification_keeps_markdown_when_only_escaped_length_exceeds_limit():
+    """Escaped MarkdownV2 should not be chunked if rendered text is still under Telegram's limit."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=301))
+
+    message = "\\[" * 2500
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 301
+    tg.bot.send_message.assert_awaited_once()
+    call_args = tg.bot.send_message.await_args
+    assert call_args.kwargs["parse_mode"] == "MarkdownV2"
+
+
+@pytest.mark.asyncio
+async def test_send_notification_chunked_markdown_preserves_literal_backslashes():
+    """Chunked Markdown fallback should preserve literal backslashes such as Windows paths."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=401),
+            SimpleNamespace(message_id=402),
+        ]
+    )
+
+    message = ("C:\\temp " * 600) + ("\\*hello\\* " * 100)
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 401
+    assert tg.bot.send_message.await_count == 2
+    first_text = tg.bot.send_message.await_args_list[0].kwargs["text"]
+    assert "C:\\temp" in first_text
+
+
+def test_split_message_chunks_preserves_indentation_after_newline_boundary():
+    """Chunk splitting should not strip indentation from the next chunk."""
+    tg = TelegramBot.__new__(TelegramBot)
+    message = ("a" * 20) + "\n    indented line"
+
+    chunks = tg._split_message_chunks(message, limit=20)
+
+    assert chunks == ["a" * 20, "    indented line"]
+
+
+def test_markdown_v2_to_plain_text_preserves_backslashes_inside_code():
+    """Plain-text fallback should keep literal backslashes inside code spans."""
+    tg = TelegramBot.__new__(TelegramBot)
+
+    plain = tg._markdown_v2_to_plain_text(r"Prefix `\\_` and `\\.py` suffix")
+
+    assert plain == r"Prefix `\\_` and `\\.py` suffix"
+
+
+@pytest.mark.asyncio
+async def test_send_notification_keeps_markdown_when_only_link_urls_exceed_limit():
+    """Link-heavy Markdown should stay formatted when rendered text is still within the limit."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=501))
+
+    message = ("[x](https://example.com/" + ("a" * 80) + ") " ) * 120
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 501
+    tg.bot.send_message.assert_awaited_once()
+    assert tg.bot.send_message.await_args.kwargs["parse_mode"] == "MarkdownV2"
 
 
 # ============================================================================
