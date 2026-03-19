@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MESSAGE_CHAR_LIMIT = 4096
 TELEGRAM_CHUNK_CHAR_LIMIT = 3900
+MARKDOWN_V2_ESCAPE_CHARS = r'\_*[]()~`>#+-=|{}.!'
 
 # Stall detection thresholds
 _POLLING_CHECK_INTERVAL = 30   # seconds between health checks
@@ -90,7 +91,7 @@ def escape_markdown_v2(text: str) -> str:
     """Escape special characters for Telegram MarkdownV2, preserving formatting."""
     # Characters that need escaping in MarkdownV2 (outside of code blocks)
     # We'll escape conservatively to avoid breaking formatting
-    escape_chars = r'\_[]()~`>#+-=|{}.!'
+    escape_chars = MARKDOWN_V2_ESCAPE_CHARS
 
     result = []
     i = 0
@@ -347,9 +348,32 @@ class TelegramBot:
                 split_at = limit
 
             chunks.append(chunk)
-            remaining = remaining[split_at:].lstrip("\n ")
+            if split_at < len(remaining) and remaining[split_at] in {"\n", " "}:
+                remaining = remaining[split_at + 1:]
+            else:
+                remaining = remaining[split_at:]
 
         return chunks
+
+    def _markdown_v2_to_plain_text(self, message: str) -> str:
+        """Convert MarkdownV2 text to readable plain text without losing literal backslashes."""
+        result: list[str] = []
+        i = 0
+        while i < len(message):
+            char = message[i]
+            if char == "\\" and i + 1 < len(message) and message[i + 1] in MARKDOWN_V2_ESCAPE_CHARS:
+                result.append(message[i + 1])
+                i += 2
+                continue
+            result.append(char)
+            i += 1
+        return "".join(result)
+
+    def _telegram_length_basis(self, message: str, parse_mode: Optional[str]) -> str:
+        """Return the text basis used to decide if Telegram chunking is necessary."""
+        if parse_mode == "MarkdownV2":
+            return self._markdown_v2_to_plain_text(message)
+        return message
 
     async def _send_chunked_notification(
         self,
@@ -1048,8 +1072,9 @@ Provide ONLY the summary, no preamble or questions."""
                 logger.error("Bot not initialized")
             return None
 
-        if len(message) > TELEGRAM_MESSAGE_CHAR_LIMIT:
-            plain_message = message.replace('\\', '') if parse_mode else message
+        length_basis = self._telegram_length_basis(message, parse_mode)
+        if len(length_basis) > TELEGRAM_MESSAGE_CHAR_LIMIT:
+            plain_message = length_basis if parse_mode else message
             try:
                 return await self._send_chunked_notification(
                     chat_id=chat_id,
@@ -1082,7 +1107,7 @@ Provide ONLY the summary, no preamble or questions."""
                 logger.warning(f"Markdown parsing failed, retrying as plain text: {e}")
                 try:
                     # Strip markdown escape chars for plain text fallback
-                    plain_message = message.replace('\\', '')
+                    plain_message = self._markdown_v2_to_plain_text(message)
                     if len(plain_message) > TELEGRAM_MESSAGE_CHAR_LIMIT:
                         return await self._send_chunked_notification(
                             chat_id=chat_id,

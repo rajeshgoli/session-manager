@@ -82,10 +82,11 @@ async def test_send_notification_chunks_oversized_markdown_as_plain_text():
         side_effect=[
             SimpleNamespace(message_id=201),
             SimpleNamespace(message_id=202),
+            SimpleNamespace(message_id=203),
         ]
     )
 
-    message = ("\\*hello\\* " * 500)
+    message = ("\\*hello\\* " * 1000)
     result = await tg.send_notification(
         chat_id=10000,
         message=message,
@@ -94,10 +95,67 @@ async def test_send_notification_chunks_oversized_markdown_as_plain_text():
     )
 
     assert result == 201
-    assert tg.bot.send_message.await_count == 2
+    assert tg.bot.send_message.await_count >= 2
     for call_args in tg.bot.send_message.await_args_list:
         assert "parse_mode" not in call_args.kwargs
         assert "\\" not in call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_notification_keeps_markdown_when_only_escaped_length_exceeds_limit():
+    """Escaped MarkdownV2 should not be chunked if rendered text is still under Telegram's limit."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=301))
+
+    message = "\\[" * 2500
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 301
+    tg.bot.send_message.assert_awaited_once()
+    call_args = tg.bot.send_message.await_args
+    assert call_args.kwargs["parse_mode"] == "MarkdownV2"
+
+
+@pytest.mark.asyncio
+async def test_send_notification_chunked_markdown_preserves_literal_backslashes():
+    """Chunked Markdown fallback should preserve literal backslashes such as Windows paths."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=401),
+            SimpleNamespace(message_id=402),
+        ]
+    )
+
+    message = ("C:\\temp " * 600) + ("\\*hello\\* " * 100)
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 401
+    assert tg.bot.send_message.await_count == 2
+    first_text = tg.bot.send_message.await_args_list[0].kwargs["text"]
+    assert "C:\\temp" in first_text
+
+
+def test_split_message_chunks_preserves_indentation_after_newline_boundary():
+    """Chunk splitting should not strip indentation from the next chunk."""
+    tg = TelegramBot.__new__(TelegramBot)
+    message = ("a" * 20) + "\n    indented line"
+
+    chunks = tg._split_message_chunks(message, limit=20)
+
+    assert chunks == ["a" * 20, "    indented line"]
 
 
 # ============================================================================
