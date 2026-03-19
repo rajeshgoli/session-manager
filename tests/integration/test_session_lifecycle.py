@@ -438,7 +438,8 @@ class TestSendInput:
         assert result == DeliveryResult.DELIVERED
         mock_tmux.send_input_async.assert_called_with(
             session.tmux_session,
-            "Direct message"
+            "Direct message",
+            verify_claude_submit=True,
         )
 
 

@@ -135,7 +135,11 @@ async def test_send_input_async_uses_send_input_async(session_manager, mock_tmux
     )
 
     # Verify send_input_async was called (not send_input)
-    mock_tmux.send_input_async.assert_called_once_with("tmux-test", "test input")
+    mock_tmux.send_input_async.assert_called_once_with(
+        "tmux-test",
+        "test input",
+        verify_claude_submit=True,
+    )
     assert success == DeliveryResult.DELIVERED
 
 

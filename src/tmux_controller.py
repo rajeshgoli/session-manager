@@ -31,6 +31,8 @@ class TmuxController:
         self.send_keys_settle_max_seconds = tmux_timeouts.get("send_keys_settle_max_seconds", 0.9)
         self.send_keys_settle_per_ki_chars = tmux_timeouts.get("send_keys_settle_per_ki_chars", 0.06)
         self.send_keys_settle_per_extra_line = tmux_timeouts.get("send_keys_settle_per_extra_line", 0.015)
+        self.submit_verify_seconds = tmux_timeouts.get("submit_verify_seconds", 0.6)
+        self.submit_retry_seconds = tmux_timeouts.get("submit_retry_seconds", 0.6)
 
     def _run_tmux(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run a tmux command."""
@@ -114,6 +116,127 @@ class TmuxController:
             pass
         after = await self._get_pane_in_mode_async(session_name)
         return before, after
+
+    async def _capture_pane_async(self, session_name: str) -> Optional[str]:
+        """Capture the full active tmux pane asynchronously."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "capture-pane", "-p", "-t", session_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=self.send_keys_timeout_seconds
+            )
+            if proc.returncode != 0:
+                return None
+            return stdout.decode(errors="ignore")
+        except Exception:
+            return None
+
+    def _extract_active_claude_composer_text(self, pane_text: Optional[str]) -> Optional[str]:
+        """Extract the current Claude composer text from the bottom prompt block."""
+        if not pane_text:
+            return None
+
+        lines = pane_text.splitlines()
+        separator_indexes = [
+            i for i, line in enumerate(lines)
+            if line.strip() and set(line.strip()) == {"─"}
+        ]
+        if len(separator_indexes) < 2:
+            return None
+
+        block = lines[separator_indexes[-2] + 1:separator_indexes[-1]]
+        if not block:
+            return None
+
+        prompt_index = None
+        for idx, line in enumerate(block):
+            stripped = line.lstrip()
+            if stripped.startswith("❯") or stripped.startswith(">"):
+                prompt_index = idx
+                break
+        if prompt_index is None:
+            return None
+
+        prompt_line = block[prompt_index].lstrip()
+        if prompt_line.startswith("❯"):
+            current = prompt_line[1:].lstrip()
+        else:
+            current = prompt_line[1:].lstrip()
+
+        continuation: list[str] = []
+        for line in block[prompt_index + 1:]:
+            if line.lstrip().startswith("❯") or line.lstrip().startswith(">"):
+                break
+            continuation.append(line.strip())
+
+        parts = [current] if current else []
+        parts.extend(part for part in continuation if part)
+        composer = " ".join(parts).strip()
+        return composer or None
+
+    def _looks_like_queued_message_placeholder(self, composer_text: Optional[str]) -> bool:
+        """Return True for Claude's local queued-message editor prompt."""
+        if not composer_text:
+            return False
+        lowered = composer_text.lower()
+        return "queued messages" in lowered or "queued message" in lowered
+
+    def _normalize_for_compare(self, text: str) -> str:
+        """Collapse whitespace for approximate pane-vs-payload comparison."""
+        return " ".join((text or "").split())
+
+    async def _verify_claude_submit_async(self, session_name: str, text: str) -> bool:
+        """Retry Enter once if Claude still shows the unsent payload in the composer."""
+        normalized_text = self._normalize_for_compare(text)
+        if not normalized_text:
+            return False
+
+        async def _capture_matching_composer() -> Optional[str]:
+            pane = await self._capture_pane_async(session_name)
+            composer = self._extract_active_claude_composer_text(pane)
+            if not composer or self._looks_like_queued_message_placeholder(composer):
+                return None
+            normalized_composer = self._normalize_for_compare(composer)
+            if (
+                normalized_composer
+                and (
+                    normalized_text.startswith(normalized_composer)
+                    or normalized_composer in normalized_text
+                )
+            ):
+                return composer
+            return None
+
+        await asyncio.sleep(self.submit_verify_seconds)
+        first_match = await _capture_matching_composer()
+        if not first_match:
+            return False
+
+        await asyncio.sleep(self.submit_retry_seconds)
+        second_match = await _capture_matching_composer()
+        if not second_match:
+            return False
+
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", session_name, "Enter",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=self.send_keys_timeout_seconds
+        )
+        if proc.returncode != 0:
+            logger.error(f"Failed to resend Enter during Claude submit verification: {stderr.decode()}")
+            return False
+
+        logger.warning(
+            "Claude submit verification resent Enter for %s after composer stayed populated",
+            session_name,
+        )
+        return True
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a tmux session exists."""
@@ -437,7 +560,12 @@ class TmuxController:
             logger.error(f"Timeout sending input to {session_name}")
             return False
 
-    async def send_input_async(self, session_name: str, text: str) -> bool:
+    async def send_input_async(
+        self,
+        session_name: str,
+        text: str,
+        verify_claude_submit: bool = False,
+    ) -> bool:
         """
         Send input text to a tmux session (ASYNC - non-blocking).
 
@@ -489,6 +617,9 @@ class TmuxController:
             if proc.returncode != 0:
                 logger.error(f"Failed to send Enter: {stderr.decode()}")
                 return False
+
+            if verify_claude_submit:
+                await self._verify_claude_submit_async(session_name, text)
 
             line_count = (text or "").count("\n") + 1
             if mode_before == 1 or settle_delay > self.send_keys_settle_seconds:
