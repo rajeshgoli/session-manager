@@ -121,7 +121,7 @@ class TmuxController:
         """Capture the full active tmux pane asynchronously."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "capture-pane", "-p", "-t", session_name,
+                "tmux", "capture-pane", "-p", "-J", "-S", "-200", "-t", session_name,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

@@ -87,6 +87,36 @@ async def test_send_input_async_retries_enter_when_composer_stays_populated(tmux
 
 
 @pytest.mark.asyncio
+async def test_capture_pane_async_uses_history_and_join_flags(tmux_controller):
+    """Verification should inspect pane history and join wrapped lines."""
+    subprocess_calls = []
+
+    async def mock_subprocess(*args, **kwargs):
+        subprocess_calls.append(args)
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"pane output", b""))
+        proc.returncode = 0
+        return proc
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        result = await tmux_controller._capture_pane_async("claude-test")
+
+    assert result == "pane output"
+    assert subprocess_calls == [
+        (
+            "tmux",
+            "capture-pane",
+            "-p",
+            "-J",
+            "-S",
+            "-200",
+            "-t",
+            "claude-test",
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_send_input_async_does_not_retry_when_composer_is_empty(tmux_controller):
     submitted_pane = """
 ✳ Orbiting…
