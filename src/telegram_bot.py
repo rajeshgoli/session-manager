@@ -360,6 +360,20 @@ class TelegramBot:
         result: list[str] = []
         i = 0
         while i < len(message):
+            if message[i:i+3] == "```":
+                end = message.find("```", i + 3)
+                if end != -1:
+                    result.append(message[i:end + 3])
+                    i = end + 3
+                    continue
+
+            if message[i] == "`":
+                end = message.find("`", i + 1)
+                if end != -1:
+                    result.append(message[i:end + 1])
+                    i = end + 1
+                    continue
+
             char = message[i]
             if char == "\\" and i + 1 < len(message) and message[i + 1] in MARKDOWN_V2_ESCAPE_CHARS:
                 result.append(message[i + 1])
@@ -369,10 +383,64 @@ class TelegramBot:
             i += 1
         return "".join(result)
 
+    def _markdown_v2_rendered_text(self, message: str) -> str:
+        """Approximate the rendered Telegram text after MarkdownV2 entity parsing."""
+        result: list[str] = []
+        i = 0
+        while i < len(message):
+            if message[i:i+3] == "```":
+                end = message.find("```", i + 3)
+                if end != -1:
+                    result.append(message[i + 3:end])
+                    i = end + 3
+                    continue
+
+            if message[i] == "`":
+                end = message.find("`", i + 1)
+                if end != -1:
+                    result.append(message[i + 1:end])
+                    i = end + 1
+                    continue
+
+            if message[i] == "[":
+                close_bracket = message.find("]", i + 1)
+                if close_bracket != -1 and message[close_bracket:close_bracket + 2] == "](":
+                    close_paren = message.find(")", close_bracket + 2)
+                    if close_paren != -1:
+                        result.append(
+                            self._markdown_v2_rendered_text(message[i + 1:close_bracket])
+                        )
+                        i = close_paren + 1
+                        continue
+
+            if message[i:i+2] == "||":
+                end = message.find("||", i + 2)
+                if end != -1:
+                    result.append(self._markdown_v2_rendered_text(message[i + 2:end]))
+                    i = end + 2
+                    continue
+
+            if message[i] in {"*", "_", "~"}:
+                end = message.find(message[i], i + 1)
+                if end != -1:
+                    result.append(self._markdown_v2_rendered_text(message[i + 1:end]))
+                    i = end + 1
+                    continue
+
+            if message[i] == "\\" and i + 1 < len(message) and message[i + 1] in MARKDOWN_V2_ESCAPE_CHARS:
+                result.append(message[i + 1])
+                i += 2
+                continue
+
+            result.append(message[i])
+            i += 1
+
+        return "".join(result)
+
     def _telegram_length_basis(self, message: str, parse_mode: Optional[str]) -> str:
         """Return the text basis used to decide if Telegram chunking is necessary."""
         if parse_mode == "MarkdownV2":
-            return self._markdown_v2_to_plain_text(message)
+            return self._markdown_v2_rendered_text(message)
         return message
 
     async def _send_chunked_notification(

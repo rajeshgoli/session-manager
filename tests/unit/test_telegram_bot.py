@@ -158,6 +158,35 @@ def test_split_message_chunks_preserves_indentation_after_newline_boundary():
     assert chunks == ["a" * 20, "    indented line"]
 
 
+def test_markdown_v2_to_plain_text_preserves_backslashes_inside_code():
+    """Plain-text fallback should keep literal backslashes inside code spans."""
+    tg = TelegramBot.__new__(TelegramBot)
+
+    plain = tg._markdown_v2_to_plain_text(r"Prefix `\\_` and `\\.py` suffix")
+
+    assert plain == r"Prefix `\\_` and `\\.py` suffix"
+
+
+@pytest.mark.asyncio
+async def test_send_notification_keeps_markdown_when_only_link_urls_exceed_limit():
+    """Link-heavy Markdown should stay formatted when rendered text is still within the limit."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=501))
+
+    message = ("[x](https://example.com/" + ("a" * 80) + ") " ) * 120
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 501
+    tg.bot.send_message.assert_awaited_once()
+    assert tg.bot.send_message.await_args.kwargs["parse_mode"] == "MarkdownV2"
+
+
 # ============================================================================
 # send_with_fallback unit tests
 # ============================================================================
