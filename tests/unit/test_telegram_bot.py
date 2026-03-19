@@ -6,8 +6,9 @@ whole-function boundary.
 
 import pytest
 from unittest.mock import Mock, AsyncMock, MagicMock, call, patch
+from types import SimpleNamespace
 
-from src.telegram_bot import TelegramBot
+from src.telegram_bot import TelegramBot, TELEGRAM_MESSAGE_CHAR_LIMIT
 
 
 # ============================================================================
@@ -46,6 +47,57 @@ async def test_send_notification_noisy_logs_error():
 
     assert result is None
     mock_logger.error.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_notification_chunks_oversized_plain_text():
+    """Oversized plain-text messages should be sent as numbered chunks."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=101),
+            SimpleNamespace(message_id=102),
+        ]
+    )
+
+    message = ("a" * (TELEGRAM_MESSAGE_CHAR_LIMIT - 100)) + "\n" + ("b" * 300)
+    result = await tg.send_notification(chat_id=10000, message=message, message_thread_id=50000)
+
+    assert result == 101
+    assert tg.bot.send_message.await_count == 2
+    first_call = tg.bot.send_message.await_args_list[0]
+    second_call = tg.bot.send_message.await_args_list[1]
+    assert first_call.kwargs["message_thread_id"] == 50000
+    assert first_call.kwargs["text"].startswith("[1/2]\n")
+    assert second_call.kwargs["text"].startswith("[2/2]\n")
+
+
+@pytest.mark.asyncio
+async def test_send_notification_chunks_oversized_markdown_as_plain_text():
+    """Oversized Markdown messages should degrade to plain-text chunks, not fail."""
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=201),
+            SimpleNamespace(message_id=202),
+        ]
+    )
+
+    message = ("\\*hello\\* " * 500)
+    result = await tg.send_notification(
+        chat_id=10000,
+        message=message,
+        message_thread_id=50000,
+        parse_mode="MarkdownV2",
+    )
+
+    assert result == 201
+    assert tg.bot.send_message.await_count == 2
+    for call_args in tg.bot.send_message.await_args_list:
+        assert "parse_mode" not in call_args.kwargs
+        assert "\\" not in call_args.kwargs["text"]
 
 
 # ============================================================================

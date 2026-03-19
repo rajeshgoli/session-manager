@@ -21,6 +21,9 @@ from .models import Session, UserInput, NotificationChannel, DeliveryResult
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_MESSAGE_CHAR_LIMIT = 4096
+TELEGRAM_CHUNK_CHAR_LIMIT = 3900
+
 # Stall detection thresholds
 _POLLING_CHECK_INTERVAL = 30   # seconds between health checks
 _POLLING_STALL_THRESHOLD = 45  # seconds without a getUpdates before restart
@@ -319,6 +322,64 @@ class TelegramBot:
                 return False
 
         return True
+
+    def _split_message_chunks(self, message: str, limit: int = TELEGRAM_CHUNK_CHAR_LIMIT) -> list[str]:
+        """Split oversized Telegram text into readable chunks."""
+        if len(message) <= limit:
+            return [message]
+
+        chunks: list[str] = []
+        remaining = message
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+
+            split_at = remaining.rfind("\n", 0, limit + 1)
+            if split_at <= 0:
+                split_at = remaining.rfind(" ", 0, limit + 1)
+            if split_at <= 0:
+                split_at = limit
+
+            chunk = remaining[:split_at].rstrip()
+            if not chunk:
+                chunk = remaining[:limit]
+                split_at = limit
+
+            chunks.append(chunk)
+            remaining = remaining[split_at:].lstrip("\n ")
+
+        return chunks
+
+    async def _send_chunked_notification(
+        self,
+        chat_id: int,
+        message: str,
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> Optional[int]:
+        """Send an oversized Telegram message as numbered plain-text chunks."""
+        if not self.bot:
+            return None
+
+        chunks = self._split_message_chunks(message)
+        total = len(chunks)
+        first_message_id: Optional[int] = None
+
+        for index, chunk in enumerate(chunks, start=1):
+            prefix = f"[{index}/{total}]\n" if total > 1 else ""
+            msg = await self.bot.send_message(
+                chat_id=chat_id,
+                text=f"{prefix}{chunk}",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+                reply_markup=reply_markup if index == 1 else None,
+            )
+            if first_message_id is None:
+                first_message_id = msg.message_id
+
+        return first_message_id
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
@@ -987,6 +1048,23 @@ Provide ONLY the summary, no preamble or questions."""
                 logger.error("Bot not initialized")
             return None
 
+        if len(message) > TELEGRAM_MESSAGE_CHAR_LIMIT:
+            plain_message = message.replace('\\', '') if parse_mode else message
+            try:
+                return await self._send_chunked_notification(
+                    chat_id=chat_id,
+                    message=plain_message,
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message_thread_id,
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                if silent:
+                    logger.warning(f"Failed to send chunked Telegram message (expected): {e}")
+                else:
+                    logger.error(f"Failed to send chunked Telegram message: {e}")
+                return None
+
         try:
             msg = await self.bot.send_message(
                 chat_id=chat_id,
@@ -1005,6 +1083,14 @@ Provide ONLY the summary, no preamble or questions."""
                 try:
                     # Strip markdown escape chars for plain text fallback
                     plain_message = message.replace('\\', '')
+                    if len(plain_message) > TELEGRAM_MESSAGE_CHAR_LIMIT:
+                        return await self._send_chunked_notification(
+                            chat_id=chat_id,
+                            message=plain_message,
+                            reply_to_message_id=reply_to_message_id,
+                            message_thread_id=message_thread_id,
+                            reply_markup=reply_markup,
+                        )
                     msg = await self.bot.send_message(
                         chat_id=chat_id,
                         text=plain_message,
