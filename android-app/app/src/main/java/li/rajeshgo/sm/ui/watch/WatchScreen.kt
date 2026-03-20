@@ -1,7 +1,11 @@
 package li.rajeshgo.sm.ui.watch
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +24,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
@@ -85,6 +90,8 @@ fun WatchScreen(
     val sections = remember(state.sessions, filter, query) {
         filterSections(buildSections(state.sessions), filter, query)
     }
+    val activeSections = remember(sections) { sliceSections(sections, TreeSlice.Active) }
+    val idleSections = remember(sections) { sliceSections(sections, TreeSlice.Idle) }
     val sessionsById = remember(state.sessions) { state.sessions.associateBy { it.id } }
     val context = LocalContext.current
 
@@ -106,51 +113,13 @@ fun WatchScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                HeaderCard(
+                HeaderBar(
                     userEmail = state.userEmail,
                     lastSync = state.lastSync,
                     refreshing = state.refreshing,
                     onRefresh = { viewModel.refresh() },
                     onOpenSettings = onNavigateToSettings,
                 )
-            }
-
-            item {
-                SummaryStrip(sessions = state.sessions)
-            }
-
-            item {
-                Surface(
-                    shape = RoundedCornerShape(24.dp),
-                    color = Panel,
-                    tonalElevation = 0.dp,
-                    shadowElevation = 0.dp,
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Border),
-                ) {
-                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        OutlinedTextField(
-                            value = query,
-                            onValueChange = { query = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            label = { Text("Search") },
-                            placeholder = { Text("name, id, role, alias, worktree") },
-                            singleLine = true,
-                        )
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf("all", "running", "idle", "stopped").forEach { candidate ->
-                                val selected = candidate == filter
-                                AssistChip(
-                                    onClick = { filter = candidate },
-                                    label = { Text(candidate.uppercase()) },
-                                    colors = AssistChipDefaults.assistChipColors(
-                                        containerColor = if (selected) Cyan.copy(alpha = 0.18f) else PanelMuted,
-                                        labelColor = if (selected) Color.White else TextSecondary,
-                                    ),
-                                )
-                            }
-                        }
-                    }
-                }
             }
 
             if (state.error != null) {
@@ -168,14 +137,15 @@ fun WatchScreen(
                     EmptyState(query = query, filter = filter)
                 }
             } else {
-                sections.forEach { section ->
+                activeSections.forEach { section ->
                     item(key = "repo-${section.repoKey}") {
                         RepoHeader(title = "${section.repoLabel} (${section.repoKey})")
                     }
-                    items(section.roots, key = { it.session.id }) { root ->
+                    items(section.roots, key = { "active-${it.session.id}" }) { root ->
                         WatchTree(
                             node = root,
                             depth = 0,
+                            slice = TreeSlice.Active,
                             sessionsById = sessionsById,
                             expandedSessionIds = state.expandedSessionIds,
                             detailsById = state.detailsBySessionId,
@@ -200,6 +170,20 @@ fun WatchScreen(
                                     toast = "Attach command copied"
                                 }
                             },
+                            onOpenTelegram = { session ->
+                                val link = telegramLink(session)
+                                if (link == null) {
+                                    toast = "Telegram thread unavailable"
+                                } else {
+                                    runCatching {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        })
+                                    }.onFailure { error ->
+                                        toast = error.message ?: "Unable to open Telegram"
+                                    }
+                                }
+                            },
                             onKill = { session ->
                                 viewModel.killSession(session.id) { result ->
                                     toast = result.exceptionOrNull()?.message ?: "Killed ${session.id}"
@@ -208,6 +192,71 @@ fun WatchScreen(
                         )
                     }
                 }
+                idleSections.forEach { section ->
+                    item(key = "idle-repo-${section.repoKey}") {
+                        RepoHeader(title = "${section.repoLabel} (${section.repoKey})")
+                    }
+                    items(section.roots, key = { "idle-${it.session.id}" }) { root ->
+                        WatchTree(
+                            node = root,
+                            depth = 0,
+                            slice = TreeSlice.Idle,
+                            sessionsById = sessionsById,
+                            expandedSessionIds = state.expandedSessionIds,
+                            detailsById = state.detailsBySessionId,
+                            onToggleExpanded = { viewModel.toggleExpanded(it) },
+                            onOpenAttach = { session ->
+                                val attach = session.termuxAttach
+                                if (attach == null) {
+                                    toast = "Attach metadata unavailable"
+                                } else {
+                                    launchTermuxAttach(context, attach)
+                                        .onSuccess { toast = "Opening Termux for ${sessionDisplayName(session)}" }
+                                        .onFailure { error -> toast = error.message ?: "Attach failed" }
+                                }
+                            },
+                            onCopyAttach = { session ->
+                                val command = session.termuxAttach?.let(::termuxAttachCommand)
+                                if (command == null) {
+                                    toast = "Attach command unavailable"
+                                } else {
+                                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm attach", command))
+                                    toast = "Attach command copied"
+                                }
+                            },
+                            onOpenTelegram = { session ->
+                                val link = telegramLink(session)
+                                if (link == null) {
+                                    toast = "Telegram thread unavailable"
+                                } else {
+                                    runCatching {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        })
+                                    }.onFailure { error ->
+                                        toast = error.message ?: "Unable to open Telegram"
+                                    }
+                                }
+                            },
+                            onKill = { session ->
+                                viewModel.killSession(session.id) { result ->
+                                    toast = result.exceptionOrNull()?.message ?: "Killed ${session.id}"
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
+                FooterControls(
+                    sessions = state.sessions,
+                    query = query,
+                    filter = filter,
+                    onQueryChange = { query = it },
+                    onFilterChange = { filter = it },
+                )
             }
         }
 
@@ -232,7 +281,7 @@ fun WatchScreen(
 }
 
 @Composable
-private fun HeaderCard(
+private fun HeaderBar(
     userEmail: String,
     lastSync: String?,
     refreshing: Boolean,
@@ -240,66 +289,116 @@ private fun HeaderCard(
     onOpenSettings: () -> Unit,
 ) {
     Surface(
-        shape = RoundedCornerShape(28.dp),
+        shape = RoundedCornerShape(18.dp),
         color = Panel,
         border = androidx.compose.foundation.BorderStroke(1.dp, Border),
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Column {
-                    Text("sm watch", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurface)
-                    Spacer(Modifier.height(6.dp))
-                    Text(userEmail.ifBlank { "Not signed in" }, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column {
+                Text("sm watch", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
+                val statusLine = buildString {
+                    append("Last sync ")
+                    append(formatDateTime(lastSync))
+                    if (userEmail.isNotBlank()) {
+                        append(" • ")
+                        append(userEmail)
+                    }
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onRefresh) {
-                        Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = if (refreshing) Cyan else TextSecondary)
-                    }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Rounded.Settings, contentDescription = "Settings", tint = TextSecondary)
-                    }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = statusLine,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (refreshing) Cyan else TextMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onRefresh) {
+                    Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = if (refreshing) Cyan else TextSecondary)
+                }
+                IconButton(onClick = onOpenSettings) {
+                    Icon(Icons.Rounded.Settings, contentDescription = "Settings", tint = TextSecondary)
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            Text(
-                text = "Dense, Android-native session watch with direct Termux attach.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondary,
-            )
-            Spacer(Modifier.height(12.dp))
-            Text(
-                text = "Last sync ${formatDateTime(lastSync)}",
-                style = MaterialTheme.typography.labelSmall,
-                color = if (refreshing) Cyan else TextMuted,
-            )
         }
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SummaryStrip(sessions: List<ClientSession>) {
+private fun FooterControls(
+    sessions: List<ClientSession>,
+    query: String,
+    filter: String,
+    onQueryChange: (String) -> Unit,
+    onFilterChange: (String) -> Unit,
+) {
     val running = sessions.count { it.status == "running" }
     val working = sessions.count { it.activityState == "working" }
     val thinking = sessions.count { it.activityState == "thinking" }
     val maintainers = sessions.count { it.isMaintainer }
 
-    FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        SummaryPill(label = "sessions", value = sessions.size.toString(), tint = MaterialTheme.colorScheme.onSurface)
-        SummaryPill(label = "running / working", value = "$running / $working", tint = Emerald)
-        SummaryPill(label = "thinking", value = thinking.toString(), tint = Cyan)
-        SummaryPill(label = "maintainer", value = maintainers.toString(), tint = Violet)
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Panel,
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
+        border = androidx.compose.foundation.BorderStroke(1.dp, Border),
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedTextField(
+                value = query,
+                onValueChange = onQueryChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Search") },
+                placeholder = { Text("name, id, role, alias, worktree") },
+                singleLine = true,
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("all", "running", "idle", "stopped").forEach { candidate ->
+                    val selected = candidate == filter
+                    AssistChip(
+                        onClick = { onFilterChange(candidate) },
+                        label = { Text(candidate.uppercase()) },
+                        colors = AssistChipDefaults.assistChipColors(
+                            containerColor = if (selected) Cyan.copy(alpha = 0.18f) else PanelMuted,
+                            labelColor = if (selected) Color.White else TextSecondary,
+                        ),
+                    )
+                }
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                SummaryBadge(label = "${sessions.size} sessions", tint = MaterialTheme.colorScheme.onSurface)
+                SummaryBadge(label = "$running running", tint = Emerald)
+                SummaryBadge(label = "$working working", tint = Emerald)
+                SummaryBadge(label = "$thinking thinking", tint = Cyan)
+                if (maintainers > 0) {
+                    SummaryBadge(label = "$maintainers maintainer", tint = Violet)
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun SummaryPill(label: String, value: String, tint: Color) {
-    Surface(shape = RoundedCornerShape(24.dp), color = Panel, border = androidx.compose.foundation.BorderStroke(1.dp, Border)) {
-        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
-            Text(label.uppercase(), style = MaterialTheme.typography.labelSmall, color = TextMuted)
-            Spacer(Modifier.height(4.dp))
-            Text(value, style = MaterialTheme.typography.titleLarge, color = tint, fontWeight = FontWeight.SemiBold)
-        }
+private fun SummaryBadge(label: String, tint: Color) {
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = tint.copy(alpha = 0.12f),
+        border = androidx.compose.foundation.BorderStroke(1.dp, tint.copy(alpha = 0.24f)),
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = tint,
+            fontWeight = FontWeight.Medium,
+        )
     }
 }
 
@@ -317,40 +416,59 @@ private fun RepoHeader(title: String) {
 private fun WatchTree(
     node: WatchSessionNode,
     depth: Int,
+    slice: TreeSlice,
     sessionsById: Map<String, ClientSession>,
     expandedSessionIds: Set<String>,
     detailsById: Map<String, SessionDetail>,
     onToggleExpanded: (ClientSession) -> Unit,
     onOpenAttach: (ClientSession) -> Unit,
     onCopyAttach: (ClientSession) -> Unit,
+    onOpenTelegram: (ClientSession) -> Unit,
     onKill: (ClientSession) -> Unit,
 ) {
-    SessionRow(
-        session = node.session,
-        depth = depth,
-        parentLabel = parentLabel(node.session, sessionsById),
-        expanded = expandedSessionIds.contains(node.session.id),
-        detail = detailsById[node.session.id],
-        onToggleExpanded = { onToggleExpanded(node.session) },
-        onOpenAttach = { onOpenAttach(node.session) },
-        onCopyAttach = { onCopyAttach(node.session) },
-        onKill = { onKill(node.session) },
-    )
+    if (!nodeMatchesSlice(node, slice)) {
+        return
+    }
 
-    node.sameRepoChildren.forEach { child ->
-        WatchTree(child, depth + 1, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onKill)
+    val renderNode = shouldRenderNode(node, slice)
+    if (renderNode) {
+        SessionRow(
+            session = node.session,
+            depth = depth,
+            parentLabel = parentLabel(node.session, sessionsById),
+            expanded = expandedSessionIds.contains(node.session.id),
+            detail = detailsById[node.session.id],
+            onToggleExpanded = { onToggleExpanded(node.session) },
+            onOpenAttach = { onOpenAttach(node.session) },
+            onCopyAttach = { onCopyAttach(node.session) },
+            onOpenTelegram = { onOpenTelegram(node.session) },
+            onKill = { onKill(node.session) },
+        )
+    }
+
+    val childDepth = if (renderNode) depth + 1 else depth
+
+    node.sameRepoChildren
+        .filter { nodeMatchesSlice(it, slice) }
+        .forEach { child ->
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onKill)
     }
 
     node.crossRepoGroups.forEach { group ->
+        val visibleChildren = group.children.filter { nodeMatchesSlice(it, slice) }
+        if (visibleChildren.isEmpty()) {
+            return@forEach
+        }
+        val groupDepth = if (renderNode) depth + 1 else depth
         Text(
             text = "${group.repoLabel} (${group.repoKey})",
-            modifier = Modifier.padding(start = ((depth + 1) * 18).dp, top = 2.dp, bottom = 6.dp),
+            modifier = Modifier.padding(start = (groupDepth * 18).dp, top = 2.dp, bottom = 6.dp),
             style = MaterialTheme.typography.labelSmall,
             color = TextMuted,
             fontFamily = FontFamily.Monospace,
         )
-        group.children.forEach { child ->
-            WatchTree(child, depth + 2, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onKill)
+        visibleChildren.forEach { child ->
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onKill)
         }
     }
 }
@@ -366,6 +484,7 @@ private fun SessionRow(
     onToggleExpanded: () -> Unit,
     onOpenAttach: () -> Unit,
     onCopyAttach: () -> Unit,
+    onOpenTelegram: () -> Unit,
     onKill: () -> Unit,
 ) {
     val attachSupported = session.termuxAttach?.supported == true
@@ -409,8 +528,18 @@ private fun SessionRow(
                             fontFamily = FontFamily.Monospace,
                         )
                         Spacer(Modifier.height(6.dp))
+                        val secondaryLine = buildString {
+                            if (parentLabel != "-") {
+                                append("Parent ")
+                                append(parentLabel)
+                                append(" • ")
+                            }
+                            append(lastSummary(session))
+                            append(" • ")
+                            append(formatAge(session.lastActivity, session.activityState))
+                        }
                         Text(
-                            text = "Parent $parentLabel • ${lastSummary(session)} • ${formatAge(session.lastActivity, session.activityState)}",
+                            text = secondaryLine,
                             style = MaterialTheme.typography.bodySmall,
                             color = TextMuted,
                             maxLines = 2,
@@ -452,15 +581,21 @@ private fun SessionRow(
                             fontFamily = FontFamily.Monospace,
                         )
                     }
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         if (attachSupported) {
-                            ActionChip(label = "Attach", icon = Icons.Rounded.Terminal, onClick = onOpenAttach)
-                            ActionChip(label = "Copy", icon = Icons.Rounded.ContentCopy, onClick = onCopyAttach)
+                            ActionPill(label = "Attach", icon = Icons.Rounded.Terminal, onClick = onOpenAttach)
+                            ActionPill(label = "Copy", icon = Icons.Rounded.ContentCopy, onClick = onCopyAttach)
                         }
-                        ActionChip(label = "Kill", icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
-                        if (session.termuxAttach?.supported == false) {
-                            StatusChip(label = session.termuxAttach.reason ?: "attach unavailable", tint = TextMuted)
+                        if (telegramLink(session) != null) {
+                            ActionPill(label = "TG", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = onOpenTelegram, tint = Cyan)
                         }
+                        ActionPill(label = "Kill", icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
+                    }
+                    if (session.termuxAttach?.supported == false) {
+                        StatusChip(label = session.termuxAttach.reason ?: "attach unavailable", tint = TextMuted)
                     }
                 }
             }
@@ -476,10 +611,10 @@ private fun StatusChip(label: String, tint: Color) {
 }
 
 @Composable
-private fun ActionChip(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit, tint: Color = Emerald) {
+private fun ActionPill(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit, tint: Color = Emerald) {
     AssistChip(
         onClick = onClick,
-        label = { Text(label.uppercase()) },
+        label = { Text(label, maxLines = 1) },
         leadingIcon = { Icon(icon, contentDescription = null, tint = tint) },
         colors = AssistChipDefaults.assistChipColors(containerColor = PanelMuted, labelColor = MaterialTheme.colorScheme.onSurface),
         border = AssistChipDefaults.assistChipBorder(enabled = true, borderColor = tint.copy(alpha = 0.32f)),
@@ -506,6 +641,69 @@ private fun EmptyState(query: String, filter: String) {
             )
         }
     }
+}
+
+private fun telegramLink(session: ClientSession): String? {
+    val chatId = session.telegramChatId ?: return null
+    val threadId = session.telegramThreadId ?: return null
+    val normalizedChatId = chatId.toString().removePrefix("-").removePrefix("100")
+    return "https://t.me/c/$normalizedChatId/$threadId"
+}
+
+private enum class TreeSlice {
+    Active,
+    Idle,
+}
+
+private fun nodeMatchesSlice(node: WatchSessionNode, slice: TreeSlice): Boolean {
+    return when (slice) {
+        TreeSlice.Active -> hasActiveBranch(node)
+        TreeSlice.Idle -> hasIdleBranch(node)
+    }
+}
+
+private fun shouldRenderNode(node: WatchSessionNode, slice: TreeSlice): Boolean {
+    return when (slice) {
+        TreeSlice.Active -> hasActiveBranch(node)
+        TreeSlice.Idle -> !isActiveSession(node.session) && hasIdleBranch(node)
+    }
+}
+
+private fun sliceSections(sections: List<WatchSection>, slice: TreeSlice): List<WatchSection> {
+    return sections.mapNotNull { section ->
+        val roots = section.roots
+            .filter { nodeMatchesSlice(it, slice) }
+            .sortedWith(
+                compareByDescending<WatchSessionNode> { nodeSliceFreshness(it, slice) }
+                    .thenBy { sessionDisplayName(it.session).lowercase() }
+                    .thenBy { it.session.id }
+            )
+        if (roots.isEmpty()) null else section.copy(roots = roots)
+    }.sortedWith(
+        compareByDescending<WatchSection> { sectionSliceFreshness(it, slice) }
+            .thenBy { it.repoLabel.lowercase() }
+            .thenBy { it.repoKey }
+    )
+}
+
+private fun sectionSliceFreshness(section: WatchSection, slice: TreeSlice): Long {
+    return section.roots.maxOfOrNull { nodeSliceFreshness(it, slice) } ?: Long.MIN_VALUE
+}
+
+private fun nodeSliceFreshness(node: WatchSessionNode, slice: TreeSlice): Long {
+    val ownFreshness = when (slice) {
+        TreeSlice.Active -> if (isActiveSession(node.session)) sessionLastActivityEpoch(node.session) else Long.MIN_VALUE
+        TreeSlice.Idle -> if (!isActiveSession(node.session)) sessionLastActivityEpoch(node.session) else Long.MIN_VALUE
+    }
+    val childFreshness = node.sameRepoChildren.maxOfOrNull { nodeSliceFreshness(it, slice) } ?: Long.MIN_VALUE
+    val crossRepoFreshness = node.crossRepoGroups
+        .flatMap { it.children }
+        .maxOfOrNull { nodeSliceFreshness(it, slice) } ?: Long.MIN_VALUE
+    return maxOf(ownFreshness, childFreshness, crossRepoFreshness)
+}
+
+private fun sessionLastActivityEpoch(session: ClientSession): Long {
+    return parseIso(session.lastActivity)?.toEpochSecond() ?: Long.MIN_VALUE
 }
 
 private fun statusDot(session: ClientSession): Color = when (session.status) {

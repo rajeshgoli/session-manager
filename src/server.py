@@ -1141,12 +1141,24 @@ def create_app(
         ssh_args = ["ssh"]
         if ssh_proxy_command:
             ssh_args.extend(["-o", f"ProxyCommand={ssh_proxy_command}"])
+        remote_attach_script = (
+            "PATH=/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/bin:/bin:$PATH; "
+            "export PATH; "
+            "if command -v tmux >/dev/null 2>&1; then "
+            "exec tmux attach-session -t \"$1\"; "
+            "elif [ -x /opt/homebrew/bin/tmux ]; then "
+            "exec /opt/homebrew/bin/tmux attach-session -t \"$1\"; "
+            "elif [ -x /usr/local/bin/tmux ]; then "
+            "exec /usr/local/bin/tmux attach-session -t \"$1\"; "
+            "else echo \"tmux not found on remote host\" >&2; exit 127; fi"
+        )
         ssh_args.extend([
             "-t",
             f"{ssh_username}@{public_ssh_host}",
-            "tmux",
-            "attach-session",
-            "-t",
+            "sh",
+            "-lc",
+            remote_attach_script,
+            "sh",
             tmux_session,
         ])
 

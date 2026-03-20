@@ -37,7 +37,53 @@ fun repoLabel(workingDir: String): String {
 }
 
 private fun sortSessions(left: ClientSession, right: ClientSession): Int {
-    return compareValuesBy(left, right, { sessionDisplayName(it).lowercase() }, { it.id })
+    return compareValuesBy(
+        left,
+        right,
+        { sessionPriority(it) },
+        { sessionDisplayName(it).lowercase() },
+        { it.id },
+    )
+}
+
+private fun sessionPriority(session: ClientSession): Int {
+    val activity = activityLabel(session.activityState)
+    return when {
+        session.status == "running" || activity == "working" || activity == "thinking" || activity == "waiting" -> 0
+        session.status == "idle" -> 1
+        session.status == "stopped" -> 2
+        else -> 3
+    }
+}
+
+fun isActiveSession(session: ClientSession): Boolean = sessionPriority(session) == 0
+
+private fun nodePriority(node: WatchSessionNode): Int {
+    val childPriorities = node.sameRepoChildren.map(::nodePriority)
+    val crossRepoPriorities = node.crossRepoGroups.flatMap { group -> group.children.map(::nodePriority) }
+    return (listOf(sessionPriority(node.session)) + childPriorities + crossRepoPriorities).minOrNull() ?: 3
+}
+
+fun hasActiveBranch(node: WatchSessionNode): Boolean {
+    return isActiveSession(node.session) ||
+        node.sameRepoChildren.any(::hasActiveBranch) ||
+        node.crossRepoGroups.any { group -> group.children.any(::hasActiveBranch) }
+}
+
+fun hasIdleBranch(node: WatchSessionNode): Boolean {
+    return !isActiveSession(node.session) ||
+        node.sameRepoChildren.any(::hasIdleBranch) ||
+        node.crossRepoGroups.any { group -> group.children.any(::hasIdleBranch) }
+}
+
+private fun sortNodes(nodes: List<WatchSessionNode>): List<WatchSessionNode> {
+    return nodes.sortedWith(
+        compareBy<WatchSessionNode>({ nodePriority(it) }, { sessionDisplayName(it.session).lowercase() }, { it.session.id })
+    )
+}
+
+private fun sectionPriority(section: WatchSection): Int {
+    return section.roots.map(::nodePriority).minOrNull() ?: 3
 }
 
 fun buildSections(sessions: List<ClientSession>): List<WatchSection> {
@@ -72,24 +118,27 @@ fun buildSections(sessions: List<ClientSession>): List<WatchSection> {
     }
 
     fun buildNode(session: ClientSession): WatchSessionNode {
-        val localChildren = (sameRepoChildren[session.id] ?: emptyList()).sortedWith { left, right -> sortSessions(left, right) }.map(::buildNode)
+        val localChildren = (sameRepoChildren[session.id] ?: emptyList())
+            .sortedWith(::sortSessions)
+            .map(::buildNode)
         val remoteGroups = (crossRepoChildren[session.id] ?: linkedMapOf()).entries
             .sortedBy { repoLabel(it.key).lowercase() }
             .map { (key, children) ->
                 WatchRepoGroup(
                     repoKey = key,
                     repoLabel = repoLabel(key),
-                    children = children.sortedWith { left, right -> sortSessions(left, right) }.map(::buildNode),
+                    children = sortNodes(children.sortedWith(::sortSessions).map(::buildNode)),
                 )
             }
-        return WatchSessionNode(session, localChildren, remoteGroups)
+        return WatchSessionNode(session, sortNodes(localChildren), remoteGroups)
     }
 
     return repoKeys.sortedBy { repoLabel(it).lowercase() }
         .mapNotNull { key ->
-            val roots = (rootsByRepo[key] ?: emptyList()).sortedWith { left, right -> sortSessions(left, right) }.map(::buildNode)
+            val roots = sortNodes((rootsByRepo[key] ?: emptyList()).sortedWith(::sortSessions).map(::buildNode))
             if (roots.isEmpty()) null else WatchSection(key, repoLabel(key), roots)
         }
+        .sortedWith(compareBy<WatchSection>({ sectionPriority(it) }, { it.repoLabel.lowercase() }, { it.repoKey }))
 }
 
 fun filterSections(sections: List<WatchSection>, statusFilter: String, query: String): List<WatchSection> {
