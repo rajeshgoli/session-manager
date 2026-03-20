@@ -20,6 +20,7 @@ def mock_session_manager():
     mock.tmux.list_sessions = MagicMock(return_value=[])
     mock.message_queue_manager = None
     mock.is_codex_rollout_enabled = MagicMock(return_value=True)
+    mock.validate_friendly_name_update = MagicMock(return_value=None)
     mock._save_state = MagicMock()
     return mock
 

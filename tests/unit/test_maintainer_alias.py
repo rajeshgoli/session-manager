@@ -13,11 +13,16 @@ from src.session_manager import SessionManager
 
 
 def _manager(tmp_path) -> SessionManager:
-    return SessionManager(
+    manager = SessionManager(
         log_dir=str(tmp_path / "logs"),
         state_file=str(tmp_path / "sessions.json"),
         config={},
     )
+    manager.tmux = Mock()
+    manager.tmux.list_sessions.return_value = []
+    manager.tmux.session_exists.return_value = False
+    manager.tmux.set_status_bar.return_value = True
+    return manager
 
 
 def _session(session_id: str, tmp_path) -> Session:
