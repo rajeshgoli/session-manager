@@ -51,7 +51,12 @@ def _google_auth_config(config: Optional[dict]) -> dict:
     return ((config or {}).get("auth") or {}).get("google") or {}
 
 
-def _google_auth_enabled(config: Optional[dict]) -> bool:
+def _google_auth_requested(config: Optional[dict]) -> bool:
+    """Whether operators requested Google auth enforcement."""
+    return bool(_google_auth_config(config).get("enabled"))
+
+
+def _google_auth_ready(config: Optional[dict]) -> bool:
     """Whether external Google auth is fully configured."""
     auth = _google_auth_config(config)
     return bool(
@@ -133,7 +138,8 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, config: Optional[dict] = None):
         super().__init__(app)
         self.config = config or {}
-        self.enabled = _google_auth_enabled(self.config)
+        self.requested = _google_auth_requested(self.config)
+        self.ready = _google_auth_ready(self.config)
         self.exempt_paths = {
             "/",
             "/health",
@@ -145,7 +151,7 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
         }
 
     async def dispatch(self, request: Request, call_next):
-        if not self.enabled:
+        if not self.requested:
             return await call_next(request)
         if _is_local_bypass_request(request, self.config):
             return await call_next(request)
@@ -153,6 +159,12 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if path in self.exempt_paths:
             return await call_next(request)
+
+        if not self.ready:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Google auth is enabled but incomplete"},
+            )
 
         session_state = getattr(request, "session", {}) or {}
         if session_state.get("google_authenticated") is True:
@@ -746,17 +758,18 @@ def create_app(
     # Store config first so middleware can access it
     app.state.config = config or {}
 
-    if _google_auth_enabled(config):
+    if _google_auth_requested(config):
         auth_config = _google_auth_config(config)
         app.add_middleware(GoogleAuthMiddleware, config=config)
-        app.add_middleware(
-            SessionMiddleware,
-            secret_key=str(auth_config.get("session_cookie_secret")),
-            session_cookie="sm_auth",
-            same_site="lax",
-            https_only=True,
-            max_age=60 * 60 * 24 * 14,
-        )
+        if _google_auth_ready(config):
+            app.add_middleware(
+                SessionMiddleware,
+                secret_key=str(auth_config.get("session_cookie_secret")),
+                session_cookie="sm_auth",
+                same_site="lax",
+                https_only=True,
+                max_age=60 * 60 * 24 * 14,
+            )
 
     # Add timing middleware for debugging (with config)
     app.add_middleware(RequestTimingMiddleware, config=config)
@@ -1030,7 +1043,7 @@ def create_app(
     @app.get("/auth/session")
     async def auth_session(request: Request):
         """Return current external auth session state."""
-        if not _google_auth_enabled(app.state.config):
+        if not _google_auth_requested(app.state.config):
             return {
                 "enabled": False,
                 "authenticated": True,
@@ -1038,7 +1051,6 @@ def create_app(
                 "email": None,
                 "name": None,
             }
-
         if _is_local_bypass_request(request, app.state.config):
             return {
                 "enabled": True,
@@ -1046,6 +1058,15 @@ def create_app(
                 "bypass": True,
                 "email": None,
                 "name": None,
+            }
+        if not _google_auth_ready(app.state.config):
+            return {
+                "enabled": True,
+                "authenticated": False,
+                "bypass": False,
+                "email": None,
+                "name": None,
+                "error": "misconfigured",
             }
 
         session_state = getattr(request, "session", {}) or {}
@@ -1060,7 +1081,7 @@ def create_app(
     @app.get("/auth/google/login")
     async def google_login(request: Request, next: Optional[str] = Query(default="/watch/")):
         """Start the Google OAuth redirect flow."""
-        if not _google_auth_enabled(app.state.config):
+        if not _google_auth_ready(app.state.config):
             raise HTTPException(status_code=503, detail="Google auth is not configured")
 
         auth_config = _google_auth_config(app.state.config)
@@ -1094,7 +1115,7 @@ def create_app(
         error: Optional[str] = None,
     ):
         """Finish the Google OAuth flow and establish a signed browser session."""
-        if not _google_auth_enabled(app.state.config):
+        if not _google_auth_ready(app.state.config):
             raise HTTPException(status_code=503, detail="Google auth is not configured")
 
         if error:
@@ -1143,12 +1164,12 @@ def create_app(
         )
 
     @app.get("/auth/logout")
-    async def auth_logout(request: Request, next: Optional[str] = Query(default="/watch/")):
+    async def auth_logout(request: Request, next: Optional[str] = Query(default="/")):
         """Clear the current browser auth session."""
         session_state = getattr(request, "session", None)
         if session_state is not None:
             session_state.clear()
-        safe_next = next if _is_safe_next_path(next) else "/watch/"
+        safe_next = next if _is_safe_next_path(next) else "/"
         return RedirectResponse(url=safe_next, status_code=302)
 
     @app.get("/health")
