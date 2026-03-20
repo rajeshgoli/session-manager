@@ -1,0 +1,536 @@
+package li.rajeshgo.sm.ui.watch
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.rounded.UnfoldLess
+import androidx.compose.material.icons.rounded.UnfoldMore
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Divider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import li.rajeshgo.sm.data.model.ClientSession
+import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.ui.theme.Amber
+import li.rajeshgo.sm.ui.theme.Border
+import li.rajeshgo.sm.ui.theme.BorderStrong
+import li.rajeshgo.sm.ui.theme.Cyan
+import li.rajeshgo.sm.ui.theme.Emerald
+import li.rajeshgo.sm.ui.theme.Fuchsia
+import li.rajeshgo.sm.ui.theme.Panel
+import li.rajeshgo.sm.ui.theme.PanelElevated
+import li.rajeshgo.sm.ui.theme.PanelMuted
+import li.rajeshgo.sm.ui.theme.Rose
+import li.rajeshgo.sm.ui.theme.TextMuted
+import li.rajeshgo.sm.ui.theme.TextSecondary
+import li.rajeshgo.sm.ui.theme.Violet
+import li.rajeshgo.sm.util.launchTermuxAttach
+import li.rajeshgo.sm.util.termuxAttachCommand
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun WatchScreen(
+    onNavigateToSettings: () -> Unit,
+    viewModel: WatchViewModel = viewModel(),
+) {
+    val state by viewModel.uiState.collectAsState()
+    var query by remember { mutableStateOf("") }
+    var filter by remember { mutableStateOf("all") }
+    var toast by remember { mutableStateOf<String?>(null) }
+
+    val sections = remember(state.sessions, filter, query) {
+        filterSections(buildSections(state.sessions), filter, query)
+    }
+    val sessionsById = remember(state.sessions) { state.sessions.associateBy { it.id } }
+    val context = LocalContext.current
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        if (state.loading) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = Cyan)
+            }
+            return@Box
+        }
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item {
+                HeaderCard(
+                    userEmail = state.userEmail,
+                    lastSync = state.lastSync,
+                    refreshing = state.refreshing,
+                    onRefresh = { viewModel.refresh() },
+                    onOpenSettings = onNavigateToSettings,
+                )
+            }
+
+            item {
+                SummaryStrip(sessions = state.sessions)
+            }
+
+            item {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Panel,
+                    tonalElevation = 0.dp,
+                    shadowElevation = 0.dp,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Border),
+                ) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        OutlinedTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Search") },
+                            placeholder = { Text("name, id, role, alias, worktree") },
+                            singleLine = true,
+                        )
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("all", "running", "idle", "stopped").forEach { candidate ->
+                                val selected = candidate == filter
+                                AssistChip(
+                                    onClick = { filter = candidate },
+                                    label = { Text(candidate.uppercase()) },
+                                    colors = AssistChipDefaults.assistChipColors(
+                                        containerColor = if (selected) Cyan.copy(alpha = 0.18f) else PanelMuted,
+                                        labelColor = if (selected) Color.White else TextSecondary,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (state.error != null) {
+                item {
+                    Text(
+                        text = state.error.orEmpty(),
+                        color = Rose,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+
+            if (sections.isEmpty()) {
+                item {
+                    EmptyState(query = query, filter = filter)
+                }
+            } else {
+                sections.forEach { section ->
+                    item(key = "repo-${section.repoKey}") {
+                        RepoHeader(title = "${section.repoLabel} (${section.repoKey})")
+                    }
+                    items(section.roots, key = { it.session.id }) { root ->
+                        WatchTree(
+                            node = root,
+                            depth = 0,
+                            sessionsById = sessionsById,
+                            expandedSessionIds = state.expandedSessionIds,
+                            detailsById = state.detailsBySessionId,
+                            onToggleExpanded = { viewModel.toggleExpanded(it) },
+                            onOpenAttach = { session ->
+                                val attach = session.termuxAttach
+                                if (attach == null) {
+                                    toast = "Attach metadata unavailable"
+                                } else {
+                                    launchTermuxAttach(context, attach)
+                                        .onSuccess { toast = "Opening Termux for ${sessionDisplayName(session)}" }
+                                        .onFailure { error -> toast = error.message ?: "Attach failed" }
+                                }
+                            },
+                            onCopyAttach = { session ->
+                                val command = session.termuxAttach?.let(::termuxAttachCommand)
+                                if (command == null) {
+                                    toast = "Attach command unavailable"
+                                } else {
+                                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm attach", command))
+                                    toast = "Attach command copied"
+                                }
+                            },
+                            onKill = { session ->
+                                viewModel.killSession(session.id) { result ->
+                                    toast = result.exceptionOrNull()?.message ?: "Killed ${session.id}"
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+        if (toast != null) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                Surface(
+                    modifier = Modifier.padding(16.dp),
+                    shape = RoundedCornerShape(999.dp),
+                    color = PanelElevated,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
+                ) {
+                    Text(
+                        text = toast.orEmpty(),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HeaderCard(
+    userEmail: String,
+    lastSync: String?,
+    refreshing: Boolean,
+    onRefresh: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(28.dp),
+        color = Panel,
+        border = androidx.compose.foundation.BorderStroke(1.dp, Border),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Column {
+                    Text("sm watch", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.height(6.dp))
+                    Text(userEmail.ifBlank { "Not signed in" }, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onRefresh) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = if (refreshing) Cyan else TextSecondary)
+                    }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Rounded.Settings, contentDescription = "Settings", tint = TextSecondary)
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = "Dense, Android-native session watch with direct Termux attach.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = "Last sync ${formatDateTime(lastSync)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (refreshing) Cyan else TextMuted,
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SummaryStrip(sessions: List<ClientSession>) {
+    val running = sessions.count { it.status == "running" }
+    val working = sessions.count { it.activityState == "working" }
+    val thinking = sessions.count { it.activityState == "thinking" }
+    val maintainers = sessions.count { it.isMaintainer }
+
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SummaryPill(label = "sessions", value = sessions.size.toString(), tint = MaterialTheme.colorScheme.onSurface)
+        SummaryPill(label = "running / working", value = "$running / $working", tint = Emerald)
+        SummaryPill(label = "thinking", value = thinking.toString(), tint = Cyan)
+        SummaryPill(label = "maintainer", value = maintainers.toString(), tint = Violet)
+    }
+}
+
+@Composable
+private fun SummaryPill(label: String, value: String, tint: Color) {
+    Surface(shape = RoundedCornerShape(24.dp), color = Panel, border = androidx.compose.foundation.BorderStroke(1.dp, Border)) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Text(label.uppercase(), style = MaterialTheme.typography.labelSmall, color = TextMuted)
+            Spacer(Modifier.height(4.dp))
+            Text(value, style = MaterialTheme.typography.titleLarge, color = tint, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun RepoHeader(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelSmall,
+        color = Cyan,
+        fontFamily = FontFamily.Monospace,
+    )
+}
+
+@Composable
+private fun WatchTree(
+    node: WatchSessionNode,
+    depth: Int,
+    sessionsById: Map<String, ClientSession>,
+    expandedSessionIds: Set<String>,
+    detailsById: Map<String, SessionDetail>,
+    onToggleExpanded: (ClientSession) -> Unit,
+    onOpenAttach: (ClientSession) -> Unit,
+    onCopyAttach: (ClientSession) -> Unit,
+    onKill: (ClientSession) -> Unit,
+) {
+    SessionRow(
+        session = node.session,
+        depth = depth,
+        parentLabel = parentLabel(node.session, sessionsById),
+        expanded = expandedSessionIds.contains(node.session.id),
+        detail = detailsById[node.session.id],
+        onToggleExpanded = { onToggleExpanded(node.session) },
+        onOpenAttach = { onOpenAttach(node.session) },
+        onCopyAttach = { onCopyAttach(node.session) },
+        onKill = { onKill(node.session) },
+    )
+
+    node.sameRepoChildren.forEach { child ->
+        WatchTree(child, depth + 1, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onKill)
+    }
+
+    node.crossRepoGroups.forEach { group ->
+        Text(
+            text = "${group.repoLabel} (${group.repoKey})",
+            modifier = Modifier.padding(start = ((depth + 1) * 18).dp, top = 2.dp, bottom = 6.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = TextMuted,
+            fontFamily = FontFamily.Monospace,
+        )
+        group.children.forEach { child ->
+            WatchTree(child, depth + 2, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onKill)
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SessionRow(
+    session: ClientSession,
+    depth: Int,
+    parentLabel: String,
+    expanded: Boolean,
+    detail: SessionDetail?,
+    onToggleExpanded: () -> Unit,
+    onOpenAttach: () -> Unit,
+    onCopyAttach: () -> Unit,
+    onKill: () -> Unit,
+) {
+    val attachSupported = session.termuxAttach?.supported == true
+    Surface(
+        modifier = Modifier.padding(start = (depth * 14).dp),
+        shape = RoundedCornerShape(22.dp),
+        color = Panel,
+        border = androidx.compose.foundation.BorderStroke(1.dp, Border),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { if (attachSupported) onOpenAttach() else onToggleExpanded() }
+                    .padding(14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(9.dp).background(statusDot(session), CircleShape))
+                    Spacer(Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = sessionDisplayName(session),
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (session.isMaintainer) {
+                                Spacer(Modifier.width(8.dp))
+                                InlineBadge("maintainer", Cyan)
+                            }
+                        }
+                        Spacer(Modifier.height(3.dp))
+                        Text(
+                            text = "${session.id} • ${session.role ?: if (session.isEm) "em" else session.provider ?: "-"}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Parent $parentLabel • ${lastSummary(session)} • ${formatAge(session.lastActivity, session.activityState)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextMuted,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (attachSupported) {
+                        IconButton(onClick = onOpenAttach) {
+                            Icon(Icons.Rounded.Terminal, contentDescription = "Attach", tint = Emerald)
+                        }
+                    }
+                    IconButton(onClick = onToggleExpanded) {
+                        Icon(
+                            if (expanded) Icons.Rounded.UnfoldLess else Icons.Rounded.UnfoldMore,
+                            contentDescription = if (expanded) "Collapse" else "Expand",
+                            tint = TextSecondary,
+                        )
+                    }
+                }
+            }
+
+            if (expanded) {
+                Divider(color = Border)
+                Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StatusChip(label = activityLabel(session.activityState), tint = activityTint(session.activityState))
+                        StatusChip(label = session.status, tint = statusTint(session.status))
+                        StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
+                        if (session.role != null) StatusChip(label = session.role, tint = Violet)
+                    }
+                    detailLines(session, detail).forEach { line ->
+                        Text(
+                            text = line,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (attachSupported) {
+                            ActionChip(label = "Attach", icon = Icons.Rounded.Terminal, onClick = onOpenAttach)
+                            ActionChip(label = "Copy", icon = Icons.Rounded.ContentCopy, onClick = onCopyAttach)
+                        }
+                        ActionChip(label = "Kill", icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
+                        if (session.termuxAttach?.supported == false) {
+                            StatusChip(label = session.termuxAttach.reason ?: "attach unavailable", tint = TextMuted)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusChip(label: String, tint: Color) {
+    Surface(shape = RoundedCornerShape(999.dp), color = tint.copy(alpha = 0.18f), border = androidx.compose.foundation.BorderStroke(1.dp, tint.copy(alpha = 0.32f))) {
+        Text(label.uppercase(), modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelSmall, color = tint)
+    }
+}
+
+@Composable
+private fun ActionChip(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit, tint: Color = Emerald) {
+    AssistChip(
+        onClick = onClick,
+        label = { Text(label.uppercase()) },
+        leadingIcon = { Icon(icon, contentDescription = null, tint = tint) },
+        colors = AssistChipDefaults.assistChipColors(containerColor = PanelMuted, labelColor = MaterialTheme.colorScheme.onSurface),
+        border = AssistChipDefaults.assistChipBorder(enabled = true, borderColor = tint.copy(alpha = 0.32f)),
+    )
+}
+
+@Composable
+private fun InlineBadge(label: String, tint: Color) {
+    Surface(shape = RoundedCornerShape(999.dp), color = tint.copy(alpha = 0.16f)) {
+        Text(label.uppercase(), modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall, color = tint)
+    }
+}
+
+@Composable
+private fun EmptyState(query: String, filter: String) {
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), border = androidx.compose.foundation.BorderStroke(1.dp, Border)) {
+        Column(modifier = Modifier.fillMaxWidth().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("No sessions matched", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = if (query.isNotBlank() || filter != "all") "Adjust the filter or search query." else "Waiting for session-manager to report sessions.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+            )
+        }
+    }
+}
+
+private fun statusDot(session: ClientSession): Color = when (session.status) {
+    "running" -> Emerald
+    "stopped" -> Rose
+    else -> TextMuted
+}
+
+private fun statusTint(status: String?): Color = when (status) {
+    "running" -> Emerald
+    "stopped" -> Rose
+    else -> TextSecondary
+}
+
+private fun activityTint(state: String?): Color = when (activityLabel(state)) {
+    "working" -> Emerald
+    "thinking" -> Cyan
+    "waiting" -> Amber
+    "stopped" -> Rose
+    else -> TextSecondary
+}
+
+private fun providerTint(provider: String?): Color = when (provider) {
+    "codex-fork" -> Cyan
+    "claude" -> Fuchsia
+    "codex-app" -> Violet
+    else -> TextSecondary
+}
