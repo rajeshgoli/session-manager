@@ -1158,21 +1158,21 @@ def create_app(
             "PATH=/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/bin:/bin:$PATH; "
             "export PATH; "
             "if command -v tmux >/dev/null 2>&1; then "
-            "exec tmux attach-session -t \"$1\"; "
+            "exec tmux attach-session -t \"$SM_TMUX_SESSION\"; "
             "elif [ -x /opt/homebrew/bin/tmux ]; then "
-            "exec /opt/homebrew/bin/tmux attach-session -t \"$1\"; "
+            "exec /opt/homebrew/bin/tmux attach-session -t \"$SM_TMUX_SESSION\"; "
             "elif [ -x /usr/local/bin/tmux ]; then "
-            "exec /usr/local/bin/tmux attach-session -t \"$1\"; "
+            "exec /usr/local/bin/tmux attach-session -t \"$SM_TMUX_SESSION\"; "
             "else echo \"tmux not found on remote host\" >&2; exit 127; fi"
+        )
+        remote_command = (
+            f"SM_TMUX_SESSION={shlex.quote(tmux_session)} "
+            f"sh -lc {shlex.quote(remote_attach_script)}"
         )
         ssh_args.extend([
             "-t",
             f"{ssh_username}@{public_ssh_host}",
-            "sh",
-            "-lc",
-            remote_attach_script,
-            "sh",
-            tmux_session,
+            remote_command,
         ])
 
         return {
