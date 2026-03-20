@@ -22,6 +22,22 @@ def _auth_config() -> dict:
     }
 
 
+def _misconfigured_auth_config() -> dict:
+    return {
+        "auth": {
+            "google": {
+                "enabled": True,
+                "public_host": "sm.rajeshgo.li",
+                "client_id": "web-client-id",
+                # client_secret intentionally missing
+                "redirect_uri": "https://sm.rajeshgo.li/auth/google/callback",
+                "allowlist_emails": ["rajeshgoli@gmail.com"],
+                "session_cookie_secret": "test-session-secret",
+            }
+        }
+    }
+
+
 def _session() -> Session:
     return Session(
         id="abc12345",
@@ -91,6 +107,21 @@ def test_local_loopback_bypasses_google_auth():
     assert response.json()["sessions"][0]["id"] == "abc12345"
 
 
+def test_external_requests_fail_closed_when_google_auth_is_misconfigured():
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_misconfigured_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    sessions_response = client.get("/sessions")
+    watch_response = client.get("/watch")
+
+    assert sessions_response.status_code == 503
+    assert sessions_response.json()["detail"] == "Google auth is enabled but incomplete"
+    assert watch_response.status_code == 503
+    assert watch_response.json()["detail"] == "Google auth is enabled but incomplete"
+
+
 def test_google_callback_authenticates_allowlisted_email(monkeypatch):
     monkeypatch.setattr("src.server.secrets.token_urlsafe", lambda _: "oauth-state-123")
 
@@ -140,6 +171,40 @@ def test_google_callback_authenticates_allowlisted_email(monkeypatch):
 
     protected_response = client.get("/sessions")
     assert protected_response.status_code == 200
+
+
+def test_logout_redirects_to_unprotected_root(monkeypatch):
+    monkeypatch.setattr("src.server.secrets.token_urlsafe", lambda _: "oauth-state-123")
+
+    async def fake_exchange_google_code(client_id: str, client_secret: str, redirect_uri: str, code: str) -> dict:
+        return {"access_token": "token-123"}
+
+    async def fake_fetch_google_userinfo(access_token: str) -> dict:
+        return {
+            "email": "rajeshgoli@gmail.com",
+            "email_verified": True,
+            "name": "Rajesh Goli",
+        }
+
+    monkeypatch.setattr("src.server._exchange_google_code", fake_exchange_google_code)
+    monkeypatch.setattr("src.server._fetch_google_userinfo", fake_fetch_google_userinfo)
+
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    client.get("/auth/google/login?next=/watch/", follow_redirects=False)
+    client.get("/auth/google/callback?state=oauth-state-123&code=oauth-code", follow_redirects=False)
+
+    logout_response = client.get("/auth/logout", follow_redirects=False)
+
+    assert logout_response.status_code == 302
+    assert logout_response.headers["location"] == "/"
+
+    post_logout_watch = client.get("/watch", follow_redirects=False)
+    assert post_logout_watch.status_code == 302
+    assert post_logout_watch.headers["location"] == "/auth/google/login?next=%2Fwatch"
 
 
 def test_google_callback_rejects_non_allowlisted_email(monkeypatch):
