@@ -1166,8 +1166,8 @@ def create_app(
     @app.get("/auth/logout")
     async def auth_logout(request: Request, next: Optional[str] = Query(default="/")):
         """Clear the current browser auth session."""
-        session_state = getattr(request, "session", None)
-        if session_state is not None:
+        session_state = request.scope.get("session")
+        if isinstance(session_state, dict):
             session_state.clear()
         safe_next = next if _is_safe_next_path(next) else "/"
         return RedirectResponse(url=safe_next, status_code=302)
