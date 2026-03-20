@@ -87,6 +87,18 @@ def test_external_watch_redirects_to_google_login():
     assert response.headers["location"] == "/auth/google/login?next=%2Fwatch"
 
 
+def test_external_root_redirects_into_watch_flow():
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/watch/"
+
+
 def test_external_sessions_ignore_forwarded_host_spoof():
     client = TestClient(
         create_app(session_manager=_session_manager(), config=_auth_config()),
@@ -102,9 +114,12 @@ def test_local_loopback_bypasses_google_auth():
     client = TestClient(create_app(session_manager=_session_manager(), config=_auth_config()))
 
     response = client.get("/sessions")
+    root_response = client.get("/")
 
     assert response.status_code == 200
     assert response.json()["sessions"][0]["id"] == "abc12345"
+    assert root_response.status_code == 200
+    assert root_response.json() == {"status": "ok", "service": "session-manager"}
 
 
 def test_external_requests_fail_closed_when_google_auth_is_misconfigured():
@@ -159,8 +174,25 @@ def test_logout_redirects_cleanly_when_google_auth_is_misconfigured():
     response = client.get("/auth/logout", follow_redirects=False)
 
     assert response.status_code == 302
-    assert response.headers["location"] == "/"
+    assert response.headers["location"] == "/logged-out"
     assert "sm_auth=\"\";" in response.headers["set-cookie"]
+
+    landing_response = client.get("/logged-out")
+    assert landing_response.status_code == 200
+    assert "Signed out" in landing_response.text
+
+
+def test_logged_out_page_hides_google_login_when_auth_is_incomplete():
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_misconfigured_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    response = client.get("/logged-out")
+
+    assert response.status_code == 200
+    assert "Google sign-in is not available on this deployment right now." in response.text
+    assert "/auth/google/login" not in response.text
 
 
 def test_google_callback_authenticates_allowlisted_email(monkeypatch):
@@ -214,7 +246,7 @@ def test_google_callback_authenticates_allowlisted_email(monkeypatch):
     assert protected_response.status_code == 200
 
 
-def test_logout_redirects_to_unprotected_root(monkeypatch):
+def test_logout_redirects_to_public_signed_out_page(monkeypatch):
     monkeypatch.setattr("src.server.secrets.token_urlsafe", lambda _: "oauth-state-123")
 
     async def fake_exchange_google_code(client_id: str, client_secret: str, redirect_uri: str, code: str) -> dict:
@@ -241,11 +273,15 @@ def test_logout_redirects_to_unprotected_root(monkeypatch):
     logout_response = client.get("/auth/logout", follow_redirects=False)
 
     assert logout_response.status_code == 302
-    assert logout_response.headers["location"] == "/"
+    assert logout_response.headers["location"] == "/logged-out"
 
     post_logout_watch = client.get("/watch", follow_redirects=False)
     assert post_logout_watch.status_code == 302
     assert post_logout_watch.headers["location"] == "/auth/google/login?next=%2Fwatch"
+
+    landing_response = client.get("/logged-out")
+    assert landing_response.status_code == 200
+    assert "Signed out" in landing_response.text
 
 
 def test_google_callback_rejects_non_allowlisted_email(monkeypatch):
