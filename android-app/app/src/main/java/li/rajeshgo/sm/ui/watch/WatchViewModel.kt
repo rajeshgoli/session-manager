@@ -68,7 +68,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 .onSuccess { sessions ->
                     _uiState.value = _uiState.value.copy(
                         sessions = sessions,
-                        detailsBySessionId = if (expandedSessionIds.isEmpty()) _uiState.value.detailsBySessionId else emptyMap(),
+                        detailsBySessionId = emptyMap(),
                         loading = false,
                         refreshing = false,
                         userEmail = userEmail,
