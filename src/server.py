@@ -1170,7 +1170,9 @@ def create_app(
         if isinstance(session_state, dict):
             session_state.clear()
         safe_next = next if _is_safe_next_path(next) else "/"
-        return RedirectResponse(url=safe_next, status_code=302)
+        response = RedirectResponse(url=safe_next, status_code=302)
+        response.delete_cookie("sm_auth")
+        return response
 
     @app.get("/health")
     async def health():

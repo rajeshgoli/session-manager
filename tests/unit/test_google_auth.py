@@ -160,6 +160,7 @@ def test_logout_redirects_cleanly_when_google_auth_is_misconfigured():
 
     assert response.status_code == 302
     assert response.headers["location"] == "/"
+    assert "sm_auth=\"\";" in response.headers["set-cookie"]
 
 
 def test_google_callback_authenticates_allowlisted_email(monkeypatch):
