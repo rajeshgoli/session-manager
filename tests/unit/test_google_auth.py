@@ -87,6 +87,18 @@ def test_external_watch_redirects_to_google_login():
     assert response.headers["location"] == "/auth/google/login?next=%2Fwatch"
 
 
+def test_external_root_redirects_into_watch_flow():
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/watch/"
+
+
 def test_external_sessions_ignore_forwarded_host_spoof():
     client = TestClient(
         create_app(session_manager=_session_manager(), config=_auth_config()),
@@ -102,9 +114,12 @@ def test_local_loopback_bypasses_google_auth():
     client = TestClient(create_app(session_manager=_session_manager(), config=_auth_config()))
 
     response = client.get("/sessions")
+    root_response = client.get("/")
 
     assert response.status_code == 200
     assert response.json()["sessions"][0]["id"] == "abc12345"
+    assert root_response.status_code == 200
+    assert root_response.json() == {"status": "ok", "service": "session-manager"}
 
 
 def test_external_requests_fail_closed_when_google_auth_is_misconfigured():

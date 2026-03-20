@@ -1036,8 +1036,10 @@ def create_app(
         return CODEX_APP_RETIRED_SESSION_ERROR
 
     @app.get("/")
-    async def root():
-        """Health check endpoint."""
+    async def root(request: Request):
+        """Health check endpoint locally, watch entrypoint externally."""
+        if _google_auth_requested(app.state.config) and not _is_local_bypass_request(request, app.state.config):
+            return RedirectResponse(url="/watch/", status_code=302)
         return {"status": "ok", "service": "session-manager"}
 
     @app.get("/auth/session")
