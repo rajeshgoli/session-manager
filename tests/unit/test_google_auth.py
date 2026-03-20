@@ -150,6 +150,19 @@ def test_local_auth_session_reports_bypass_when_google_auth_is_misconfigured():
     }
 
 
+def test_logout_redirects_cleanly_when_google_auth_is_misconfigured():
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_misconfigured_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    response = client.get("/auth/logout", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/"
+    assert "sm_auth=\"\";" in response.headers["set-cookie"]
+
+
 def test_google_callback_authenticates_allowlisted_email(monkeypatch):
     monkeypatch.setattr("src.server.secrets.token_urlsafe", lambda _: "oauth-state-123")
 
