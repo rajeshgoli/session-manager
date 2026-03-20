@@ -3,6 +3,7 @@ package li.rajeshgo.sm.ui.watch
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -29,6 +30,7 @@ data class WatchUiState(
 class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
     private val sessionRepository = SessionManagerRepository()
+    private var refreshJob: Job? = null
 
     private val _uiState = MutableStateFlow(WatchUiState())
     val uiState: StateFlow<WatchUiState> = _uiState
@@ -49,42 +51,49 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refresh(initial: Boolean = false) {
-        viewModelScope.launch {
-            val serverUrl = settingsRepository.serverUrl.first()
-            val accessToken = settingsRepository.accessToken.first()
-            val userEmail = settingsRepository.userEmail.first()
-            if (serverUrl.isBlank() || accessToken.isBlank()) {
-                _uiState.value = _uiState.value.copy(
-                    loading = false,
-                    refreshing = false,
-                    userEmail = userEmail,
-                    error = "Sign in to load sessions",
-                )
-                return@launch
+        if (refreshJob?.isActive == true) {
+            return
+        }
+        refreshJob = viewModelScope.launch {
+            try {
+                val serverUrl = settingsRepository.serverUrl.first()
+                val accessToken = settingsRepository.accessToken.first()
+                val userEmail = settingsRepository.userEmail.first()
+                if (serverUrl.isBlank() || accessToken.isBlank()) {
+                    _uiState.value = _uiState.value.copy(
+                        loading = false,
+                        refreshing = false,
+                        userEmail = userEmail,
+                        error = "Sign in to load sessions",
+                    )
+                    return@launch
+                }
+                _uiState.value = _uiState.value.copy(loading = initial, refreshing = !initial, error = null)
+                val expandedSessionIds = _uiState.value.expandedSessionIds
+                runCatching { sessionRepository.fetchSessions(serverUrl, accessToken) }
+                    .onSuccess { sessions ->
+                        _uiState.value = _uiState.value.copy(
+                            sessions = sessions,
+                            detailsBySessionId = emptyMap(),
+                            loading = false,
+                            refreshing = false,
+                            userEmail = userEmail,
+                            lastSync = java.time.OffsetDateTime.now().toString(),
+                            error = null,
+                        )
+                        sessions.filter { it.id in expandedSessionIds }.forEach { loadDetail(it) }
+                    }
+                    .onFailure { error ->
+                        _uiState.value = _uiState.value.copy(
+                            loading = false,
+                            refreshing = false,
+                            userEmail = userEmail,
+                            error = error.message ?: "Failed to refresh sessions",
+                        )
+                    }
+            } finally {
+                refreshJob = null
             }
-            _uiState.value = _uiState.value.copy(loading = initial, refreshing = !initial, error = null)
-            val expandedSessionIds = _uiState.value.expandedSessionIds
-            runCatching { sessionRepository.fetchSessions(serverUrl, accessToken) }
-                .onSuccess { sessions ->
-                    _uiState.value = _uiState.value.copy(
-                        sessions = sessions,
-                        detailsBySessionId = emptyMap(),
-                        loading = false,
-                        refreshing = false,
-                        userEmail = userEmail,
-                        lastSync = java.time.OffsetDateTime.now().toString(),
-                        error = null,
-                    )
-                    sessions.filter { it.id in expandedSessionIds }.forEach { loadDetail(it) }
-                }
-                .onFailure { error ->
-                    _uiState.value = _uiState.value.copy(
-                        loading = false,
-                        refreshing = false,
-                        userEmail = userEmail,
-                        error = error.message ?: "Failed to refresh sessions",
-                    )
-                }
         }
     }
 
