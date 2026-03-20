@@ -72,16 +72,20 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 val expandedSessionIds = _uiState.value.expandedSessionIds
                 runCatching { sessionRepository.fetchSessions(serverUrl, accessToken) }
                     .onSuccess { sessions ->
+                        val sessionIds = sessions.map { it.id }.toSet()
+                        val preservedDetails = _uiState.value.detailsBySessionId.filterKeys { it in sessionIds }
                         _uiState.value = _uiState.value.copy(
                             sessions = sessions,
-                            detailsBySessionId = emptyMap(),
+                            detailsBySessionId = preservedDetails,
                             loading = false,
                             refreshing = false,
                             userEmail = userEmail,
                             lastSync = java.time.OffsetDateTime.now().toString(),
                             error = null,
                         )
-                        sessions.filter { it.id in expandedSessionIds }.forEach { loadDetail(it) }
+                        sessions
+                            .filter { it.id in expandedSessionIds && it.id !in preservedDetails }
+                            .forEach { loadDetail(it) }
                     }
                     .onFailure { error ->
                         _uiState.value = _uiState.value.copy(

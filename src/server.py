@@ -60,7 +60,8 @@ class WatchStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
         response = await super().get_response(path, scope)
         content_type = response.headers.get("content-type", "")
-        if response.status_code == 200 and content_type.startswith("text/html"):
+        is_html_entry = content_type.startswith("text/html") or path in {"", ".", "index.html"}
+        if response.status_code in {200, 304} and is_html_entry:
             response.headers["Cache-Control"] = "no-store, max-age=0, must-revalidate"
             response.headers["Pragma"] = "no-cache"
         return response
