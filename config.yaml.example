@@ -132,6 +132,24 @@ services:
   # Office automation service (for /password command and other utilities)
   office_automate_url: "http://192.168.5.140:8080"
 
+# Optional external access configuration for cloudflared + Android/web clients.
+# Real secrets should stay in a gitignored local env file; these are placeholders.
+external_access:
+  public_http_host: "sm.example.com"
+  public_ssh_host: "ssh.sm.example.com"
+  http_origin_url: "http://127.0.0.1:8420"
+
+auth:
+  google:
+    enabled: false
+    public_host: "sm.example.com"
+    client_id: "YOUR_GOOGLE_WEB_CLIENT_ID"
+    client_secret: "YOUR_GOOGLE_WEB_CLIENT_SECRET"
+    redirect_uri: "https://sm.example.com/auth/google/callback"
+    allowlist_emails:
+      - "you@example.com"
+    session_cookie_secret: "SET_IN_LOCAL_ENV_OR_OVERRIDE"
+
 # Multi-agent coordination settings
 claude:
   # Command to spawn Claude Code sessions (user-controlled, agents cannot override)
