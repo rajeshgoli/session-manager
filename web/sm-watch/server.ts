@@ -13,7 +13,7 @@ async function startServer() {
 
   // Mock session data generator
   const generateSessions = () => {
-    const statuses: SessionStatus[] = ["running", "idle", "error", "detached", "active"];
+    const statuses: SessionStatus[] = ["running", "idle", "stopped"];
     const owners = ["alice", "bob", "charlie", "system"];
     const humanStatuses = [
       "reviewing PR #1764 diff for edge-case coverage and spec adherence; preparing blocking feedback",
@@ -83,7 +83,7 @@ async function startServer() {
       // Randomly update a session status or heartbeat
       sessions = sessions.map(s => {
         if (Math.random() > 0.8) {
-          const statuses: SessionStatus[] = ["running", "idle", "error", "detached", "active"];
+          const statuses: SessionStatus[] = ["running", "idle", "stopped"];
           return { ...s, status: statuses[Math.floor(Math.random() * statuses.length)], lastHeartbeat: new Date().toISOString() };
         }
         return { ...s, lastHeartbeat: new Date().toISOString() };

@@ -240,6 +240,7 @@ def test_google_callback_authenticates_allowlisted_email(monkeypatch):
         "bypass": False,
         "email": "rajeshgoli@gmail.com",
         "name": "Rajesh Goli",
+        "auth_type": "browser_session",
     }
 
     protected_response = client.get("/sessions")

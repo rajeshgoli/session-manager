@@ -1,16 +1,23 @@
 """FastAPI server for hooks and API endpoints."""
 
+import asyncio
 import json
 import logging
 import secrets
 import subprocess
 import time
+import shlex
+import base64
+import hashlib
+import hmac
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
 from urllib.parse import urlencode, urlparse
 
 import httpx
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token as google_id_token
 from fastapi import FastAPI, HTTPException, Body, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,6 +51,7 @@ EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS = 0.5
 LOCAL_TRUSTED_CLIENTS = {"127.0.0.1", "localhost", "::1", "testclient"}
 LOCAL_TRUSTED_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
 GOOGLE_AUTH_SCOPES = "openid email profile"
+DEVICE_TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 14
 
 
 def _google_auth_config(config: Optional[dict]) -> dict:
@@ -104,6 +112,15 @@ def _google_login_redirect(next_path: Optional[str] = None) -> str:
     return f"/auth/google/login?{urlencode({'next': safe_next})}"
 
 
+def _allowed_google_audiences(config: Optional[dict]) -> set[str]:
+    auth = _google_auth_config(config)
+    audiences = {
+        str(auth.get("client_id") or "").strip(),
+        str(auth.get("android_client_id") or "").strip(),
+    }
+    return {aud for aud in audiences if aud}
+
+
 async def _exchange_google_code(client_id: str, client_secret: str, redirect_uri: str, code: str) -> dict:
     """Exchange an OAuth authorization code for Google tokens."""
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -132,6 +149,101 @@ async def _fetch_google_userinfo(access_token: str) -> dict:
         return response.json()
 
 
+async def _verify_google_id_token(id_token: str) -> dict:
+    """Verify a Google ID token locally with Google's official auth library."""
+    return await asyncio.to_thread(
+        google_id_token.verify_oauth2_token,
+        id_token,
+        GoogleAuthRequest(),
+        None,
+    )
+
+
+def _urlsafe_b64encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _urlsafe_b64decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+
+def _device_token_secret(config: Optional[dict]) -> Optional[bytes]:
+    auth = _google_auth_config(config)
+    secret = str(auth.get("session_cookie_secret") or "").strip()
+    if not secret:
+        return None
+    return secret.encode("utf-8")
+
+
+def _issue_device_access_token(config: Optional[dict], *, email: str, name: Optional[str]) -> Optional[dict[str, Any]]:
+    secret = _device_token_secret(config)
+    if not secret:
+        return None
+
+    now = int(time.time())
+    payload = {
+        "v": 1,
+        "type": "device_access",
+        "email": email,
+        "name": name,
+        "iat": now,
+        "exp": now + DEVICE_TOKEN_MAX_AGE_SECONDS,
+    }
+    payload_b64 = _urlsafe_b64encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    signature = _urlsafe_b64encode(hmac.new(secret, payload_b64.encode("ascii"), hashlib.sha256).digest())
+    return {
+        "access_token": f"smat_{payload_b64}.{signature}",
+        "expires_at": datetime.fromtimestamp(payload["exp"], tz=timezone.utc).isoformat(),
+    }
+
+
+def _verify_device_access_token(config: Optional[dict], token: str) -> Optional[dict[str, Any]]:
+    secret = _device_token_secret(config)
+    if not secret or not token.startswith("smat_"):
+        return None
+
+    raw = token[len("smat_"):]
+    if "." not in raw:
+        return None
+    payload_b64, signature = raw.split(".", 1)
+    expected = _urlsafe_b64encode(hmac.new(secret, payload_b64.encode("ascii"), hashlib.sha256).digest())
+    if not hmac.compare_digest(signature, expected):
+        return None
+
+    try:
+        payload = json.loads(_urlsafe_b64decode(payload_b64).decode("utf-8"))
+    except Exception:
+        return None
+
+    if payload.get("type") != "device_access":
+        return None
+    if int(payload.get("exp", 0)) <= int(time.time()):
+        return None
+    email = str(payload.get("email") or "").strip().lower()
+    if not email:
+        return None
+    return payload
+
+
+def _request_bearer_token(request: Request) -> Optional[str]:
+    auth_header = str(request.headers.get("authorization") or "").strip()
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    token = auth_header[7:].strip()
+    return token or None
+
+
+def _device_auth_from_request(request: Request, config: Optional[dict]) -> Optional[dict[str, Any]]:
+    state_payload = getattr(request.state, "device_auth", None)
+    if isinstance(state_payload, dict):
+        return state_payload
+    bearer_token = _request_bearer_token(request)
+    if not bearer_token:
+        return None
+    return _verify_device_access_token(config, bearer_token)
+
+
 class GoogleAuthMiddleware(BaseHTTPMiddleware):
     """Protect external routes with Google cookie auth while preserving local loopback access."""
 
@@ -147,8 +259,10 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
             "/health/detailed",
             "/auth/google/login",
             "/auth/google/callback",
+            "/auth/device/google",
             "/auth/logout",
             "/auth/session",
+            "/client/bootstrap",
         }
 
     async def dispatch(self, request: Request, call_next):
@@ -166,6 +280,13 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
                 status_code=503,
                 content={"detail": "Google auth is enabled but incomplete"},
             )
+
+        bearer_token = _request_bearer_token(request)
+        if bearer_token:
+            payload = _verify_device_access_token(self.config, bearer_token)
+            if payload is not None:
+                request.state.device_auth = payload
+                return await call_next(request)
 
         session_state = getattr(request, "session", {}) or {}
         if session_state.get("google_authenticated") is True:
@@ -307,6 +428,27 @@ class EnsureMaintainerResponse(BaseModel):
     """Response payload for maintainer auto-bootstrap."""
     created: bool
     session: SessionResponse
+
+
+class ClientBootstrapResponse(BaseModel):
+    """Bootstrap config for generic mobile/native clients."""
+    auth: Dict[str, Any]
+    external_access: Dict[str, Any]
+    session_open_defaults: Dict[str, Any]
+
+
+class DeviceGoogleAuthRequest(BaseModel):
+    """Request body for native Android Google ID token exchange."""
+    id_token: str
+
+
+class DeviceGoogleAuthResponse(BaseModel):
+    """Response payload for native Android auth token exchange."""
+    access_token: str
+    token_type: str = "Bearer"
+    expires_at: str
+    email: str
+    name: Optional[str] = None
 
 
 class SendInputRequest(BaseModel):
@@ -950,6 +1092,102 @@ def create_app(
             return dumper()
         return model.dict()
 
+    def _external_access_config() -> dict:
+        return (app.state.config or {}).get("external_access") or {}
+
+    def _attach_descriptor(session: Session) -> Optional[dict[str, Any]]:
+        sm = app.state.session_manager
+        getter = getattr(sm, "get_attach_descriptor", None) if sm else None
+        if not callable(getter):
+            return None
+        return getter(session.id)
+
+    def _termux_attach_metadata(session: Session, descriptor: Optional[dict[str, Any]]) -> dict[str, Any]:
+        external_access = _external_access_config()
+        public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
+        ssh_username = str(external_access.get("ssh_username") or "").strip()
+        ssh_proxy_command = str(external_access.get("ssh_proxy_command") or "").strip()
+        tmux_session = ""
+        if descriptor:
+            tmux_session = str(descriptor.get("tmux_session") or "").strip()
+        if not tmux_session:
+            tmux_session = str(getattr(session, "tmux_session", "") or "").strip()
+
+        if not descriptor:
+            return {
+                "supported": False,
+                "reason": "attach descriptor unavailable",
+                "transport": "termux-ssh-tmux",
+            }
+        if not descriptor.get("attach_supported", True):
+            return {
+                "supported": False,
+                "reason": descriptor.get("message") or "attach not supported",
+                "transport": "termux-ssh-tmux",
+            }
+        if not public_ssh_host or not ssh_username:
+            return {
+                "supported": False,
+                "reason": "external ssh attach is not configured",
+                "transport": "termux-ssh-tmux",
+            }
+        if not tmux_session:
+            return {
+                "supported": False,
+                "reason": "tmux target unavailable",
+                "transport": "termux-ssh-tmux",
+            }
+
+        ssh_args = ["ssh"]
+        if ssh_proxy_command:
+            ssh_args.extend(["-o", f"ProxyCommand={ssh_proxy_command}"])
+        ssh_args.extend([
+            "-t",
+            f"{ssh_username}@{public_ssh_host}",
+            "tmux",
+            "attach-session",
+            "-t",
+            tmux_session,
+        ])
+
+        return {
+            "supported": True,
+            "transport": "termux-ssh-tmux",
+            "ssh_host": public_ssh_host,
+            "ssh_username": ssh_username,
+            "ssh_proxy_command": ssh_proxy_command or None,
+            "ssh_command": shlex.join(ssh_args),
+            "tmux_session": tmux_session,
+            "runtime_mode": descriptor.get("runtime_mode"),
+            "termux_package": "com.termux",
+        }
+
+    def _mobile_primary_action(termux_attach: dict[str, Any], descriptor: Optional[dict[str, Any]]) -> dict[str, Any]:
+        if termux_attach.get("supported"):
+            return {
+                "type": "termux_attach",
+                "label": "Attach in Termux",
+            }
+        if descriptor and not descriptor.get("attach_supported", True):
+            return {
+                "type": "details",
+                "label": "View details",
+                "reason": descriptor.get("message") or "attach not supported",
+            }
+        return {
+            "type": "details",
+            "label": "View details",
+        }
+
+    def _mobile_session_payload(session: Session) -> dict[str, Any]:
+        base = _response_dict(_session_to_response(session))
+        descriptor = _attach_descriptor(session)
+        termux_attach = _termux_attach_metadata(session, descriptor)
+        base["attach_descriptor"] = descriptor
+        base["termux_attach"] = termux_attach
+        base["primary_action"] = _mobile_primary_action(termux_attach, descriptor)
+        return base
+
     async def _sync_session_display_identity(session: Session) -> None:
         """Propagate the canonical display name to tmux and Telegram surfaces."""
         display_name = _effective_session_name(session)
@@ -1072,6 +1310,17 @@ def create_app(
                 "error": "misconfigured",
             }
 
+        device_auth = _device_auth_from_request(request, app.state.config)
+        if isinstance(device_auth, dict):
+            return {
+                "enabled": True,
+                "authenticated": True,
+                "bypass": False,
+                "email": device_auth.get("email"),
+                "name": device_auth.get("name"),
+                "auth_type": "device_bearer",
+            }
+
         session_state = getattr(request, "session", {}) or {}
         return {
             "enabled": True,
@@ -1079,7 +1328,78 @@ def create_app(
             "bypass": False,
             "email": session_state.get("google_email"),
             "name": session_state.get("google_name"),
+            "auth_type": "browser_session" if session_state.get("google_authenticated") is True else None,
         }
+
+    @app.get("/client/bootstrap", response_model=ClientBootstrapResponse)
+    async def client_bootstrap():
+        """Return runtime bootstrap config for native/mobile clients."""
+        external_access = _external_access_config()
+        google_auth = _google_auth_config(app.state.config)
+        public_http_host = str(external_access.get("public_http_host") or "").strip()
+        public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
+        ssh_username = str(external_access.get("ssh_username") or "").strip()
+        google_server_client_id = str(google_auth.get("client_id") or "").strip()
+        termux_supported = bool(public_ssh_host and ssh_username)
+
+        return ClientBootstrapResponse(
+            auth={
+                "mode": "browser_session_cookie",
+                "session_endpoint": "/auth/session",
+                "login_endpoint": "/auth/google/login",
+                "logout_endpoint": "/auth/logout",
+                "device_auth_endpoint": "/auth/device/google",
+                "device_auth_token_type": "Bearer",
+                "google_server_client_id": google_server_client_id or None,
+            },
+            external_access={
+                "public_http_host": public_http_host or None,
+                "public_ssh_host": public_ssh_host or None,
+                "ssh_username": ssh_username or None,
+                "termux_attach_supported": termux_supported,
+            },
+            session_open_defaults={
+                "preferred_action": "termux_attach" if termux_supported else "details",
+                "termux_package": "com.termux",
+            },
+        )
+
+    @app.post("/auth/device/google", response_model=DeviceGoogleAuthResponse)
+    async def auth_device_google(request: DeviceGoogleAuthRequest):
+        """Exchange a Google ID token for a native-client bearer token."""
+        if not _google_auth_ready(app.state.config):
+            raise HTTPException(status_code=503, detail="Google auth is not configured")
+
+        try:
+            tokeninfo = await _verify_google_id_token(request.id_token)
+        except Exception as exc:
+            logger.warning("Device Google auth verification failed: %s", exc)
+            raise HTTPException(status_code=401, detail="Invalid Google ID token")
+
+        audience = str(tokeninfo.get("aud") or "").strip()
+        if audience not in _allowed_google_audiences(app.state.config):
+            raise HTTPException(status_code=401, detail="Google ID token audience is not allowed")
+
+        email = str(tokeninfo.get("email") or "").strip().lower()
+        verified = str(tokeninfo.get("email_verified") or "").lower() == "true"
+        allowlist = {str(item).strip().lower() for item in _google_auth_config(app.state.config).get("allowlist_emails", []) if item}
+        if not verified or email not in allowlist:
+            raise HTTPException(status_code=403, detail="Google account is not allowlisted")
+
+        issued = _issue_device_access_token(
+            app.state.config,
+            email=email,
+            name=str(tokeninfo.get("name") or email),
+        )
+        if issued is None:
+            raise HTTPException(status_code=503, detail="Device auth signing is not configured")
+
+        return DeviceGoogleAuthResponse(
+            access_token=issued["access_token"],
+            expires_at=issued["expires_at"],
+            email=email,
+            name=str(tokeninfo.get("name") or email),
+        )
 
     @app.get("/auth/google/login")
     async def google_login(request: Request, next: Optional[str] = Query(default="/watch/")):
@@ -1714,6 +2034,17 @@ def create_app(
             ]
         }
 
+    @app.get("/client/sessions")
+    async def list_client_sessions():
+        """List sessions with mobile-friendly attach metadata."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        sessions = app.state.session_manager.list_sessions()
+        return {
+            "sessions": [_mobile_session_payload(session) for session in sessions]
+        }
+
     @app.get("/sessions/{session_id}/attach-descriptor")
     async def get_attach_descriptor(session_id: str):
         """Get provider-specific attach metadata for detached-runtime reattach."""
@@ -1755,6 +2086,18 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found")
 
         return _session_to_response(session)
+
+    @app.get("/client/sessions/{session_id}")
+    async def get_client_session(session_id: str):
+        """Get one session with mobile-friendly attach metadata."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return _mobile_session_payload(session)
 
     @app.get("/sessions/{session_id}/codex-events")
     async def get_codex_events(

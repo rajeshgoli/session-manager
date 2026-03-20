@@ -1,5 +1,66 @@
-export type SessionStatus = "running" | "idle" | "stopped";
-export type ActivityState = "working" | "thinking" | "idle" | "waiting" | "stopped";
+export type SessionStatus = 'running' | 'idle' | 'stopped';
+export type ActivityState =
+  | 'working'
+  | 'thinking'
+  | 'idle'
+  | 'waiting'
+  | 'waiting_permission'
+  | 'waiting_input'
+  | 'stopped';
+
+export interface AdoptionProposal {
+  proposer_session_id?: string | null;
+  proposer_name?: string | null;
+  created_at?: string | null;
+  status?: string | null;
+}
+
+export interface ToolCallRow {
+  timestamp?: string | null;
+  tool_name?: string | null;
+}
+
+export interface ActivityActionRow {
+  summary_text?: string | null;
+  action_kind?: string | null;
+  status?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+}
+
+export interface SessionDetail {
+  action_lines: string[];
+  tail_lines: string[];
+  fetched_at: number;
+  loading: boolean;
+  last_error?: string | null;
+}
+
+export interface AttachDescriptor {
+  attach_supported?: boolean;
+  message?: string | null;
+  tmux_session?: string | null;
+  runtime_mode?: string | null;
+}
+
+export interface TermuxAttach {
+  supported?: boolean;
+  reason?: string | null;
+  transport?: string | null;
+  ssh_host?: string | null;
+  ssh_username?: string | null;
+  ssh_proxy_command?: string | null;
+  ssh_command?: string | null;
+  tmux_session?: string | null;
+  runtime_mode?: string | null;
+  termux_package?: string | null;
+}
+
+export interface PrimaryAction {
+  type?: string | null;
+  label?: string | null;
+  reason?: string | null;
+}
 
 export interface Session {
   id: string;
@@ -29,4 +90,39 @@ export interface Session {
   last_action_at?: string | null;
   tokens_used?: number;
   context_monitor_enabled?: boolean;
+  pending_adoption_proposals?: AdoptionProposal[];
+  aliases?: string[];
+  is_maintainer?: boolean;
+  attach_descriptor?: AttachDescriptor | null;
+  termux_attach?: TermuxAttach | null;
+  primary_action?: PrimaryAction | null;
+}
+
+export interface WatchSection {
+  repoKey: string;
+  repoLabel: string;
+  roots: WatchSessionNode[];
+}
+
+export interface WatchSessionNode {
+  session: Session;
+  sameRepoChildren: WatchSessionNode[];
+  crossRepoGroups: WatchRepoRef[];
+}
+
+export interface WatchRepoRef {
+  repoKey: string;
+  repoLabel: string;
+  children: WatchSessionNode[];
+}
+
+export interface WatchRow {
+  kind: 'repo' | 'session' | 'status' | 'detail' | 'repo-ref';
+  id: string;
+  session?: Session;
+  depth: number;
+  columns?: Record<string, string>;
+  text?: string;
+  detailLines?: string[];
+  activityState?: string;
 }
