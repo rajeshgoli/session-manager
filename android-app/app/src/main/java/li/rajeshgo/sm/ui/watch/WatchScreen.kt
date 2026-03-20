@@ -430,23 +430,28 @@ private fun WatchTree(
         return
     }
 
-    SessionRow(
-        session = node.session,
-        depth = depth,
-        parentLabel = parentLabel(node.session, sessionsById),
-        expanded = expandedSessionIds.contains(node.session.id),
-        detail = detailsById[node.session.id],
-        onToggleExpanded = { onToggleExpanded(node.session) },
-        onOpenAttach = { onOpenAttach(node.session) },
-        onCopyAttach = { onCopyAttach(node.session) },
-        onOpenTelegram = { onOpenTelegram(node.session) },
-        onKill = { onKill(node.session) },
-    )
+    val renderNode = shouldRenderNode(node, slice)
+    if (renderNode) {
+        SessionRow(
+            session = node.session,
+            depth = depth,
+            parentLabel = parentLabel(node.session, sessionsById),
+            expanded = expandedSessionIds.contains(node.session.id),
+            detail = detailsById[node.session.id],
+            onToggleExpanded = { onToggleExpanded(node.session) },
+            onOpenAttach = { onOpenAttach(node.session) },
+            onCopyAttach = { onCopyAttach(node.session) },
+            onOpenTelegram = { onOpenTelegram(node.session) },
+            onKill = { onKill(node.session) },
+        )
+    }
+
+    val childDepth = if (renderNode) depth + 1 else depth
 
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, depth + 1, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onKill)
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onKill)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -454,15 +459,16 @@ private fun WatchTree(
         if (visibleChildren.isEmpty()) {
             return@forEach
         }
+        val groupDepth = if (renderNode) depth + 1 else depth
         Text(
             text = "${group.repoLabel} (${group.repoKey})",
-            modifier = Modifier.padding(start = ((depth + 1) * 18).dp, top = 2.dp, bottom = 6.dp),
+            modifier = Modifier.padding(start = (groupDepth * 18).dp, top = 2.dp, bottom = 6.dp),
             style = MaterialTheme.typography.labelSmall,
             color = TextMuted,
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, depth + 2, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onKill)
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onKill)
         }
     }
 }
@@ -639,9 +645,9 @@ private fun EmptyState(query: String, filter: String) {
 
 private fun telegramLink(session: ClientSession): String? {
     val chatId = session.telegramChatId ?: return null
+    val threadId = session.telegramThreadId ?: return null
     val normalizedChatId = chatId.toString().removePrefix("-").removePrefix("100")
-    return session.telegramThreadId?.let { "https://t.me/c/$normalizedChatId/$it" }
-        ?: "https://t.me/c/$normalizedChatId"
+    return "https://t.me/c/$normalizedChatId/$threadId"
 }
 
 private enum class TreeSlice {
@@ -653,6 +659,13 @@ private fun nodeMatchesSlice(node: WatchSessionNode, slice: TreeSlice): Boolean 
     return when (slice) {
         TreeSlice.Active -> hasActiveBranch(node)
         TreeSlice.Idle -> hasIdleBranch(node)
+    }
+}
+
+private fun shouldRenderNode(node: WatchSessionNode, slice: TreeSlice): Boolean {
+    return when (slice) {
+        TreeSlice.Active -> hasActiveBranch(node)
+        TreeSlice.Idle -> !isActiveSession(node.session) && hasIdleBranch(node)
     }
 }
 
