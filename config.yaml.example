@@ -138,6 +138,7 @@ external_access:
   public_http_host: "sm.example.com"
   public_ssh_host: "ssh.sm.example.com"
   http_origin_url: "http://127.0.0.1:8420"
+  ssh_username: "your-ssh-user"
 
 auth:
   google:

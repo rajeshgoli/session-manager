@@ -135,8 +135,10 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
     public_http_host = env_values.get("PUBLIC_HTTP_HOST", "").strip()
     public_ssh_host = env_values.get("PUBLIC_SSH_HOST", "").strip()
     http_origin_url = env_values.get("HTTP_ORIGIN_URL", "").strip()
+    ssh_username = env_values.get("SSH_USERNAME", "").strip()
     web_client_id = env_values.get("GOOGLE_WEB_CLIENT_ID", "").strip()
     web_client_secret = env_values.get("GOOGLE_WEB_CLIENT_SECRET", "").strip()
+    android_client_id = env_values.get("GOOGLE_ANDROID_CLIENT_ID", "").strip()
     allowlist = [
         email.strip()
         for email in env_values.get("ALLOWLIST_EMAIL", "").replace(";", ",").split(",")
@@ -155,6 +157,8 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
         auth_google["redirect_uri"] = redirect_uri
     if web_client_id:
         auth_google["client_id"] = web_client_id
+    if android_client_id:
+        auth_google["android_client_id"] = android_client_id
     if web_client_secret:
         auth_google["client_secret"] = web_client_secret
     if allowlist:
@@ -171,6 +175,8 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
         external_access["public_ssh_host"] = public_ssh_host
     if http_origin_url:
         external_access["http_origin_url"] = http_origin_url
+    if ssh_username:
+        external_access["ssh_username"] = ssh_username
 
     overrides: dict[str, object] = {}
     if auth_google:

@@ -232,7 +232,9 @@ class TestLoadConfig:
                 [
                     "PUBLIC_HTTP_HOST=sm.rajeshgo.li",
                     "PUBLIC_SSH_HOST=ssh.sm.rajeshgo.li",
+                    "SSH_USERNAME=rajesh",
                     "HTTP_ORIGIN_URL=http://127.0.0.1:8420",
+                    "GOOGLE_ANDROID_CLIENT_ID=android-client-id",
                     "GOOGLE_WEB_CLIENT_ID=web-client-id",
                     "GOOGLE_WEB_CLIENT_SECRET=web-client-secret",
                     "ALLOWLIST_EMAIL=rajeshgoli@gmail.com",
@@ -245,9 +247,11 @@ class TestLoadConfig:
         assert config["server"]["host"] == "127.0.0.1"
         assert config["external_access"]["public_http_host"] == "sm.rajeshgo.li"
         assert config["external_access"]["public_ssh_host"] == "ssh.sm.rajeshgo.li"
+        assert config["external_access"]["ssh_username"] == "rajesh"
 
         google_auth = config["auth"]["google"]
         assert google_auth["enabled"] is True
+        assert google_auth["android_client_id"] == "android-client-id"
         assert google_auth["client_id"] == "web-client-id"
         assert google_auth["client_secret"] == "web-client-secret"
         assert google_auth["allowlist_emails"] == ["rajeshgoli@gmail.com"]
