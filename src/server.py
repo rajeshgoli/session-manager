@@ -2,17 +2,21 @@
 
 import json
 import logging
+import secrets
 import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
+from urllib.parse import urlencode, urlparse
 
+import httpx
 from fastapi import FastAPI, HTTPException, Body, Request, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 
 from .codex_provider_policy import (
     CODEX_APP_RETIRED_SESSION_ERROR,
@@ -37,6 +41,127 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_RETRY_DELAY_SECONDS = 0.3
 # Delay before retrying an empty transcript read in the Stop hook handler (#230).
 EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS = 0.5
+LOCAL_TRUSTED_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
+GOOGLE_AUTH_SCOPES = "openid email profile"
+
+
+def _google_auth_config(config: Optional[dict]) -> dict:
+    """Return normalized Google auth config block."""
+    return ((config or {}).get("auth") or {}).get("google") or {}
+
+
+def _google_auth_enabled(config: Optional[dict]) -> bool:
+    """Whether external Google auth is fully configured."""
+    auth = _google_auth_config(config)
+    return bool(
+        auth.get("enabled")
+        and auth.get("client_id")
+        and auth.get("client_secret")
+        and auth.get("session_cookie_secret")
+        and auth.get("allowlist_emails")
+        and auth.get("public_host")
+        and auth.get("redirect_uri")
+    )
+
+
+def _request_hostname(request: Request) -> str:
+    """Best-effort hostname extraction without port noise."""
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").strip()
+    host_value = forwarded_host or request.headers.get("host") or request.url.hostname or ""
+    return host_value.split(":", 1)[0].strip().lower()
+
+
+def _is_local_bypass_request(request: Request, config: Optional[dict]) -> bool:
+    """Allow local loopback/test hosts to keep working without external auth."""
+    hostname = _request_hostname(request)
+    public_host = str(_google_auth_config(config).get("public_host") or "").strip().lower()
+    if public_host and hostname == public_host:
+        return False
+    return hostname in LOCAL_TRUSTED_HOSTS
+
+
+def _is_safe_next_path(next_path: Optional[str]) -> bool:
+    """Allow only relative in-app redirect targets."""
+    if not next_path:
+        return False
+    if not next_path.startswith("/"):
+        return False
+    parsed = urlparse(next_path)
+    return not parsed.scheme and not parsed.netloc
+
+
+def _google_login_redirect(next_path: Optional[str] = None) -> str:
+    """Build the login redirect URL."""
+    safe_next = next_path if _is_safe_next_path(next_path) else "/watch/"
+    return f"/auth/google/login?{urlencode({'next': safe_next})}"
+
+
+async def _exchange_google_code(client_id: str, client_secret: str, redirect_uri: str, code: str) -> dict:
+    """Exchange an OAuth authorization code for Google tokens."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def _fetch_google_userinfo(access_token: str) -> dict:
+    """Fetch OpenID user info for an authenticated Google session."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+class GoogleAuthMiddleware(BaseHTTPMiddleware):
+    """Protect external routes with Google cookie auth while preserving local loopback access."""
+
+    def __init__(self, app, config: Optional[dict] = None):
+        super().__init__(app)
+        self.config = config or {}
+        self.enabled = _google_auth_enabled(self.config)
+        self.exempt_paths = {
+            "/",
+            "/health",
+            "/health/detailed",
+            "/auth/google/login",
+            "/auth/google/callback",
+            "/auth/logout",
+            "/auth/session",
+        }
+
+    async def dispatch(self, request: Request, call_next):
+        if not self.enabled:
+            return await call_next(request)
+        if _is_local_bypass_request(request, self.config):
+            return await call_next(request)
+
+        path = request.url.path
+        if path in self.exempt_paths:
+            return await call_next(request)
+
+        session_state = getattr(request, "session", {}) or {}
+        if session_state.get("google_authenticated") is True:
+            return await call_next(request)
+
+        if path.startswith("/watch"):
+            return RedirectResponse(url=_google_login_redirect(request.url.path), status_code=302)
+
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Authentication required", "login_url": _google_login_redirect(path)},
+        )
 
 
 def _canonical_session_name(session_manager, session: Session, fallback: str) -> str:
@@ -618,6 +743,18 @@ def create_app(
     # Store config first so middleware can access it
     app.state.config = config or {}
 
+    if _google_auth_enabled(config):
+        auth_config = _google_auth_config(config)
+        app.add_middleware(GoogleAuthMiddleware, config=config)
+        app.add_middleware(
+            SessionMiddleware,
+            secret_key=str(auth_config.get("session_cookie_secret")),
+            session_cookie="sm_auth",
+            same_site="lax",
+            https_only=True,
+            max_age=60 * 60 * 24 * 14,
+        )
+
     # Add timing middleware for debugging (with config)
     app.add_middleware(RequestTimingMiddleware, config=config)
 
@@ -886,6 +1023,130 @@ def create_app(
     async def root():
         """Health check endpoint."""
         return {"status": "ok", "service": "session-manager"}
+
+    @app.get("/auth/session")
+    async def auth_session(request: Request):
+        """Return current external auth session state."""
+        if not _google_auth_enabled(app.state.config):
+            return {
+                "enabled": False,
+                "authenticated": True,
+                "bypass": True,
+                "email": None,
+                "name": None,
+            }
+
+        if _is_local_bypass_request(request, app.state.config):
+            return {
+                "enabled": True,
+                "authenticated": True,
+                "bypass": True,
+                "email": None,
+                "name": None,
+            }
+
+        session_state = getattr(request, "session", {}) or {}
+        return {
+            "enabled": True,
+            "authenticated": session_state.get("google_authenticated") is True,
+            "bypass": False,
+            "email": session_state.get("google_email"),
+            "name": session_state.get("google_name"),
+        }
+
+    @app.get("/auth/google/login")
+    async def google_login(request: Request, next: Optional[str] = Query(default="/watch/")):
+        """Start the Google OAuth redirect flow."""
+        if not _google_auth_enabled(app.state.config):
+            raise HTTPException(status_code=503, detail="Google auth is not configured")
+
+        auth_config = _google_auth_config(app.state.config)
+        safe_next = next if _is_safe_next_path(next) else "/watch/"
+        oauth_state = secrets.token_urlsafe(24)
+        request.session["google_oauth_state"] = oauth_state
+        request.session["google_post_auth_redirect"] = safe_next
+
+        redirect_uri = str(auth_config["redirect_uri"])
+        google_params = urlencode(
+            {
+                "client_id": str(auth_config["client_id"]),
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": GOOGLE_AUTH_SCOPES,
+                "state": oauth_state,
+                "access_type": "offline",
+                "prompt": "select_account",
+            }
+        )
+        return RedirectResponse(
+            url=f"https://accounts.google.com/o/oauth2/v2/auth?{google_params}",
+            status_code=302,
+        )
+
+    @app.get("/auth/google/callback")
+    async def google_callback(
+        request: Request,
+        state: Optional[str] = None,
+        code: Optional[str] = None,
+        error: Optional[str] = None,
+    ):
+        """Finish the Google OAuth flow and establish a signed browser session."""
+        if not _google_auth_enabled(app.state.config):
+            raise HTTPException(status_code=503, detail="Google auth is not configured")
+
+        if error:
+            return RedirectResponse(url="/watch/?auth_error=google_denied", status_code=302)
+        if not code or not state:
+            return RedirectResponse(url="/watch/?auth_error=missing_code", status_code=302)
+
+        session_state = getattr(request, "session", {}) or {}
+        expected_state = session_state.get("google_oauth_state")
+        if not expected_state or state != expected_state:
+            session_state.clear()
+            return RedirectResponse(url="/watch/?auth_error=invalid_state", status_code=302)
+
+        auth_config = _google_auth_config(app.state.config)
+        try:
+            token_payload = await _exchange_google_code(
+                client_id=str(auth_config["client_id"]),
+                client_secret=str(auth_config["client_secret"]),
+                redirect_uri=str(auth_config["redirect_uri"]),
+                code=code,
+            )
+            userinfo = await _fetch_google_userinfo(str(token_payload["access_token"]))
+        except Exception as exc:
+            logger.warning("Google OAuth callback failed: %s", exc)
+            session_state.clear()
+            return RedirectResponse(url="/watch/?auth_error=exchange_failed", status_code=302)
+
+        email = str(userinfo.get("email") or "").strip().lower()
+        verified = bool(userinfo.get("email_verified"))
+        allowlist = {str(item).strip().lower() for item in auth_config.get("allowlist_emails", []) if item}
+        if not verified or email not in allowlist:
+            logger.warning("Rejected Google login for email=%s verified=%s", email or "<missing>", verified)
+            session_state.clear()
+            return RedirectResponse(url="/watch/?auth_error=unauthorized_email", status_code=302)
+
+        next_path = session_state.get("google_post_auth_redirect")
+        session_state.clear()
+        session_state["google_authenticated"] = True
+        session_state["google_email"] = email
+        session_state["google_name"] = userinfo.get("name") or email
+        session_state["google_picture"] = userinfo.get("picture")
+        session_state["google_authenticated_at"] = datetime.now(timezone.utc).isoformat()
+        return RedirectResponse(
+            url=next_path if _is_safe_next_path(next_path) else "/watch/",
+            status_code=302,
+        )
+
+    @app.get("/auth/logout")
+    async def auth_logout(request: Request, next: Optional[str] = Query(default="/watch/")):
+        """Clear the current browser auth session."""
+        session_state = getattr(request, "session", None)
+        if session_state is not None:
+            session_state.clear()
+        safe_next = next if _is_safe_next_path(next) else "/watch/"
+        return RedirectResponse(url=safe_next, status_code=302)
 
     @app.get("/health")
     async def health():

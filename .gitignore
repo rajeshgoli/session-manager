@@ -50,3 +50,9 @@ sessions.json
 
 # Logs
 *.log
+
+# Local deployment / private rollout state
+.local/
+
+# Local Google OAuth secrets
+local_data/client_secret_*.json

@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import hashlib
 import logging
 import os
 import signal
@@ -97,16 +98,98 @@ class EventLoopWatchdog:
             return False
 
 
-def load_config(config_path: str = "config.yaml") -> dict:
+def _merge_dicts(base: dict, override: dict) -> dict:
+    """Recursively merge two dictionaries, with override winning."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_env_file(path: Path) -> dict[str, str]:
+    """Parse a simple KEY=VALUE env file without mutating process env."""
+    if not path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        values[key] = value.strip()
+    return values
+
+
+def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
+    """Map gitignored Android parity env values into tracked config structure."""
+    if not env_values:
+        return {}
+
+    public_http_host = env_values.get("PUBLIC_HTTP_HOST", "").strip()
+    public_ssh_host = env_values.get("PUBLIC_SSH_HOST", "").strip()
+    http_origin_url = env_values.get("HTTP_ORIGIN_URL", "").strip()
+    web_client_id = env_values.get("GOOGLE_WEB_CLIENT_ID", "").strip()
+    web_client_secret = env_values.get("GOOGLE_WEB_CLIENT_SECRET", "").strip()
+    allowlist = [
+        email.strip()
+        for email in env_values.get("ALLOWLIST_EMAIL", "").replace(";", ",").split(",")
+        if email.strip()
+    ]
+    session_secret = env_values.get("SESSION_COOKIE_SECRET", "").strip()
+    if not session_secret and web_client_secret:
+        session_secret = hashlib.sha256(
+            f"sm-google-session:{public_http_host}:{web_client_secret}".encode("utf-8")
+        ).hexdigest()
+
+    redirect_uri = ""
+    if public_http_host:
+        redirect_uri = f"https://{public_http_host}/auth/google/callback"
+
+    auth_google: dict[str, object] = {
+        "enabled": bool(public_http_host and web_client_id and web_client_secret and allowlist),
+        "public_host": public_http_host,
+        "client_id": web_client_id,
+        "client_secret": web_client_secret,
+        "redirect_uri": redirect_uri,
+        "allowlist_emails": allowlist,
+        "session_cookie_secret": session_secret,
+    }
+
+    return {
+        "auth": {
+            "google": auth_google,
+        },
+        "external_access": {
+            "public_http_host": public_http_host,
+            "public_ssh_host": public_ssh_host,
+            "http_origin_url": http_origin_url,
+        },
+    }
+
+
+def load_config(config_path: str = "config.yaml", local_env_path: Optional[str] = None) -> dict:
     """Load configuration from YAML file."""
     path = Path(config_path)
 
     if not path.exists():
         logger.warning(f"Config file not found: {config_path}, using defaults")
-        return {}
+        config = {}
+    else:
+        with open(path) as f:
+            config = yaml.safe_load(f) or {}
 
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
+    env_path = Path(local_env_path) if local_env_path else path.parent / ".local" / "android-parity" / "values.env"
+    env_values = _load_env_file(env_path)
+    if not env_values:
+        return config
+    return _merge_dicts(config, _build_local_auth_overrides(env_values))
 
 
 class SessionManagerApp:

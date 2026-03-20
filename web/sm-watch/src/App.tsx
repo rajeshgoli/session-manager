@@ -310,6 +310,11 @@ async function fetchJson<T>(paths: string[]): Promise<T | null> {
       const response = await fetch(path, {
         cache: 'no-store',
       });
+      if (response.status === 401) {
+        const nextPath = window.location.pathname || '/watch/';
+        window.location.assign(`/auth/google/login?next=${encodeURIComponent(nextPath)}`);
+        return null;
+      }
       if (!response.ok) {
         continue;
       }
