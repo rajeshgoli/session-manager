@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_RETRY_DELAY_SECONDS = 0.3
 # Delay before retrying an empty transcript read in the Stop hook handler (#230).
 EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS = 0.5
+LOCAL_TRUSTED_CLIENTS = {"127.0.0.1", "localhost", "::1", "testclient"}
 LOCAL_TRUSTED_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
 GOOGLE_AUTH_SCOPES = "openid email profile"
 
@@ -66,13 +67,15 @@ def _google_auth_enabled(config: Optional[dict]) -> bool:
 
 def _request_hostname(request: Request) -> str:
     """Best-effort hostname extraction without port noise."""
-    forwarded_host = (request.headers.get("x-forwarded-host") or "").strip()
-    host_value = forwarded_host or request.headers.get("host") or request.url.hostname or ""
+    host_value = request.headers.get("host") or request.url.hostname or ""
     return host_value.split(":", 1)[0].strip().lower()
 
 
 def _is_local_bypass_request(request: Request, config: Optional[dict]) -> bool:
-    """Allow local loopback/test hosts to keep working without external auth."""
+    """Allow only true loopback/test requests to keep working without external auth."""
+    client_host = ((request.client.host if request.client else "") or "").strip().lower()
+    if client_host not in LOCAL_TRUSTED_CLIENTS:
+        return False
     hostname = _request_hostname(request)
     public_host = str(_google_auth_config(config).get("public_host") or "").strip().lower()
     if public_host and hostname == public_host:

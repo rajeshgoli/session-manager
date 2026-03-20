@@ -148,30 +148,36 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
             f"sm-google-session:{public_http_host}:{web_client_secret}".encode("utf-8")
         ).hexdigest()
 
-    redirect_uri = ""
+    redirect_uri = f"https://{public_http_host}/auth/google/callback" if public_http_host else ""
+    auth_google: dict[str, object] = {}
     if public_http_host:
-        redirect_uri = f"https://{public_http_host}/auth/google/callback"
+        auth_google["public_host"] = public_http_host
+        auth_google["redirect_uri"] = redirect_uri
+    if web_client_id:
+        auth_google["client_id"] = web_client_id
+    if web_client_secret:
+        auth_google["client_secret"] = web_client_secret
+    if allowlist:
+        auth_google["allowlist_emails"] = allowlist
+    if session_secret:
+        auth_google["session_cookie_secret"] = session_secret
+    if public_http_host and web_client_id and web_client_secret and allowlist and session_secret:
+        auth_google["enabled"] = True
 
-    auth_google: dict[str, object] = {
-        "enabled": bool(public_http_host and web_client_id and web_client_secret and allowlist),
-        "public_host": public_http_host,
-        "client_id": web_client_id,
-        "client_secret": web_client_secret,
-        "redirect_uri": redirect_uri,
-        "allowlist_emails": allowlist,
-        "session_cookie_secret": session_secret,
-    }
+    external_access: dict[str, object] = {}
+    if public_http_host:
+        external_access["public_http_host"] = public_http_host
+    if public_ssh_host:
+        external_access["public_ssh_host"] = public_ssh_host
+    if http_origin_url:
+        external_access["http_origin_url"] = http_origin_url
 
-    return {
-        "auth": {
-            "google": auth_google,
-        },
-        "external_access": {
-            "public_http_host": public_http_host,
-            "public_ssh_host": public_ssh_host,
-            "http_origin_url": http_origin_url,
-        },
-    }
+    overrides: dict[str, object] = {}
+    if auth_google:
+        overrides["auth"] = {"google": auth_google}
+    if external_access:
+        overrides["external_access"] = external_access
+    return overrides
 
 
 def load_config(config_path: str = "config.yaml", local_env_path: Optional[str] = None) -> dict:

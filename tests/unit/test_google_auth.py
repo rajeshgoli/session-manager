@@ -71,6 +71,17 @@ def test_external_watch_redirects_to_google_login():
     assert response.headers["location"] == "/auth/google/login?next=%2Fwatch"
 
 
+def test_external_sessions_ignore_forwarded_host_spoof():
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    response = client.get("/sessions", headers={"x-forwarded-host": "localhost"})
+
+    assert response.status_code == 401
+
+
 def test_local_loopback_bypasses_google_auth():
     client = TestClient(create_app(session_manager=_session_manager(), config=_auth_config()))
 

@@ -253,3 +253,36 @@ class TestLoadConfig:
         assert google_auth["allowlist_emails"] == ["rajeshgoli@gmail.com"]
         assert google_auth["redirect_uri"] == "https://sm.rajeshgo.li/auth/google/callback"
         assert google_auth["session_cookie_secret"]
+
+    def test_partial_local_auth_env_does_not_clear_yaml_values(self, tmp_path: Path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "auth:",
+                    "  google:",
+                    "    enabled: true",
+                    "    public_host: existing.example.com",
+                    "    client_id: yaml-client-id",
+                    "    client_secret: yaml-client-secret",
+                    "    redirect_uri: https://existing.example.com/auth/google/callback",
+                    "    allowlist_emails:",
+                    "      - existing@example.com",
+                    "    session_cookie_secret: yaml-secret",
+                ]
+            )
+        )
+
+        env_path = tmp_path / "values.env"
+        env_path.write_text("PUBLIC_HTTP_HOST=sm.rajeshgo.li\n")
+
+        config = load_config(str(config_path), local_env_path=str(env_path))
+
+        google_auth = config["auth"]["google"]
+        assert google_auth["enabled"] is True
+        assert google_auth["client_id"] == "yaml-client-id"
+        assert google_auth["client_secret"] == "yaml-client-secret"
+        assert google_auth["allowlist_emails"] == ["existing@example.com"]
+        assert google_auth["session_cookie_secret"] == "yaml-secret"
+        assert google_auth["public_host"] == "sm.rajeshgo.li"
+        assert google_auth["redirect_uri"] == "https://sm.rajeshgo.li/auth/google/callback"
