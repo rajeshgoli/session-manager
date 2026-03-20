@@ -1,5 +1,6 @@
 """FastAPI server for hooks and API endpoints."""
 
+import asyncio
 import json
 import logging
 import secrets
@@ -15,6 +16,8 @@ from typing import Optional, Dict, Any, Literal
 from urllib.parse import urlencode, urlparse
 
 import httpx
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token as google_id_token
 from fastapi import FastAPI, HTTPException, Body, Request, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -147,14 +150,13 @@ async def _fetch_google_userinfo(access_token: str) -> dict:
 
 
 async def _verify_google_id_token(id_token: str) -> dict:
-    """Verify a Google ID token via the tokeninfo endpoint."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            "https://oauth2.googleapis.com/tokeninfo",
-            params={"id_token": id_token},
-        )
-        response.raise_for_status()
-        return response.json()
+    """Verify a Google ID token locally with Google's official auth library."""
+    return await asyncio.to_thread(
+        google_id_token.verify_oauth2_token,
+        id_token,
+        GoogleAuthRequest(),
+        None,
+    )
 
 
 def _urlsafe_b64encode(data: bytes) -> str:
