@@ -1169,8 +1169,15 @@ def create_app(
     @app.get("/logged-out", include_in_schema=False)
     async def logged_out_landing():
         """Public post-logout landing page for external browser flows."""
+        if _google_auth_ready(app.state.config):
+            follow_up = '<p><a href="/auth/google/login?next=%2Fwatch%2F">Sign in again</a></p>'
+        elif _google_auth_requested(app.state.config):
+            follow_up = '<p>Google sign-in is not available on this deployment right now.</p>'
+        else:
+            follow_up = '<p><a href="/watch/">Return to watch</a></p>'
+
         return HTMLResponse(
-            """
+            f"""
 <!doctype html>
 <html>
   <head>
@@ -1178,11 +1185,11 @@ def create_app(
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Signed Out</title>
     <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f6f8fb; color: #0f172a; margin: 0; }
-      .wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-      .card { background: white; border: 1px solid #e2e8f0; border-radius: 18px; padding: 24px; max-width: 420px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }
-      a { color: #0f172a; font-weight: 600; }
-      p { line-height: 1.5; color: #475569; }
+      body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f6f8fb; color: #0f172a; margin: 0; }}
+      .wrap {{ min-height: 100vh; display: grid; place-items: center; padding: 24px; }}
+      .card {{ background: white; border: 1px solid #e2e8f0; border-radius: 18px; padding: 24px; max-width: 420px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }}
+      a {{ color: #0f172a; font-weight: 600; }}
+      p {{ line-height: 1.5; color: #475569; }}
     </style>
   </head>
   <body>
@@ -1190,7 +1197,7 @@ def create_app(
       <div class="card">
         <h1>Signed out</h1>
         <p>Your session-manager browser session is closed.</p>
-        <p><a href="/auth/google/login?next=%2Fwatch%2F">Sign in again</a></p>
+        {follow_up}
       </div>
     </div>
   </body>
