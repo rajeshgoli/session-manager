@@ -12,7 +12,7 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Body, Request, Query
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -142,6 +142,7 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
         self.ready = _google_auth_ready(self.config)
         self.exempt_paths = {
             "/",
+            "/logged-out",
             "/health",
             "/health/detailed",
             "/auth/google/login",
@@ -1165,13 +1166,45 @@ def create_app(
             status_code=302,
         )
 
+    @app.get("/logged-out", include_in_schema=False)
+    async def logged_out_landing():
+        """Public post-logout landing page for external browser flows."""
+        return HTMLResponse(
+            """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Signed Out</title>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f6f8fb; color: #0f172a; margin: 0; }
+      .wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+      .card { background: white; border: 1px solid #e2e8f0; border-radius: 18px; padding: 24px; max-width: 420px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }
+      a { color: #0f172a; font-weight: 600; }
+      p { line-height: 1.5; color: #475569; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Signed out</h1>
+        <p>Your session-manager browser session is closed.</p>
+        <p><a href="/auth/google/login?next=%2Fwatch%2F">Sign in again</a></p>
+      </div>
+    </div>
+  </body>
+</html>
+            """.strip()
+        )
+
     @app.get("/auth/logout")
-    async def auth_logout(request: Request, next: Optional[str] = Query(default="/")):
+    async def auth_logout(request: Request, next: Optional[str] = Query(default="/logged-out")):
         """Clear the current browser auth session."""
         session_state = request.scope.get("session")
         if isinstance(session_state, dict):
             session_state.clear()
-        safe_next = next if _is_safe_next_path(next) else "/"
+        safe_next = next if _is_safe_next_path(next) else "/logged-out"
         response = RedirectResponse(url=safe_next, status_code=302)
         response.delete_cookie("sm_auth")
         return response
