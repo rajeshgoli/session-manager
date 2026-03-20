@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import secrets
+import shutil
 import subprocess
 import time
 import shlex
@@ -1141,10 +1142,11 @@ def create_app(
         ssh_args = ["ssh"]
         if ssh_proxy_command:
             ssh_args.extend(["-o", f"ProxyCommand={ssh_proxy_command}"])
+        tmux_binary = shutil.which("tmux") or "tmux"
         ssh_args.extend([
             "-t",
             f"{ssh_username}@{public_ssh_host}",
-            "tmux",
+            tmux_binary,
             "attach-session",
             "-t",
             tmux_session,
