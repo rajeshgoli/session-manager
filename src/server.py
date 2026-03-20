@@ -1330,10 +1330,11 @@ def create_app(
     async def client_bootstrap():
         """Return runtime bootstrap config for native/mobile clients."""
         external_access = _external_access_config()
+        google_auth = _google_auth_config(app.state.config)
         public_http_host = str(external_access.get("public_http_host") or "").strip()
         public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
         ssh_username = str(external_access.get("ssh_username") or "").strip()
-        ssh_proxy_command = str(external_access.get("ssh_proxy_command") or "").strip()
+        google_server_client_id = str(google_auth.get("client_id") or "").strip()
         termux_supported = bool(public_ssh_host and ssh_username)
 
         return ClientBootstrapResponse(
@@ -1344,12 +1345,12 @@ def create_app(
                 "logout_endpoint": "/auth/logout",
                 "device_auth_endpoint": "/auth/device/google",
                 "device_auth_token_type": "Bearer",
+                "google_server_client_id": google_server_client_id or None,
             },
             external_access={
                 "public_http_host": public_http_host or None,
                 "public_ssh_host": public_ssh_host or None,
                 "ssh_username": ssh_username or None,
-                "ssh_proxy_command": ssh_proxy_command or None,
                 "termux_attach_supported": termux_supported,
             },
             session_open_defaults={

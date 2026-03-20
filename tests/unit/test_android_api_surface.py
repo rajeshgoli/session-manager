@@ -99,12 +99,12 @@ def test_client_bootstrap_reports_termux_attach_defaults():
             "logout_endpoint": "/auth/logout",
             "device_auth_endpoint": "/auth/device/google",
             "device_auth_token_type": "Bearer",
+            "google_server_client_id": "web-client-id",
         },
         "external_access": {
             "public_http_host": "sm.rajeshgo.li",
             "public_ssh_host": "ssh.sm.rajeshgo.li",
             "ssh_username": "rajesh",
-            "ssh_proxy_command": "cloudflared access ssh --hostname %h",
             "termux_attach_supported": True,
         },
         "session_open_defaults": {
@@ -112,6 +112,21 @@ def test_client_bootstrap_reports_termux_attach_defaults():
             "termux_package": "com.termux",
         },
     }
+
+
+def test_client_bootstrap_does_not_leak_raw_proxy_command():
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_android_config(),
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/bootstrap")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "ssh_proxy_command" not in payload["external_access"]
 
 
 def test_client_sessions_include_termux_attach_metadata():
