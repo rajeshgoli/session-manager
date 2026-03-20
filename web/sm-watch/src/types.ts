@@ -49,6 +49,8 @@ export interface TermuxAttach {
   transport?: string | null;
   ssh_host?: string | null;
   ssh_username?: string | null;
+  ssh_proxy_command?: string | null;
+  ssh_command?: string | null;
   tmux_session?: string | null;
   runtime_mode?: string | null;
   termux_package?: string | null;

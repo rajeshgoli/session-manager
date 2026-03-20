@@ -136,6 +136,7 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
     public_ssh_host = env_values.get("PUBLIC_SSH_HOST", "").strip()
     http_origin_url = env_values.get("HTTP_ORIGIN_URL", "").strip()
     ssh_username = env_values.get("SSH_USERNAME", "").strip()
+    ssh_proxy_command = env_values.get("SSH_PROXY_COMMAND", "").strip()
     web_client_id = env_values.get("GOOGLE_WEB_CLIENT_ID", "").strip()
     web_client_secret = env_values.get("GOOGLE_WEB_CLIENT_SECRET", "").strip()
     android_client_id = env_values.get("GOOGLE_ANDROID_CLIENT_ID", "").strip()
@@ -177,6 +178,8 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
         external_access["http_origin_url"] = http_origin_url
     if ssh_username:
         external_access["ssh_username"] = ssh_username
+    if ssh_proxy_command:
+        external_access["ssh_proxy_command"] = ssh_proxy_command
 
     overrides: dict[str, object] = {}
     if auth_google:

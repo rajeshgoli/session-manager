@@ -5,6 +5,7 @@ import logging
 import secrets
 import subprocess
 import time
+import shlex
 import base64
 import hashlib
 import hmac
@@ -258,6 +259,7 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
             "/auth/device/google",
             "/auth/logout",
             "/auth/session",
+            "/client/bootstrap",
         }
 
     async def dispatch(self, request: Request, call_next):
@@ -1101,6 +1103,7 @@ def create_app(
         external_access = _external_access_config()
         public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
         ssh_username = str(external_access.get("ssh_username") or "").strip()
+        ssh_proxy_command = str(external_access.get("ssh_proxy_command") or "").strip()
         tmux_session = ""
         if descriptor:
             tmux_session = str(descriptor.get("tmux_session") or "").strip()
@@ -1132,11 +1135,25 @@ def create_app(
                 "transport": "termux-ssh-tmux",
             }
 
+        ssh_args = ["ssh"]
+        if ssh_proxy_command:
+            ssh_args.extend(["-o", f"ProxyCommand={ssh_proxy_command}"])
+        ssh_args.extend([
+            "-t",
+            f"{ssh_username}@{public_ssh_host}",
+            "tmux",
+            "attach-session",
+            "-t",
+            tmux_session,
+        ])
+
         return {
             "supported": True,
             "transport": "termux-ssh-tmux",
             "ssh_host": public_ssh_host,
             "ssh_username": ssh_username,
+            "ssh_proxy_command": ssh_proxy_command or None,
+            "ssh_command": shlex.join(ssh_args),
             "tmux_session": tmux_session,
             "runtime_mode": descriptor.get("runtime_mode"),
             "termux_package": "com.termux",
@@ -1316,6 +1333,7 @@ def create_app(
         public_http_host = str(external_access.get("public_http_host") or "").strip()
         public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
         ssh_username = str(external_access.get("ssh_username") or "").strip()
+        ssh_proxy_command = str(external_access.get("ssh_proxy_command") or "").strip()
         termux_supported = bool(public_ssh_host and ssh_username)
 
         return ClientBootstrapResponse(
@@ -1331,6 +1349,7 @@ def create_app(
                 "public_http_host": public_http_host or None,
                 "public_ssh_host": public_ssh_host or None,
                 "ssh_username": ssh_username or None,
+                "ssh_proxy_command": ssh_proxy_command or None,
                 "termux_attach_supported": termux_supported,
             },
             session_open_defaults={

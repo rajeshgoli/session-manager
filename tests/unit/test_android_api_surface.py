@@ -24,6 +24,7 @@ def _android_config() -> dict:
             "public_http_host": "sm.rajeshgo.li",
             "public_ssh_host": "ssh.sm.rajeshgo.li",
             "ssh_username": "rajesh",
+            "ssh_proxy_command": "cloudflared access ssh --hostname %h",
         },
     }
 
@@ -65,6 +66,20 @@ def _manager(session: Session) -> MagicMock:
     return manager
 
 
+def test_client_bootstrap_is_public_for_cold_mobile_clients():
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_android_config(),
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.get("/client/bootstrap")
+
+    assert response.status_code == 200
+    assert response.json()["auth"]["device_auth_endpoint"] == "/auth/device/google"
+
+
 def test_client_bootstrap_reports_termux_attach_defaults():
     session = _session()
     app = create_app(
@@ -89,6 +104,7 @@ def test_client_bootstrap_reports_termux_attach_defaults():
             "public_http_host": "sm.rajeshgo.li",
             "public_ssh_host": "ssh.sm.rajeshgo.li",
             "ssh_username": "rajesh",
+            "ssh_proxy_command": "cloudflared access ssh --hostname %h",
             "termux_attach_supported": True,
         },
         "session_open_defaults": {
@@ -117,6 +133,8 @@ def test_client_sessions_include_termux_attach_metadata():
         "transport": "termux-ssh-tmux",
         "ssh_host": "ssh.sm.rajeshgo.li",
         "ssh_username": "rajesh",
+        "ssh_proxy_command": "cloudflared access ssh --hostname %h",
+        "ssh_command": "ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' -t rajesh@ssh.sm.rajeshgo.li tmux attach-session -t codex-fork-fork1001",
         "tmux_session": "codex-fork-fork1001",
         "runtime_mode": "detached_runtime",
         "termux_package": "com.termux",

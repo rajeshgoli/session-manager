@@ -40,7 +40,13 @@ function telegramDeepLink(chatId?: number | null, threadId?: number | null): str
 
 function attachCommand(session: Session): string | null {
   const attach = session.termux_attach;
-  if (!attach?.supported || !attach.ssh_host || !attach.ssh_username || !attach.tmux_session) {
+  if (!attach?.supported) {
+    return null;
+  }
+  if (attach.ssh_command) {
+    return attach.ssh_command;
+  }
+  if (!attach.ssh_host || !attach.ssh_username || !attach.tmux_session) {
     return null;
   }
   const target = `${attach.ssh_username}@${attach.ssh_host}`;

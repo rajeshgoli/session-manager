@@ -267,11 +267,17 @@ export default function App() {
 
   const handleCopyAttach = async (session: Session) => {
     const attach = session.termux_attach;
-    if (!attach?.supported || !attach.ssh_host || !attach.ssh_username || !attach.tmux_session) {
+    if (!attach?.supported) {
       showToast(attach?.reason || 'Attach command is not available for this session.');
       return;
     }
-    const command = `ssh -t ${attach.ssh_username}@${attach.ssh_host} 'tmux attach-session -t ${attach.tmux_session.replace(/'/g, `'"'"'`)}'`;
+    const command = attach.ssh_command || (attach.ssh_host && attach.ssh_username && attach.tmux_session
+      ? `ssh -t ${attach.ssh_username}@${attach.ssh_host} 'tmux attach-session -t ${attach.tmux_session.replace(/'/g, `'"'"'`)}'`
+      : null);
+    if (!command) {
+      showToast(attach?.reason || 'Attach command is not available for this session.');
+      return;
+    }
     try {
       await navigator.clipboard.writeText(command);
       setCopiedAttachSessionId(session.id);
