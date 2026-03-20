@@ -44,6 +44,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -57,7 +58,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.ui.theme.Amber
@@ -75,6 +82,8 @@ import li.rajeshgo.sm.ui.theme.TextSecondary
 import li.rajeshgo.sm.ui.theme.Violet
 import li.rajeshgo.sm.util.launchTermuxAttach
 import li.rajeshgo.sm.util.termuxAttachCommand
+
+private const val WATCH_AUTO_REFRESH_MS = 5000L
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -94,6 +103,31 @@ fun WatchScreen(
     val idleSections = remember(sections) { sliceSections(sections, TreeSlice.Idle) }
     val sessionsById = remember(state.sessions) { state.sessions.associateBy { it.id } }
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isResumed by remember {
+        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, _ ->
+            isResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(isResumed, state.serverUrl, state.userEmail) {
+        if (!isResumed || state.serverUrl.isBlank()) {
+            return@LaunchedEffect
+        }
+        viewModel.refresh()
+        while (coroutineContext.isActive) {
+            delay(WATCH_AUTO_REFRESH_MS)
+            viewModel.refresh()
+        }
+    }
 
     Box(
         modifier = Modifier

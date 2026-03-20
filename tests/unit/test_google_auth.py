@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+import re
 
 from fastapi.testclient import TestClient
 
@@ -120,6 +121,33 @@ def test_local_loopback_bypasses_google_auth():
     assert response.json()["sessions"][0]["id"] == "abc12345"
     assert root_response.status_code == 200
     assert root_response.json() == {"status": "ok", "service": "session-manager"}
+
+
+def test_watch_html_is_not_cached_but_hashed_assets_remain_static():
+    client = TestClient(create_app(session_manager=_session_manager(), config=_auth_config()))
+
+    html_response = client.get("/watch/")
+
+    assert html_response.status_code == 200
+    assert html_response.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
+    assert html_response.headers["pragma"] == "no-cache"
+
+    match = re.search(r"/watch/assets/[^\"']+\.js", html_response.text)
+    assert match is not None
+
+    asset_response = client.get(match.group(0))
+
+    assert asset_response.status_code == 200
+    assert "no-store" not in asset_response.headers.get("cache-control", "")
+
+    etag = html_response.headers.get("etag")
+    assert etag
+
+    revalidated_response = client.get("/watch/", headers={"if-none-match": etag})
+
+    assert revalidated_response.status_code == 304
+    assert revalidated_response.headers["cache-control"] == "no-store, max-age=0, must-revalidate"
+    assert revalidated_response.headers["pragma"] == "no-cache"
 
 
 def test_external_requests_fail_closed_when_google_auth_is_misconfigured():

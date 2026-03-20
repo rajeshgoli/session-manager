@@ -54,6 +54,19 @@ GOOGLE_AUTH_SCOPES = "openid email profile"
 DEVICE_TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 14
 
 
+class WatchStaticFiles(StaticFiles):
+    """Static file handler that disables caching for HTML entrypoints only."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        content_type = response.headers.get("content-type", "")
+        is_html_entry = content_type.startswith("text/html") or path in {"", ".", "index.html"}
+        if response.status_code in {200, 304} and is_html_entry:
+            response.headers["Cache-Control"] = "no-store, max-age=0, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
 def _google_auth_config(config: Optional[dict]) -> dict:
     """Return normalized Google auth config block."""
     return ((config or {}).get("auth") or {}).get("google") or {}
@@ -1235,7 +1248,7 @@ def create_app(
         async def watch_frontend_root():
             return RedirectResponse(url="/watch/")
 
-        app.mount("/watch", StaticFiles(directory=str(watch_dist), html=True), name="sm_watch")
+        app.mount("/watch", WatchStaticFiles(directory=str(watch_dist), html=True), name="sm_watch")
 
     _configure_watch_frontend()
 
