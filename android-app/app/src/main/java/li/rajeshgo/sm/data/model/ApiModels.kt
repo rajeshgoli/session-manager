@@ -241,6 +241,12 @@ data class KillSessionResponse(
 )
 
 @Serializable
+data class KillSessionRequest(
+    @SerialName("requester_session_id")
+    val requesterSessionId: String? = null,
+)
+
+@Serializable
 data class SessionDetail(
     val actionLines: List<String> = emptyList(),
     val tailLines: List<String> = emptyList(),

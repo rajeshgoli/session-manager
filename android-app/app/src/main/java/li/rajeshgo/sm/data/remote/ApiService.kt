@@ -6,6 +6,7 @@ import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthRequest
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
+import li.rajeshgo.sm.data.model.KillSessionRequest
 import li.rajeshgo.sm.data.model.KillSessionResponse
 import li.rajeshgo.sm.data.model.OutputResponse
 import li.rajeshgo.sm.data.model.SessionListResponse
@@ -51,5 +52,8 @@ interface ApiService {
     ): ActivityActionsResponse
 
     @POST("sessions/{session_id}/kill")
-    suspend fun killSession(@Path("session_id") sessionId: String): KillSessionResponse
+    suspend fun killSession(
+        @Path("session_id") sessionId: String,
+        @Body request: KillSessionRequest = KillSessionRequest(),
+    ): KillSessionResponse
 }
