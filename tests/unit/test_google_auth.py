@@ -182,6 +182,19 @@ def test_logout_redirects_cleanly_when_google_auth_is_misconfigured():
     assert "Signed out" in landing_response.text
 
 
+def test_logged_out_page_hides_google_login_when_auth_is_incomplete():
+    client = TestClient(
+        create_app(session_manager=_session_manager(), config=_misconfigured_auth_config()),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    response = client.get("/logged-out")
+
+    assert response.status_code == 200
+    assert "Google sign-in is not available on this deployment right now." in response.text
+    assert "/auth/google/login" not in response.text
+
+
 def test_google_callback_authenticates_allowlisted_email(monkeypatch):
     monkeypatch.setattr("src.server.secrets.token_urlsafe", lambda _: "oauth-state-123")
 
