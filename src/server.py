@@ -157,15 +157,14 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         path = request.url.path
+        if path in self.exempt_paths:
+            return await call_next(request)
 
         if not self.ready:
             return JSONResponse(
                 status_code=503,
                 content={"detail": "Google auth is enabled but incomplete"},
             )
-
-        if path in self.exempt_paths:
-            return await call_next(request)
 
         session_state = getattr(request, "session", {}) or {}
         if session_state.get("google_authenticated") is True:
@@ -1052,6 +1051,14 @@ def create_app(
                 "email": None,
                 "name": None,
             }
+        if _is_local_bypass_request(request, app.state.config):
+            return {
+                "enabled": True,
+                "authenticated": True,
+                "bypass": True,
+                "email": None,
+                "name": None,
+            }
         if not _google_auth_ready(app.state.config):
             return {
                 "enabled": True,
@@ -1060,15 +1067,6 @@ def create_app(
                 "email": None,
                 "name": None,
                 "error": "misconfigured",
-            }
-
-        if _is_local_bypass_request(request, app.state.config):
-            return {
-                "enabled": True,
-                "authenticated": True,
-                "bypass": True,
-                "email": None,
-                "name": None,
             }
 
         session_state = getattr(request, "session", {}) or {}

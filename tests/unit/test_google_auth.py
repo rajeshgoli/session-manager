@@ -115,11 +115,39 @@ def test_external_requests_fail_closed_when_google_auth_is_misconfigured():
 
     sessions_response = client.get("/sessions")
     watch_response = client.get("/watch")
+    health_response = client.get("/health")
+    auth_session_response = client.get("/auth/session")
 
     assert sessions_response.status_code == 503
     assert sessions_response.json()["detail"] == "Google auth is enabled but incomplete"
     assert watch_response.status_code == 503
     assert watch_response.json()["detail"] == "Google auth is enabled but incomplete"
+    assert health_response.status_code == 200
+    assert health_response.json() == {"status": "healthy"}
+    assert auth_session_response.status_code == 200
+    assert auth_session_response.json() == {
+        "enabled": True,
+        "authenticated": False,
+        "bypass": False,
+        "email": None,
+        "name": None,
+        "error": "misconfigured",
+    }
+
+
+def test_local_auth_session_reports_bypass_when_google_auth_is_misconfigured():
+    client = TestClient(create_app(session_manager=_session_manager(), config=_misconfigured_auth_config()))
+
+    response = client.get("/auth/session")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": True,
+        "authenticated": True,
+        "bypass": True,
+        "email": None,
+        "name": None,
+    }
 
 
 def test_google_callback_authenticates_allowlisted_email(monkeypatch):
