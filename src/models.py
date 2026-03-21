@@ -304,6 +304,8 @@ class Session:
     error_message: Optional[str] = None
     transcript_path: Optional[str] = None  # Claude's transcript file path
     friendly_name: Optional[str] = None  # User-provided label for display
+    native_title: Optional[str] = None  # Provider-native display title (e.g. Claude /rename)
+    native_title_source_mtime_ns: Optional[int] = None  # Transcript mtime used when syncing native_title
     current_task: Optional[str] = None  # What the session is currently working on
     git_remote_url: Optional[str] = None  # Git remote URL for repo matching
     subagents: List[Subagent] = field(default_factory=list)  # Subagents spawned by this session
@@ -382,6 +384,8 @@ class Session:
             "error_message": self.error_message,
             "transcript_path": self.transcript_path,
             "friendly_name": self.friendly_name,
+            "native_title": self.native_title,
+            "native_title_source_mtime_ns": self.native_title_source_mtime_ns,
             "current_task": self.current_task,
             "git_remote_url": self.git_remote_url,
             "subagents": [s.to_dict() for s in self.subagents],
@@ -461,6 +465,8 @@ class Session:
             error_message=data.get("error_message"),
             transcript_path=data.get("transcript_path"),
             friendly_name=data.get("friendly_name"),
+            native_title=data.get("native_title"),
+            native_title_source_mtime_ns=data.get("native_title_source_mtime_ns"),
             current_task=data.get("current_task"),
             git_remote_url=data.get("git_remote_url"),
             subagents=subagents,
