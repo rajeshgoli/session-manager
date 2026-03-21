@@ -2164,8 +2164,76 @@ class SessionManager:
         aliases = self.get_session_aliases(session_id)
         return aliases[0] if aliases else None
 
+    def _extract_claude_native_title(self, transcript_path: str) -> tuple[Optional[str], Optional[int]]:
+        """Read Claude transcript metadata and return the latest native title plus file mtime."""
+        transcript_file = Path(transcript_path).expanduser()
+        if not transcript_file.exists():
+            return None, None
+
+        stat = transcript_file.stat()
+        latest_custom_title: Optional[str] = None
+        latest_agent_name: Optional[str] = None
+
+        with transcript_file.open() as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") == "custom-title":
+                    candidate = str(entry.get("customTitle") or "").strip()
+                    if candidate:
+                        latest_custom_title = candidate
+                elif entry.get("type") == "agent-name":
+                    candidate = str(entry.get("agentName") or "").strip()
+                    if candidate:
+                        latest_agent_name = candidate
+
+        return latest_custom_title or latest_agent_name, stat.st_mtime_ns
+
+    def sync_claude_native_title(self, session_or_id: Session | str | None, persist: bool = True) -> Optional[str]:
+        """Synchronize one Claude session's native title from transcript metadata."""
+        if session_or_id is None:
+            return None
+        if isinstance(session_or_id, Session):
+            session = session_or_id
+        else:
+            session = self.sessions.get(session_or_id)
+            if session is None:
+                return None
+
+        if session.provider != "claude" or not session.transcript_path:
+            return session.native_title
+
+        transcript_file = Path(session.transcript_path).expanduser()
+        if not transcript_file.exists():
+            return session.native_title
+
+        try:
+            current_mtime_ns = transcript_file.stat().st_mtime_ns
+        except OSError:
+            return session.native_title
+
+        if session.native_title_source_mtime_ns == current_mtime_ns:
+            return session.native_title
+
+        try:
+            native_title, synced_mtime_ns = self._extract_claude_native_title(session.transcript_path)
+        except OSError as exc:
+            logger.debug("Failed reading Claude transcript title for %s: %s", session.id, exc)
+            return session.native_title
+
+        title_changed = native_title != session.native_title
+        session.native_title = native_title
+        session.native_title_source_mtime_ns = synced_mtime_ns
+        if title_changed and persist:
+            self._save_state()
+        return session.native_title
+
     def get_effective_session_name(self, session_or_id: Session | str | None) -> Optional[str]:
-        """Return canonical display identity: registry alias > friendly_name > internal name."""
+        """Return canonical display identity: registry alias > friendly_name > native title > internal name."""
         if session_or_id is None:
             return None
         if isinstance(session_or_id, Session):
@@ -2178,7 +2246,13 @@ class SessionManager:
         primary_alias = self.get_primary_session_alias(session.id)
         if primary_alias:
             return primary_alias
-        return session.friendly_name or session.name or session.id
+        if session.friendly_name:
+            return session.friendly_name
+        if session.provider == "claude":
+            native_title = self.sync_claude_native_title(session)
+            if native_title:
+                return native_title
+        return session.name or session.id
 
     def validate_friendly_name_update(self, session_id: str, friendly_name: str) -> Optional[str]:
         """Return an error when a friendly name conflicts with canonical registry identity."""
