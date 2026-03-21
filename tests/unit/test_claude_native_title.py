@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 from src.models import Session, SessionStatus
+from src.server import create_app
 from src.session_manager import SessionManager
 
 
@@ -79,3 +81,72 @@ def test_effective_name_refreshes_when_claude_transcript_title_changes(tmp_path:
 
     assert manager.get_effective_session_name(session.id) == "second-title"
     assert session.native_title == "second-title"
+
+
+def test_transcript_mtime_churn_does_not_persist_without_title_change(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript, {"type": "custom-title", "customTitle": "stable-title"})
+    session = _claude_session(tmp_path, transcript)
+    manager.sessions[session.id] = session
+    manager._save_state = MagicMock()
+
+    assert manager.get_effective_session_name(session.id) == "stable-title"
+    manager._save_state.reset_mock()
+
+    with transcript.open("a") as handle:
+        handle.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "still working"}]}}) + "\n")
+    os.utime(transcript, None)
+
+    assert manager.sync_claude_native_title(session.id) == "stable-title"
+    manager._save_state.assert_not_called()
+
+
+def test_claude_hook_resyncs_tmux_and_telegram_when_native_title_changes(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.set_status_bar.return_value = True
+    manager.message_queue_manager = MagicMock()
+    manager.message_queue_manager.mark_session_idle = MagicMock()
+    manager.message_queue_manager.delivery_states = {}
+    manager.message_queue_manager._restore_user_input_after_response = AsyncMock()
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        {"type": "custom-title", "customTitle": "native-hook-title"},
+    )
+    session = _claude_session(tmp_path, transcript)
+    session.native_title = "old-title"
+    session.native_title_source_mtime_ns = 1
+    session.telegram_chat_id = 123
+    session.telegram_thread_id = 456
+    manager.sessions[session.id] = session
+
+    notifier = MagicMock()
+    notifier.rename_session_topic = AsyncMock(return_value=True)
+    notifier.notify = AsyncMock(return_value=True)
+
+    client = create_app(
+        session_manager=manager,
+        notifier=notifier,
+        output_monitor=MagicMock(),
+        config={},
+    )
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(client).post(
+        "/hooks/claude",
+        json={
+            "hook_event_name": "Stop",
+            "session_manager_id": session.id,
+            "transcript_path": str(transcript),
+        },
+    )
+
+    assert response.status_code == 200
+    assert session.native_title == "native-hook-title"
+    manager.tmux.set_status_bar.assert_called_with(session.tmux_session, "native-hook-title")
+    notifier.rename_session_topic.assert_awaited_with(session, "native-hook-title")

@@ -2225,13 +2225,10 @@ class SessionManager:
             logger.debug("Failed reading Claude transcript title for %s: %s", session.id, exc)
             return session.native_title
 
-        changed = (
-            native_title != session.native_title
-            or synced_mtime_ns != session.native_title_source_mtime_ns
-        )
+        title_changed = native_title != session.native_title
         session.native_title = native_title
         session.native_title_source_mtime_ns = synced_mtime_ns
-        if changed and persist:
+        if title_changed and persist:
             self._save_state()
         return session.native_title
 

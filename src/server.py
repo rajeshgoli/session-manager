@@ -3203,8 +3203,10 @@ Provide ONLY the summary, no preamble or questions."""
         # This will be set by the environment variable we pass when launching Claude
         session_manager_id = payload.get("session_manager_id") or payload.get("CLAUDE_SESSION_MANAGER_ID")
 
-        # Read last assistant message from transcript file (in thread pool to avoid blocking)
+        # Read transcript metadata in a thread pool to avoid blocking the event loop.
         last_message = None
+        native_title = None
+        native_title_mtime_ns = None
         if transcript_path:
             import asyncio
 
@@ -3213,19 +3215,36 @@ Provide ONLY the summary, no preamble or questions."""
                 Read transcript file synchronously (runs in thread pool).
 
                 Returns:
-                    Tuple of (success: bool, message: str | None)
+                    Tuple of (
+                        success: bool,
+                        message: str | None,
+                        native_title: str | None,
+                        transcript_mtime_ns: int | None,
+                    )
                 """
                 try:
                     transcript_file = Path(transcript_path)
                     if not transcript_file.exists():
                         logger.warning(f"Transcript file does not exist: {transcript_path}")
-                        return (False, None)
+                        return (False, None, None, None)
+                    transcript_stat = transcript_file.stat()
                     # JSONL file - read last lines and find last assistant message
                     lines = transcript_file.read_text().strip().split('\n')
+                    latest_native_title = None
+                    latest_assistant_message = None
                     for line in reversed(lines):
                         try:
                             entry = json.loads(line)
-                            if entry.get("type") == "assistant":
+                            if latest_native_title is None:
+                                if entry.get("type") == "custom-title":
+                                    candidate = str(entry.get("customTitle") or "").strip()
+                                    if candidate:
+                                        latest_native_title = candidate
+                                elif entry.get("type") == "agent-name":
+                                    candidate = str(entry.get("agentName") or "").strip()
+                                    if candidate:
+                                        latest_native_title = candidate
+                            if latest_assistant_message is None and entry.get("type") == "assistant":
                                 # Extract text from message content
                                 message = entry.get("message", {})
                                 content = message.get("content", [])
@@ -3235,29 +3254,35 @@ Provide ONLY the summary, no preamble or questions."""
                                         texts.append(item.get("text", ""))
                                 full_text = "\n".join(texts).strip()
                                 if full_text:
-                                    return (True, full_text)
-                                # Newest assistant message exists but has no
-                                # visible text (whitespace-only / not flushed).
-                                # Stop here — do NOT fall back to older entries
-                                # which would surface a stale message.
-                                return (True, None)
+                                    latest_assistant_message = full_text
+                                else:
+                                    # Newest assistant message exists but has no
+                                    # visible text (whitespace-only / not flushed).
+                                    # Stop here — do NOT fall back to older entries
+                                    # which would surface a stale message.
+                                    latest_assistant_message = None
+                            if latest_native_title is not None and (
+                                latest_assistant_message is not None or entry.get("type") == "assistant"
+                            ):
+                                break
                         except json.JSONDecodeError as e:
                             logger.debug(f"Skipping malformed JSON line in transcript: {e}")
                             continue
-                    # No assistant message found
-                    return (True, None)
+                    return (True, latest_assistant_message, latest_native_title, transcript_stat.st_mtime_ns)
                 except Exception as e:
                     logger.error(f"CRITICAL: Error reading transcript {transcript_path}: {e}")
                     logger.error(f"Claude output will not be available for this hook event")
-                    return (False, None)
+                    return (False, None, None, None)
 
             try:
-                success, last_message = await asyncio.to_thread(read_transcript)
+                success, last_message, native_title, native_title_mtime_ns = await asyncio.to_thread(read_transcript)
                 if not success:
                     logger.warning(f"Failed to read transcript for hook event: {hook_event}")
             except Exception as e:
                 logger.error(f"CRITICAL: Error reading transcript in thread: {e}")
                 last_message = None
+                native_title = None
+                native_title_mtime_ns = None
 
             # Fix #230: Bounded retry for empty transcript reads on Stop hooks.
             # The Stop hook can fire before Claude flushes the current response to
@@ -3273,13 +3298,17 @@ Provide ONLY the summary, no preamble or questions."""
                 )
                 await asyncio.sleep(EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS)
                 try:
-                    success, last_message = await asyncio.to_thread(read_transcript)
+                    success, last_message, native_title, native_title_mtime_ns = await asyncio.to_thread(read_transcript)
                     if not success:
                         logger.warning(f"Empty transcript retry: failed for {session_manager_id or 'unknown'}")
                         last_message = None
+                        native_title = None
+                        native_title_mtime_ns = None
                 except Exception as e:
                     logger.error(f"Empty transcript retry: error for {session_manager_id or 'unknown'}: {e}")
                     last_message = None
+                    native_title = None
+                    native_title_mtime_ns = None
 
             # Fix #184: Bounded retry for stale transcript reads on Stop hooks.
             # The Stop hook can fire before Claude writes the current response to
@@ -3292,13 +3321,42 @@ Provide ONLY the summary, no preamble or questions."""
                     logger.info(f"Transcript appears stale for {session_manager_id}, retrying after {TRANSCRIPT_RETRY_DELAY_SECONDS}s")
                     await asyncio.sleep(TRANSCRIPT_RETRY_DELAY_SECONDS)
                     try:
-                        success, last_message = await asyncio.to_thread(read_transcript)
+                        success, last_message, native_title, native_title_mtime_ns = await asyncio.to_thread(read_transcript)
                         if not success:
                             logger.warning(f"Retry: Failed to read transcript for {session_manager_id}")
                             last_message = None
+                            native_title = None
+                            native_title_mtime_ns = None
                     except Exception as e:
                         logger.error(f"Retry: Error reading transcript for {session_manager_id}: {e}")
                         last_message = None
+                        native_title = None
+                        native_title_mtime_ns = None
+
+        if session_manager_id and app.state.session_manager:
+            target_session = app.state.session_manager.get_session(session_manager_id)
+            if target_session:
+                state_changed = False
+                title_changed = False
+
+                if transcript_path and target_session.transcript_path != transcript_path:
+                    target_session.transcript_path = transcript_path
+                    state_changed = True
+
+                if target_session.provider == "claude" and native_title_mtime_ns is not None:
+                    previous_native_title = target_session.native_title
+                    if target_session.native_title_source_mtime_ns != native_title_mtime_ns:
+                        target_session.native_title = native_title
+                        target_session.native_title_source_mtime_ns = native_title_mtime_ns
+                        if previous_native_title != native_title:
+                            title_changed = True
+                            state_changed = True
+
+                if state_changed:
+                    app.state.session_manager._save_state()
+
+                if title_changed:
+                    await _sync_session_display_identity(target_session)
 
         # Store last message
         if last_message:
@@ -3345,13 +3403,6 @@ Provide ONLY the summary, no preamble or questions."""
                         app.state.session_manager.update_session_status(
                             session_manager_id, SessionStatus.IDLE
                         )
-
-            # Always keep transcript_path up to date (needed for crash recovery)
-            if transcript_path and app.state.session_manager:
-                target = app.state.session_manager.get_session(session_manager_id)
-                if target and target.transcript_path != transcript_path:
-                    target.transcript_path = transcript_path
-                    app.state.session_manager._save_state()
 
             # Auto-release locks and check for cleanup
             if app.state.session_manager:
@@ -3462,11 +3513,6 @@ Provide ONLY the summary, no preamble or questions."""
 
                 # If we found a matching session, send the notification
                 if target_session and target_session.telegram_chat_id:
-                    # Store transcript path for /name command (only set it once, don't overwrite)
-                    if transcript_path and not target_session.transcript_path:
-                        target_session.transcript_path = transcript_path
-                        app.state.session_manager._save_state()
-
                     # Store last output under our session ID for /status
                     app.state.last_claude_output[target_session.id] = last_message
 
