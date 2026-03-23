@@ -1671,22 +1671,6 @@ class MessageQueueManager:
                     return
             # No idle gate for sequential or important: tty buffer handles ordering (sm#244)
 
-            # Claude plain-text delivery is only safe at a prompt boundary. The in-memory
-            # status can drift after restart or a lost stop hook, so allow immediate
-            # delivery when tmux shows a real prompt even if session.status is stale.
-            provider = getattr(session, "provider", "claude")
-            if provider == "claude" and session.status != SessionStatus.IDLE:
-                tmux_session = getattr(session, "tmux_session", None)
-                prompt_visible = False
-                if tmux_session:
-                    prompt_visible = await self._check_idle_prompt(tmux_session)
-                if not prompt_visible:
-                    logger.debug(
-                        "Claude session %s not at prompt; leaving queued message pending",
-                        session_id,
-                    )
-                    return
-
             # Check for user input (final gate)
             current_input = None
             if getattr(session, "provider", "claude") != "codex-app":
