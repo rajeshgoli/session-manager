@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import time
 from typing import Optional, Callable, Awaitable
 import httpx
@@ -202,6 +203,33 @@ class TelegramBot:
         self._completed_sessions: set[str] = set()
         # Track "/force next message" arming per (chat, user, session)
         self._force_next_inputs: set[tuple[int, int, str]] = set()
+
+    @staticmethod
+    def _is_known_command_text(text: Optional[str]) -> bool:
+        """Return True when a Telegram message targets one of SM's bot commands."""
+        if not text or not text.startswith("/"):
+            return False
+        match = re.match(r"^/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)", text)
+        if not match:
+            return False
+        return match.group(1).lower() in {
+            "start",
+            "help",
+            "new",
+            "session",
+            "list",
+            "status",
+            "subagents",
+            "message",
+            "summary",
+            "kill",
+            "stop",
+            "force",
+            "open",
+            "name",
+            "password",
+            "follow",
+        }
 
     def load_session_threads(self, sessions: list[Session]):
         """Load thread and topic mappings from existing sessions (call on startup)."""
@@ -1060,7 +1088,7 @@ Provide ONLY the summary, no preamble or questions."""
         if not self._on_session_input:
             return
 
-        if update.message.text and update.message.text.startswith("/"):
+        if self._is_known_command_text(update.message.text):
             return
 
         chat_id = update.effective_chat.id

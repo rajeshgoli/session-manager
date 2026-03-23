@@ -322,3 +322,31 @@ async def test_force_next_message_arms_urgent_delivery_for_followup():
     assert delivered_input.session_id == "sess123"
     assert delivered_input.text == "Actual urgent payload"
     assert delivered_input.delivery_mode == "urgent"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_allows_slash_prefixed_non_command_text():
+    """Slash-prefixed code snippets should still reach the session input handler."""
+    tg = TelegramBot(token="test-token")
+    tg._on_session_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+    tg._is_allowed = lambda chat_id, user_id=None: True
+    tg._get_session_from_context = lambda update: "sess123"
+
+    delivered_reply = AsyncMock(return_value=SimpleNamespace(message_id=555))
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=100, is_forum=True),
+        effective_user=SimpleNamespace(id=200),
+        message=SimpleNamespace(
+            text="/tmp/config.yaml",
+            message_id=3,
+            message_thread_id=10,
+            reply_text=delivered_reply,
+        ),
+    )
+
+    await tg._handle_message(update, SimpleNamespace(args=[]))
+
+    tg._on_session_input.assert_awaited_once()
+    delivered_input = tg._on_session_input.await_args.args[0]
+    assert delivered_input.text == "/tmp/config.yaml"
+    assert delivered_input.delivery_mode == "sequential"

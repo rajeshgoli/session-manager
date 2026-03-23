@@ -204,6 +204,68 @@ class TestSendInputDeliveryResult:
         mock_message_queue.deliver_queued_message_now.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_running_claude_queued_sm_send_still_records_suppression_metadata(self, session_manager, mock_message_queue):
+        """Busy Claude sm-send traffic must still record the sender/target suppression pair."""
+        target = Session(
+            id="target123",
+            name="target-session",
+            working_dir="/tmp",
+            tmux_session="claude-target123",
+            provider="claude",
+            status=SessionStatus.RUNNING,
+        )
+        sender = Session(
+            id="sender456",
+            name="sender-session",
+            working_dir="/tmp",
+            tmux_session="claude-sender456",
+            provider="claude",
+            status=SessionStatus.IDLE,
+        )
+        sender_state = MagicMock()
+        mock_message_queue._get_or_create_state = MagicMock(return_value=sender_state)
+        session_manager.sessions[target.id] = target
+        session_manager.sessions[sender.id] = sender
+        session_manager.message_queue_manager = mock_message_queue
+
+        result = await session_manager.send_input(
+            session_id=target.id,
+            text="hello",
+            sender_session_id=sender.id,
+            delivery_mode="sequential",
+            from_sm_send=True,
+        )
+
+        assert result == DeliveryResult.QUEUED
+        assert sender_state.last_outgoing_sm_send_target == target.id
+        assert sender_state.last_outgoing_sm_send_at is not None
+        mock_message_queue.deliver_queued_message_now.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stopped_claude_send_fails_fast_instead_of_queueing(self, session_manager, mock_message_queue):
+        """Stopped Claude sessions should not retain undeliverable queued messages."""
+        session = Session(
+            id="test123",
+            name="test-session",
+            working_dir="/tmp",
+            tmux_session="claude-test123",
+            provider="claude",
+            status=SessionStatus.STOPPED,
+        )
+        session_manager.sessions["test123"] = session
+        session_manager.message_queue_manager = mock_message_queue
+
+        result = await session_manager.send_input(
+            session_id="test123",
+            text="hello",
+            delivery_mode="sequential",
+        )
+
+        assert result == DeliveryResult.FAILED
+        mock_message_queue.queue_message.assert_not_called()
+        mock_message_queue.deliver_queued_message_now.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_returns_queued_when_immediate_delivery_defers(self, session_manager, mock_message_queue):
         """Verify QUEUED is returned when the queued message was not injected immediately."""
         session = Session(
