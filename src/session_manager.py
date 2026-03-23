@@ -2233,7 +2233,7 @@ class SessionManager:
         return session.native_title
 
     def get_effective_session_name(self, session_or_id: Session | str | None) -> Optional[str]:
-        """Return canonical display identity: registry alias > friendly_name > native title > internal name."""
+        """Return canonical display identity for one session."""
         if session_or_id is None:
             return None
         if isinstance(session_or_id, Session):
@@ -2246,12 +2246,15 @@ class SessionManager:
         primary_alias = self.get_primary_session_alias(session.id)
         if primary_alias:
             return primary_alias
-        if session.friendly_name:
-            return session.friendly_name
+        native_title = None
         if session.provider == "claude":
             native_title = self.sync_claude_native_title(session)
-            if native_title:
-                return native_title
+        if session.friendly_name and session.friendly_name_is_explicit:
+            return session.friendly_name
+        if native_title:
+            return native_title
+        if session.friendly_name:
+            return session.friendly_name
         return session.name or session.id
 
     def validate_friendly_name_update(self, session_id: str, friendly_name: str) -> Optional[str]:
@@ -2406,6 +2409,12 @@ class SessionManager:
                 notifier=self.notifier,
             ))
 
+        def _record_outgoing_sm_send_target() -> None:
+            if from_sm_send and sender_session_id and self.message_queue_manager:
+                sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
+                sender_state.last_outgoing_sm_send_target = session_id
+                sender_state.last_outgoing_sm_send_at = datetime.now()
+
         # Handle steer delivery mode — direct Enter-based injection, bypasses queue
         if delivery_mode == "steer":
             if session.provider not in ("codex", "codex-fork"):
@@ -2419,6 +2428,8 @@ class SessionManager:
             # For sequential mode, queue first, then report whether the immediate
             # delivery attempt actually injected the message.
             if delivery_mode == "sequential":
+                if session.provider == "claude" and session.status == SessionStatus.STOPPED:
+                    return DeliveryResult.FAILED
                 msg = self.message_queue_manager.queue_message(
                     target_session_id=session_id,
                     text=formatted_text,
@@ -2438,10 +2449,7 @@ class SessionManager:
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
-                if from_sm_send and sender_session_id:
-                    sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
-                    sender_state.last_outgoing_sm_send_target = session_id
-                    sender_state.last_outgoing_sm_send_at = datetime.now()
+                _record_outgoing_sm_send_target()
                 delivered = await self.message_queue_manager.deliver_queued_message_now(
                     session_id=session_id,
                     message_id=msg.id,
@@ -2451,6 +2459,8 @@ class SessionManager:
 
             # For important, queue first, then report the real immediate-delivery outcome.
             if delivery_mode == "important":
+                if session.provider == "claude" and session.status == SessionStatus.STOPPED:
+                    return DeliveryResult.FAILED
                 msg = self.message_queue_manager.queue_message(
                     target_session_id=session_id,
                     text=formatted_text,
@@ -2469,10 +2479,7 @@ class SessionManager:
                     trigger_delivery=False,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
-                if from_sm_send and sender_session_id:
-                    sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
-                    sender_state.last_outgoing_sm_send_target = session_id
-                    sender_state.last_outgoing_sm_send_at = datetime.now()
+                _record_outgoing_sm_send_target()
                 delivered = await self.message_queue_manager.deliver_queued_message_now(
                     session_id=session_id,
                     message_id=msg.id,
@@ -2498,10 +2505,7 @@ class SessionManager:
                     remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                 )
-                if from_sm_send and sender_session_id:
-                    sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
-                    sender_state.last_outgoing_sm_send_target = session_id
-                    sender_state.last_outgoing_sm_send_at = datetime.now()
+                _record_outgoing_sm_send_target()
                 return DeliveryResult.DELIVERED
 
         # Fallback: send immediately (no queue manager or unknown mode)

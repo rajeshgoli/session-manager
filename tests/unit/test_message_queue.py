@@ -1616,6 +1616,52 @@ class TestDirectDelivery244:
         mock_session_manager._deliver_direct.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_running_claude_without_prompt_defers_sequential_delivery(self, mock_session_manager, temp_db_path):
+        """Running Claude sessions stay queued until tmux shows a prompt."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        session = MagicMock()
+        session.id = "target244busy"
+        session.provider = "claude"
+        session.tmux_session = "claude-target244busy"
+        session.status = SessionStatus.RUNNING
+        session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+
+        self._insert_pending_message(mq, "target244busy")
+        mq._check_idle_prompt = AsyncMock(return_value=False)
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
+
+        await mq._try_deliver_messages("target244busy")
+
+        mock_session_manager._deliver_direct.assert_not_called()
+        pending = mq.get_pending_messages("target244busy")
+        assert len(pending) == 1
+
+    @pytest.mark.asyncio
+    async def test_running_claude_with_prompt_stale_status_still_delivers(self, mock_session_manager, temp_db_path):
+        """tmux prompt visibility overrides stale running status for queued Claude sends."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        session = MagicMock()
+        session.id = "target244stale"
+        session.provider = "claude"
+        session.tmux_session = "claude-target244stale"
+        session.status = SessionStatus.RUNNING
+        session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+
+        self._insert_pending_message(mq, "target244stale")
+        mq._check_idle_prompt = AsyncMock(return_value=True)
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
+
+        await mq._try_deliver_messages("target244stale")
+
+        mock_session_manager._deliver_direct.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_notify_on_stop_mid_turn_uses_paste_buffered(self, mock_session_manager, temp_db_path):
         """notify_on_stop=True mid-turn sets paste_buffered_notify, NOT stop_notify_sender_id (sm#244)."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
@@ -2037,15 +2083,12 @@ class TestSkipFence232:
         # Let delivery task run (direct delivery queues and delivers the timeout notification)
         await asyncio.sleep(0)
 
-        # Watch timed out (no false idle notification).
-        # With sm#244, the timeout notification is delivered immediately (no idle gate),
-        # so we verify via _deliver_direct rather than the pending queue.
-        mock_session_manager._deliver_direct.assert_called()
-        timeout_payloads = [
-            call.args[1] for call in mock_session_manager._deliver_direct.call_args_list
-            if "Timeout" in str(call.args[1])
-        ]
-        assert len(timeout_payloads) >= 1
+        # Watch timed out (no false idle notification). For a running Claude session
+        # without a visible prompt, the timeout notification should remain queued
+        # rather than forcing an unsafe inject into the composer.
+        pending = mq.get_pending_messages("watcher232h")
+        assert len(pending) == 1
+        assert "Timeout" in pending[0].text
 
 
 # =============================================================================

@@ -8,6 +8,7 @@ import pytest
 from unittest.mock import Mock, AsyncMock, MagicMock, call, patch
 from types import SimpleNamespace
 
+from src.models import DeliveryResult
 from src.telegram_bot import TelegramBot, TELEGRAM_MESSAGE_CHAR_LIMIT
 
 
@@ -248,3 +249,104 @@ async def test_send_with_fallback_both_fail_logs_warning_not_error():
     assert result is None
     mock_logger.error.assert_not_called()
     assert mock_logger.warning.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_handle_message_ignores_command_text():
+    """Slash commands should not also go through the plain-text input handler."""
+    tg = TelegramBot(token="test-token")
+    tg._on_session_input = AsyncMock()
+    tg._is_allowed = lambda chat_id, user_id=None: True
+    tg._get_session_from_context = lambda update: "sess123"
+
+    reply_text = AsyncMock()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=100, is_forum=True),
+        effective_user=SimpleNamespace(id=200),
+        message=SimpleNamespace(
+            text="/force next message",
+            message_id=1,
+            message_thread_id=10,
+            reply_text=reply_text,
+        ),
+    )
+
+    await tg._handle_message(update, SimpleNamespace(args=["next", "message"]))
+
+    tg._on_session_input.assert_not_awaited()
+    reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_force_next_message_arms_urgent_delivery_for_followup():
+    """`/force next message` should arm the next plain-text reply as urgent input."""
+    tg = TelegramBot(token="test-token")
+    tg._on_session_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+    tg._is_allowed = lambda chat_id, user_id=None: True
+    tg._get_session_from_context = lambda update: "sess123"
+
+    arm_reply = AsyncMock()
+    arm_update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=100, is_forum=True),
+        effective_user=SimpleNamespace(id=200),
+        message=SimpleNamespace(
+            text="/force next message",
+            message_id=1,
+            message_thread_id=10,
+            reply_text=arm_reply,
+        ),
+    )
+
+    await tg._cmd_force(arm_update, SimpleNamespace(args=["next", "message"]))
+
+    tg._on_session_input.assert_not_awaited()
+    arm_reply.assert_awaited_once()
+    assert "Next message will interrupt immediately" in arm_reply.await_args.args[0]
+
+    followup_reply = AsyncMock(return_value=SimpleNamespace(message_id=999))
+    followup_update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=100, is_forum=True),
+        effective_user=SimpleNamespace(id=200),
+        message=SimpleNamespace(
+            text="Actual urgent payload",
+            message_id=2,
+            message_thread_id=10,
+            reply_text=followup_reply,
+        ),
+    )
+
+    await tg._handle_message(followup_update, SimpleNamespace(args=[]))
+
+    tg._on_session_input.assert_awaited_once()
+    delivered_input = tg._on_session_input.await_args.args[0]
+    assert delivered_input.session_id == "sess123"
+    assert delivered_input.text == "Actual urgent payload"
+    assert delivered_input.delivery_mode == "urgent"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_allows_slash_prefixed_non_command_text():
+    """Slash-prefixed code snippets should still reach the session input handler."""
+    tg = TelegramBot(token="test-token")
+    tg._on_session_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+    tg._is_allowed = lambda chat_id, user_id=None: True
+    tg._get_session_from_context = lambda update: "sess123"
+
+    delivered_reply = AsyncMock(return_value=SimpleNamespace(message_id=555))
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=100, is_forum=True),
+        effective_user=SimpleNamespace(id=200),
+        message=SimpleNamespace(
+            text="/tmp/config.yaml",
+            message_id=3,
+            message_thread_id=10,
+            reply_text=delivered_reply,
+        ),
+    )
+
+    await tg._handle_message(update, SimpleNamespace(args=[]))
+
+    tg._on_session_input.assert_awaited_once()
+    delivered_input = tg._on_session_input.await_args.args[0]
+    assert delivered_input.text == "/tmp/config.yaml"
+    assert delivered_input.delivery_mode == "sequential"
