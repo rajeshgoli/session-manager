@@ -1616,8 +1616,8 @@ class TestDirectDelivery244:
         mock_session_manager._deliver_direct.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_running_claude_without_prompt_defers_sequential_delivery(self, mock_session_manager, temp_db_path):
-        """Running Claude sessions stay queued until tmux shows a prompt."""
+    async def test_running_claude_without_prompt_still_delivers_immediately(self, mock_session_manager, temp_db_path):
+        """Busy Claude sessions still receive immediate composer injection."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
 
         session = MagicMock()
@@ -1635,13 +1635,11 @@ class TestDirectDelivery244:
 
         await mq._try_deliver_messages("target244busy")
 
-        mock_session_manager._deliver_direct.assert_not_called()
-        pending = mq.get_pending_messages("target244busy")
-        assert len(pending) == 1
+        mock_session_manager._deliver_direct.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_running_claude_with_prompt_stale_status_still_delivers(self, mock_session_manager, temp_db_path):
-        """tmux prompt visibility overrides stale running status for queued Claude sends."""
+        """Stale running status should not block immediate queued Claude delivery."""
         mq = self._make_mq(mock_session_manager, temp_db_path)
 
         session = MagicMock()
@@ -2083,12 +2081,9 @@ class TestSkipFence232:
         # Let delivery task run (direct delivery queues and delivers the timeout notification)
         await asyncio.sleep(0)
 
-        # Watch timed out (no false idle notification). For a running Claude session
-        # without a visible prompt, the timeout notification should remain queued
-        # rather than forcing an unsafe inject into the composer.
-        pending = mq.get_pending_messages("watcher232h")
-        assert len(pending) == 1
-        assert "Timeout" in pending[0].text
+        # Watch timed out (no false idle notification).
+        # With sm#244, the timeout notification is delivered immediately.
+        mock_session_manager._deliver_direct.assert_called()
 
 
 # =============================================================================
