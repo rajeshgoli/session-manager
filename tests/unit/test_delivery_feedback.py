@@ -192,6 +192,7 @@ class TestSendInputDeliveryResult:
         )
         session_manager.sessions["test123"] = session
         session_manager.message_queue_manager = mock_message_queue
+        mock_message_queue.deliver_queued_message_now.return_value = False
 
         result = await session_manager.send_input(
             session_id="test123",
@@ -201,7 +202,11 @@ class TestSendInputDeliveryResult:
 
         assert result == DeliveryResult.QUEUED
         mock_message_queue.queue_message.assert_called_once()
-        mock_message_queue.deliver_queued_message_now.assert_not_awaited()
+        mock_message_queue.deliver_queued_message_now.assert_awaited_once_with(
+            session_id="test123",
+            message_id="msg-123",
+            delivery_mode="sequential",
+        )
 
     @pytest.mark.asyncio
     async def test_running_claude_queued_sm_send_still_records_suppression_metadata(self, session_manager, mock_message_queue):
@@ -227,6 +232,7 @@ class TestSendInputDeliveryResult:
         session_manager.sessions[target.id] = target
         session_manager.sessions[sender.id] = sender
         session_manager.message_queue_manager = mock_message_queue
+        mock_message_queue.deliver_queued_message_now.return_value = False
 
         result = await session_manager.send_input(
             session_id=target.id,
@@ -239,7 +245,11 @@ class TestSendInputDeliveryResult:
         assert result == DeliveryResult.QUEUED
         assert sender_state.last_outgoing_sm_send_target == target.id
         assert sender_state.last_outgoing_sm_send_at is not None
-        mock_message_queue.deliver_queued_message_now.assert_not_awaited()
+        mock_message_queue.deliver_queued_message_now.assert_awaited_once_with(
+            session_id=target.id,
+            message_id="msg-123",
+            delivery_mode="sequential",
+        )
 
     @pytest.mark.asyncio
     async def test_stopped_claude_send_fails_fast_instead_of_queueing(self, session_manager, mock_message_queue):

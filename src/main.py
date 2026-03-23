@@ -420,6 +420,7 @@ class SessionManagerApp:
                 return False
 
             session.friendly_name = name
+            session.friendly_name_is_explicit = True
             self.session_manager._save_state()
 
             # Update tmux status bar to show friendly name

@@ -66,6 +66,18 @@ def test_effective_name_prefers_claude_native_title_over_stale_friendly_name(tmp
     assert session.native_title == "native-claude-title"
 
 
+def test_effective_name_prefers_explicit_sm_name_over_claude_native_title(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript, {"type": "custom-title", "customTitle": "native-claude-title"})
+    session = _claude_session(tmp_path, transcript, friendly_name="sm-explicit-name")
+    session.friendly_name_is_explicit = True
+    manager.sessions[session.id] = session
+
+    assert manager.get_effective_session_name(session.id) == "sm-explicit-name"
+    assert session.native_title == "native-claude-title"
+
+
 def test_effective_name_refreshes_when_claude_transcript_title_changes(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     transcript = tmp_path / "transcript.jsonl"

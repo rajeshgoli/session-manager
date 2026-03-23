@@ -2246,10 +2246,13 @@ class SessionManager:
         primary_alias = self.get_primary_session_alias(session.id)
         if primary_alias:
             return primary_alias
+        native_title = None
         if session.provider == "claude":
             native_title = self.sync_claude_native_title(session)
-            if native_title:
-                return native_title
+        if session.friendly_name and session.friendly_name_is_explicit:
+            return session.friendly_name
+        if native_title:
+            return native_title
         if session.friendly_name:
             return session.friendly_name
         return session.name or session.id
@@ -2444,14 +2447,6 @@ class SessionManager:
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
                 )
-                # Claude turn boundaries remain authoritative for when plain-text
-                # input can actually be consumed. If we inject mid-turn, Claude can
-                # stash the text locally and SM will falsely report immediate delivery.
-                # Leave the message queued until the next real Stop hook instead.
-                if session.provider == "claude":
-                    if session.status != SessionStatus.IDLE:
-                        _record_outgoing_sm_send_target()
-                        return DeliveryResult.QUEUED
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
                 _record_outgoing_sm_send_target()
@@ -2483,10 +2478,6 @@ class SessionManager:
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
                 )
-                if session.provider == "claude":
-                    if session.status != SessionStatus.IDLE:
-                        _record_outgoing_sm_send_target()
-                        return DeliveryResult.QUEUED
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 _record_outgoing_sm_send_target()
                 delivered = await self.message_queue_manager.deliver_queued_message_now(

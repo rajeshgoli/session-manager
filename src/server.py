@@ -2282,6 +2282,7 @@ def create_app(
                     raise HTTPException(status_code=400, detail=identity_error)
 
             session.friendly_name = friendly_name
+            session.friendly_name_is_explicit = True
 
         if is_em is not None:
             session.is_em = is_em
