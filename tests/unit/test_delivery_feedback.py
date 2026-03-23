@@ -160,6 +160,8 @@ class TestSendInputDeliveryResult:
             working_dir="/tmp",
             tmux_session="claude-test123",
         )
+        session.provider = "claude"
+        session.status = SessionStatus.IDLE
         session_manager.sessions["test123"] = session
         session_manager.message_queue_manager = mock_message_queue
 
@@ -176,6 +178,30 @@ class TestSendInputDeliveryResult:
             message_id="msg-123",
             delivery_mode="sequential",
         )
+
+    @pytest.mark.asyncio
+    async def test_returns_queued_for_running_claude_until_stop_hook(self, session_manager, mock_message_queue):
+        """Claude sequential delivery should remain queued while the turn is still running."""
+        session = Session(
+            id="test123",
+            name="test-session",
+            working_dir="/tmp",
+            tmux_session="claude-test123",
+            provider="claude",
+            status=SessionStatus.RUNNING,
+        )
+        session_manager.sessions["test123"] = session
+        session_manager.message_queue_manager = mock_message_queue
+
+        result = await session_manager.send_input(
+            session_id="test123",
+            text="hello",
+            delivery_mode="sequential",
+        )
+
+        assert result == DeliveryResult.QUEUED
+        mock_message_queue.queue_message.assert_called_once()
+        mock_message_queue.deliver_queued_message_now.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_queued_when_immediate_delivery_defers(self, session_manager, mock_message_queue):
@@ -240,6 +266,8 @@ class TestAPIDeliveryResult:
             name="test-session",
             working_dir="/tmp",
             tmux_session="claude-test123",
+            provider="claude",
+            status=SessionStatus.IDLE,
         )
         session_manager.sessions["test123"] = session
 

@@ -200,6 +200,8 @@ class TelegramBot:
         self._pending_input_msgs: dict[str, tuple[int, int]] = {}  # session_id -> (chat_id, msg_id)
         # Track sessions that have completed (for progress monitoring)
         self._completed_sessions: set[str] = set()
+        # Track "/force next message" arming per (chat, user, session)
+        self._force_next_inputs: set[tuple[int, int, str]] = set()
 
     def load_session_threads(self, sessions: list[Session]):
         """Load thread and topic mappings from existing sessions (call on startup)."""
@@ -941,16 +943,17 @@ Provide ONLY the summary, no preamble or questions."""
             )
             return
 
-        # Get the message text (everything after /force)
-        if not context.args:
+        chat_id = update.effective_chat.id
+        normalized_args = [arg.strip().lower() for arg in context.args]
+        if not normalized_args or normalized_args in (["next"], ["next", "message"]):
+            user_id = update.effective_user.id if update.effective_user else 0
+            self._force_next_inputs.add((chat_id, user_id, session_id))
             await update.message.reply_text(
-                "Usage: /force <message>\n"
-                "Interrupts Claude and delivers your message immediately."
+                f"[{session_id}] ⚡ Next message will interrupt immediately"
             )
             return
 
         text = " ".join(context.args)
-        chat_id = update.effective_chat.id
 
         try:
             # Create UserInput with urgent delivery mode
@@ -1057,6 +1060,9 @@ Provide ONLY the summary, no preamble or questions."""
         if not self._on_session_input:
             return
 
+        if update.message.text and update.message.text.startswith("/"):
+            return
+
         chat_id = update.effective_chat.id
 
         # Find the session from topic or reply context
@@ -1078,12 +1084,18 @@ Provide ONLY the summary, no preamble or questions."""
             return
 
         # Send input to the session
+        user_id = update.effective_user.id if update.effective_user else 0
+        force_next_key = (chat_id, user_id, session_id)
+        delivery_mode = "urgent" if force_next_key in self._force_next_inputs else "sequential"
+        self._force_next_inputs.discard(force_next_key)
+
         user_input = UserInput(
             session_id=session_id,
             text=update.message.text,
             source=NotificationChannel.TELEGRAM,
             chat_id=chat_id,
             message_id=update.message.message_id,
+            delivery_mode=delivery_mode,
         )
 
         try:
@@ -1098,7 +1110,7 @@ Provide ONLY the summary, no preamble or questions."""
             elif result == DeliveryResult.QUEUED:
                 msg = await update.message.reply_text(
                     f"[{session_id}] ⏳ Queued (delivery deferred)\n"
-                    f"Reply /force to interrupt instead"
+                    f"Use /force <message> to interrupt now, or /force next message before your next reply"
                 )
                 # Track queued message for potential /force promotion
                 self._pending_input_msgs[session_id] = (chat_id, msg.message_id)

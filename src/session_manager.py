@@ -2233,7 +2233,7 @@ class SessionManager:
         return session.native_title
 
     def get_effective_session_name(self, session_or_id: Session | str | None) -> Optional[str]:
-        """Return canonical display identity: registry alias > friendly_name > native title > internal name."""
+        """Return canonical display identity for one session."""
         if session_or_id is None:
             return None
         if isinstance(session_or_id, Session):
@@ -2246,12 +2246,12 @@ class SessionManager:
         primary_alias = self.get_primary_session_alias(session.id)
         if primary_alias:
             return primary_alias
-        if session.friendly_name:
-            return session.friendly_name
         if session.provider == "claude":
             native_title = self.sync_claude_native_title(session)
             if native_title:
                 return native_title
+        if session.friendly_name:
+            return session.friendly_name
         return session.name or session.id
 
     def validate_friendly_name_update(self, session_id: str, friendly_name: str) -> Optional[str]:
@@ -2436,6 +2436,12 @@ class SessionManager:
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
                 )
+                # Claude turn boundaries remain authoritative for when plain-text
+                # input can actually be consumed. If we inject mid-turn, Claude can
+                # stash the text locally and SM will falsely report immediate delivery.
+                # Leave the message queued until the next real Stop hook instead.
+                if session.provider == "claude" and session.status != SessionStatus.IDLE:
+                    return DeliveryResult.QUEUED
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
                 if from_sm_send and sender_session_id:
@@ -2468,6 +2474,8 @@ class SessionManager:
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
                 )
+                if session.provider == "claude" and session.status != SessionStatus.IDLE:
+                    return DeliveryResult.QUEUED
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 if from_sm_send and sender_session_id:
                     sender_state = self.message_queue_manager._get_or_create_state(sender_session_id)
