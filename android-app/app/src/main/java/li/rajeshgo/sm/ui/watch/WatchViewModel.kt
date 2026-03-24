@@ -96,6 +96,10 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                 _uiState.value = _uiState.value.copy(
                                     loading = false,
                                     refreshing = false,
+                                    sessions = emptyList(),
+                                    expandedSessionIds = emptySet(),
+                                    detailsBySessionId = emptyMap(),
+                                    lastSync = null,
                                     userEmail = "",
                                     error = error.message ?: "Session expired. Sign in again.",
                                 )
@@ -166,6 +170,13 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (result.exceptionOrNull() is SessionManagerAuthException) {
                 settingsRepository.clearAuth()
+                _uiState.value = _uiState.value.copy(
+                    sessions = emptyList(),
+                    expandedSessionIds = emptySet(),
+                    detailsBySessionId = emptyMap(),
+                    lastSync = null,
+                    userEmail = "",
+                )
             }
             if (result.isSuccess) {
                 _uiState.value = _uiState.value.copy(
