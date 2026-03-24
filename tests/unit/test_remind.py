@@ -1310,6 +1310,43 @@ class TestTrackedStatusNudge:
         assert reg.soft_fired is True
 
     @pytest.mark.asyncio
+    async def test_tracked_nudge_stays_suppressed_after_soft_fired(self, mq):
+        owner = Session(
+            id="owner447soft",
+            name="owner447soft",
+            working_dir="/tmp",
+            tmux_session="claude-owner447soft",
+            status=SessionStatus.IDLE,
+        )
+        target = Session(
+            id="target447soft",
+            name="target447soft",
+            working_dir="/tmp",
+            tmux_session="claude-target447soft",
+            status=SessionStatus.RUNNING,
+        )
+        mq.session_manager.sessions = {owner.id: owner, target.id: target}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                target.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id=owner.id,
+            )
+
+        reg = mq._remind_registrations[target.id]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=450)
+        reg.tracked_status_nudge_fired = False
+        reg.soft_fired = True
+
+        await run_one_iteration(mq, target.id)
+
+        assert mq.get_pending_messages(target.id) == []
+        assert mq.get_pending_messages(owner.id) == []
+
+    @pytest.mark.asyncio
     async def test_hard_cycle_resets_tracked_status_nudge(self, mq):
         owner = Session(
             id="owner447c",

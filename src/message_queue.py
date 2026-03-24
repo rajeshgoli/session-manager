@@ -2632,7 +2632,7 @@ class MessageQueueManager:
 
                 elapsed = (datetime.now() - reg.last_reset_at).total_seconds()
 
-                if reg.cancel_on_reply_session_ids and not reg.tracked_status_nudge_fired:
+                if reg.cancel_on_reply_session_ids and not reg.tracked_status_nudge_fired and not reg.soft_fired:
                     lead_seconds = self._tracked_status_nudge_lead_seconds(reg.soft_threshold_seconds)
                     nudge_threshold = max(reg.soft_threshold_seconds - lead_seconds, 0)
                     if lead_seconds > 0 and elapsed >= nudge_threshold:
