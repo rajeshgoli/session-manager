@@ -11,7 +11,9 @@ import kotlinx.coroutines.launch
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
+import li.rajeshgo.sm.data.repository.SessionManagerTransientException
 import li.rajeshgo.sm.data.repository.SettingsRepository
 
 data class WatchUiState(
@@ -88,12 +90,37 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                             .forEach { loadDetail(it) }
                     }
                     .onFailure { error ->
-                        _uiState.value = _uiState.value.copy(
-                            loading = false,
-                            refreshing = false,
-                            userEmail = userEmail,
-                            error = error.message ?: "Failed to refresh sessions",
-                        )
+                        when (error) {
+                            is SessionManagerAuthException -> {
+                                settingsRepository.clearAuth()
+                                _uiState.value = _uiState.value.copy(
+                                    loading = false,
+                                    refreshing = false,
+                                    sessions = emptyList(),
+                                    expandedSessionIds = emptySet(),
+                                    detailsBySessionId = emptyMap(),
+                                    lastSync = null,
+                                    userEmail = "",
+                                    error = error.message ?: "Session expired. Sign in again.",
+                                )
+                            }
+                            is SessionManagerTransientException -> {
+                                _uiState.value = _uiState.value.copy(
+                                    loading = false,
+                                    refreshing = false,
+                                    userEmail = userEmail,
+                                    error = error.message ?: "Server temporarily unavailable. Retrying soon.",
+                                )
+                            }
+                            else -> {
+                                _uiState.value = _uiState.value.copy(
+                                    loading = false,
+                                    refreshing = false,
+                                    userEmail = userEmail,
+                                    error = error.message ?: "Failed to refresh sessions",
+                                )
+                            }
+                        }
                     }
             } finally {
                 refreshJob = null
@@ -140,6 +167,16 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 Result.failure(IllegalStateException("Sign in to kill sessions"))
             } else {
                 sessionRepository.killSession(serverUrl, accessToken, sessionId)
+            }
+            if (result.exceptionOrNull() is SessionManagerAuthException) {
+                settingsRepository.clearAuth()
+                _uiState.value = _uiState.value.copy(
+                    sessions = emptyList(),
+                    expandedSessionIds = emptySet(),
+                    detailsBySessionId = emptyMap(),
+                    lastSync = null,
+                    userEmail = "",
+                )
             }
             if (result.isSuccess) {
                 _uiState.value = _uiState.value.copy(
