@@ -2417,12 +2417,12 @@ def create_app(
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        ensurer = getattr(app.state.session_manager, "ensure_role_session", None)
+        ensurer = getattr(app.state.session_manager, "ensure_maintainer_session", None)
         if not callable(ensurer):
             raise HTTPException(status_code=503, detail="Maintainer bootstrap unavailable")
 
         try:
-            session, created = await ensurer("maintainer")
+            session, created = await ensurer()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
