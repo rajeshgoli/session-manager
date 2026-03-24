@@ -228,6 +228,19 @@ maintainer_agent:
       open a PR, comment `@codex review`, poll for feedback, merge when clean, and restart SM again.
     - Do not send acknowledgements unless the reporter asks for one.
 
+# Generic auto-bootstrap config for durable service roles.
+# `maintainer` uses the legacy `maintainer_agent` block above by default, but may
+# also be configured here explicitly.
+service_roles:
+  chief-scientist:
+    auto_bootstrap: true
+    preferred_providers:
+      - "codex-fork"
+      - "claude"
+    working_dir: "/path/to/research-lane"
+    friendly_name: "chief-scientist"
+    bootstrap_prompt_file: "~/.sm/boot_docs/chief-scientist.md"
+
 # Durable codex lifecycle event stream (for /codex-events + activity_state)
 codex_events:
   db_path: "~/.local/share/claude-sessions/codex_events.db"

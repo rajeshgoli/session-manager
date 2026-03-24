@@ -47,3 +47,35 @@ def test_clear_role_sends_delete():
     assert captured["data"] is None
     assert success is True
     assert unavailable is False
+
+
+def test_ensure_role_posts_generic_role_endpoint():
+    client = _make_client()
+    captured = {}
+
+    def fake_request_with_status(method, path, data=None, timeout=None):
+        captured["method"] = method
+        captured["path"] = path
+        captured["data"] = data
+        captured["timeout"] = timeout
+        return {"created": True, "session": {"id": "chief001"}}, 200, False
+
+    with patch.object(client, "_request_with_status", side_effect=fake_request_with_status):
+        result = client.ensure_role("chief-scientist", requester_session_id="sender123")
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/registry/chief-scientist/ensure"
+    assert captured["data"] == {"requester_session_id": "sender123"}
+    assert captured["timeout"] == 10
+    assert result["ok"] is True
+    assert result["data"]["session"]["id"] == "chief001"
+
+
+def test_ensure_maintainer_delegates_to_generic_role_endpoint():
+    client = _make_client()
+
+    with patch.object(client, "ensure_role", return_value={"ok": True}) as ensure_role:
+        result = client.ensure_maintainer(requester_session_id="sender123")
+
+    ensure_role.assert_called_once_with("maintainer", requester_session_id="sender123")
+    assert result == {"ok": True}

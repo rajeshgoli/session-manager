@@ -1290,27 +1290,27 @@ def cmd_send(
     # Resolve identifier to session ID and get session details
     session_id, session = resolve_session_id(client, identifier)
     if session_id is None:
-        if identifier == "maintainer":
-            ensure_result = client.ensure_maintainer(requester_session_id=sender_session_id)
-            if ensure_result.get("unavailable"):
-                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
-                return 2
-            if not ensure_result.get("ok"):
-                detail = ensure_result.get("detail") or "Failed to bootstrap maintainer session"
-                print(f"Error: {detail}", file=sys.stderr)
-                return 1
-
+        ensure_result = client.ensure_role(identifier, requester_session_id=sender_session_id)
+        if ensure_result.get("unavailable"):
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        if ensure_result.get("ok"):
             payload = ensure_result.get("data") or {}
             session = payload.get("session") or {}
             session_id = session.get("id")
             if not session_id:
-                print("Error: Maintainer bootstrap returned no session", file=sys.stderr)
+                print(f"Error: Role bootstrap for '{identifier}' returned no session", file=sys.stderr)
                 return 1
             if payload.get("created"):
-                maintainer_name = session.get("friendly_name") or session.get("name") or session_id
+                boot_name = session.get("friendly_name") or session.get("name") or session_id
                 provider = session.get("provider") or "unknown"
-                print(f"Maintainer bootstrapped: {maintainer_name} ({session_id}) [{provider}]")
+                print(f"Role bootstrapped: {identifier} -> {boot_name} ({session_id}) [{provider}]")
         else:
+            status_code = ensure_result.get("status_code")
+            detail = ensure_result.get("detail")
+            if status_code not in (None, 404):
+                print(f"Error: {detail or 'Failed to bootstrap role'}", file=sys.stderr)
+                return 1
             # Check if it's unavailable or not found
             sessions = client.list_sessions()
             if sessions is None:

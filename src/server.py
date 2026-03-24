@@ -553,6 +553,11 @@ class EnsureMaintainerRequest(BaseModel):
     requester_session_id: Optional[str] = None
 
 
+class EnsureRoleRequest(BaseModel):
+    """Request to ensure a generic service role session exists."""
+    requester_session_id: Optional[str] = None
+
+
 class RoleRegistrationRequest(BaseModel):
     """Request to register or clear a generic agent registry role."""
     requester_session_id: str
@@ -2412,14 +2417,42 @@ def create_app(
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        ensurer = getattr(app.state.session_manager, "ensure_maintainer_session", None)
+        ensurer = getattr(app.state.session_manager, "ensure_role_session", None)
         if not callable(ensurer):
             raise HTTPException(status_code=503, detail="Maintainer bootstrap unavailable")
 
         try:
-            session, created = await ensurer()
+            session, created = await ensurer("maintainer")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if created and app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
+            await app.state.output_monitor.start_monitoring(session)
+        await _sync_session_display_identity(session)
+
+        return EnsureMaintainerResponse(
+            created=created,
+            session=_session_to_response(session),
+        )
+
+    @app.post("/registry/{role}/ensure", response_model=EnsureMaintainerResponse)
+    async def ensure_agent_registry_role(role: str, request: EnsureRoleRequest):
+        """Ensure one configured auto-bootstrap registry role session exists."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        ensurer = getattr(app.state.session_manager, "ensure_role_session", None)
+        if not callable(ensurer):
+            raise HTTPException(status_code=503, detail="Role bootstrap unavailable")
+
+        try:
+            session, created = await ensurer(role)
+        except ValueError as exc:
+            detail = str(exc)
+            status_code = 404 if "not configured for auto-bootstrap" in detail else 400
+            raise HTTPException(status_code=status_code, detail=detail) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
