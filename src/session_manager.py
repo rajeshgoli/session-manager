@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import textwrap
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2232,6 +2233,36 @@ class SessionManager:
             self._save_state()
         return session.native_title
 
+    def set_session_friendly_name(
+        self,
+        session_or_id: Session | str | None,
+        friendly_name: str,
+        *,
+        explicit: bool = True,
+        updated_at_ns: Optional[int] = None,
+    ) -> bool:
+        """Record one Session Manager friendly-name update with a comparable timestamp."""
+        if session_or_id is None:
+            return False
+        if isinstance(session_or_id, Session):
+            session = session_or_id
+        else:
+            session = self.sessions.get(session_or_id)
+        if session is None:
+            return False
+
+        session.friendly_name = friendly_name
+        session.friendly_name_is_explicit = explicit
+        session.friendly_name_updated_at_ns = updated_at_ns or time.time_ns()
+        return True
+
+    @staticmethod
+    def _session_label_sort_key(session: Session) -> tuple[int, int]:
+        """Return comparable timestamps for SM-managed and provider-native labels."""
+        friendly_name_updated_at_ns = int(session.friendly_name_updated_at_ns or 0)
+        native_title_updated_at_ns = int(session.native_title_source_mtime_ns or 0)
+        return friendly_name_updated_at_ns, native_title_updated_at_ns
+
     def get_effective_session_name(self, session_or_id: Session | str | None) -> Optional[str]:
         """Return canonical display identity for one session."""
         if session_or_id is None:
@@ -2249,6 +2280,11 @@ class SessionManager:
         native_title = None
         if session.provider == "claude":
             native_title = self.sync_claude_native_title(session)
+        friendly_name_updated_at_ns, native_title_updated_at_ns = self._session_label_sort_key(session)
+        if session.friendly_name and native_title:
+            if friendly_name_updated_at_ns >= native_title_updated_at_ns:
+                return session.friendly_name
+            return native_title
         if session.friendly_name and session.friendly_name_is_explicit:
             return session.friendly_name
         if native_title:

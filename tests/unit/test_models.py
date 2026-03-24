@@ -36,6 +36,8 @@ class TestSession:
             error_message="test error",
             transcript_path="/tmp/transcripts/test.jsonl",
             friendly_name="My Test Session",
+            friendly_name_is_explicit=True,
+            friendly_name_updated_at_ns=123456789,
             current_task="Running unit tests",
             git_remote_url="https://github.com/test/repo.git",
             parent_session_id="parent123",
@@ -70,6 +72,8 @@ class TestSession:
         assert restored.error_message == original.error_message
         assert restored.transcript_path == original.transcript_path
         assert restored.friendly_name == original.friendly_name
+        assert restored.friendly_name_is_explicit == original.friendly_name_is_explicit
+        assert restored.friendly_name_updated_at_ns == original.friendly_name_updated_at_ns
         assert restored.current_task == original.current_task
         assert restored.git_remote_url == original.git_remote_url
         assert restored.parent_session_id == original.parent_session_id

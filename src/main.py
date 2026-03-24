@@ -419,8 +419,11 @@ class SessionManagerApp:
                 logger.warning("Rejected Telegram name update for %s: %s", session_id, identity_error)
                 return False
 
-            session.friendly_name = name
-            session.friendly_name_is_explicit = True
+            setter = getattr(self.session_manager, "set_session_friendly_name", None)
+            updated = setter(session, name, explicit=True) if callable(setter) else False
+            if updated is not True:
+                session.friendly_name = name
+                session.friendly_name_is_explicit = True
             self.session_manager._save_state()
 
             # Update tmux status bar to show friendly name
