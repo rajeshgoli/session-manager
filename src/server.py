@@ -3353,6 +3353,7 @@ Provide ONLY the summary, no preamble or questions."""
                         target_session.native_title = native_title
                         target_session.native_title_source_mtime_ns = native_title_mtime_ns
                         if previous_native_title != native_title:
+                            target_session.native_title_updated_at_ns = native_title_mtime_ns
                             title_changed = True
                             state_changed = True
 

@@ -124,6 +124,7 @@ def test_effective_name_refreshes_when_claude_transcript_title_changes(tmp_path:
 
     assert manager.get_effective_session_name(session.id) == "second-title"
     assert session.native_title == "second-title"
+    assert session.native_title_updated_at_ns == session.native_title_source_mtime_ns
 
 
 def test_transcript_mtime_churn_does_not_persist_without_title_change(tmp_path: Path) -> None:
@@ -143,6 +144,30 @@ def test_transcript_mtime_churn_does_not_persist_without_title_change(tmp_path: 
 
     assert manager.sync_claude_native_title(session.id) == "stable-title"
     manager._save_state.assert_not_called()
+
+
+def test_transcript_mtime_churn_does_not_override_later_sm_name(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript, {"type": "custom-title", "customTitle": "stable-title"})
+    session = _claude_session(tmp_path, transcript)
+    manager.sessions[session.id] = session
+
+    assert manager.get_effective_session_name(session.id) == "stable-title"
+    native_title_updated_at_ns = session.native_title_updated_at_ns or 0
+    manager.set_session_friendly_name(
+        session,
+        "sm-renamed-later",
+        explicit=True,
+        updated_at_ns=native_title_updated_at_ns + 1,
+    )
+    assert manager.get_effective_session_name(session.id) == "sm-renamed-later"
+
+    with transcript.open("a") as handle:
+        handle.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "still working"}]}}) + "\n")
+    os.utime(transcript, None)
+
+    assert manager.get_effective_session_name(session.id) == "sm-renamed-later"
 
 
 def test_claude_hook_resyncs_tmux_and_telegram_when_native_title_changes(tmp_path: Path) -> None:

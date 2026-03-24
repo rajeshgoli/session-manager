@@ -2229,6 +2229,8 @@ class SessionManager:
         title_changed = native_title != session.native_title
         session.native_title = native_title
         session.native_title_source_mtime_ns = synced_mtime_ns
+        if title_changed:
+            session.native_title_updated_at_ns = synced_mtime_ns
         if title_changed and persist:
             self._save_state()
         return session.native_title
@@ -2260,7 +2262,7 @@ class SessionManager:
     def _session_label_sort_key(session: Session) -> tuple[int, int]:
         """Return comparable timestamps for SM-managed and provider-native labels."""
         friendly_name_updated_at_ns = int(session.friendly_name_updated_at_ns or 0)
-        native_title_updated_at_ns = int(session.native_title_source_mtime_ns or 0)
+        native_title_updated_at_ns = int(session.native_title_updated_at_ns or session.native_title_source_mtime_ns or 0)
         return friendly_name_updated_at_ns, native_title_updated_at_ns
 
     def get_effective_session_name(self, session_or_id: Session | str | None) -> Optional[str]:
