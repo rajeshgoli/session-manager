@@ -3,7 +3,9 @@ package li.rajeshgo.sm.data.repository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.ActivityActionRow
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
@@ -17,10 +19,20 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
+import retrofit2.HttpException
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+
+open class SessionManagerRequestException(message: String, cause: Throwable? = null) : IllegalStateException(message, cause)
+class SessionManagerAuthException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
+class SessionManagerTransientException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 
 class SessionManagerRepository {
     private val json = Json { ignoreUnknownKeys = true }
+
+    private companion object {
+        private const val READ_RETRY_ATTEMPTS = 3
+        private const val READ_RETRY_BASE_DELAY_MS = 600L
+    }
 
     private fun api(baseUrl: String, token: String = ""): ApiService {
         require(baseUrl.isNotBlank()) { "Server URL is required" }
@@ -38,8 +50,56 @@ class SessionManagerRepository {
             .create(ApiService::class.java)
     }
 
+    private suspend fun <T> executeReadRequest(
+        baseUrl: String,
+        token: String = "",
+        block: suspend (ApiService) -> T,
+    ): T {
+        var lastTransient: Throwable? = null
+        repeat(READ_RETRY_ATTEMPTS) { attempt ->
+            try {
+                return block(api(baseUrl, token))
+            } catch (error: HttpException) {
+                when (error.code()) {
+                    401, 403 -> throw SessionManagerAuthException("Session expired. Sign in again.", error)
+                    502, 503, 504 -> {
+                        lastTransient = error
+                        if (attempt < READ_RETRY_ATTEMPTS - 1) {
+                            delay(READ_RETRY_BASE_DELAY_MS * (attempt + 1))
+                            return@repeat
+                        }
+                        throw SessionManagerTransientException("Server temporarily unavailable. Retrying soon.", error)
+                    }
+                    else -> throw SessionManagerRequestException("Request failed (${error.code()})", error)
+                }
+            } catch (error: IOException) {
+                lastTransient = error
+                if (attempt < READ_RETRY_ATTEMPTS - 1) {
+                    delay(READ_RETRY_BASE_DELAY_MS * (attempt + 1))
+                    return@repeat
+                }
+                throw SessionManagerTransientException("Network unavailable. Retrying soon.", error)
+            }
+        }
+        throw SessionManagerTransientException("Server temporarily unavailable. Retrying soon.", lastTransient)
+    }
+
+    private fun classifyWriteFailure(error: Throwable): Throwable {
+        if (error is HttpException) {
+            return when (error.code()) {
+                401, 403 -> SessionManagerAuthException("Session expired. Sign in again.", error)
+                502, 503, 504 -> SessionManagerTransientException("Server temporarily unavailable. Try again.", error)
+                else -> SessionManagerRequestException("Request failed (${error.code()})", error)
+            }
+        }
+        if (error is IOException) {
+            return SessionManagerTransientException("Network unavailable. Try again.", error)
+        }
+        return error
+    }
+
     suspend fun fetchBootstrap(baseUrl: String): ClientBootstrapResponse = withContext(Dispatchers.IO) {
-        api(baseUrl).getBootstrap()
+        executeReadRequest(baseUrl) { it.getBootstrap() }
     }
 
     suspend fun exchangeGoogleIdToken(baseUrl: String, idToken: String): DeviceGoogleAuthResponse = withContext(Dispatchers.IO) {
@@ -47,18 +107,18 @@ class SessionManagerRepository {
     }
 
     suspend fun fetchAuthSession(baseUrl: String, token: String) = withContext(Dispatchers.IO) {
-        api(baseUrl, token).getAuthSession()
+        executeReadRequest(baseUrl, token) { it.getAuthSession() }
     }
 
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
-        api(baseUrl, token).getClientSessions().sessions
+        executeReadRequest(baseUrl, token) { it.getClientSessions().sessions }
     }
 
     suspend fun killSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val response = api(baseUrl, token).killSession(sessionId)
             check(response.status == "killed") { response.error ?: "Kill request failed" }
-        }
+        }.mapFailure(::classifyWriteFailure)
     }
 
     suspend fun fetchSessionDetail(baseUrl: String, token: String, session: ClientSession): SessionDetail = withContext(Dispatchers.IO) {
@@ -84,6 +144,11 @@ class SessionManagerRepository {
                 lastError = lastError,
             )
         }
+    }
+
+    private inline fun <T> Result<T>.mapFailure(transform: (Throwable) -> Throwable): Result<T> {
+        val error = exceptionOrNull() ?: return this
+        return Result.failure(transform(error))
     }
 
     private fun summarizeToolCalls(provider: String, rows: List<ToolCallRow>): List<String> {
