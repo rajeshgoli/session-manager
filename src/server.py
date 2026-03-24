@@ -2281,8 +2281,11 @@ def create_app(
                 if identity_error:
                     raise HTTPException(status_code=400, detail=identity_error)
 
-            session.friendly_name = friendly_name
-            session.friendly_name_is_explicit = True
+            setter = getattr(app.state.session_manager, "set_session_friendly_name", None)
+            updated = setter(session, friendly_name, explicit=True) if callable(setter) else False
+            if updated is not True:
+                session.friendly_name = friendly_name
+                session.friendly_name_is_explicit = True
 
         if is_em is not None:
             session.is_em = is_em
@@ -3350,6 +3353,7 @@ Provide ONLY the summary, no preamble or questions."""
                         target_session.native_title = native_title
                         target_session.native_title_source_mtime_ns = native_title_mtime_ns
                         if previous_native_title != native_title:
+                            target_session.native_title_updated_at_ns = native_title_mtime_ns
                             title_changed = True
                             state_changed = True
 
