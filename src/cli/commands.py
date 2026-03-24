@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Optional
 
 _BASH_DISPLAY_WIDTH = 80
+UNAVAILABLE_MESSAGE = "Error: Session manager unavailable or request timed out"
+UNAVAILABLE_STATUS_MESSAGE = "You: Session manager unavailable or request timed out"
 
 from .client import SessionManagerClient
 from .formatting import format_session_line, format_relative_time, format_status_list
@@ -211,7 +213,7 @@ def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str
             print(f"Name set: {friendly_name} ({session_id})")
             return 0
         elif unavailable:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print("Error: Failed to set name", file=sys.stderr)
@@ -233,7 +235,7 @@ def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str
         # Check if it's unavailable or not found
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
@@ -254,7 +256,7 @@ def cmd_name(client: SessionManagerClient, session_id: str, name_or_session: str
         print(f"Name set: {friendly_name} ({target_session_id})")
         return 0
     elif unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     else:
         print("Error: Failed to set name", file=sys.stderr)
@@ -278,14 +280,14 @@ def cmd_adopt(client: SessionManagerClient, session_id: Optional[str], target_id
     if target_session_id is None:
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
         return 1
 
     result = client.propose_adoption(target_session_id, session_id)
     if result.get("unavailable"):
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
         detail = result.get("detail") or "Failed to submit adoption proposal"
@@ -323,7 +325,7 @@ def cmd_role(client: SessionManagerClient, session_id: Optional[str], role: Opti
             print("Role cleared")
             return 0
         if unavailable:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         print("Error: Failed to clear role", file=sys.stderr)
         return 1
@@ -338,7 +340,7 @@ def cmd_role(client: SessionManagerClient, session_id: Optional[str], role: Opti
         print(f"Role set: {normalized_role}")
         return 0
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     print("Error: Failed to set role", file=sys.stderr)
     return 1
@@ -363,7 +365,7 @@ def cmd_maintainer(client: SessionManagerClient, session_id: Optional[str], clea
             print("Maintainer alias cleared")
             return 0
         if unavailable:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         print("Error: Failed to clear maintainer alias", file=sys.stderr)
         return 1
@@ -373,7 +375,7 @@ def cmd_maintainer(client: SessionManagerClient, session_id: Optional[str], clea
         print(f"Maintainer alias registered: maintainer -> {session_id}")
         return 0
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     print("Error: Failed to register maintainer alias", file=sys.stderr)
     return 1
@@ -399,7 +401,7 @@ def cmd_register(client: SessionManagerClient, session_id: Optional[str], role: 
 
     result = client.register_role(session_id, normalized_role)
     if result.get("unavailable"):
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
         detail = result.get("detail") or "Failed to register role"
@@ -433,7 +435,7 @@ def cmd_unregister(client: SessionManagerClient, session_id: Optional[str], role
 
     result = client.unregister_role(session_id, normalized_role)
     if result.get("unavailable"):
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
         detail = result.get("detail") or "Failed to unregister role"
@@ -459,7 +461,7 @@ def cmd_lookup(client: SessionManagerClient, role: str) -> int:
 
     result = client.lookup_role(normalized_role)
     if result.get("unavailable"):
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
         detail = result.get("detail") or "Role not registered"
@@ -486,7 +488,7 @@ def cmd_roster(client: SessionManagerClient) -> int:
     """
     registrations = client.list_registry()
     if registrations is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not registrations:
         print("No registered roles.")
@@ -528,7 +530,7 @@ def cmd_me(client: SessionManagerClient, session_id: str) -> int:
     session = client.get_session(session_id)
 
     if session is None:
-        print("Error: Session manager unavailable or session not found", file=sys.stderr)
+        print("Error: Session manager unavailable, request timed out, or session not found", file=sys.stderr)
         return 1
 
     print(format_session_line(session, show_working_dir=True))
@@ -552,13 +554,13 @@ def cmd_who(client: SessionManagerClient, session_id: str) -> int:
         if lock and not lock.is_stale():
             print(f"{lock.session_id} | locked | {lock.task}")
             return 0
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     # List all sessions
     sessions = client.list_sessions()
     if sessions is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     # Filter: same working_dir, not current session, active status
@@ -593,7 +595,7 @@ def cmd_what(client: SessionManagerClient, identifier: str, lines: int, deep: bo
     if session_id is None:
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print("Error: Session not found", file=sys.stderr)
@@ -641,13 +643,13 @@ def cmd_others(client: SessionManagerClient, session_id: str, include_repo: bool
             print(f"{lock.session_id} | locked")
             print(f"  → {lock.task}")
             return 0
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     # List all sessions
     sessions = client.list_sessions()
     if sessions is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     # Filter based on --repo flag
@@ -703,7 +705,7 @@ def cmd_all(client: SessionManagerClient, include_summaries: bool) -> int:
     # List all sessions
     sessions = client.list_sessions()
     if sessions is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if not sessions:
@@ -843,7 +845,7 @@ def cmd_status(client: SessionManagerClient, session_id: str) -> int:
 
     if current is None or sessions is None:
         # Session manager unavailable, show lock file only
-        print("You: Session manager unavailable")
+        print(UNAVAILABLE_STATUS_MESSAGE)
         print()
         lock_manager = LockManager()
         lock = lock_manager.check_lock()
@@ -996,7 +998,7 @@ def cmd_clean(client: SessionManagerClient, session_ids: Optional[list] = None) 
     result, unavailable = client.cleanup_idle_topics(session_ids=session_ids)
 
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if result is None:
@@ -1035,7 +1037,7 @@ def cmd_subagents(client: SessionManagerClient, target_session_id: str) -> int:
     if session is None:
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print("Error: Session not found", file=sys.stderr)
@@ -1130,7 +1132,7 @@ def cmd_dispatch(
     if target_session_id is None:
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         print(f"Error: Session '{agent_id}' not found", file=sys.stderr)
         return 1
@@ -1189,7 +1191,7 @@ def cmd_agent_status(client: SessionManagerClient, session_id: str, text: str) -
         print(f"Status set: {text}")
         return 0
     elif unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     else:
         print("Error: Failed to set status", file=sys.stderr)
@@ -1213,7 +1215,7 @@ def cmd_remind_stop(client: SessionManagerClient, target_identifier: str) -> int
     if target_session_id is None:
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
@@ -1226,7 +1228,7 @@ def cmd_remind_stop(client: SessionManagerClient, target_identifier: str) -> int
         print(f"Remind cancelled for {name} ({target_session_id})")
         return 0
     elif unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     else:
         print("Error: Failed to cancel remind", file=sys.stderr)
@@ -1291,7 +1293,7 @@ def cmd_send(
         if identifier == "maintainer":
             ensure_result = client.ensure_maintainer(requester_session_id=sender_session_id)
             if ensure_result.get("unavailable"):
-                print("Error: Session manager unavailable", file=sys.stderr)
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
             if not ensure_result.get("ok"):
                 detail = ensure_result.get("detail") or "Failed to bootstrap maintainer session"
@@ -1312,7 +1314,7 @@ def cmd_send(
             # Check if it's unavailable or not found
             sessions = client.list_sessions()
             if sessions is None:
-                print("Error: Session manager unavailable", file=sys.stderr)
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
             else:
                 print(f"Error: Session '{identifier}' not found", file=sys.stderr)
@@ -1345,7 +1347,7 @@ def cmd_send(
     )
 
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if not success:
@@ -1400,7 +1402,7 @@ def cmd_remind(client: SessionManagerClient, session_id: str, delay_seconds: int
     result = client.schedule_reminder(session_id, delay_seconds, message)
 
     if result is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if result.get("status") == "scheduled":
@@ -1435,7 +1437,7 @@ def cmd_queue(client: SessionManagerClient, session_id: str) -> int:
     result = client.get_queue_status(session_id)
 
     if result is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     is_idle = result.get("is_idle", False)
@@ -1534,7 +1536,7 @@ def cmd_spawn(
     )
 
     if result is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if result.get("error"):
@@ -1740,7 +1742,7 @@ def cmd_children(
     )
 
     if result is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     children = result.get("children", [])
@@ -1899,7 +1901,7 @@ def cmd_kill(
         # Check if it's unavailable or not found
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
@@ -1912,7 +1914,7 @@ def cmd_kill(
     )
 
     if result is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if result.get("error"):
@@ -1989,7 +1991,7 @@ def cmd_new(
     )
 
     if session is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     session_id = session.get("id")
@@ -2068,7 +2070,7 @@ def cmd_codex_2(
         parent_session_id=parent_session_id,
     )
     if session is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     session_id = session.get("id")
@@ -2133,7 +2135,7 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
         if session_id is None:
             sessions = client.list_sessions()
             if sessions is None:
-                print("Error: Session manager unavailable", file=sys.stderr)
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
             print(f"Error: Session '{identifier}' not found", file=sys.stderr)
             return 1
@@ -2144,7 +2146,7 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
     sessions = client.list_sessions()
 
     if sessions is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     # Filter out stopped sessions only (error status is still attachable)
@@ -2221,7 +2223,7 @@ def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int
         # Check if it's unavailable or not found
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print(f"Error: Session '{identifier}' not found", file=sys.stderr)
@@ -2273,7 +2275,7 @@ def cmd_codex_tui(
     if session_id is None:
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         print(f"Error: Session '{identifier}' not found", file=sys.stderr)
         return 1
@@ -2436,7 +2438,7 @@ def cmd_tail(
     if session_id is None:
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print(f"Error: Session '{identifier}' not found", file=sys.stderr)
@@ -2604,7 +2606,7 @@ def cmd_wait(
         # Check if it's unavailable or not found
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print(f"Error: Session '{identifier}' not found", file=sys.stderr)
@@ -2620,7 +2622,7 @@ def cmd_wait(
     result = client.watch_session(target_session_id, watcher_session_id, timeout_seconds)
 
     if result is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if result.get("status") != "watching":
@@ -2663,7 +2665,7 @@ def cmd_watch_job_add(
         if target_session_id is None:
             sessions = client.list_sessions()
             if sessions is None:
-                print("Error: Session manager unavailable", file=sys.stderr)
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
             print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
             return 1
@@ -2692,7 +2694,7 @@ def cmd_watch_job_add(
         notify_on_change=notify_on_change,
     )
     if result.get("unavailable"):
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
         detail = result.get("detail") or "Failed to create job watch"
@@ -2742,7 +2744,7 @@ def cmd_watch_job_list(
         if target_session_id is None:
             sessions = client.list_sessions()
             if sessions is None:
-                print("Error: Session manager unavailable", file=sys.stderr)
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
             print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
             return 2
@@ -2754,7 +2756,7 @@ def cmd_watch_job_list(
 
     watches = client.list_job_watches(target_session_id=target_session_id, include_inactive=include_inactive)
     if watches is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     if json_output:
@@ -2801,7 +2803,7 @@ def cmd_watch_job_cancel(client: SessionManagerClient, watch_id: str) -> int:
     """
     result = client.cancel_job_watch(watch_id)
     if result.get("unavailable"):
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
         detail = result.get("detail") or "Failed to cancel job watch"
@@ -2877,7 +2879,7 @@ def cmd_review(
         )
 
         if result is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
 
         if result.get("error"):
@@ -2961,7 +2963,7 @@ def cmd_review(
         )
 
         if result is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
 
         if result.get("error") or result.get("detail"):
@@ -2980,7 +2982,7 @@ def cmd_review(
         if session_id is None:
             sessions = client.list_sessions()
             if sessions is None:
-                print("Error: Session manager unavailable", file=sys.stderr)
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
             else:
                 print(f"Error: Session '{session}' not found", file=sys.stderr)
@@ -2998,7 +3000,7 @@ def cmd_review(
         )
 
         if result is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
 
         if result.get("error") or result.get("detail"):
@@ -3077,7 +3079,7 @@ def cmd_clear(
         # Check if it's unavailable or not found
         sessions = client.list_sessions()
         if sessions is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         else:
             print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
@@ -3106,7 +3108,7 @@ def cmd_clear(
     if provider == "codex-app":
         success, unavailable = client.clear_session(target_session_id, new_prompt)
         if unavailable:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         if not success:
             print("Error: Failed to clear Codex app session", file=sys.stderr)
@@ -3280,7 +3282,7 @@ def cmd_handoff(client: SessionManagerClient, session_id: str, file_path: str) -
     # 4. Call server API
     result = client.schedule_handoff(session_id, abs_path)
     if result is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if result.get("error") or result.get("detail"):
         print(f"Error: {result.get('error') or result.get('detail')}", file=sys.stderr)
@@ -3316,7 +3318,7 @@ def cmd_task_complete(client: SessionManagerClient, session_id: str) -> int:
     success, unavailable, em_notified = client.task_complete(session_id)
 
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not success:
         print("Error: Failed to mark task complete", file=sys.stderr)
@@ -3346,7 +3348,7 @@ def cmd_turn_complete(client: SessionManagerClient, session_id: str) -> int:
     success, unavailable = client.turn_complete(session_id)
 
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not success:
         print("Error: Failed to mark turn complete", file=sys.stderr)
@@ -3374,7 +3376,7 @@ def cmd_context_monitor(
     if action == "status":
         monitored = client.get_context_monitor_status()
         if monitored is None:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         if not monitored:
             print("No sessions currently registered for context monitoring.")
@@ -3408,7 +3410,7 @@ def cmd_context_monitor(
             resolved_target, enabled, session_id, notify_session_id=notify_session_id
         )
         if unavailable:
-            print("Error: Session manager unavailable", file=sys.stderr)
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
         if not success:
             err = (data or {}).get("detail", "Unknown error")
@@ -3464,7 +3466,7 @@ def cmd_em(
 
     success, unavailable = client.update_friendly_name(session_id, friendly_name)
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if success:
         results.append(f"  Name set: {friendly_name} ({session_id})")
@@ -3474,7 +3476,7 @@ def cmd_em(
     # Step 1b: Register EM role server-side (#256)
     success, unavailable = client.set_em_role(session_id)
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if success:
         results.append("  EM role: registered")
@@ -3487,7 +3489,7 @@ def cmd_em(
         notify_session_id=session_id,
     )
     if unavailable:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if success:
         results.append("  Context monitoring: enabled (notifications → self)")
@@ -3497,7 +3499,7 @@ def cmd_em(
     # Step 3: List and register children
     children_data = client.list_children(session_id)
     if children_data is None:
-        print("Error: Session manager unavailable", file=sys.stderr)
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     children = children_data.get("children", [])

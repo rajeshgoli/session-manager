@@ -10,8 +10,23 @@ import json
 
 # Default API endpoint
 DEFAULT_API_URL = "http://127.0.0.1:8420"
-API_TIMEOUT = 2  # seconds
+DEFAULT_API_TIMEOUT = 5.0  # seconds
 KILL_TIMEOUT = 30  # seconds (kill triggers cleanup that may involve network I/O)
+
+
+def _read_api_timeout() -> float:
+    """Return CLI API timeout from env with a sane fallback."""
+    raw = os.environ.get("SM_API_TIMEOUT")
+    if not raw:
+        return DEFAULT_API_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_API_TIMEOUT
+    return value if value > 0 else DEFAULT_API_TIMEOUT
+
+
+API_TIMEOUT = _read_api_timeout()
 
 
 class SessionManagerClient:
@@ -40,7 +55,7 @@ class SessionManagerClient:
         Returns:
             Tuple of (response_data, success, unavailable)
             - success=True, unavailable=False: Request succeeded
-            - success=False, unavailable=True: Connection error (session manager unavailable)
+            - success=False, unavailable=True: Transport error / timeout
             - success=False, unavailable=False: API error (4xx, 5xx response)
         """
         url = f"{self.api_url}{path}"
@@ -70,10 +85,10 @@ class SessionManagerClient:
                     return {"error": payload.decode(errors="replace")}, False, False
             return {"error": f"HTTP {getattr(e, 'code', 'error')}"}, False, False
         except urllib.error.URLError as e:
-            # Connection refused, timeout, etc. - session manager unavailable
+            # Connection refused, timeout, etc. - treat as transport unavailable
             return None, False, True
         except Exception as e:
-            # Other errors - treat as unavailable
+            # Other transport errors - treat as unavailable
             return None, False, True
 
     def _request_with_status(

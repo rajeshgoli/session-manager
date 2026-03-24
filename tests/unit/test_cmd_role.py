@@ -2,6 +2,8 @@
 
 from unittest.mock import Mock
 
+import pytest
+
 from src.cli.client import SessionManagerClient
 from src.cli.commands import cmd_role
 
@@ -30,3 +32,13 @@ def test_cmd_role_clear_success():
     rc = cmd_role(client, session_id="abc12345", role=None, clear=True)
     assert rc == 0
     client.clear_role.assert_called_once_with("abc12345")
+
+
+def test_cmd_role_reports_timeout_or_unavailable(capsys: pytest.CaptureFixture[str]):
+    client = _make_client()
+    client.set_role.return_value = (False, True)
+
+    rc = cmd_role(client, session_id="abc12345", role="engineer", clear=False)
+
+    assert rc == 2
+    assert "request timed out" in capsys.readouterr().err
