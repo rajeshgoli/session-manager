@@ -41,6 +41,8 @@ class MessageQueueManager:
     """
 
     _STOP_SUPPRESS_WINDOW_SECONDS = 10
+    _REMIND_CHECK_INTERVAL_SECONDS = 5
+    _TRACK_STATUS_NUDGE_MAX_LEAD_SECONDS = 60
 
     def __init__(
         self,
@@ -223,6 +225,9 @@ class MessageQueueManager:
         if "cancel_on_reply_session_id" not in remind_columns:
             cursor.execute("ALTER TABLE remind_registrations ADD COLUMN cancel_on_reply_session_id TEXT")
             logger.info("Migrated remind_registrations: added cancel_on_reply_session_id column")
+        if "tracked_status_nudge_fired" not in remind_columns:
+            cursor.execute("ALTER TABLE remind_registrations ADD COLUMN tracked_status_nudge_fired INTEGER DEFAULT 0")
+            logger.info("Migrated remind_registrations: added tracked_status_nudge_fired column")
 
         # Parent wake-up registrations table (#225-C)
         cursor.execute("""
@@ -2180,9 +2185,11 @@ class MessageQueueManager:
             owners = set(existing.cancel_on_reply_session_ids)
             if cancel_on_reply_session_id:
                 owners.add(cancel_on_reply_session_id)
+            self.cancel_queued_track_status_nudges(target_session_id)
             existing.soft_threshold_seconds = min(existing.soft_threshold_seconds, soft_threshold)
             existing.hard_threshold_seconds = min(existing.hard_threshold_seconds, hard_threshold)
             existing.last_reset_at = now
+            existing.tracked_status_nudge_fired = False
             existing.soft_fired = False
             existing.cancel_on_reply_session_ids = tuple(sorted(owners))
             self._update_remind_db(
@@ -2190,6 +2197,7 @@ class MessageQueueManager:
                 soft_threshold_seconds=existing.soft_threshold_seconds,
                 hard_threshold_seconds=existing.hard_threshold_seconds,
                 last_reset_at=now,
+                tracked_status_nudge_fired=False,
                 soft_fired=False,
                 cancel_on_reply_session_id=self._serialize_cancel_on_reply_session_ids(existing.cancel_on_reply_session_ids),
             )
@@ -2216,6 +2224,7 @@ class MessageQueueManager:
             registered_at=now,
             last_reset_at=now,
             cancel_on_reply_session_ids=cancel_on_reply_session_ids,
+            tracked_status_nudge_fired=False,
         )
         self._remind_registrations[target_session_id] = reg
 
@@ -2223,8 +2232,8 @@ class MessageQueueManager:
         self._execute("""
             INSERT OR REPLACE INTO remind_registrations
             (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
-             registered_at, last_reset_at, cancel_on_reply_session_id, soft_fired, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)
+             registered_at, last_reset_at, cancel_on_reply_session_id, tracked_status_nudge_fired, soft_fired, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 1)
         """, (
             reg_id,
             target_session_id,
@@ -2295,9 +2304,15 @@ class MessageQueueManager:
 
         now = datetime.now()
         reg.last_reset_at = now
+        reg.tracked_status_nudge_fired = False
         reg.soft_fired = False
 
-        self._update_remind_db(target_session_id, last_reset_at=now, soft_fired=False)
+        self._update_remind_db(
+            target_session_id,
+            last_reset_at=now,
+            tracked_status_nudge_fired=False,
+            soft_fired=False,
+        )
         logger.info(f"Remind timer reset for {target_session_id}")
 
     def cancel_queued_track_reminds(self, tracked_session_id: str, owner_session_id: str) -> int:
@@ -2324,6 +2339,29 @@ class MessageQueueManager:
             )
         return count
 
+    def cancel_queued_track_status_nudges(self, target_session_id: str) -> int:
+        """Delete undelivered target-facing status nudges for one tracked session."""
+        rows = self._execute_query(
+            "SELECT COUNT(*) FROM message_queue "
+            "WHERE target_session_id = ? "
+            "AND message_category = 'track_status_nudge' AND delivered_at IS NULL",
+            (target_session_id,),
+        )
+        count = rows[0][0] if rows else 0
+        if count:
+            self._execute(
+                "DELETE FROM message_queue "
+                "WHERE target_session_id = ? "
+                "AND message_category = 'track_status_nudge' AND delivered_at IS NULL",
+                (target_session_id,),
+            )
+            logger.info(
+                "Cancelled %s queued track status nudge(s) for target=%s",
+                count,
+                target_session_id,
+            )
+        return count
+
     def _build_tracked_remind_text(self, target_session_id: str, reg: RemindRegistration, urgent: bool) -> str:
         """Build requester-facing tracked reminder text for one target session (#408)."""
         session = self.session_manager.get_session(target_session_id) if self.session_manager else None
@@ -2343,6 +2381,43 @@ class MessageQueueManager:
             lines.append("Status: (no agent status reported)")
         lines.append(f"Awaiting explicit reply from {target_session_id[:8]}.")
         return "\n".join(lines)
+
+    def _tracked_status_nudge_lead_seconds(self, soft_threshold_seconds: int) -> int:
+        """Return how far ahead of the owner reminder to nudge the tracked agent."""
+        if soft_threshold_seconds <= self._REMIND_CHECK_INTERVAL_SECONDS:
+            return 0
+        return min(self._TRACK_STATUS_NUDGE_MAX_LEAD_SECONDS, max(soft_threshold_seconds // 2, 1))
+
+    def _build_tracked_status_nudge_text(self, reg: RemindRegistration) -> str:
+        """Build a target-facing nudge so tracked work reports status before owner polling."""
+        owner_labels: list[str] = []
+        for owner_session_id in reg.cancel_on_reply_session_ids:
+            owner_session = self.session_manager.get_session(owner_session_id) if self.session_manager else None
+            owner_labels.append(self._get_display_name(owner_session) or owner_session_id[:8])
+        owner_text = ", ".join(owner_labels) if owner_labels else "waiting agents"
+        lead_seconds = self._tracked_status_nudge_lead_seconds(reg.soft_threshold_seconds)
+        if lead_seconds >= 60:
+            lead_text = "within the next minute"
+        else:
+            lead_text = f"within the next {lead_seconds} seconds"
+        return (
+            "[sm remind] Update your status "
+            f"{lead_text} so it can be reported to {owner_text}: "
+            'sm status "your current progress" '
+            "— if waiting on others: sm turn-complete — if done: sm task-complete"
+        )
+
+    def _queue_tracked_status_nudge(self, target_session_id: str, reg: RemindRegistration) -> None:
+        """Queue one target-facing status nudge for a tracked session before owner reminder."""
+        pending = self.get_pending_messages(target_session_id)
+        if any(m.message_category == "track_status_nudge" for m in pending):
+            return
+        self.queue_message(
+            target_session_id=target_session_id,
+            text=self._build_tracked_status_nudge_text(reg),
+            delivery_mode="important",
+            message_category="track_status_nudge",
+        )
 
     def _queue_tracked_remind_notifications(
         self,
@@ -2506,6 +2581,7 @@ class MessageQueueManager:
                 "UPDATE remind_registrations SET is_active = 0 WHERE target_session_id = ?",
                 (target_session_id,)
             )
+            self.cancel_queued_track_status_nudges(target_session_id)
             logger.info(f"Periodic remind cancelled for {target_session_id}")
 
         # Cancel async task
@@ -2541,11 +2617,10 @@ class MessageQueueManager:
         hard (urgent) when hard_threshold exceeded. Hard fire resets the cycle.
         Skips delivery while session is compacting (#249).
         """
-        CHECK_INTERVAL = 5  # seconds
         REMIND_PREFIX = "[sm remind]"
         try:
             while True:
-                await asyncio.sleep(CHECK_INTERVAL)
+                await asyncio.sleep(self._REMIND_CHECK_INTERVAL_SECONDS)
                 reg = self._remind_registrations.get(target_session_id)
                 if not reg or not reg.is_active:
                     return
@@ -2556,6 +2631,14 @@ class MessageQueueManager:
                     continue
 
                 elapsed = (datetime.now() - reg.last_reset_at).total_seconds()
+
+                if reg.cancel_on_reply_session_ids and not reg.tracked_status_nudge_fired:
+                    lead_seconds = self._tracked_status_nudge_lead_seconds(reg.soft_threshold_seconds)
+                    nudge_threshold = max(reg.soft_threshold_seconds - lead_seconds, 0)
+                    if lead_seconds > 0 and elapsed >= nudge_threshold:
+                        self._queue_tracked_status_nudge(target_session_id, reg)
+                        reg.tracked_status_nudge_fired = True
+                        self._update_remind_db(target_session_id, tracked_status_nudge_fired=True)
 
                 # Soft threshold: fire important remind
                 if not reg.soft_fired and elapsed >= reg.soft_threshold_seconds:
@@ -2595,10 +2678,12 @@ class MessageQueueManager:
                     # Reset cycle so it restarts
                     now = datetime.now()
                     reg.last_reset_at = now
+                    reg.tracked_status_nudge_fired = False
                     reg.soft_fired = False
                     self._update_remind_db(
                         target_session_id,
                         last_reset_at=now,
+                        tracked_status_nudge_fired=False,
                         soft_fired=False,
                     )
 
@@ -2611,7 +2696,7 @@ class MessageQueueManager:
         """Recover active remind registrations on server restart."""
         rows = self._execute_query("""
             SELECT id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
-                   registered_at, last_reset_at, cancel_on_reply_session_id, soft_fired
+                   registered_at, last_reset_at, cancel_on_reply_session_id, tracked_status_nudge_fired, soft_fired
             FROM remind_registrations
             WHERE is_active = 1
         """)
@@ -2625,6 +2710,7 @@ class MessageQueueManager:
                 registered_at_str,
                 last_reset_at_str,
                 cancel_on_reply_session_id,
+                tracked_status_nudge_fired,
                 soft_fired,
             ) = row
             last_reset_at = datetime.fromisoformat(last_reset_at_str)
@@ -2637,6 +2723,7 @@ class MessageQueueManager:
                 registered_at=datetime.fromisoformat(registered_at_str),
                 last_reset_at=last_reset_at,
                 cancel_on_reply_session_ids=self._deserialize_cancel_on_reply_session_ids(cancel_on_reply_session_id),
+                tracked_status_nudge_fired=bool(tracked_status_nudge_fired),
                 soft_fired=bool(soft_fired),
                 is_active=True,
             )

@@ -135,6 +135,7 @@ class TestDeliveryTriggeredStart:
         assert reg.soft_threshold_seconds == 30
         assert reg.hard_threshold_seconds == 60
         assert reg.cancel_on_reply_session_ids == ("parent3",)
+        assert reg.tracked_status_nudge_fired is False
 
     def test_registration_persisted_to_db(self, mq):
         """register_periodic_remind writes the registration to remind_registrations table."""
@@ -149,7 +150,7 @@ class TestDeliveryTriggeredStart:
         conn = sqlite3.connect(mq.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, is_active, cancel_on_reply_session_id FROM remind_registrations WHERE target_session_id = ?",
+            "SELECT id, is_active, cancel_on_reply_session_id, tracked_status_nudge_fired FROM remind_registrations WHERE target_session_id = ?",
             ("agent4",),
         )
         row = cursor.fetchone()
@@ -159,6 +160,7 @@ class TestDeliveryTriggeredStart:
         assert row[0] == reg_id
         assert row[1] == 1  # is_active=True
         assert row[2] == "[\"parent4\"]"
+        assert row[3] == 0
 
 
 # ===========================================================================
@@ -291,11 +293,13 @@ class TestStatusReset:
         reg = mq._remind_registrations["tracked-target-force"]
         old_reset = datetime.now() - timedelta(seconds=30)
         reg.last_reset_at = old_reset
+        reg.tracked_status_nudge_fired = True
         reg.soft_fired = True
 
         mq.reset_remind("tracked-target-force", force_tracked=True)
 
         assert reg.last_reset_at > old_reset
+        assert reg.tracked_status_nudge_fired is False
         assert reg.soft_fired is False
 
     def test_reset_remind_persists_to_db(self, mq):
@@ -711,6 +715,47 @@ class TestCrashRecovery:
             await mq2._recover_remind_registrations()
 
         assert mq2._remind_registrations["agent10b"].cancel_on_reply_session_ids == ("parent10b",)
+        assert mq2._remind_registrations["agent10b"].tracked_status_nudge_fired is False
+
+    @pytest.mark.asyncio
+    async def test_recover_restores_tracked_status_nudge_state(self, mock_session_manager, temp_db_path):
+        """Crash recovery restores tracked status nudge progress for tracked reminders."""
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"remind": {"soft_threshold_seconds": 180, "hard_gap_seconds": 120}},
+            notifier=None,
+        )
+
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO remind_registrations
+            (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
+             registered_at, last_reset_at, cancel_on_reply_session_id, tracked_status_nudge_fired, soft_fired, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "reg447recover",
+                "agent10c",
+                300,
+                600,
+                datetime.now().isoformat(),
+                datetime.now().isoformat(),
+                "[\"owner10c\"]",
+                1,
+                0,
+                1,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("asyncio.create_task", noop_create_task):
+            await mq._recover_remind_registrations()
+
+        assert mq._remind_registrations["agent10c"].tracked_status_nudge_fired is True
 
     @pytest.mark.asyncio
     async def test_recover_skips_inactive_registrations(self, mock_session_manager, temp_db_path):
@@ -1047,6 +1092,7 @@ class TestDatabaseSchema:
         columns = {row[1] for row in cursor.fetchall()}
         conn.close()
         assert "cancel_on_reply_session_id" in columns
+        assert "tracked_status_nudge_fired" in columns
 
 
 class TestTrackedReplyCancellation:
@@ -1174,6 +1220,154 @@ class TestTrackedReplyCancellation:
 
         assert result == DeliveryResult.DELIVERED
         assert child.id not in mq._remind_registrations
+
+
+class TestTrackedStatusNudge:
+    """Tracked sessions get a status nudge before requester-facing reminders (#447)."""
+
+    @pytest.mark.asyncio
+    async def test_tracked_nudge_goes_to_target_before_owner_remind(self, mq):
+        owner = Session(
+            id="owner447",
+            name="owner447",
+            working_dir="/tmp",
+            tmux_session="claude-owner447",
+            status=SessionStatus.IDLE,
+            friendly_name="em-orch",
+        )
+        target = Session(
+            id="target447",
+            name="target447",
+            working_dir="/tmp",
+            tmux_session="claude-target447",
+            status=SessionStatus.RUNNING,
+            friendly_name="eng-worker",
+        )
+        mq.session_manager.sessions = {owner.id: owner, target.id: target}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                target.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id=owner.id,
+            )
+
+        reg = mq._remind_registrations[target.id]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=245)
+
+        await run_one_iteration(mq, target.id)
+
+        target_pending = mq.get_pending_messages(target.id)
+        owner_pending = mq.get_pending_messages(owner.id)
+        assert len(target_pending) == 1
+        assert target_pending[0].message_category == "track_status_nudge"
+        assert target_pending[0].delivery_mode == "important"
+        assert "within the next minute" in target_pending[0].text
+        assert "reported to em-orch" in target_pending[0].text
+        assert owner_pending == []
+        assert reg.tracked_status_nudge_fired is True
+
+    @pytest.mark.asyncio
+    async def test_soft_owner_remind_does_not_duplicate_tracked_nudge(self, mq):
+        owner = Session(
+            id="owner447b",
+            name="owner447b",
+            working_dir="/tmp",
+            tmux_session="claude-owner447b",
+            status=SessionStatus.IDLE,
+        )
+        target = Session(
+            id="target447b",
+            name="target447b",
+            working_dir="/tmp",
+            tmux_session="claude-target447b",
+            status=SessionStatus.RUNNING,
+        )
+        mq.session_manager.sessions = {owner.id: owner, target.id: target}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                target.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id=owner.id,
+            )
+
+        reg = mq._remind_registrations[target.id]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=305)
+        reg.tracked_status_nudge_fired = True
+
+        await run_one_iteration(mq, target.id)
+
+        target_pending = mq.get_pending_messages(target.id)
+        owner_pending = mq.get_pending_messages(owner.id)
+        assert target_pending == []
+        assert len(owner_pending) == 1
+        assert owner_pending[0].message_category == "track_remind"
+        assert reg.soft_fired is True
+
+    @pytest.mark.asyncio
+    async def test_hard_cycle_resets_tracked_status_nudge(self, mq):
+        owner = Session(
+            id="owner447c",
+            name="owner447c",
+            working_dir="/tmp",
+            tmux_session="claude-owner447c",
+            status=SessionStatus.IDLE,
+        )
+        target = Session(
+            id="target447c",
+            name="target447c",
+            working_dir="/tmp",
+            tmux_session="claude-target447c",
+            status=SessionStatus.RUNNING,
+        )
+        mq.session_manager.sessions = {owner.id: owner, target.id: target}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                target.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id=owner.id,
+            )
+
+        reg = mq._remind_registrations[target.id]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=605)
+        reg.tracked_status_nudge_fired = True
+        reg.soft_fired = True
+
+        await run_one_iteration(mq, target.id)
+
+        owner_pending = mq.get_pending_messages(owner.id)
+        assert len(owner_pending) == 1
+        assert owner_pending[0].message_category == "track_remind"
+        assert owner_pending[0].delivery_mode == "urgent"
+        assert reg.tracked_status_nudge_fired is False
+        assert reg.soft_fired is False
+
+    def test_cancel_remind_clears_pending_tracked_status_nudge(self, mq):
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                "target447d",
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id="owner447d",
+            )
+            mq.queue_message(
+                target_session_id="target447d",
+                text='[sm remind] Update your status within the next minute',
+                delivery_mode="important",
+                message_category="track_status_nudge",
+            )
+
+        assert len(mq.get_pending_messages("target447d")) == 1
+        mq.cancel_remind("target447d")
+        assert mq.get_pending_messages("target447d") == []
 
 
 class TestTrackedReminderDelivery:
