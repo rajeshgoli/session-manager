@@ -72,6 +72,22 @@ DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
 ).strip()
 
+DEFAULT_SERVICE_ROLE_BOOTSTRAP_PROMPT = textwrap.dedent(
+    """
+    Act as the {role} service agent for this repository.
+
+    Role:
+    - Keep the `{role}` registry role for this session.
+    - Process requests delivered via `sm send {role} "..."`.
+
+    Communication:
+    - Work through the incoming queue for this role until the request is resolved.
+
+    Repository:
+    - Work in {working_dir}.
+    """
+).strip()
+
 ROLE_KEYWORDS = (
     "engineer",
     "architect",
@@ -153,8 +169,11 @@ class SessionManager:
         self.adoption_proposals: dict[str, AdoptionProposal] = {}
         self.agent_registrations: dict[str, AgentRegistration] = {}
         self._maintainer_bootstrap_lock = asyncio.Lock()
+        self._service_role_bootstrap_locks: dict[str, asyncio.Lock] = {}
 
         maintainer_config = self.config.get("maintainer_agent", {})
+        raw_service_roles = self.config.get("service_roles", {})
+        self._maintainer_service_role_explicit = isinstance(raw_service_roles, dict) and "maintainer" in raw_service_roles
         configured_working_dir = maintainer_config.get("working_dir")
         default_working_dir = str(Path(__file__).resolve().parents[1])
         self.maintainer_working_dir = str(configured_working_dir or default_working_dir)
@@ -172,6 +191,14 @@ class SessionManager:
             DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT,
         )
         self.maintainer_bootstrap_prompt_template = str(raw_bootstrap_prompt).strip() or DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT
+        self.service_role_bootstrap_specs = self._build_service_role_bootstrap_specs(
+            default_working_dir=default_working_dir,
+            maintainer_config=maintainer_config,
+        )
+        self._maintainer_bootstrap_lock = self._service_role_bootstrap_locks.setdefault(
+            "maintainer",
+            asyncio.Lock(),
+        )
 
         codex_config = self.config.get("codex", {})
         codex_app_config = self.config.get("codex_app_server", codex_config)
@@ -2031,6 +2058,138 @@ class SessionManager:
         """Render the maintainer bootstrap prompt for a new service session."""
         return self.maintainer_bootstrap_prompt_template.replace("{working_dir}", working_dir)
 
+    @staticmethod
+    def _normalize_provider_list(raw_value: Any, fallback: list[str]) -> list[str]:
+        """Normalize one preferred-provider config value to a non-empty list."""
+        if isinstance(raw_value, list):
+            normalized = [str(provider).strip() for provider in raw_value if str(provider).strip()]
+            return normalized or fallback
+        if raw_value is None:
+            return fallback
+        provider = str(raw_value).strip()
+        return [provider] if provider else fallback
+
+    def _normalize_service_role_bootstrap_spec(
+        self,
+        role: str,
+        raw_spec: Any,
+        *,
+        default_working_dir: str,
+        default_friendly_name: Optional[str] = None,
+        default_preferred_providers: Optional[list[str]] = None,
+        default_bootstrap_prompt: Optional[str] = None,
+        default_auto_bootstrap: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """Normalize one service-role bootstrap config block."""
+        if not isinstance(raw_spec, dict):
+            return None
+
+        normalized_role = self.normalize_agent_role(role)
+        if not normalized_role:
+            return None
+
+        preferred_providers = self._normalize_provider_list(
+            raw_spec.get("preferred_providers", raw_spec.get("provider")),
+            default_preferred_providers or ["codex-fork", "claude"],
+        )
+        working_dir = str(raw_spec.get("working_dir", default_working_dir)).strip() or default_working_dir
+        friendly_name = str(raw_spec.get("friendly_name", default_friendly_name or normalized_role)).strip() or (
+            default_friendly_name or normalized_role
+        )
+        bootstrap_prompt = str(raw_spec.get("bootstrap_prompt", default_bootstrap_prompt or "")).strip()
+        bootstrap_prompt_file = str(
+            raw_spec.get("bootstrap_prompt_file", raw_spec.get("boot_prompt_file", ""))
+        ).strip()
+
+        return {
+            "role": normalized_role,
+            "auto_bootstrap": bool(raw_spec.get("auto_bootstrap", default_auto_bootstrap)),
+            "working_dir": working_dir,
+            "friendly_name": friendly_name,
+            "preferred_providers": preferred_providers,
+            "bootstrap_prompt": bootstrap_prompt,
+            "bootstrap_prompt_file": bootstrap_prompt_file,
+        }
+
+    def _build_service_role_bootstrap_specs(
+        self,
+        *,
+        default_working_dir: str,
+        maintainer_config: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Build normalized service-role bootstrap specs from config."""
+        specs: dict[str, dict[str, Any]] = {}
+        raw_roles = self.config.get("service_roles", {})
+        if isinstance(raw_roles, dict):
+            for role, raw_spec in raw_roles.items():
+                normalized = self._normalize_service_role_bootstrap_spec(
+                    str(role),
+                    raw_spec,
+                    default_working_dir=default_working_dir,
+                )
+                if normalized:
+                    specs[normalized["role"]] = normalized
+
+        if "maintainer" not in specs:
+            maintainer_spec = self._normalize_service_role_bootstrap_spec(
+                "maintainer",
+                maintainer_config,
+                default_working_dir=default_working_dir,
+                default_friendly_name=self.maintainer_friendly_name,
+                default_preferred_providers=self.maintainer_preferred_providers,
+                default_bootstrap_prompt=self.maintainer_bootstrap_prompt_template,
+                default_auto_bootstrap=True,
+            )
+            if maintainer_spec:
+                specs["maintainer"] = maintainer_spec
+
+        return specs
+
+    def get_service_role_bootstrap_spec(self, role: str) -> Optional[dict[str, Any]]:
+        """Return one configured service-role bootstrap spec."""
+        normalized_role = self.normalize_agent_role(role)
+        if not normalized_role:
+            return None
+        spec = self.service_role_bootstrap_specs.get(normalized_role)
+        if not spec:
+            return None
+        return dict(spec)
+
+    def _get_service_role_bootstrap_lock(self, role: str) -> asyncio.Lock:
+        """Return a stable bootstrap lock for one service role."""
+        normalized_role = self.normalize_agent_role(role)
+        return self._service_role_bootstrap_locks.setdefault(normalized_role, asyncio.Lock())
+
+    def _resolve_service_role_working_dir(self, spec: dict[str, Any]) -> str:
+        """Resolve one service-role working directory."""
+        candidate = Path(str(spec["working_dir"])).expanduser().resolve()
+        role = spec["role"]
+        if not candidate.exists():
+            raise ValueError(f'Service role "{role}" working directory does not exist: {candidate}')
+        if not candidate.is_dir():
+            raise ValueError(f'Service role "{role}" working directory is not a directory: {candidate}')
+        return str(candidate)
+
+    def _render_service_role_bootstrap_prompt(self, spec: dict[str, Any], working_dir: str) -> str:
+        """Render one bootstrap prompt from inline text or a prompt file."""
+        role = spec["role"]
+        prompt_template = str(spec.get("bootstrap_prompt") or "").strip()
+        prompt_file = str(spec.get("bootstrap_prompt_file") or "").strip()
+        if prompt_file:
+            prompt_path = Path(prompt_file).expanduser().resolve()
+            if not prompt_path.exists():
+                raise ValueError(f'Service role "{role}" bootstrap prompt file does not exist: {prompt_path}')
+            if not prompt_path.is_file():
+                raise ValueError(f'Service role "{role}" bootstrap prompt path is not a file: {prompt_path}')
+            prompt_template = prompt_path.read_text().strip()
+        if not prompt_template:
+            prompt_template = DEFAULT_SERVICE_ROLE_BOOTSTRAP_PROMPT
+        return (
+            prompt_template
+            .replace("{working_dir}", working_dir)
+            .replace("{role}", role)
+        )
+
     def _provider_entrypoint_available(self, provider: str) -> bool:
         """Best-effort preflight for tmux-backed providers used during maintainer bootstrap."""
         if provider == "codex-fork":
@@ -2067,51 +2226,87 @@ class SessionManager:
             raise ValueError(f"Maintainer working directory is not a directory: {candidate}")
         return str(candidate)
 
+    def _refresh_maintainer_service_role_spec(self) -> None:
+        """Keep legacy maintainer bootstrap attributes mirrored into the generic role spec."""
+        if self._maintainer_service_role_explicit:
+            return
+        self.service_role_bootstrap_specs["maintainer"] = {
+            "role": "maintainer",
+            "auto_bootstrap": True,
+            "working_dir": self.maintainer_working_dir,
+            "friendly_name": self.maintainer_friendly_name,
+            "preferred_providers": list(self.maintainer_preferred_providers),
+            "bootstrap_prompt": self.maintainer_bootstrap_prompt_template,
+            "bootstrap_prompt_file": "",
+        }
+
     async def ensure_maintainer_session(self) -> tuple[Session, bool]:
         """Return the live maintainer session, spawning it if needed."""
-        existing = self.get_maintainer_session()
+        self._refresh_maintainer_service_role_spec()
+        return await self.ensure_role_session("maintainer")
+
+    def get_service_role_session(self, role: str) -> Optional[Session]:
+        """Return the active live session for one service role, if registered."""
+        registration = self.lookup_agent_registration(role)
+        if not registration:
+            return None
+        return self._get_live_registered_session(registration.session_id)
+
+    async def ensure_role_session(self, role: str) -> tuple[Session, bool]:
+        """Return the live session for one auto-bootstrap service role, spawning it if needed."""
+        normalized_role = self.normalize_agent_role(role)
+        if not normalized_role:
+            raise ValueError("Role cannot be empty")
+
+        spec = self.get_service_role_bootstrap_spec(normalized_role)
+        if not spec or not spec.get("auto_bootstrap"):
+            raise ValueError(f'Role "{normalized_role}" is not configured for auto-bootstrap')
+
+        existing = self.get_service_role_session(normalized_role)
         if existing:
             return existing, False
 
-        async with self._maintainer_bootstrap_lock:
-            existing = self.get_maintainer_session()
+        async with self._get_service_role_bootstrap_lock(normalized_role):
+            existing = self.get_service_role_session(normalized_role)
             if existing:
                 return existing, False
 
-            working_dir = self._resolve_maintainer_working_dir()
-            bootstrap_prompt = self._maintainer_bootstrap_prompt(working_dir)
+            working_dir = self._resolve_service_role_working_dir(spec)
+            bootstrap_prompt = self._render_service_role_bootstrap_prompt(spec, working_dir)
             last_error: Optional[str] = None
 
-            for provider in self.maintainer_preferred_providers:
+            for provider in spec["preferred_providers"]:
                 if not self._provider_entrypoint_available(provider):
                     last_error = f"{provider} entrypoint unavailable"
                     logger.warning(
-                        "Skipping maintainer bootstrap provider %s: entrypoint unavailable",
+                        "Skipping %s bootstrap provider %s: entrypoint unavailable",
+                        normalized_role,
                         provider,
                     )
                     continue
 
                 session = await self._create_session_common(
                     working_dir=working_dir,
-                    friendly_name=self.maintainer_friendly_name,
+                    friendly_name=spec["friendly_name"],
                     initial_prompt=bootstrap_prompt,
                     provider=provider,
                 )
                 if not session:
                     last_error = f"{provider} session creation failed"
                     logger.warning(
-                        "Maintainer bootstrap failed for provider %s during session creation",
+                        "%s bootstrap failed for provider %s during session creation",
+                        normalized_role,
                         provider,
                     )
                     continue
 
-                session.role = "maintainer"
+                session.role = normalized_role
                 self._save_state()
 
                 try:
-                    self.register_agent_role(session.id, "maintainer")
+                    self.register_agent_role(session.id, normalized_role)
                 except ValueError:
-                    adopted = self.get_maintainer_session()
+                    adopted = self.get_service_role_session(normalized_role)
                     if adopted and adopted.id != session.id:
                         self.kill_session(session.id)
                         return adopted, False
@@ -2119,13 +2314,14 @@ class SessionManager:
                     raise
 
                 logger.info(
-                    "Bootstrapped maintainer session %s using provider %s",
+                    "Bootstrapped service role %s as session %s using provider %s",
+                    normalized_role,
                     session.id,
                     provider,
                 )
                 return session, True
 
-            detail = "Failed to bootstrap maintainer session"
+            detail = f'Failed to bootstrap role "{normalized_role}"'
             if last_error:
                 detail = f"{detail}: {last_error}"
             raise RuntimeError(detail)

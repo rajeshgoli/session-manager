@@ -12,11 +12,11 @@ from src.server import create_app
 from src.session_manager import SessionManager
 
 
-def _manager(tmp_path) -> SessionManager:
+def _manager(tmp_path, config=None) -> SessionManager:
     manager = SessionManager(
         log_dir=str(tmp_path / "logs"),
         state_file=str(tmp_path / "sessions.json"),
-        config={},
+        config=config or {},
     )
     manager.tmux = Mock()
     manager.tmux.list_sessions.return_value = []
@@ -225,12 +225,104 @@ def test_post_ensure_maintainer_bootstraps_session(tmp_path):
     assert payload["session"]["provider"] == "codex-fork"
 
 
+def test_ensure_service_role_session_uses_prompt_file_and_registers_alias(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    prompt_file = tmp_path / "chief-scientist.md"
+    prompt_file.write_text("Act as {role} in {working_dir}.")
+    manager = _manager(
+        tmp_path,
+        config={
+            "service_roles": {
+                "chief-scientist": {
+                    "auto_bootstrap": True,
+                    "working_dir": str(repo_dir),
+                    "friendly_name": "chief-scientist",
+                    "preferred_providers": ["claude"],
+                    "bootstrap_prompt_file": str(prompt_file),
+                }
+            }
+        },
+    )
+
+    async def _fake_create_session_common(**kwargs):
+        session = Session(
+            id="chief001",
+            working_dir=kwargs["working_dir"],
+            provider=kwargs["provider"],
+            friendly_name=kwargs["friendly_name"],
+            log_file=str(tmp_path / "chief001.log"),
+            status=SessionStatus.RUNNING,
+        )
+        manager.sessions[session.id] = session
+        _fake_create_session_common.kwargs = kwargs
+        return session
+
+    manager._provider_entrypoint_available = Mock(return_value=True)
+    manager._create_session_common = AsyncMock(side_effect=_fake_create_session_common)
+
+    session, created = asyncio.run(manager.ensure_role_session("chief-scientist"))
+
+    assert created is True
+    assert session.id == "chief001"
+    assert session.provider == "claude"
+    assert session.role == "chief-scientist"
+    assert manager.lookup_agent_registration("chief-scientist").session_id == session.id
+    assert _fake_create_session_common.kwargs["initial_prompt"] == (
+        f"Act as chief-scientist in {repo_dir}."
+    )
+
+
+def test_post_ensure_role_bootstraps_generic_service_role(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    manager = _manager(
+        tmp_path,
+        config={
+            "service_roles": {
+                "chief-scientist": {
+                    "auto_bootstrap": True,
+                    "working_dir": str(repo_dir),
+                    "friendly_name": "chief-scientist",
+                    "preferred_providers": ["claude"],
+                    "bootstrap_prompt": "Act as {role} in {working_dir}.",
+                }
+            }
+        },
+    )
+
+    async def _fake_create_session_common(**kwargs):
+        session = Session(
+            id="chief002",
+            working_dir=kwargs["working_dir"],
+            provider=kwargs["provider"],
+            friendly_name=kwargs["friendly_name"],
+            log_file=str(tmp_path / "chief002.log"),
+            status=SessionStatus.RUNNING,
+        )
+        manager.sessions[session.id] = session
+        return session
+
+    manager._provider_entrypoint_available = Mock(return_value=True)
+    manager._create_session_common = AsyncMock(side_effect=_fake_create_session_common)
+    client = TestClient(create_app(session_manager=manager))
+
+    response = client.post("/registry/chief-scientist/ensure", json={})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created"] is True
+    assert payload["session"]["id"] == "chief002"
+    assert payload["session"]["aliases"] == ["chief-scientist"]
+    assert payload["session"]["provider"] == "claude"
+
+
 def test_cmd_send_bootstraps_maintainer_when_missing(capsys):
     client = Mock()
     client.get_session.return_value = None
     client.list_sessions.return_value = []
     client.session_id = "sender123"
-    client.ensure_maintainer.return_value = {
+    client.ensure_role.return_value = {
         "ok": True,
         "unavailable": False,
         "data": {
@@ -248,9 +340,38 @@ def test_cmd_send_bootstraps_maintainer_when_missing(capsys):
     rc = cmd_send(client, "maintainer", "bug report")
 
     assert rc == 0
-    client.ensure_maintainer.assert_called_once_with(requester_session_id="sender123")
+    client.ensure_role.assert_called_once_with("maintainer", requester_session_id="sender123")
     client.send_input.assert_called_once()
     assert client.send_input.call_args[0][0] == "maint004"
     output = capsys.readouterr().out
-    assert "Maintainer bootstrapped: sm-maintainer (maint004) [codex-fork]" in output
+    assert "Role bootstrapped: maintainer -> sm-maintainer (maint004) [codex-fork]" in output
     assert "Input sent to sm-maintainer (maint004)" in output
+
+
+def test_cmd_send_bootstraps_generic_role_when_missing(capsys):
+    client = Mock()
+    client.get_session.return_value = None
+    client.list_sessions.return_value = []
+    client.session_id = "sender123"
+    client.ensure_role.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "created": True,
+            "session": {
+                "id": "chief003",
+                "friendly_name": "chief-scientist",
+                "name": "claude-chief003",
+                "provider": "claude",
+            },
+        },
+    }
+    client.send_input.return_value = (True, False)
+
+    rc = cmd_send(client, "chief-scientist", "continue")
+
+    assert rc == 0
+    client.ensure_role.assert_called_once_with("chief-scientist", requester_session_id="sender123")
+    assert client.send_input.call_args[0][0] == "chief003"
+    output = capsys.readouterr().out
+    assert "Role bootstrapped: chief-scientist -> chief-scientist (chief003) [claude]" in output

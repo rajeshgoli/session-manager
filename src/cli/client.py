@@ -309,12 +309,17 @@ class SessionManagerClient:
 
     def ensure_maintainer(self, requester_session_id: Optional[str] = None) -> dict:
         """Ensure the maintainer service session exists."""
+        return self.ensure_role("maintainer", requester_session_id=requester_session_id)
+
+    def ensure_role(self, role: str, requester_session_id: Optional[str] = None) -> dict:
+        """Ensure one configured auto-bootstrap registry role session exists."""
         payload = {}
         if requester_session_id:
             payload["requester_session_id"] = requester_session_id
+        role_path = urllib.parse.quote(role, safe="")
         data, status_code, unavailable = self._request_with_status(
             "POST",
-            "/maintainer/ensure",
+            f"/registry/{role_path}/ensure",
             payload,
             timeout=10,
         )
