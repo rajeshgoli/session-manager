@@ -1485,7 +1485,9 @@ def cmd_spawn(
     - remind (thresholds from config.yaml dispatch.auto_remind, default 210s soft / 420s hard → EM session)
     - context monitoring (alerts → EM session)
     - notify-on-stop pointing to EM session
-    This mirrors what sm dispatch does (sm#277).
+    This mirrors what sm dispatch does (sm#277). The monitoring registration now
+    happens server-side as part of the spawn request, so a slow spawn response
+    cannot create an untracked child.
 
     Args:
         client: API client
@@ -1533,6 +1535,7 @@ def cmd_spawn(
         model=model,
         working_dir=working_dir,
         provider=provider,
+        track_seconds=track_seconds,
     )
 
     if result is None:
@@ -1555,84 +1558,15 @@ def cmd_spawn(
             print(f"Spawned {child_name} ({child_id}) [codex-app]")
         else:
             print(f"Spawned {child_name} ({child_id}) in tmux session {result['tmux_session']}")
-
-    # Auto-register EM monitoring when parent is EM (sm#277)
-    parent_session = client.get_session(parent_session_id)
-    if parent_session and parent_session.get("is_em"):
-        from .dispatch import get_auto_remind_config
-        soft_threshold, hard_threshold = get_auto_remind_config(os.getcwd())
-        _register_em_monitoring(client, child_id, parent_session_id, soft_threshold, hard_threshold)
-    if track_seconds is not None:
-        _register_tracked_remind(client, child_id, parent_session_id, track_seconds)
+    for warning in result.get("warnings", []) or []:
+        print(f"  Warning: {warning}", file=sys.stderr)
 
     return 0
-
-
-_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS = 8
 
 
 def _track_hard_threshold_seconds(track_seconds: int) -> int:
     """Return the hard-threshold cadence for --track (#406)."""
     return track_seconds * 2
-
-
-def _register_em_monitoring(
-    client: SessionManagerClient,
-    child_id: str,
-    em_session_id: str,
-    soft_threshold: int,
-    hard_threshold: int,
-) -> None:
-    """Register remind, context monitoring, and notify-on-stop for an EM-spawned child (sm#277).
-
-    Args:
-        client: API client
-        child_id: Spawned child session ID
-        em_session_id: EM parent session ID (is_em=True)
-        soft_threshold: Soft remind threshold in seconds (from config.yaml or default)
-        hard_threshold: Hard remind threshold in seconds (from config.yaml or default)
-    """
-    # Remind: thresholds from config.yaml (or defaults), alerts → EM
-    remind_result = client.register_remind(child_id, soft_threshold=soft_threshold, hard_threshold=hard_threshold)
-    if remind_result is None:
-        print(f"  Warning: Failed to register remind for {child_id}", file=sys.stderr)
-
-    # Context monitoring: enabled, alerts → EM
-    _, cm_ok, _ = client.set_context_monitor(
-        child_id,
-        enabled=True,
-        requester_session_id=em_session_id,
-        notify_session_id=em_session_id,
-    )
-    if not cm_ok:
-        print(f"  Warning: Failed to enable context monitoring for {child_id}", file=sys.stderr)
-
-    # Notify-on-stop: fires → EM when child stops
-    ns_ok, _ = client.arm_stop_notify(
-        child_id,
-        sender_session_id=em_session_id,
-        requester_session_id=em_session_id,
-        delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
-    )
-    if not ns_ok:
-        print(f"  Warning: Failed to arm stop notification for {child_id}", file=sys.stderr)
-
-
-def _register_tracked_remind(
-    client: SessionManagerClient,
-    child_id: str,
-    requester_session_id: str,
-    track_seconds: int,
-) -> None:
-    """Register reply-cancelled remind tracking for spawn/send workflows (#406)."""
-    remind_result = client.register_remind(
-        child_id,
-        soft_threshold=track_seconds,
-        hard_threshold=_track_hard_threshold_seconds(track_seconds),
-        cancel_on_reply_session_id=requester_session_id,
-    )
-    if remind_result is None:
-        print(f"  Warning: Failed to register tracked remind for {child_id}", file=sys.stderr)
 
 
 _TOOL_DB_DEFAULT = "~/.local/share/claude-sessions/tool_usage.db"

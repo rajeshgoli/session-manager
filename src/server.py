@@ -41,6 +41,7 @@ from .models import (
     DeliveryResult,
 )
 from .cli.commands import validate_friendly_name
+from .cli.dispatch import get_auto_remind_config
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ LOCAL_TRUSTED_CLIENTS = {"127.0.0.1", "localhost", "::1", "testclient"}
 LOCAL_TRUSTED_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
 GOOGLE_AUTH_SCOPES = "openid email profile"
 DEVICE_TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 14
+_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS = 8
 
 
 class WatchStaticFiles(StaticFiles):
@@ -623,6 +625,7 @@ class SpawnChildRequest(BaseModel):
     model: Optional[str] = None
     working_dir: Optional[str] = None
     provider: Optional[str] = None
+    track_seconds: Optional[int] = Field(default=None, gt=0)
 
 
 class KillSessionRequest(BaseModel):
@@ -989,6 +992,73 @@ def create_app(
                 if isinstance(display_name, str) and display_name:
                     return display_name
         return session.friendly_name or session.name or session.id
+
+    def _track_hard_threshold_seconds(track_seconds: int) -> int:
+        """Return the hard-threshold cadence for spawn/send --track."""
+        return track_seconds * 2
+
+    def _register_spawn_monitoring(
+        child_session: Session,
+        parent_session: Session,
+        *,
+        track_seconds: Optional[int],
+    ) -> list[str]:
+        """Best-effort monitoring registration for a newly spawned child session."""
+        warnings: list[str] = []
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            if track_seconds is not None or parent_session.is_em:
+                warnings.append("message queue unavailable; monitoring not registered")
+            return warnings
+
+        child_id = child_session.id
+        parent_id = parent_session.id
+        child_working_dir = child_session.working_dir or parent_session.working_dir
+
+        if track_seconds is not None:
+            queue_mgr.register_periodic_remind(
+                target_session_id=child_id,
+                soft_threshold=track_seconds,
+                hard_threshold=_track_hard_threshold_seconds(track_seconds),
+                cancel_on_reply_session_id=parent_id,
+            )
+
+        if not parent_session.is_em:
+            return warnings
+
+        if track_seconds is None:
+            try:
+                soft_threshold, hard_threshold = get_auto_remind_config(child_working_dir)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load auto-remind config for spawned child %s in %s: %s",
+                    child_id,
+                    child_working_dir,
+                    exc,
+                )
+                warnings.append("failed to load EM auto-remind config; using defaults skipped")
+            else:
+                queue_mgr.register_periodic_remind(
+                    target_session_id=child_id,
+                    soft_threshold=soft_threshold,
+                    hard_threshold=hard_threshold,
+                )
+
+        child_session.context_monitor_enabled = True
+        child_session.context_monitor_notify = parent_id
+        child_session._context_warning_sent = False
+        child_session._context_critical_sent = False
+
+        if getattr(child_session, "provider", "claude") != "codex-fork":
+            queue_mgr.arm_stop_notify(
+                session_id=child_id,
+                sender_session_id=parent_id,
+                sender_name=_effective_session_name(parent_session),
+                delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
+            )
+
+        app.state.session_manager._save_state()
+        return warnings
 
     def _session_to_response(session: Session) -> SessionResponse:
         provider = getattr(session, "provider", "claude")
@@ -3726,10 +3796,17 @@ Provide ONLY the summary, no preamble or questions."""
             model=request.model,
             working_dir=request.working_dir or parent_session.working_dir,
             provider=provider,
+            defer_telegram_topic=True,
         )
 
         if not child_session:
             return {"error": "Failed to spawn child session"}
+
+        spawn_warnings = _register_spawn_monitoring(
+            child_session,
+            parent_session,
+            track_seconds=request.track_seconds,
+        )
 
         # Start monitoring the child session (tmux providers only)
         if app.state.output_monitor and getattr(child_session, "provider", "claude") != "codex-app":
@@ -3737,7 +3814,7 @@ Provide ONLY the summary, no preamble or questions."""
 
         # Note: --wait monitoring is already registered by session_manager.spawn_child_session()
 
-        return {
+        response = {
             "session_id": child_session.id,
             "name": child_session.name,
             "friendly_name": _effective_session_name(child_session),
@@ -3747,6 +3824,9 @@ Provide ONLY the summary, no preamble or questions."""
             "provider": getattr(child_session, "provider", "claude"),
             "created_at": child_session.created_at.isoformat(),
         }
+        if spawn_warnings:
+            response["warnings"] = spawn_warnings
+        return response
 
     @app.get("/sessions/{session_id}/review-results")
     async def get_review_results(session_id: str):
