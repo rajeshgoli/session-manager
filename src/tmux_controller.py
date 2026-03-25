@@ -68,6 +68,20 @@ class TmuxController:
         except Exception:
             return None
 
+    def get_pane_title(self, session_name: str) -> Optional[str]:
+        """Return the active pane title for one tmux session."""
+        try:
+            result = self._run_tmux(
+                "display-message", "-p", "-t", session_name, "#{pane_title}",
+                check=False,
+            )
+            if result.returncode != 0:
+                return None
+            title = (result.stdout or "").strip()
+            return title or None
+        except Exception:
+            return None
+
     def _exit_copy_mode_if_needed(self, session_name: str) -> tuple[Optional[int], Optional[int]]:
         """Exit tmux copy-mode on active pane when present."""
         before = self._get_pane_in_mode(session_name)

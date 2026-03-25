@@ -2426,15 +2426,57 @@ class SessionManager:
         aliases = self.get_session_aliases(session_id)
         return aliases[0] if aliases else None
 
-    def _extract_claude_native_title(self, transcript_path: str) -> tuple[Optional[str], Optional[int]]:
-        """Read Claude transcript metadata and return the latest native title plus file mtime."""
+    def _claude_transcript_root(self) -> Path:
+        """Return Claude's transcript project root."""
+        claude_config = self.config.get("claude", {})
+        configured_root = claude_config.get("transcript_root", "~/.claude/projects")
+        return Path(str(configured_root)).expanduser()
+
+    @staticmethod
+    def _claude_project_dir_name(working_dir: str) -> str:
+        """Map one working directory to Claude's per-project transcript directory."""
+        resolved = str(Path(working_dir).expanduser().resolve())
+        return resolved.replace(os.sep, "-")
+
+    @staticmethod
+    def _parse_claude_timestamp(raw_timestamp: Any) -> Optional[datetime]:
+        """Parse Claude transcript timestamps into UTC datetimes."""
+        if not raw_timestamp:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _session_time_ns(session: Session, attr: str) -> int:
+        """Normalize one session timestamp attribute to epoch nanoseconds."""
+        value = getattr(session, attr, None)
+        if not isinstance(value, datetime):
+            return 0
+        if value.tzinfo is None:
+            value = value.astimezone()
+        return int(value.timestamp() * 1_000_000_000)
+
+    def _read_claude_transcript_metadata(self, transcript_path: str) -> dict[str, Any]:
+        """Read one Claude transcript and return title plus binding metadata."""
         transcript_file = Path(transcript_path).expanduser()
         if not transcript_file.exists():
-            return None, None
+            return {
+                "title": None,
+                "mtime_ns": None,
+                "cwd": None,
+                "started_at": None,
+            }
 
         stat = transcript_file.stat()
         latest_custom_title: Optional[str] = None
         latest_agent_name: Optional[str] = None
+        first_user_cwd: Optional[str] = None
+        first_user_timestamp: Optional[datetime] = None
 
         with transcript_file.open() as handle:
             for line in handle:
@@ -2444,6 +2486,11 @@ class SessionManager:
                     continue
                 if not isinstance(entry, dict):
                     continue
+                if entry.get("type") == "user" and first_user_cwd is None:
+                    candidate_cwd = str(entry.get("cwd") or "").strip()
+                    if candidate_cwd:
+                        first_user_cwd = str(Path(candidate_cwd).expanduser().resolve())
+                    first_user_timestamp = self._parse_claude_timestamp(entry.get("timestamp"))
                 if entry.get("type") == "custom-title":
                     candidate = str(entry.get("customTitle") or "").strip()
                     if candidate:
@@ -2453,7 +2500,97 @@ class SessionManager:
                     if candidate:
                         latest_agent_name = candidate
 
-        return latest_custom_title or latest_agent_name, stat.st_mtime_ns
+        return {
+            "title": latest_custom_title or latest_agent_name,
+            "mtime_ns": stat.st_mtime_ns,
+            "cwd": first_user_cwd,
+            "started_at": first_user_timestamp,
+        }
+
+    def _extract_claude_live_title(self, session: Session) -> Optional[str]:
+        """Read Claude's current native title from tmux when available."""
+        if session.provider != "claude" or not session.tmux_session:
+            return None
+
+        raw_title = self.tmux.get_pane_title(session.tmux_session)
+        if not isinstance(raw_title, str) or not raw_title:
+            return None
+
+        title = raw_title.strip()
+        first_token, _, remainder = title.partition(" ")
+        if remainder and not any(char.isalnum() for char in first_token):
+            title = remainder.strip()
+        title = title.strip()
+        if not title or title == "Claude Code":
+            return None
+        return title
+
+    def _discover_claude_transcript_path(
+        self,
+        session: Session,
+        *,
+        expected_title: Optional[str] = None,
+    ) -> Optional[str]:
+        """Bind a missing Claude transcript path using cwd plus recent activity."""
+        if session.provider != "claude" or session.transcript_path or not session.working_dir:
+            return session.transcript_path
+
+        project_dir = self._claude_transcript_root() / self._claude_project_dir_name(session.working_dir)
+        if not project_dir.is_dir():
+            return None
+
+        resolved_working_dir = str(Path(session.working_dir).expanduser().resolve())
+        claimed_paths: set[Path] = set()
+        for other_session in self.sessions.values():
+            if other_session.id == session.id or not other_session.transcript_path:
+                continue
+            try:
+                claimed_paths.add(Path(other_session.transcript_path).expanduser().resolve())
+            except OSError:
+                continue
+
+        target_time_ns = max(
+            self._session_time_ns(session, "last_activity"),
+            self._session_time_ns(session, "created_at"),
+        )
+        candidates: list[tuple[int, int, int, str]] = []
+
+        for transcript_file in project_dir.glob("*.jsonl"):
+            try:
+                resolved_transcript = transcript_file.expanduser().resolve()
+            except OSError:
+                continue
+            if resolved_transcript in claimed_paths:
+                continue
+            try:
+                metadata = self._read_claude_transcript_metadata(str(resolved_transcript))
+            except OSError:
+                continue
+            transcript_cwd = metadata.get("cwd")
+            if transcript_cwd and transcript_cwd != resolved_working_dir:
+                continue
+            transcript_title = metadata.get("title")
+            if expected_title and transcript_title != expected_title:
+                continue
+            transcript_mtime_ns = int(metadata.get("mtime_ns") or 0)
+            transcript_start_ns = 0
+            started_at = metadata.get("started_at")
+            if isinstance(started_at, datetime):
+                transcript_start_ns = int(started_at.timestamp() * 1_000_000_000)
+            distance = abs(target_time_ns - (transcript_mtime_ns or transcript_start_ns))
+            start_distance = abs(target_time_ns - transcript_start_ns) if transcript_start_ns else distance
+            candidates.append((distance, start_distance, -transcript_mtime_ns, str(resolved_transcript)))
+
+        if not candidates:
+            return None
+
+        candidates.sort()
+        return candidates[0][3]
+
+    def _extract_claude_native_title(self, transcript_path: str) -> tuple[Optional[str], Optional[int]]:
+        """Read Claude transcript metadata and return the latest native title plus file mtime."""
+        metadata = self._read_claude_transcript_metadata(transcript_path)
+        return metadata.get("title"), metadata.get("mtime_ns")
 
     def sync_claude_native_title(self, session_or_id: Session | str | None, persist: bool = True) -> Optional[str]:
         """Synchronize one Claude session's native title from transcript metadata."""
@@ -2466,25 +2603,65 @@ class SessionManager:
             if session is None:
                 return None
 
-        if session.provider != "claude" or not session.transcript_path:
+        if session.provider != "claude":
+            return session.native_title
+
+        live_title = self._extract_claude_live_title(session)
+        state_changed = False
+        if not session.transcript_path:
+            discovered_transcript_path = self._discover_claude_transcript_path(
+                session,
+                expected_title=live_title,
+            )
+            if discovered_transcript_path and session.transcript_path != discovered_transcript_path:
+                session.transcript_path = discovered_transcript_path
+                state_changed = True
+
+        if not session.transcript_path:
+            if live_title and live_title != session.native_title:
+                session.native_title = live_title
+                session.native_title_updated_at_ns = time.time_ns()
+                state_changed = True
+            if state_changed and persist:
+                self._save_state()
             return session.native_title
 
         transcript_file = Path(session.transcript_path).expanduser()
         if not transcript_file.exists():
+            if live_title and live_title != session.native_title:
+                session.native_title = live_title
+                session.native_title_updated_at_ns = time.time_ns()
+                state_changed = True
+            if state_changed and persist:
+                self._save_state()
             return session.native_title
 
         try:
             current_mtime_ns = transcript_file.stat().st_mtime_ns
         except OSError:
+            if live_title and live_title != session.native_title:
+                session.native_title = live_title
+                session.native_title_updated_at_ns = time.time_ns()
+                state_changed = True
+            if state_changed and persist:
+                self._save_state()
             return session.native_title
 
         if session.native_title_source_mtime_ns == current_mtime_ns:
+            if state_changed and persist:
+                self._save_state()
             return session.native_title
 
         try:
             native_title, synced_mtime_ns = self._extract_claude_native_title(session.transcript_path)
         except OSError as exc:
             logger.debug("Failed reading Claude transcript title for %s: %s", session.id, exc)
+            if live_title and live_title != session.native_title:
+                session.native_title = live_title
+                session.native_title_updated_at_ns = time.time_ns()
+                state_changed = True
+            if state_changed and persist:
+                self._save_state()
             return session.native_title
 
         title_changed = native_title != session.native_title
@@ -2492,7 +2669,7 @@ class SessionManager:
         session.native_title_source_mtime_ns = synced_mtime_ns
         if title_changed:
             session.native_title_updated_at_ns = synced_mtime_ns
-        if title_changed and persist:
+        if (state_changed or title_changed) and persist:
             self._save_state()
         return session.native_title
 
