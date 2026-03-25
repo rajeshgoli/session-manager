@@ -2581,6 +2581,8 @@ class MessageQueueManager:
                 "UPDATE remind_registrations SET is_active = 0 WHERE target_session_id = ?",
                 (target_session_id,)
             )
+            for owner_session_id in reg.cancel_on_reply_session_ids:
+                self.cancel_queued_track_reminds(target_session_id, owner_session_id)
             self.cancel_queued_track_status_nudges(target_session_id)
             logger.info(f"Periodic remind cancelled for {target_session_id}")
 
@@ -2609,6 +2611,23 @@ class MessageQueueManager:
             tuple(values)
         )
 
+    def _is_session_runtime_alive(self, session_id: str) -> bool:
+        """Return True only while the target session still has a live runtime."""
+        session = self.session_manager.get_session(session_id)
+        if not session:
+            return False
+        if getattr(session, "status", None) == SessionStatus.STOPPED:
+            return False
+
+        if getattr(session, "provider", "claude") == "codex-app":
+            return True
+
+        tmux_session = getattr(session, "tmux_session", None)
+        if not tmux_session:
+            return False
+
+        return bool(self.session_manager.tmux.session_exists(tmux_session))
+
     async def _run_remind_task(self, target_session_id: str):
         """
         Async loop that fires soft/hard remind messages for a target session.
@@ -2623,6 +2642,14 @@ class MessageQueueManager:
                 await asyncio.sleep(self._REMIND_CHECK_INTERVAL_SECONDS)
                 reg = self._remind_registrations.get(target_session_id)
                 if not reg or not reg.is_active:
+                    return
+
+                if reg.cancel_on_reply_session_ids and not self._is_session_runtime_alive(target_session_id):
+                    logger.info(
+                        "Tracked remind auto-cancelled for dead target=%s before notification dispatch",
+                        target_session_id,
+                    )
+                    self.cancel_remind(target_session_id)
                     return
 
                 # Skip this iteration if the session is mid-compaction (#249)
@@ -2713,6 +2740,23 @@ class MessageQueueManager:
                 tracked_status_nudge_fired,
                 soft_fired,
             ) = row
+            cancel_on_reply_session_ids = self._deserialize_cancel_on_reply_session_ids(cancel_on_reply_session_id)
+
+            if cancel_on_reply_session_ids and not self._is_session_runtime_alive(target_session_id):
+                self._execute(
+                    "UPDATE remind_registrations SET is_active = 0 WHERE target_session_id = ?",
+                    (target_session_id,),
+                )
+                for owner_session_id in cancel_on_reply_session_ids:
+                    self.cancel_queued_track_reminds(target_session_id, owner_session_id)
+                self.cancel_queued_track_status_nudges(target_session_id)
+                logger.info(
+                    "Skipped recovery for dead tracked remind registration %s: target=%s",
+                    reg_id,
+                    target_session_id,
+                )
+                continue
+
             last_reset_at = datetime.fromisoformat(last_reset_at_str)
 
             reg = RemindRegistration(
@@ -2722,7 +2766,7 @@ class MessageQueueManager:
                 hard_threshold_seconds=hard,
                 registered_at=datetime.fromisoformat(registered_at_str),
                 last_reset_at=last_reset_at,
-                cancel_on_reply_session_ids=self._deserialize_cancel_on_reply_session_ids(cancel_on_reply_session_id),
+                cancel_on_reply_session_ids=cancel_on_reply_session_ids,
                 tracked_status_nudge_fired=bool(tracked_status_nudge_fired),
                 soft_fired=bool(soft_fired),
                 is_active=True,

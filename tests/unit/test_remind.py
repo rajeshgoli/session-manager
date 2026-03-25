@@ -469,6 +469,120 @@ class TestManualStop:
         assert len(pending) == 0
 
 
+class TestTrackedRemindDeadTargetCleanup:
+    """Tracked reminders auto-cancel when the tracked agent no longer has a live runtime."""
+
+    @pytest.mark.asyncio
+    async def test_tracked_remind_task_cancels_dead_target_and_queued_notifications(self, mq, mock_session_manager):
+        target_session = Session(
+            id="dead-track",
+            name="dead-track",
+            tmux_session="tmux-dead-track",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = target_session
+        mock_session_manager.tmux.session_exists.return_value = False
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                "dead-track",
+                soft_threshold=10,
+                hard_threshold=20,
+                cancel_on_reply_session_id="owner-dead",
+            )
+            mq.queue_message(
+                target_session_id="owner-dead",
+                sender_session_id="dead-track",
+                text="[sm track] Waiting on dead-track (dead-tra)",
+                delivery_mode="important",
+                message_category="track_remind",
+            )
+            mq.queue_message(
+                target_session_id="dead-track",
+                text="[sm remind] Update your status",
+                delivery_mode="important",
+                message_category="track_status_nudge",
+            )
+
+        await run_one_iteration(mq, "dead-track")
+
+        assert "dead-track" not in mq._remind_registrations
+        assert mq.get_pending_messages("owner-dead") == []
+        assert mq.get_pending_messages("dead-track") == []
+
+        conn = sqlite3.connect(mq.db_path)
+        row = conn.execute(
+            "SELECT is_active FROM remind_registrations WHERE target_session_id = ?",
+            ("dead-track",),
+        ).fetchone()
+        conn.close()
+        assert row[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_recover_skips_dead_tracked_registration_and_scrubs_queue(
+        self,
+        mock_session_manager,
+        temp_db_path,
+    ):
+        target_session = Session(
+            id="dead-recover",
+            name="dead-recover",
+            tmux_session="tmux-dead-recover",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = target_session
+        mock_session_manager.tmux.session_exists.return_value = False
+
+        mq1 = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"remind": {"soft_threshold_seconds": 180, "hard_gap_seconds": 120}},
+            notifier=None,
+        )
+        with patch("asyncio.create_task", noop_create_task):
+            mq1.register_periodic_remind(
+                "dead-recover",
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id="owner-recover",
+            )
+            mq1.queue_message(
+                target_session_id="owner-recover",
+                sender_session_id="dead-recover",
+                text="[sm track] Waiting on dead-recover (dead-rec)",
+                delivery_mode="important",
+                message_category="track_remind",
+            )
+            mq1.queue_message(
+                target_session_id="dead-recover",
+                text="[sm remind] Update your status",
+                delivery_mode="important",
+                message_category="track_status_nudge",
+            )
+
+        mq2 = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            config={"remind": {"soft_threshold_seconds": 180, "hard_gap_seconds": 120}},
+            notifier=None,
+        )
+
+        with patch("asyncio.create_task", noop_create_task):
+            await mq2._recover_remind_registrations()
+
+        assert "dead-recover" not in mq2._remind_registrations
+        assert mq2.get_pending_messages("owner-recover") == []
+        assert mq2.get_pending_messages("dead-recover") == []
+
+        conn = sqlite3.connect(temp_db_path)
+        row = conn.execute(
+            "SELECT is_active FROM remind_registrations WHERE target_session_id = ?",
+            ("dead-recover",),
+        ).fetchone()
+        conn.close()
+        assert row[0] == 0
+
+
 # ===========================================================================
 # 9 — Replacement policy
 # ===========================================================================
