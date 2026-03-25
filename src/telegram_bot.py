@@ -49,6 +49,7 @@ _POLLING_CONNECT_TIMEOUT = 5.0
 _POLLING_WRITE_TIMEOUT = 5.0
 _POLLING_POOL_TIMEOUT = 5.0
 _TYPING_REFRESH_SECONDS = 4.0
+_TYPING_TIMEOUT_SECONDS = 300.0
 
 
 class _PollingTracker:
@@ -379,11 +380,23 @@ class TelegramBot:
         message_thread_id: Optional[int] = None,
     ) -> None:
         """Keep Telegram's native typing indicator active until the session responds."""
+        started_at = time.monotonic()
         try:
             while True:
                 if session_id in self._completed_sessions:
                     self._completed_sessions.discard(session_id)
                     return
+                if (time.monotonic() - started_at) >= _TYPING_TIMEOUT_SECONDS:
+                    return
+                if self._on_session_status:
+                    try:
+                        session = await self._on_session_status(session_id)
+                    except Exception as e:
+                        logger.debug(f"Could not resolve session {session_id} for typing indicator: {e}")
+                        session = None
+                    status_value = getattr(getattr(session, "status", None), "value", None) if session else None
+                    if session is None or status_value == "stopped":
+                        return
                 if not self.bot:
                     return
                 await self.bot.send_chat_action(

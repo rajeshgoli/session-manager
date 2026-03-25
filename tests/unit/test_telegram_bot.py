@@ -419,3 +419,33 @@ async def test_configure_bot_commands_registers_private_and_group_menus():
     assert type(group_call.kwargs["scope"]).__name__ == "BotCommandScopeAllGroupChats"
     tg.bot.set_chat_menu_button.assert_awaited_once()
     assert type(tg.bot.set_chat_menu_button.await_args.kwargs["menu_button"]).__name__ == "MenuButtonCommands"
+
+
+@pytest.mark.asyncio
+async def test_run_typing_indicator_exits_for_stopped_session():
+    """Typing indicator should not run forever after the session stops."""
+    tg = TelegramBot(token="test-token")
+    tg.bot = AsyncMock()
+    tg._on_session_status = AsyncMock(
+        return_value=SimpleNamespace(status=SimpleNamespace(value="stopped"))
+    )
+    tg._completed_sessions = set()
+    tg._typing_indicator_tasks = {}
+
+    await tg._run_typing_indicator("sess123", 100, 10)
+
+    tg.bot.send_chat_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_typing_indicator_exits_when_session_missing():
+    """Typing indicator should stop when the target session disappears."""
+    tg = TelegramBot(token="test-token")
+    tg.bot = AsyncMock()
+    tg._on_session_status = AsyncMock(return_value=None)
+    tg._completed_sessions = set()
+    tg._typing_indicator_tasks = {}
+
+    await tg._run_typing_indicator("sess123", 100, 10)
+
+    tg.bot.send_chat_action.assert_not_awaited()
