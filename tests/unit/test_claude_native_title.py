@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,7 +15,11 @@ def _manager(tmp_path: Path) -> SessionManager:
     return SessionManager(
         log_dir=str(tmp_path / "logs"),
         state_file=str(tmp_path / "sessions.json"),
-        config={},
+        config={
+            "claude": {
+                "transcript_root": str(tmp_path / ".claude" / "projects"),
+            }
+        },
     )
 
 
@@ -25,7 +30,13 @@ def _write_transcript(path: Path, *entries: dict) -> None:
             handle.write(json.dumps(entry) + "\n")
 
 
-def _claude_session(tmp_path: Path, transcript_path: Path, *, friendly_name: str | None = None) -> Session:
+def _claude_session(
+    tmp_path: Path,
+    transcript_path: Path | None,
+    *,
+    friendly_name: str | None = None,
+    created_at: datetime | None = None,
+) -> Session:
     return Session(
         id="claude123",
         name="claude-claude123",
@@ -34,9 +45,16 @@ def _claude_session(tmp_path: Path, transcript_path: Path, *, friendly_name: str
         provider="claude",
         log_file=str(tmp_path / "claude123.log"),
         status=SessionStatus.RUNNING,
-        transcript_path=str(transcript_path),
+        created_at=created_at or datetime.now(),
+        last_activity=created_at or datetime.now(),
+        transcript_path=str(transcript_path) if transcript_path else None,
         friendly_name=friendly_name,
     )
+
+
+def _claude_project_dir(tmp_path: Path, working_dir: Path) -> Path:
+    normalized = str(working_dir.expanduser().resolve()).replace("/", "-")
+    return tmp_path / ".claude" / "projects" / normalized
 
 
 def test_effective_name_uses_claude_custom_title_when_no_friendly_name(tmp_path: Path) -> None:
@@ -53,6 +71,123 @@ def test_effective_name_uses_claude_custom_title_when_no_friendly_name(tmp_path:
     assert manager.get_effective_session_name(session.id) == "native-claude-title"
     assert session.native_title == "native-claude-title"
     assert session.native_title_source_mtime_ns is not None
+
+
+def test_effective_name_uses_live_tmux_title_when_transcript_path_missing(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.get_pane_title.return_value = "⠂ bork-investigator"
+    session = _claude_session(tmp_path, None)
+    manager.sessions[session.id] = session
+
+    assert manager.get_effective_session_name(session.id) == "bork-investigator"
+    assert session.native_title == "bork-investigator"
+    assert session.transcript_path is None
+
+
+def test_effective_name_discovers_matching_transcript_path_when_missing(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.get_pane_title.return_value = "✳ bork-investigator"
+    working_dir = tmp_path / "repo"
+    working_dir.mkdir()
+    created_at = datetime.now(timezone.utc)
+    project_dir = _claude_project_dir(tmp_path, working_dir)
+    transcript = project_dir / "chosen.jsonl"
+    _write_transcript(
+        transcript,
+        {
+            "type": "user",
+            "timestamp": created_at.isoformat(),
+            "cwd": str(working_dir.resolve()),
+        },
+        {"type": "custom-title", "customTitle": "bork-investigator"},
+    )
+    other_transcript = project_dir / "other.jsonl"
+    _write_transcript(
+        other_transcript,
+        {
+            "type": "user",
+            "timestamp": (created_at + timedelta(seconds=2)).isoformat(),
+            "cwd": str(working_dir.resolve()),
+        },
+        {"type": "custom-title", "customTitle": "other-title"},
+    )
+    session = Session(
+        id="claude123",
+        name="claude-claude123",
+        working_dir=str(working_dir),
+        tmux_session="claude-claude123",
+        provider="claude",
+        log_file=str(tmp_path / "claude123.log"),
+        status=SessionStatus.RUNNING,
+        created_at=created_at,
+        last_activity=created_at,
+    )
+    manager.sessions[session.id] = session
+
+    assert manager.get_effective_session_name(session.id) == "bork-investigator"
+    assert session.native_title == "bork-investigator"
+    assert session.transcript_path == str(transcript.resolve())
+    assert session.native_title_source_mtime_ns is not None
+
+
+def test_effective_name_discovery_skips_transcript_claimed_by_other_session(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.get_pane_title.return_value = "✳ bork-investigator"
+    working_dir = tmp_path / "repo"
+    working_dir.mkdir()
+    created_at = datetime.now(timezone.utc)
+    project_dir = _claude_project_dir(tmp_path, working_dir)
+    claimed_transcript = project_dir / "claimed.jsonl"
+    _write_transcript(
+        claimed_transcript,
+        {
+            "type": "user",
+            "timestamp": created_at.isoformat(),
+            "cwd": str(working_dir.resolve()),
+        },
+        {"type": "custom-title", "customTitle": "bork-investigator"},
+    )
+    chosen_transcript = project_dir / "chosen.jsonl"
+    _write_transcript(
+        chosen_transcript,
+        {
+            "type": "user",
+            "timestamp": (created_at + timedelta(seconds=1)).isoformat(),
+            "cwd": str(working_dir.resolve()),
+        },
+        {"type": "custom-title", "customTitle": "bork-investigator"},
+    )
+    claimed_session = Session(
+        id="claimed",
+        name="claude-claimed",
+        working_dir=str(working_dir),
+        tmux_session="claude-claimed",
+        provider="claude",
+        log_file=str(tmp_path / "claimed.log"),
+        status=SessionStatus.RUNNING,
+        created_at=created_at,
+        last_activity=created_at,
+        transcript_path=str(claimed_transcript.resolve()),
+    )
+    session = Session(
+        id="claude123",
+        name="claude-claude123",
+        working_dir=str(working_dir),
+        tmux_session="claude-claude123",
+        provider="claude",
+        log_file=str(tmp_path / "claude123.log"),
+        status=SessionStatus.RUNNING,
+        created_at=created_at,
+        last_activity=created_at,
+    )
+    manager.sessions[claimed_session.id] = claimed_session
+    manager.sessions[session.id] = session
+
+    assert manager.get_effective_session_name(session.id) == "bork-investigator"
+    assert session.transcript_path == str(chosen_transcript.resolve())
 
 
 def test_effective_name_prefers_claude_native_title_over_stale_friendly_name(tmp_path: Path) -> None:
