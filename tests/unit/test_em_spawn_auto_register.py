@@ -303,6 +303,44 @@ class TestSpawnEndpointMonitoring:
         assert child.context_monitor_notify == "em0000aa"
         mock_sm.message_queue_manager.arm_stop_notify.assert_called_once()
 
+    def test_spawn_returns_warning_when_tracking_registration_raises(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="eng111bb",
+            name="claude-eng111bb",
+            working_dir="/tmp/parent",
+            tmux_session="claude-eng111bb",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
+        )
+        child = Session(
+            id="child456",
+            name="claude-child456",
+            working_dir="/tmp/parent",
+            tmux_session="claude-child456",
+            log_file="/tmp/child.log",
+            status=SessionStatus.RUNNING,
+            parent_session_id="eng111bb",
+            spawned_at=datetime.now(),
+        )
+        mock_sm.get_session.side_effect = lambda sid: {"eng111bb": parent, "child456": child}.get(sid)
+        mock_sm.spawn_child_session = AsyncMock(return_value=child)
+        mock_sm.message_queue_manager.register_periodic_remind.side_effect = RuntimeError("sqlite busy")
+
+        response = tc.post(
+            "/sessions/spawn",
+            json={
+                "parent_session_id": "eng111bb",
+                "prompt": "Implement feature X",
+                "track_seconds": 300,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["session_id"] == "child456"
+        assert data["warnings"] == ["failed to register spawn tracking"]
+
 
 # ---------------------------------------------------------------------------
 # Tests: MessageQueueManager.arm_stop_notify (sm#277)

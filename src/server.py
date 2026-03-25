@@ -1015,13 +1015,20 @@ def create_app(
         parent_id = parent_session.id
         child_working_dir = child_session.working_dir or parent_session.working_dir
 
+        def _append_warning(message: str, exc: Exception) -> None:
+            logger.warning("Spawn monitoring degraded for %s: %s (%s)", child_id, message, exc)
+            warnings.append(message)
+
         if track_seconds is not None:
-            queue_mgr.register_periodic_remind(
-                target_session_id=child_id,
-                soft_threshold=track_seconds,
-                hard_threshold=_track_hard_threshold_seconds(track_seconds),
-                cancel_on_reply_session_id=parent_id,
-            )
+            try:
+                queue_mgr.register_periodic_remind(
+                    target_session_id=child_id,
+                    soft_threshold=track_seconds,
+                    hard_threshold=_track_hard_threshold_seconds(track_seconds),
+                    cancel_on_reply_session_id=parent_id,
+                )
+            except Exception as exc:
+                _append_warning("failed to register spawn tracking", exc)
 
         if not parent_session.is_em:
             return warnings
@@ -1036,13 +1043,16 @@ def create_app(
                     child_working_dir,
                     exc,
                 )
-                warnings.append("failed to load EM auto-remind config; using defaults skipped")
+                warnings.append("failed to load EM auto-remind config")
             else:
-                queue_mgr.register_periodic_remind(
-                    target_session_id=child_id,
-                    soft_threshold=soft_threshold,
-                    hard_threshold=hard_threshold,
-                )
+                try:
+                    queue_mgr.register_periodic_remind(
+                        target_session_id=child_id,
+                        soft_threshold=soft_threshold,
+                        hard_threshold=hard_threshold,
+                    )
+                except Exception as exc:
+                    _append_warning("failed to register EM auto-remind", exc)
 
         child_session.context_monitor_enabled = True
         child_session.context_monitor_notify = parent_id
@@ -1050,14 +1060,20 @@ def create_app(
         child_session._context_critical_sent = False
 
         if getattr(child_session, "provider", "claude") != "codex-fork":
-            queue_mgr.arm_stop_notify(
-                session_id=child_id,
-                sender_session_id=parent_id,
-                sender_name=_effective_session_name(parent_session),
-                delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
-            )
+            try:
+                queue_mgr.arm_stop_notify(
+                    session_id=child_id,
+                    sender_session_id=parent_id,
+                    sender_name=_effective_session_name(parent_session),
+                    delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
+                )
+            except Exception as exc:
+                _append_warning("failed to arm EM stop notification", exc)
 
-        app.state.session_manager._save_state()
+        try:
+            app.state.session_manager._save_state()
+        except Exception as exc:
+            _append_warning("failed to persist spawn monitoring state", exc)
         return warnings
 
     def _session_to_response(session: Session) -> SessionResponse:
