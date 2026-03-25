@@ -80,6 +80,53 @@ def test_lookup_prunes_stopped_registration(tmp_path):
     assert state_data["agent_registrations"] == []
 
 
+def test_register_role_reparents_live_children_from_stopped_prior_holder(tmp_path):
+    manager = _manager(tmp_path)
+    old_owner = _session("chiefold", tmp_path)
+    new_owner = _session("chiefnew", tmp_path)
+    child_live = _session("child001", tmp_path)
+    child_stopped = _session("child002", tmp_path)
+    child_live.parent_session_id = old_owner.id
+    child_stopped.parent_session_id = old_owner.id
+    child_stopped.status = SessionStatus.STOPPED
+    manager.sessions[old_owner.id] = old_owner
+    manager.sessions[new_owner.id] = new_owner
+    manager.sessions[child_live.id] = child_live
+    manager.sessions[child_stopped.id] = child_stopped
+
+    manager.register_agent_role(old_owner.id, "chief-scientist")
+    old_owner.status = SessionStatus.STOPPED
+
+    manager.register_agent_role(new_owner.id, "chief-scientist")
+
+    assert child_live.parent_session_id == new_owner.id
+    assert child_stopped.parent_session_id == old_owner.id
+    assert manager.lookup_agent_registration("chief-scientist").session_id == new_owner.id
+
+
+def test_register_role_reparents_from_last_dead_holder_after_registration_pruned(tmp_path):
+    manager = _manager(tmp_path)
+    old_owner = _session("chiefold", tmp_path)
+    new_owner = _session("chiefnew", tmp_path)
+    child_live = _session("child001", tmp_path)
+    child_live.parent_session_id = old_owner.id
+    manager.sessions[old_owner.id] = old_owner
+    manager.sessions[new_owner.id] = new_owner
+    manager.sessions[child_live.id] = child_live
+
+    manager.register_agent_role(old_owner.id, "chief-scientist")
+    old_owner.status = SessionStatus.STOPPED
+
+    # Simulate the normal prune path that removes dead live-role registrations.
+    assert manager.lookup_agent_registration("chief-scientist") is None
+
+    manager.register_agent_role(new_owner.id, "chief-scientist")
+
+    assert child_live.parent_session_id == new_owner.id
+    state_data = json.loads((tmp_path / "sessions.json").read_text())
+    assert state_data["agent_role_last_session_ids"]["chief-scientist"] == new_owner.id
+
+
 def test_kill_session_unregisters_roles(tmp_path):
     manager = _manager(tmp_path)
     session = _session("kill1234", tmp_path)

@@ -168,6 +168,7 @@ class SessionManager:
         self._topic_creator: Optional[Callable[..., Awaitable[Optional[int]]]] = None
         self.adoption_proposals: dict[str, AdoptionProposal] = {}
         self.agent_registrations: dict[str, AgentRegistration] = {}
+        self.agent_role_last_session_ids: dict[str, str] = {}
         self._maintainer_bootstrap_lock = asyncio.Lock()
         self._service_role_bootstrap_locks: dict[str, asyncio.Lock] = {}
 
@@ -705,14 +706,26 @@ class SessionManager:
                 self.em_topic = data.get("em_topic")
                 self.maintainer_session_id = data.get("maintainer_session_id")
                 self.agent_registrations = {}
+                raw_last_session_ids = data.get("agent_role_last_session_ids", {})
+                self.agent_role_last_session_ids = (
+                    {
+                        self.normalize_agent_role(str(role)): str(session_id)
+                        for role, session_id in raw_last_session_ids.items()
+                        if self.normalize_agent_role(str(role)) and str(session_id).strip()
+                    }
+                    if isinstance(raw_last_session_ids, dict)
+                    else {}
+                )
                 for registration_data in data.get("agent_registrations", []):
                     registration = AgentRegistration.from_dict(registration_data)
                     self.agent_registrations[registration.role] = registration
+                    self.agent_role_last_session_ids[registration.role] = registration.session_id
                 if self.maintainer_session_id and "maintainer" not in self.agent_registrations:
                     self.agent_registrations["maintainer"] = AgentRegistration(
                         role="maintainer",
                         session_id=self.maintainer_session_id,
                     )
+                    self.agent_role_last_session_ids["maintainer"] = self.maintainer_session_id
                 self.adoption_proposals = {}
                 for proposal_data in data.get("adoption_proposals", []):
                     proposal = AdoptionProposal.from_dict(proposal_data)
@@ -769,6 +782,11 @@ class SessionManager:
                         key=lambda registration: (registration.role, registration.created_at),
                     )
                 ],
+                "agent_role_last_session_ids": {
+                    role: self.agent_role_last_session_ids[role]
+                    for role in sorted(self.agent_role_last_session_ids)
+                    if self.agent_role_last_session_ids.get(role)
+                },
                 "adoption_proposals": [
                     proposal.to_dict()
                     for proposal in sorted(
@@ -1961,6 +1979,7 @@ class SessionManager:
         for role, registration in list(registration_map.items()):
             if self._get_live_registered_session(registration.session_id):
                 continue
+            self.agent_role_last_session_ids[role] = registration.session_id
             registration_map.pop(role, None)
             removed = True
         if removed:
@@ -1968,6 +1987,30 @@ class SessionManager:
             if persist:
                 self._save_state()
         return removed
+
+    def _reparent_live_children(self, old_parent_session_id: Optional[str], new_parent_session_id: str) -> int:
+        """Move live child sessions from one dead/cleared owner to a new owner."""
+        if not old_parent_session_id or old_parent_session_id == new_parent_session_id:
+            return 0
+
+        reparented = 0
+        for session in self.sessions.values():
+            if session.parent_session_id != old_parent_session_id:
+                continue
+            if session.status == SessionStatus.STOPPED:
+                continue
+            session.parent_session_id = new_parent_session_id
+            reparented += 1
+
+        if reparented:
+            logger.info(
+                "Reparented %s live child sessions from %s to %s during role takeover",
+                reparented,
+                old_parent_session_id,
+                new_parent_session_id,
+            )
+
+        return reparented
 
     def register_agent_role(self, session_id: str, role: str) -> AgentRegistration:
         """Register one live session as the current owner for a registry role."""
@@ -1982,6 +2025,16 @@ class SessionManager:
             raise ValueError("Stopped sessions cannot register roles")
 
         registration_map = self._get_agent_registration_map()
+        prior_holder_session_id: Optional[str] = None
+        preexisting = registration_map.get(normalized_role)
+        if preexisting and preexisting.session_id != session_id:
+            live_owner = self._get_live_registered_session(preexisting.session_id)
+            if live_owner:
+                raise ValueError(
+                    f'Role "{normalized_role}" is already registered to {preexisting.session_id}'
+                )
+            prior_holder_session_id = preexisting.session_id
+
         self._prune_agent_registrations(persist=False)
         existing = registration_map.get(normalized_role)
         if existing and existing.session_id != session_id:
@@ -1990,10 +2043,18 @@ class SessionManager:
                 raise ValueError(
                     f'Role "{normalized_role}" is already registered to {existing.session_id}'
                 )
+        if prior_holder_session_id is None:
+            historical_holder = self.agent_role_last_session_ids.get(normalized_role)
+            if historical_holder and historical_holder != session_id:
+                historical_session = self.sessions.get(historical_holder)
+                if historical_session is None or historical_session.status == SessionStatus.STOPPED:
+                    prior_holder_session_id = historical_holder
 
         registration = existing or AgentRegistration(role=normalized_role, session_id=session_id)
         registration.session_id = session_id
         registration_map[normalized_role] = registration
+        self.agent_role_last_session_ids[normalized_role] = session_id
+        self._reparent_live_children(prior_holder_session_id, session_id)
         self._synchronize_maintainer_alias()
         self._save_state()
         return registration
@@ -2007,6 +2068,7 @@ class SessionManager:
         registration = registration_map.get(normalized_role)
         if not registration or registration.session_id != session_id:
             return False
+        self.agent_role_last_session_ids[normalized_role] = registration.session_id
         registration_map.pop(normalized_role, None)
         self._synchronize_maintainer_alias()
         self._save_state()
@@ -2023,6 +2085,9 @@ class SessionManager:
         if not removed_roles:
             return []
         for role in removed_roles:
+            registration = registration_map.get(role)
+            if registration:
+                self.agent_role_last_session_ids[role] = registration.session_id
             registration_map.pop(role, None)
         self._synchronize_maintainer_alias()
         if persist:
