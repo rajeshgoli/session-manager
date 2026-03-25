@@ -596,6 +596,7 @@ class SessionManagerClient:
         model: Optional[str] = None,
         working_dir: Optional[str] = None,
         provider: Optional[str] = None,
+        track_seconds: Optional[int] = None,
     ) -> Optional[dict]:
         """
         Spawn a child agent session.
@@ -625,6 +626,8 @@ class SessionManagerClient:
             payload["working_dir"] = working_dir
         if provider:
             payload["provider"] = provider
+        if track_seconds is not None:
+            payload["track_seconds"] = track_seconds
 
         data, success, unavailable = self._request("POST", "/sessions/spawn", payload, timeout=10)
         if unavailable:

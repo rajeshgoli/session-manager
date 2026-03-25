@@ -166,6 +166,7 @@ class SessionManager:
         self.telegram_topic_registry_path.parent.mkdir(parents=True, exist_ok=True)
         self.telegram_topic_registry: dict[tuple[int, int], TelegramTopicRecord] = {}
         self._topic_creator: Optional[Callable[..., Awaitable[Optional[int]]]] = None
+        self._pending_telegram_topic_tasks: set[asyncio.Task[Any]] = set()
         self.adoption_proposals: dict[str, AdoptionProposal] = {}
         self.agent_registrations: dict[str, AgentRegistration] = {}
         self.agent_role_last_session_ids: dict[str, str] = {}
@@ -1603,6 +1604,7 @@ class SessionManager:
         model: Optional[str] = None,
         initial_prompt: Optional[str] = None,
         provider: str = "claude",
+        defer_telegram_topic: bool = False,
     ) -> Optional[Session]:
         """
         Common session creation logic (private method).
@@ -1623,13 +1625,15 @@ class SessionManager:
         # Create session object with common fields
         session = Session(
             working_dir=working_dir,
-            friendly_name=friendly_name,
             telegram_chat_id=telegram_chat_id,
             parent_session_id=parent_session_id,
             spawn_prompt=spawn_prompt,
             spawned_at=datetime.now() if parent_session_id else None,
             provider=provider,
         )
+
+        if friendly_name:
+            self.set_session_friendly_name(session, friendly_name, explicit=True)
 
         # Set name if provided, otherwise __post_init__ generates claude-{id}
         if name:
@@ -1744,8 +1748,12 @@ class SessionManager:
             )
             self._start_codex_fork_event_monitor(session)
 
-        # Auto-create Telegram topic for this session
-        await self._ensure_telegram_topic(session, telegram_chat_id)
+        # Auto-create Telegram topic for this session. Spawn paths can defer this
+        # non-critical work so the HTTP response returns before Telegram latency.
+        if defer_telegram_topic:
+            self._schedule_telegram_topic_ensure(session, telegram_chat_id)
+        else:
+            await self._ensure_telegram_topic(session, telegram_chat_id)
 
         if provider == "codex-app" and not initial_prompt and self.message_queue_manager:
             self.message_queue_manager.mark_session_idle(session.id)
@@ -1757,6 +1765,31 @@ class SessionManager:
             logger.info(f"Created session {session.name} (id={session.id})")
 
         return session
+
+    def _schedule_telegram_topic_ensure(
+        self,
+        session: "Session",
+        explicit_chat_id: Optional[int] = None,
+    ) -> None:
+        """Ensure Telegram topic creation runs in the background for a session."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _runner() -> None:
+            try:
+                await self._ensure_telegram_topic(session, explicit_chat_id)
+            except Exception as exc:
+                logger.warning(
+                    "Deferred Telegram topic creation failed for session %s: %s",
+                    session.id,
+                    exc,
+                )
+
+        task = loop.create_task(_runner())
+        self._pending_telegram_topic_tasks.add(task)
+        task.add_done_callback(self._pending_telegram_topic_tasks.discard)
 
     def set_topic_creator(self, creator: Callable[..., Awaitable[Optional[int]]]):
         """Set the callback used to create Telegram forum topics.
@@ -1846,6 +1879,7 @@ class SessionManager:
         model: Optional[str] = None,
         working_dir: Optional[str] = None,
         provider: Optional[str] = None,
+        defer_telegram_topic: bool = False,
     ) -> Optional[Session]:
         """
         Spawn a child agent session.
@@ -1888,6 +1922,7 @@ class SessionManager:
             model=model,
             initial_prompt=prompt,
             provider=selected_provider,
+            defer_telegram_topic=defer_telegram_topic,
         )
 
         if not session:
@@ -2428,7 +2463,8 @@ class SessionManager:
 
     def _claude_transcript_root(self) -> Path:
         """Return Claude's transcript project root."""
-        claude_config = self.config.get("claude", {})
+        config = getattr(self, "config", {}) or {}
+        claude_config = config.get("claude", {})
         configured_root = claude_config.get("transcript_root", "~/.claude/projects")
         return Path(str(configured_root)).expanduser()
 
@@ -2512,7 +2548,11 @@ class SessionManager:
         if session.provider != "claude" or not session.tmux_session:
             return None
 
-        raw_title = self.tmux.get_pane_title(session.tmux_session)
+        tmux_controller = getattr(self, "tmux", None)
+        if tmux_controller is None or not hasattr(tmux_controller, "get_pane_title"):
+            return None
+
+        raw_title = tmux_controller.get_pane_title(session.tmux_session)
         if not isinstance(raw_title, str) or not raw_title:
             return None
 
@@ -2522,6 +2562,14 @@ class SessionManager:
             title = remainder.strip()
         title = title.strip()
         if not title or title == "Claude Code":
+            return None
+        hostname_candidates = {
+            socket.gethostname().strip(),
+            socket.gethostname().split(".", 1)[0].strip(),
+        }
+        if title in hostname_candidates:
+            return None
+        if title.endswith(".local") and " " not in title:
             return None
         return title
 
@@ -3068,6 +3116,12 @@ class SessionManager:
         await self.codex_observability_logger.stop_periodic_prune()
         for session_id in list(self.codex_fork_event_monitors.keys()):
             await self._stop_codex_fork_event_monitor(session_id)
+        pending_topic_tasks = list(self._pending_telegram_topic_tasks)
+        for task in pending_topic_tasks:
+            task.cancel()
+        for task in pending_topic_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _ensure_codex_session(self, session: Session, model: Optional[str] = None) -> Optional[CodexAppServerSession]:
         """Ensure a Codex app-server session is running for this session."""

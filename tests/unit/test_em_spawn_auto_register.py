@@ -1,11 +1,11 @@
-"""Unit tests for sm#277: auto-register remind + context monitoring when EM parent calls sm spawn."""
+"""Unit tests for sm spawn client wiring and server-side EM monitoring setup."""
 
-from unittest.mock import MagicMock, call, patch
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.cli.commands import cmd_spawn, _register_em_monitoring, _EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS
-from src.cli.dispatch import DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD
+from src.cli.commands import cmd_spawn
 from src.message_queue import MessageQueueManager
 from src.models import Session, SessionStatus
 
@@ -29,250 +29,83 @@ _SPAWN_RESULT_CODEX_APP = {
     "provider": "codex-app",
 }
 
-
-def _make_em_session() -> dict:
-    return {"id": "em0000aa", "is_em": True, "friendly_name": "em", "name": "claude-em0000aa"}
-
-
-def _make_non_em_session() -> dict:
-    return {"id": "eng111bb", "is_em": False, "friendly_name": "engineer-277", "name": "claude-eng111bb"}
-
-
-_REMIND_OK = {"status": "registered"}
-
 def _make_client(
-    parent_session: dict | None = None,
     spawn_result: dict | None = None,
     spawn_unavailable: bool = False,
-    remind_result=_REMIND_OK,
-    cm_result: tuple = (None, True, False),
-    ns_result: tuple = (True, False),
 ):
-    """Build a mock SessionManagerClient.
-
-    Pass remind_result=None to simulate a failed remind registration.
-    """
+    """Build a mock SessionManagerClient for cmd_spawn."""
     client = MagicMock()
 
     if spawn_unavailable:
         client.spawn_child.return_value = None
     else:
         client.spawn_child.return_value = spawn_result if spawn_result is not None else _SPAWN_RESULT_CLAUDE
-
-    client.get_session.return_value = parent_session
-    client.register_remind.return_value = remind_result
-    client.set_context_monitor.return_value = cm_result
-    client.arm_stop_notify.return_value = ns_result
     return client
 
 
-# ---------------------------------------------------------------------------
-# Tests: cmd_spawn EM auto-registration (sm#277)
-# ---------------------------------------------------------------------------
+class TestCmdSpawnClientWiring:
+    """sm spawn delegates all monitoring setup to the server-side spawn flow."""
 
-
-class TestEmSpawnAutoRegister:
-    """sm spawn auto-registers remind + context monitor + notify-on-stop when parent is EM."""
-
-    @pytest.fixture(autouse=True)
-    def patch_remind_config(self):
-        """Patch get_auto_remind_config to return defaults, keeping tests hermetic."""
-        with patch(
-            "src.cli.dispatch.get_auto_remind_config",
-            return_value=(DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD),
-        ):
-            yield
-
-    def test_em_parent_registers_remind(self):
-        """When parent is_em=True, register_remind called with default soft/hard thresholds."""
-        client = _make_client(parent_session=_make_em_session())
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        client.register_remind.assert_called_once_with(
-            "child001",
-            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
-            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
-        )
-
-    def test_em_parent_enables_context_monitoring(self):
-        """When parent is_em=True, set_context_monitor called with notify → EM session."""
-        client = _make_client(parent_session=_make_em_session())
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        client.set_context_monitor.assert_called_once_with(
-            "child001",
-            enabled=True,
-            requester_session_id="em0000aa",
-            notify_session_id="em0000aa",
-        )
-
-    def test_em_parent_arms_stop_notify(self):
-        """When parent is_em=True, arm_stop_notify called pointing to EM session."""
-        client = _make_client(parent_session=_make_em_session())
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        client.arm_stop_notify.assert_called_once_with(
-            "child001",
-            sender_session_id="em0000aa",
-            requester_session_id="em0000aa",
-            delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
-        )
-
-    def test_em_parent_calls_get_session_to_check_is_em(self):
-        """After spawn, cmd_spawn looks up the parent session to check is_em."""
-        client = _make_client(parent_session=_make_em_session())
-        cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        client.get_session.assert_called_once_with("em0000aa")
-
-    def test_non_em_parent_no_remind(self):
-        """When parent is_em=False, register_remind is NOT called."""
-        client = _make_client(parent_session=_make_non_em_session())
-        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X")
-        assert rc == 0
-        client.register_remind.assert_not_called()
-
-    def test_non_em_parent_no_context_monitor(self):
-        """When parent is_em=False, set_context_monitor is NOT called."""
-        client = _make_client(parent_session=_make_non_em_session())
-        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X")
-        assert rc == 0
-        client.set_context_monitor.assert_not_called()
-
-    def test_non_em_parent_no_arm_stop_notify(self):
-        """When parent is_em=False, arm_stop_notify is NOT called."""
-        client = _make_client(parent_session=_make_non_em_session())
-        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X")
-        assert rc == 0
-        client.arm_stop_notify.assert_not_called()
-
-    def test_parent_session_not_found_no_registration(self):
-        """If get_session returns None, no EM registration is attempted."""
-        client = _make_client(parent_session=None)
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        client.register_remind.assert_not_called()
-        client.set_context_monitor.assert_not_called()
-        client.arm_stop_notify.assert_not_called()
-
-    def test_spawn_failure_skips_registration(self):
-        """If spawn fails, EM registration is NOT attempted."""
-        client = _make_client(
-            parent_session=_make_em_session(),
-            spawn_result={"error": "spawn failed"},
-        )
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 1
-        client.get_session.assert_not_called()
-        client.register_remind.assert_not_called()
-
-    def test_spawn_unavailable_skips_registration(self):
-        """If session manager unavailable, EM registration is NOT attempted."""
-        client = _make_client(parent_session=_make_em_session(), spawn_unavailable=True)
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 2
-        client.get_session.assert_not_called()
-        client.register_remind.assert_not_called()
-
-    def test_remind_failure_prints_warning_and_continues(self, capsys):
-        """register_remind returning None prints a warning but cmd_spawn still returns 0."""
-        client = _make_client(parent_session=_make_em_session(), remind_result=None)
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        err = capsys.readouterr().err
-        assert "Warning" in err
-        assert "remind" in err
-        # Context monitor and stop notify still attempted
-        client.set_context_monitor.assert_called_once()
-        client.arm_stop_notify.assert_called_once()
-
-    def test_context_monitor_failure_prints_warning_and_continues(self, capsys):
-        """set_context_monitor returning not-ok prints a warning but cmd_spawn still returns 0."""
-        client = _make_client(
-            parent_session=_make_em_session(),
-            cm_result=(None, False, False),
-        )
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        err = capsys.readouterr().err
-        assert "Warning" in err
-        assert "context monitoring" in err
-        # Stop notify still attempted
-        client.arm_stop_notify.assert_called_once()
-
-    def test_stop_notify_failure_prints_warning(self, capsys):
-        """arm_stop_notify returning (False, False) prints a warning but cmd_spawn still returns 0."""
-        client = _make_client(
-            parent_session=_make_em_session(),
-            ns_result=(False, False),
-        )
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        err = capsys.readouterr().err
-        assert "Warning" in err
-        assert "stop notification" in err
-
-    def test_stop_notify_unavailable_prints_warning(self, capsys):
-        """arm_stop_notify returning (False, True) (server unavailable) still prints a warning."""
-        client = _make_client(
-            parent_session=_make_em_session(),
-            ns_result=(False, True),
-        )
-        rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        err = capsys.readouterr().err
-        assert "Warning" in err
-        assert "stop notification" in err
-
-    def test_track_registers_reply_cancelled_remind_for_non_em_parent(self):
-        """--track registers remind even when the parent is not EM."""
-        client = _make_client(parent_session=_make_non_em_session())
+    def test_track_is_forwarded_in_spawn_request(self):
+        client = _make_client()
 
         rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X", track_seconds=300)
 
         assert rc == 0
-        client.register_remind.assert_called_once_with(
-            "child001",
-            soft_threshold=300,
-            hard_threshold=600,
-            cancel_on_reply_session_id="eng111bb",
+        client.spawn_child.assert_called_once_with(
+            parent_session_id="eng111bb",
+            prompt="Implement feature X",
+            name=None,
+            wait=None,
+            model=None,
+            working_dir=None,
+            provider="claude",
+            track_seconds=300,
         )
 
-    def test_track_overrides_em_remind_registration_but_keeps_em_monitoring(self):
-        """--track replaces the default remind thresholds while leaving EM monitoring intact."""
-        client = _make_client(parent_session=_make_em_session())
+    def test_no_client_side_monitoring_followups_after_spawn(self):
+        client = _make_client()
 
         rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X", track_seconds=300)
 
         assert rc == 0
-        assert client.register_remind.call_count == 2
-        assert client.register_remind.call_args_list[0] == call(
-            "child001",
-            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
-            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
-        )
-        assert client.register_remind.call_args_list[1] == call(
-            "child001",
-            soft_threshold=300,
-            hard_threshold=600,
-            cancel_on_reply_session_id="em0000aa",
-        )
-        client.set_context_monitor.assert_called_once()
-        client.arm_stop_notify.assert_called_once()
+        client.get_session.assert_not_called()
+        client.register_remind.assert_not_called()
+        client.set_context_monitor.assert_not_called()
+        client.arm_stop_notify.assert_not_called()
+
+    def test_spawn_warning_payload_is_printed(self, capsys):
+        client = _make_client(spawn_result={**_SPAWN_RESULT_CLAUDE, "warnings": ["monitoring degraded"]})
+
+        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X")
+
+        assert rc == 0
+        assert "monitoring degraded" in capsys.readouterr().err
+
+    def test_spawn_failure_skips_followup_work(self):
+        client = _make_client(spawn_result={"error": "spawn failed"})
+
+        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X")
+
+        assert rc == 1
+        client.get_session.assert_not_called()
+        client.register_remind.assert_not_called()
+
+    def test_spawn_unavailable_skips_followup_work(self):
+        client = _make_client(spawn_unavailable=True)
+
+        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X")
+
+        assert rc == 2
+        client.get_session.assert_not_called()
+        client.register_remind.assert_not_called()
 
 
 class TestSpawnProviderAwareModel:
     """Provider-aware model handling for sm spawn (#290)."""
 
-    @pytest.fixture(autouse=True)
-    def patch_remind_config(self):
-        with patch(
-            "src.cli.dispatch.get_auto_remind_config",
-            return_value=(DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD),
-        ):
-            yield
-
     def test_claude_invalid_model_rejected(self, capsys):
-        client = _make_client(parent_session=_make_non_em_session())
+        client = _make_client()
 
         rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X", model="codex-5.1\x1b[31m")
 
@@ -287,7 +120,7 @@ class TestSpawnProviderAwareModel:
         spawn_result["provider"] = "codex"
         spawn_result["name"] = "codex-child001"
         spawn_result["tmux_session"] = "codex-child001"
-        client = _make_client(parent_session=_make_non_em_session(), spawn_result=spawn_result)
+        client = _make_client(spawn_result=spawn_result)
 
         rc = cmd_spawn(client, "eng111bb", "codex", "Implement feature X", model="codex-5.1")
 
@@ -300,10 +133,11 @@ class TestSpawnProviderAwareModel:
             model="codex-5.1",
             working_dir=None,
             provider="codex",
+            track_seconds=None,
         )
 
     def test_codex_app_model_forwarded(self):
-        client = _make_client(parent_session=_make_non_em_session(), spawn_result=_SPAWN_RESULT_CODEX_APP)
+        client = _make_client(spawn_result=_SPAWN_RESULT_CODEX_APP)
 
         rc = cmd_spawn(client, "eng111bb", "codex-app", "Implement feature X", model="codex-5.1")
 
@@ -316,10 +150,11 @@ class TestSpawnProviderAwareModel:
             model="codex-5.1",
             working_dir=None,
             provider="codex-app",
+            track_seconds=None,
         )
 
     def test_codex_model_rejects_shell_metacharacters(self, capsys):
-        client = _make_client(parent_session=_make_non_em_session())
+        client = _make_client()
 
         rc = cmd_spawn(client, "eng111bb", "codex", "Implement feature X", model="codex-5.1;touch_/tmp/pwned")
 
@@ -327,106 +162,184 @@ class TestSpawnProviderAwareModel:
         assert "invalid codex model" in capsys.readouterr().err.lower()
         client.spawn_child.assert_not_called()
 
-    def test_codex_app_em_parent_also_registers(self):
-        """EM registration also fires for codex-app spawned children."""
-        client = _make_client(
-            parent_session=_make_em_session(),
-            spawn_result=_SPAWN_RESULT_CODEX_APP,
-        )
+    def test_codex_app_em_parent_still_uses_server_side_spawn(self):
+        """codex-app spawn keeps using the same spawn endpoint contract."""
+        client = _make_client(spawn_result=_SPAWN_RESULT_CODEX_APP)
         rc = cmd_spawn(client, "em0000aa", "codex-app", "Implement feature X")
         assert rc == 0
-        client.register_remind.assert_called_once_with(
-            "child002",
-            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
-            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
-        )
-        client.set_context_monitor.assert_called_once()
-        client.arm_stop_notify.assert_called_once()
-
-    def test_config_override_thresholds_used(self, patch_remind_config):
-        """Config-overridden thresholds from config.yaml flow through to register_remind."""
-        # Override the autouse patch to return non-default values
-        with patch("src.cli.dispatch.get_auto_remind_config", return_value=(300, 600)):
-            client = _make_client(parent_session=_make_em_session())
-            rc = cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
-        assert rc == 0
-        client.register_remind.assert_called_once_with("child001", soft_threshold=300, hard_threshold=600)
+        client.spawn_child.assert_called_once()
 
     def test_output_unchanged_for_non_em(self, capsys):
         """cmd_spawn output is unchanged when parent is not EM."""
-        client = _make_client(parent_session=_make_non_em_session())
+        client = _make_client()
         cmd_spawn(client, "eng111bb", "claude", "Implement feature X")
         out = capsys.readouterr().out
         assert "Spawned scout-277 (child001) in tmux session claude-child001" in out
 
     def test_output_unchanged_for_em(self, capsys):
         """cmd_spawn output still shows spawn line even when parent is EM."""
-        client = _make_client(parent_session=_make_em_session())
+        client = _make_client()
         cmd_spawn(client, "em0000aa", "claude", "Implement feature X")
         out = capsys.readouterr().out
         assert "Spawned scout-277 (child001) in tmux session claude-child001" in out
 
 
 # ---------------------------------------------------------------------------
-# Tests: _register_em_monitoring helper
+# Tests: server-side spawn monitoring registration (sm#465)
 # ---------------------------------------------------------------------------
 
 
-class TestRegisterEmMonitoring:
-    """Unit tests for the _register_em_monitoring helper."""
+class TestSpawnEndpointMonitoring:
+    """Spawn endpoint wires tracking and EM monitoring atomically server-side."""
 
-    def test_remind_called_with_correct_thresholds(self):
-        """register_remind called with provided soft/hard thresholds."""
-        client = MagicMock()
-        client.register_remind.return_value = {"status": "registered"}
-        client.set_context_monitor.return_value = (None, True, False)
-        client.arm_stop_notify.return_value = (True, False)
+    @pytest.fixture
+    def app_client(self):
+        from fastapi.testclient import TestClient
+        from src.server import create_app
 
-        _register_em_monitoring(
-            client, "childXXX", "emYYY",
-            DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD,
+        app = create_app({})
+        mock_sm = MagicMock()
+        mock_sm._save_state = MagicMock()
+        mock_sm.message_queue_manager = MagicMock()
+        mock_output_monitor = MagicMock()
+        mock_output_monitor.start_monitoring = AsyncMock()
+        app.state.session_manager = mock_sm
+        app.state.output_monitor = mock_output_monitor
+        return TestClient(app), mock_sm, mock_output_monitor
+
+    def test_spawn_with_track_registers_server_side_tracking(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="eng111bb",
+            name="claude-eng111bb",
+            working_dir="/tmp/parent",
+            tmux_session="claude-eng111bb",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
         )
-        client.register_remind.assert_called_once_with(
-            "childXXX",
-            soft_threshold=DEFAULT_DISPATCH_SOFT_THRESHOLD,
-            hard_threshold=DEFAULT_DISPATCH_HARD_THRESHOLD,
+        child = Session(
+            id="child456",
+            name="claude-child456",
+            working_dir="/tmp/parent",
+            tmux_session="claude-child456",
+            log_file="/tmp/child.log",
+            status=SessionStatus.RUNNING,
+            parent_session_id="eng111bb",
+            spawned_at=datetime.now(),
+        )
+        mock_sm.get_session.side_effect = lambda sid: {"eng111bb": parent, "child456": child}.get(sid)
+        mock_sm.spawn_child_session = AsyncMock(return_value=child)
+
+        response = tc.post(
+            "/sessions/spawn",
+            json={
+                "parent_session_id": "eng111bb",
+                "prompt": "Implement feature X",
+                "track_seconds": 300,
+            },
         )
 
-    def test_context_monitor_notify_points_to_em(self):
-        """set_context_monitor notify_session_id points to EM session."""
-        client = MagicMock()
-        client.register_remind.return_value = {"status": "registered"}
-        client.set_context_monitor.return_value = (None, True, False)
-        client.arm_stop_notify.return_value = (True, False)
+        assert response.status_code == 200
+        mock_sm.spawn_child_session.assert_awaited_once_with(
+            parent_session_id="eng111bb",
+            prompt="Implement feature X",
+            name=None,
+            wait=None,
+            model=None,
+            working_dir="/tmp/parent",
+            provider=None,
+            defer_telegram_topic=True,
+        )
+        mock_sm.message_queue_manager.register_periodic_remind.assert_called_once_with(
+            target_session_id="child456",
+            soft_threshold=300,
+            hard_threshold=600,
+            cancel_on_reply_session_id="eng111bb",
+        )
+        assert child.context_monitor_enabled is False
+        mock_sm.message_queue_manager.arm_stop_notify.assert_not_called()
 
-        _register_em_monitoring(
-            client, "childXXX", "emYYY",
-            DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD,
+    def test_spawn_em_parent_registers_server_side_monitoring(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="em0000aa",
+            name="claude-em0000aa",
+            working_dir="/tmp/parent",
+            tmux_session="claude-em0000aa",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
+            is_em=True,
         )
-        client.set_context_monitor.assert_called_once_with(
-            "childXXX",
-            enabled=True,
-            requester_session_id="emYYY",
-            notify_session_id="emYYY",
+        child = Session(
+            id="child456",
+            name="claude-child456",
+            working_dir="/tmp/parent",
+            tmux_session="claude-child456",
+            log_file="/tmp/child.log",
+            status=SessionStatus.RUNNING,
+            parent_session_id="em0000aa",
+            spawned_at=datetime.now(),
+        )
+        mock_sm.get_session.side_effect = lambda sid: {"em0000aa": parent, "child456": child}.get(sid)
+        mock_sm.spawn_child_session = AsyncMock(return_value=child)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("src.server.get_auto_remind_config", lambda working_dir: (210, 420))
+            response = tc.post(
+                "/sessions/spawn",
+                json={
+                    "parent_session_id": "em0000aa",
+                    "prompt": "Implement feature X",
+                },
+            )
+
+        assert response.status_code == 200
+        mock_sm.message_queue_manager.register_periodic_remind.assert_called_once_with(
+            target_session_id="child456",
+            soft_threshold=210,
+            hard_threshold=420,
+        )
+        assert child.context_monitor_enabled is True
+        assert child.context_monitor_notify == "em0000aa"
+        mock_sm.message_queue_manager.arm_stop_notify.assert_called_once()
+
+    def test_spawn_returns_warning_when_tracking_registration_raises(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="eng111bb",
+            name="claude-eng111bb",
+            working_dir="/tmp/parent",
+            tmux_session="claude-eng111bb",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
+        )
+        child = Session(
+            id="child456",
+            name="claude-child456",
+            working_dir="/tmp/parent",
+            tmux_session="claude-child456",
+            log_file="/tmp/child.log",
+            status=SessionStatus.RUNNING,
+            parent_session_id="eng111bb",
+            spawned_at=datetime.now(),
+        )
+        mock_sm.get_session.side_effect = lambda sid: {"eng111bb": parent, "child456": child}.get(sid)
+        mock_sm.spawn_child_session = AsyncMock(return_value=child)
+        mock_sm.message_queue_manager.register_periodic_remind.side_effect = RuntimeError("sqlite busy")
+
+        response = tc.post(
+            "/sessions/spawn",
+            json={
+                "parent_session_id": "eng111bb",
+                "prompt": "Implement feature X",
+                "track_seconds": 300,
+            },
         )
 
-    def test_arm_stop_notify_points_to_em(self):
-        """arm_stop_notify sender_session_id points to EM session."""
-        client = MagicMock()
-        client.register_remind.return_value = {"status": "registered"}
-        client.set_context_monitor.return_value = (None, True, False)
-        client.arm_stop_notify.return_value = (True, False)
-
-        _register_em_monitoring(
-            client, "childXXX", "emYYY",
-            DEFAULT_DISPATCH_SOFT_THRESHOLD, DEFAULT_DISPATCH_HARD_THRESHOLD,
-        )
-        client.arm_stop_notify.assert_called_once_with(
-            "childXXX",
-            sender_session_id="emYYY",
-            requester_session_id="emYYY",
-            delay_seconds=_EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
-        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["session_id"] == "child456"
+        assert data["warnings"] == ["failed to register spawn tracking"]
 
 
 # ---------------------------------------------------------------------------
