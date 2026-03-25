@@ -350,3 +350,72 @@ async def test_handle_message_allows_slash_prefixed_non_command_text():
     delivered_input = tg._on_session_input.await_args.args[0]
     assert delivered_input.text == "/tmp/config.yaml"
     assert delivered_input.delivery_mode == "sequential"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_delivered_starts_typing_indicator_without_reply_stub():
+    """Immediate Telegram delivery should start native typing instead of posting a progress stub."""
+    tg = TelegramBot(token="test-token")
+    tg._on_session_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+    tg._is_allowed = lambda chat_id, user_id=None: True
+    tg._get_session_from_context = lambda update: "sess123"
+    tg._start_typing_indicator = Mock()
+
+    delivered_reply = AsyncMock(return_value=SimpleNamespace(message_id=555))
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=100, is_forum=True),
+        effective_user=SimpleNamespace(id=200),
+        message=SimpleNamespace(
+            text="hello",
+            message_id=3,
+            message_thread_id=10,
+            reply_text=delivered_reply,
+        ),
+    )
+
+    await tg._handle_message(update, SimpleNamespace(args=[]))
+
+    tg._on_session_input.assert_awaited_once()
+    delivered_reply.assert_not_awaited()
+    tg._start_typing_indicator.assert_called_once_with("sess123", 100, 10)
+
+
+@pytest.mark.asyncio
+async def test_delete_pending_input_msg_cancels_typing_indicator():
+    """Response completion should stop any active typing indicator loop."""
+    tg = TelegramBot(token="test-token")
+    typing_task = Mock()
+    typing_task.done.return_value = False
+    tg._typing_indicator_tasks = {"sess123": typing_task}
+    tg._pending_input_msgs = {}
+    tg._completed_sessions = set()
+    tg.bot = None
+
+    await tg.delete_pending_input_msg("sess123")
+
+    typing_task.cancel.assert_called_once()
+    assert "sess123" not in tg._typing_indicator_tasks
+
+
+@pytest.mark.asyncio
+async def test_configure_bot_commands_registers_private_and_group_menus():
+    """Bot startup should publish a curated Telegram command menu."""
+    tg = TelegramBot(token="test-token")
+    tg.bot = AsyncMock()
+
+    await tg._configure_bot_commands()
+
+    assert tg.bot.set_my_commands.await_count == 2
+    private_call = tg.bot.set_my_commands.await_args_list[0]
+    group_call = tg.bot.set_my_commands.await_args_list[1]
+    private_names = [command.command for command in private_call.args[0]]
+    group_names = [command.command for command in group_call.args[0]]
+
+    assert "session" in private_names
+    assert "follow" in private_names
+    assert "force" in group_names
+    assert "kill" in group_names
+    assert type(private_call.kwargs["scope"]).__name__ == "BotCommandScopeAllPrivateChats"
+    assert type(group_call.kwargs["scope"]).__name__ == "BotCommandScopeAllGroupChats"
+    tg.bot.set_chat_menu_button.assert_awaited_once()
+    assert type(tg.bot.set_chat_menu_button.await_args.kwargs["menu_button"]).__name__ == "MenuButtonCommands"
