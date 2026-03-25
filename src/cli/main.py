@@ -230,9 +230,13 @@ def main():
         help="Track the child with periodic remind until it replies (default: 300s)",
     )
 
-    # sm children [session-id]
+    # sm children [session]
     children_parser = subparsers.add_parser("children", help="List child sessions")
-    children_parser.add_argument("session_id", nargs="?", help="Parent session ID (defaults to current)")
+    children_parser.add_argument(
+        "session_id",
+        nargs="?",
+        help="Parent session ID, friendly name, or registry alias (defaults to current)",
+    )
     children_parser.add_argument("--recursive", action="store_true", help="Include grandchildren")
     children_parser.add_argument("--status", choices=["running", "completed", "error", "all"], help="Filter by status")
     children_parser.add_argument("--json", action="store_true", help="Output JSON")
@@ -754,9 +758,28 @@ def main():
             getattr(args, "track", None),
         ))
     elif args.command == "children":
-        # Use current session if not specified
-        parent_id = args.session_id if args.session_id else session_id
-        sys.exit(commands.cmd_children(client, parent_id, args.recursive, args.status, args.json, getattr(args, 'db_path', None)))
+        if args.session_id:
+            parent_id, _ = commands.resolve_session_id(client, args.session_id)
+            if parent_id is None:
+                sessions = client.list_sessions()
+                if sessions is None:
+                    print(commands.UNAVAILABLE_MESSAGE, file=sys.stderr)
+                    sys.exit(2)
+                print(f"Error: Session '{args.session_id}' not found", file=sys.stderr)
+                sys.exit(1)
+        else:
+            parent_id = session_id
+
+        sys.exit(
+            commands.cmd_children(
+                client,
+                parent_id,
+                args.recursive,
+                args.status,
+                args.json,
+                getattr(args, "db_path", None),
+            )
+        )
     elif args.command == "kill":
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
     elif args.command == "clean":

@@ -361,7 +361,7 @@ class TestChildrenCommand:
         assert args.session_id is None  # Will use current
 
     def test_children_with_session_id(self):
-        """sm children <session-id> specifies parent."""
+        """sm children <session> specifies parent."""
         parser = TestCliParsing()
         args = parser._get_parsed_args(["children", "parent123"])
 
@@ -402,6 +402,49 @@ class TestChildrenCommand:
         args = parser._get_parsed_args(["children"])
 
         assert args.db_path is None
+
+
+class TestChildrenCommandDispatch:
+    """Tests for 'sm children' runtime resolution and dispatch."""
+
+    def test_children_resolves_parent_identifier_before_dispatch(self):
+        mock_client = MagicMock()
+
+        with patch.object(sys, "argv", ["sm", "children", "chief-scientist"]):
+            with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                with patch("src.cli.main.commands.resolve_session_id", return_value=("abc12345", {"id": "abc12345"})):
+                    with patch("src.cli.main.commands.cmd_children", return_value=0) as mock_cmd_children:
+                        with pytest.raises(SystemExit) as exc_info:
+                            main()
+
+        assert exc_info.value.code == 0
+        mock_cmd_children.assert_called_once_with(mock_client, "abc12345", False, None, False, None)
+
+    def test_children_reports_missing_named_parent(self, capsys):
+        mock_client = MagicMock()
+        mock_client.list_sessions.return_value = []
+
+        with patch.object(sys, "argv", ["sm", "children", "chief-scientist"]):
+            with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                with patch("src.cli.main.commands.resolve_session_id", return_value=(None, None)):
+                    with pytest.raises(SystemExit) as exc_info:
+                        main()
+
+        assert exc_info.value.code == 1
+        assert "Error: Session 'chief-scientist' not found" in capsys.readouterr().err
+
+    def test_children_reports_unavailable_when_resolution_cannot_query_sessions(self, capsys):
+        mock_client = MagicMock()
+        mock_client.list_sessions.return_value = None
+
+        with patch.object(sys, "argv", ["sm", "children", "chief-scientist"]):
+            with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                with patch("src.cli.main.commands.resolve_session_id", return_value=(None, None)):
+                    with pytest.raises(SystemExit) as exc_info:
+                        main()
+
+        assert exc_info.value.code == 2
+        assert "Session manager unavailable or request timed out" in capsys.readouterr().err
 
 
 class TestOutputCommand:
