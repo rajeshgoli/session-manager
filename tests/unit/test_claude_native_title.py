@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+import pytest
 
 from src.models import Session, SessionStatus
 from src.server import create_app
@@ -83,6 +84,38 @@ def test_effective_name_uses_live_tmux_title_when_transcript_path_missing(tmp_pa
     assert manager.get_effective_session_name(session.id) == "bork-investigator"
     assert session.native_title == "bork-investigator"
     assert session.transcript_path is None
+
+
+def test_effective_name_ignores_hostname_pane_title_when_friendly_name_exists(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.get_pane_title.return_value = "Rajeshs-MacBook-Pro.local"
+    session = _claude_session(tmp_path, None, friendly_name="spawned-name")
+    manager.set_session_friendly_name(session, "spawned-name", explicit=True)
+    manager.sessions[session.id] = session
+
+    assert manager.get_effective_session_name(session.id) == "spawned-name"
+    assert session.native_title is None
+
+
+@pytest.mark.asyncio
+async def test_create_session_common_marks_requested_friendly_name_explicit(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.create_session_with_command.return_value = True
+    manager._get_git_remote_url_async = AsyncMock(return_value=None)
+    manager._ensure_telegram_topic = AsyncMock()
+
+    session = await manager._create_session_common(
+        working_dir=str(tmp_path),
+        friendly_name="spawned-name",
+        provider="claude",
+    )
+
+    assert session is not None
+    assert session.friendly_name == "spawned-name"
+    assert session.friendly_name_is_explicit is True
+    assert isinstance(session.friendly_name_updated_at_ns, int)
 
 
 def test_effective_name_discovers_matching_transcript_path_when_missing(tmp_path: Path) -> None:

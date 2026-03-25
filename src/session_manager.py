@@ -1625,13 +1625,15 @@ class SessionManager:
         # Create session object with common fields
         session = Session(
             working_dir=working_dir,
-            friendly_name=friendly_name,
             telegram_chat_id=telegram_chat_id,
             parent_session_id=parent_session_id,
             spawn_prompt=spawn_prompt,
             spawned_at=datetime.now() if parent_session_id else None,
             provider=provider,
         )
+
+        if friendly_name:
+            self.set_session_friendly_name(session, friendly_name, explicit=True)
 
         # Set name if provided, otherwise __post_init__ generates claude-{id}
         if name:
@@ -2461,7 +2463,8 @@ class SessionManager:
 
     def _claude_transcript_root(self) -> Path:
         """Return Claude's transcript project root."""
-        claude_config = self.config.get("claude", {})
+        config = getattr(self, "config", {}) or {}
+        claude_config = config.get("claude", {})
         configured_root = claude_config.get("transcript_root", "~/.claude/projects")
         return Path(str(configured_root)).expanduser()
 
@@ -2545,7 +2548,11 @@ class SessionManager:
         if session.provider != "claude" or not session.tmux_session:
             return None
 
-        raw_title = self.tmux.get_pane_title(session.tmux_session)
+        tmux_controller = getattr(self, "tmux", None)
+        if tmux_controller is None or not hasattr(tmux_controller, "get_pane_title"):
+            return None
+
+        raw_title = tmux_controller.get_pane_title(session.tmux_session)
         if not isinstance(raw_title, str) or not raw_title:
             return None
 
@@ -2555,6 +2562,14 @@ class SessionManager:
             title = remainder.strip()
         title = title.strip()
         if not title or title == "Claude Code":
+            return None
+        hostname_candidates = {
+            socket.gethostname().strip(),
+            socket.gethostname().split(".", 1)[0].strip(),
+        }
+        if title in hostname_candidates:
+            return None
+        if title.endswith(".local") and " " not in title:
             return None
         return title
 
