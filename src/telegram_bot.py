@@ -7,7 +7,17 @@ import time
 from typing import Optional, Callable, Awaitable
 import httpx
 
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    Bot,
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+)
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -38,6 +48,8 @@ _POLLING_READ_TIMEOUT = 30.0
 _POLLING_CONNECT_TIMEOUT = 5.0
 _POLLING_WRITE_TIMEOUT = 5.0
 _POLLING_POOL_TIMEOUT = 5.0
+_TYPING_REFRESH_SECONDS = 4.0
+_TYPING_TIMEOUT_SECONDS = 300.0
 
 
 class _PollingTracker:
@@ -201,6 +213,7 @@ class TelegramBot:
         self._pending_input_msgs: dict[str, tuple[int, int]] = {}  # session_id -> (chat_id, msg_id)
         # Track sessions that have completed (for progress monitoring)
         self._completed_sessions: set[str] = set()
+        self._typing_indicator_tasks: dict[str, asyncio.Task] = {}
         # Track "/force next message" arming per (chat, user, session)
         self._force_next_inputs: set[tuple[int, int, str]] = set()
 
@@ -300,6 +313,104 @@ class TelegramBot:
     def set_get_subagents_handler(self, handler: Callable[[str], Awaitable[Optional[list]]]):
         """Set handler for getting subagents. Handler receives session_id."""
         self._on_get_subagents = handler
+
+    async def _configure_bot_commands(self) -> None:
+        """Register a curated bot command menu for private and group chats."""
+        if not self.bot:
+            return
+
+        private_commands = [
+            BotCommand("start", "Show help and overview"),
+            BotCommand("session", "Create a session from the project picker"),
+            BotCommand("new", "Create a session from a path"),
+            BotCommand("list", "List active sessions"),
+            BotCommand("follow", "Create a forum topic for a session"),
+            BotCommand("help", "Show all commands"),
+        ]
+        group_commands = [
+            BotCommand("list", "List active sessions"),
+            BotCommand("follow", "Create a topic for a session"),
+            BotCommand("status", "Show the current session status"),
+            BotCommand("subagents", "Show the current session's child agents"),
+            BotCommand("summary", "Show the last Claude response"),
+            BotCommand("stop", "Interrupt the current session"),
+            BotCommand("force", "Force the next message through immediately"),
+            BotCommand("kill", "Kill the current session"),
+            BotCommand("name", "Rename the current session"),
+            BotCommand("help", "Show all commands"),
+        ]
+
+        try:
+            await self.bot.set_my_commands(
+                private_commands,
+                scope=BotCommandScopeAllPrivateChats(),
+            )
+            await self.bot.set_my_commands(
+                group_commands,
+                scope=BotCommandScopeAllGroupChats(),
+            )
+            await self.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        except Exception as e:
+            logger.warning(f"Failed to configure Telegram bot commands: {e}")
+
+    def _stop_typing_indicator(self, session_id: str) -> None:
+        """Cancel one active typing indicator loop."""
+        task = self._typing_indicator_tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _start_typing_indicator(
+        self,
+        session_id: str,
+        chat_id: int,
+        message_thread_id: Optional[int] = None,
+    ) -> None:
+        """Start or replace the typing indicator loop for one session."""
+        self._stop_typing_indicator(session_id)
+        self._completed_sessions.discard(session_id)
+        self._typing_indicator_tasks[session_id] = asyncio.create_task(
+            self._run_typing_indicator(session_id, chat_id, message_thread_id),
+            name=f"telegram-typing-{session_id}",
+        )
+
+    async def _run_typing_indicator(
+        self,
+        session_id: str,
+        chat_id: int,
+        message_thread_id: Optional[int] = None,
+    ) -> None:
+        """Keep Telegram's native typing indicator active until the session responds."""
+        started_at = time.monotonic()
+        try:
+            while True:
+                if session_id in self._completed_sessions:
+                    self._completed_sessions.discard(session_id)
+                    return
+                if (time.monotonic() - started_at) >= _TYPING_TIMEOUT_SECONDS:
+                    return
+                if self._on_session_status:
+                    try:
+                        session = await self._on_session_status(session_id)
+                    except Exception as e:
+                        logger.debug(f"Could not resolve session {session_id} for typing indicator: {e}")
+                        session = None
+                    status_value = getattr(getattr(session, "status", None), "value", None) if session else None
+                    if session is None or status_value == "stopped":
+                        return
+                if not self.bot:
+                    return
+                await self.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.TYPING,
+                    message_thread_id=message_thread_id,
+                )
+                await asyncio.sleep(_TYPING_REFRESH_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Could not send typing indicator for {session_id}: {e}")
+        finally:
+            self._typing_indicator_tasks.pop(session_id, None)
 
     def _format_subagents(self, subagents: list) -> str:
         """Format subagents list for display."""
@@ -1130,11 +1241,11 @@ Provide ONLY the summary, no preamble or questions."""
             result = await self._on_session_input(user_input)
 
             if result == DeliveryResult.DELIVERED:
-                msg = await update.message.reply_text(f"[{session_id}] ✓ Delivered")
-                # Track this message so we can delete it when response arrives
-                self._pending_input_msgs[session_id] = (chat_id, msg.message_id)
-                # Start progress monitoring for delivered messages
-                asyncio.create_task(self._monitor_progress(session_id, chat_id, msg.message_id))
+                self._start_typing_indicator(
+                    session_id,
+                    chat_id,
+                    update.message.message_thread_id,
+                )
             elif result == DeliveryResult.QUEUED:
                 msg = await update.message.reply_text(
                     f"[{session_id}] ⏳ Queued (delivery deferred)\n"
@@ -1266,6 +1377,7 @@ Provide ONLY the summary, no preamble or questions."""
         """Delete the 'Input sent' message for a session (called when response arrives)."""
         # Mark session as completed to stop progress monitoring
         self._completed_sessions.add(session_id)
+        self._stop_typing_indicator(session_id)
 
         pending = self._pending_input_msgs.pop(session_id, None)
         if pending and self.bot:
@@ -1274,62 +1386,6 @@ Provide ONLY the summary, no preamble or questions."""
                 await self.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except Exception as e:
                 logger.debug(f"Could not delete input msg: {e}")
-
-    async def _monitor_progress(self, session_id: str, chat_id: int, msg_id: int):
-        """
-        Update message with Claude's progress every 5 seconds.
-
-        Runs until the Stop hook fires (session added to _completed_sessions)
-        or a timeout is reached (60 seconds).
-        """
-        # Clear any previous completion flag for this session
-        self._completed_sessions.discard(session_id)
-
-        last_content = ""
-        max_iterations = 12  # 60 seconds total (5s * 12)
-
-        for _ in range(max_iterations):
-            await asyncio.sleep(5)
-
-            # Check if Stop hook fired (response complete)
-            if session_id in self._completed_sessions:
-                self._completed_sessions.discard(session_id)
-                return
-
-            # Check if message was removed from tracking (e.g., replaced by response)
-            if session_id not in self._pending_input_msgs:
-                return
-
-            # Get current tmux output
-            if not self._on_get_tmux_output:
-                return
-
-            try:
-                output = await self._on_get_tmux_output(session_id, 20)
-                if not output or output == last_content:
-                    continue
-
-                last_content = output
-
-                # Strip ANSI codes and truncate for display
-                from .notifier import strip_ansi
-                clean_output = strip_ansi(output)
-
-                # Truncate if too long
-                if len(clean_output) > 400:
-                    clean_output = "..." + clean_output[-400:]
-
-                # Update the message with progress
-                if self.bot:
-                    await self.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=f"[{session_id}] ⏳ Working...\n```\n{clean_output}\n```",
-                        parse_mode="Markdown",
-                    )
-            except Exception as e:
-                # Message might be deleted or rate limited
-                logger.debug(f"Could not update progress message: {e}")
 
     async def create_forum_topic(self, chat_id: int, name: str) -> Optional[int]:
         """Create a forum topic and return its ID."""
@@ -1889,6 +1945,7 @@ Provide ONLY the summary, no preamble or questions."""
 
         # Start polling
         await self.application.initialize()
+        await self._configure_bot_commands()
         await self.application.start()
         self._polling_tracker.record()
         await self.application.updater.start_polling()
