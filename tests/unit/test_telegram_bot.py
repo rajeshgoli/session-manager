@@ -235,6 +235,29 @@ async def test_send_with_fallback_forum_failure_uses_reply_thread():
 
 
 @pytest.mark.asyncio
+async def test_send_with_fallback_forum_failure_can_skip_reply_fallback():
+    """Forum-backed callers can disable reply fallback to avoid leaking into general chat."""
+    tg = Mock(spec=TelegramBot)
+    tg.send_notification = AsyncMock(return_value=None)
+
+    result = await TelegramBot.send_with_fallback(
+        tg,
+        chat_id=10000,
+        message="Session stopped [sess]",
+        thread_id=50000,
+        allow_reply_fallback=False,
+    )
+
+    tg.send_notification.assert_called_once_with(
+        chat_id=10000,
+        message="Session stopped [sess]",
+        message_thread_id=50000,
+        silent=True,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_send_with_fallback_both_fail_logs_warning_not_error():
     """Spec item 7: when both forum and fallback sends fail, failures are logged at WARNING not ERROR."""
     tg = TelegramBot.__new__(TelegramBot)

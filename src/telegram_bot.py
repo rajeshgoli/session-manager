@@ -1353,7 +1353,14 @@ Provide ONLY the summary, no preamble or questions."""
                 logger.error(f"Failed to send Telegram message: {e}")
             return None
 
-    async def send_with_fallback(self, chat_id: int, message: str, thread_id: int) -> Optional[int]:
+    async def send_with_fallback(
+        self,
+        chat_id: int,
+        message: str,
+        thread_id: int,
+        *,
+        allow_reply_fallback: bool = True,
+    ) -> Optional[int]:
         """Try forum-topic delivery; fall back to reply-thread if it fails.
 
         Returns the forum msg_id if forum delivery succeeded, None otherwise.
@@ -1361,7 +1368,7 @@ Provide ONLY the summary, no preamble or questions."""
         msg_id = await self.send_notification(
             chat_id=chat_id, message=message, message_thread_id=thread_id, silent=True
         )
-        if msg_id is None:
+        if msg_id is None and allow_reply_fallback:
             await self.send_notification(chat_id=chat_id, message=message, reply_to_message_id=thread_id, silent=True)
         return msg_id
 

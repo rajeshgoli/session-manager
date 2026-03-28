@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from src.output_monitor import OutputMonitor
 from src.server import create_app
 from src.models import Session, SessionStatus
+from src.notifier import Notifier, NotificationEvent, NotificationChannel
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ def mock_session_manager():
     manager.notifier = Mock()
     manager.notifier.telegram = Mock()
     manager.notifier.telegram.bot = AsyncMock()
-    manager.notifier.telegram._topic_sessions = {}
+    manager.notifier.telegram._topic_sessions = {(12345, 67890): "test123"}
     manager.notifier.telegram._session_threads = {}
     # send_with_fallback is async; return a message_id so forum path is taken
     manager.notifier.telegram.send_with_fallback = AsyncMock(return_value=9999)
@@ -78,6 +79,7 @@ async def test_cleanup_accesses_correct_telegram_attribute(output_monitor, mock_
         chat_id=12345,
         message=f"Session stopped [{mock_session.id}]",
         thread_id=67890,
+        allow_reply_fallback=False,
     )
 
 
@@ -157,3 +159,83 @@ def test_notifier_stores_telegram_bot_as_telegram():
     # Verify telegram_bot attribute doesn't exist (or is different)
     # The parameter name is telegram_bot, but it's stored as telegram
     assert not hasattr(notifier, 'telegram_bot') or getattr(notifier, 'telegram_bot', None) != mock_bot
+
+
+@pytest.mark.asyncio
+async def test_notifier_ensures_topic_for_live_session_instead_of_posting_to_general():
+    session = Session(
+        id="live123",
+        name="live-session",
+        working_dir="/tmp",
+        tmux_session="claude-live123",
+        log_file="/tmp/test.log",
+        status=SessionStatus.RUNNING,
+        telegram_chat_id=12345,
+        telegram_thread_id=None,
+    )
+    telegram = Mock()
+    telegram.send_notification = AsyncMock(return_value=4321)
+    telegram.get_session_thread = Mock(return_value=None)
+    telegram.delete_pending_input_msg = AsyncMock()
+
+    manager = Mock()
+    manager._ensure_telegram_topic = AsyncMock(
+        side_effect=lambda s: setattr(s, "telegram_thread_id", 67890)
+    )
+
+    notifier = Notifier(telegram_bot=telegram)
+    notifier.session_manager = manager
+
+    event = NotificationEvent(
+        session_id=session.id,
+        event_type="response",
+        message="ok",
+        context="response body",
+        channel=NotificationChannel.TELEGRAM,
+    )
+
+    ok = await notifier._notify_telegram(event, session, "response body", use_markdown=False)
+
+    assert ok is True
+    manager._ensure_telegram_topic.assert_awaited_once_with(session)
+    telegram.send_notification.assert_awaited_once()
+    assert telegram.send_notification.await_args.kwargs["message_thread_id"] == 67890
+    assert telegram.send_notification.await_args.kwargs["reply_to_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_notifier_suppresses_live_session_notification_when_topic_still_missing():
+    session = Session(
+        id="live124",
+        name="live-session",
+        working_dir="/tmp",
+        tmux_session="claude-live124",
+        log_file="/tmp/test.log",
+        status=SessionStatus.RUNNING,
+        telegram_chat_id=12345,
+        telegram_thread_id=None,
+    )
+    telegram = Mock()
+    telegram.send_notification = AsyncMock(return_value=4321)
+    telegram.get_session_thread = Mock(return_value=None)
+    telegram.delete_pending_input_msg = AsyncMock()
+
+    manager = Mock()
+    manager._ensure_telegram_topic = AsyncMock(return_value=None)
+
+    notifier = Notifier(telegram_bot=telegram)
+    notifier.session_manager = manager
+
+    event = NotificationEvent(
+        session_id=session.id,
+        event_type="response",
+        message="ok",
+        context="response body",
+        channel=NotificationChannel.TELEGRAM,
+    )
+
+    ok = await notifier._notify_telegram(event, session, "response body", use_markdown=False)
+
+    assert ok is False
+    manager._ensure_telegram_topic.assert_awaited_once_with(session)
+    telegram.send_notification.assert_not_awaited()
