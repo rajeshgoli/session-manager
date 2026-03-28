@@ -542,6 +542,7 @@ class OutputMonitor:
                     allow_reply_fallback=self._should_allow_reply_fallback(
                         session, telegram_bot
                     ),
+                    session_id=session_id,
                 )
 
                 if msg_id is not None:
@@ -609,6 +610,7 @@ class OutputMonitor:
                             allow_reply_fallback=self._should_allow_reply_fallback(
                                 session, telegram_bot
                             ),
+                            session_id=session_id,
                         ),
                         timeout=self._cleanup_notify_timeout,
                     )

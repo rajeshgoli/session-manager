@@ -311,6 +311,8 @@ class SessionManagerApp:
         tool_logging_config = config.get("tool_logging", {})
         db_path = tool_logging_config.get("db_path", "~/.local/share/claude-sessions/tool_usage.db")
         self.tool_logger = ToolLogger(db_path=db_path)
+        if self.telegram_bot:
+            self.telegram_bot.set_telemetry_logger(self.tool_logger)
 
         # Create ASGI lifespan — runs post-bind work only after uvicorn
         # successfully binds the port.  Doomed instances (port already in use)
@@ -518,13 +520,14 @@ class SessionManagerApp:
                     session = self.session_manager.get_session(session_id)
                     session_name = session.name if session else session_id
                     working_dir = session.working_dir if session else "unknown"
-                    await self.telegram_bot.bot.send_message(
+                    await self.telegram_bot.send_notification(
                         chat_id=chat_id,
+                        session_id=session_id,
                         message_thread_id=topic_id,
-                        text=f"Session created: {session_name}\n"
-                             f"ID: {session_id}\n"
-                             f"Directory: {working_dir}\n\n"
-                             "Send messages here to interact with Claude."
+                        message=f"Session created: {session_name}\n"
+                        f"ID: {session_id}\n"
+                        f"Directory: {working_dir}\n\n"
+                        "Send messages here to interact with Claude."
                     )
                 except Exception as e:
                     logger.warning(f"Failed to send welcome message in topic: {e}")

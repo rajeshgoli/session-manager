@@ -175,6 +175,7 @@ class Notifier:
         msg_id = await self.telegram.send_notification(
             chat_id=chat_id,
             message=message,
+            session_id=event.session_id,
             reply_to_message_id=reply_to if not topic_id else None,
             message_thread_id=topic_id,
             parse_mode=parse_mode,

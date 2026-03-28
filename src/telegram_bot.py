@@ -216,6 +216,7 @@ class TelegramBot:
         self._typing_indicator_tasks: dict[str, asyncio.Task] = {}
         # Track "/force next message" arming per (chat, user, session)
         self._force_next_inputs: set[tuple[int, int, str]] = set()
+        self._telemetry_logger = None
 
     @staticmethod
     def _is_known_command_text(text: Optional[str]) -> bool:
@@ -313,6 +314,75 @@ class TelegramBot:
     def set_get_subagents_handler(self, handler: Callable[[str], Awaitable[Optional[list]]]):
         """Set handler for getting subagents. Handler receives session_id."""
         self._on_get_subagents = handler
+
+    def set_telemetry_logger(self, telemetry_logger) -> None:
+        """Set async telemetry logger for inbound/outbound Telegram events."""
+        self._telemetry_logger = telemetry_logger
+
+    def _queue_telegram_telemetry(
+        self,
+        *,
+        direction: str,
+        session_id: Optional[str],
+        chat_id: int,
+        result: str,
+    ) -> None:
+        """Log Telegram telemetry without blocking the current request path."""
+        telemetry_logger = getattr(self, "_telemetry_logger", None)
+        if not telemetry_logger:
+            return
+        try:
+            asyncio.create_task(
+                telemetry_logger.log_telegram_telemetry(
+                    direction=direction,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    result=result,
+                )
+            )
+        except RuntimeError:
+            logger.debug("Skipping Telegram telemetry because no event loop is running")
+
+    async def _send_logged_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        session_id: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+        parse_mode: Optional[str] = None,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ):
+        """Send a Telegram message and record outbound telemetry for the attempt."""
+        if not self.bot:
+            raise RuntimeError("Bot not initialized")
+
+        try:
+            message = await self.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            self._queue_telegram_telemetry(
+                direction="out",
+                session_id=session_id,
+                chat_id=chat_id,
+                result="FAILED",
+            )
+            raise
+
+        self._queue_telegram_telemetry(
+            direction="out",
+            session_id=session_id,
+            chat_id=chat_id,
+            result="DELIVERED",
+        )
+        return message
 
     async def _configure_bot_commands(self) -> None:
         """Register a curated bot command menu for private and group chats."""
@@ -588,6 +658,7 @@ class TelegramBot:
         self,
         chat_id: int,
         message: str,
+        session_id: Optional[str] = None,
         reply_to_message_id: Optional[int] = None,
         message_thread_id: Optional[int] = None,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
@@ -602,9 +673,10 @@ class TelegramBot:
 
         for index, chunk in enumerate(chunks, start=1):
             prefix = f"[{index}/{total}]\n" if total > 1 else ""
-            msg = await self.bot.send_message(
+            msg = await self._send_logged_message(
                 chat_id=chat_id,
                 text=f"{prefix}{chunk}",
+                session_id=session_id,
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=message_thread_id,
                 reply_markup=reply_markup if index == 1 else None,
@@ -688,13 +760,14 @@ class TelegramBot:
                         if topic_id:
                             self.register_topic_session(chat_id, topic_id, session.id)
 
-                            await self.bot.send_message(
+                            await self._send_logged_message(
                                 chat_id=chat_id,
                                 message_thread_id=topic_id,
+                                session_id=session.id,
                                 text=f"Session created: {session.name}\n"
-                                     f"ID: {session.id}\n"
-                                     f"Directory: {session.working_dir}\n\n"
-                                     "Send messages here to interact with Claude."
+                                f"ID: {session.id}\n"
+                                f"Directory: {session.working_dir}\n\n"
+                                "Send messages here to interact with Claude."
                             )
 
                             if self._on_update_topic:
@@ -1216,9 +1289,21 @@ Provide ONLY the summary, no preamble or questions."""
                     await update.message.reply_text(
                         "Could not identify session for this topic. The session may have been created before the server started."
                     )
+                self._queue_telegram_telemetry(
+                    direction="in",
+                    session_id=None,
+                    chat_id=chat_id,
+                    result="FAILED",
+                )
                 return  # Silently ignore in General topic
             await update.message.reply_text(
                 "Could not identify session. Reply to a message containing [session_id]."
+            )
+            self._queue_telegram_telemetry(
+                direction="in",
+                session_id=None,
+                chat_id=chat_id,
+                result="FAILED",
             )
             return
 
@@ -1246,6 +1331,7 @@ Provide ONLY the summary, no preamble or questions."""
                     chat_id,
                     update.message.message_thread_id,
                 )
+                telemetry_result = "DELIVERED"
             elif result == DeliveryResult.QUEUED:
                 msg = await update.message.reply_text(
                     f"[{session_id}] ⏳ Queued (delivery deferred)\n"
@@ -1253,17 +1339,33 @@ Provide ONLY the summary, no preamble or questions."""
                 )
                 # Track queued message for potential /force promotion
                 self._pending_input_msgs[session_id] = (chat_id, msg.message_id)
+                telemetry_result = "QUEUED"
             else:
                 await update.message.reply_text(f"[{session_id}] ❌ Failed to send input")
+                telemetry_result = "FAILED"
+
+            self._queue_telegram_telemetry(
+                direction="in",
+                session_id=session_id,
+                chat_id=chat_id,
+                result=telemetry_result,
+            )
 
         except Exception as e:
             logger.error(f"Error sending input: {e}")
             await update.message.reply_text(f"[{session_id}] Error: {e}")
+            self._queue_telegram_telemetry(
+                direction="in",
+                session_id=session_id,
+                chat_id=chat_id,
+                result="FAILED",
+            )
 
     async def send_notification(
         self,
         chat_id: int,
         message: str,
+        session_id: Optional[str] = None,
         reply_to_message_id: Optional[int] = None,
         message_thread_id: Optional[int] = None,
         parse_mode: Optional[str] = None,
@@ -1298,6 +1400,7 @@ Provide ONLY the summary, no preamble or questions."""
                 return await self._send_chunked_notification(
                     chat_id=chat_id,
                     message=plain_message,
+                    session_id=session_id,
                     reply_to_message_id=reply_to_message_id,
                     message_thread_id=message_thread_id,
                     reply_markup=reply_markup,
@@ -1310,9 +1413,10 @@ Provide ONLY the summary, no preamble or questions."""
                 return None
 
         try:
-            msg = await self.bot.send_message(
+            msg = await self._send_logged_message(
                 chat_id=chat_id,
                 text=message,
+                session_id=session_id,
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=message_thread_id,
                 parse_mode=parse_mode,
@@ -1331,13 +1435,15 @@ Provide ONLY the summary, no preamble or questions."""
                         return await self._send_chunked_notification(
                             chat_id=chat_id,
                             message=plain_message,
+                            session_id=session_id,
                             reply_to_message_id=reply_to_message_id,
                             message_thread_id=message_thread_id,
                             reply_markup=reply_markup,
                         )
-                    msg = await self.bot.send_message(
+                    msg = await self._send_logged_message(
                         chat_id=chat_id,
                         text=plain_message,
+                        session_id=session_id,
                         reply_to_message_id=reply_to_message_id,
                         message_thread_id=message_thread_id,
                         reply_markup=reply_markup,
@@ -1360,16 +1466,32 @@ Provide ONLY the summary, no preamble or questions."""
         thread_id: int,
         *,
         allow_reply_fallback: bool = True,
+        session_id: Optional[str] = None,
     ) -> Optional[int]:
         """Try forum-topic delivery; fall back to reply-thread if it fails.
 
         Returns the forum msg_id if forum delivery succeeded, None otherwise.
         """
-        msg_id = await self.send_notification(
-            chat_id=chat_id, message=message, message_thread_id=thread_id, silent=True
-        )
+        send_kwargs = {
+            "chat_id": chat_id,
+            "message": message,
+            "message_thread_id": thread_id,
+            "silent": True,
+        }
+        if session_id is not None:
+            send_kwargs["session_id"] = session_id
+
+        msg_id = await self.send_notification(**send_kwargs)
         if msg_id is None and allow_reply_fallback:
-            await self.send_notification(chat_id=chat_id, message=message, reply_to_message_id=thread_id, silent=True)
+            fallback_kwargs = {
+                "chat_id": chat_id,
+                "message": message,
+                "reply_to_message_id": thread_id,
+                "silent": True,
+            }
+            if session_id is not None:
+                fallback_kwargs["session_id"] = session_id
+            await self.send_notification(**fallback_kwargs)
         return msg_id
 
     def register_session_thread(self, session_id: str, chat_id: int, message_id: int):
@@ -1652,13 +1774,14 @@ Provide ONLY the summary, no preamble or questions."""
         self.register_topic_session(chat_id, topic_id, session.id)
 
         # Send welcome message in the new topic
-        await self.bot.send_message(
+        await self._send_logged_message(
             chat_id=chat_id,
             message_thread_id=topic_id,
+            session_id=session.id,
             text=f"Now following session: {session.name}\n"
-                 f"ID: {session.id}\n"
-                 f"Directory: {session.working_dir}\n\n"
-                 "Send messages here to interact with Claude."
+            f"ID: {session.id}\n"
+            f"Directory: {session.working_dir}\n\n"
+            "Send messages here to interact with Claude."
         )
 
         # Update session with topic info
@@ -1712,13 +1835,14 @@ Provide ONLY the summary, no preamble or questions."""
                         if topic_id:
                             self.register_topic_session(chat_id, topic_id, session.id)
 
-                            await self.bot.send_message(
+                            await self._send_logged_message(
                                 chat_id=chat_id,
                                 message_thread_id=topic_id,
+                                session_id=session.id,
                                 text=f"Session created: {session.name}\n"
-                                     f"ID: {session.id}\n"
-                                     f"Directory: {session.working_dir}\n\n"
-                                     "Send messages here to interact with Claude."
+                                f"ID: {session.id}\n"
+                                f"Directory: {session.working_dir}\n\n"
+                                "Send messages here to interact with Claude."
                             )
 
                             if self._on_update_topic:
@@ -1862,13 +1986,14 @@ Provide ONLY the summary, no preamble or questions."""
             self.register_topic_session(chat_id, topic_id, session.id)
 
             # Send welcome message in the new topic
-            await self.bot.send_message(
+            await self._send_logged_message(
                 chat_id=chat_id,
                 message_thread_id=topic_id,
+                session_id=session.id,
                 text=f"Now following session: {session.name}\n"
-                     f"ID: {session.id}\n"
-                     f"Directory: {session.working_dir}\n\n"
-                     "Send messages here to interact with Claude."
+                f"ID: {session.id}\n"
+                f"Directory: {session.working_dir}\n\n"
+                "Send messages here to interact with Claude."
             )
 
             # Update session with topic info

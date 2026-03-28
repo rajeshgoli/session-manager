@@ -4,12 +4,36 @@ Covers internal logic not exercised by regression tests that mock at the
 whole-function boundary.
 """
 
-import pytest
-from unittest.mock import Mock, AsyncMock, MagicMock, call, patch
+import asyncio
+import sqlite3
+import time
 from types import SimpleNamespace
+from unittest.mock import Mock, AsyncMock, MagicMock, call, patch
+
+import pytest
 
 from src.models import DeliveryResult
 from src.telegram_bot import TelegramBot, TELEGRAM_MESSAGE_CHAR_LIMIT
+from src.tool_logger import ToolLogger
+
+
+async def _wait_for_telegram_telemetry_row(db_path, *, timeout: float = 1.0):
+    """Poll for the latest Telegram telemetry row inserted by async fire-and-forget logging."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT direction, session_id, chat_id, result
+                FROM telegram_telemetry
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is not None:
+            return row
+        await asyncio.sleep(0.01)
+    raise AssertionError("Timed out waiting for telegram_telemetry row")
 
 
 # ============================================================================
@@ -32,6 +56,57 @@ async def test_send_notification_silent_logs_warning_not_error():
     assert result is None
     mock_logger.warning.assert_called_once()
     mock_logger.error.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_logs_inbound_telegram_telemetry(tmp_path):
+    """Inbound message handling should enqueue a telegram_telemetry row."""
+    db_path = tmp_path / "tool_usage.db"
+    telemetry_logger = ToolLogger(db_path=str(db_path))
+    tg = TelegramBot(token="test-token")
+    tg.set_telemetry_logger(telemetry_logger)
+    tg._on_session_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+    tg._is_allowed = lambda chat_id, user_id=None: True
+    tg._get_session_from_context = lambda update: "sess123"
+    tg._start_typing_indicator = Mock()
+
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=100, is_forum=True),
+        effective_user=SimpleNamespace(id=200),
+        message=SimpleNamespace(
+            text="hello",
+            message_id=3,
+            message_thread_id=10,
+            reply_text=AsyncMock(),
+        ),
+    )
+
+    await tg._handle_message(update, SimpleNamespace(args=[]))
+
+    row = await _wait_for_telegram_telemetry_row(str(db_path))
+    assert row == ("in", "sess123", "100", "DELIVERED")
+
+
+@pytest.mark.asyncio
+async def test_send_notification_logs_outbound_telegram_telemetry(tmp_path):
+    """Outbound bot sends should enqueue a telegram_telemetry row."""
+    db_path = tmp_path / "tool_usage.db"
+    telemetry_logger = ToolLogger(db_path=str(db_path))
+    tg = TelegramBot(token="test-token")
+    tg.set_telemetry_logger(telemetry_logger)
+    tg.bot = AsyncMock()
+    tg.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=301))
+
+    result = await tg.send_notification(
+        chat_id=10000,
+        message="hello",
+        session_id="sess123",
+        message_thread_id=50000,
+    )
+
+    assert result == 301
+    row = await _wait_for_telegram_telemetry_row(str(db_path))
+    assert row == ("out", "sess123", "10000", "DELIVERED")
 
 
 @pytest.mark.asyncio
