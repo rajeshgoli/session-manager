@@ -534,12 +534,14 @@ class OutputMonitor:
                 thread_id = session.telegram_thread_id
                 chat_id = session.telegram_chat_id
 
-                # Try forum-topic delivery first; fall back to reply-thread on failure.
+                # Suppress reply fallback only for confirmed forum-topic sessions.
                 msg_id = await telegram_bot.send_with_fallback(
                     chat_id=chat_id,
                     message=completion_msg,
                     thread_id=thread_id,
-                    allow_reply_fallback=False,
+                    allow_reply_fallback=self._should_allow_reply_fallback(
+                        session, telegram_bot
+                    ),
                 )
 
                 if msg_id is not None:
@@ -597,14 +599,16 @@ class OutputMonitor:
 
                 msg_id = None
                 try:
-                    # Try forum-topic delivery first; fall back to reply-thread on failure.
+                    # Suppress reply fallback only for confirmed forum-topic sessions.
                     # send_with_fallback() returns the forum msg_id if forum succeeded, None otherwise.
                     msg_id = await asyncio.wait_for(
                         telegram_bot.send_with_fallback(
                             chat_id=chat_id,
                             message=stopped_msg,
                             thread_id=thread_id,
-                            allow_reply_fallback=False,
+                            allow_reply_fallback=self._should_allow_reply_fallback(
+                                session, telegram_bot
+                            ),
                         ),
                         timeout=self._cleanup_notify_timeout,
                     )
@@ -661,6 +665,33 @@ class OutputMonitor:
         self._output_history.pop(session_id, None)
         self._tasks.pop(session_id, None)
         logger.info(f"Completed cleanup for session {session_id}")
+
+    def _should_allow_reply_fallback(self, session: Session, telegram_bot: object) -> bool:
+        """Return whether cleanup sends may fall back to reply-thread mode."""
+        chat_id = session.telegram_chat_id
+        thread_id = session.telegram_thread_id
+        if not chat_id or not thread_id:
+            return True
+
+        topic_sessions = getattr(telegram_bot, "_topic_sessions", {}) or {}
+        if (chat_id, thread_id) in topic_sessions:
+            return False
+
+        session_manager = self._session_manager
+        get_topic_record = (
+            getattr(session_manager, "get_active_telegram_topic_record", None)
+            if session_manager
+            else None
+        )
+        if callable(get_topic_record):
+            try:
+                record = get_topic_record(session.id, chat_id)
+            except Exception:
+                record = None
+            if record and getattr(record, "thread_id", None) == thread_id:
+                return False
+
+        return True
 
     async def _handle_session_died(self, session: Session):
         """

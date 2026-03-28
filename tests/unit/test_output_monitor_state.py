@@ -169,3 +169,57 @@ async def test_cleanup_session_notification_timeout_is_non_fatal():
     assert sm.notifier.telegram.call_kwargs["allow_reply_fallback"] is False
     assert session.id not in sm.sessions
     assert sm.saved >= 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_allows_reply_fallback_for_legacy_reply_threads():
+    class _Telegram:
+        def __init__(self):
+            self.bot = SimpleNamespace(close_forum_topic=self._close_forum_topic)
+            self._topic_sessions = {}
+            self._session_threads = {"monreply1": 777}
+            self.call_kwargs = None
+
+        async def send_with_fallback(
+            self,
+            chat_id: int,
+            message: str,
+            thread_id: int,
+            *,
+            allow_reply_fallback: bool = True,
+        ):
+            self.call_kwargs = {
+                "chat_id": chat_id,
+                "message": message,
+                "thread_id": thread_id,
+                "allow_reply_fallback": allow_reply_fallback,
+            }
+            return None
+
+        async def _close_forum_topic(self, chat_id: int, message_thread_id: int):
+            return None
+
+    class _SessionManager:
+        def __init__(self, session: Session):
+            self.sessions = {session.id: session}
+            self.notifier = SimpleNamespace(telegram=_Telegram())
+            self.saved = 0
+
+        def _save_state(self):
+            self.saved += 1
+
+        def get_active_telegram_topic_record(self, session_id: str, chat_id: int):
+            return None
+
+    session = _make_session("monreply1")
+    session.telegram_chat_id = 987
+    session.telegram_thread_id = 777
+    monitor = OutputMonitor()
+    sm = _SessionManager(session)
+    monitor.set_session_manager(sm)
+
+    await monitor.cleanup_session(session)
+
+    assert sm.notifier.telegram.call_kwargs is not None
+    assert sm.notifier.telegram.call_kwargs["allow_reply_fallback"] is True
+    assert session.id not in sm.sessions

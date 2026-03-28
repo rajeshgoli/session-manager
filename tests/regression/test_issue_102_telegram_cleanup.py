@@ -43,7 +43,7 @@ def mock_session_manager():
     manager.notifier = Mock()
     manager.notifier.telegram = Mock()
     manager.notifier.telegram.bot = AsyncMock()
-    manager.notifier.telegram._topic_sessions = {}
+    manager.notifier.telegram._topic_sessions = {(12345, 67890): "test123"}
     manager.notifier.telegram._session_threads = {}
     # send_with_fallback is async; return a message_id so forum path is taken
     manager.notifier.telegram.send_with_fallback = AsyncMock(return_value=9999)
