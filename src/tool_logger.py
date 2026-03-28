@@ -135,6 +135,18 @@ class ToolLogger:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_id ON tool_usage(agent_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_name ON tool_usage(project_name)")
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_telemetry (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
+                    session_id TEXT,
+                    chat_id TEXT,
+                    result TEXT
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tg_timestamp ON telegram_telemetry(timestamp)")
+
             conn.commit()
 
     def _detect_destructive(self, tool_name: str, tool_input: dict) -> tuple[bool, Optional[str]]:
@@ -279,3 +291,47 @@ class ToolLogger:
             )
         except Exception as e:
             logger.error(f"Failed to log tool usage: {e}")
+
+    def _do_log_telegram_sync(
+        self,
+        direction: str,
+        session_id: Optional[str],
+        chat_id: Optional[int | str],
+        result: Optional[str],
+    ) -> None:
+        """Synchronously log a Telegram telemetry event."""
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO telegram_telemetry (direction, session_id, chat_id, result)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    direction,
+                    session_id,
+                    str(chat_id) if chat_id is not None else None,
+                    result,
+                ),
+            )
+            conn.commit()
+
+    async def log_telegram_telemetry(
+        self,
+        direction: str,
+        session_id: Optional[str],
+        chat_id: Optional[int | str],
+        result: Optional[str],
+    ) -> None:
+        """Log a Telegram telemetry event without blocking the event loop."""
+        try:
+            await asyncio.to_thread(
+                self._do_log_telegram_sync,
+                direction,
+                session_id,
+                chat_id,
+                result,
+            )
+        except Exception as e:
+            logger.error(f"Failed to log Telegram telemetry: {e}")

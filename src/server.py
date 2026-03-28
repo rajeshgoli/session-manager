@@ -877,6 +877,7 @@ async def _handle_em_topic_inheritance(session, session_manager, telegram_bot):
             chat_id=new_chat_id,
             message=f"EM session [{session.id}] continuing",
             thread_id=old_thread_id,
+            session_id=session.id,
         )
     except Exception as e:
         logger.warning(f"EM topic inheritance: failed to post continuation message: {e}")
@@ -2884,6 +2885,7 @@ def create_app(
                 chat_id=chat_id,
                 message=cleared_msg,
                 thread_id=thread_id,
+                session_id=session_id,
             )
 
         # Cancel periodic remind and parent wake (context reset means task is over) (#188, #225-C)
