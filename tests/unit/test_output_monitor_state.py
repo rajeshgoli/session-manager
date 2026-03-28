@@ -76,8 +76,22 @@ async def test_cleanup_session_continues_when_telegram_notify_fails():
             self.bot = SimpleNamespace(close_forum_topic=_close_forum_topic)
             self._topic_sessions = {(123, 456): "monclean1"}
             self._session_threads = {"monclean1": 456}
+            self.call_kwargs = None
 
-        async def send_with_fallback(self, chat_id: int, message: str, thread_id: int):
+        async def send_with_fallback(
+            self,
+            chat_id: int,
+            message: str,
+            thread_id: int,
+            *,
+            allow_reply_fallback: bool = True,
+        ):
+            self.call_kwargs = {
+                "chat_id": chat_id,
+                "message": message,
+                "thread_id": thread_id,
+                "allow_reply_fallback": allow_reply_fallback,
+            }
             raise RuntimeError("telegram down")
 
     class _SessionManager:
@@ -98,6 +112,8 @@ async def test_cleanup_session_continues_when_telegram_notify_fails():
 
     await monitor.cleanup_session(session)
 
+    assert sm.notifier.telegram.call_kwargs is not None
+    assert sm.notifier.telegram.call_kwargs["allow_reply_fallback"] is False
     assert session.id not in sm.sessions
     assert sm.saved >= 1
 
@@ -109,8 +125,22 @@ async def test_cleanup_session_notification_timeout_is_non_fatal():
             self.bot = SimpleNamespace(close_forum_topic=self._close_forum_topic)
             self._topic_sessions = {(321, 654): "monclean2"}
             self._session_threads = {"monclean2": 654}
+            self.call_kwargs = None
 
-        async def send_with_fallback(self, chat_id: int, message: str, thread_id: int):
+        async def send_with_fallback(
+            self,
+            chat_id: int,
+            message: str,
+            thread_id: int,
+            *,
+            allow_reply_fallback: bool = True,
+        ):
+            self.call_kwargs = {
+                "chat_id": chat_id,
+                "message": message,
+                "thread_id": thread_id,
+                "allow_reply_fallback": allow_reply_fallback,
+            }
             await asyncio.sleep(0.2)
             return None
 
@@ -135,5 +165,7 @@ async def test_cleanup_session_notification_timeout_is_non_fatal():
 
     await monitor.cleanup_session(session)
 
+    assert sm.notifier.telegram.call_kwargs is not None
+    assert sm.notifier.telegram.call_kwargs["allow_reply_fallback"] is False
     assert session.id not in sm.sessions
     assert sm.saved >= 1

@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Optional
 
-from .models import Session, NotificationEvent, NotificationChannel, ReviewResult
+from .models import Session, SessionStatus, NotificationEvent, NotificationChannel, ReviewResult
 from .telegram_bot import TelegramBot, escape_markdown_v2, create_permission_keyboard
 from .email_handler import EmailHandler
 
@@ -126,6 +126,27 @@ class Notifier:
             chat_id = session.telegram_chat_id
             topic_id = session.telegram_thread_id  # Can be forum topic or reply thread
             reply_to = session.telegram_thread_id  # Same field, used for both
+            if chat_id and not topic_id:
+                session_manager = getattr(self, "session_manager", None)
+                ensure_topic = getattr(session_manager, "_ensure_telegram_topic", None) if session_manager else None
+                if callable(ensure_topic) and getattr(session, "status", None) != SessionStatus.STOPPED:
+                    try:
+                        await ensure_topic(session)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to ensure Telegram topic for live session %s before notifying: %s",
+                            event.session_id,
+                            exc,
+                        )
+                    chat_id = session.telegram_chat_id
+                    topic_id = session.telegram_thread_id
+                    reply_to = session.telegram_thread_id
+                if chat_id and not topic_id:
+                    logger.warning(
+                        "Suppressing Telegram notification for session %s: no live topic routing available",
+                        event.session_id,
+                    )
+                    return False
         else:
             # Try to get from session thread registry
             thread_info = self.telegram.get_session_thread(event.session_id)

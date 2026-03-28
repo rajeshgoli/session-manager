@@ -539,6 +539,7 @@ class OutputMonitor:
                     chat_id=chat_id,
                     message=completion_msg,
                     thread_id=thread_id,
+                    allow_reply_fallback=False,
                 )
 
                 if msg_id is not None:
@@ -603,6 +604,7 @@ class OutputMonitor:
                             chat_id=chat_id,
                             message=stopped_msg,
                             thread_id=thread_id,
+                            allow_reply_fallback=False,
                         ),
                         timeout=self._cleanup_notify_timeout,
                     )
