@@ -112,6 +112,7 @@ class TestHealthCheckBasic:
             "message_queue",
             "telegram",
             "monitors",
+            "infrastructure",
         ]
 
         for check in expected_checks:

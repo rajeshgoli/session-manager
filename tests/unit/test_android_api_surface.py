@@ -180,6 +180,55 @@ def test_client_session_reports_details_when_external_attach_not_configured():
     }
 
 
+def test_client_session_reports_details_when_attach_infra_is_down():
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_android_config(),
+    )
+    app.state.infra_supervisor = MagicMock()
+    app.state.infra_supervisor.get_check.side_effect = lambda name: {
+        "status": "error",
+        "message": "android attach sshd is unavailable",
+    } if name == "android_sshd" else None
+    client = TestClient(app)
+
+    response = client.get(f"/client/sessions/{session.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["termux_attach"] == {
+        "supported": False,
+        "reason": "android attach sshd is unavailable",
+        "transport": "termux-ssh-tmux",
+    }
+    assert payload["primary_action"] == {
+        "type": "details",
+        "label": "View details",
+    }
+
+
+def test_client_bootstrap_disables_termux_attach_when_attach_infra_is_down():
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_android_config(),
+    )
+    app.state.infra_supervisor = MagicMock()
+    app.state.infra_supervisor.get_check.side_effect = lambda name: {
+        "status": "error",
+        "message": "android attach sshd is unavailable",
+    } if name == "android_sshd" else None
+    client = TestClient(app)
+
+    response = client.get("/client/bootstrap")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["external_access"]["termux_attach_supported"] is False
+    assert payload["session_open_defaults"]["preferred_action"] == "details"
+
+
 def test_client_session_reports_headless_provider_as_details():
     session = _session(session_id="app1001", provider="codex-app", status=SessionStatus.IDLE)
     manager = _manager(session)

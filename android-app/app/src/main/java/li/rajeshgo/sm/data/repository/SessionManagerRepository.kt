@@ -7,6 +7,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import li.rajeshgo.sm.data.model.ActivityActionRow
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
@@ -32,6 +34,8 @@ class SessionManagerRepository {
     private companion object {
         private const val READ_RETRY_ATTEMPTS = 3
         private const val READ_RETRY_BASE_DELAY_MS = 600L
+        private const val GENERIC_TRANSIENT_READ_MESSAGE = "Server temporarily unavailable. Retrying soon."
+        private const val GENERIC_TRANSIENT_WRITE_MESSAGE = "Server temporarily unavailable. Try again."
     }
 
     private fun api(baseUrl: String, token: String = ""): ApiService {
@@ -50,6 +54,25 @@ class SessionManagerRepository {
             .create(ApiService::class.java)
     }
 
+    private fun extractServerMessage(error: HttpException): String? {
+        val body = runCatching { error.response()?.errorBody()?.string() }.getOrNull()?.trim().orEmpty()
+        if (body.isBlank()) {
+            return null
+        }
+        val parsedMessage = runCatching {
+            val obj = json.parseToJsonElement(body).jsonObject
+            listOf("detail", "message", "error")
+                .firstNotNullOfOrNull { key ->
+                    obj[key]
+                        ?.jsonPrimitive
+                        ?.content
+                        ?.trim()
+                        ?.takeIf { it.isNotBlank() }
+                }
+        }.getOrNull()
+        return parsedMessage ?: body.takeIf { !it.startsWith("<!DOCTYPE") && !it.startsWith("<html", ignoreCase = true) }
+    }
+
     private suspend fun <T> executeReadRequest(
         baseUrl: String,
         token: String = "",
@@ -63,14 +86,18 @@ class SessionManagerRepository {
                 when (error.code()) {
                     401, 403 -> throw SessionManagerAuthException("Session expired. Sign in again.", error)
                     502, 503, 504 -> {
+                        val serverMessage = extractServerMessage(error)
                         lastTransient = error
                         if (attempt < READ_RETRY_ATTEMPTS - 1) {
                             delay(READ_RETRY_BASE_DELAY_MS * (attempt + 1))
                             return@repeat
                         }
-                        throw SessionManagerTransientException("Server temporarily unavailable. Retrying soon.", error)
+                        throw SessionManagerTransientException(serverMessage ?: GENERIC_TRANSIENT_READ_MESSAGE, error)
                     }
-                    else -> throw SessionManagerRequestException("Request failed (${error.code()})", error)
+                    else -> throw SessionManagerRequestException(
+                        extractServerMessage(error) ?: "Request failed (${error.code()})",
+                        error,
+                    )
                 }
             } catch (error: IOException) {
                 lastTransient = error
@@ -88,8 +115,14 @@ class SessionManagerRepository {
         if (error is HttpException) {
             return when (error.code()) {
                 401, 403 -> SessionManagerAuthException("Session expired. Sign in again.", error)
-                502, 503, 504 -> SessionManagerTransientException("Server temporarily unavailable. Try again.", error)
-                else -> SessionManagerRequestException("Request failed (${error.code()})", error)
+                502, 503, 504 -> SessionManagerTransientException(
+                    extractServerMessage(error) ?: GENERIC_TRANSIENT_WRITE_MESSAGE,
+                    error,
+                )
+                else -> SessionManagerRequestException(
+                    extractServerMessage(error) ?: "Request failed (${error.code()})",
+                    error,
+                )
             }
         }
         if (error is IOException) {
