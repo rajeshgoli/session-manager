@@ -1102,6 +1102,7 @@ def create_app(
                     soft_threshold=track_seconds,
                     hard_threshold=_track_hard_threshold_seconds(track_seconds),
                     cancel_on_reply_session_id=parent_id,
+                    persistent_tracking=True,
                 )
             except Exception as exc:
                 _append_warning("failed to register spawn tracking", exc)

@@ -804,6 +804,16 @@ class TestCrashRecovery:
     @pytest.mark.asyncio
     async def test_recover_restores_cancel_on_reply_session_id(self, mock_session_manager, temp_db_path):
         """Crash recovery restores tracked-reply cancellation metadata."""
+        mock_session_manager.tmux.session_exists.return_value = True
+        tracked = Session(
+            id="agent10b",
+            name="agent10b",
+            working_dir="/tmp",
+            tmux_session="claude-agent10b",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.sessions = {tracked.id: tracked}
+        mock_session_manager.get_session.side_effect = lambda sid: mock_session_manager.sessions.get(sid)
         mq1 = MessageQueueManager(
             session_manager=mock_session_manager,
             db_path=temp_db_path,
@@ -834,6 +844,16 @@ class TestCrashRecovery:
     @pytest.mark.asyncio
     async def test_recover_restores_tracked_status_nudge_state(self, mock_session_manager, temp_db_path):
         """Crash recovery restores tracked status nudge progress for tracked reminders."""
+        mock_session_manager.tmux.session_exists.return_value = True
+        tracked = Session(
+            id="agent10c",
+            name="agent10c",
+            working_dir="/tmp",
+            tmux_session="claude-agent10c",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.sessions = {tracked.id: tracked}
+        mock_session_manager.get_session.side_effect = lambda sid: mock_session_manager.sessions.get(sid)
         mq = MessageQueueManager(
             session_manager=mock_session_manager,
             db_path=temp_db_path,
@@ -1207,6 +1227,7 @@ class TestDatabaseSchema:
         conn.close()
         assert "cancel_on_reply_session_id" in columns
         assert "tracked_status_nudge_fired" in columns
+        assert "persistent_tracking" in columns
 
 
 class TestTrackedReplyCancellation:
@@ -1286,6 +1307,45 @@ class TestTrackedReplyCancellation:
         assert cancelled is True
         pending = mq.get_pending_messages("parent406queued")
         assert pending == []
+
+    def test_persistent_tracked_reply_refreshes_instead_of_cancelling(self, mq):
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                "child406persist",
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id="parent406persist",
+                persistent_tracking=True,
+            )
+            mq.queue_message(
+                target_session_id="parent406persist",
+                sender_session_id="child406persist",
+                text="[sm track] Waiting on child406persist (child406)",
+                delivery_mode="important",
+                message_category="track_remind",
+                trigger_delivery=False,
+            )
+            mq.queue_message(
+                target_session_id="child406persist",
+                text='[sm remind] Update your status within the next minute',
+                delivery_mode="important",
+                message_category="track_status_nudge",
+                trigger_delivery=False,
+            )
+
+        reg = mq._remind_registrations["child406persist"]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=120)
+
+        cancelled = mq.cancel_tracked_remind_on_reply("child406persist", "parent406persist")
+
+        assert cancelled is True
+        assert "child406persist" in mq._remind_registrations
+        reg = mq._remind_registrations["child406persist"]
+        assert reg.persistent_tracking is True
+        assert reg.cancel_on_reply_session_ids == ("parent406persist",)
+        assert (datetime.now() - reg.last_reset_at).total_seconds() < 5
+        assert mq.get_pending_messages("parent406persist") == []
+        assert mq.get_pending_messages("child406persist") == []
 
     @pytest.mark.asyncio
     async def test_send_input_cancels_tracked_remind_on_reply(self, mq):
@@ -1707,3 +1767,141 @@ class TestTrackedReminderDelivery:
 
         assert result == DeliveryResult.DELIVERED
         assert child.id not in mq._remind_registrations
+
+    @pytest.mark.asyncio
+    async def test_persistent_spawn_tracking_survives_reply_and_resets_timer(self, mq):
+        parent = Session(
+            id="parent480",
+            name="parent480",
+            working_dir="/tmp",
+            tmux_session="claude-parent480",
+            status=SessionStatus.IDLE,
+        )
+        child = Session(
+            id="child480",
+            name="child480",
+            working_dir="/tmp",
+            tmux_session="claude-child480",
+            status=SessionStatus.RUNNING,
+        )
+        mq.session_manager.sessions = {parent.id: parent, child.id: child}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+        mq._get_or_create_state(parent.id).is_idle = True
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                child.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id=parent.id,
+                persistent_tracking=True,
+            )
+
+        reg = mq._remind_registrations[child.id]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=180)
+
+        sm = SessionManager.__new__(SessionManager)
+        sm.sessions = mq.session_manager.sessions
+        sm.message_queue_manager = mq
+        sm.notifier = None
+        sm._save_state = MagicMock()
+        sm._deliver_direct = AsyncMock(return_value=True)
+
+        with patch("asyncio.create_task", noop_create_task):
+            result = await sm.send_input(
+                session_id=parent.id,
+                text="done",
+                sender_session_id=child.id,
+                delivery_mode="sequential",
+                from_sm_send=True,
+            )
+
+        assert result == DeliveryResult.DELIVERED
+        assert child.id in mq._remind_registrations
+        reg = mq._remind_registrations[child.id]
+        assert reg.persistent_tracking is True
+        assert (datetime.now() - reg.last_reset_at).total_seconds() < 5
+
+    @pytest.mark.asyncio
+    async def test_status_resets_persistent_tracking_timer(self, mq):
+        target = Session(
+            id="target480status",
+            name="target480status",
+            working_dir="/tmp",
+            tmux_session="claude-target480status",
+            status=SessionStatus.RUNNING,
+        )
+        mq.session_manager.sessions = {target.id: target}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                target.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id="owner480status",
+                persistent_tracking=True,
+            )
+
+        reg = mq._remind_registrations[target.id]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=200)
+        previous = reg.last_reset_at
+
+        mq.reset_remind(target.id)
+
+        reg = mq._remind_registrations[target.id]
+        assert reg.last_reset_at > previous
+        assert reg.persistent_tracking is True
+
+    @pytest.mark.asyncio
+    async def test_followup_send_refreshes_persistent_spawn_tracking(self, mq):
+        parent = Session(
+            id="parent480follow",
+            name="parent480follow",
+            working_dir="/tmp",
+            tmux_session="claude-parent480follow",
+            status=SessionStatus.IDLE,
+        )
+        child = Session(
+            id="child480follow",
+            name="child480follow",
+            working_dir="/tmp",
+            tmux_session="claude-child480follow",
+            status=SessionStatus.IDLE,
+        )
+        mq.session_manager.sessions = {parent.id: parent, child.id: child}
+        mq.session_manager.get_session = lambda sid: mq.session_manager.sessions.get(sid)
+        mq._get_or_create_state(child.id).is_idle = True
+
+        with patch("asyncio.create_task", noop_create_task):
+            mq.register_periodic_remind(
+                child.id,
+                soft_threshold=300,
+                hard_threshold=600,
+                cancel_on_reply_session_id=parent.id,
+                persistent_tracking=True,
+            )
+
+        reg = mq._remind_registrations[child.id]
+        reg.last_reset_at = datetime.now() - timedelta(seconds=240)
+
+        sm = SessionManager.__new__(SessionManager)
+        sm.sessions = mq.session_manager.sessions
+        sm.message_queue_manager = mq
+        sm.notifier = None
+        sm._save_state = MagicMock()
+        sm._deliver_direct = AsyncMock(return_value=True)
+
+        with patch("asyncio.create_task", noop_create_task):
+            result = await sm.send_input(
+                session_id=child.id,
+                text="keep going",
+                sender_session_id=parent.id,
+                delivery_mode="sequential",
+                from_sm_send=True,
+            )
+
+        assert result == DeliveryResult.DELIVERED
+        reg = mq._remind_registrations[child.id]
+        assert reg.persistent_tracking is True
+        assert (datetime.now() - reg.last_reset_at).total_seconds() < 5
