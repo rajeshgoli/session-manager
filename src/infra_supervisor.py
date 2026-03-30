@@ -246,11 +246,15 @@ class InfrastructureSupervisor:
         return "state = running" in output or "state = xpcproxy" in output
 
     def _on_ac_power(self) -> bool:
-        result = subprocess.run(
-            ["pmset", "-g", "batt"],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["pmset", "-g", "batt"],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            logger.warning("pmset is unavailable; skipping AC power detection")
+            return True
         if result.returncode != 0:
             return True
         return "AC Power" in (result.stdout or "")
@@ -258,7 +262,7 @@ class InfrastructureSupervisor:
     @staticmethod
     def _parse_sshd_listener_targets(config_path: Path) -> list[tuple[str, int]]:
         port = 22
-        listen_addresses: list[str] = []
+        listen_addresses: list[tuple[str, Optional[int]]] = []
         for raw_line in config_path.read_text().splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -274,10 +278,26 @@ class InfrastructureSupervisor:
                 except ValueError:
                     continue
             elif key == "listenaddress":
-                listen_addresses.append(value)
+                listen_port: Optional[int] = None
+                host = value
+                if value.startswith("[") and "]:" in value:
+                    host_part, port_part = value.rsplit("]:", 1)
+                    host = host_part[1:]
+                    try:
+                        listen_port = int(port_part)
+                    except ValueError:
+                        listen_port = None
+                elif value.count(":") == 1:
+                    host_part, port_part = value.rsplit(":", 1)
+                    try:
+                        listen_port = int(port_part)
+                        host = host_part
+                    except ValueError:
+                        host = value
+                listen_addresses.append((host, listen_port))
         if not listen_addresses:
-            listen_addresses = ["127.0.0.1"]
-        return [(address, port) for address in listen_addresses]
+            listen_addresses = [("127.0.0.1", None)]
+        return [(address, listen_port or port) for address, listen_port in listen_addresses]
 
     @staticmethod
     def _format_targets(targets: list[tuple[str, int]]) -> list[str]:

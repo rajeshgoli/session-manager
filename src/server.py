@@ -1218,13 +1218,6 @@ def create_app(
         public_ssh_host = str((_external_access_config().get("public_ssh_host") or "")).strip()
         if not public_ssh_host:
             return None
-        supervisor = getattr(app.state, "infra_supervisor", None)
-        refresher = getattr(supervisor, "ensure_now", None) if supervisor else None
-        if callable(refresher):
-            try:
-                refresher()
-            except Exception:
-                logger.exception("Failed to refresh infra status before termux attach check")
         infra_status = _infra_check("android_sshd")
         if not infra_status:
             return None
