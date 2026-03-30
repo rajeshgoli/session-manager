@@ -228,6 +228,9 @@ class MessageQueueManager:
         if "tracked_status_nudge_fired" not in remind_columns:
             cursor.execute("ALTER TABLE remind_registrations ADD COLUMN tracked_status_nudge_fired INTEGER DEFAULT 0")
             logger.info("Migrated remind_registrations: added tracked_status_nudge_fired column")
+        if "persistent_tracking" not in remind_columns:
+            cursor.execute("ALTER TABLE remind_registrations ADD COLUMN persistent_tracking INTEGER DEFAULT 0")
+            logger.info("Migrated remind_registrations: added persistent_tracking column")
 
         # Parent wake-up registrations table (#225-C)
         cursor.execute("""
@@ -1724,6 +1727,10 @@ class MessageQueueManager:
                             sender_session_id=msg.sender_session_id,
                             recipient_session_id=msg.target_session_id,
                         )
+                        self.refresh_persistent_tracked_remind(
+                            target_session_id=msg.target_session_id,
+                            owner_session_id=msg.sender_session_id,
+                        )
 
                     # Mirror to Telegram (fire-and-forget)
                     if self.notifier:
@@ -1813,6 +1820,10 @@ class MessageQueueManager:
                             sender_session_id=msg.sender_session_id,
                             recipient_session_id=msg.target_session_id,
                         )
+                        self.refresh_persistent_tracked_remind(
+                            target_session_id=msg.target_session_id,
+                            owner_session_id=msg.sender_session_id,
+                        )
 
                     # Handle notifications
                     if msg.notify_on_delivery and msg.sender_session_id:
@@ -1892,6 +1903,10 @@ class MessageQueueManager:
                         self.cancel_tracked_remind_on_reply(
                             sender_session_id=msg.sender_session_id,
                             recipient_session_id=msg.target_session_id,
+                        )
+                        self.refresh_persistent_tracked_remind(
+                            target_session_id=msg.target_session_id,
+                            owner_session_id=msg.sender_session_id,
                         )
 
                     # Handle notifications
@@ -2163,6 +2178,7 @@ class MessageQueueManager:
         soft_threshold: int,
         hard_threshold: int,
         cancel_on_reply_session_id: Optional[str] = None,
+        persistent_tracking: bool = False,
         merge_with_existing: bool = False,
     ) -> str:
         """
@@ -2174,6 +2190,8 @@ class MessageQueueManager:
             hard_threshold: Seconds after last reset before hard (urgent) remind fires
             cancel_on_reply_session_id: Optional session ID that cancels the remind when the
                 target replies to it via sm send (#406)
+            persistent_tracking: Keep requester-facing tracking active across replies/status
+                updates until explicitly stopped (#480)
             merge_with_existing: Preserve existing tracked reply owners for this target (#406)
 
         Returns:
@@ -2189,6 +2207,7 @@ class MessageQueueManager:
             existing.soft_threshold_seconds = min(existing.soft_threshold_seconds, soft_threshold)
             existing.hard_threshold_seconds = min(existing.hard_threshold_seconds, hard_threshold)
             existing.last_reset_at = now
+            existing.persistent_tracking = existing.persistent_tracking or persistent_tracking
             existing.tracked_status_nudge_fired = False
             existing.soft_fired = False
             existing.cancel_on_reply_session_ids = tuple(sorted(owners))
@@ -2197,16 +2216,18 @@ class MessageQueueManager:
                 soft_threshold_seconds=existing.soft_threshold_seconds,
                 hard_threshold_seconds=existing.hard_threshold_seconds,
                 last_reset_at=now,
+                persistent_tracking=1 if existing.persistent_tracking else 0,
                 tracked_status_nudge_fired=False,
                 soft_fired=False,
                 cancel_on_reply_session_id=self._serialize_cancel_on_reply_session_ids(existing.cancel_on_reply_session_ids),
             )
             logger.info(
-                "Periodic remind merged for %s (soft=%ss, hard=%ss, owners=%s, id=%s)",
+                "Periodic remind merged for %s (soft=%ss, hard=%ss, owners=%s, persistent=%s, id=%s)",
                 target_session_id,
                 existing.soft_threshold_seconds,
                 existing.hard_threshold_seconds,
                 existing.cancel_on_reply_session_ids,
+                existing.persistent_tracking,
                 existing.id,
             )
             return existing.id
@@ -2224,6 +2245,7 @@ class MessageQueueManager:
             registered_at=now,
             last_reset_at=now,
             cancel_on_reply_session_ids=cancel_on_reply_session_ids,
+            persistent_tracking=persistent_tracking,
             tracked_status_nudge_fired=False,
         )
         self._remind_registrations[target_session_id] = reg
@@ -2232,8 +2254,8 @@ class MessageQueueManager:
         self._execute("""
             INSERT OR REPLACE INTO remind_registrations
             (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
-             registered_at, last_reset_at, cancel_on_reply_session_id, tracked_status_nudge_fired, soft_fired, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 1)
+             registered_at, last_reset_at, cancel_on_reply_session_id, persistent_tracking, tracked_status_nudge_fired, soft_fired, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1)
         """, (
             reg_id,
             target_session_id,
@@ -2242,6 +2264,7 @@ class MessageQueueManager:
             now.isoformat(),
             now.isoformat(),
             self._serialize_cancel_on_reply_session_ids(cancel_on_reply_session_ids),
+            1 if persistent_tracking else 0,
         ))
 
         # Start async task
@@ -2250,7 +2273,8 @@ class MessageQueueManager:
 
         logger.info(
             f"Periodic remind registered for {target_session_id} "
-            f"(soft={soft_threshold}s, hard={hard_threshold}s, cancel_on_reply={cancel_on_reply_session_ids}, id={reg_id})"
+            f"(soft={soft_threshold}s, hard={hard_threshold}s, "
+            f"cancel_on_reply={cancel_on_reply_session_ids}, persistent={persistent_tracking}, id={reg_id})"
         )
         return reg_id
 
@@ -2262,6 +2286,14 @@ class MessageQueueManager:
         owners = set(reg.cancel_on_reply_session_ids)
         if recipient_session_id not in owners:
             return False
+        if reg.persistent_tracking:
+            self.refresh_persistent_tracked_remind(sender_session_id, recipient_session_id)
+            logger.info(
+                "Persistent tracked remind refreshed for %s after reply to %s",
+                sender_session_id,
+                recipient_session_id,
+            )
+            return True
         owners.discard(recipient_session_id)
         if owners:
             reg.cancel_on_reply_session_ids = tuple(sorted(owners))
@@ -2295,7 +2327,7 @@ class MessageQueueManager:
         reg = self._remind_registrations.get(target_session_id)
         if not reg or not reg.is_active:
             return
-        if reg.cancel_on_reply_session_ids and not force_tracked:
+        if reg.cancel_on_reply_session_ids and not (force_tracked or reg.persistent_tracking):
             logger.debug(
                 "Ignoring reset_remind for tracked session %s; tracking cadence is requester-facing (#408)",
                 target_session_id,
@@ -2314,6 +2346,18 @@ class MessageQueueManager:
             soft_fired=False,
         )
         logger.info(f"Remind timer reset for {target_session_id}")
+
+    def refresh_persistent_tracked_remind(self, target_session_id: str, owner_session_id: str) -> bool:
+        """Refresh persistent spawn tracking when work continues or a reply lands."""
+        reg = self._remind_registrations.get(target_session_id)
+        if not reg or not reg.is_active or not reg.persistent_tracking:
+            return False
+        if owner_session_id not in reg.cancel_on_reply_session_ids:
+            return False
+        self.cancel_queued_track_reminds(target_session_id, owner_session_id)
+        self.cancel_queued_track_status_nudges(target_session_id)
+        self.reset_remind(target_session_id, force_tracked=True)
+        return True
 
     def cancel_queued_track_reminds(self, tracked_session_id: str, owner_session_id: str) -> int:
         """Delete undelivered requester-facing track reminders for one tracked-session/owner pair."""
@@ -2379,7 +2423,10 @@ class MessageQueueManager:
                 lines.append(f'Status: "{status_text}"')
         else:
             lines.append("Status: (no agent status reported)")
-        lines.append(f"Awaiting explicit reply from {target_session_id[:8]}.")
+        if reg.persistent_tracking:
+            lines.append(f"Tracking remains active for {target_session_id[:8]} until you stop it.")
+        else:
+            lines.append(f"Awaiting explicit reply from {target_session_id[:8]}.")
         return "\n".join(lines)
 
     def _tracked_status_nudge_lead_seconds(self, soft_threshold_seconds: int) -> int:
@@ -2723,7 +2770,7 @@ class MessageQueueManager:
         """Recover active remind registrations on server restart."""
         rows = self._execute_query("""
             SELECT id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
-                   registered_at, last_reset_at, cancel_on_reply_session_id, tracked_status_nudge_fired, soft_fired
+                   registered_at, last_reset_at, cancel_on_reply_session_id, persistent_tracking, tracked_status_nudge_fired, soft_fired
             FROM remind_registrations
             WHERE is_active = 1
         """)
@@ -2737,6 +2784,7 @@ class MessageQueueManager:
                 registered_at_str,
                 last_reset_at_str,
                 cancel_on_reply_session_id,
+                persistent_tracking,
                 tracked_status_nudge_fired,
                 soft_fired,
             ) = row
@@ -2767,6 +2815,7 @@ class MessageQueueManager:
                 registered_at=datetime.fromisoformat(registered_at_str),
                 last_reset_at=last_reset_at,
                 cancel_on_reply_session_ids=cancel_on_reply_session_ids,
+                persistent_tracking=bool(persistent_tracking),
                 tracked_status_nudge_fired=bool(tracked_status_nudge_fired),
                 soft_fired=bool(soft_fired),
                 is_active=True,

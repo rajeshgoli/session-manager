@@ -227,7 +227,7 @@ def main():
         const=300,
         type=int,
         metavar="SECONDS",
-        help="Track the child with periodic remind until it replies (default: 300s)",
+        help="Track the child with periodic remind until stopped (default: 300s)",
     )
 
     # sm children [session]

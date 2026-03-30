@@ -1499,7 +1499,7 @@ def cmd_spawn(
         model: Model override (opus, sonnet, haiku)
         working_dir: Working directory override
         json_output: Output JSON format
-        track_seconds: Auto-track the child with periodic remind until it replies (#406)
+        track_seconds: Auto-track the child with periodic remind until stopped (#480)
 
     Exit codes:
         0: Success

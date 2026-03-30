@@ -594,6 +594,7 @@ class RemindRegistration:
     registered_at: datetime
     last_reset_at: datetime  # updated by sm status; initialized on delivery
     cancel_on_reply_session_ids: tuple[str, ...] = field(default_factory=tuple)
+    persistent_tracking: bool = False
     tracked_status_nudge_fired: bool = False
     soft_fired: bool = False
     is_active: bool = True

@@ -255,6 +255,7 @@ class TestSpawnEndpointMonitoring:
             soft_threshold=300,
             hard_threshold=600,
             cancel_on_reply_session_id="eng111bb",
+            persistent_tracking=True,
         )
         assert child.context_monitor_enabled is False
         mock_sm.message_queue_manager.arm_stop_notify.assert_not_called()
