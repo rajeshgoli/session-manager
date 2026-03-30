@@ -944,10 +944,13 @@ def create_app(
     app.state.notifier = notifier
     app.state.output_monitor = output_monitor
     app.state.child_monitor = child_monitor
+    app.state.infra_supervisor = None
     app.state.last_claude_output = {}  # Store last output per session from hooks
     app.state.pending_stop_notifications = set()  # Sessions where Stop hook had empty transcript
     if notifier is not None:
         setattr(notifier, "session_manager", session_manager)
+
+    attach_infra_cache = {"expires_at": 0.0, "issue": None}
 
     # Wire _app back-reference so _execute_handoff can clear server-side caches (#196)
     if session_manager:
@@ -1200,6 +1203,35 @@ def create_app(
     def _external_access_config() -> dict:
         return (app.state.config or {}).get("external_access") or {}
 
+    def _infra_check(name: str) -> Optional[dict[str, Any]]:
+        supervisor = getattr(app.state, "infra_supervisor", None)
+        getter = getattr(supervisor, "get_check", None) if supervisor else None
+        if not callable(getter):
+            return None
+        return getter(name)
+
+    def _termux_attach_infra_issue() -> Optional[str]:
+        now = time.time()
+        if now < attach_infra_cache["expires_at"]:
+            return attach_infra_cache["issue"]
+
+        public_ssh_host = str((_external_access_config().get("public_ssh_host") or "")).strip()
+        if not public_ssh_host:
+            return None
+        infra_status = _infra_check("android_sshd")
+        if not infra_status:
+            return None
+        details = infra_status.get("details") or {}
+        attach_ready = details.get("attach_ready")
+        issue = None
+        if attach_ready is not True and not (
+            attach_ready is None and str(infra_status.get("status") or "").lower() in {"ok", "warning"}
+        ):
+            issue = str(infra_status.get("message") or "android attach sshd is unavailable")
+        attach_infra_cache["issue"] = issue
+        attach_infra_cache["expires_at"] = now + 5.0
+        return issue
+
     def _attach_descriptor(session: Session) -> Optional[dict[str, Any]]:
         sm = app.state.session_manager
         getter = getattr(sm, "get_attach_descriptor", None) if sm else None
@@ -1234,6 +1266,13 @@ def create_app(
             return {
                 "supported": False,
                 "reason": "external ssh attach is not configured",
+                "transport": "termux-ssh-tmux",
+            }
+        infra_issue = _termux_attach_infra_issue()
+        if infra_issue:
+            return {
+                "supported": False,
+                "reason": infra_issue,
                 "transport": "termux-ssh-tmux",
             }
         if not tmux_session:
@@ -1457,7 +1496,7 @@ def create_app(
         public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
         ssh_username = str(external_access.get("ssh_username") or "").strip()
         google_server_client_id = str(google_auth.get("client_id") or "").strip()
-        termux_supported = bool(public_ssh_host and ssh_username)
+        termux_supported = bool(public_ssh_host and ssh_username and not _termux_attach_infra_issue())
 
         return ClientBootstrapResponse(
             auth={
@@ -1707,7 +1746,11 @@ def create_app(
         checks["monitors"] = monitor_check
         update_status(monitor_check.status)
 
-        # 5. Resource Usage
+        infra_check = await _check_infrastructure(app)
+        checks["infrastructure"] = infra_check
+        update_status(infra_check.status)
+
+        # 6. Resource Usage
         resources = _get_resource_usage(app)
 
         return HealthCheckResponse(
@@ -2035,6 +2078,42 @@ def create_app(
                 "output_monitor": output_status,
                 "child_monitor": child_status,
             },
+        )
+
+    async def _check_infrastructure(app) -> HealthCheckResult:
+        """Check local sidecar infrastructure supervised by SM."""
+        supervisor = getattr(app.state, "infra_supervisor", None)
+        snapshot_getter = getattr(supervisor, "snapshot", None) if supervisor else None
+        if not callable(snapshot_getter):
+            return HealthCheckResult(
+                status="ok",
+                message="Infrastructure supervisor not configured",
+                details={"checks": {}},
+            )
+
+        snapshot = snapshot_getter() or {}
+        if not snapshot:
+            return HealthCheckResult(
+                status="warning",
+                message="Infrastructure supervisor has no status yet",
+                details={"checks": {}},
+            )
+
+        statuses = {str(item.get("status") or "").lower() for item in snapshot.values()}
+        if "error" in statuses:
+            status = "error"
+            message = "One or more local sidecars are down"
+        elif "warning" in statuses:
+            status = "warning"
+            message = "One or more local sidecars required recovery"
+        else:
+            status = "ok"
+            message = "Local sidecar infrastructure healthy"
+
+        return HealthCheckResult(
+            status=status,
+            message=message,
+            details={"checks": snapshot},
         )
 
     def _get_resource_usage(app) -> Dict[str, Any]:

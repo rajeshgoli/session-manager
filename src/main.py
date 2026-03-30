@@ -27,6 +27,7 @@ from .child_monitor import ChildMonitor
 from .message_queue import MessageQueueManager
 from .tool_logger import ToolLogger
 from .cli.commands import validate_friendly_name
+from .infra_supervisor import InfrastructureSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +342,9 @@ class SessionManagerApp:
         self.output_monitor.set_hook_output_store(self.app.state.last_claude_output)
         # Expose hook output storage to session manager (Codex uses this)
         self.session_manager.set_hook_output_store(self.app.state.last_claude_output)
+
+        self.infra_supervisor = InfrastructureSupervisor(config)
+        self.app.state.infra_supervisor = self.infra_supervisor
 
         self._shutdown_event = asyncio.Event()
 
@@ -718,6 +722,10 @@ class SessionManagerApp:
         """Start all components."""
         logger.info("Starting Claude Session Manager...")
 
+        # Run local infra repair before serving requests so external attach paths
+        # heal quickly after reboot.
+        self.infra_supervisor.start()
+
         # Pre-flight check: bail immediately if port is already in use.
         # This prevents side effects (Telegram API calls, monitoring restores)
         # from firing on doomed instances during crash-loop restarts.
@@ -776,6 +784,8 @@ class SessionManagerApp:
     async def stop(self):
         """Stop all components."""
         logger.info("Stopping Claude Session Manager...")
+
+        self.infra_supervisor.stop()
 
         # Stop output monitor
         await self.output_monitor.stop_all()
