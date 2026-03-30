@@ -10,6 +10,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import li.rajeshgo.sm.data.model.ActivityActionRow
+import li.rajeshgo.sm.data.model.AnalyticsSummary
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
@@ -178,6 +179,10 @@ class SessionManagerRepository {
 
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getClientSessions().sessions }
+    }
+
+    suspend fun fetchAnalytics(baseUrl: String, token: String): AnalyticsSummary = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getAnalyticsSummary() }
     }
 
     suspend fun killSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {

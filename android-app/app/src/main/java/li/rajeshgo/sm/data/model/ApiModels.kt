@@ -269,3 +269,118 @@ data class SessionDetail(
     val lastError: String? = null,
     val fetchedAt: Long = System.currentTimeMillis(),
 )
+
+@Serializable
+data class AnalyticsSummary(
+    @SerialName("generated_at")
+    val generatedAt: String,
+    @SerialName("window_hours")
+    val windowHours: Int = 24,
+    val kpis: AnalyticsKpiSet = AnalyticsKpiSet(),
+    val throughput: List<AnalyticsThroughputBucket> = emptyList(),
+    @SerialName("state_distribution")
+    val stateDistribution: List<AnalyticsDistributionItem> = emptyList(),
+    @SerialName("provider_distribution")
+    val providerDistribution: List<AnalyticsDistributionItem> = emptyList(),
+    @SerialName("repo_distribution")
+    val repoDistribution: List<AnalyticsRepoItem> = emptyList(),
+    @SerialName("longest_running")
+    val longestRunning: List<AnalyticsLongestRunningItem> = emptyList(),
+    @SerialName("health_checks")
+    val healthChecks: List<AnalyticsHealthCheck> = emptyList(),
+    val reliability: AnalyticsReliability = AnalyticsReliability(),
+    val totals: AnalyticsTotals = AnalyticsTotals(),
+    @SerialName("attach_available")
+    val attachAvailable: Boolean = false,
+)
+
+@Serializable
+data class AnalyticsKpiSet(
+    @SerialName("active_sessions")
+    val activeSessions: AnalyticsKpi = AnalyticsKpi(),
+    @SerialName("sends_24h")
+    val sends24h: AnalyticsKpi = AnalyticsKpi(),
+    @SerialName("spawns_24h")
+    val spawns24h: AnalyticsKpi = AnalyticsKpi(),
+    @SerialName("active_tracks")
+    val activeTracks: AnalyticsKpi = AnalyticsKpi(),
+    @SerialName("overdue_tracks")
+    val overdueTracks: AnalyticsKpi = AnalyticsKpi(),
+    @SerialName("incidents_24h")
+    val incidents24h: AnalyticsKpi = AnalyticsKpi(),
+)
+
+@Serializable
+data class AnalyticsKpi(
+    val label: String = "",
+    val value: Int = 0,
+    @SerialName("delta_pct")
+    val deltaPct: Float? = null,
+)
+
+@Serializable
+data class AnalyticsThroughputBucket(
+    @SerialName("bucket_start")
+    val bucketStart: String,
+    @SerialName("bucket_label")
+    val bucketLabel: String,
+    val sends: Int = 0,
+    val spawns: Int = 0,
+    @SerialName("track_reminders")
+    val trackReminders: Int = 0,
+)
+
+@Serializable
+data class AnalyticsDistributionItem(
+    val key: String,
+    val label: String,
+    val count: Int = 0,
+    @SerialName("share_pct")
+    val sharePct: Float? = null,
+)
+
+@Serializable
+data class AnalyticsRepoItem(
+    val key: String,
+    val label: String,
+    @SerialName("session_count")
+    val sessionCount: Int = 0,
+    @SerialName("tokens_used")
+    val tokensUsed: Int = 0,
+    @SerialName("share_pct")
+    val sharePct: Float = 0f,
+)
+
+@Serializable
+data class AnalyticsLongestRunningItem(
+    val id: String,
+    val name: String,
+    val repo: String,
+    val provider: String,
+    @SerialName("age_hours")
+    val ageHours: Float = 0f,
+)
+
+@Serializable
+data class AnalyticsHealthCheck(
+    val key: String,
+    val label: String,
+    val status: String? = null,
+    val message: String? = null,
+)
+
+@Serializable
+data class AnalyticsReliability(
+    @SerialName("restart_count_24h")
+    val restartCount24h: Int = 0,
+    @SerialName("self_heal_count_24h")
+    val selfHealCount24h: Int = 0,
+)
+
+@Serializable
+data class AnalyticsTotals(
+    @SerialName("tokens_live")
+    val tokensLive: Int = 0,
+    @SerialName("track_reminders_24h")
+    val trackReminders24h: Int = 0,
+)
