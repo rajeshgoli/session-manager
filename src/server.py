@@ -3,13 +3,17 @@
 import asyncio
 import json
 import logging
+import os
 import secrets
+import shutil
 import subprocess
+import tempfile
 import time
 import shlex
 import base64
 import hashlib
 import hmac
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
@@ -19,7 +23,7 @@ import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token as google_id_token
 from fastapi import FastAPI, HTTPException, Body, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -54,6 +58,54 @@ LOCAL_TRUSTED_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
 GOOGLE_AUTH_SCOPES = "openid email profile"
 DEVICE_TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 14
 _EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS = 8
+APP_ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+APP_ARTIFACT_HASH_PATTERN = re.compile(r"^[0-9a-f]{8}$")
+APP_ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
+DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
+
+
+def _is_valid_app_artifact_name(app_name: str) -> bool:
+    return bool(APP_ARTIFACT_NAME_PATTERN.fullmatch(app_name))
+
+
+def _is_valid_app_artifact_hash(artifact_hash: str) -> bool:
+    return bool(APP_ARTIFACT_HASH_PATTERN.fullmatch(artifact_hash))
+
+
+def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON metadata via temp file + replace to avoid partial writes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-meta-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _copy_file_atomically(source_path: Path, destination_path: Path) -> None:
+    """Copy file content via temp file + replace to publish immutable artifacts safely."""
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        dir=str(destination_path.parent),
+        prefix=".tmp-artifact-copy-",
+        suffix=destination_path.suffix,
+    )
+    os.close(fd)
+    try:
+        shutil.copyfile(source_path, temp_path)
+        os.replace(temp_path, destination_path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class WatchStaticFiles(StaticFiles):
@@ -287,7 +339,7 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         path = request.url.path
-        if path in self.exempt_paths:
+        if path in self.exempt_paths or path == "/apk" or path.startswith("/apps/"):
             return await call_next(request)
 
         if not self.ready:
@@ -464,6 +516,25 @@ class DeviceGoogleAuthResponse(BaseModel):
     expires_at: str
     email: str
     name: Optional[str] = None
+
+
+class AppArtifactMetadataResponse(BaseModel):
+    """Metadata describing the latest published Android client artifact."""
+    artifact_hash: str
+    size_bytes: int
+    uploaded_at: str
+    uploaded_by: Optional[str] = None
+    version_code: Optional[int] = None
+    version_name: Optional[str] = None
+
+
+class AppArtifactDeployResponse(BaseModel):
+    """Response for a successful app artifact upload."""
+    ok: bool = True
+    app: str
+    size_bytes: int
+    download_url: str
+    artifact_hash: str
 
 
 class SendInputRequest(BaseModel):
@@ -1203,6 +1274,47 @@ def create_app(
     def _external_access_config() -> dict:
         return (app.state.config or {}).get("external_access") or {}
 
+    def _app_artifacts_root() -> Path:
+        configured = ((app.state.config or {}).get("paths") or {}).get("app_artifacts_dir")
+        if configured:
+            return Path(configured).expanduser()
+        return DEFAULT_APP_ARTIFACTS_ROOT
+
+    def _app_artifact_dir(app_name: str) -> Path:
+        return _app_artifacts_root() / app_name
+
+    def _app_artifact_latest_path(app_name: str) -> Path:
+        return _app_artifact_dir(app_name) / "latest.apk"
+
+    def _app_artifact_hashed_path(app_name: str, artifact_hash: str) -> Path:
+        return _app_artifact_dir(app_name) / f"{artifact_hash}.apk"
+
+    def _app_artifact_meta_path(app_name: str) -> Path:
+        return _app_artifact_dir(app_name) / "meta.json"
+
+    def _read_app_artifact_metadata(app_name: str) -> dict[str, Any]:
+        metadata_path = _app_artifact_meta_path(app_name)
+        if not metadata_path.exists():
+            raise HTTPException(status_code=404, detail="Artifact metadata not found")
+        try:
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("Failed to read artifact metadata for %s: %s", app_name, exc)
+            raise HTTPException(status_code=500, detail="Artifact metadata unreadable") from exc
+
+    def _request_actor_email(request: Request) -> Optional[str]:
+        device_auth = _device_auth_from_request(request, app.state.config)
+        if isinstance(device_auth, dict):
+            email = str(device_auth.get("email") or "").strip().lower()
+            return email or None
+        session_state = getattr(request, "session", {}) or {}
+        email = str(session_state.get("google_email") or "").strip().lower()
+        if email:
+            return email
+        if _is_local_bypass_request(request, app.state.config):
+            return "local_bypass"
+        return None
+
     def _infra_check(name: str) -> Optional[dict[str, Any]]:
         supervisor = getattr(app.state, "infra_supervisor", None)
         getter = getattr(supervisor, "get_check", None) if supervisor else None
@@ -1556,6 +1668,144 @@ def create_app(
             email=email,
             name=str(tokeninfo.get("name") or email),
         )
+
+    @app.post("/deploy/{app_name}", response_model=AppArtifactDeployResponse)
+    async def deploy_app_artifact(request: Request, app_name: str):
+        """Upload the latest Android artifact for an app."""
+        if not _is_valid_app_artifact_name(app_name):
+            raise HTTPException(status_code=400, detail="Invalid app name")
+
+        actor_email = _request_actor_email(request)
+        if actor_email is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        try:
+            form = await request.form()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Expected multipart form upload") from exc
+
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise HTTPException(status_code=400, detail="Missing multipart field 'file'")
+
+        raw_version_code = str(form.get("version_code") or "").strip()
+        version_name = str(form.get("version_name") or "").strip() or None
+        version_code: Optional[int] = None
+        if raw_version_code:
+            try:
+                version_code = int(raw_version_code)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="version_code must be an integer") from exc
+
+        app_dir = _app_artifact_dir(app_name)
+        app_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = _app_artifact_latest_path(app_name)
+        fd, temp_path = tempfile.mkstemp(dir=str(app_dir), prefix=".tmp-artifact-", suffix=".apk")
+        size_bytes = 0
+        sha256 = hashlib.sha256()
+
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                while True:
+                    chunk = await upload.read(64 * 1024)
+                    if not chunk:
+                        break
+                    size_bytes += len(chunk)
+                    if size_bytes > APP_ARTIFACT_MAX_SIZE_BYTES:
+                        raise HTTPException(status_code=413, detail="Artifact exceeds 100 MB limit")
+                    sha256.update(chunk)
+                    handle.write(chunk)
+
+            if size_bytes <= 0:
+                raise HTTPException(status_code=400, detail="Uploaded artifact is empty")
+
+            os.replace(temp_path, artifact_path)
+            artifact_hash = sha256.hexdigest()[:8]
+            hashed_artifact_path = _app_artifact_hashed_path(app_name, artifact_hash)
+            if not hashed_artifact_path.exists():
+                _copy_file_atomically(artifact_path, hashed_artifact_path)
+
+            metadata: dict[str, Any] = {
+                "artifact_hash": artifact_hash,
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                "size_bytes": size_bytes,
+                "uploaded_by": actor_email,
+            }
+            if version_code is not None:
+                metadata["version_code"] = version_code
+            if version_name is not None:
+                metadata["version_name"] = version_name
+            _write_json_atomically(_app_artifact_meta_path(app_name), metadata)
+
+            return AppArtifactDeployResponse(
+                app=app_name,
+                size_bytes=size_bytes,
+                download_url=f"/apps/{app_name}/latest.apk",
+                artifact_hash=artifact_hash,
+            )
+        except HTTPException:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise
+        except Exception as exc:
+            logger.error("Failed to store app artifact for %s: %s", app_name, exc)
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise HTTPException(status_code=500, detail="Failed to store artifact") from exc
+        finally:
+            close_upload = getattr(upload, "close", None)
+            if callable(close_upload):
+                maybe_coro = close_upload()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+
+    @app.get("/apps/{app_name}/latest.apk")
+    async def get_latest_app_artifact(app_name: str):
+        """Redirect callers to the immutable APK artifact for the current app build."""
+        if not _is_valid_app_artifact_name(app_name):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        metadata = _read_app_artifact_metadata(app_name)
+        artifact_hash = str(metadata.get("artifact_hash") or "").strip().lower()
+        if not _is_valid_app_artifact_hash(artifact_hash):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        return RedirectResponse(
+            url=f"/apps/{app_name}/{artifact_hash}.apk",
+            status_code=302,
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.get("/apps/{app_name}/{artifact_hash}.apk")
+    async def get_hashed_app_artifact(app_name: str, artifact_hash: str):
+        """Download a content-addressed immutable app artifact."""
+        if not _is_valid_app_artifact_name(app_name) or not _is_valid_app_artifact_hash(artifact_hash):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        artifact_path = _app_artifact_hashed_path(app_name, artifact_hash)
+        if not artifact_path.exists():
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        response = FileResponse(
+            artifact_path,
+            media_type="application/vnd.android.package-archive",
+            filename=f"{app_name}.apk",
+        )
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+    @app.get("/apps/{app_name}/meta.json", response_model=AppArtifactMetadataResponse)
+    async def get_app_artifact_metadata(app_name: str):
+        """Return metadata for the latest published app artifact."""
+        if not _is_valid_app_artifact_name(app_name):
+            raise HTTPException(status_code=404, detail="Artifact metadata not found")
+        metadata = _read_app_artifact_metadata(app_name)
+        return AppArtifactMetadataResponse(**metadata)
+
+    @app.get("/apk")
+    async def get_legacy_apk_download():
+        """Backward-compatible alias for the session-manager Android artifact."""
+        return RedirectResponse(url="/apps/session-manager-android/latest.apk", status_code=302)
 
     @app.get("/auth/google/login")
     async def google_login(request: Request, next: Optional[str] = Query(default="/watch/")):

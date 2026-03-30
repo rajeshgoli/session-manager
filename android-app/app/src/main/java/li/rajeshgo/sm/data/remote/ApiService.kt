@@ -1,6 +1,7 @@
 package li.rajeshgo.sm.data.remote
 
 import li.rajeshgo.sm.data.model.ActivityActionsResponse
+import li.rajeshgo.sm.data.model.AppArtifactMetadata
 import li.rajeshgo.sm.data.model.AuthSessionResponse
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
@@ -20,6 +21,9 @@ import retrofit2.http.Query
 interface ApiService {
     @GET("client/bootstrap")
     suspend fun getBootstrap(): ClientBootstrapResponse
+
+    @GET("apps/{app}/meta.json")
+    suspend fun getAppArtifactMetadata(@Path("app") app: String): AppArtifactMetadata
 
     @GET("auth/session")
     suspend fun getAuthSession(): AuthSessionResponse

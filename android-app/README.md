@@ -25,9 +25,38 @@ cd android-app
 The app expects:
 - external Session Manager origin protected by Google auth
 - `/auth/device/google` enabled on the server
+- `/apps/session-manager-android/meta.json` and `/apps/session-manager-android/latest.apk` available on the server
 - Termux installed for direct tmux attach
 - SSH attach exposed through a tunnel such as Cloudflare Access SSH
 - SSH origin configured for public-key auth only; password auth should remain disabled
+
+## Publish a new APK
+
+Build the app:
+
+```
+cd android-app
+./gradlew assembleDebug
+```
+
+Then publish it to the local Session Manager artifact server:
+
+```
+cd ..
+VERSION_NAME=0.1.0 ./scripts/deploy_android_app.sh
+```
+
+By default the deploy script uploads:
+- app: `session-manager-android`
+- server: `http://127.0.0.1:8420`
+- APK: `android-app/app/build/outputs/apk/debug/app-debug.apk`
+
+You can override those with `APP_NAME`, `SERVER_URL`, `VERSION_CODE`, `VERSION_NAME`, or by passing a different APK path as the first argument.
+
+The server stores:
+- `latest.apk` for convenience
+- immutable hashed APKs for cache-safe installs
+- `meta.json` for in-app update checks
 
 ## Attach security model
 
