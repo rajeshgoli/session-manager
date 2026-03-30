@@ -81,6 +81,9 @@ import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.TextMuted
 import li.rajeshgo.sm.ui.theme.TextSecondary
 import li.rajeshgo.sm.ui.theme.Violet
+import li.rajeshgo.sm.ui.update.SettingsIconButtonWithUpdate
+import li.rajeshgo.sm.ui.update.UpdateAvailabilityViewModel
+import li.rajeshgo.sm.ui.update.UpdateReadyBanner
 
 private const val ANALYTICS_AUTO_REFRESH_MS = 10000L
 
@@ -90,8 +93,10 @@ fun AnalyticsScreen(
     onNavigateToSettings: () -> Unit,
     onOpenDetail: (String) -> Unit,
     viewModel: AnalyticsViewModel = viewModel(),
+    updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
+    val updateState by updateViewModel.uiState.collectAsState()
     val lifecycleOwner = LocalLifecycleOwner.current
     var isResumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
@@ -110,6 +115,7 @@ fun AnalyticsScreen(
             return@LaunchedEffect
         }
         viewModel.refresh()
+        updateViewModel.refresh()
         while (coroutineContext.isActive) {
             delay(ANALYTICS_AUTO_REFRESH_MS)
             viewModel.refresh()
@@ -138,9 +144,19 @@ fun AnalyticsScreen(
                     userEmail = state.userEmail,
                     generatedAt = state.summary?.generatedAt,
                     refreshing = state.refreshing,
+                    hasUpdate = updateState.availableUpdate != null,
                     onRefresh = { viewModel.refresh() },
                     onOpenSettings = onNavigateToSettings,
                 )
+            }
+
+            updateState.availableUpdate?.let { update ->
+                item {
+                    UpdateReadyBanner(
+                        update = update,
+                        onOpenSettings = onNavigateToSettings,
+                    )
+                }
             }
 
             state.error?.takeIf { it.isNotBlank() }?.let { message ->
@@ -413,6 +429,7 @@ private fun AnalyticsHeader(
     userEmail: String,
     generatedAt: String?,
     refreshing: Boolean,
+    hasUpdate: Boolean,
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
@@ -463,9 +480,7 @@ private fun AnalyticsHeader(
                             Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = TextSecondary)
                         }
                     }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Rounded.Settings, contentDescription = "Settings", tint = TextSecondary)
-                    }
+                    SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
                 }
             }
             Box(
