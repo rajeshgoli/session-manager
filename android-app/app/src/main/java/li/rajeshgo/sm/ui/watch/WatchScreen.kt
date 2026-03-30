@@ -67,6 +67,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.ui.navigation.AppBottomNav
+import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Border
 import li.rajeshgo.sm.ui.theme.BorderStrong
@@ -89,6 +91,7 @@ private const val WATCH_AUTO_REFRESH_MS = 5000L
 @Composable
 fun WatchScreen(
     onNavigateToSettings: () -> Unit,
+    onNavigateToAnalytics: () -> Unit,
     viewModel: WatchViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -143,7 +146,7 @@ fun WatchScreen(
 
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 128.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
@@ -294,10 +297,22 @@ fun WatchScreen(
             }
         }
 
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(horizontal = 16.dp, vertical = 16.dp),
+        ) {
+            AppBottomNav(
+                currentRoute = Routes.WATCH,
+                onWatch = {},
+                onAnalytics = onNavigateToAnalytics,
+            )
+        }
+
         if (toast != null) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
                 Surface(
-                    modifier = Modifier.padding(16.dp),
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 88.dp),
                     shape = RoundedCornerShape(999.dp),
                     color = PanelElevated,
                     border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),

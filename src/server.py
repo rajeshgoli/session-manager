@@ -46,6 +46,7 @@ from .models import (
 )
 from .cli.commands import validate_friendly_name
 from .cli.dispatch import get_auto_remind_config
+from .mobile_analytics import MobileAnalyticsBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -1322,6 +1323,29 @@ def create_app(
             return None
         return getter(name)
 
+    def _analytics_health_checks() -> list[dict[str, Any]]:
+        supervisor = getattr(app.state, "infra_supervisor", None)
+        snapshotter = getattr(supervisor, "snapshot", None) if supervisor else None
+        if not callable(snapshotter):
+            return []
+        snapshot = snapshotter() or {}
+        labels = {
+            "android_sshd": "Android attach SSHD",
+            "tmux_base": "tmux base",
+            "ac_caffeinate": "AC caffeinate",
+        }
+        checks: list[dict[str, Any]] = []
+        for key, payload in snapshot.items():
+            checks.append(
+                {
+                    "key": key,
+                    "label": labels.get(key, key.replace("_", " ")),
+                    "status": payload.get("status"),
+                    "message": payload.get("message"),
+                }
+            )
+        return checks
+
     def _termux_attach_infra_issue() -> Optional[str]:
         now = time.time()
         if now < attach_infra_cache["expires_at"]:
@@ -1631,6 +1655,15 @@ def create_app(
                 "termux_package": "com.termux",
             },
         )
+
+    @app.get("/client/analytics/summary")
+    async def client_analytics_summary():
+        """Return mobile-friendly analytics summary derived from live state and local telemetry."""
+        builder = MobileAnalyticsBuilder(app.state.session_manager, app.state.config)
+        payload = builder.build_summary()
+        payload["health_checks"] = _analytics_health_checks()
+        payload["attach_available"] = not bool(_termux_attach_infra_issue())
+        return payload
 
     @app.post("/auth/device/google", response_model=DeviceGoogleAuthResponse)
     async def auth_device_google(request: DeviceGoogleAuthRequest):
