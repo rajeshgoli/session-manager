@@ -82,6 +82,9 @@ import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.TextMuted
 import li.rajeshgo.sm.ui.theme.TextSecondary
 import li.rajeshgo.sm.ui.theme.Violet
+import li.rajeshgo.sm.ui.update.SettingsIconButtonWithUpdate
+import li.rajeshgo.sm.ui.update.UpdateAvailabilityViewModel
+import li.rajeshgo.sm.ui.update.UpdateReadyBanner
 import li.rajeshgo.sm.util.launchTermuxAttach
 import li.rajeshgo.sm.util.termuxAttachCommand
 
@@ -93,8 +96,10 @@ fun WatchScreen(
     onNavigateToSettings: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
     viewModel: WatchViewModel = viewModel(),
+    updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
+    val updateState by updateViewModel.uiState.collectAsState()
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
@@ -126,6 +131,7 @@ fun WatchScreen(
             return@LaunchedEffect
         }
         viewModel.refresh()
+        updateViewModel.refresh()
         while (coroutineContext.isActive) {
             delay(WATCH_AUTO_REFRESH_MS)
             viewModel.refresh()
@@ -154,9 +160,19 @@ fun WatchScreen(
                     userEmail = state.userEmail,
                     lastSync = state.lastSync,
                     refreshing = state.refreshing,
+                    hasUpdate = updateState.availableUpdate != null,
                     onRefresh = { viewModel.refresh() },
                     onOpenSettings = onNavigateToSettings,
                 )
+            }
+
+            updateState.availableUpdate?.let { update ->
+                item {
+                    UpdateReadyBanner(
+                        update = update,
+                        onOpenSettings = onNavigateToSettings,
+                    )
+                }
             }
 
             if (state.error != null) {
@@ -334,6 +350,7 @@ private fun HeaderBar(
     userEmail: String,
     lastSync: String?,
     refreshing: Boolean,
+    hasUpdate: Boolean,
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
@@ -370,9 +387,7 @@ private fun HeaderBar(
                 IconButton(onClick = onRefresh) {
                     Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = if (refreshing) Cyan else TextSecondary)
                 }
-                IconButton(onClick = onOpenSettings) {
-                    Icon(Icons.Rounded.Settings, contentDescription = "Settings", tint = TextSecondary)
-                }
+                SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
             }
         }
     }
