@@ -27,6 +27,7 @@ import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFact
 open class SessionManagerRequestException(message: String, cause: Throwable? = null) : IllegalStateException(message, cause)
 class SessionManagerAuthException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 class SessionManagerTransientException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
+class SessionManagerBackendUnavailableException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 
 class SessionManagerRepository {
     private val json = Json { ignoreUnknownKeys = true }
@@ -36,7 +37,13 @@ class SessionManagerRepository {
         private const val READ_RETRY_BASE_DELAY_MS = 600L
         private const val GENERIC_TRANSIENT_READ_MESSAGE = "Server temporarily unavailable. Retrying soon."
         private const val GENERIC_TRANSIENT_WRITE_MESSAGE = "Server temporarily unavailable. Try again."
+        private const val BACKEND_UNREACHABLE_ERROR = "backend_unreachable"
     }
+
+    private data class ServerErrorPayload(
+        val code: String? = null,
+        val message: String? = null,
+    )
 
     private fun api(baseUrl: String, token: String = ""): ApiService {
         require(baseUrl.isNotBlank()) { "Server URL is required" }
@@ -54,23 +61,30 @@ class SessionManagerRepository {
             .create(ApiService::class.java)
     }
 
-    private fun extractServerMessage(error: HttpException): String? {
+    private fun extractServerError(error: HttpException): ServerErrorPayload? {
         val body = runCatching { error.response()?.errorBody()?.string() }.getOrNull()?.trim().orEmpty()
         if (body.isBlank()) {
             return null
         }
-        val parsedMessage = runCatching {
+        return runCatching {
             val obj = json.parseToJsonElement(body).jsonObject
-            listOf("detail", "message", "error")
+            val code = obj["error"]
+                ?.jsonPrimitive
+                ?.content
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+            val message = listOf("detail", "message")
                 .firstNotNullOfOrNull { key ->
                     obj[key]
                         ?.jsonPrimitive
                         ?.content
                         ?.trim()
                         ?.takeIf { it.isNotBlank() }
-                }
-        }.getOrNull()
-        return parsedMessage ?: body.takeIf { !it.startsWith("<!DOCTYPE") && !it.startsWith("<html", ignoreCase = true) }
+                } ?: body.takeIf { !it.startsWith("<!DOCTYPE") && !it.startsWith("<html", ignoreCase = true) }
+            ServerErrorPayload(code = code, message = message)
+        }.getOrNull() ?: ServerErrorPayload(
+            message = body.takeIf { !it.startsWith("<!DOCTYPE") && !it.startsWith("<html", ignoreCase = true) }
+        )
     }
 
     private suspend fun <T> executeReadRequest(
@@ -86,16 +100,25 @@ class SessionManagerRepository {
                 when (error.code()) {
                     401, 403 -> throw SessionManagerAuthException("Session expired. Sign in again.", error)
                     502, 503, 504 -> {
-                        val serverMessage = extractServerMessage(error)
+                        val serverError = extractServerError(error)
+                        if (serverError?.code == BACKEND_UNREACHABLE_ERROR) {
+                            throw SessionManagerBackendUnavailableException(
+                                serverError.message ?: GENERIC_TRANSIENT_READ_MESSAGE,
+                                error,
+                            )
+                        }
                         lastTransient = error
                         if (attempt < READ_RETRY_ATTEMPTS - 1) {
                             delay(READ_RETRY_BASE_DELAY_MS * (attempt + 1))
                             return@repeat
                         }
-                        throw SessionManagerTransientException(serverMessage ?: GENERIC_TRANSIENT_READ_MESSAGE, error)
+                        throw SessionManagerTransientException(
+                            serverError?.message ?: GENERIC_TRANSIENT_READ_MESSAGE,
+                            error,
+                        )
                     }
                     else -> throw SessionManagerRequestException(
-                        extractServerMessage(error) ?: "Request failed (${error.code()})",
+                        extractServerError(error)?.message ?: "Request failed (${error.code()})",
                         error,
                     )
                 }
@@ -115,12 +138,22 @@ class SessionManagerRepository {
         if (error is HttpException) {
             return when (error.code()) {
                 401, 403 -> SessionManagerAuthException("Session expired. Sign in again.", error)
-                502, 503, 504 -> SessionManagerTransientException(
-                    extractServerMessage(error) ?: GENERIC_TRANSIENT_WRITE_MESSAGE,
-                    error,
-                )
+                502, 503, 504 -> {
+                    val serverError = extractServerError(error)
+                    if (serverError?.code == BACKEND_UNREACHABLE_ERROR) {
+                        SessionManagerBackendUnavailableException(
+                            serverError.message ?: GENERIC_TRANSIENT_WRITE_MESSAGE,
+                            error,
+                        )
+                    } else {
+                        SessionManagerTransientException(
+                            serverError?.message ?: GENERIC_TRANSIENT_WRITE_MESSAGE,
+                            error,
+                        )
+                    }
+                }
                 else -> SessionManagerRequestException(
-                    extractServerMessage(error) ?: "Request failed (${error.code()})",
+                    extractServerError(error)?.message ?: "Request failed (${error.code()})",
                     error,
                 )
             }

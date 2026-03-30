@@ -12,6 +12,7 @@ import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
+import li.rajeshgo.sm.data.repository.SessionManagerBackendUnavailableException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SessionManagerTransientException
 import li.rajeshgo.sm.data.repository.SettingsRepository
@@ -102,6 +103,19 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                     lastSync = null,
                                     userEmail = "",
                                     error = error.message ?: "Session expired. Sign in again.",
+                                )
+                            }
+                            is SessionManagerBackendUnavailableException -> {
+                                _uiState.value = _uiState.value.copy(
+                                    loading = false,
+                                    refreshing = false,
+                                    sessions = emptyList(),
+                                    expandedSessionIds = emptySet(),
+                                    detailsBySessionId = emptyMap(),
+                                    lastSync = null,
+                                    userEmail = userEmail,
+                                    error = error.message
+                                        ?: "Session Manager backend is unreachable from the ingress host.",
                                 )
                             }
                             is SessionManagerTransientException -> {

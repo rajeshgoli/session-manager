@@ -80,6 +80,22 @@ data class DeviceGoogleAuthResponse(
 )
 
 @Serializable
+data class AppArtifactMetadata(
+    @SerialName("artifact_hash")
+    val artifactHash: String? = null,
+    @SerialName("size_bytes")
+    val sizeBytes: Long? = null,
+    @SerialName("uploaded_at")
+    val uploadedAt: String? = null,
+    @SerialName("uploaded_by")
+    val uploadedBy: String? = null,
+    @SerialName("version_code")
+    val versionCode: Int? = null,
+    @SerialName("version_name")
+    val versionName: String? = null,
+)
+
+@Serializable
 data class SessionListResponse(
     val sessions: List<ClientSession> = emptyList(),
 )

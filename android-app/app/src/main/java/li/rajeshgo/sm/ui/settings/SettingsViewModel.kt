@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
+import li.rajeshgo.sm.data.repository.AppUpdateRepository
+import li.rajeshgo.sm.data.repository.AvailableAppUpdate
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
 
@@ -19,12 +21,16 @@ data class SettingsUiState(
     val isLoggedIn: Boolean = false,
     val loading: Boolean = false,
     val bootstrap: ClientBootstrapResponse? = null,
+    val availableUpdate: AvailableAppUpdate? = null,
+    val updateInstalling: Boolean = false,
+    val updateError: String? = null,
     val error: String? = null,
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
     private val sessionRepository = SessionManagerRepository()
+    private val appUpdateRepository = AppUpdateRepository(application, settingsRepository)
 
     private val _uiState = MutableStateFlow(SettingsUiState())
     val uiState: StateFlow<SettingsUiState> = _uiState
@@ -38,6 +44,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 isLoggedIn = settingsRepository.isLoggedIn.first(),
             )
             refreshBootstrap()
+            refreshUpdate()
         }
     }
 
@@ -48,7 +55,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun refreshBootstrap() {
         val serverUrl = _uiState.value.serverUrl.trim().trimEnd('/')
         if (serverUrl.isBlank()) {
-            _uiState.value = _uiState.value.copy(bootstrap = null)
+            _uiState.value = _uiState.value.copy(bootstrap = null, availableUpdate = null, updateError = null)
             return
         }
         viewModelScope.launch {
@@ -57,9 +64,22 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 sessionRepository.fetchBootstrap(serverUrl)
             }.onSuccess { bootstrap ->
                 _uiState.value = _uiState.value.copy(bootstrap = bootstrap, error = null, serverUrl = serverUrl)
+                refreshUpdate()
             }.onFailure { error ->
                 _uiState.value = _uiState.value.copy(error = error.message ?: "Failed to load bootstrap")
             }
+        }
+    }
+
+    fun refreshUpdate() {
+        viewModelScope.launch {
+            runCatching { appUpdateRepository.getAvailableUpdate() }
+                .onSuccess { update ->
+                    _uiState.value = _uiState.value.copy(availableUpdate = update, updateError = null)
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(updateError = error.message ?: "Failed to check app update")
+                }
         }
     }
 
@@ -84,6 +104,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     loading = false,
                     error = null,
                 )
+                refreshUpdate()
                 onSuccess()
             }.onFailure { error ->
                 _uiState.value = _uiState.value.copy(
@@ -109,5 +130,38 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 error = null,
             )
         }
+    }
+
+    fun dismissUpdate() {
+        val update = _uiState.value.availableUpdate ?: return
+        viewModelScope.launch {
+            appUpdateRepository.dismissUpdate(update.artifactHash)
+            _uiState.value = _uiState.value.copy(availableUpdate = null, updateError = null)
+        }
+    }
+
+    fun installUpdate() {
+        val update = _uiState.value.availableUpdate ?: return
+        if (_uiState.value.updateInstalling) {
+            return
+        }
+        _uiState.value = _uiState.value.copy(updateInstalling = true, updateError = null)
+        viewModelScope.launch {
+            runCatching {
+                val apkFile = appUpdateRepository.downloadUpdate(update)
+                appUpdateRepository.launchInstaller(apkFile)
+            }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    updateInstalling = false,
+                    updateError = error.message ?: "Update failed",
+                )
+                return@launch
+            }
+            _uiState.value = _uiState.value.copy(updateInstalling = false)
+        }
+    }
+
+    fun clearUpdateError() {
+        _uiState.value = _uiState.value.copy(updateError = null)
     }
 }

@@ -36,6 +36,7 @@ android {
 
         buildConfigField("String", "SM_DEFAULT_SERVER_URL", project.stringProp("SM_DEFAULT_SERVER_URL").toBuildConfigString())
         buildConfigField("String", "SM_GOOGLE_SERVER_CLIENT_ID", project.stringProp("SM_GOOGLE_SERVER_CLIENT_ID").toBuildConfigString())
+        buildConfigField("String", "SM_APK_HASH", project.stringProp("SM_APK_HASH").toBuildConfigString())
     }
 
     buildTypes {

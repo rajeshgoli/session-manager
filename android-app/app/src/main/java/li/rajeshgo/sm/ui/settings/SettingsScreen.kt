@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -24,9 +26,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import li.rajeshgo.sm.BuildConfig
 import li.rajeshgo.sm.auth.GoogleSignInManager
+import li.rajeshgo.sm.ui.theme.BorderStrong
 import li.rajeshgo.sm.ui.theme.Cyan
 import li.rajeshgo.sm.ui.theme.Emerald
+import li.rajeshgo.sm.ui.theme.PanelElevated
 import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.util.LocalDefaults
 import kotlinx.coroutines.launch
@@ -60,6 +65,13 @@ fun SettingsScreen(
             text = "Native Android watch client for sm.rajeshgo.li with direct Termux attach.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "App version ${BuildConfig.VERSION_NAME}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontFamily = FontFamily.Monospace,
         )
 
         Spacer(Modifier.height(24.dp))
@@ -106,6 +118,77 @@ fun SettingsScreen(
                 color = Cyan,
                 fontFamily = FontFamily.Monospace,
             )
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = PanelElevated),
+            border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "App updates",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(8.dp))
+                val availableUpdate = state.availableUpdate
+                if (availableUpdate == null) {
+                    Text(
+                        text = "This build matches the latest published artifact.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedButton(onClick = viewModel::refreshUpdate, modifier = Modifier.fillMaxWidth()) {
+                        Text("Check for update")
+                    }
+                } else {
+                    Text(
+                        text = "Update available: ${availableUpdate.versionName}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Emerald,
+                    )
+                    availableUpdate.uploadedAt?.let { uploadedAt ->
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = "Published $uploadedAt",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = viewModel::installUpdate,
+                        enabled = !state.updateInstalling,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        if (state.updateInstalling) {
+                            CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
+                        } else {
+                            Text("Install update")
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = viewModel::dismissUpdate,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Dismiss this version")
+                    }
+                }
+
+                state.updateError?.let { updateError ->
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        text = updateError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Rose,
+                    )
+                }
+            }
         }
 
         Spacer(Modifier.height(24.dp))
