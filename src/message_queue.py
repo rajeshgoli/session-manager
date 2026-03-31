@@ -178,7 +178,9 @@ class MessageQueueManager:
                 message TEXT NOT NULL,
                 fire_at TIMESTAMP NOT NULL,
                 task_type TEXT DEFAULT 'reminder',
-                fired INTEGER DEFAULT 0
+                fired INTEGER DEFAULT 0,
+                recurring_interval_seconds INTEGER,
+                is_active INTEGER DEFAULT 1
             )
         """)
         # Migration: add new columns to message_queue if they don't exist
@@ -205,6 +207,21 @@ class MessageQueueManager:
         if "message_category" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN message_category TEXT DEFAULT NULL")
             logger.info("Migrated message_queue: added message_category column")
+        cursor.execute("PRAGMA table_info(scheduled_reminders)")
+        reminder_columns = [col[1] for col in cursor.fetchall()]
+        if "recurring_interval_seconds" not in reminder_columns:
+            cursor.execute("ALTER TABLE scheduled_reminders ADD COLUMN recurring_interval_seconds INTEGER")
+            logger.info("Migrated scheduled_reminders: added recurring_interval_seconds column")
+        if "is_active" not in reminder_columns:
+            cursor.execute("ALTER TABLE scheduled_reminders ADD COLUMN is_active INTEGER DEFAULT 1")
+            logger.info("Migrated scheduled_reminders: added is_active column")
+        cursor.execute(
+            """
+            UPDATE scheduled_reminders
+            SET is_active = 0
+            WHERE fired = 1 AND recurring_interval_seconds IS NULL AND is_active = 1
+            """
+        )
 
         # Remind registrations table (#188)
         cursor.execute("""
@@ -2079,6 +2096,7 @@ class MessageQueueManager:
         session_id: str,
         delay_seconds: int,
         message: str,
+        recurring_interval_seconds: Optional[int] = None,
     ) -> str:
         """
         Schedule a self-reminder.
@@ -2087,27 +2105,85 @@ class MessageQueueManager:
             session_id: Session to receive the reminder
             delay_seconds: Seconds until reminder fires
             message: Reminder message
+            recurring_interval_seconds: Optional cadence for recurring reminders
 
         Returns:
             Reminder ID
         """
+        if delay_seconds <= 0:
+            raise ValueError("delay_seconds must be > 0")
+        if recurring_interval_seconds is not None and recurring_interval_seconds <= 0:
+            raise ValueError("recurring_interval_seconds must be > 0")
+
         reminder_id = uuid.uuid4().hex[:12]
         fire_at = datetime.now() + timedelta(seconds=delay_seconds)
 
         # Persist to database
         self._execute("""
-            INSERT INTO scheduled_reminders (id, target_session_id, message, fire_at, task_type)
-            VALUES (?, ?, ?, ?, 'reminder')
-        """, (reminder_id, session_id, message, fire_at.isoformat()))
+            INSERT INTO scheduled_reminders (
+                id, target_session_id, message, fire_at, task_type, recurring_interval_seconds, is_active
+            )
+            VALUES (?, ?, ?, ?, 'reminder', ?, 1)
+        """, (reminder_id, session_id, message, fire_at.isoformat(), recurring_interval_seconds))
 
-        # Schedule async task
-        task = asyncio.create_task(self._fire_reminder(reminder_id, session_id, message, delay_seconds))
-        self._scheduled_tasks[reminder_id] = task
+        self._schedule_reminder_task(
+            reminder_id=reminder_id,
+            session_id=session_id,
+            message=message,
+            fire_at=fire_at,
+            recurring_interval_seconds=recurring_interval_seconds,
+        )
 
-        logger.info(f"Scheduled reminder {reminder_id} for {session_id} in {delay_seconds}s")
+        if recurring_interval_seconds is None:
+            logger.info(f"Scheduled reminder {reminder_id} for {session_id} in {delay_seconds}s")
+        else:
+            logger.info(
+                "Scheduled recurring reminder %s for %s every %ss",
+                reminder_id,
+                session_id,
+                recurring_interval_seconds,
+            )
         return reminder_id
 
-    async def _fire_reminder(self, reminder_id: str, session_id: str, message: str, delay_seconds: int):
+    def _schedule_reminder_task(
+        self,
+        reminder_id: str,
+        session_id: str,
+        message: str,
+        fire_at: datetime,
+        recurring_interval_seconds: Optional[int],
+    ) -> None:
+        """Create or replace the in-memory task for a scheduled reminder."""
+        delay_seconds = max(0.0, (fire_at - datetime.now()).total_seconds())
+        task = asyncio.create_task(
+            self._fire_reminder(
+                reminder_id=reminder_id,
+                session_id=session_id,
+                message=message,
+                delay_seconds=delay_seconds,
+                recurring_interval_seconds=recurring_interval_seconds,
+            )
+        )
+        self._scheduled_tasks[reminder_id] = task
+
+    def _format_scheduled_reminder_message(self, message: str, recurring_interval_seconds: Optional[int]) -> str:
+        """Render the delivered reminder text."""
+        prefix = "[sm] Recurring reminder:" if recurring_interval_seconds is not None else "[sm] Scheduled reminder:"
+        return f"{prefix}\n{message}"
+
+    def _is_runnable_reminder_target(self, session_id: str) -> bool:
+        """Return True when the reminder target session still exists and is not stopped."""
+        session = self.session_manager.get_session(session_id)
+        return session is not None and getattr(session, "status", None) != SessionStatus.STOPPED
+
+    async def _fire_reminder(
+        self,
+        reminder_id: str,
+        session_id: str,
+        message: str,
+        delay_seconds: float,
+        recurring_interval_seconds: Optional[int] = None,
+    ):
         """Fire a reminder after delay.
 
         If the session is mid-compaction when the reminder fires, waits up to
@@ -2117,7 +2193,20 @@ class MessageQueueManager:
         COMPACTION_WAIT_MAX = 300     # seconds
         COMPACTION_POLL_INTERVAL = 5  # seconds
         try:
-            await asyncio.sleep(delay_seconds)
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+            if not self._is_runnable_reminder_target(session_id):
+                self._execute(
+                    "UPDATE scheduled_reminders SET is_active = 0 WHERE id = ?",
+                    (reminder_id,),
+                )
+                logger.info(
+                    "Reminder %s deactivated because target session %s is not runnable",
+                    reminder_id,
+                    session_id,
+                )
+                return
 
             # Wait for compaction to complete before delivering (#249)
             waited = 0
@@ -2129,44 +2218,119 @@ class MessageQueueManager:
                 waited += COMPACTION_POLL_INTERVAL
 
             # Queue the reminder with urgent delivery to actually wake the agent
-            formatted_message = f"[sm] Scheduled reminder:\n{message}"
+            formatted_message = self._format_scheduled_reminder_message(message, recurring_interval_seconds)
             self.queue_message(
                 target_session_id=session_id,
                 text=formatted_message,
                 delivery_mode="urgent",
             )
 
-            # Mark as fired in database
-            self._execute(
-                "UPDATE scheduled_reminders SET fired = 1 WHERE id = ?",
-                (reminder_id,)
-            )
-
-            logger.info(f"Reminder {reminder_id} fired for {session_id}")
+            fired_at = datetime.now()
+            if recurring_interval_seconds is None:
+                self._execute(
+                    "UPDATE scheduled_reminders SET fired = 1, is_active = 0 WHERE id = ?",
+                    (reminder_id,),
+                )
+                logger.info(f"Reminder {reminder_id} fired for {session_id}")
+            else:
+                next_fire_at = fired_at + timedelta(seconds=recurring_interval_seconds)
+                cursor = self._execute(
+                    """
+                    UPDATE scheduled_reminders
+                    SET fire_at = ?, fired = 0, is_active = 1
+                    WHERE id = ? AND is_active = 1
+                    """,
+                    (next_fire_at.isoformat(), reminder_id),
+                )
+                if cursor.rowcount:
+                    self._schedule_reminder_task(
+                        reminder_id=reminder_id,
+                        session_id=session_id,
+                        message=message,
+                        fire_at=next_fire_at,
+                        recurring_interval_seconds=recurring_interval_seconds,
+                    )
+                    logger.info(
+                        "Recurring reminder %s fired for %s; next fire in %ss",
+                        reminder_id,
+                        session_id,
+                        recurring_interval_seconds,
+                    )
+                else:
+                    logger.info("Recurring reminder %s became inactive before reschedule", reminder_id)
 
         except asyncio.CancelledError:
             logger.info(f"Reminder {reminder_id} cancelled")
         finally:
-            self._scheduled_tasks.pop(reminder_id, None)
+            current_task = asyncio.current_task()
+            if self._scheduled_tasks.get(reminder_id) is current_task:
+                self._scheduled_tasks.pop(reminder_id, None)
+
+    def cancel_scheduled_reminder(self, reminder_id: str) -> Optional[dict]:
+        """Cancel a scheduled or recurring reminder by reminder ID."""
+        rows = self._execute_query(
+            """
+            SELECT id, target_session_id, message, fire_at, recurring_interval_seconds, fired, is_active
+            FROM scheduled_reminders
+            WHERE id = ?
+            """,
+            (reminder_id,),
+        )
+        if not rows:
+            return None
+
+        row = rows[0]
+        self._execute(
+            "UPDATE scheduled_reminders SET is_active = 0 WHERE id = ?",
+            (reminder_id,),
+        )
+
+        task = self._scheduled_tasks.pop(reminder_id, None)
+        if task is not None:
+            task.cancel()
+
+        return {
+            "id": row[0],
+            "target_session_id": row[1],
+            "message": row[2],
+            "fire_at": row[3],
+            "recurring_interval_seconds": row[4],
+            "fired": bool(row[5]),
+            "was_active": bool(row[6]),
+        }
 
     async def _recover_scheduled_reminders(self):
         """Recover unfired reminders on startup."""
         rows = self._execute_query("""
-            SELECT id, target_session_id, message, fire_at
+            SELECT id, target_session_id, message, fire_at, recurring_interval_seconds
             FROM scheduled_reminders
-            WHERE fired = 0 AND fire_at > ?
-        """, (datetime.now().isoformat(),))
+            WHERE is_active = 1
+              AND (fired = 0 OR recurring_interval_seconds IS NOT NULL)
+        """)
 
         for row in rows:
-            reminder_id, session_id, message, fire_at_str = row
-            fire_at = datetime.fromisoformat(fire_at_str)
-            delay = (fire_at - datetime.now()).total_seconds()
-            if delay > 0:
-                task = asyncio.create_task(
-                    self._fire_reminder(reminder_id, session_id, message, delay)
+            reminder_id, session_id, message, fire_at_str, recurring_interval_seconds = row
+            if not self._is_runnable_reminder_target(session_id):
+                self._execute(
+                    "UPDATE scheduled_reminders SET is_active = 0 WHERE id = ?",
+                    (reminder_id,),
                 )
-                self._scheduled_tasks[reminder_id] = task
-                logger.info(f"Recovered reminder {reminder_id}, fires in {delay:.0f}s")
+                logger.info(
+                    "Skipped recovery for reminder %s because target session %s is not runnable",
+                    reminder_id,
+                    session_id,
+                )
+                continue
+            fire_at = datetime.fromisoformat(fire_at_str)
+            self._schedule_reminder_task(
+                reminder_id=reminder_id,
+                session_id=session_id,
+                message=message,
+                fire_at=fire_at,
+                recurring_interval_seconds=recurring_interval_seconds,
+            )
+            delay = max(0.0, (fire_at - datetime.now()).total_seconds())
+            logger.info(f"Recovered reminder {reminder_id}, fires in {delay:.0f}s")
 
     # =========================================================================
     # Periodic Remind (#188)

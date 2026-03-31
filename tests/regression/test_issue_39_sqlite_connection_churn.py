@@ -331,6 +331,7 @@ async def test_reminder_operations_use_persistent_connection(queue_manager):
         session_id="test-session",
         delay_seconds=1,
         message="Test reminder",
+        recurring_interval_seconds=1,
     )
 
     # Verify INSERT went through helper

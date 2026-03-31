@@ -1109,17 +1109,37 @@ class SessionManagerClient:
             return payload
         return None
 
-    def schedule_reminder(self, session_id: str, delay_seconds: int, message: str) -> Optional[dict]:
-        """Schedule a one-shot self-reminder (calls POST /scheduler/remind)."""
+    def schedule_reminder(
+        self,
+        session_id: str,
+        delay_seconds: int,
+        message: str,
+        recurring_interval_seconds: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Schedule a one-shot or recurring self-reminder (calls POST /scheduler/remind)."""
         query = (
             f"session_id={urllib.parse.quote(session_id)}"
             f"&delay_seconds={delay_seconds}"
             f"&message={urllib.parse.quote(message)}"
         )
+        if recurring_interval_seconds is not None:
+            query += f"&recurring_interval_seconds={recurring_interval_seconds}"
         data, success, unavailable = self._request("POST", f"/scheduler/remind?{query}")
         if unavailable:
             return None
         return data if success else None
+
+    def cancel_scheduled_reminder(self, reminder_id: str) -> dict:
+        """Cancel a scheduled reminder by reminder ID."""
+        data, status_code, unavailable = self._request_with_status(
+            "DELETE",
+            f"/scheduler/remind/{urllib.parse.quote(reminder_id)}",
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
 
     def create_job_watch(
         self,

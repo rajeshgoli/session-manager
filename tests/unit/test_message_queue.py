@@ -19,6 +19,26 @@ def noop_create_task(coro):
     return MagicMock()
 
 
+def _close_message_queue(mq: MessageQueueManager) -> None:
+    """Release SQLite handles and any queued background tasks for repeatable tests."""
+    for task_map_name in ("_scheduled_tasks", "_remind_tasks", "_job_watch_tasks", "_pending_stop_notify_tasks"):
+        task_map = getattr(mq, task_map_name, {})
+        for task in list(task_map.values()):
+            cancel = getattr(task, "cancel", None)
+            if callable(cancel):
+                cancel()
+        task_map.clear()
+    monitor_task = getattr(mq, "_monitor_task", None)
+    if monitor_task is not None:
+        cancel = getattr(monitor_task, "cancel", None)
+        if callable(cancel):
+            cancel()
+        mq._monitor_task = None
+    if mq._db_conn is not None:
+        mq._db_conn.close()
+        mq._db_conn = None
+
+
 @pytest.fixture
 def mock_session_manager():
     """Create a mock SessionManager."""
@@ -60,7 +80,10 @@ def message_queue(mock_session_manager, temp_db_path):
         },
         notifier=None,  # No Telegram mirroring in tests
     )
-    return mq
+    try:
+        yield mq
+    finally:
+        _close_message_queue(mq)
 
 
 class TestQueueing:
@@ -395,8 +418,56 @@ class TestDatabaseOperations:
 
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_reminders'")
         assert cursor.fetchone() is not None
+        cursor.execute("PRAGMA table_info(scheduled_reminders)")
+        reminder_columns = {row[1] for row in cursor.fetchall()}
+        assert "recurring_interval_seconds" in reminder_columns
+        assert "is_active" in reminder_columns
 
         conn.close()
+
+    @pytest.mark.asyncio
+    async def test_init_db_backfills_fired_one_shot_reminders_inactive(self, mock_session_manager, temp_db_path):
+        """Legacy fired one-shot reminders must not be reactivated by the new migration."""
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE scheduled_reminders (
+                id TEXT PRIMARY KEY,
+                target_session_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                fire_at TIMESTAMP NOT NULL,
+                task_type TEXT DEFAULT 'reminder',
+                fired INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute(
+            """
+            INSERT INTO scheduled_reminders (id, target_session_id, message, fire_at, task_type, fired)
+            VALUES (?, ?, ?, ?, 'reminder', 1)
+            """,
+            ("legacy-fired", "target123", "Old reminder", datetime.now().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=None,
+        )
+        try:
+            row = mq._execute_query(
+                "SELECT fired, recurring_interval_seconds, is_active FROM scheduled_reminders WHERE id = ?",
+                ("legacy-fired",),
+            )[0]
+            assert row == (1, None, 0)
+
+            with patch("asyncio.create_task", noop_create_task):
+                await mq._recover_scheduled_reminders()
+
+            assert "legacy-fired" not in mq._scheduled_tasks
+        finally:
+            _close_message_queue(mq)
 
     def test_mark_delivered_updates_db(self, message_queue):
         """_mark_delivered updates delivered_at in database."""

@@ -145,21 +145,29 @@ def main():
         help="Track the recipient with periodic remind until it replies (default: 300s)",
     )
 
-    # sm remind <delay> <message>  (one-shot self-reminder)
-    # sm remind <session-id> --stop  (cancel periodic remind)
+    # sm remind <delay> <message>              (one-shot self-reminder)
+    # sm remind --recurring <delay> <message>  (recurring self-reminder)
+    # sm remind cancel <reminder-id>           (cancel scheduled reminder)
+    # sm remind <session-id> --stop            (cancel periodic remind)
     remind_parser = subparsers.add_parser(
         "remind",
-        help="Schedule a self-reminder (sm remind <delay> <msg>) or cancel periodic remind (sm remind <id> --stop)",
+        help="Schedule a self-reminder, recurring self-reminder, or cancel periodic remind / scheduled reminder",
     )
     remind_parser.add_argument(
         "first_arg",
-        help="Delay in seconds for one-shot remind, or session ID for --stop",
+        nargs="?",
+        help="Delay in seconds, 'cancel', or session ID for --stop",
     )
     remind_parser.add_argument(
         "message",
-        nargs="?",
-        default=None,
-        help="Reminder message (for one-shot mode)",
+        nargs="*",
+        default=[],
+        help="Reminder message or cancel target",
+    )
+    remind_parser.add_argument(
+        "--recurring",
+        action="store_true",
+        help="Repeat the reminder using the same delay interval",
     )
     remind_parser.add_argument(
         "--stop",
@@ -697,19 +705,36 @@ def main():
     elif args.command == "remind":
         if args.stop:
             # sm remind <session-id> --stop: cancel periodic remind (#188)
+            if not args.first_arg:
+                print("Error: Expected session ID before --stop", file=sys.stderr)
+                sys.exit(1)
             sys.exit(commands.cmd_remind_stop(client, args.first_arg))
+        elif args.first_arg == "cancel":
+            if len(args.message) != 1:
+                print("Error: Expected reminder ID after 'cancel'", file=sys.stderr)
+                sys.exit(1)
+            sys.exit(commands.cmd_cancel_scheduled_reminder(client, args.message[0]))
         else:
-            # sm remind <delay> <message>: one-shot self-reminder
+            # sm remind <delay> <message>: one-shot or recurring self-reminder
+            if not args.first_arg:
+                print("Error: Expected delay in seconds", file=sys.stderr)
+                sys.exit(1)
             if not session_id:
                 print("Error: CLAUDE_SESSION_MANAGER_ID not set (required for self-reminder)", file=sys.stderr)
                 sys.exit(2)
             try:
                 delay_seconds = int(args.first_arg)
-            except ValueError:
+            except (TypeError, ValueError):
                 print(f"Error: Expected integer delay (seconds), got: {args.first_arg!r}", file=sys.stderr)
                 sys.exit(1)
-            message = args.message or "Reminder"
-            sys.exit(commands.cmd_remind(client, session_id, delay_seconds, message))
+            message = " ".join(args.message).strip() or "Reminder"
+            sys.exit(commands.cmd_remind(
+                client,
+                session_id,
+                delay_seconds,
+                message,
+                recurring=args.recurring,
+            ))
     elif args.command == "wait":
         sys.exit(commands.cmd_wait(client, args.session_id, args.seconds))
     elif args.command == "watch-job":
