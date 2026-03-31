@@ -2171,6 +2171,11 @@ class MessageQueueManager:
         prefix = "[sm] Recurring reminder:" if recurring_interval_seconds is not None else "[sm] Scheduled reminder:"
         return f"{prefix}\n{message}"
 
+    def _is_runnable_reminder_target(self, session_id: str) -> bool:
+        """Return True when the reminder target session still exists and is not stopped."""
+        session = self.session_manager.get_session(session_id)
+        return session is not None and getattr(session, "status", None) != SessionStatus.STOPPED
+
     async def _fire_reminder(
         self,
         reminder_id: str,
@@ -2190,6 +2195,18 @@ class MessageQueueManager:
         try:
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
+
+            if not self._is_runnable_reminder_target(session_id):
+                self._execute(
+                    "UPDATE scheduled_reminders SET is_active = 0 WHERE id = ?",
+                    (reminder_id,),
+                )
+                logger.info(
+                    "Reminder %s deactivated because target session %s is not runnable",
+                    reminder_id,
+                    session_id,
+                )
+                return
 
             # Wait for compaction to complete before delivering (#249)
             waited = 0
@@ -2293,6 +2310,17 @@ class MessageQueueManager:
 
         for row in rows:
             reminder_id, session_id, message, fire_at_str, recurring_interval_seconds = row
+            if not self._is_runnable_reminder_target(session_id):
+                self._execute(
+                    "UPDATE scheduled_reminders SET is_active = 0 WHERE id = ?",
+                    (reminder_id,),
+                )
+                logger.info(
+                    "Skipped recovery for reminder %s because target session %s is not runnable",
+                    reminder_id,
+                    session_id,
+                )
+                continue
             fire_at = datetime.fromisoformat(fire_at_str)
             self._schedule_reminder_task(
                 reminder_id=reminder_id,

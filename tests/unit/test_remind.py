@@ -1033,6 +1033,14 @@ class TestOneShotRemind:
     @pytest.mark.asyncio
     async def test_recurring_reminder_reschedules_after_firing(self, mq):
         """Recurring scheduled reminders re-arm themselves after each fire."""
+        session = Session(
+            id="loop1",
+            name="claude-loop1",
+            tmux_session="claude-loop1",
+            status=SessionStatus.RUNNING,
+        )
+        mq.session_manager.get_session = MagicMock(return_value=session)
+
         with patch("asyncio.create_task", noop_create_task):
             reminder_id = await mq.schedule_reminder(
                 session_id="loop1",
@@ -1078,6 +1086,44 @@ class TestOneShotRemind:
             (reminder_id,),
         )[0]
         assert row == (30, 1, 0)
+
+    @pytest.mark.asyncio
+    async def test_recurring_reminder_deactivates_when_target_not_runnable(self, mq):
+        """Recurring reminders must stop once the target session is gone or stopped."""
+        stopped_session = Session(
+            id="gone1",
+            name="claude-gone1",
+            tmux_session="claude-gone1",
+            status=SessionStatus.STOPPED,
+        )
+        mq.session_manager.get_session = MagicMock(return_value=stopped_session)
+
+        with patch("asyncio.create_task", noop_create_task):
+            reminder_id = await mq.schedule_reminder(
+                session_id="gone1",
+                delay_seconds=30,
+                message="Should not re-arm",
+                recurring_interval_seconds=30,
+            )
+
+        with patch.object(mq, "queue_message") as queue_message:
+            with patch.object(mq, "_schedule_reminder_task") as reschedule:
+                with patch("asyncio.sleep", AsyncMock()):
+                    await mq._fire_reminder(
+                        reminder_id=reminder_id,
+                        session_id="gone1",
+                        message="Should not re-arm",
+                        delay_seconds=0,
+                        recurring_interval_seconds=30,
+                    )
+
+        queue_message.assert_not_called()
+        reschedule.assert_not_called()
+        row = mq._execute_query(
+            "SELECT is_active FROM scheduled_reminders WHERE id = ?",
+            (reminder_id,),
+        )[0]
+        assert row == (0,)
 
     @pytest.mark.asyncio
     async def test_cancel_scheduled_reminder_marks_row_inactive(self, mq):
