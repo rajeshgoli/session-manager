@@ -215,6 +215,13 @@ class MessageQueueManager:
         if "is_active" not in reminder_columns:
             cursor.execute("ALTER TABLE scheduled_reminders ADD COLUMN is_active INTEGER DEFAULT 1")
             logger.info("Migrated scheduled_reminders: added is_active column")
+        cursor.execute(
+            """
+            UPDATE scheduled_reminders
+            SET is_active = 0
+            WHERE fired = 1 AND recurring_interval_seconds IS NULL AND is_active = 1
+            """
+        )
 
         # Remind registrations table (#188)
         cursor.execute("""
@@ -2281,6 +2288,7 @@ class MessageQueueManager:
             SELECT id, target_session_id, message, fire_at, recurring_interval_seconds
             FROM scheduled_reminders
             WHERE is_active = 1
+              AND (fired = 0 OR recurring_interval_seconds IS NOT NULL)
         """)
 
         for row in rows:

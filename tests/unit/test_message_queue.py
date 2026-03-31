@@ -425,6 +425,50 @@ class TestDatabaseOperations:
 
         conn.close()
 
+    @pytest.mark.asyncio
+    async def test_init_db_backfills_fired_one_shot_reminders_inactive(self, mock_session_manager, temp_db_path):
+        """Legacy fired one-shot reminders must not be reactivated by the new migration."""
+        conn = sqlite3.connect(temp_db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE scheduled_reminders (
+                id TEXT PRIMARY KEY,
+                target_session_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                fire_at TIMESTAMP NOT NULL,
+                task_type TEXT DEFAULT 'reminder',
+                fired INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute(
+            """
+            INSERT INTO scheduled_reminders (id, target_session_id, message, fire_at, task_type, fired)
+            VALUES (?, ?, ?, ?, 'reminder', 1)
+            """,
+            ("legacy-fired", "target123", "Old reminder", datetime.now().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        mq = MessageQueueManager(
+            session_manager=mock_session_manager,
+            db_path=temp_db_path,
+            notifier=None,
+        )
+        try:
+            row = mq._execute_query(
+                "SELECT fired, recurring_interval_seconds, is_active FROM scheduled_reminders WHERE id = ?",
+                ("legacy-fired",),
+            )[0]
+            assert row == (1, None, 0)
+
+            with patch("asyncio.create_task", noop_create_task):
+                await mq._recover_scheduled_reminders()
+
+            assert "legacy-fired" not in mq._scheduled_tasks
+        finally:
+            _close_message_queue(mq)
+
     def test_mark_delivered_updates_db(self, message_queue):
         """_mark_delivered updates delivered_at in database."""
         with patch('asyncio.create_task', noop_create_task):
