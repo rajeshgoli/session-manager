@@ -4689,8 +4689,9 @@ Provide ONLY the summary, no preamble or questions."""
     @app.post("/scheduler/remind")
     async def schedule_reminder(
         session_id: str,
-        delay_seconds: int,
         message: str,
+        delay_seconds: int = Query(..., gt=0),
+        recurring_interval_seconds: Optional[int] = Query(default=None, gt=0),
     ):
         """Schedule a self-reminder for a session."""
         if not app.state.session_manager:
@@ -4704,13 +4705,42 @@ Provide ONLY the summary, no preamble or questions."""
         if not queue_mgr:
             raise HTTPException(status_code=503, detail="Message queue not configured")
 
-        reminder_id = await queue_mgr.schedule_reminder(session_id, delay_seconds, message)
+        reminder_id = await queue_mgr.schedule_reminder(
+            session_id,
+            delay_seconds,
+            message,
+            recurring_interval_seconds=recurring_interval_seconds,
+        )
 
         return {
             "status": "scheduled",
             "reminder_id": reminder_id,
             "session_id": session_id,
             "fires_in_seconds": delay_seconds,
+            "mode": "recurring" if recurring_interval_seconds is not None else "one-shot",
+            "recurring_interval_seconds": recurring_interval_seconds,
+        }
+
+    @app.delete("/scheduler/remind/{reminder_id}")
+    async def cancel_scheduled_reminder(reminder_id: str):
+        """Cancel a scheduled reminder by reminder ID."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        reminder = queue_mgr.cancel_scheduled_reminder(reminder_id)
+        if reminder is None:
+            raise HTTPException(status_code=404, detail="Reminder not found")
+
+        return {
+            "status": "cancelled",
+            "reminder_id": reminder_id,
+            "session_id": reminder["target_session_id"],
+            "recurring_interval_seconds": reminder["recurring_interval_seconds"],
+            "fired": reminder["fired"],
         }
 
     @app.post("/sessions/{session_id}/remind")

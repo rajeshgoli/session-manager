@@ -1384,7 +1384,22 @@ def cmd_send(
     return 0
 
 
-def cmd_remind(client: SessionManagerClient, session_id: str, delay_seconds: int, message: str) -> int:
+def _format_delay(delay_seconds: int) -> str:
+    """Format a delay in seconds for CLI output."""
+    if delay_seconds >= 3600:
+        return f"{delay_seconds // 3600}h{(delay_seconds % 3600) // 60}m"
+    if delay_seconds >= 60:
+        return f"{delay_seconds // 60}m{delay_seconds % 60}s"
+    return f"{delay_seconds}s"
+
+
+def cmd_remind(
+    client: SessionManagerClient,
+    session_id: str,
+    delay_seconds: int,
+    message: str,
+    recurring: bool = False,
+) -> int:
     """
     Schedule a self-reminder.
 
@@ -1399,7 +1414,17 @@ def cmd_remind(client: SessionManagerClient, session_id: str, delay_seconds: int
         1: Failed to schedule
         2: Session manager unavailable
     """
-    result = client.schedule_reminder(session_id, delay_seconds, message)
+    if delay_seconds <= 0:
+        print("Error: Reminder delay must be > 0", file=sys.stderr)
+        return 1
+
+    recurring_interval_seconds = delay_seconds if recurring else None
+    result = client.schedule_reminder(
+        session_id,
+        delay_seconds,
+        message,
+        recurring_interval_seconds=recurring_interval_seconds,
+    )
 
     if result is None:
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
@@ -1407,18 +1432,45 @@ def cmd_remind(client: SessionManagerClient, session_id: str, delay_seconds: int
 
     if result.get("status") == "scheduled":
         reminder_id = result.get("reminder_id", "unknown")
-        # Format delay for display
-        if delay_seconds >= 3600:
-            delay_str = f"{delay_seconds // 3600}h{(delay_seconds % 3600) // 60}m"
-        elif delay_seconds >= 60:
-            delay_str = f"{delay_seconds // 60}m{delay_seconds % 60}s"
+        delay_str = _format_delay(delay_seconds)
+        if recurring:
+            print(f"Recurring reminder scheduled ({reminder_id}): every {delay_str}")
         else:
-            delay_str = f"{delay_seconds}s"
-        print(f"Reminder scheduled ({reminder_id}): fires in {delay_str}")
+            print(f"Reminder scheduled ({reminder_id}): fires in {delay_str}")
         return 0
     else:
         print(f"Error: Failed to schedule reminder", file=sys.stderr)
         return 1
+
+
+def cmd_cancel_scheduled_reminder(client: SessionManagerClient, reminder_id: str) -> int:
+    """
+    Cancel a scheduled reminder by reminder ID.
+
+    Args:
+        client: API client
+        reminder_id: Scheduled reminder ID
+
+    Exit codes:
+        0: Success
+        1: Reminder not found or cancellation failed
+        2: Session manager unavailable
+    """
+    result = client.cancel_scheduled_reminder(reminder_id)
+
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to cancel reminder"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    payload = result.get("data") or {}
+    target_session_id = payload.get("session_id", "unknown")
+    print(f"Reminder cancelled ({reminder_id}) for {target_session_id}")
+    return 0
 
 
 def cmd_queue(client: SessionManagerClient, session_id: str) -> int:

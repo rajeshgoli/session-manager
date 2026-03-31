@@ -19,6 +19,26 @@ def noop_create_task(coro):
     return MagicMock()
 
 
+def _close_message_queue(mq: MessageQueueManager) -> None:
+    """Release SQLite handles and any queued background tasks for repeatable tests."""
+    for task_map_name in ("_scheduled_tasks", "_remind_tasks", "_job_watch_tasks", "_pending_stop_notify_tasks"):
+        task_map = getattr(mq, task_map_name, {})
+        for task in list(task_map.values()):
+            cancel = getattr(task, "cancel", None)
+            if callable(cancel):
+                cancel()
+        task_map.clear()
+    monitor_task = getattr(mq, "_monitor_task", None)
+    if monitor_task is not None:
+        cancel = getattr(monitor_task, "cancel", None)
+        if callable(cancel):
+            cancel()
+        mq._monitor_task = None
+    if mq._db_conn is not None:
+        mq._db_conn.close()
+        mq._db_conn = None
+
+
 @pytest.fixture
 def mock_session_manager():
     """Create a mock SessionManager."""
@@ -60,7 +80,10 @@ def message_queue(mock_session_manager, temp_db_path):
         },
         notifier=None,  # No Telegram mirroring in tests
     )
-    return mq
+    try:
+        yield mq
+    finally:
+        _close_message_queue(mq)
 
 
 class TestQueueing:
@@ -395,6 +418,10 @@ class TestDatabaseOperations:
 
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_reminders'")
         assert cursor.fetchone() is not None
+        cursor.execute("PRAGMA table_info(scheduled_reminders)")
+        reminder_columns = {row[1] for row in cursor.fetchall()}
+        assert "recurring_interval_seconds" in reminder_columns
+        assert "is_active" in reminder_columns
 
         conn.close()
 

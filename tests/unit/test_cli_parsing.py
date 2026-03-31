@@ -55,6 +55,13 @@ class TestCliParsing:
         wait_parser.add_argument("session_id")
         wait_parser.add_argument("seconds", type=int)
 
+        # sm remind
+        remind_parser = subparsers.add_parser("remind")
+        remind_parser.add_argument("first_arg", nargs="?")
+        remind_parser.add_argument("message", nargs="*", default=[])
+        remind_parser.add_argument("--recurring", action="store_true")
+        remind_parser.add_argument("--stop", action="store_true")
+
         # sm watch-job
         watch_job_parser = subparsers.add_parser("watch-job")
         watch_job_subparsers = watch_job_parser.add_subparsers(dest="watch_job_command")
@@ -300,6 +307,35 @@ class TestWaitCommand:
         assert args.command == "wait"
         assert args.session_id == "session123"
         assert args.seconds == 60
+
+
+class TestRemindCommand:
+    """Tests for `sm remind` command parsing."""
+
+    def test_remind_one_shot_parses(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["remind", "300", "check", "run"])
+
+        assert args.command == "remind"
+        assert args.first_arg == "300"
+        assert args.message == ["check", "run"]
+        assert args.recurring is False
+        assert args.stop is False
+
+    def test_remind_recurring_flag_parses(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["remind", "--recurring", "900", "check", "run"])
+
+        assert args.first_arg == "900"
+        assert args.message == ["check", "run"]
+        assert args.recurring is True
+
+    def test_remind_cancel_parses(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["remind", "cancel", "abc123"])
+
+        assert args.first_arg == "cancel"
+        assert args.message == ["abc123"]
 
 
 class TestCodexCommandRouting:
