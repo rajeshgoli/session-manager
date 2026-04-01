@@ -2166,10 +2166,18 @@ class MessageQueueManager:
         )
         self._scheduled_tasks[reminder_id] = task
 
-    def _format_scheduled_reminder_message(self, message: str, recurring_interval_seconds: Optional[int]) -> str:
+    def _format_scheduled_reminder_message(
+        self,
+        reminder_id: str,
+        message: str,
+        recurring_interval_seconds: Optional[int],
+    ) -> str:
         """Render the delivered reminder text."""
         prefix = "[sm] Recurring reminder:" if recurring_interval_seconds is not None else "[sm] Scheduled reminder:"
-        return f"{prefix}\n{message}"
+        lines = [f"{prefix} ({reminder_id})", message]
+        if recurring_interval_seconds is not None:
+            lines.append(f"[sm] Cancel: sm remind cancel {reminder_id}")
+        return "\n".join(lines)
 
     def _is_runnable_reminder_target(self, session_id: str) -> bool:
         """Return True when the reminder target session still exists and is not stopped."""
@@ -2218,7 +2226,11 @@ class MessageQueueManager:
                 waited += COMPACTION_POLL_INTERVAL
 
             # Queue the reminder with urgent delivery to actually wake the agent
-            formatted_message = self._format_scheduled_reminder_message(message, recurring_interval_seconds)
+            formatted_message = self._format_scheduled_reminder_message(
+                reminder_id,
+                message,
+                recurring_interval_seconds,
+            )
             self.queue_message(
                 target_session_id=session_id,
                 text=formatted_message,
