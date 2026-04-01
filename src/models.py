@@ -354,6 +354,7 @@ class Session:
     agent_status_text: Optional[str] = None  # Last sm status "<text>" from agent
     agent_status_at: Optional[datetime] = None  # When agent_status_text was last set
     agent_task_completed_at: Optional[datetime] = None  # Last sm task-complete timestamp
+    auto_bootstrapped_role: Optional[str] = None  # Service role that created this session via ensure_role_session
 
     def __post_init__(self):
         if not self.name:
@@ -423,6 +424,7 @@ class Session:
             "agent_status_text": self.agent_status_text,
             "agent_status_at": self.agent_status_at.isoformat() if self.agent_status_at else None,
             "agent_task_completed_at": self.agent_task_completed_at.isoformat() if self.agent_task_completed_at else None,
+            "auto_bootstrapped_role": self.auto_bootstrapped_role,
             # EM role flag (#256)
             "is_em": self.is_em,
             # Role tag (#287)
@@ -507,6 +509,7 @@ class Session:
             agent_status_text=data.get("agent_status_text"),
             agent_status_at=datetime.fromisoformat(data["agent_status_at"]) if data.get("agent_status_at") else None,
             agent_task_completed_at=datetime.fromisoformat(data["agent_task_completed_at"]) if data.get("agent_task_completed_at") else None,
+            auto_bootstrapped_role=data.get("auto_bootstrapped_role"),
             # EM role flag (#256)
             is_em=data.get("is_em", False),
             # Role tag (#287): backward compat infers em role from legacy is_em

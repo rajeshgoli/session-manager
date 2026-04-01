@@ -132,7 +132,7 @@ def test_cmd_maintainer_clear(capsys):
     assert "cleared" in capsys.readouterr().out
 
 
-def test_ensure_maintainer_session_prefers_codex_fork_and_registers_alias(tmp_path):
+def test_ensure_maintainer_session_prefers_codex_and_registers_alias(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     manager = _manager(tmp_path)
@@ -158,8 +158,9 @@ def test_ensure_maintainer_session_prefers_codex_fork_and_registers_alias(tmp_pa
 
     assert created is True
     assert session.id == "maint001"
-    assert session.provider == "codex-fork"
+    assert session.provider == "codex"
     assert session.role == "maintainer"
+    assert session.auto_bootstrapped_role == "maintainer"
     assert manager.lookup_agent_registration("maintainer").session_id == session.id
     assert _fake_create_session_common.kwargs["working_dir"] == str(repo_dir)
     assert "sm send maintainer" in _fake_create_session_common.kwargs["initial_prompt"]
@@ -183,7 +184,7 @@ def test_ensure_maintainer_session_falls_back_to_claude(tmp_path):
         manager.sessions[session.id] = session
         return session
 
-    manager._provider_entrypoint_available = Mock(side_effect=lambda provider: provider != "codex-fork")
+    manager._provider_entrypoint_available = Mock(side_effect=lambda provider: provider != "codex")
     manager._create_session_common = AsyncMock(side_effect=_fake_create_session_common)
 
     session, created = asyncio.run(manager.ensure_maintainer_session())
@@ -222,7 +223,60 @@ def test_post_ensure_maintainer_bootstraps_session(tmp_path):
     assert payload["created"] is True
     assert payload["session"]["id"] == "maint003"
     assert payload["session"]["aliases"] == ["maintainer"]
-    assert payload["session"]["provider"] == "codex-fork"
+    assert payload["session"]["provider"] == "codex"
+
+
+def test_maintainer_fallback_uses_bootstrap_prompt_file(tmp_path):
+    repo_dir = tmp_path / "repo"
+    prompt_file = repo_dir / "docs" / "product" / "maintainer_bootstrap.md"
+    prompt_file.parent.mkdir(parents=True)
+    prompt_file.write_text("Read docs/product/lessons.md first.\nAct as {role} in {working_dir}.")
+    manager = _manager(
+        tmp_path,
+        config={
+            "maintainer_agent": {
+                "working_dir": str(repo_dir),
+                "friendly_name": "maintainer",
+                "preferred_providers": ["claude"],
+                "bootstrap_prompt_file": "docs/product/maintainer_bootstrap.md",
+            }
+        },
+    )
+
+    async def _fake_create_session_common(**kwargs):
+        session = Session(
+            id="maint004",
+            working_dir=kwargs["working_dir"],
+            provider=kwargs["provider"],
+            friendly_name=kwargs["friendly_name"],
+            log_file=str(tmp_path / "maint004.log"),
+            status=SessionStatus.RUNNING,
+        )
+        manager.sessions[session.id] = session
+        _fake_create_session_common.kwargs = kwargs
+        return session
+
+    manager._provider_entrypoint_available = Mock(return_value=True)
+    manager._create_session_common = AsyncMock(side_effect=_fake_create_session_common)
+
+    session, created = asyncio.run(manager.ensure_maintainer_session())
+
+    assert created is True
+    assert session.id == "maint004"
+    assert manager.get_service_role_bootstrap_spec("maintainer")["bootstrap_prompt_file"] == "docs/product/maintainer_bootstrap.md"
+    assert _fake_create_session_common.kwargs["initial_prompt"] == (
+        f"Read docs/product/lessons.md first.\nAct as maintainer in {repo_dir}."
+    )
+
+
+def test_manual_maintainer_registration_does_not_mark_auto_bootstrapped_role(tmp_path):
+    manager = _manager(tmp_path)
+    session = _session("maint-manual", tmp_path)
+    manager.sessions[session.id] = session
+
+    manager.set_maintainer_session(session.id)
+
+    assert session.auto_bootstrapped_role is None
 
 
 def test_ensure_service_role_session_uses_prompt_file_and_registers_alias(tmp_path):
@@ -330,8 +384,8 @@ def test_cmd_send_bootstraps_maintainer_when_missing(capsys):
             "session": {
                 "id": "maint004",
                 "friendly_name": "sm-maintainer",
-                "name": "codex-fork-maint004",
-                "provider": "codex-fork",
+                "name": "codex-maint004",
+                "provider": "codex",
             },
         },
     }
@@ -344,7 +398,7 @@ def test_cmd_send_bootstraps_maintainer_when_missing(capsys):
     client.send_input.assert_called_once()
     assert client.send_input.call_args[0][0] == "maint004"
     output = capsys.readouterr().out
-    assert "Role bootstrapped: maintainer -> sm-maintainer (maint004) [codex-fork]" in output
+    assert "Role bootstrapped: maintainer -> sm-maintainer (maint004) [codex]" in output
     assert "Input sent to sm-maintainer (maint004)" in output
 
 
