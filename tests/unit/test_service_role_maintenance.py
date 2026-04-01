@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import Mock
+from unittest.mock import AsyncMock
 
-from src.models import Session, SessionStatus
+from src.models import DeliveryResult, Session, SessionStatus
 from src.session_manager import SessionManager
 
 
@@ -120,3 +123,52 @@ def test_reap_skips_auto_bootstrapped_maintainer_before_ttl(tmp_path):
     assert killed == []
     assert manager.sessions[session.id].status == SessionStatus.RUNNING
     assert manager.lookup_agent_registration("maintainer") is not None
+
+
+def test_new_incoming_work_clears_task_complete_before_reap(tmp_path):
+    manager = _manager(
+        tmp_path,
+        config={
+            "service_roles": {
+                "maintainer": {
+                    "auto_bootstrap": True,
+                    "working_dir": str(tmp_path),
+                    "friendly_name": "maintainer",
+                    "preferred_providers": ["claude"],
+                    "bootstrap_prompt": "Act as {role} in {working_dir}.",
+                    "task_complete_ttl_seconds": 600,
+                }
+            }
+        },
+    )
+    session = _session(tmp_path, "maint004")
+    session.role = "maintainer"
+    session.auto_bootstrapped_role = "maintainer"
+    session.agent_task_completed_at = datetime.now() - timedelta(minutes=11)
+    manager.sessions[session.id] = session
+    manager.register_agent_role(session.id, "maintainer")
+
+    sender = _session(tmp_path, "sender004")
+    manager.sessions[sender.id] = sender
+
+    queue = Mock()
+    queue.queue_message.return_value = SimpleNamespace(id="msg-004")
+    queue.deliver_queued_message_now = AsyncMock(return_value=False)
+    manager.message_queue_manager = queue
+
+    result = asyncio.run(
+        manager.send_input(
+            session.id,
+            "new maintainer request",
+            sender_session_id=sender.id,
+            delivery_mode="sequential",
+            from_sm_send=True,
+        )
+    )
+
+    killed = manager.reap_completed_auto_bootstrapped_service_sessions(now=datetime.now())
+
+    assert result == DeliveryResult.QUEUED
+    assert session.agent_task_completed_at is None
+    assert killed == []
+    assert manager.sessions[session.id].status == SessionStatus.RUNNING

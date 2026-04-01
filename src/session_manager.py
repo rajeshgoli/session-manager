@@ -2910,6 +2910,10 @@ class SessionManager:
                 session.role = detected_role
                 self._save_state()
 
+        if session.agent_task_completed_at is not None and sender_session_id != session_id:
+            session.agent_task_completed_at = None
+            self._save_state()
+
         # For permission responses, bypass queue and send directly
         if bypass_queue:
             logger.info(f"Bypassing queue for direct send to {session_id}: {text}")
