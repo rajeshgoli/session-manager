@@ -166,6 +166,15 @@ def test_ensure_maintainer_session_prefers_codex_and_registers_alias(tmp_path):
     assert "sm send maintainer" in _fake_create_session_common.kwargs["initial_prompt"]
 
 
+def test_maintainer_legacy_fallback_defaults_task_complete_ttl(tmp_path):
+    manager = _manager(tmp_path)
+
+    spec = manager.get_service_role_bootstrap_spec("maintainer")
+
+    assert spec is not None
+    assert spec["task_complete_ttl_seconds"] == 600
+
+
 def test_ensure_maintainer_session_falls_back_to_claude(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()

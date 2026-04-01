@@ -172,3 +172,25 @@ def test_new_incoming_work_clears_task_complete_before_reap(tmp_path):
     assert session.agent_task_completed_at is None
     assert killed == []
     assert manager.sessions[session.id].status == SessionStatus.RUNNING
+
+
+def test_failed_send_does_not_clear_task_complete(tmp_path):
+    manager = _manager(tmp_path)
+    manager.message_queue_manager = Mock()
+    session = _session(tmp_path, "maint005")
+    session.agent_task_completed_at = datetime.now() - timedelta(minutes=11)
+    session.status = SessionStatus.STOPPED
+    manager.sessions[session.id] = session
+
+    result = asyncio.run(
+        manager.send_input(
+            session.id,
+            "new request",
+            sender_session_id="sender005",
+            delivery_mode="sequential",
+            from_sm_send=True,
+        )
+    )
+
+    assert result == DeliveryResult.FAILED
+    assert session.agent_task_completed_at is not None

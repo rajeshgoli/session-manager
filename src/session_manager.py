@@ -72,6 +72,8 @@ DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
 ).strip()
 
+DEFAULT_MAINTAINER_TASK_COMPLETE_TTL_SECONDS = 600
+
 DEFAULT_SERVICE_ROLE_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
     Act as the {role} service agent for this repository.
@@ -196,6 +198,15 @@ class SessionManager:
         self.maintainer_bootstrap_prompt_file = str(
             maintainer_config.get("bootstrap_prompt_file", maintainer_config.get("boot_prompt_file", ""))
         ).strip()
+        raw_maintainer_task_complete_ttl = maintainer_config.get("task_complete_ttl_seconds")
+        self.maintainer_task_complete_ttl_seconds = DEFAULT_MAINTAINER_TASK_COMPLETE_TTL_SECONDS
+        if raw_maintainer_task_complete_ttl not in (None, ""):
+            try:
+                normalized_maintainer_ttl = int(raw_maintainer_task_complete_ttl)
+            except (TypeError, ValueError):
+                normalized_maintainer_ttl = DEFAULT_MAINTAINER_TASK_COMPLETE_TTL_SECONDS
+            if normalized_maintainer_ttl > 0:
+                self.maintainer_task_complete_ttl_seconds = normalized_maintainer_ttl
         self.service_role_bootstrap_specs = self._build_service_role_bootstrap_specs(
             default_working_dir=default_working_dir,
             maintainer_config=maintainer_config,
@@ -2259,6 +2270,8 @@ class SessionManager:
                 default_auto_bootstrap=True,
             )
             if maintainer_spec:
+                if maintainer_spec.get("task_complete_ttl_seconds") is None:
+                    maintainer_spec["task_complete_ttl_seconds"] = self.maintainer_task_complete_ttl_seconds
                 specs["maintainer"] = maintainer_spec
 
         return specs
@@ -2359,8 +2372,9 @@ class SessionManager:
             "preferred_providers": list(self.maintainer_preferred_providers),
             "bootstrap_prompt": self.maintainer_bootstrap_prompt_template,
             "bootstrap_prompt_file": self.maintainer_bootstrap_prompt_file,
-            "task_complete_ttl_seconds": self.service_role_bootstrap_specs.get("maintainer", {}).get(
-                "task_complete_ttl_seconds"
+            "task_complete_ttl_seconds": (
+                self.service_role_bootstrap_specs.get("maintainer", {}).get("task_complete_ttl_seconds")
+                or self.maintainer_task_complete_ttl_seconds
             ),
         }
 
@@ -2910,9 +2924,12 @@ class SessionManager:
                 session.role = detected_role
                 self._save_state()
 
-        if session.agent_task_completed_at is not None and sender_session_id != session_id:
-            session.agent_task_completed_at = None
-            self._save_state()
+        should_clear_completed_state = session.agent_task_completed_at is not None and sender_session_id != session_id
+
+        def _clear_completed_state() -> None:
+            if should_clear_completed_state and session.agent_task_completed_at is not None:
+                session.agent_task_completed_at = None
+                self._save_state()
 
         # For permission responses, bypass queue and send directly
         if bypass_queue:
@@ -2920,6 +2937,7 @@ class SessionManager:
             success = await self._deliver_direct(session, text)
             if success:
                 session.last_activity = datetime.now()
+                _clear_completed_state()
             return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
         # Format message with sender metadata if provided
@@ -3008,6 +3026,7 @@ class SessionManager:
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
                 )
+                _clear_completed_state()
                 return DeliveryResult.DELIVERED if delivered else DeliveryResult.QUEUED
 
             # For important, queue first, then report the real immediate-delivery outcome.
@@ -3038,6 +3057,7 @@ class SessionManager:
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
                 )
+                _clear_completed_state()
                 return DeliveryResult.DELIVERED if delivered else DeliveryResult.QUEUED
 
             # Urgent always delivers (sends Escape first).
@@ -3059,6 +3079,7 @@ class SessionManager:
                     parent_session_id=parent_session_id,
                 )
                 _record_outgoing_sm_send_target()
+                _clear_completed_state()
                 return DeliveryResult.DELIVERED
 
         # Fallback: send immediately (no queue manager or unknown mode)
@@ -3066,6 +3087,7 @@ class SessionManager:
         if success:
             session.last_activity = datetime.now()
             session.status = SessionStatus.RUNNING
+            _clear_completed_state()
             self._save_state()
 
         return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
