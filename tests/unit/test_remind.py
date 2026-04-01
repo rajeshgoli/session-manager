@@ -1077,7 +1077,13 @@ class TestOneShotRemind:
                         recurring_interval_seconds=30,
                     )
 
-        assert fired == [("loop1", "[sm] Recurring reminder:\nCheck training run", "urgent")]
+        assert fired == [
+            (
+                "loop1",
+                f"[sm] Recurring reminder: ({reminder_id})\nCheck training run\n[sm] Cancel: sm remind cancel {reminder_id}",
+                "urgent",
+            )
+        ]
         assert len(rescheduled) == 1
         assert rescheduled[0]["recurring_interval_seconds"] == 30
 
