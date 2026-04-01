@@ -6,7 +6,7 @@ import argparse
 from unittest.mock import MagicMock, patch
 from io import StringIO
 
-from src.cli.main import main
+from src.cli.main import main, _normalize_optional_track_args
 from src.cli.commands import resolve_session_id, parse_duration
 
 
@@ -37,7 +37,8 @@ class TestCliParsing:
         send_parser.add_argument("--important", action="store_true")
         send_parser.add_argument("--urgent", action="store_true")
         send_parser.add_argument("--wait", type=int, metavar="SECONDS")
-        send_parser.add_argument("--track", nargs="?", const=300, type=int, metavar="SECONDS")
+        send_parser.add_argument("--track", action="store_const", const=300, default=None)
+        send_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS")
 
         # sm spawn
         spawn_parser = subparsers.add_parser("spawn")
@@ -48,7 +49,8 @@ class TestCliParsing:
         spawn_parser.add_argument("--model")
         spawn_parser.add_argument("--working-dir")
         spawn_parser.add_argument("--json", action="store_true")
-        spawn_parser.add_argument("--track", nargs="?", const=300, type=int, metavar="SECONDS")
+        spawn_parser.add_argument("--track", action="store_const", const=300, default=None)
+        spawn_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS")
 
         # sm wait
         wait_parser = subparsers.add_parser("wait")
@@ -114,7 +116,7 @@ class TestCliParsing:
         watch_parser.add_argument("--role", default=None)
         watch_parser.add_argument("--interval", type=float, default=2.0)
 
-        return parser.parse_args(args_list)
+        return parser.parse_args(_normalize_optional_track_args(args_list))
 
 
 class TestNameCommand:
@@ -202,6 +204,40 @@ class TestSendCommand:
 
         assert args.track == 420
 
+    def test_send_track_before_session_id_uses_default(self):
+        """sm send --track <session> <text> keeps positionals intact."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["send", "--track", "target123", "Test"])
+
+        assert args.track == 300
+        assert args.session_id == "target123"
+        assert args.text == "Test"
+
+    def test_send_track_before_text_uses_default(self):
+        """sm send <session> --track <text> keeps the message positional intact."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["send", "target123", "--track", "Test"])
+
+        assert args.track == 300
+        assert args.session_id == "target123"
+        assert args.text == "Test"
+
+    def test_send_track_equals_custom_flag(self):
+        """sm send --track=420 parses correctly."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["send", "target123", "Test", "--track=420"])
+
+        assert args.track == 420
+
+    def test_send_track_sentinel_preserves_literal_text(self):
+        """sm send target -- --track=420 keeps the payload literal."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["send", "target123", "--", "--track=420"])
+
+        assert args.track is None
+        assert args.session_id == "target123"
+        assert args.text == "--track=420"
+
 
 class TestSpawnCommand:
     """Tests for 'sm spawn' command parsing."""
@@ -240,6 +276,24 @@ class TestSpawnCommand:
         args = parser._get_parsed_args(["spawn", "claude", "Test prompt", "--track", "420"])
 
         assert args.track == 420
+
+    def test_spawn_track_before_prompt_uses_default(self):
+        """sm spawn claude --track <prompt> keeps the prompt positional intact."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "claude", "--track", "Test prompt"])
+
+        assert args.track == 300
+        assert args.provider == "claude"
+        assert args.prompt == "Test prompt"
+
+    def test_spawn_track_sentinel_preserves_literal_prompt(self):
+        """sm spawn claude -- --track=420 keeps the prompt literal."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "claude", "--", "--track=420"])
+
+        assert args.track is None
+        assert args.provider == "claude"
+        assert args.prompt == "--track=420"
 
     def test_spawn_model_flag(self):
         """sm spawn --model opus sets model."""

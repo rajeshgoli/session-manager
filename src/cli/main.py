@@ -9,6 +9,57 @@ from .client import SessionManagerClient
 from . import commands
 
 
+def _looks_like_int_token(token: str) -> bool:
+    """Return True when one argv token can be parsed as an integer."""
+    try:
+        int(token)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _normalize_optional_track_args(argv: list[str]) -> list[str]:
+    """
+    Rewrite explicit `--track` integer values before argparse runs.
+
+    Bare `--track` keeps the default 300-second behavior. Explicit integer forms
+    (`--track 420` and `--track=420`) are rewritten to a hidden internal flag so
+    argparse does not greedily consume following positional arguments.
+    """
+    if not argv:
+        return argv
+
+    if argv[0] not in {"send", "spawn"}:
+        return argv
+
+    normalized: list[str] = [argv[0]]
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            normalized.extend(argv[index:])
+            break
+        if token == "--track":
+            next_token = argv[index + 1] if index + 1 < len(argv) else None
+            if next_token is not None and _looks_like_int_token(next_token):
+                normalized.extend(["--track-seconds", next_token])
+                index += 2
+                continue
+            normalized.append(token)
+            index += 1
+            continue
+        if token.startswith("--track="):
+            maybe_value = token.split("=", 1)[1]
+            if _looks_like_int_token(maybe_value):
+                normalized.extend(["--track-seconds", maybe_value])
+                index += 1
+                continue
+        normalized.append(token)
+        index += 1
+
+    return normalized
+
+
 def _handle_dispatch(session_id: Optional[str]) -> int:
     """Handle 'sm dispatch' with two-phase argument parsing.
 
@@ -138,12 +189,12 @@ def main():
     send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
     send_parser.add_argument(
         "--track",
-        nargs="?",
+        action="store_const",
         const=300,
-        type=int,
-        metavar="SECONDS",
-        help="Track the recipient with periodic remind until it replies (default: 300s)",
+        default=None,
+        help="Track the recipient with periodic remind until it replies (default: 300s; explicit seconds also supported)",
     )
+    send_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS", help=argparse.SUPPRESS)
 
     # sm remind <delay> <message>              (one-shot self-reminder)
     # sm remind --recurring <delay> <message>  (recurring self-reminder)
@@ -231,12 +282,12 @@ def main():
     spawn_parser.add_argument("--json", action="store_true", help="Output JSON")
     spawn_parser.add_argument(
         "--track",
-        nargs="?",
+        action="store_const",
         const=300,
-        type=int,
-        metavar="SECONDS",
-        help="Track the child with periodic remind until stopped (default: 300s)",
+        default=None,
+        help="Track the child with periodic remind until stopped (default: 300s; explicit seconds also supported)",
     )
+    spawn_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS", help=argparse.SUPPRESS)
 
     # sm children [session]
     children_parser = subparsers.add_parser("children", help="List child sessions")
@@ -613,7 +664,7 @@ def main():
     review_parser.add_argument("--pr", type=int, help="PR number to review (Phase 1b)")
     review_parser.add_argument("--repo", help="Repository for PR review (Phase 1b)")
 
-    args = parser.parse_args()
+    args = parser.parse_args(_normalize_optional_track_args(sys.argv[1:]))
 
     # Check for CLAUDE_SESSION_MANAGER_ID
     session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
