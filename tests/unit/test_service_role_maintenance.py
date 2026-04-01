@@ -5,7 +5,9 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 from unittest.mock import AsyncMock
+from unittest.mock import patch
 
+import pytest
 from src.models import DeliveryResult, Session, SessionStatus
 from src.session_manager import SessionManager
 
@@ -194,3 +196,49 @@ def test_failed_send_does_not_clear_task_complete(tmp_path):
 
     assert result == DeliveryResult.FAILED
     assert session.agent_task_completed_at is not None
+
+
+def test_steer_send_clears_task_complete_when_accepted(tmp_path):
+    manager = _manager(tmp_path)
+    manager.tmux.send_steer_text = AsyncMock(return_value=True)
+    session = _session(tmp_path, "maint006")
+    session.provider = "codex"
+    session.tmux_session = "codex-maint006"
+    session.agent_task_completed_at = datetime.now() - timedelta(minutes=11)
+    manager.sessions[session.id] = session
+
+    result = asyncio.run(
+        manager.send_input(
+            session.id,
+            "please continue",
+            sender_session_id="sender006",
+            delivery_mode="steer",
+            from_sm_send=True,
+        )
+    )
+
+    assert result == DeliveryResult.DELIVERED
+    assert session.agent_task_completed_at is None
+
+
+def test_service_role_maintenance_loop_recovers_after_reap_error(tmp_path):
+    manager = _manager(tmp_path)
+    manager.service_role_maintenance_poll_interval_seconds = 0
+    calls = []
+
+    def _fake_reap():
+        calls.append("reap")
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return []
+
+    async def _fake_sleep(_seconds):
+        if len(calls) >= 2:
+            raise asyncio.CancelledError()
+
+    with patch.object(manager, "reap_completed_auto_bootstrapped_service_sessions", side_effect=_fake_reap):
+        with patch("src.session_manager.asyncio.sleep", side_effect=_fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(manager._run_service_role_maintenance_loop())
+
+    assert calls == ["reap", "reap"]

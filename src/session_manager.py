@@ -2992,6 +2992,8 @@ class SessionManager:
                 logger.error(f"Steer delivery only supported for Codex CLI sessions, not {session.provider}")
                 return DeliveryResult.FAILED
             success = await self.tmux.send_steer_text(session.tmux_session, text)
+            if success:
+                _clear_completed_state()
             return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
         # Handle delivery modes using the message queue manager
@@ -3227,12 +3229,13 @@ class SessionManager:
         """Periodically retire completed auto-bootstrapped service sessions."""
         try:
             while True:
-                self.reap_completed_auto_bootstrapped_service_sessions()
+                try:
+                    self.reap_completed_auto_bootstrapped_service_sessions()
+                except Exception:
+                    logger.exception("Service role maintenance pass failed")
                 await asyncio.sleep(self.service_role_maintenance_poll_interval_seconds)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Service role maintenance loop failed")
 
     async def _ensure_codex_session(self, session: Session, model: Optional[str] = None) -> Optional[CodexAppServerSession]:
         """Ensure a Codex app-server session is running for this session."""
