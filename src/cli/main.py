@@ -36,6 +36,9 @@ def _normalize_optional_track_args(argv: list[str]) -> list[str]:
     index = 1
     while index < len(argv):
         token = argv[index]
+        if token == "--":
+            normalized.extend(argv[index:])
+            break
         if token == "--track":
             next_token = argv[index + 1] if index + 1 < len(argv) else None
             if next_token is not None and _looks_like_int_token(next_token):

@@ -229,6 +229,15 @@ class TestSendCommand:
 
         assert args.track == 420
 
+    def test_send_track_sentinel_preserves_literal_text(self):
+        """sm send target -- --track=420 keeps the payload literal."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["send", "target123", "--", "--track=420"])
+
+        assert args.track is None
+        assert args.session_id == "target123"
+        assert args.text == "--track=420"
+
 
 class TestSpawnCommand:
     """Tests for 'sm spawn' command parsing."""
@@ -276,6 +285,15 @@ class TestSpawnCommand:
         assert args.track == 300
         assert args.provider == "claude"
         assert args.prompt == "Test prompt"
+
+    def test_spawn_track_sentinel_preserves_literal_prompt(self):
+        """sm spawn claude -- --track=420 keeps the prompt literal."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["spawn", "claude", "--", "--track=420"])
+
+        assert args.track is None
+        assert args.provider == "claude"
+        assert args.prompt == "--track=420"
 
     def test_spawn_model_flag(self):
         """sm spawn --model opus sets model."""
