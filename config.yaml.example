@@ -213,25 +213,19 @@ codex_fork:
   # Control client/runtime contract pin.
   event_schema_version: 2
 
-# Optional auto-bootstrap config for `sm send maintainer ...`
-maintainer_agent:
-  working_dir: "/path/to/session-manager"
-  friendly_name: "sm-maintainer"
-  preferred_providers:
-    - "codex-fork"
-    - "claude"
-  bootstrap_prompt: |
-    As engineer, act as the Session Manager maintainer service agent for this repository.
-    - Own the incoming maintainer queue for Session Manager.
-    - Agents will report bugs via `sm send maintainer "..."`.
-    - Investigate against real behavior first, implement fixes with tests, restart SM with launchctl,
-      open a PR, comment `@codex review`, poll for feedback, merge when clean, and restart SM again.
-    - Do not send acknowledgements unless the reporter asks for one.
-
 # Generic auto-bootstrap config for durable service roles.
-# `maintainer` uses the legacy `maintainer_agent` block above by default, but may
-# also be configured here explicitly.
+# Prefer configuring `maintainer` here so its bootstrap prompt can live in repo
+# files and be updated without code changes.
 service_roles:
+  maintainer:
+    auto_bootstrap: true
+    working_dir: "/path/to/session-manager"
+    friendly_name: "maintainer"
+    preferred_providers:
+      - "codex"
+      - "claude"
+    bootstrap_prompt_file: "docs/product/maintainer_bootstrap.md"
+    task_complete_ttl_seconds: 600
   chief-scientist:
     auto_bootstrap: true
     preferred_providers:

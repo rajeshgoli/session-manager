@@ -72,6 +72,8 @@ DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
 ).strip()
 
+DEFAULT_MAINTAINER_TASK_COMPLETE_TTL_SECONDS = 600
+
 DEFAULT_SERVICE_ROLE_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
     Act as the {role} service agent for this repository.
@@ -182,17 +184,29 @@ class SessionManager:
         self.maintainer_friendly_name = str(
             maintainer_config.get("friendly_name", "sm-maintainer")
         ).strip() or "sm-maintainer"
-        preferred_providers = maintainer_config.get("preferred_providers", ["codex-fork", "claude"])
+        preferred_providers = maintainer_config.get("preferred_providers", ["codex", "claude"])
         if isinstance(preferred_providers, list):
             normalized_providers = [str(provider).strip() for provider in preferred_providers if str(provider).strip()]
         else:
-            normalized_providers = ["codex-fork", "claude"]
-        self.maintainer_preferred_providers = normalized_providers or ["codex-fork", "claude"]
+            normalized_providers = ["codex", "claude"]
+        self.maintainer_preferred_providers = normalized_providers or ["codex", "claude"]
         raw_bootstrap_prompt = maintainer_config.get(
             "bootstrap_prompt",
             DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT,
         )
         self.maintainer_bootstrap_prompt_template = str(raw_bootstrap_prompt).strip() or DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT
+        self.maintainer_bootstrap_prompt_file = str(
+            maintainer_config.get("bootstrap_prompt_file", maintainer_config.get("boot_prompt_file", ""))
+        ).strip()
+        raw_maintainer_task_complete_ttl = maintainer_config.get("task_complete_ttl_seconds")
+        self.maintainer_task_complete_ttl_seconds = DEFAULT_MAINTAINER_TASK_COMPLETE_TTL_SECONDS
+        if raw_maintainer_task_complete_ttl not in (None, ""):
+            try:
+                normalized_maintainer_ttl = int(raw_maintainer_task_complete_ttl)
+            except (TypeError, ValueError):
+                normalized_maintainer_ttl = DEFAULT_MAINTAINER_TASK_COMPLETE_TTL_SECONDS
+            if normalized_maintainer_ttl > 0:
+                self.maintainer_task_complete_ttl_seconds = normalized_maintainer_ttl
         self.service_role_bootstrap_specs = self._build_service_role_bootstrap_specs(
             default_working_dir=default_working_dir,
             maintainer_config=maintainer_config,
@@ -201,6 +215,11 @@ class SessionManager:
             "maintainer",
             asyncio.Lock(),
         )
+        service_role_maintenance_config = self.config.get("service_role_maintenance", {})
+        self.service_role_maintenance_poll_interval_seconds = float(
+            service_role_maintenance_config.get("poll_interval_seconds", 60.0)
+        )
+        self._service_role_maintenance_task: Optional[asyncio.Task[Any]] = None
 
         codex_config = self.config.get("codex", {})
         codex_app_config = self.config.get("codex_app_server", codex_config)
@@ -2200,6 +2219,15 @@ class SessionManager:
         bootstrap_prompt_file = str(
             raw_spec.get("bootstrap_prompt_file", raw_spec.get("boot_prompt_file", ""))
         ).strip()
+        raw_task_complete_ttl = raw_spec.get("task_complete_ttl_seconds")
+        task_complete_ttl_seconds: Optional[int] = None
+        if raw_task_complete_ttl is not None and raw_task_complete_ttl != "":
+            try:
+                normalized_ttl = int(raw_task_complete_ttl)
+            except (TypeError, ValueError):
+                normalized_ttl = 0
+            if normalized_ttl > 0:
+                task_complete_ttl_seconds = normalized_ttl
 
         return {
             "role": normalized_role,
@@ -2209,6 +2237,7 @@ class SessionManager:
             "preferred_providers": preferred_providers,
             "bootstrap_prompt": bootstrap_prompt,
             "bootstrap_prompt_file": bootstrap_prompt_file,
+            "task_complete_ttl_seconds": task_complete_ttl_seconds,
         }
 
     def _build_service_role_bootstrap_specs(
@@ -2241,6 +2270,8 @@ class SessionManager:
                 default_auto_bootstrap=True,
             )
             if maintainer_spec:
+                if maintainer_spec.get("task_complete_ttl_seconds") is None:
+                    maintainer_spec["task_complete_ttl_seconds"] = self.maintainer_task_complete_ttl_seconds
                 specs["maintainer"] = maintainer_spec
 
         return specs
@@ -2276,7 +2307,10 @@ class SessionManager:
         prompt_template = str(spec.get("bootstrap_prompt") or "").strip()
         prompt_file = str(spec.get("bootstrap_prompt_file") or "").strip()
         if prompt_file:
-            prompt_path = Path(prompt_file).expanduser().resolve()
+            prompt_path = Path(prompt_file).expanduser()
+            if not prompt_path.is_absolute():
+                prompt_path = Path(working_dir) / prompt_path
+            prompt_path = prompt_path.resolve()
             if not prompt_path.exists():
                 raise ValueError(f'Service role "{role}" bootstrap prompt file does not exist: {prompt_path}')
             if not prompt_path.is_file():
@@ -2337,7 +2371,11 @@ class SessionManager:
             "friendly_name": self.maintainer_friendly_name,
             "preferred_providers": list(self.maintainer_preferred_providers),
             "bootstrap_prompt": self.maintainer_bootstrap_prompt_template,
-            "bootstrap_prompt_file": "",
+            "bootstrap_prompt_file": self.maintainer_bootstrap_prompt_file,
+            "task_complete_ttl_seconds": (
+                self.service_role_bootstrap_specs.get("maintainer", {}).get("task_complete_ttl_seconds")
+                or self.maintainer_task_complete_ttl_seconds
+            ),
         }
 
     async def ensure_maintainer_session(self) -> tuple[Session, bool]:
@@ -2401,6 +2439,7 @@ class SessionManager:
                     continue
 
                 session.role = normalized_role
+                session.auto_bootstrapped_role = normalized_role
                 self._save_state()
 
                 try:
@@ -2885,12 +2924,20 @@ class SessionManager:
                 session.role = detected_role
                 self._save_state()
 
+        should_clear_completed_state = session.agent_task_completed_at is not None and sender_session_id != session_id
+
+        def _clear_completed_state() -> None:
+            if should_clear_completed_state and session.agent_task_completed_at is not None:
+                session.agent_task_completed_at = None
+                self._save_state()
+
         # For permission responses, bypass queue and send directly
         if bypass_queue:
             logger.info(f"Bypassing queue for direct send to {session_id}: {text}")
             success = await self._deliver_direct(session, text)
             if success:
                 session.last_activity = datetime.now()
+                _clear_completed_state()
             return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
         # Format message with sender metadata if provided
@@ -2945,6 +2992,8 @@ class SessionManager:
                 logger.error(f"Steer delivery only supported for Codex CLI sessions, not {session.provider}")
                 return DeliveryResult.FAILED
             success = await self.tmux.send_steer_text(session.tmux_session, text)
+            if success:
+                _clear_completed_state()
             return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
         # Handle delivery modes using the message queue manager
@@ -2979,6 +3028,7 @@ class SessionManager:
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
                 )
+                _clear_completed_state()
                 return DeliveryResult.DELIVERED if delivered else DeliveryResult.QUEUED
 
             # For important, queue first, then report the real immediate-delivery outcome.
@@ -3009,6 +3059,7 @@ class SessionManager:
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
                 )
+                _clear_completed_state()
                 return DeliveryResult.DELIVERED if delivered else DeliveryResult.QUEUED
 
             # Urgent always delivers (sends Escape first).
@@ -3030,6 +3081,7 @@ class SessionManager:
                     parent_session_id=parent_session_id,
                 )
                 _record_outgoing_sm_send_target()
+                _clear_completed_state()
                 return DeliveryResult.DELIVERED
 
         # Fallback: send immediately (no queue manager or unknown mode)
@@ -3037,6 +3089,7 @@ class SessionManager:
         if success:
             session.last_activity = datetime.now()
             session.status = SessionStatus.RUNNING
+            _clear_completed_state()
             self._save_state()
 
         return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
@@ -3110,10 +3163,19 @@ class SessionManager:
         for session in self.sessions.values():
             if session.provider == "codex-fork" and session.status != SessionStatus.STOPPED:
                 self._start_codex_fork_event_monitor(session, from_eof=True)
+        if self._service_role_maintenance_task is None:
+            self._service_role_maintenance_task = asyncio.create_task(
+                self._run_service_role_maintenance_loop()
+            )
 
     async def stop_background_tasks(self):
         """Stop periodic maintenance tasks owned by SessionManager."""
         await self.codex_observability_logger.stop_periodic_prune()
+        if self._service_role_maintenance_task is not None:
+            self._service_role_maintenance_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._service_role_maintenance_task
+            self._service_role_maintenance_task = None
         for session_id in list(self.codex_fork_event_monitors.keys()):
             await self._stop_codex_fork_event_monitor(session_id)
         pending_topic_tasks = list(self._pending_telegram_topic_tasks)
@@ -3122,6 +3184,58 @@ class SessionManager:
         for task in pending_topic_tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+    def reap_completed_auto_bootstrapped_service_sessions(
+        self,
+        now: Optional[datetime] = None,
+    ) -> list[str]:
+        """Kill completed auto-bootstrapped service sessions that exceeded their task-complete TTL."""
+        current_time = now or datetime.now()
+        killed_session_ids: list[str] = []
+
+        for session in list(self.sessions.values()):
+            if session.status == SessionStatus.STOPPED:
+                continue
+            if not session.auto_bootstrapped_role:
+                continue
+            if session.role != session.auto_bootstrapped_role:
+                continue
+            if session.agent_task_completed_at is None:
+                continue
+
+            spec = self.get_service_role_bootstrap_spec(session.auto_bootstrapped_role)
+            if not spec or not spec.get("auto_bootstrap"):
+                continue
+            ttl_seconds = spec.get("task_complete_ttl_seconds")
+            if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+                continue
+
+            completed_age_seconds = (current_time - session.agent_task_completed_at).total_seconds()
+            if completed_age_seconds < ttl_seconds:
+                continue
+
+            if self.kill_session(session.id):
+                killed_session_ids.append(session.id)
+                logger.info(
+                    "Auto-retired completed auto-bootstrapped service session %s for role %s after %.0fs",
+                    session.id,
+                    session.role,
+                    completed_age_seconds,
+                )
+
+        return killed_session_ids
+
+    async def _run_service_role_maintenance_loop(self) -> None:
+        """Periodically retire completed auto-bootstrapped service sessions."""
+        try:
+            while True:
+                try:
+                    self.reap_completed_auto_bootstrapped_service_sessions()
+                except Exception:
+                    logger.exception("Service role maintenance pass failed")
+                await asyncio.sleep(self.service_role_maintenance_poll_interval_seconds)
+        except asyncio.CancelledError:
+            raise
 
     async def _ensure_codex_session(self, session: Session, model: Optional[str] = None) -> Optional[CodexAppServerSession]:
         """Ensure a Codex app-server session is running for this session."""
