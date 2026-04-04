@@ -372,6 +372,8 @@ def _make_app_for_em_tests(session, session_manager, telegram_bot):
 
     session_manager.sessions = {session.id: session}
     session_manager.get_session = Mock(side_effect=lambda sid: session_manager.sessions.get(sid))
+    session_manager.list_adoption_proposals = Mock(return_value=[])
+    session_manager.get_session_aliases = Mock(return_value=[])
 
     tmux = Mock()
     tmux.set_status_bar = Mock()
@@ -435,6 +437,50 @@ def test_em_topic_inherits_previous_em_topic():
     # em_topic updated to the inherited topic
     assert mgr.em_topic == {"chat_id": 10000, "thread_id": 42000}
     mgr._save_state.assert_called()
+
+
+def test_em_topic_inheritance_renames_reused_topic_to_new_em_identity():
+    """Inherited EM topics are renamed to the new EM session's display identity."""
+    session = _make_forum_session(session_id="em-second", chat_id=10000, thread_id=99999)
+    session.friendly_name = "em-e1-proximity"
+    tg = _make_telegram_bot()
+
+    mgr = Mock()
+    mgr.em_topic = {"chat_id": 10000, "thread_id": 42000}
+    mgr.sessions = {session.id: session}
+    mgr.get_session = Mock(side_effect=lambda sid: mgr.sessions.get(sid))
+    mgr._save_state = Mock()
+    mgr.list_adoption_proposals = Mock(return_value=[])
+    mgr.get_session_aliases = Mock(return_value=[])
+
+    tmux = Mock()
+    tmux.set_status_bar = Mock()
+    mgr.tmux = tmux
+
+    mqm = Mock()
+    mqm.cancel_remind = Mock()
+    mqm.cancel_parent_wake = Mock()
+    mqm.cancel_context_monitor_messages_from = Mock()
+    mqm.delivery_states = {}
+    mgr.message_queue_manager = mqm
+
+    notifier = Mock()
+    notifier.telegram = tg
+    notifier.rename_session_topic = AsyncMock(return_value=True)
+
+    app = create_app(
+        session_manager=mgr,
+        notifier=notifier,
+        output_monitor=None,
+        config={},
+    )
+    client = TestClient(app)
+
+    resp = client.patch(f"/sessions/{session.id}", json={"is_em": True})
+    assert resp.status_code == 200
+
+    assert session.telegram_thread_id == 42000
+    notifier.rename_session_topic.assert_awaited_once_with(session, "em-e1-proximity")
 
 
 def test_em_topic_different_chat_id_keeps_new_topic():
@@ -594,6 +640,8 @@ def test_em_topic_inheritance_clears_old_em_sessions():
     mgr.em_topic = {"chat_id": 10000, "thread_id": 42000}
     mgr.sessions = {old_em.id: old_em, new_em.id: new_em}
     mgr.get_session = Mock(side_effect=lambda sid: mgr.sessions.get(sid))
+    mgr.list_adoption_proposals = Mock(return_value=[])
+    mgr.get_session_aliases = Mock(return_value=[])
 
     tmux = Mock()
     tmux.set_status_bar = Mock()
@@ -706,6 +754,8 @@ def test_is_em_clears_other_sessions_em_flag():
     mgr.sessions = {session_a.id: session_a, session_b.id: session_b}
     mgr.get_session = Mock(side_effect=lambda sid: mgr.sessions.get(sid))
     mgr._save_state = Mock()
+    mgr.list_adoption_proposals = Mock(return_value=[])
+    mgr.get_session_aliases = Mock(return_value=[])
 
     tmux = Mock()
     tmux.set_status_bar = Mock()
