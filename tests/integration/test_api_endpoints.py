@@ -777,6 +777,37 @@ class TestUpdateSession:
         assert sample_session.role == "em"
         mock_session_manager._save_state.assert_called()
 
+    def test_patch_is_em_syncs_telegram_topic_title(self, mock_session_manager, mock_output_monitor, sample_session):
+        """PATCH /sessions/{id} with is_em=true also syncs the topic title for topic-backed sessions."""
+        sample_session.friendly_name = "em-e1-proximity"
+        sample_session.telegram_chat_id = 123456
+        sample_session.telegram_thread_id = 789
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager._save_state = MagicMock()
+        mock_session_manager.tmux.set_status_bar.return_value = True
+
+        mock_notifier = MagicMock()
+        mock_notifier.rename_session_topic = AsyncMock(return_value=True)
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=mock_notifier,
+            output_monitor=mock_output_monitor,
+            config={},
+        )
+        client = TestClient(app)
+
+        response = client.patch(
+            "/sessions/test123",
+            json={"is_em": True}
+        )
+
+        assert response.status_code == 200
+        mock_notifier.rename_session_topic.assert_awaited_once_with(
+            sample_session,
+            "em-e1-proximity",
+        )
+
     def test_patch_is_em_false_clears_flag(self, test_client, mock_session_manager, sample_session):
         """PATCH /sessions/{id} with is_em=false clears flag if previously set (#256)."""
         sample_session.is_em = True

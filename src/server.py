@@ -2766,8 +2766,6 @@ def create_app(
 
         if friendly_name is not None or is_em is not None:
             app.state.session_manager._save_state()
-
-        if friendly_name is not None:
             await _sync_session_display_identity(session)
 
         return _session_to_response(session)
