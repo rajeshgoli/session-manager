@@ -565,7 +565,7 @@ class OutputMonitor:
             if self._session_manager:
                 self._session_manager._save_state()
 
-    async def cleanup_session(self, session: Session):
+    async def cleanup_session(self, session: Session, preserve_record: bool = False):
         """
         Perform full cleanup for a session.
 
@@ -573,7 +573,7 @@ class OutputMonitor:
         - Setting status to STOPPED
         - Sending "Session stopped" notification to Telegram thread (forum or reply-thread mode)
         - Cleaning up in-memory Telegram mappings
-        - Removing from sessions dict
+        - Removing from sessions dict unless preserve_record=True
         - Saving state
         - Cleaning up hook output cache
         - Cleaning up monitoring state
@@ -584,6 +584,18 @@ class OutputMonitor:
         """
         session_id = session.id
         logger.info(f"Cleaning up session {session_id}")
+
+        # Explicit kill/cleanup paths can run outside the monitor task. Cancel any
+        # tracked loop first so a preserved stopped record is not reaped later and
+        # restore does not race with a stale monitor loop.
+        current_task = asyncio.current_task()
+        monitor_task = self._tasks.get(session_id)
+        if monitor_task and monitor_task is not current_task:
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
 
         # Update session status
         session.status = SessionStatus.STOPPED
@@ -637,12 +649,22 @@ class OutputMonitor:
                 telegram_bot._session_threads.pop(session_id, None)
                 logger.debug(f"Cleaned up Telegram mappings for session {session_id}")
 
-        # Remove from session manager
+        # Remove from session manager unless the caller wants to preserve a
+        # stopped record for future restore/review flows.
         if self._session_manager:
             unregister_roles = getattr(self._session_manager, "unregister_session_roles", None)
             if callable(unregister_roles):
                 unregister_roles(session_id, persist=False)
-            if session_id in self._session_manager.sessions:
+            if session.telegram_chat_id and session.telegram_thread_id:
+                mark_deleted = getattr(self._session_manager, "mark_telegram_topic_deleted", None)
+                if callable(mark_deleted):
+                    mark_deleted(
+                        session.telegram_chat_id,
+                        session.telegram_thread_id,
+                        session=session,
+                    )
+                session.telegram_thread_id = None
+            if not preserve_record and session_id in self._session_manager.sessions:
                 del self._session_manager.sessions[session_id]
                 logger.debug(f"Removed session {session_id} from sessions dict")
 

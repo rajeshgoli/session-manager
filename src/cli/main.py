@@ -305,6 +305,14 @@ def main():
     kill_parser = subparsers.add_parser("kill", help="Terminate a child session")
     kill_parser.add_argument("session_id", help="Session ID to terminate")
 
+    # sm restore <session-id-or-name>
+    restore_parser = subparsers.add_parser(
+        "restore",
+        aliases=["unkill"],
+        help="Restore a stopped session",
+    )
+    restore_parser.add_argument("session", help="Session ID or friendly name to restore")
+
     # sm clean [--session-id ID ...]
     clean_parser = subparsers.add_parser(
         "clean",
@@ -858,6 +866,8 @@ def main():
         )
     elif args.command == "kill":
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
+    elif args.command in ("restore", "unkill"):
+        sys.exit(commands.cmd_restore(client, args.session))
     elif args.command == "clean":
         sys.exit(commands.cmd_clean(client, session_ids=getattr(args, 'session_ids', None)))
     elif args.command == "claude":

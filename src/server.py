@@ -2500,12 +2500,12 @@ def create_app(
         return session.to_dict()
 
     @app.get("/sessions")
-    async def list_sessions():
+    async def list_sessions(include_stopped: bool = Query(default=False)):
         """List all active sessions."""
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        sessions = app.state.session_manager.list_sessions()
+        sessions = app.state.session_manager.list_sessions(include_stopped=include_stopped)
 
         return {
             "sessions": [
@@ -3309,9 +3309,30 @@ def create_app(
 
         # Perform full cleanup (Telegram, monitoring, state)
         if app.state.output_monitor:
-            await app.state.output_monitor.cleanup_session(session)
+            await app.state.output_monitor.cleanup_session(session, preserve_record=True)
 
         return {"status": "killed", "session_id": session_id}
+
+    @app.post("/sessions/{session_id}/restore", response_model=SessionResponse)
+    async def restore_session(session_id: str):
+        """Restore a stopped session in place."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        success, restored_session, error = await app.state.session_manager.restore_session(session_id)
+        if not success or not restored_session:
+            detail = error or "Failed to restore session"
+            status_code = 409 if detail == "Session is not stopped" else 400
+            raise HTTPException(status_code=status_code, detail=detail)
+
+        if app.state.output_monitor and getattr(restored_session, "provider", "claude") != "codex-app":
+            await app.state.output_monitor.start_monitoring(restored_session)
+
+        return _session_to_response(restored_session)
 
     @app.post("/sessions/{session_id}/open")
     async def open_terminal(session_id: str):
@@ -3827,6 +3848,7 @@ Provide ONLY the summary, no preamble or questions."""
 
                 if transcript_path and target_session.transcript_path != transcript_path:
                     target_session.transcript_path = transcript_path
+                    app.state.session_manager._sync_session_resume_id(target_session)
                     state_changed = True
 
                 if target_session.provider == "claude" and native_title_mtime_ns is not None:
@@ -4087,6 +4109,7 @@ Provide ONLY the summary, no preamble or questions."""
                             # Persist transcript path (same as immediate Stop path)
                             if transcript_path and not target_session.transcript_path:
                                 target_session.transcript_path = transcript_path
+                                app.state.session_manager._sync_session_resume_id(target_session)
                             app.state.last_claude_output[target_session.id] = last_message
                             from datetime import datetime
                             target_session.last_activity = datetime.now()
@@ -4485,7 +4508,7 @@ Provide ONLY the summary, no preamble or questions."""
         # Perform full cleanup (Telegram, monitoring, state)
         if app.state.output_monitor:
             try:
-                await app.state.output_monitor.cleanup_session(target_session)
+                await app.state.output_monitor.cleanup_session(target_session, preserve_record=True)
             except Exception:
                 logger.exception(f"cleanup_session failed for {target_session_id}")
                 return {"error": "Failed to finalize session cleanup"}

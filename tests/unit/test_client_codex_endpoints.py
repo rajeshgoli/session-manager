@@ -138,3 +138,27 @@ def test_request_sends_explicit_empty_json_body():
     assert data == {}
     assert success is True
     assert unavailable is False
+
+
+def test_list_sessions_include_stopped_uses_query_flag():
+    client = _make_client()
+    payload = {"sessions": []}
+    with patch.object(client, "_request", return_value=(payload, True, False)) as req:
+        result = client.list_sessions(include_stopped=True)
+    assert result == []
+    req.assert_called_once_with("GET", "/sessions?include_stopped=true")
+
+
+def test_restore_session_uses_explicit_empty_json_body():
+    client = _make_client()
+    payload = {"id": "abc123", "status": "running"}
+    with patch.object(client, "_request_with_status", return_value=(payload, 200, False)) as req:
+        result = client.restore_session_result("abc123")
+    assert result["ok"] is True
+    assert result["data"] == payload
+    req.assert_called_once_with(
+        "POST",
+        "/sessions/abc123/restore",
+        {},
+        timeout=10,
+    )

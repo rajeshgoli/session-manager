@@ -135,9 +135,10 @@ class SessionManagerClient:
         data, success, _ = self._request("GET", f"/sessions/{session_id}")
         return data if success else None
 
-    def list_sessions(self) -> Optional[list]:
+    def list_sessions(self, include_stopped: bool = False) -> Optional[list]:
         """List all sessions."""
-        data, success, _ = self._request("GET", "/sessions")
+        path = "/sessions?include_stopped=true" if include_stopped else "/sessions"
+        data, success, _ = self._request("GET", path)
         if success and data:
             return data.get("sessions", [])
         return None
@@ -705,6 +706,35 @@ class SessionManagerClient:
         if unavailable:
             return None
         return data
+
+    def restore_session_result(self, session_id: str) -> dict:
+        """Restore a stopped session and preserve API error details."""
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/sessions/{session_id}/restore",
+            {},
+            timeout=10,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+
+        ok = status_code in (200, 201)
+        detail = None
+        if isinstance(data, dict):
+            detail = data.get("detail") or data.get("error") or data.get("raw")
+
+        return {
+            "ok": ok,
+            "unavailable": False,
+            "status_code": status_code,
+            "data": data,
+            "detail": detail,
+        }
+
+    def restore_session(self, session_id: str) -> Optional[dict]:
+        """Restore a stopped session."""
+        result = self.restore_session_result(session_id)
+        return result.get("data") if result.get("ok") else None
 
     def create_session_result(
         self,

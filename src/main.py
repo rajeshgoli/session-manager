@@ -375,8 +375,17 @@ class SessionManagerApp:
             return display_sessions
 
         async def on_kill_session(session_id: str) -> bool:
-            await self.output_monitor.stop_monitoring(session_id)
-            return self.session_manager.kill_session(session_id)
+            session = self.session_manager.get_session(session_id)
+            if session is None:
+                return False
+            queue_mgr = self.session_manager.message_queue_manager
+            if queue_mgr:
+                queue_mgr.cancel_remind(session_id)
+                queue_mgr.cancel_parent_wake(session_id)
+            if not self.session_manager.kill_session(session_id):
+                return False
+            await self.output_monitor.cleanup_session(session, preserve_record=True)
+            return True
 
         async def on_session_input(user_input: UserInput) -> DeliveryResult:
             result = await self.session_manager.send_input(
