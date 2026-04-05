@@ -48,3 +48,42 @@ def test_load_state_heals_live_stopped_codex_fork_and_preserves_registry(tmp_pat
     assert maintainer is not None
     assert maintainer.session_id == session.id
     assert [s.id for s in manager.list_sessions()] == [session.id]
+
+
+def test_load_state_preserves_stopped_restore_target_without_tmux_runtime(tmp_path):
+    state_file = tmp_path / "sessions.json"
+    session = Session(
+        id="dead1234",
+        name="codex-dead1234",
+        working_dir=str(tmp_path / "workspace"),
+        tmux_session="codex-dead1234",
+        log_file=str(tmp_path / "dead1234.log"),
+        provider="codex",
+        status=SessionStatus.STOPPED,
+        provider_resume_id="019d5bac-3980-7291-8b17-b61f5e618748",
+    )
+    state_file.write_text(
+        json.dumps(
+            {
+                "sessions": [session.to_dict()],
+                "em_topic": None,
+                "maintainer_session_id": None,
+                "agent_registrations": [],
+                "adoption_proposals": [],
+            }
+        )
+    )
+
+    with patch("src.session_manager.TmuxController") as mock_tmux_cls:
+        mock_tmux_cls.return_value.session_exists.return_value = False
+        manager = SessionManager(
+            log_dir=str(tmp_path),
+            state_file=str(state_file),
+            config={},
+        )
+
+    restored = manager.get_session(session.id)
+    assert restored is not None
+    assert restored.status == SessionStatus.STOPPED
+    assert restored.provider_resume_id == "019d5bac-3980-7291-8b17-b61f5e618748"
+    assert [s.id for s in manager.list_sessions(include_stopped=True)] == [session.id]

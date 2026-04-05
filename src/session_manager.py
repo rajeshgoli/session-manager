@@ -698,6 +698,13 @@ class SessionManager:
                             self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
                         logger.info(f"Restored session: {session.name}")
                     else:
+                        if session.status == SessionStatus.STOPPED:
+                            self.sessions[session.id] = session
+                            logger.info(
+                                "Restored stopped session record without live tmux runtime: %s",
+                                session.name,
+                            )
+                            continue
                         logger.warning(f"Session {session.name} no longer exists in tmux")
                         # Collect orphaned Telegram forum topics for cleanup at startup.
                         # Only collect if chat_id matches the known forum group —
