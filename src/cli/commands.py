@@ -119,7 +119,12 @@ def parse_duration(duration_str: str) -> int:
     return total_seconds
 
 
-def resolve_session_id(client: SessionManagerClient, identifier: str) -> tuple[Optional[str], Optional[dict]]:
+def resolve_session_id(
+    client: SessionManagerClient,
+    identifier: str,
+    *,
+    include_stopped: bool = False,
+) -> tuple[Optional[str], Optional[dict]]:
     """
     Resolve a session identifier (ID or friendly name) to session ID and details.
 
@@ -140,7 +145,10 @@ def resolve_session_id(client: SessionManagerClient, identifier: str) -> tuple[O
         return identifier, session
 
     # Not found by ID, try as friendly name
-    sessions = client.list_sessions()
+    try:
+        sessions = client.list_sessions(include_stopped=include_stopped)
+    except TypeError:
+        sessions = client.list_sessions()
     if sessions is None:
         return None, None  # Session manager unavailable
 
@@ -1920,6 +1928,49 @@ def cmd_kill(
     name = session.get("friendly_name") or session.get("name") or target_session_id
     print(f"Session {name} ({target_session_id}) terminated")
     return 0
+
+
+def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
+    """
+    Restore a stopped session and attach to it when supported.
+
+    Args:
+        client: API client
+        target_identifier: Target session ID or friendly name
+
+    Exit codes:
+        0: Success
+        1: Failed
+        2: Session manager unavailable
+    """
+    target_session_id, _ = resolve_session_id(client, target_identifier, include_stopped=True)
+    if target_session_id is None:
+        try:
+            sessions = client.list_sessions(include_stopped=True)
+        except TypeError:
+            sessions = client.list_sessions()
+        if sessions is None:
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
+        return 1
+
+    result = client.restore_session_result(target_session_id)
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to restore session"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    session = result.get("data") or {}
+    provider = session.get("provider")
+    print(f"Session restored: {target_session_id}")
+    if provider == "codex-app":
+        print("No tmux attach for Codex app sessions.")
+        return 0
+    return cmd_attach(client, target_session_id)
 
 
 def cmd_new(

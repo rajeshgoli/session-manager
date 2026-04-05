@@ -142,6 +142,68 @@ class TestSessionLifecycle:
         assert saved_state["sessions"][0]["status"] == "stopped"
 
     @pytest.mark.asyncio
+    async def test_restore_session_flow_claude(self, session_manager, mock_tmux):
+        """Stopped Claude sessions can be restored in place."""
+        session = await session_manager.create_session(working_dir="/tmp/test")
+        session.transcript_path = "/tmp/transcripts/restore-uuid.jsonl"
+        session_manager.kill_session(session.id)
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        assert restored.status == SessionStatus.RUNNING
+        call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
+        assert call_kwargs["command"] == "claude"
+        assert call_kwargs["args"] == ["--resume", "restore-uuid"]
+
+    @pytest.mark.asyncio
+    async def test_restore_session_flow_codex_app(self, session_manager):
+        """Stopped codex-app sessions resume by stored thread id."""
+        session = Session(
+            id="app12345",
+            name="codex-app-app12345",
+            working_dir="/tmp/test",
+            provider="codex-app",
+            status=SessionStatus.STOPPED,
+            codex_thread_id="thread-123",
+        )
+        session_manager.sessions[session.id] = session
+
+        mock_codex_session = AsyncMock()
+        mock_codex_session.start.return_value = "thread-123"
+        with patch("src.session_manager.CodexAppServerSession", return_value=mock_codex_session):
+            success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored.status == SessionStatus.IDLE
+        mock_codex_session.start.assert_awaited_once_with(thread_id="thread-123")
+
+    def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
+        """Codex-fork restore id can be recovered from persisted lifecycle events."""
+        session = Session(
+            id="fork1234",
+            name="codex-fork-fork1234",
+            working_dir="/tmp/test",
+            tmux_session="codex-fork-fork1234",
+            provider="codex-fork",
+            log_file="/tmp/fork1234.log",
+            status=SessionStatus.STOPPED,
+        )
+        session_manager.sessions[session.id] = session
+        session_manager.codex_event_store.append_event(
+            session_id=session.id,
+            event_type="codex_fork_session_configured",
+            turn_id=None,
+            payload={"payload": {"session_id": "codex-session-123"}},
+        )
+
+        assert session_manager.get_session_resume_id(session) == "codex-session-123"
+        assert session.provider_resume_id == "codex-session-123"
+
+    @pytest.mark.asyncio
     async def test_session_recovery_on_restart(self, mock_tmux, temp_state_file, temp_log_dir):
         """Sessions restored from state file on restart."""
         # Pre-populate state file with a session

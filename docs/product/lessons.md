@@ -10,3 +10,4 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - The local PR review workflow doc lives at `~/.agent-os/workflows/pr_review_process.md`. Use that file for the Codex review / merge loop.
 - Maintainer work is not done at PR creation. It is done only after review feedback is handled, the PR is merged, Session Manager is restarted on merged code, and the reporting agent has been notified of the fix.
 - Use the reporting agent for missing repro/debug details sparingly. Ask only for specific facts you cannot recover from the running system or repository state.
+- Session restore features only work if explicit kill paths preserve the stopped `Session` record instead of deleting it during cleanup. Restore also needs provider-native resume metadata captured while the session is alive, not reconstructed later from guesswork.

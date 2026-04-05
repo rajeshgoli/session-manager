@@ -85,6 +85,7 @@ async def test_cleanup_session_continues_when_telegram_notify_fails():
             thread_id: int,
             *,
             allow_reply_fallback: bool = True,
+            session_id: str | None = None,
         ):
             self.call_kwargs = {
                 "chat_id": chat_id,
@@ -134,6 +135,7 @@ async def test_cleanup_session_notification_timeout_is_non_fatal():
             thread_id: int,
             *,
             allow_reply_fallback: bool = True,
+            session_id: str | None = None,
         ):
             self.call_kwargs = {
                 "chat_id": chat_id,
@@ -187,6 +189,7 @@ async def test_cleanup_session_allows_reply_fallback_for_legacy_reply_threads():
             thread_id: int,
             *,
             allow_reply_fallback: bool = True,
+            session_id: str | None = None,
         ):
             self.call_kwargs = {
                 "chat_id": chat_id,
@@ -223,3 +226,53 @@ async def test_cleanup_session_allows_reply_fallback_for_legacy_reply_threads():
     assert sm.notifier.telegram.call_kwargs is not None
     assert sm.notifier.telegram.call_kwargs["allow_reply_fallback"] is True
     assert session.id not in sm.sessions
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_preserve_record_keeps_stopped_session():
+    class _Telegram:
+        def __init__(self):
+            self.bot = SimpleNamespace(close_forum_topic=self._close_forum_topic)
+            self._topic_sessions = {(222, 333): "monkeep1"}
+            self._session_threads = {"monkeep1": 333}
+
+        async def send_with_fallback(
+            self,
+            chat_id: int,
+            message: str,
+            thread_id: int,
+            *,
+            allow_reply_fallback: bool = True,
+            session_id: str | None = None,
+        ):
+            return 999
+
+        async def _close_forum_topic(self, chat_id: int, message_thread_id: int):
+            return None
+
+    class _SessionManager:
+        def __init__(self, session: Session):
+            self.sessions = {session.id: session}
+            self.notifier = SimpleNamespace(telegram=_Telegram())
+            self.saved = 0
+            self.deleted = []
+
+        def _save_state(self):
+            self.saved += 1
+
+        def mark_telegram_topic_deleted(self, chat_id: int, thread_id: int, *, session: Session):
+            self.deleted.append((chat_id, thread_id, session.id))
+
+    session = _make_session("monkeep1")
+    session.telegram_chat_id = 222
+    session.telegram_thread_id = 333
+    monitor = OutputMonitor()
+    sm = _SessionManager(session)
+    monitor.set_session_manager(sm)
+
+    await monitor.cleanup_session(session, preserve_record=True)
+
+    assert session.id in sm.sessions
+    assert session.status.name.lower() == "stopped"
+    assert session.telegram_thread_id is None
+    assert sm.deleted == [(222, 333, "monkeep1")]

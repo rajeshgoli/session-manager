@@ -99,6 +99,10 @@ class TestCliParsing:
         children_parser.add_argument("--json", action="store_true")
         children_parser.add_argument("--db-path", default=None)
 
+        # sm restore
+        restore_parser = subparsers.add_parser("restore")
+        restore_parser.add_argument("session")
+
         # sm output
         output_parser = subparsers.add_parser("output")
         output_parser.add_argument("session")
@@ -579,6 +583,17 @@ class TestCodexTuiCommand:
         assert args.event_limit == 50
 
 
+class TestRestoreCommand:
+    """Tests for restore command parsing."""
+
+    def test_restore_command_parses_target(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["restore", "engineer-ticket2508"])
+
+        assert args.command == "restore"
+        assert args.session == "engineer-ticket2508"
+
+
 class TestSessionResolution:
     """Tests for session resolution utility."""
 
@@ -658,6 +673,24 @@ class TestSessionResolution:
         assert session is None
         # Should not even try to search
         mock_client.list_sessions.assert_not_called()
+
+    def test_resolve_by_friendly_name_including_stopped(self):
+        """Stopped sessions can be resolved when explicitly requested."""
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = None
+        mock_client.list_sessions.return_value = [
+            {"id": "dead123", "friendly_name": "engineer-ticket2508", "status": "stopped"},
+        ]
+
+        session_id, session = resolve_session_id(
+            mock_client,
+            "engineer-ticket2508",
+            include_stopped=True,
+        )
+
+        assert session_id == "dead123"
+        assert session["status"] == "stopped"
+        mock_client.list_sessions.assert_called_once_with(include_stopped=True)
 
 
 class TestParseDuration:

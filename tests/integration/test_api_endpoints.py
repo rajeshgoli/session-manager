@@ -107,6 +107,19 @@ class TestSessionEndpoints:
         assert data["sessions"][0]["agent_status_text"] == "running tests"
         assert data["sessions"][0]["agent_status_at"] == "2024-01-15T11:05:00"
         assert data["sessions"][0]["agent_task_completed_at"] == "2024-01-15T11:09:00"
+        mock_session_manager.list_sessions.assert_called_once_with(include_stopped=False)
+
+    def test_list_sessions_include_stopped(self, test_client, mock_session_manager, sample_session):
+        """GET /sessions can explicitly include stopped sessions."""
+        sample_session.status = SessionStatus.STOPPED
+        mock_session_manager.list_sessions.return_value = [sample_session]
+        mock_session_manager.get_activity_state.return_value = "stopped"
+
+        response = test_client.get("/sessions?include_stopped=true")
+
+        assert response.status_code == 200
+        assert response.json()["sessions"][0]["status"] == "stopped"
+        mock_session_manager.list_sessions.assert_called_once_with(include_stopped=True)
 
     def test_list_sessions_empty(self, test_client, mock_session_manager):
         """GET /sessions returns empty list when no sessions."""
@@ -397,6 +410,43 @@ class TestSessionEndpoints:
         data = response.json()
         assert data["status"] == "killed"
         assert data["session_id"] == "test123"
+        mock_output_monitor.cleanup_session.assert_awaited_once_with(sample_session, preserve_record=True)
+
+    def test_restore_session(self, test_client, mock_session_manager, sample_session, mock_output_monitor):
+        """POST /sessions/{id}/restore restores a stopped session."""
+        stopped_session = Session(
+            id=sample_session.id,
+            name=sample_session.name,
+            working_dir=sample_session.working_dir,
+            tmux_session=sample_session.tmux_session,
+            log_file=sample_session.log_file,
+            status=SessionStatus.STOPPED,
+            created_at=sample_session.created_at,
+            last_activity=sample_session.last_activity,
+            friendly_name=sample_session.friendly_name,
+            current_task=sample_session.current_task,
+        )
+        restored_session = Session(
+            id=sample_session.id,
+            name=sample_session.name,
+            working_dir=sample_session.working_dir,
+            tmux_session=sample_session.tmux_session,
+            log_file=sample_session.log_file,
+            status=SessionStatus.RUNNING,
+            created_at=sample_session.created_at,
+            last_activity=sample_session.last_activity,
+            friendly_name=sample_session.friendly_name,
+            current_task=sample_session.current_task,
+        )
+        mock_session_manager.get_session.return_value = stopped_session
+        mock_session_manager.restore_session = AsyncMock(return_value=(True, restored_session, None))
+        mock_session_manager.get_activity_state.return_value = "thinking"
+
+        response = test_client.post("/sessions/test123/restore")
+
+        assert response.status_code == 200
+        assert response.json()["id"] == "test123"
+        mock_output_monitor.start_monitoring.assert_awaited_once_with(restored_session)
 
     def test_kill_session_not_found(self, test_client, mock_session_manager):
         """DELETE /sessions/{id} returns 404 for unknown session."""

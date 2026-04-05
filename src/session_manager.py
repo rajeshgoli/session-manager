@@ -1460,6 +1460,14 @@ class SessionManager:
         if not event_type:
             return None
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        provider_session_id = event.get("session_id")
+        if not provider_session_id and payload:
+            provider_session_id = payload.get("session_id")
+        if isinstance(provider_session_id, str) and provider_session_id.strip() and provider_session_id != "unknown":
+            session = self.sessions.get(session_id)
+            if session and session.provider in ("codex", "codex-fork") and session.provider_resume_id != provider_session_id:
+                session.provider_resume_id = provider_session_id
+                self._save_state()
         seq_raw = event.get("seq")
         seq = int(seq_raw) if isinstance(seq_raw, int) or (isinstance(seq_raw, str) and seq_raw.isdigit()) else None
         session_epoch = event.get("session_epoch")
@@ -1513,6 +1521,53 @@ class SessionManager:
             seq=seq,
             session_epoch=session_epoch,
         )
+
+    def _sync_session_resume_id(self, session: Session) -> bool:
+        """Synchronize one session's provider-native resume identifier."""
+        resume_id: Optional[str] = None
+        if session.provider == "claude" and session.transcript_path:
+            resume_id = Path(session.transcript_path).expanduser().stem
+        elif session.provider == "codex-app" and session.codex_thread_id:
+            resume_id = session.codex_thread_id
+        elif session.provider in ("codex", "codex-fork") and session.provider_resume_id:
+            resume_id = session.provider_resume_id
+
+        if resume_id == session.provider_resume_id:
+            return False
+
+        session.provider_resume_id = resume_id
+        return True
+
+    def _get_codex_resume_id_from_events(self, session_id: str) -> Optional[str]:
+        """Recover a codex resume id from persisted lifecycle events."""
+        try:
+            events = self.codex_event_store.get_events(session_id=session_id, limit=200).get("events", [])
+        except Exception:
+            return None
+
+        for event in reversed(events):
+            if event.get("event_type") != "codex_fork_session_configured":
+                continue
+            payload_preview = event.get("payload_preview") or {}
+            payload = payload_preview.get("payload") if isinstance(payload_preview, dict) else None
+            candidate = payload.get("session_id") if isinstance(payload, dict) else None
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return None
+
+    def get_session_resume_id(self, session: Session) -> Optional[str]:
+        """Return the provider-native identifier needed to resume a stopped session."""
+        if self._sync_session_resume_id(session):
+            self._save_state()
+        if session.provider_resume_id:
+            return session.provider_resume_id
+        if session.provider == "codex-fork":
+            recovered = self._get_codex_resume_id_from_events(session.id)
+            if recovered:
+                session.provider_resume_id = recovered
+                self._save_state()
+                return recovered
+        return None
 
     def get_codex_fork_lifecycle_state(self, session_id: str) -> Optional[dict[str, Any]]:
         """Return current codex-fork lifecycle reducer snapshot."""
@@ -1732,6 +1787,7 @@ class SessionManager:
                 )
                 thread_id = await codex_session.start(thread_id=session.codex_thread_id, model=model)
                 session.codex_thread_id = thread_id
+                self._sync_session_resume_id(session)
                 if initial_prompt:
                     try:
                         await codex_session.send_user_turn(initial_prompt, model=model)
@@ -2916,6 +2972,9 @@ class SessionManager:
         session = self.sessions.get(session_id)
         if not session:
             logger.error(f"Session not found: {session_id}")
+            return DeliveryResult.FAILED
+        if session.status == SessionStatus.STOPPED:
+            logger.error(f"Cannot send input to stopped session {session_id}")
             return DeliveryResult.FAILED
 
         if session.role is None:
@@ -4444,6 +4503,120 @@ class SessionManager:
 
         logger.info(f"Killed session {session.name}")
         return True
+
+    async def restore_session(self, session_id: str) -> tuple[bool, Optional[Session], Optional[str]]:
+        """Restore a stopped session in place using provider-native resume metadata."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return False, None, "Session not found"
+        if session.status != SessionStatus.STOPPED:
+            return False, session, "Session is not stopped"
+
+        resume_id = self.get_session_resume_id(session)
+        if session.provider != "codex-app" and not session.log_file:
+            session.log_file = str(self.log_dir / f"{session.name}.log")
+        if session.provider != "codex-app" and self.tmux.session_exists(session.tmux_session):
+            self.tmux.kill_session(session.tmux_session)
+
+        if session.provider == "claude":
+            if not resume_id:
+                return False, session, "No Claude resume id is available for this session"
+            claude_config = self.config.get("claude", {})
+            command = claude_config.get("command", "claude")
+            args = list(claude_config.get("args", []))
+            args.extend(["--resume", resume_id])
+            if not self.tmux.create_session_with_command(
+                session.tmux_session,
+                session.working_dir,
+                session.log_file,
+                session_id=session.id,
+                command=command,
+                args=args,
+            ):
+                return False, session, "Failed to restore Claude session runtime"
+        elif session.provider in ("codex", "codex-fork"):
+            if not resume_id:
+                return False, session, "No Codex resume id is available for this session"
+            if session.provider == "codex":
+                command = self.codex_cli_command
+                args = ["resume", resume_id, *self.codex_cli_args]
+            else:
+                command = self.codex_fork_command
+                args = ["resume", resume_id, *self.codex_fork_args]
+                event_stream_path = self._codex_fork_event_stream_path(session)
+                control_socket_path = self._codex_fork_control_socket_path(session)
+                event_stream_path.parent.mkdir(parents=True, exist_ok=True)
+                if event_stream_path.exists():
+                    event_stream_path.unlink()
+                if control_socket_path.exists():
+                    control_socket_path.unlink()
+                args.extend(
+                    [
+                        "--event-stream",
+                        str(event_stream_path),
+                        "--event-schema-version",
+                        str(self.codex_fork_event_schema_version),
+                        "--control-socket",
+                        str(control_socket_path),
+                    ]
+                )
+            if not self.tmux.create_session_with_command(
+                session.tmux_session,
+                session.working_dir,
+                session.log_file,
+                session_id=session.id,
+                command=command,
+                args=args,
+            ):
+                return False, session, "Failed to restore Codex session runtime"
+        elif session.provider == "codex-app":
+            thread_id = session.codex_thread_id or resume_id
+            if not thread_id:
+                return False, session, "No Codex app thread id is available for this session"
+            try:
+                codex_session = CodexAppServerSession(
+                    session_id=session.id,
+                    working_dir=session.working_dir,
+                    config=self.codex_config,
+                    on_turn_complete=self._handle_codex_turn_complete,
+                    on_turn_started=self._handle_codex_turn_started,
+                    on_turn_delta=self._handle_codex_turn_delta,
+                    on_review_complete=self._handle_codex_review_complete,
+                    on_server_request=self._handle_codex_server_request,
+                    on_item_notification=self._handle_codex_item_notification,
+                    on_stream_error=self._handle_codex_stream_error,
+                )
+                session.codex_thread_id = await codex_session.start(thread_id=thread_id)
+                self.codex_sessions[session.id] = codex_session
+                self._sync_session_resume_id(session)
+            except CodexAppServerError as exc:
+                return False, session, f"Failed to restore Codex app session: {exc}"
+            except Exception as exc:
+                logger.error("Unexpected Codex app restore error for %s: %s", session.id, exc)
+                return False, session, "Failed to restore Codex app session"
+        else:
+            return False, session, f"Restore not supported for provider={session.provider}"
+
+        session.error_message = None
+        session.status = SessionStatus.IDLE if session.provider == "codex-app" else SessionStatus.RUNNING
+        session.last_activity = datetime.now()
+        if session.provider == "codex-fork":
+            self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
+            self.codex_fork_event_offsets.pop(session.id, None)
+            self.codex_fork_event_buffers.pop(session.id, None)
+            self._set_codex_fork_lifecycle_state(
+                session_id=session.id,
+                state="running",
+                cause_event_type="session_restored",
+            )
+            self._start_codex_fork_event_monitor(session)
+        if self.message_queue_manager and session.provider == "codex-app":
+            self.message_queue_manager.mark_session_idle(session.id)
+        self._save_state()
+        if session.telegram_chat_id:
+            await self._ensure_telegram_topic(session, session.telegram_chat_id)
+        logger.info("Restored session %s (%s)", session.id, session.provider)
+        return True, session, None
 
     def open_terminal(self, session_id: str) -> bool:
         """Open a session in Terminal.app."""
