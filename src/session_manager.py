@@ -13,7 +13,7 @@ import subprocess
 import textwrap
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Callable, Awaitable, Any
 
@@ -1527,9 +1527,11 @@ class SessionManager:
         resume_id: Optional[str] = None
         if session.provider == "claude" and session.transcript_path:
             resume_id = Path(session.transcript_path).expanduser().stem
+        elif session.provider == "codex":
+            resume_id = session.provider_resume_id or self._discover_codex_cli_resume_id(session)
         elif session.provider == "codex-app" and session.codex_thread_id:
             resume_id = session.codex_thread_id
-        elif session.provider in ("codex", "codex-fork") and session.provider_resume_id:
+        elif session.provider == "codex-fork" and session.provider_resume_id:
             resume_id = session.provider_resume_id
 
         if resume_id == session.provider_resume_id:
@@ -1537,6 +1539,92 @@ class SessionManager:
 
         session.provider_resume_id = resume_id
         return True
+
+    def _read_codex_cli_session_metadata(self, session_file: Path) -> dict[str, Any]:
+        """Read one Codex CLI session file and return minimal binding metadata."""
+        try:
+            with session_file.open("r", encoding="utf-8", errors="ignore") as handle:
+                first_line = handle.readline()
+        except OSError:
+            return {"id": None, "cwd": None, "started_at": None}
+
+        if not first_line:
+            return {"id": None, "cwd": None, "started_at": None}
+
+        try:
+            record = json.loads(first_line)
+        except json.JSONDecodeError:
+            return {"id": None, "cwd": None, "started_at": None}
+
+        if record.get("type") != "session_meta":
+            return {"id": None, "cwd": None, "started_at": None}
+
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        session_id = payload.get("id")
+        cwd = payload.get("cwd")
+        started_at = self._parse_claude_timestamp(payload.get("timestamp") or record.get("timestamp"))
+        return {
+            "id": session_id if isinstance(session_id, str) and session_id.strip() else None,
+            "cwd": cwd if isinstance(cwd, str) and cwd.strip() else None,
+            "started_at": started_at,
+        }
+
+    def _discover_codex_cli_resume_id(self, session: Session) -> Optional[str]:
+        """Bind a missing legacy Codex CLI resume id using Codex's session metadata."""
+        if session.provider != "codex" or not session.working_dir:
+            return session.provider_resume_id
+
+        sessions_root = Path.home() / ".codex" / "sessions"
+        if not sessions_root.is_dir():
+            return session.provider_resume_id
+
+        resolved_working_dir = str(Path(session.working_dir).expanduser().resolve())
+        claimed_ids = {
+            other.provider_resume_id
+            for other in self.sessions.values()
+            if other.id != session.id and other.provider_resume_id
+        }
+
+        target_time_ns = max(
+            self._session_time_ns(session, "last_activity"),
+            self._session_time_ns(session, "created_at"),
+        )
+
+        candidate_files: list[Path] = []
+        base_time = session.created_at.astimezone() if session.created_at.tzinfo else session.created_at
+        for day_offset in (-1, 0, 1):
+            day = base_time.date() + timedelta(days=day_offset)
+            day_dir = sessions_root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+            if day_dir.is_dir():
+                candidate_files.extend(day_dir.glob("rollout-*.jsonl"))
+
+        if not candidate_files:
+            return session.provider_resume_id
+
+        candidates: list[tuple[int, int, str]] = []
+        for session_file in candidate_files:
+            metadata = self._read_codex_cli_session_metadata(session_file)
+            candidate_id = metadata.get("id")
+            candidate_cwd = metadata.get("cwd")
+            if not candidate_id or candidate_id in claimed_ids or not candidate_cwd:
+                continue
+            try:
+                resolved_candidate_cwd = str(Path(candidate_cwd).expanduser().resolve())
+            except OSError:
+                continue
+            if resolved_candidate_cwd != resolved_working_dir:
+                continue
+
+            started_at = metadata.get("started_at")
+            started_ns = int(started_at.timestamp() * 1_000_000_000) if isinstance(started_at, datetime) else 0
+            distance = abs(target_time_ns - started_ns) if started_ns else 10**30
+            candidates.append((distance, -started_ns, candidate_id))
+
+        if not candidates:
+            return session.provider_resume_id
+
+        candidates.sort()
+        return candidates[0][2]
 
     def _get_codex_resume_id_from_events(self, session_id: str) -> Optional[str]:
         """Recover a codex resume id from persisted lifecycle events."""
@@ -1812,6 +1900,7 @@ class SessionManager:
         else:
             session.status = SessionStatus.RUNNING
         self.sessions[session.id] = session
+        self._sync_session_resume_id(session)
         self._save_state()
 
         if provider == "codex-fork":

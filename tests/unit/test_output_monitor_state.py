@@ -276,3 +276,39 @@ async def test_cleanup_session_preserve_record_keeps_stopped_session():
     assert session.status.name.lower() == "stopped"
     assert session.telegram_thread_id is None
     assert sm.deleted == [(222, 333, "monkeep1")]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_preserve_record_cancels_external_monitor_task(tmp_path):
+    class _SessionManager:
+        def __init__(self, session: Session):
+            self.sessions = {session.id: session}
+            self.tmux = SimpleNamespace(session_exists=lambda _: True)
+            self.notifier = None
+            self.saved = 0
+
+        def _save_state(self):
+            self.saved += 1
+
+    log_file = tmp_path / "monitor.log"
+    log_file.write_text("")
+    session = Session(
+        id="monkeep2",
+        name="claude-monkeep2",
+        working_dir=str(tmp_path),
+        tmux_session="claude-monkeep2",
+        provider="claude",
+        log_file=str(log_file),
+    )
+    monitor = OutputMonitor(poll_interval=0.01)
+    sm = _SessionManager(session)
+    monitor.set_session_manager(sm)
+
+    await monitor.start_monitoring(session)
+    task = monitor._tasks[session.id]
+
+    await monitor.cleanup_session(session, preserve_record=True)
+
+    assert task.done() is True
+    assert session.id not in monitor._tasks
+    assert session.id in sm.sessions

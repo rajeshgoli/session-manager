@@ -585,6 +585,18 @@ class OutputMonitor:
         session_id = session.id
         logger.info(f"Cleaning up session {session_id}")
 
+        # Explicit kill/cleanup paths can run outside the monitor task. Cancel any
+        # tracked loop first so a preserved stopped record is not reaped later and
+        # restore does not race with a stale monitor loop.
+        current_task = asyncio.current_task()
+        monitor_task = self._tasks.get(session_id)
+        if monitor_task and monitor_task is not current_task:
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+
         # Update session status
         session.status = SessionStatus.STOPPED
 

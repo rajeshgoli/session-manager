@@ -4,7 +4,7 @@ import pytest
 import json
 import tempfile
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -180,6 +180,57 @@ class TestSessionLifecycle:
         assert error is None
         assert restored.status == SessionStatus.IDLE
         mock_codex_session.start.assert_awaited_once_with(thread_id="thread-123")
+
+    @pytest.mark.asyncio
+    async def test_restore_session_flow_codex_discovers_resume_id_from_codex_metadata(
+        self,
+        session_manager,
+        mock_tmux,
+        tmp_path,
+    ):
+        """Stopped legacy codex sessions recover resume ids from Codex session metadata."""
+        resume_id = "019d5bac-3980-7291-8b17-b61f5e618748"
+        with patch("src.session_manager.Path.home", return_value=tmp_path):
+            session = await session_manager.create_session(
+                working_dir=str(tmp_path / "workspace"),
+                provider="codex",
+            )
+            assert session is not None
+            assert session.provider_resume_id is None
+
+            created_at = session.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            timestamp = created_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            day_dir = tmp_path / ".codex" / "sessions" / timestamp[:4] / timestamp[5:7] / timestamp[8:10]
+            day_dir.mkdir(parents=True, exist_ok=True)
+            session_file = day_dir / f"rollout-restore-{resume_id}.jsonl"
+            session_file.write_text(
+                json.dumps(
+                    {
+                        "timestamp": timestamp,
+                        "type": "session_meta",
+                        "payload": {
+                            "id": resume_id,
+                            "timestamp": timestamp,
+                            "cwd": str((tmp_path / "workspace").resolve()),
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+            session_manager.kill_session(session.id)
+            success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is not None
+        assert restored.provider_resume_id == resume_id
+        assert restored.status == SessionStatus.RUNNING
+        call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
+        assert call_kwargs["command"] == session_manager.codex_cli_command
+        assert call_kwargs["args"] == ["resume", resume_id, *session_manager.codex_cli_args]
 
     def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
         """Codex-fork restore id can be recovered from persisted lifecycle events."""
