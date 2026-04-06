@@ -44,6 +44,8 @@ def mock_email_handler():
     mock.bridge_webhook_path.return_value = "/api/email-inbound"
     mock.bridge_worker_secret.return_value = None
     mock.bridge_worker_secret_header.return_value = "x-email-worker-secret"
+    mock.bridge_session_id_header.return_value = "x-email-session-id"
+    mock.normalize_explicit_session_id.side_effect = lambda value: value.strip().lower() if value else None
     mock.send_agent_email = AsyncMock(return_value={"to": [], "cc": [], "subject": "test"})
     mock.is_authorized_sender.return_value = True
     mock.extract_routed_session_id.return_value = None
@@ -321,6 +323,64 @@ class TestEmailBridgeEndpoints:
 
         assert response.status_code == 200
         mock_session_manager.send_input.assert_awaited_once()
+
+    def test_inbound_email_accepts_explicit_session_header_when_worker_secret_is_valid(
+        self,
+        test_client,
+        mock_email_handler,
+        mock_session_manager,
+        sample_session,
+    ):
+        mock_email_handler.bridge_worker_secret.return_value = "worker-secret-123"
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+
+        response = test_client.post(
+            "/api/email-inbound",
+            headers={
+                "x-email-worker-secret": "worker-secret-123",
+                "x-email-session-id": "test123",
+            },
+            json={
+                "body": "hello from explicit route",
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["session_id"] == "test123"
+        mock_email_handler.normalize_explicit_session_id.assert_called_once_with("test123")
+        mock_email_handler.extract_routed_session_id.assert_not_called()
+        mock_session_manager.send_input.assert_awaited_once_with(
+            "test123",
+            "{sm email from rajesh@example.com}\nhello from explicit route",
+            sender_session_id=None,
+            delivery_mode="sequential",
+            from_sm_send=False,
+        )
+
+    def test_inbound_email_ignores_explicit_session_header_without_worker_secret(
+        self,
+        test_client,
+        mock_email_handler,
+        mock_session_manager,
+    ):
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+
+        response = test_client.post(
+            "/api/email-inbound",
+            headers={"x-email-session-id": "test123"},
+            json={
+                "body": "hello without routing metadata",
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ignored"
+        assert response.json()["reason"] == "missing_routing_footer"
+        mock_email_handler.normalize_explicit_session_id.assert_not_called()
+        mock_session_manager.send_input.assert_not_called()
 
     def test_inbound_email_honors_codex_pending_request_gate(
         self,
