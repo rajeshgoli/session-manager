@@ -297,6 +297,11 @@ class SessionManager:
         self.codex_fork_control_epoch: dict[str, str] = {}
         self.codex_fork_control_degraded: dict[str, str] = {}
         self.codex_fork_runtime_owner: dict[str, str] = {}
+        codex_fork_runtime_maintenance_config = self.config.get("codex_fork_runtime_maintenance", {})
+        self.codex_fork_runtime_maintenance_poll_interval_seconds = float(
+            codex_fork_runtime_maintenance_config.get("poll_interval_seconds", 300.0)
+        )
+        self._codex_fork_runtime_maintenance_task: Optional[asyncio.Task[Any]] = None
 
         # App-server config (can be overridden by codex_app_server section)
         self.codex_config = CodexAppServerConfig(
@@ -920,6 +925,24 @@ class SessionManager:
     def _codex_fork_control_socket_path(self, session: Session) -> Path:
         """Return control-socket path for one codex-fork session."""
         return self.log_dir / f"{session.id}.codex-fork.control.sock"
+
+    @staticmethod
+    def _codex_fork_session_id_from_artifact_name(name: str) -> Optional[str]:
+        """Extract the owning session id from one codex-fork runtime artifact filename."""
+        if name.endswith(".codex-fork.events.jsonl"):
+            return name[: -len(".codex-fork.events.jsonl")] or None
+        if name.endswith(".codex-fork.control.sock"):
+            return name[: -len(".codex-fork.control.sock")] or None
+        return None
+
+    def _iter_codex_fork_runtime_artifacts(self) -> list[Path]:
+        """List codex-fork runtime artifacts currently present in the log directory."""
+        return sorted(
+            [
+                *self.log_dir.glob("*.codex-fork.events.jsonl"),
+                *self.log_dir.glob("*.codex-fork.control.sock"),
+            ]
+        )
 
     @staticmethod
     def _normalize_codex_fork_event_type(event_type: Any) -> str:
@@ -3315,12 +3338,17 @@ class SessionManager:
     async def start_background_tasks(self):
         """Start periodic maintenance tasks owned by SessionManager."""
         await self.codex_observability_logger.start_periodic_prune()
+        await self.maintain_codex_fork_runtime_artifacts()
         for session in self.sessions.values():
             if session.provider == "codex-fork" and session.status != SessionStatus.STOPPED:
                 self._start_codex_fork_event_monitor(session, from_eof=True)
         if self._service_role_maintenance_task is None:
             self._service_role_maintenance_task = asyncio.create_task(
                 self._run_service_role_maintenance_loop()
+            )
+        if self._codex_fork_runtime_maintenance_task is None:
+            self._codex_fork_runtime_maintenance_task = asyncio.create_task(
+                self._run_codex_fork_runtime_maintenance_loop()
             )
 
     async def stop_background_tasks(self):
@@ -3331,6 +3359,11 @@ class SessionManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._service_role_maintenance_task
             self._service_role_maintenance_task = None
+        if self._codex_fork_runtime_maintenance_task is not None:
+            self._codex_fork_runtime_maintenance_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._codex_fork_runtime_maintenance_task
+            self._codex_fork_runtime_maintenance_task = None
         for session_id in list(self.codex_fork_event_monitors.keys()):
             await self._stop_codex_fork_event_monitor(session_id)
         pending_topic_tasks = list(self._pending_telegram_topic_tasks)
@@ -3389,6 +3422,164 @@ class SessionManager:
                 except Exception:
                     logger.exception("Service role maintenance pass failed")
                 await asyncio.sleep(self.service_role_maintenance_poll_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
+    def prune_codex_fork_runtime_artifacts(self) -> list[str]:
+        """Remove codex-fork event/control artifacts that no longer belong to a live runtime."""
+        removed: list[str] = []
+        for artifact_path in self._iter_codex_fork_runtime_artifacts():
+            session_id = self._codex_fork_session_id_from_artifact_name(artifact_path.name)
+            if not session_id:
+                continue
+            session = self.sessions.get(session_id)
+            should_remove = False
+            if session is None:
+                should_remove = True
+            elif session.provider != "codex-fork":
+                should_remove = True
+            elif session.status == SessionStatus.STOPPED:
+                should_remove = True
+            elif not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
+                should_remove = True
+
+            if not should_remove:
+                continue
+
+            with contextlib.suppress(FileNotFoundError):
+                artifact_path.unlink()
+                removed.append(artifact_path.name)
+
+        return removed
+
+    async def _restart_codex_fork_runtime(
+        self,
+        session: Session,
+        *,
+        reason: str,
+    ) -> tuple[bool, str]:
+        """Recreate one codex-fork runtime in place to restore missing bridge artifacts."""
+        if session.provider != "codex-fork":
+            return False, "session is not codex-fork"
+
+        resume_id = self.get_session_resume_id(session)
+        if not resume_id:
+            return False, "no Codex resume id is available for this session"
+
+        await self._stop_codex_fork_event_monitor(session.id)
+        self.codex_fork_event_offsets.pop(session.id, None)
+        self.codex_fork_event_buffers.pop(session.id, None)
+        self.codex_fork_turns_in_flight.discard(session.id)
+        self.codex_fork_wait_resume_state.pop(session.id, None)
+        self.codex_fork_wait_kind.pop(session.id, None)
+        self.codex_fork_last_seq.pop(session.id, None)
+        self.codex_fork_session_epoch.pop(session.id, None)
+        self.codex_fork_control_epoch.pop(session.id, None)
+        self.codex_fork_control_degraded.pop(session.id, None)
+
+        if session.tmux_session and self.tmux.session_exists(session.tmux_session):
+            self.tmux.kill_session(session.tmux_session)
+
+        command = self.codex_fork_command
+        args = ["resume", resume_id, *self.codex_fork_args]
+        event_stream_path = self._codex_fork_event_stream_path(session)
+        control_socket_path = self._codex_fork_control_socket_path(session)
+        event_stream_path.parent.mkdir(parents=True, exist_ok=True)
+        if event_stream_path.exists():
+            event_stream_path.unlink()
+        if control_socket_path.exists():
+            control_socket_path.unlink()
+        args.extend(
+            [
+                "--event-stream",
+                str(event_stream_path),
+                "--event-schema-version",
+                str(self.codex_fork_event_schema_version),
+                "--control-socket",
+                str(control_socket_path),
+            ]
+        )
+
+        if not self.tmux.create_session_with_command(
+            session.tmux_session,
+            session.working_dir,
+            session.log_file,
+            session_id=session.id,
+            command=command,
+            args=args,
+        ):
+            session.error_message = f"codex_fork_runtime_artifacts_missing: {reason}"
+            self._save_state()
+            return False, "failed to recreate Codex session runtime"
+
+        session.error_message = None
+        session.status = SessionStatus.RUNNING
+        session.last_activity = datetime.now()
+        self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
+        self._set_codex_fork_lifecycle_state(
+            session_id=session.id,
+            state="running",
+            cause_event_type="runtime_artifacts_restored",
+        )
+        self._start_codex_fork_event_monitor(session)
+        self._save_state()
+        logger.info("Recreated codex-fork runtime artifacts for %s after %s", session.id, reason)
+        return True, ""
+
+    async def maintain_codex_fork_runtime_artifacts(self) -> dict[str, list[str]]:
+        """Prune dead codex-fork artifacts and recreate missing live bridge artifacts when possible."""
+        removed = self.prune_codex_fork_runtime_artifacts()
+        healed: list[str] = []
+        degraded: list[str] = []
+
+        for session in list(self.sessions.values()):
+            if session.provider != "codex-fork" or session.status == SessionStatus.STOPPED:
+                continue
+            if not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
+                continue
+
+            missing: list[str] = []
+            event_stream_path = self._codex_fork_event_stream_path(session)
+            control_socket_path = self._codex_fork_control_socket_path(session)
+            if not event_stream_path.exists():
+                missing.append("event_stream")
+            if not control_socket_path.exists():
+                missing.append("control_socket")
+
+            if not missing:
+                if session.id not in self.codex_fork_event_monitors:
+                    self._start_codex_fork_event_monitor(session, from_eof=True)
+                if session.error_message and session.error_message.startswith("codex_fork_runtime_artifacts_missing:"):
+                    session.error_message = None
+                    self._save_state()
+                continue
+
+            reason = ", ".join(missing)
+            ok, error = await self._restart_codex_fork_runtime(session, reason=reason)
+            if ok:
+                healed.append(session.id)
+            else:
+                if not session.error_message or not session.error_message.startswith(
+                    "codex_fork_runtime_artifacts_missing:"
+                ):
+                    session.error_message = (
+                        f"codex_fork_runtime_artifacts_missing: {reason}"
+                        + (f" ({error})" if error else "")
+                    )
+                    self._save_state()
+                degraded.append(session.id)
+
+        return {"removed": removed, "healed": healed, "degraded": degraded}
+
+    async def _run_codex_fork_runtime_maintenance_loop(self) -> None:
+        """Periodically heal missing codex-fork bridge artifacts and prune dead ones."""
+        try:
+            while True:
+                try:
+                    await self.maintain_codex_fork_runtime_artifacts()
+                except Exception:
+                    logger.exception("Codex-fork runtime maintenance pass failed")
+                await asyncio.sleep(self.codex_fork_runtime_maintenance_poll_interval_seconds)
         except asyncio.CancelledError:
             raise
 
@@ -4584,7 +4775,10 @@ class SessionManager:
                 self.codex_fork_control_epoch.pop(session_id, None)
                 self.codex_fork_control_degraded.pop(session_id, None)
                 self.codex_fork_runtime_owner.pop(session_id, None)
+                event_stream_path = self._codex_fork_event_stream_path(session)
                 control_socket_path = self._codex_fork_control_socket_path(session)
+                if event_stream_path.exists():
+                    event_stream_path.unlink()
                 if control_socket_path.exists():
                     control_socket_path.unlink()
                 self._set_codex_fork_lifecycle_state(
