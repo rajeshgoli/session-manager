@@ -40,6 +40,7 @@ from .models import (
     Session,
     SessionStatus,
     NotificationChannel,
+    NotificationEvent,
     Subagent,
     SubagentStatus,
     DeliveryResult,
@@ -5102,6 +5103,15 @@ Provide ONLY the summary, no preamble or questions."""
         queue_mgr = app.state.session_manager.message_queue_manager
         if request.text is not None and queue_mgr:
             queue_mgr.reset_remind(session_id)
+
+        notifier = getattr(app.state, "notifier", None)
+        if request.text is not None and notifier and session.telegram_chat_id:
+            event = NotificationEvent(
+                session_id=session.id,
+                event_type="agent_status",
+                message=request.text,
+            )
+            await notifier.notify(event, session)
 
         return {
             "status": "updated",

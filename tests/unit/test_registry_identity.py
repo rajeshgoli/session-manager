@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -138,3 +139,28 @@ def test_notifier_response_message_prefers_registry_alias(tmp_path):
     message = notifier._format_message(event, session)
 
     assert message.startswith("maintainer \\[maint123\\] *Claude:*")
+
+
+def test_notifier_uses_live_session_identity_for_snapshot_routing_objects(tmp_path):
+    manager = _manager(tmp_path)
+    session = _session("maint123", tmp_path)
+    session.friendly_name = "codex-345"
+    session.telegram_chat_id = 123
+    session.telegram_thread_id = 456
+    manager.sessions[session.id] = session
+    manager.register_agent_role(session.id, "maintainer")
+
+    notifier = Notifier()
+    notifier.session_manager = manager
+    snapshot = SimpleNamespace(id=session.id, telegram_chat_id=123, telegram_thread_id=456)
+    event = NotificationEvent(
+        session_id=session.id,
+        event_type="message_delivered",
+        message="hello from queue",
+        channel=NotificationChannel.TELEGRAM,
+    )
+
+    message = notifier._format_message(event, snapshot)
+
+    assert "[MESSAGE_DELIVERED] hello from queue" in message
+    assert f"Session: {session.id}" in message

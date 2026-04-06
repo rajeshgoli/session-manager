@@ -57,12 +57,24 @@ class Notifier:
         if session is None:
             return None
         session_manager = getattr(self, "session_manager", None)
+        resolved_session = session
+        if session_manager and not isinstance(session, Session):
+            session_id = getattr(session, "id", None)
+            getter = getattr(session_manager, "get_session", None)
+            if isinstance(session_id, str) and callable(getter):
+                live_session = getter(session_id)
+                if live_session is not None:
+                    resolved_session = live_session
         getter = getattr(session_manager, "get_effective_session_name", None) if session_manager else None
         if callable(getter):
-            display_name = getter(session)
+            display_name = getter(resolved_session)
             if isinstance(display_name, str) and display_name:
                 return display_name
-        return session.friendly_name or session.name or session.id
+        return (
+            getattr(resolved_session, "friendly_name", None)
+            or getattr(resolved_session, "name", None)
+            or getattr(resolved_session, "id", None)
+        )
 
     async def notify(
         self,
