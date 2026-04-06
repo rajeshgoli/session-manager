@@ -1,28 +1,57 @@
-"""Wrapper around existing email harness for sending/receiving emails."""
+"""Email bridge helpers and legacy notification harness support."""
 
-import sys
+from __future__ import annotations
+
 import asyncio
+import html
 import logging
+import re
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+import httpx
+import yaml
 
 logger = logging.getLogger(__name__)
 
 # Path to existing email automation
 EMAIL_HARNESS_PATH = Path(__file__).parent.parent.parent.parent / "claude-email-automation"
+DEFAULT_BRIDGE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "email_send.yaml"
+DEFAULT_EMAIL_WEBHOOK_PATH = "/api/email-inbound"
+MAX_EMAIL_SUBJECT_LENGTH = 140
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+MARKDOWN_CODE_RE = re.compile(r"`([^`]+)`")
+MARKDOWN_STRONG_RE = re.compile(r"\*\*([^*]+)\*\*")
+MARKDOWN_EM_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+WHITESPACE_RE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True)
+class RegisteredEmailUser:
+    """Resolved user entry from the gitignored email bridge config."""
+
+    username: str
+    email: str
+    display_name: str
+    aliases: tuple[str, ...]
 
 
 class EmailHandler:
-    """Handles email notifications using existing email harness."""
+    """Handles legacy email notifications and Resend-based agent email bridging."""
 
     def __init__(
         self,
         email_config: str = "",
         imap_config: str = "",
+        bridge_config: str = "",
     ):
-        # Use provided paths or default to existing harness location
+        # Legacy harness config
         self.email_config = Path(email_config) if email_config else EMAIL_HARNESS_PATH / "email.yaml"
         self.imap_config = Path(imap_config) if imap_config else EMAIL_HARNESS_PATH / "imap.yaml"
+        self.bridge_config = Path(bridge_config).expanduser() if bridge_config else DEFAULT_BRIDGE_CONFIG_PATH
 
         # Add harness path to sys.path for imports
         harness_str = str(EMAIL_HARNESS_PATH)
@@ -31,32 +60,392 @@ class EmailHandler:
 
         self._send_module = None
         self._wait_module = None
+        self._bridge_cache: Optional[dict[str, Any]] = None
+        self._bridge_cache_mtime_ns: Optional[int] = None
 
     def _load_modules(self):
-        """Lazy load the email modules."""
+        """Lazy load the legacy email harness modules."""
         if self._send_module is None:
             try:
                 import send_completion_email as send_module
                 import wait_for_response as wait_module
+
                 self._send_module = send_module
                 self._wait_module = wait_module
-                logger.info("Loaded email harness modules")
-            except ImportError as e:
-                logger.error(f"Failed to import email harness: {e}")
-                logger.error(f"Expected harness at: {EMAIL_HARNESS_PATH}")
+                logger.info("Loaded legacy email harness modules")
+            except ImportError as exc:
+                logger.error("Failed to import email harness: %s", exc)
+                logger.error("Expected harness at: %s", EMAIL_HARNESS_PATH)
                 raise
 
     def is_available(self) -> bool:
-        """Check if email harness is available and configured."""
+        """Check if the legacy email harness is available and configured."""
         if not EMAIL_HARNESS_PATH.exists():
-            logger.warning(f"Email harness not found at {EMAIL_HARNESS_PATH}")
+            logger.warning("Email harness not found at %s", EMAIL_HARNESS_PATH)
             return False
 
         if not self.email_config.exists():
-            logger.warning(f"Email config not found at {self.email_config}")
+            logger.warning("Email config not found at %s", self.email_config)
             return False
 
         return True
+
+    def _load_bridge_config(self) -> dict[str, Any]:
+        """Load and cache the gitignored email bridge config."""
+        if not self.bridge_config.exists():
+            self._bridge_cache = {}
+            self._bridge_cache_mtime_ns = None
+            return {}
+
+        stat = self.bridge_config.stat()
+        if self._bridge_cache is not None and self._bridge_cache_mtime_ns == stat.st_mtime_ns:
+            return self._bridge_cache
+
+        try:
+            data = yaml.safe_load(self.bridge_config.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            logger.error("Failed to load email bridge config %s: %s", self.bridge_config, exc)
+            data = {}
+
+        if not isinstance(data, dict):
+            logger.error("Email bridge config %s must contain a YAML mapping", self.bridge_config)
+            data = {}
+
+        self._bridge_cache = data
+        self._bridge_cache_mtime_ns = stat.st_mtime_ns
+        return data
+
+    def bridge_is_available(self) -> bool:
+        """Whether the Resend-based email bridge is configured."""
+        resend = (self._load_bridge_config().get("resend") or {})
+        return bool(str(resend.get("api_key") or "").strip() and str(resend.get("domain") or "").strip())
+
+    def bridge_webhook_path(self) -> str:
+        """Return the configured inbound email webhook path."""
+        bridge = (self._load_bridge_config().get("email_bridge") or {})
+        raw_path = str(bridge.get("webhook_path") or DEFAULT_EMAIL_WEBHOOK_PATH).strip() or DEFAULT_EMAIL_WEBHOOK_PATH
+        return raw_path if raw_path.startswith("/") else f"/{raw_path}"
+
+    def authorized_senders(self) -> set[str]:
+        """Return normalized allowlisted sender addresses for inbound replies."""
+        bridge = (self._load_bridge_config().get("email_bridge") or {})
+        allowlist = bridge.get("authorized_senders") or []
+        if isinstance(allowlist, str):
+            allowlist = [allowlist]
+        return {
+            str(address).strip().lower()
+            for address in allowlist
+            if str(address).strip()
+        }
+
+    def is_authorized_sender(self, address: str) -> bool:
+        """Return True when the sender email is explicitly allowlisted."""
+        normalized = str(address or "").strip().lower()
+        allowlist = self.authorized_senders()
+        return bool(normalized and normalized in allowlist)
+
+    def lookup_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
+        """Resolve one registered user by username or alias."""
+        needle = str(identifier or "").strip().lower()
+        if not needle:
+            return None
+
+        users = self._load_bridge_config().get("users") or {}
+        if not isinstance(users, dict):
+            return None
+
+        for username, raw_spec in users.items():
+            resolved = self._normalize_user_spec(username, raw_spec)
+            if resolved is None:
+                continue
+            if needle in resolved.aliases:
+                return resolved
+        return None
+
+    def resolve_users(self, identifiers: list[str]) -> list[RegisteredEmailUser]:
+        """Resolve a list of usernames/aliases into distinct registered users."""
+        resolved: list[RegisteredEmailUser] = []
+        seen_emails: set[str] = set()
+
+        for identifier in identifiers:
+            user = self.lookup_user(identifier)
+            if user is None:
+                raise LookupError(f"No registered email user found for '{identifier}'")
+            email_key = user.email.lower()
+            if email_key in seen_emails:
+                continue
+            seen_emails.add(email_key)
+            resolved.append(user)
+
+        if not resolved:
+            raise LookupError("No registered email users were provided")
+        return resolved
+
+    def _normalize_user_spec(self, username: Any, raw_spec: Any) -> Optional[RegisteredEmailUser]:
+        """Normalize one YAML user record into a consistent shape."""
+        normalized_username = str(username or "").strip()
+        if not normalized_username:
+            return None
+
+        if isinstance(raw_spec, str):
+            email_address = raw_spec.strip()
+            display_name = normalized_username
+            aliases: list[str] = [normalized_username]
+        elif isinstance(raw_spec, dict):
+            email_address = str(raw_spec.get("email") or "").strip()
+            display_name = str(raw_spec.get("name") or normalized_username).strip() or normalized_username
+            aliases = [normalized_username]
+            raw_aliases = raw_spec.get("aliases") or []
+            if isinstance(raw_aliases, str):
+                raw_aliases = [raw_aliases]
+            aliases.extend(str(alias).strip() for alias in raw_aliases if str(alias).strip())
+        else:
+            return None
+
+        if not email_address:
+            return None
+
+        normalized_aliases = tuple({alias.lower() for alias in aliases if alias})
+        return RegisteredEmailUser(
+            username=normalized_username,
+            email=email_address,
+            display_name=display_name,
+            aliases=normalized_aliases,
+        )
+
+    def _bridge_reply_domain(self) -> str:
+        resend = (self._load_bridge_config().get("resend") or {})
+        reply_domain = str(resend.get("reply_domain") or resend.get("domain") or "").strip()
+        if not reply_domain:
+            raise RuntimeError("Email bridge is missing resend.domain")
+        return reply_domain
+
+    def _bridge_api_key(self) -> str:
+        resend = (self._load_bridge_config().get("resend") or {})
+        api_key = str(resend.get("api_key") or "").strip()
+        if not api_key:
+            raise RuntimeError("Email bridge is missing resend.api_key")
+        return api_key
+
+    def _bridge_api_base_url(self) -> str:
+        resend = (self._load_bridge_config().get("resend") or {})
+        return str(resend.get("api_base_url") or "https://api.resend.com").rstrip("/")
+
+    def _default_subject(self, sender_name: str, body_text: str) -> str:
+        """Generate a deterministic email subject from the first non-empty line."""
+        subject = ""
+        for raw_line in body_text.splitlines():
+            line = WHITESPACE_RE.sub(" ", raw_line).strip().lstrip("#*- ")
+            if line:
+                subject = line
+                break
+        if not subject:
+            subject = f"Message from {sender_name or 'Session Manager'}"
+        return subject[:MAX_EMAIL_SUBJECT_LENGTH]
+
+    def _strip_html(self, body_html: str) -> str:
+        """Best-effort conversion from HTML into plain text."""
+        text = re.sub(r"(?i)<br\s*/?>", "\n", body_html)
+        text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+        text = re.sub(r"(?i)</li\s*>", "\n", text)
+        text = HTML_TAG_RE.sub("", text)
+        text = html.unescape(text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _render_inline_markdown(self, text: str) -> str:
+        """Render a narrow markdown subset for email HTML bodies."""
+
+        def _render_link(match: re.Match[str]) -> str:
+            label = html.escape(match.group(1))
+            href = html.escape(match.group(2), quote=True)
+            return f'<a href="{href}">{label}</a>'
+
+        escaped = html.escape(text)
+        escaped = MARKDOWN_LINK_RE.sub(_render_link, escaped)
+        escaped = MARKDOWN_CODE_RE.sub(lambda m: f"<code>{html.escape(m.group(1))}</code>", escaped)
+        escaped = MARKDOWN_STRONG_RE.sub(lambda m: f"<strong>{html.escape(m.group(1))}</strong>", escaped)
+        escaped = MARKDOWN_EM_RE.sub(lambda m: f"<em>{html.escape(m.group(1))}</em>", escaped)
+        return escaped
+
+    def render_markdown_to_html(self, body_text: str) -> str:
+        """Render basic markdown to HTML without extra dependencies."""
+        lines = body_text.splitlines()
+        parts: list[str] = []
+        list_open = False
+        code_open = False
+        code_lines: list[str] = []
+        paragraph: list[str] = []
+
+        def flush_paragraph() -> None:
+            if not paragraph:
+                return
+            parts.append(f"<p>{'<br/>'.join(paragraph)}</p>")
+            paragraph.clear()
+
+        def flush_list() -> None:
+            nonlocal list_open
+            if list_open:
+                parts.append("</ul>")
+                list_open = False
+
+        def flush_code() -> None:
+            nonlocal code_open
+            if code_open:
+                code_text = "\n".join(code_lines)
+                parts.append(f"<pre><code>{html.escape(code_text)}</code></pre>")
+                code_lines.clear()
+                code_open = False
+
+        for raw_line in lines:
+            line = raw_line.rstrip("\n")
+            stripped = line.strip()
+
+            if stripped.startswith("```"):
+                flush_paragraph()
+                flush_list()
+                if code_open:
+                    flush_code()
+                else:
+                    code_open = True
+                continue
+
+            if code_open:
+                code_lines.append(line)
+                continue
+
+            if not stripped:
+                flush_paragraph()
+                flush_list()
+                continue
+
+            heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if heading_match:
+                flush_paragraph()
+                flush_list()
+                level = len(heading_match.group(1))
+                parts.append(f"<h{level}>{self._render_inline_markdown(heading_match.group(2).strip())}</h{level}>")
+                continue
+
+            list_match = re.match(r"^[-*+]\s+(.*)$", stripped)
+            if list_match:
+                flush_paragraph()
+                if not list_open:
+                    parts.append("<ul>")
+                    list_open = True
+                parts.append(f"<li>{self._render_inline_markdown(list_match.group(1).strip())}</li>")
+                continue
+
+            flush_list()
+            paragraph.append(self._render_inline_markdown(stripped))
+
+        flush_paragraph()
+        flush_list()
+        flush_code()
+        if not parts:
+            return "<p></p>"
+        return "\n".join(parts)
+
+    def _plain_text_to_html(self, body_text: str) -> str:
+        """Convert plain text to readable HTML paragraphs."""
+        paragraphs = [chunk.strip() for chunk in re.split(r"\n\s*\n", body_text) if chunk.strip()]
+        if not paragraphs:
+            return "<p></p>"
+        return "\n".join(
+            f"<p>{html.escape(paragraph).replace(chr(10), '<br/>')}</p>"
+            for paragraph in paragraphs
+        )
+
+    async def send_agent_email(
+        self,
+        *,
+        sender_session_id: str,
+        sender_name: str,
+        to_identifiers: list[str],
+        cc_identifiers: Optional[list[str]] = None,
+        subject: Optional[str] = None,
+        body_text: Optional[str] = None,
+        body_html: Optional[str] = None,
+        body_markdown: bool = False,
+        auto_subject: bool = False,
+    ) -> dict[str, Any]:
+        """Send a reply-routable email from one managed session to registered user(s)."""
+        if not self.bridge_is_available():
+            raise RuntimeError(f"Email bridge config is unavailable at {self.bridge_config}")
+
+        normalized_sender_id = str(sender_session_id or "").strip()
+        normalized_sender_name = str(sender_name or "").strip() or normalized_sender_id
+        if not normalized_sender_id:
+            raise ValueError("Managed sender session is required for agent email delivery")
+
+        text_payload = (body_text or "").strip()
+        html_payload = (body_html or "").strip()
+        if not text_payload and not html_payload:
+            raise ValueError("Email body is required")
+
+        to_users = self.resolve_users(to_identifiers)
+        cc_users = self.resolve_users(cc_identifiers or []) if cc_identifiers else []
+
+        if body_markdown and text_payload and not html_payload:
+            html_payload = self.render_markdown_to_html(text_payload)
+        elif text_payload and not html_payload:
+            html_payload = self._plain_text_to_html(text_payload)
+        elif html_payload and not text_payload:
+            text_payload = self._strip_html(html_payload)
+
+        resolved_subject = str(subject or "").strip()
+        if not resolved_subject:
+            if not auto_subject:
+                raise ValueError("Email subject is required")
+            resolved_subject = self._default_subject(normalized_sender_name, text_payload)
+
+        reply_domain = self._bridge_reply_domain()
+        from_address = f"{normalized_sender_id}@{reply_domain}"
+        from_header = f"{normalized_sender_name} <{from_address}>"
+        payload = {
+            "from": from_header,
+            "to": [user.email for user in to_users],
+            "subject": resolved_subject,
+            "text": text_payload,
+            "reply_to": from_address,
+            "headers": {
+                "X-SM-Session-ID": normalized_sender_id,
+            },
+        }
+        if cc_users:
+            payload["cc"] = [user.email for user in cc_users]
+        if html_payload:
+            payload["html"] = html_payload
+
+        endpoint = f"{self._bridge_api_base_url()}/emails"
+        headers = {
+            "Authorization": f"Bearer {self._bridge_api_key()}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+
+        if response.status_code >= 400:
+            try:
+                error_payload = response.json()
+            except ValueError:
+                error_payload = response.text
+            raise RuntimeError(f"Resend email send failed ({response.status_code}): {error_payload}")
+
+        try:
+            response_payload = response.json()
+        except ValueError:
+            response_payload = {}
+
+        return {
+            "subject": resolved_subject,
+            "to": [{"username": user.username, "email": user.email} for user in to_users],
+            "cc": [{"username": user.username, "email": user.email} for user in cc_users],
+            "message_id": response_payload.get("id"),
+            "from": from_header,
+            "reply_to": from_address,
+        }
 
     async def send_notification(
         self,
@@ -65,15 +454,10 @@ class EmailHandler:
         urgent: bool = False,
     ) -> bool:
         """
-        Send email notification for a session.
+        Send a legacy notification email for a session.
 
-        Args:
-            session_id: Session ID for tracking
-            message: Message body
-            urgent: If True, also send to SMS gateways
-
-        Returns:
-            True if sent successfully
+        The maintainer email-bridge feature uses `send_agent_email()` instead. This
+        method remains as a compatibility wrapper for existing notification flows.
         """
         if not self.is_available():
             logger.warning("Email not available, skipping notification")
@@ -81,27 +465,20 @@ class EmailHandler:
 
         try:
             self._load_modules()
-
-            # Load config
             config = self._send_module.load_email_config(str(self.email_config))
-
-            # Send email
             success = self._send_module.send_completion_email(
                 session_id=session_id,
                 body_content=message,
                 config=config,
                 urgent=urgent,
             )
-
             if success:
-                logger.info(f"Email sent for session {session_id}")
+                logger.info("Email sent for session %s", session_id)
             else:
-                logger.error(f"Failed to send email for session {session_id}")
-
+                logger.error("Failed to send email for session %s", session_id)
             return success
-
-        except Exception as e:
-            logger.error(f"Email send error: {e}")
+        except Exception as exc:
+            logger.error("Email send error: %s", exc)
             return False
 
     async def wait_for_response(
@@ -109,31 +486,18 @@ class EmailHandler:
         session_id: str,
         timeout: int = 3600,
     ) -> Optional[str]:
-        """
-        Wait for email response with session ID.
-
-        Args:
-            session_id: Session ID to wait for
-            timeout: Maximum wait time in seconds
-
-        Returns:
-            Email body if received, None if timeout
-        """
+        """Wait for a legacy email response with the given session ID."""
         if not self.is_available():
             logger.warning("Email not available")
             return None
 
         if not self.imap_config.exists():
-            logger.warning(f"IMAP config not found at {self.imap_config}")
+            logger.warning("IMAP config not found at %s", self.imap_config)
             return None
 
         try:
             self._load_modules()
-
-            # Load IMAP config
             config = self._wait_module.load_imap_config(str(self.imap_config))
-
-            # Run blocking wait in thread pool
             loop = asyncio.get_event_loop()
             body = await loop.run_in_executor(
                 None,
@@ -142,33 +506,9 @@ class EmailHandler:
                 config,
                 timeout,
             )
-
             if body:
-                logger.info(f"Received email response for session {session_id}")
-
+                logger.info("Received email response for session %s", session_id)
             return body
-
-        except Exception as e:
-            logger.error(f"Email wait error: {e}")
+        except Exception as exc:
+            logger.error("Email wait error: %s", exc)
             return None
-
-
-async def test_email_handler():
-    """Test the email handler."""
-    handler = EmailHandler()
-
-    print(f"Email available: {handler.is_available()}")
-
-    if handler.is_available():
-        # Send a test notification
-        success = await handler.send_notification(
-            session_id="test123",
-            message="This is a test notification from Claude Session Manager",
-            urgent=False,
-        )
-        print(f"Send result: {success}")
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-    asyncio.run(test_email_handler())

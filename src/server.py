@@ -63,6 +63,7 @@ APP_ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 APP_ARTIFACT_HASH_PATTERN = re.compile(r"^[0-9a-f]{8}$")
 APP_ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
 DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
+DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
 
 
 def _is_valid_app_artifact_name(app_name: str) -> bool:
@@ -650,6 +651,25 @@ class NotifyRequest(BaseModel):
     urgent: bool = False
 
 
+class SendEmailRequest(BaseModel):
+    """Request to send a routed email to registered user(s)."""
+    requester_session_id: Optional[str] = None
+    recipients: list[str]
+    cc: list[str] = Field(default_factory=list)
+    subject: Optional[str] = None
+    body_text: Optional[str] = None
+    body_html: Optional[str] = None
+    body_markdown: bool = False
+    auto_subject: bool = False
+
+
+class InboundEmailRequest(BaseModel):
+    """Inbound email payload forwarded by the email worker/webhook bridge."""
+    session_id: str
+    body: str
+    from_address: str
+
+
 class HookPayload(BaseModel):
     """Payload from Claude Code hooks."""
     # Claude Code hook fields
@@ -970,6 +990,7 @@ def create_app(
     child_monitor=None,
     config: Optional[dict] = None,
     lifespan=None,
+    email_handler=None,
 ) -> FastAPI:
     """
     Create the FastAPI application.
@@ -981,6 +1002,7 @@ def create_app(
         child_monitor: ChildMonitor instance
         config: Configuration dictionary
         lifespan: Optional ASGI lifespan context manager
+        email_handler: EmailHandler instance
 
     Returns:
         Configured FastAPI app
@@ -1016,6 +1038,7 @@ def create_app(
     app.state.notifier = notifier
     app.state.output_monitor = output_monitor
     app.state.child_monitor = child_monitor
+    app.state.email_handler = email_handler
     app.state.infra_supervisor = None
     app.state.last_claude_output = {}  # Store last output per session from hooks
     app.state.pending_stop_notifications = set()  # Sessions where Stop hook had empty transcript
@@ -1068,6 +1091,107 @@ def create_app(
                 if isinstance(display_name, str) and display_name:
                     return display_name
         return session.friendly_name or session.name or session.id
+
+    def _email_handler_or_503():
+        handler = getattr(app.state, "email_handler", None)
+        if handler is None:
+            raise HTTPException(status_code=503, detail="Email bridge not configured")
+        return handler
+
+    def _normalize_identifier_list(values: list[str]) -> list[str]:
+        identifiers: list[str] = []
+        for value in values:
+            for part in str(value or "").split(","):
+                normalized = part.strip()
+                if normalized:
+                    identifiers.append(normalized)
+        return identifiers
+
+    async def _send_registered_email(request: SendEmailRequest) -> dict[str, Any]:
+        handler = _email_handler_or_503()
+        if not getattr(handler, "bridge_is_available", lambda: False)():
+            raise HTTPException(status_code=503, detail="Email bridge is unavailable")
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        if not request.requester_session_id:
+            raise HTTPException(status_code=400, detail="Managed sender session is required for email delivery")
+
+        sender_session = app.state.session_manager.get_session(request.requester_session_id)
+        if not sender_session:
+            raise HTTPException(status_code=404, detail="Sender session not found")
+
+        recipients = _normalize_identifier_list(request.recipients)
+        cc = _normalize_identifier_list(request.cc)
+        if not recipients:
+            raise HTTPException(status_code=400, detail="At least one email recipient is required")
+
+        try:
+            return await handler.send_agent_email(
+                sender_session_id=sender_session.id,
+                sender_name=_effective_session_name(sender_session),
+                to_identifiers=recipients,
+                cc_identifiers=cc,
+                subject=request.subject,
+                body_text=request.body_text,
+                body_html=request.body_html,
+                body_markdown=request.body_markdown,
+                auto_subject=request.auto_subject,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    async def _deliver_email_reply_to_session(payload: InboundEmailRequest) -> dict[str, Any]:
+        handler = _email_handler_or_503()
+        if not getattr(handler, "bridge_is_available", lambda: False)():
+            raise HTTPException(status_code=503, detail="Email bridge is unavailable")
+        if not getattr(handler, "is_authorized_sender", lambda _value: False)(payload.from_address):
+            raise HTTPException(status_code=403, detail="Inbound sender is not authorized")
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session_id = str(payload.session_id or "").strip()
+        body = str(payload.body or "").strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        if not body:
+            raise HTTPException(status_code=400, detail="body is required")
+
+        session = app.state.session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        restored = False
+        if session.status == SessionStatus.STOPPED:
+            success, restored_session, error = await app.state.session_manager.restore_session(session_id)
+            if not success or not restored_session:
+                raise HTTPException(status_code=409, detail=error or "Failed to restore session")
+            session = restored_session
+            restored = True
+            if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
+                await app.state.output_monitor.start_monitoring(session)
+
+        result = await app.state.session_manager.send_input(
+            session_id,
+            body,
+            sender_session_id=None,
+            delivery_mode="sequential",
+            from_sm_send=False,
+        )
+        if result == DeliveryResult.FAILED:
+            raise HTTPException(status_code=500, detail="Failed to deliver inbound email to session")
+        if app.state.output_monitor:
+            app.state.output_monitor.update_activity(session_id)
+
+        return {
+            "status": "sent",
+            "session_id": session_id,
+            "restored": restored,
+            "delivery_result": result.value if hasattr(result, "value") else str(result),
+        }
 
     def _track_hard_threshold_seconds(track_seconds: int) -> int:
         """Return the hard-threshold cadence for spawn/send --track."""
@@ -3690,6 +3814,36 @@ Provide ONLY the summary, no preamble or questions."""
             success = True
 
         return {"status": "sent" if success else "failed"}
+
+    @app.post("/email/send")
+    async def send_registered_email(request: SendEmailRequest):
+        """Send an email from a managed session to one or more registered users."""
+        result = await _send_registered_email(request)
+        return {"status": "sent", **result}
+
+    async def inbound_email_webhook(request: InboundEmailRequest):
+        """Accept one validated inbound email reply and forward it into the target session."""
+        return await _deliver_email_reply_to_session(request)
+
+    app.add_api_route(
+        DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH,
+        inbound_email_webhook,
+        methods=["POST"],
+    )
+    configured_email_webhook_path = DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH
+    email_handler_instance = getattr(app.state, "email_handler", None)
+    if email_handler_instance is not None:
+        configured_email_webhook_path = getattr(
+            email_handler_instance,
+            "bridge_webhook_path",
+            lambda: DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH,
+        )()
+    if configured_email_webhook_path != DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH:
+        app.add_api_route(
+            configured_email_webhook_path,
+            inbound_email_webhook,
+            methods=["POST"],
+        )
 
     @app.post("/hooks/claude")
     async def claude_hook(payload: dict = Body(...)):

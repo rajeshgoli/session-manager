@@ -249,6 +249,7 @@ class SessionManagerApp:
         self.email_handler = EmailHandler(
             email_config=email_config.get("smtp_config", ""),
             imap_config=email_config.get("imap_config", ""),
+            bridge_config=email_config.get("bridge_config", ""),
         )
 
         # Telegram bot (optional)
@@ -331,6 +332,7 @@ class SessionManagerApp:
             notifier=self.notifier,
             output_monitor=self.output_monitor,
             child_monitor=self.child_monitor,
+            email_handler=self.email_handler,
             config=config,  # Pass config for server timeout settings
             lifespan=_lifespan,
         )

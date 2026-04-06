@@ -37,12 +37,24 @@ def mock_output_monitor():
 
 
 @pytest.fixture
-def test_client(mock_session_manager, mock_output_monitor):
+def mock_email_handler():
+    """Create a mock EmailHandler."""
+    mock = MagicMock()
+    mock.bridge_is_available.return_value = True
+    mock.bridge_webhook_path.return_value = "/api/email-inbound"
+    mock.send_agent_email = AsyncMock(return_value={"to": [], "cc": [], "subject": "test"})
+    mock.is_authorized_sender.return_value = True
+    return mock
+
+
+@pytest.fixture
+def test_client(mock_session_manager, mock_output_monitor, mock_email_handler):
     """Create a FastAPI TestClient with mocked dependencies."""
     app = create_app(
         session_manager=mock_session_manager,
         notifier=None,
         output_monitor=mock_output_monitor,
+        email_handler=mock_email_handler,
         config={},
     )
     return TestClient(app)
@@ -151,6 +163,116 @@ class TestSessionEndpoints:
         assert data["agent_status_text"] == "reviewing logs"
         assert data["agent_status_at"] == "2024-01-15T11:07:00"
         assert data["agent_task_completed_at"] == "2024-01-15T11:10:00"
+
+
+class TestEmailBridgeEndpoints:
+    """Tests for email bridge API endpoints."""
+
+    def test_send_registered_email_endpoint(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_email_handler,
+        sample_session,
+    ):
+        mock_session_manager.get_session.return_value = sample_session
+        mock_email_handler.send_agent_email = AsyncMock(
+            return_value={
+                "to": [{"username": "rajesh", "email": "rajesh@example.com"}],
+                "cc": [],
+                "subject": "Reading list",
+                "message_id": "email_123",
+            }
+        )
+
+        response = test_client.post(
+            "/email/send",
+            json={
+                "requester_session_id": "test123",
+                "recipients": ["rajesh"],
+                "subject": "Reading list",
+                "body_text": "Hello",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "sent"
+        assert data["subject"] == "Reading list"
+        mock_email_handler.send_agent_email.assert_awaited_once_with(
+            sender_session_id="test123",
+            sender_name="Test Session",
+            to_identifiers=["rajesh"],
+            cc_identifiers=[],
+            subject="Reading list",
+            body_text="Hello",
+            body_html=None,
+            body_markdown=False,
+            auto_subject=False,
+        )
+
+    def test_inbound_email_restores_stopped_session(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_output_monitor,
+        sample_session,
+    ):
+        stopped = sample_session
+        stopped.status = SessionStatus.STOPPED
+        restored = Session(
+            id=stopped.id,
+            name=stopped.name,
+            working_dir=stopped.working_dir,
+            tmux_session=stopped.tmux_session,
+            log_file=stopped.log_file,
+            status=SessionStatus.RUNNING,
+            created_at=stopped.created_at,
+            last_activity=stopped.last_activity,
+            friendly_name=stopped.friendly_name,
+        )
+        mock_session_manager.get_session.return_value = stopped
+        mock_session_manager.restore_session = AsyncMock(return_value=(True, restored, None))
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+
+        response = test_client.post(
+            "/api/email-inbound",
+            json={
+                "session_id": "test123",
+                "body": "please continue",
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["restored"] is True
+        mock_session_manager.restore_session.assert_awaited_once_with("test123")
+        mock_session_manager.send_input.assert_awaited_once_with(
+            "test123",
+            "please continue",
+            sender_session_id=None,
+            delivery_mode="sequential",
+            from_sm_send=False,
+        )
+        mock_output_monitor.start_monitoring.assert_awaited_once_with(restored)
+
+    def test_inbound_email_rejects_unauthorized_sender(
+        self,
+        test_client,
+        mock_email_handler,
+    ):
+        mock_email_handler.is_authorized_sender.return_value = False
+
+        response = test_client.post(
+            "/api/email-inbound",
+            json={
+                "session_id": "test123",
+                "body": "hello",
+                "from_address": "intruder@example.com",
+            },
+        )
+
+        assert response.status_code == 403
 
     def test_get_session_not_found(self, test_client, mock_session_manager):
         """GET /sessions/{id} returns 404 for unknown session."""

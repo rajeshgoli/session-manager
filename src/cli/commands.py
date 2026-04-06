@@ -1295,6 +1295,8 @@ def cmd_send(
         remind_soft_threshold = track_seconds
         remind_hard_threshold = _track_hard_threshold_seconds(track_seconds)
 
+    effective_notify_after = wait_seconds if wait_seconds is not None else notify_after_seconds
+
     # Resolve identifier to session ID and get session details
     session_id, session = resolve_session_id(client, identifier)
     if session_id is None:
@@ -1324,18 +1326,40 @@ def cmd_send(
             if sessions is None:
                 print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
-            else:
-                print(f"Error: Session '{identifier}' not found", file=sys.stderr)
+            if delivery_mode != "sequential" or effective_notify_after or track_seconds is not None:
+                print(
+                    "Error: email fallback only supports plain sequential sends without --wait/--track/--urgent",
+                    file=sys.stderr,
+                )
                 return 1
+            email_result = client.send_email_result(
+                requester_session_id=sender_session_id,
+                recipients=[identifier],
+                body_text=text,
+                auto_subject=True,
+            )
+            if email_result.get("unavailable"):
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+                return 2
+            if email_result.get("ok"):
+                payload = email_result.get("data") or {}
+                recipients = payload.get("to") or []
+                recipient_summary = ", ".join(
+                    f"{item.get('username')} <{item.get('email')}>"
+                    for item in recipients
+                    if isinstance(item, dict)
+                ) or identifier
+                print(f"Email sent to {recipient_summary}")
+                return 0
+            detail_message = email_result.get("detail") or f"Session '{identifier}' not found"
+            print(f"Error: {detail_message}", file=sys.stderr)
+            return 1
 
     # Self-sends are commonly used as delayed wakeups; do not advertise or request
     # stop-notify because it would wake the same agent on its next stop hook.
     effective_notify_on_stop = notify_on_stop and sender_session_id != session_id
     if effective_notify_on_stop and session.get("provider") == "codex-fork":
         effective_notify_on_stop = False
-
-    # Use wait_seconds if provided, otherwise use notify_after_seconds
-    effective_notify_after = wait_seconds if wait_seconds is not None else notify_after_seconds
 
     # Send input with sender metadata, delivery mode, and sm send flag
     success, unavailable = client.send_input(
@@ -1389,6 +1413,105 @@ def cmd_send(
     if extras:
         print(f"  Options: {', '.join(extras)}")
 
+    return 0
+
+
+def _split_email_targets(raw_value: str) -> list[str]:
+    """Split a comma-delimited user/alias list into individual identifiers."""
+    return [part.strip() for part in str(raw_value or "").split(",") if part.strip()]
+
+
+def _load_email_body(
+    *,
+    body: Optional[str],
+    text_file: Optional[str],
+    html_file: Optional[str],
+) -> tuple[Optional[str], Optional[str], bool]:
+    """Resolve CLI email content from inline text, files, or stdin."""
+    provided_sources = sum(bool(value) for value in (body, text_file, html_file))
+    stdin_text: Optional[str] = None
+    if provided_sources == 0 and not sys.stdin.isatty():
+        stdin_text = sys.stdin.read()
+        if stdin_text == "":
+            stdin_text = None
+    if provided_sources + bool(stdin_text) != 1:
+        raise ValueError("Provide exactly one of --body, --text, --html, or stdin")
+
+    if body is not None:
+        return body, None, False
+    if stdin_text is not None:
+        return stdin_text, None, False
+    if text_file is not None:
+        path = Path(text_file)
+        text = path.read_text(encoding="utf-8")
+        is_markdown = path.suffix.lower() in {".md", ".markdown"}
+        return text, None, is_markdown
+    if html_file is not None:
+        return None, Path(html_file).read_text(encoding="utf-8"), False
+    raise ValueError("Email body is required")
+
+
+def cmd_email(
+    client: SessionManagerClient,
+    *,
+    sender_session_id: Optional[str],
+    recipients_raw: str,
+    subject: str,
+    body: Optional[str] = None,
+    text_file: Optional[str] = None,
+    html_file: Optional[str] = None,
+    cc_raw: Optional[str] = None,
+) -> int:
+    """Send a routed email from the current managed session to registered users."""
+    if not sender_session_id:
+        print("Error: sm email requires a managed session (CLAUDE_SESSION_MANAGER_ID not set)", file=sys.stderr)
+        return 2
+
+    recipients = _split_email_targets(recipients_raw)
+    cc = _split_email_targets(cc_raw or "")
+    if not recipients:
+        print("Error: at least one recipient is required", file=sys.stderr)
+        return 1
+    if not str(subject or "").strip():
+        print("Error: --subject is required", file=sys.stderr)
+        return 1
+
+    try:
+        body_text, body_html, body_markdown = _load_email_body(
+            body=body,
+            text_file=text_file,
+            html_file=html_file,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    result = client.send_email_result(
+        requester_session_id=sender_session_id,
+        recipients=recipients,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        body_markdown=body_markdown,
+        cc=cc,
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        print(f"Error: {result.get('detail') or 'Failed to send email'}", file=sys.stderr)
+        return 1
+
+    payload = result.get("data") or {}
+    to_entries = payload.get("to") or []
+    to_summary = ", ".join(
+        f"{entry.get('username')} <{entry.get('email')}>"
+        for entry in to_entries
+        if isinstance(entry, dict)
+    ) or ", ".join(recipients)
+    print(f"Email sent to {to_summary}")
+    if payload.get("subject"):
+        print(f"  Subject: {payload['subject']}")
     return 0
 
 
