@@ -501,6 +501,22 @@ class EmailHandler:
             return content.strip()
         return normalized
 
+    def extract_subject_from_raw_email(self, raw_email: str) -> Optional[str]:
+        """Parse a raw RFC822 email and return a normalized Subject header."""
+        normalized = str(raw_email or "").strip()
+        if not normalized:
+            return None
+
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(normalized.encode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+        subject = str(message.get("Subject") or "").strip()
+        if not subject:
+            return None
+        return WHITESPACE_RE.sub(" ", subject).strip()
+
     async def send_agent_email(
         self,
         *,

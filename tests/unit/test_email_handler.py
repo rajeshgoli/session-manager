@@ -161,3 +161,4 @@ def test_extract_text_from_raw_email_prefers_text_plain_part(tmp_path):
 
     assert "inbound footer test live" in extracted
     assert "SM: maintainer 057f8de4 codex-fork" in extracted
+    assert handler.extract_subject_from_raw_email(raw_email) == "Re: test"
