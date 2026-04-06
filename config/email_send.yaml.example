@@ -1,7 +1,9 @@
 resend:
   api_key: "re_PLACEHOLDER"
-  domain: "rajeshgo.li"
-  # Optional override when Email Routing receives replies on a different domain.
+  domain: "sm.rajeshgo.li"
+  # Optional stable mailbox address for friendly-name outbound mail and routed replies.
+  reply_address: "reply@sm.rajeshgo.li"
+  # Legacy fallback when Email Routing receives replies on a different domain.
   # reply_domain: "rajeshgo.li"
 
 users:
@@ -14,4 +16,7 @@ users:
 email_bridge:
   authorized_senders:
     - "rajeshgoli@gmail.com"
+  # Optional shared secret header enforced on inbound worker delivery.
+  # worker_secret: "set-a-random-secret"
+  # worker_secret_header: "x-email-worker-secret"
   webhook_path: "/api/email-inbound"

@@ -8,6 +8,8 @@ import logging
 import re
 import sys
 from dataclasses import dataclass
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 EMAIL_HARNESS_PATH = Path(__file__).parent.parent.parent.parent / "claude-email-automation"
 DEFAULT_BRIDGE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "email_send.yaml"
 DEFAULT_EMAIL_WEBHOOK_PATH = "/api/email-inbound"
+DEFAULT_EMAIL_WORKER_SECRET_HEADER = "x-email-worker-secret"
 MAX_EMAIL_SUBJECT_LENGTH = 140
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 MARKDOWN_CODE_RE = re.compile(r"`([^`]+)`")
@@ -27,6 +30,7 @@ MARKDOWN_STRONG_RE = re.compile(r"\*\*([^*]+)\*\*")
 MARKDOWN_EM_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
+ROUTING_FOOTER_RE = re.compile(r"(?im)^\s*>*\s*SM:\s+(.+?)\s+([a-z0-9]{6,})\s+([a-z0-9-]+)\s*$")
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,18 @@ class EmailHandler:
         raw_path = str(bridge.get("webhook_path") or DEFAULT_EMAIL_WEBHOOK_PATH).strip() or DEFAULT_EMAIL_WEBHOOK_PATH
         return raw_path if raw_path.startswith("/") else f"/{raw_path}"
 
+    def bridge_worker_secret_header(self) -> str:
+        """Return the header name used for the inbound worker shared secret."""
+        bridge = (self._load_bridge_config().get("email_bridge") or {})
+        raw_header = str(bridge.get("worker_secret_header") or DEFAULT_EMAIL_WORKER_SECRET_HEADER).strip().lower()
+        return raw_header or DEFAULT_EMAIL_WORKER_SECRET_HEADER
+
+    def bridge_worker_secret(self) -> Optional[str]:
+        """Return the configured inbound worker shared secret, if any."""
+        bridge = (self._load_bridge_config().get("email_bridge") or {})
+        secret = str(bridge.get("worker_secret") or "").strip()
+        return secret or None
+
     def authorized_senders(self) -> set[str]:
         """Return normalized allowlisted sender addresses for inbound replies."""
         bridge = (self._load_bridge_config().get("email_bridge") or {})
@@ -219,6 +235,15 @@ class EmailHandler:
         if not reply_domain:
             raise RuntimeError("Email bridge is missing resend.domain")
         return reply_domain
+
+    def _bridge_reply_address(self, sender_session_id: str) -> str:
+        """Return the reply-routable mailbox address for agent email."""
+        resend = (self._load_bridge_config().get("resend") or {})
+        reply_address = str(resend.get("reply_address") or resend.get("from_address") or "").strip()
+        if reply_address:
+            return reply_address
+        reply_domain = self._bridge_reply_domain()
+        return f"{sender_session_id}@{reply_domain}"
 
     def _bridge_api_key(self) -> str:
         resend = (self._load_bridge_config().get("resend") or {})
@@ -356,11 +381,117 @@ class EmailHandler:
             for paragraph in paragraphs
         )
 
+    def build_routing_footer(self, *, sender_name: str, sender_session_id: str, sender_provider: str) -> str:
+        """Build the compact routing footer embedded in outbound email bodies."""
+        normalized_name = WHITESPACE_RE.sub(" ", str(sender_name or "").strip()) or "session"
+        normalized_provider = WHITESPACE_RE.sub(" ", str(sender_provider or "").strip()) or "unknown"
+        return f"SM: {normalized_name} {sender_session_id} {normalized_provider}"
+
+    def append_routing_footer(self, *, body_text: str, body_html: str, footer_line: str) -> tuple[str, str]:
+        """Append a compact routing footer to both text and HTML email bodies."""
+        normalized_text = body_text.rstrip()
+        normalized_html = body_html.rstrip()
+        text_with_footer = f"{normalized_text}\n\n--\n{footer_line}" if normalized_text else f"--\n{footer_line}"
+        html_footer = f"<hr/>\n<p>{html.escape(footer_line)}</p>"
+        html_with_footer = f"{normalized_html}\n{html_footer}" if normalized_html else html_footer
+        return text_with_footer, html_with_footer
+
+    def extract_routed_session_id(self, body_text: str) -> Optional[str]:
+        """Extract the routed session id from the last compact footer in an inbound email body."""
+        normalized_body = str(body_text or "").replace("\r\n", "\n")
+        matches = list(ROUTING_FOOTER_RE.finditer(normalized_body))
+        if not matches:
+            return None
+        return matches[-1].group(2)
+
+    def extract_reply_message_body(self, body_text: str) -> str:
+        """Strip quoted history and the routing footer from an inbound email body."""
+        normalized_body = str(body_text or "").replace("\r\n", "\n").strip()
+        if not normalized_body:
+            return ""
+
+        lines = normalized_body.split("\n")
+        body_lines: list[str] = []
+        for line in lines:
+            trimmed = line.strip()
+            if (
+                line.startswith(">")
+                or re.match(r"^On .+wrote:$", trimmed, re.IGNORECASE)
+                or re.match(r"^From:\s", line)
+                or re.match(r"^Sent:\s", line)
+                or re.match(r"^Subject:\s", line)
+                or re.match(r"^To:\s", line)
+            ):
+                break
+            body_lines.append(line)
+
+        cleaned_lines = body_lines[:]
+        while cleaned_lines and not cleaned_lines[-1].strip():
+            cleaned_lines.pop()
+        if cleaned_lines and ROUTING_FOOTER_RE.match(cleaned_lines[-1].strip()):
+            cleaned_lines.pop()
+            while cleaned_lines and not cleaned_lines[-1].strip():
+                cleaned_lines.pop()
+            if cleaned_lines and cleaned_lines[-1].strip() == "--":
+                cleaned_lines.pop()
+        return "\n".join(cleaned_lines).strip()
+
+    def extract_text_from_raw_email(self, raw_email: str) -> str:
+        """Parse a raw RFC822 email and return the best-effort plain-text body."""
+        normalized = str(raw_email or "").strip()
+        if not normalized:
+            return ""
+
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(normalized.encode("utf-8", errors="replace"))
+        except Exception:
+            return normalized
+
+        if message.is_multipart():
+            plain_parts: list[str] = []
+            html_parts: list[str] = []
+            for part in message.walk():
+                if part.is_multipart():
+                    continue
+                if str(part.get_content_disposition() or "").lower() == "attachment":
+                    continue
+                content_type = str(part.get_content_type() or "").lower()
+                try:
+                    content = part.get_content()
+                except Exception:
+                    try:
+                        payload = part.get_payload(decode=True) or b""
+                        charset = part.get_content_charset() or "utf-8"
+                        content = payload.decode(charset, errors="replace")
+                    except Exception:
+                        content = ""
+                if not isinstance(content, str):
+                    continue
+                if content_type == "text/plain":
+                    plain_parts.append(content)
+                elif content_type == "text/html":
+                    html_parts.append(content)
+            if plain_parts:
+                return "\n".join(part.strip() for part in plain_parts if part.strip()).strip()
+            if html_parts:
+                return self._strip_html("\n".join(part.strip() for part in html_parts if part.strip()))
+
+        try:
+            content = message.get_content()
+        except Exception:
+            return normalized
+        if isinstance(content, str):
+            if str(message.get_content_type() or "").lower() == "text/html":
+                return self._strip_html(content)
+            return content.strip()
+        return normalized
+
     async def send_agent_email(
         self,
         *,
         sender_session_id: str,
         sender_name: str,
+        sender_provider: str,
         to_identifiers: list[str],
         cc_identifiers: Optional[list[str]] = None,
         subject: Optional[str] = None,
@@ -399,8 +530,18 @@ class EmailHandler:
                 raise ValueError("Email subject is required")
             resolved_subject = self._default_subject(normalized_sender_name, text_payload)
 
-        reply_domain = self._bridge_reply_domain()
-        from_address = f"{normalized_sender_id}@{reply_domain}"
+        footer_line = self.build_routing_footer(
+            sender_name=normalized_sender_name,
+            sender_session_id=normalized_sender_id,
+            sender_provider=sender_provider,
+        )
+        text_payload, html_payload = self.append_routing_footer(
+            body_text=text_payload,
+            body_html=html_payload,
+            footer_line=footer_line,
+        )
+
+        from_address = self._bridge_reply_address(normalized_sender_id)
         from_header = f"{normalized_sender_name} <{from_address}>"
         payload = {
             "from": from_header,

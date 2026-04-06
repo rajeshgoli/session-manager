@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from src.models import Session, SessionStatus
 from src.server import create_app
+from src.email_handler import EmailHandler
 
 
 def _auth_config() -> dict:
@@ -74,6 +75,42 @@ def test_external_sessions_requires_google_auth():
     assert response.status_code == 401
     assert response.json()["detail"] == "Authentication required"
     assert response.json()["login_url"] == "/auth/google/login?next=%2Fsessions"
+
+
+def test_external_email_inbound_webhook_is_exempt_from_google_auth(tmp_path):
+    config_path = tmp_path / "email_send.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "resend:",
+                "  api_key: re_test",
+                "  domain: sm.rajeshgo.li",
+                "users:",
+                "  rajesh: rajesh@example.com",
+                "email_bridge:",
+                "  authorized_senders:",
+                "    - rajeshgoli@gmail.com",
+                "  webhook_path: /api/email-inbound",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manager = _session_manager()
+    manager.send_input.return_value = "delivered"
+    email_handler = EmailHandler(bridge_config=str(config_path))
+    client = TestClient(
+        create_app(session_manager=manager, config=_auth_config(), email_handler=email_handler),
+        base_url="https://sm.rajeshgo.li",
+    )
+
+    response = client.post(
+        "/api/email-inbound",
+        json={"body": "hello", "from_address": "rajeshgoli@gmail.com"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+    assert response.json()["reason"] == "missing_routing_footer"
 
 
 def test_external_watch_redirects_to_google_login():
