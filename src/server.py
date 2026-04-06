@@ -1166,8 +1166,10 @@ def create_app(
 
         raw_email = str(payload.raw_email or "").strip()
         raw_body = ""
+        subject = None
         if raw_email:
             raw_body = str(getattr(handler, "extract_text_from_raw_email", lambda value: value)(raw_email) or "").strip()
+            subject = getattr(handler, "extract_subject_from_raw_email", lambda _value: None)(raw_email)
         if not raw_body:
             raw_body = str(payload.body or "").strip()
         if not raw_body:
@@ -1187,7 +1189,10 @@ def create_app(
                 "session_id": session_id,
                 "reason": "empty_reply_body",
             }
-        body = f"{{sm email from {payload.from_address}}}\n{body}"
+        prefix = f"{{sm email from {payload.from_address}}}"
+        if subject:
+            prefix = f"{{sm email from {payload.from_address} subj: {subject}}}"
+        body = f"{prefix}\n{body}"
 
         session = app.state.session_manager.get_session(session_id)
         if not session:

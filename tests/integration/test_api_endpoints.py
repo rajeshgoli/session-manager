@@ -47,6 +47,7 @@ def mock_email_handler():
     mock.send_agent_email = AsyncMock(return_value={"to": [], "cc": [], "subject": "test"})
     mock.is_authorized_sender.return_value = True
     mock.extract_routed_session_id.return_value = None
+    mock.extract_subject_from_raw_email.return_value = None
     mock.extract_reply_message_body.side_effect = lambda value: value
     return mock
 
@@ -430,6 +431,7 @@ class TestEmailBridgeEndpoints:
         mock_email_handler.extract_text_from_raw_email.return_value = (
             "inbound footer test live\\n\\n> --\\n> SM: maintainer test123 codex-fork"
         )
+        mock_email_handler.extract_subject_from_raw_email.return_value = "Re: reply mailbox footer routing test 6"
         mock_email_handler.extract_routed_session_id.return_value = "test123"
         mock_email_handler.extract_reply_message_body.side_effect = None
         mock_email_handler.extract_reply_message_body.return_value = "inbound footer test live"
@@ -445,9 +447,10 @@ class TestEmailBridgeEndpoints:
         assert response.status_code == 200
         assert response.json()["session_id"] == "test123"
         mock_email_handler.extract_text_from_raw_email.assert_called_once_with(raw_email)
+        mock_email_handler.extract_subject_from_raw_email.assert_called_once_with(raw_email)
         mock_session_manager.send_input.assert_awaited_once_with(
             "test123",
-            "{sm email from rajesh@example.com}\ninbound footer test live",
+            "{sm email from rajesh@example.com subj: Re: reply mailbox footer routing test 6}\ninbound footer test live",
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
