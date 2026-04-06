@@ -149,7 +149,7 @@ def test_client_sessions_include_termux_attach_metadata():
         "ssh_host": "ssh.sm.rajeshgo.li",
         "ssh_username": "rajesh",
         "ssh_proxy_command": "cloudflared access ssh --hostname %h",
-        "ssh_command": "ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' -tt rajesh@ssh.sm.rajeshgo.li 'SM_TMUX_SESSION=codex-fork-fork1001 sh -lc '\"'\"'PATH=/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/bin:/bin:$PATH; export PATH; if command -v tmux >/dev/null 2>&1; then exec tmux attach-session -t \"$SM_TMUX_SESSION\"; elif [ -x /opt/homebrew/bin/tmux ]; then exec /opt/homebrew/bin/tmux attach-session -t \"$SM_TMUX_SESSION\"; elif [ -x /usr/local/bin/tmux ]; then exec /usr/local/bin/tmux attach-session -t \"$SM_TMUX_SESSION\"; else echo \"tmux not found on remote host\" >&2; exit 127; fi'\"'\"''",
+        "ssh_command": "ssh -o 'ProxyCommand=cloudflared access ssh --hostname %h' -tt rajesh@ssh.sm.rajeshgo.li 'SM_TMUX_SESSION=codex-fork-fork1001 sh -lc '\"'\"'PATH=/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/bin:/bin:$PATH; export PATH; if command -v tmux >/dev/null 2>&1; then exec tmux attach-session -d -t \"$SM_TMUX_SESSION\"; elif [ -x /opt/homebrew/bin/tmux ]; then exec /opt/homebrew/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; elif [ -x /usr/local/bin/tmux ]; then exec /usr/local/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; else echo \"tmux not found on remote host\" >&2; exit 127; fi'\"'\"''",
         "tmux_session": "codex-fork-fork1001",
         "runtime_mode": "detached_runtime",
         "termux_package": "com.termux",
