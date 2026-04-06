@@ -51,6 +51,9 @@ def test_lookup_user_and_authorized_sender(tmp_path):
     assert handler.bridge_webhook_path() == "/api/email-inbound"
     assert handler.bridge_worker_secret() == "worker-secret-123"
     assert handler.bridge_worker_secret_header() == "x-email-worker-secret"
+    assert handler.bridge_session_id_header() == "x-email-session-id"
+    assert handler.normalize_explicit_session_id("ABC12345") == "abc12345"
+    assert handler.normalize_explicit_session_id("reply@sm.rajeshgo.li") is None
 
 
 @pytest.mark.asyncio

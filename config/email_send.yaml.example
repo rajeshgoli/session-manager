@@ -19,4 +19,5 @@ email_bridge:
   # Optional shared secret header enforced on inbound worker delivery.
   # worker_secret: "set-a-random-secret"
   # worker_secret_header: "x-email-worker-secret"
+  # session_id_header: "x-email-session-id"
   webhook_path: "/api/email-inbound"

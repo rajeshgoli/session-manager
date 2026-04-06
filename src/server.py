@@ -1152,6 +1152,7 @@ def create_app(
         if not getattr(handler, "bridge_is_available", lambda: False)():
             raise HTTPException(status_code=503, detail="Email bridge is unavailable")
         configured_worker_secret = getattr(handler, "bridge_worker_secret", lambda: None)()
+        trusted_session_id = ""
         if configured_worker_secret:
             secret_header_name = getattr(handler, "bridge_worker_secret_header", lambda: "x-email-worker-secret")()
             provided_worker_secret = ""
@@ -1159,6 +1160,14 @@ def create_app(
                 provided_worker_secret = str(request.headers.get(secret_header_name, "")).strip()
             if provided_worker_secret != configured_worker_secret:
                 raise HTTPException(status_code=401, detail="Invalid email worker secret")
+            explicit_session_header = getattr(handler, "bridge_session_id_header", lambda: "x-email-session-id")()
+            if request is not None:
+                trusted_session_id = str(
+                    getattr(handler, "normalize_explicit_session_id", lambda value: value)(
+                        request.headers.get(explicit_session_header, "")
+                    )
+                    or ""
+                )
         if not getattr(handler, "is_authorized_sender", lambda _value: False)(payload.from_address):
             raise HTTPException(status_code=403, detail="Inbound sender is not authorized")
         if not app.state.session_manager:
@@ -1172,9 +1181,9 @@ def create_app(
             raw_body = str(payload.body or "").strip()
         if not raw_body:
             raise HTTPException(status_code=400, detail="body or raw_email is required")
-        session_id = str(payload.session_id or "").strip() or getattr(handler, "extract_routed_session_id", lambda _value: None)(
-            raw_body
-        ) or ""
+        session_id = trusted_session_id or str(payload.session_id or "").strip()
+        if not session_id:
+            session_id = getattr(handler, "extract_routed_session_id", lambda _value: None)(raw_body) or ""
         if not session_id:
             return {
                 "status": "ignored",

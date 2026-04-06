@@ -23,6 +23,7 @@ EMAIL_HARNESS_PATH = Path(__file__).parent.parent.parent.parent / "claude-email-
 DEFAULT_BRIDGE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "email_send.yaml"
 DEFAULT_EMAIL_WEBHOOK_PATH = "/api/email-inbound"
 DEFAULT_EMAIL_WORKER_SECRET_HEADER = "x-email-worker-secret"
+DEFAULT_EMAIL_SESSION_ID_HEADER = "x-email-session-id"
 MAX_EMAIL_SUBJECT_LENGTH = 140
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 MARKDOWN_CODE_RE = re.compile(r"`([^`]+)`")
@@ -31,6 +32,7 @@ MARKDOWN_EM_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
 ROUTING_FOOTER_RE = re.compile(r"(?im)^\s*>*\s*SM:\s+(.+?)\s+([a-z0-9]{6,})\s+([a-z0-9-]+)\s*$")
+SESSION_ID_RE = re.compile(r"^[a-z0-9]{6,}$")
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,12 @@ class EmailHandler:
         secret = str(bridge.get("worker_secret") or "").strip()
         return secret or None
 
+    def bridge_session_id_header(self) -> str:
+        """Return the trusted inbound header name for explicit session-id routing."""
+        bridge = (self._load_bridge_config().get("email_bridge") or {})
+        raw_header = str(bridge.get("session_id_header") or DEFAULT_EMAIL_SESSION_ID_HEADER).strip().lower()
+        return raw_header or DEFAULT_EMAIL_SESSION_ID_HEADER
+
     def authorized_senders(self) -> set[str]:
         """Return normalized allowlisted sender addresses for inbound replies."""
         bridge = (self._load_bridge_config().get("email_bridge") or {})
@@ -159,6 +167,13 @@ class EmailHandler:
         normalized = str(address or "").strip().lower()
         allowlist = self.authorized_senders()
         return bool(normalized and normalized in allowlist)
+
+    def normalize_explicit_session_id(self, value: str) -> Optional[str]:
+        """Validate and normalize an explicit worker-supplied session id."""
+        normalized = str(value or "").strip().lower()
+        if not normalized or not SESSION_ID_RE.fullmatch(normalized):
+            return None
+        return normalized
 
     def lookup_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
         """Resolve one registered user by username or alias."""
