@@ -42,8 +42,12 @@ def mock_email_handler():
     mock = MagicMock()
     mock.bridge_is_available.return_value = True
     mock.bridge_webhook_path.return_value = "/api/email-inbound"
+    mock.bridge_worker_secret.return_value = None
+    mock.bridge_worker_secret_header.return_value = "x-email-worker-secret"
     mock.send_agent_email = AsyncMock(return_value={"to": [], "cc": [], "subject": "test"})
     mock.is_authorized_sender.return_value = True
+    mock.extract_routed_session_id.return_value = None
+    mock.extract_reply_message_body.side_effect = lambda value: value
     return mock
 
 
@@ -202,6 +206,7 @@ class TestEmailBridgeEndpoints:
         mock_email_handler.send_agent_email.assert_awaited_once_with(
             sender_session_id="test123",
             sender_name="Test Session",
+            sender_provider="claude",
             to_identifiers=["rajesh"],
             cc_identifiers=[],
             subject="Reading list",
@@ -216,6 +221,7 @@ class TestEmailBridgeEndpoints:
         test_client,
         mock_session_manager,
         mock_output_monitor,
+        mock_email_handler,
         sample_session,
     ):
         stopped = sample_session
@@ -249,12 +255,13 @@ class TestEmailBridgeEndpoints:
         mock_session_manager.restore_session.assert_awaited_once_with("test123")
         mock_session_manager.send_input.assert_awaited_once_with(
             "test123",
-            "please continue",
+            "{sm email from rajesh@example.com}\nplease continue",
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
         )
         mock_output_monitor.start_monitoring.assert_awaited_once_with(restored)
+        mock_email_handler.extract_reply_message_body.assert_called_once_with("please continue")
 
     def test_inbound_email_rejects_unauthorized_sender(
         self,
@@ -274,10 +281,52 @@ class TestEmailBridgeEndpoints:
 
         assert response.status_code == 403
 
+    def test_inbound_email_rejects_invalid_worker_secret(
+        self,
+        test_client,
+        mock_email_handler,
+    ):
+        mock_email_handler.bridge_worker_secret.return_value = "worker-secret-123"
+
+        response = test_client.post(
+            "/api/email-inbound",
+            json={
+                "body": "hello",
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 401
+
+    def test_inbound_email_accepts_valid_worker_secret(
+        self,
+        test_client,
+        mock_email_handler,
+        mock_session_manager,
+        sample_session,
+    ):
+        mock_email_handler.bridge_worker_secret.return_value = "worker-secret-123"
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+
+        response = test_client.post(
+            "/api/email-inbound",
+            headers={"x-email-worker-secret": "worker-secret-123"},
+            json={
+                "session_id": "test123",
+                "body": "hello",
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 200
+        mock_session_manager.send_input.assert_awaited_once()
+
     def test_inbound_email_honors_codex_pending_request_gate(
         self,
         test_client,
         mock_session_manager,
+        mock_email_handler,
     ):
         codex_session = Session(
             id="codex123",
@@ -304,6 +353,105 @@ class TestEmailBridgeEndpoints:
         assert response.status_code == 409
         assert response.json()["detail"]["error_code"] == "pending_structured_request"
         mock_session_manager.send_input.assert_not_called()
+        mock_email_handler.extract_reply_message_body.assert_called_once_with("hello")
+
+    def test_inbound_email_parses_session_id_from_footer(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_email_handler,
+        sample_session,
+    ):
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+        body = "\n".join(
+            [
+                "Please continue with the rollout.",
+                "",
+                "On Sun, Apr 5, 2026 at 10:00 AM maintainer wrote:",
+                "> context",
+                "> --",
+                "> SM: maintainer test123 codex",
+            ]
+        )
+        mock_email_handler.extract_routed_session_id.return_value = "test123"
+        mock_email_handler.extract_reply_message_body.side_effect = None
+        mock_email_handler.extract_reply_message_body.return_value = "Please continue with the rollout."
+
+        response = test_client.post(
+            "/api/email-inbound",
+            json={
+                "body": body,
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["session_id"] == "test123"
+        mock_session_manager.send_input.assert_awaited_once_with(
+            "test123",
+            "{sm email from rajesh@example.com}\nPlease continue with the rollout.",
+            sender_session_id=None,
+            delivery_mode="sequential",
+            from_sm_send=False,
+        )
+        mock_email_handler.extract_routed_session_id.assert_called_once_with(body)
+
+    def test_inbound_email_ignores_missing_routing_footer(
+        self,
+        test_client,
+        mock_session_manager,
+    ):
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+
+        response = test_client.post(
+            "/api/email-inbound",
+            json={
+                "body": "hello without routing metadata",
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ignored"
+        assert response.json()["reason"] == "missing_routing_footer"
+        mock_session_manager.send_input.assert_not_called()
+
+    def test_inbound_email_accepts_raw_email_payload(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_email_handler,
+        sample_session,
+    ):
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+        raw_email = "Content-Type: text/plain\\n\\ninbound footer test live\\n\\n> --\\n> SM: maintainer test123 codex-fork\\n"
+        mock_email_handler.extract_text_from_raw_email.return_value = (
+            "inbound footer test live\\n\\n> --\\n> SM: maintainer test123 codex-fork"
+        )
+        mock_email_handler.extract_routed_session_id.return_value = "test123"
+        mock_email_handler.extract_reply_message_body.side_effect = None
+        mock_email_handler.extract_reply_message_body.return_value = "inbound footer test live"
+
+        response = test_client.post(
+            "/api/email-inbound",
+            json={
+                "raw_email": raw_email,
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["session_id"] == "test123"
+        mock_email_handler.extract_text_from_raw_email.assert_called_once_with(raw_email)
+        mock_session_manager.send_input.assert_awaited_once_with(
+            "test123",
+            "{sm email from rajesh@example.com}\ninbound footer test live",
+            sender_session_id=None,
+            delivery_mode="sequential",
+            from_sm_send=False,
+        )
 
     def test_get_session_not_found(self, test_client, mock_session_manager):
         """GET /sessions/{id} returns 404 for unknown session."""

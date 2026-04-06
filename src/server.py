@@ -326,6 +326,7 @@ class GoogleAuthMiddleware(BaseHTTPMiddleware):
             "/logged-out",
             "/health",
             "/health/detailed",
+            DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH,
             "/auth/google/login",
             "/auth/google/callback",
             "/auth/device/google",
@@ -665,8 +666,9 @@ class SendEmailRequest(BaseModel):
 
 class InboundEmailRequest(BaseModel):
     """Inbound email payload forwarded by the email worker/webhook bridge."""
-    session_id: str
-    body: str
+    session_id: Optional[str] = None
+    body: Optional[str] = None
+    raw_email: Optional[str] = None
     from_address: str
 
 
@@ -1129,6 +1131,7 @@ def create_app(
             return await handler.send_agent_email(
                 sender_session_id=sender_session.id,
                 sender_name=_effective_session_name(sender_session),
+                sender_provider=getattr(sender_session, "provider", "claude"),
                 to_identifiers=recipients,
                 cc_identifiers=cc,
                 subject=request.subject,
@@ -1144,21 +1147,47 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    async def _deliver_email_reply_to_session(payload: InboundEmailRequest) -> dict[str, Any]:
+    async def _deliver_email_reply_to_session(payload: InboundEmailRequest, request: Optional[Request] = None) -> dict[str, Any]:
         handler = _email_handler_or_503()
         if not getattr(handler, "bridge_is_available", lambda: False)():
             raise HTTPException(status_code=503, detail="Email bridge is unavailable")
+        configured_worker_secret = getattr(handler, "bridge_worker_secret", lambda: None)()
+        if configured_worker_secret:
+            secret_header_name = getattr(handler, "bridge_worker_secret_header", lambda: "x-email-worker-secret")()
+            provided_worker_secret = ""
+            if request is not None:
+                provided_worker_secret = str(request.headers.get(secret_header_name, "")).strip()
+            if provided_worker_secret != configured_worker_secret:
+                raise HTTPException(status_code=401, detail="Invalid email worker secret")
         if not getattr(handler, "is_authorized_sender", lambda _value: False)(payload.from_address):
             raise HTTPException(status_code=403, detail="Inbound sender is not authorized")
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        session_id = str(payload.session_id or "").strip()
-        body = str(payload.body or "").strip()
+        raw_email = str(payload.raw_email or "").strip()
+        raw_body = ""
+        if raw_email:
+            raw_body = str(getattr(handler, "extract_text_from_raw_email", lambda value: value)(raw_email) or "").strip()
+        if not raw_body:
+            raw_body = str(payload.body or "").strip()
+        if not raw_body:
+            raise HTTPException(status_code=400, detail="body or raw_email is required")
+        session_id = str(payload.session_id or "").strip() or getattr(handler, "extract_routed_session_id", lambda _value: None)(
+            raw_body
+        ) or ""
         if not session_id:
-            raise HTTPException(status_code=400, detail="session_id is required")
+            return {
+                "status": "ignored",
+                "reason": "missing_routing_footer",
+            }
+        body = getattr(handler, "extract_reply_message_body", lambda value: value)(raw_body).strip()
         if not body:
-            raise HTTPException(status_code=400, detail="body is required")
+            return {
+                "status": "ignored",
+                "session_id": session_id,
+                "reason": "empty_reply_body",
+            }
+        body = f"{{sm email from {payload.from_address}}}\n{body}"
 
         session = app.state.session_manager.get_session(session_id)
         if not session:
@@ -3829,9 +3858,9 @@ Provide ONLY the summary, no preamble or questions."""
         result = await _send_registered_email(request)
         return {"status": "sent", **result}
 
-    async def inbound_email_webhook(request: InboundEmailRequest):
+    async def inbound_email_webhook(http_request: Request, request: InboundEmailRequest):
         """Accept one validated inbound email reply and forward it into the target session."""
-        return await _deliver_email_reply_to_session(request)
+        return await _deliver_email_reply_to_session(request, http_request)
 
     app.add_api_route(
         DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH,
