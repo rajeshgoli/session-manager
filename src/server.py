@@ -1602,7 +1602,7 @@ def create_app(
             f"sh -lc {shlex.quote(remote_attach_script)}"
         )
         ssh_args.extend([
-            "-t",
+            "-tt",
             f"{ssh_username}@{public_ssh_host}",
             remote_command,
         ])
