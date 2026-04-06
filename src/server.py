@@ -1596,11 +1596,11 @@ def create_app(
             "PATH=/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/bin:/bin:$PATH; "
             "export PATH; "
             "if command -v tmux >/dev/null 2>&1; then "
-            "exec tmux attach-session -t \"$SM_TMUX_SESSION\"; "
+            "exec tmux attach-session -d -t \"$SM_TMUX_SESSION\"; "
             "elif [ -x /opt/homebrew/bin/tmux ]; then "
-            "exec /opt/homebrew/bin/tmux attach-session -t \"$SM_TMUX_SESSION\"; "
+            "exec /opt/homebrew/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; "
             "elif [ -x /usr/local/bin/tmux ]; then "
-            "exec /usr/local/bin/tmux attach-session -t \"$SM_TMUX_SESSION\"; "
+            "exec /usr/local/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; "
             "else echo \"tmux not found on remote host\" >&2; exit 127; fi"
         )
         remote_command = (
