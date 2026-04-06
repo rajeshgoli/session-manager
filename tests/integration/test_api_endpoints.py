@@ -274,6 +274,37 @@ class TestEmailBridgeEndpoints:
 
         assert response.status_code == 403
 
+    def test_inbound_email_honors_codex_pending_request_gate(
+        self,
+        test_client,
+        mock_session_manager,
+    ):
+        codex_session = Session(
+            id="codex123",
+            name="codex-app-codex123",
+            working_dir="/tmp/test",
+            tmux_session="codex-app-codex123",
+            provider="codex-app",
+            log_file="/tmp/codex.log",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.get_session.return_value = codex_session
+        mock_session_manager.has_pending_codex_requests.return_value = True
+        mock_session_manager.oldest_pending_codex_request.return_value = {"id": "req-1"}
+
+        response = test_client.post(
+            "/api/email-inbound",
+            json={
+                "session_id": "codex123",
+                "body": "hello",
+                "from_address": "rajesh@example.com",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["error_code"] == "pending_structured_request"
+        mock_session_manager.send_input.assert_not_called()
+
     def test_get_session_not_found(self, test_client, mock_session_manager):
         """GET /sessions/{id} returns 404 for unknown session."""
         mock_session_manager.get_session.return_value = None

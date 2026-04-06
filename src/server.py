@@ -1174,6 +1174,8 @@ def create_app(
             if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
                 await app.state.output_monitor.start_monitoring(session)
 
+        _enforce_session_input_gates(session, session_id)
+
         result = await app.state.session_manager.send_input(
             session_id,
             body,
@@ -1690,6 +1692,35 @@ def create_app(
         if policy.get("phase") != "post_cutover":
             return None
         return CODEX_APP_RETIRED_SESSION_ERROR
+
+    def _enforce_session_input_gates(session: Session, session_id: str) -> None:
+        """Apply shared mutation gating for all session chat-input paths."""
+        mutation_rejection = _codex_app_mutation_rejection(session)
+        if mutation_rejection:
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "error_code": CODEX_APP_RETIRED_SESSION_REASON,
+                    "message": mutation_rejection,
+                },
+            )
+
+        if getattr(session, "provider", "claude") != "codex-app":
+            return
+
+        has_pending = getattr(app.state.session_manager, "has_pending_codex_requests", None)
+        oldest_pending = getattr(app.state.session_manager, "oldest_pending_codex_request", None)
+        structured_gate_enabled = _codex_rollout_enabled("enable_structured_requests")
+        if structured_gate_enabled and callable(has_pending) and has_pending(session_id):
+            summary = oldest_pending(session_id) if callable(oldest_pending) else None
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "pending_structured_request",
+                    "message": "structured codex request pending; resolve request before chat input",
+                    "pending_request": summary,
+                },
+            )
 
     @app.get("/")
     async def root(request: Request):
@@ -3247,30 +3278,7 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        mutation_rejection = _codex_app_mutation_rejection(session)
-        if mutation_rejection:
-            raise HTTPException(
-                status_code=410,
-                detail={
-                    "error_code": CODEX_APP_RETIRED_SESSION_REASON,
-                    "message": mutation_rejection,
-                },
-            )
-
-        if getattr(session, "provider", "claude") == "codex-app":
-            has_pending = getattr(app.state.session_manager, "has_pending_codex_requests", None)
-            oldest_pending = getattr(app.state.session_manager, "oldest_pending_codex_request", None)
-            structured_gate_enabled = _codex_rollout_enabled("enable_structured_requests")
-            if structured_gate_enabled and callable(has_pending) and has_pending(session_id):
-                summary = oldest_pending(session_id) if callable(oldest_pending) else None
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error_code": "pending_structured_request",
-                        "message": "structured codex request pending; resolve request before chat input",
-                        "pending_request": summary,
-                    },
-                )
+        _enforce_session_input_gates(session, session_id)
 
         result = await app.state.session_manager.send_input(
             session_id,

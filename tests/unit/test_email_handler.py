@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import httpx
 
 from src.email_handler import EmailHandler
 
@@ -79,3 +80,23 @@ async def test_send_agent_email_builds_resend_payload(tmp_path):
     assert payload["subject"] == "Reading list"
     assert "<ul>" in payload["html"]
     assert payload["headers"]["X-SM-Session-ID"] == "abc12345"
+
+
+@pytest.mark.asyncio
+async def test_send_agent_email_wraps_transport_failure(tmp_path):
+    config_path = tmp_path / "email_send.yaml"
+    _write_bridge_config(config_path)
+    handler = EmailHandler(bridge_config=str(config_path))
+
+    with patch(
+        "src.email_handler.httpx.AsyncClient.post",
+        new=AsyncMock(side_effect=httpx.ConnectError("boom")),
+    ):
+        with pytest.raises(RuntimeError, match="Resend email send failed"):
+            await handler.send_agent_email(
+                sender_session_id="abc12345",
+                sender_name="engineer-issue497",
+                to_identifiers=["rajesh"],
+                subject="Reading list",
+                body_text="Hello",
+            )

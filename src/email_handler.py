@@ -423,8 +423,11 @@ class EmailHandler:
             "Content-Type": "application/json",
         }
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(endpoint, headers=headers, json=payload)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(endpoint, headers=headers, json=payload)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Resend email send failed: {exc}") from exc
 
         if response.status_code >= 400:
             try:
