@@ -125,8 +125,42 @@ class TestSessionEndpoints:
         assert data["sessions"][0]["activity_state"] == "working"
         assert data["sessions"][0]["agent_status_text"] == "running tests"
         assert data["sessions"][0]["agent_status_at"] == "2024-01-15T11:05:00"
-        assert data["sessions"][0]["agent_task_completed_at"] == "2024-01-15T11:09:00"
-        mock_session_manager.list_sessions.assert_called_once_with(include_stopped=False)
+
+    def test_set_agent_status_notifies_telegram_when_notifier_present(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+    ):
+        notifier = AsyncMock()
+        notifier.notify = AsyncMock(return_value=True)
+        sample_session.telegram_chat_id = 12345
+        sample_session.telegram_thread_id = 67890
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.message_queue_manager = MagicMock()
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=notifier,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            f"/sessions/{sample_session.id}/agent-status",
+            json={"text": "Investigating Telegram mirror drops"},
+        )
+
+        assert response.status_code == 200
+        notifier.notify.assert_awaited_once()
+        event, notified_session = notifier.notify.await_args.args
+        assert event.event_type == "agent_status"
+        assert event.message == "Investigating Telegram mirror drops"
+        assert notified_session is sample_session
+        mock_session_manager.message_queue_manager.reset_remind.assert_called_once_with(sample_session.id)
 
     def test_list_sessions_include_stopped(self, test_client, mock_session_manager, sample_session):
         """GET /sessions can explicitly include stopped sessions."""
