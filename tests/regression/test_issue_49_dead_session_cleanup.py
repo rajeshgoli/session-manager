@@ -97,8 +97,8 @@ async def test_monitor_detects_tmux_death(output_monitor, mock_session, mock_ses
     await asyncio.sleep(3.5)
 
     # Verify cleanup happened
-    # Session should be removed from sessions dict
-    assert mock_session.id not in mock_session_manager.sessions
+    # Monitor-driven death should preserve the stopped record for sm restore.
+    assert mock_session.id in mock_session_manager.sessions
 
     # Status should be STOPPED
     assert mock_session.status == SessionStatus.STOPPED
@@ -111,6 +111,8 @@ async def test_monitor_detects_tmux_death(output_monitor, mock_session, mock_ses
         chat_id=12345,
         message=f"Session stopped [{mock_session.id}]",
         thread_id=67890,
+        allow_reply_fallback=True,
+        session_id=mock_session.id,
     )
 
     # Monitoring should have stopped
@@ -151,6 +153,8 @@ async def test_cleanup_session_full_workflow(output_monitor, mock_session, mock_
         chat_id=12345,
         message=f"Session stopped [{mock_session.id}]",
         thread_id=67890,
+        allow_reply_fallback=False,
+        session_id=mock_session.id,
     )
 
     # Hook output cache cleanup

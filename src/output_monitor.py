@@ -722,7 +722,9 @@ class OutputMonitor:
         Handle tmux session death - called when monitor detects tmux no longer exists.
         """
         logger.info(f"Tmux session {session.tmux_session} died, performing cleanup")
-        await self.cleanup_session(session)
+        # Preserve the stopped record so dead sessions remain restorable and
+        # can produce useful diagnostics instead of disappearing from state.
+        await self.cleanup_session(session, preserve_record=True)
 
     def _get_context(self, content: str) -> str:
         """Extract recent context from content."""
