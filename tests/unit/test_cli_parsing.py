@@ -40,6 +40,15 @@ class TestCliParsing:
         send_parser.add_argument("--track", action="store_const", const=300, default=None)
         send_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS")
 
+        # sm email
+        email_parser = subparsers.add_parser("email")
+        email_parser.add_argument("recipients")
+        email_parser.add_argument("--subject", required=True)
+        email_parser.add_argument("--body")
+        email_parser.add_argument("--text")
+        email_parser.add_argument("--html")
+        email_parser.add_argument("--cc")
+
         # sm spawn
         spawn_parser = subparsers.add_parser("spawn")
         spawn_parser.add_argument("provider", choices=["claude", "codex", "codex-fork", "codex-app"])
@@ -241,6 +250,32 @@ class TestSendCommand:
         assert args.track is None
         assert args.session_id == "target123"
         assert args.text == "--track=420"
+
+
+class TestEmailCommand:
+    """Tests for 'sm email' command parsing."""
+
+    def test_email_command_parses_basic_flags(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(
+            ["email", "rajesh,architect", "--subject", "Spec ready", "--body", "See attached"]
+        )
+
+        assert args.command == "email"
+        assert args.recipients == "rajesh,architect"
+        assert args.subject == "Spec ready"
+        assert args.body == "See attached"
+        assert args.text is None
+        assert args.html is None
+
+    def test_email_command_parses_file_flags(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(
+            ["email", "rajesh", "--subject", "Weekly", "--text", "docs/summary.md", "--cc", "architect"]
+        )
+
+        assert args.text == "docs/summary.md"
+        assert args.cc == "architect"
 
 
 class TestSpawnCommand:

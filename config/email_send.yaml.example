@@ -1,0 +1,17 @@
+resend:
+  api_key: "re_PLACEHOLDER"
+  domain: "rajeshgo.li"
+  # Optional override when Email Routing receives replies on a different domain.
+  # reply_domain: "rajeshgo.li"
+
+users:
+  rajesh:
+    email: "rajeshgoli@gmail.com"
+    name: "Rajesh"
+    aliases:
+      - "owner"
+
+email_bridge:
+  authorized_senders:
+    - "rajeshgoli@gmail.com"
+  webhook_path: "/api/email-inbound"

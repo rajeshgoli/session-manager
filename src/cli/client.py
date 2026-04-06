@@ -736,6 +736,55 @@ class SessionManagerClient:
         result = self.restore_session_result(session_id)
         return result.get("data") if result.get("ok") else None
 
+    def send_email_result(
+        self,
+        *,
+        requester_session_id: Optional[str],
+        recipients: list[str],
+        subject: Optional[str] = None,
+        body_text: Optional[str] = None,
+        body_html: Optional[str] = None,
+        body_markdown: bool = False,
+        auto_subject: bool = False,
+        cc: Optional[list[str]] = None,
+    ) -> dict:
+        """Send a routed email to registered user recipients."""
+        payload: dict[str, object] = {
+            "recipients": recipients,
+            "cc": cc or [],
+            "body_markdown": body_markdown,
+            "auto_subject": auto_subject,
+        }
+        if requester_session_id is not None:
+            payload["requester_session_id"] = requester_session_id
+        if subject is not None:
+            payload["subject"] = subject
+        if body_text is not None:
+            payload["body_text"] = body_text
+        if body_html is not None:
+            payload["body_html"] = body_html
+
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            "/email/send",
+            payload,
+            timeout=15,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+
+        ok = status_code in (200, 201)
+        detail = None
+        if isinstance(data, dict):
+            detail = data.get("detail") or data.get("error") or data.get("raw")
+        return {
+            "ok": ok,
+            "unavailable": False,
+            "status_code": status_code,
+            "data": data,
+            "detail": detail,
+        }
+
     def create_session_result(
         self,
         working_dir: str,

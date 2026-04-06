@@ -196,6 +196,15 @@ def main():
     )
     send_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS", help=argparse.SUPPRESS)
 
+    # sm email <user[,user2]> --subject "..." [--body ... | --text file | --html file]
+    email_parser = subparsers.add_parser("email", help="Send a routed email to registered user(s)")
+    email_parser.add_argument("recipients", help="Registered user(s), comma-separated")
+    email_parser.add_argument("--subject", required=True, help="Email subject line")
+    email_parser.add_argument("--body", help="Inline plain-text body")
+    email_parser.add_argument("--text", help="Text/Markdown file for the body")
+    email_parser.add_argument("--html", help="HTML file for the body")
+    email_parser.add_argument("--cc", help="Additional registered user(s), comma-separated")
+
     # sm remind <delay> <message>              (one-shot self-reminder)
     # sm remind --recurring <delay> <message>  (recurring self-reminder)
     # sm remind cancel <reminder-id>           (cancel scheduled reminder)
@@ -689,7 +698,7 @@ def main():
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server",
-        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", None
+        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", None
     ]
     # Commands that require session_id: self-directed managed-session actions
     requires_session_id = ["spawn", "adopt", "maintainer", "register", "unregister"]
@@ -760,6 +769,17 @@ def main():
             client, args.session_id, args.text, delivery_mode,
             wait_seconds=wait_seconds, notify_on_stop=notify_on_stop,
             track_seconds=getattr(args, "track", None),
+        ))
+    elif args.command == "email":
+        sys.exit(commands.cmd_email(
+            client,
+            sender_session_id=session_id,
+            recipients_raw=args.recipients,
+            subject=args.subject,
+            body=getattr(args, "body", None),
+            text_file=getattr(args, "text", None),
+            html_file=getattr(args, "html", None),
+            cc_raw=getattr(args, "cc", None),
         ))
     elif args.command == "remind":
         if args.stop:

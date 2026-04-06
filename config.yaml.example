@@ -127,6 +127,8 @@ email:
   # Leave empty to use defaults from ../claude-email-automation/
   smtp_config: ""
   imap_config: ""
+  # Gitignored Resend + registered-user bridge config (see config/email_send.yaml.example)
+  bridge_config: "config/email_send.yaml"
 
 services:
   # Office automation service (for /password command and other utilities)

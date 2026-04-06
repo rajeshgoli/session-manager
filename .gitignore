@@ -1,5 +1,6 @@
 # Configuration files with secrets
 config.yaml
+config/email_send.yaml
 .env
 .env.local
 .env.*.local
