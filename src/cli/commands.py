@@ -1440,7 +1440,10 @@ def _load_email_body(
     if body is not None:
         return body, None, False
     if stdin_text is not None:
-        return stdin_text, None, False
+        # Pipe-friendly `sm email` examples commonly stream markdown via stdin.
+        # Treat stdin as markdown so headings/lists render to HTML consistently
+        # with `--text file.md`, while plain text still degrades cleanly.
+        return stdin_text, None, True
     if text_file is not None:
         path = Path(text_file)
         text = path.read_text(encoding="utf-8")

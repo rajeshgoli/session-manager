@@ -1,5 +1,7 @@
 """Unit tests for email bridge CLI commands."""
-from unittest.mock import Mock
+
+import sys
+from unittest.mock import Mock, patch
 
 from src.cli.commands import cmd_email, cmd_send
 
@@ -87,5 +89,35 @@ def test_cmd_email_reads_markdown_file_and_calls_api(tmp_path, capsys):
     assert kwargs["cc"] == ["architect"]
     assert kwargs["subject"] == "Reading list"
     assert kwargs["body_text"] == body_path.read_text(encoding="utf-8")
+    assert kwargs["body_markdown"] is True
+    assert "Email sent to rajesh <rajesh@example.com>" in capsys.readouterr().out
+
+
+def test_cmd_email_treats_stdin_as_markdown(capsys):
+    client = Mock()
+    client.send_email_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "to": [{"username": "rajesh", "email": "rajesh@example.com"}],
+            "subject": "From stdin",
+        },
+    }
+
+    with patch.object(sys.stdin, "isatty", return_value=False), patch.object(
+        sys.stdin,
+        "read",
+        return_value="# Heading\n\n## Subhead\n",
+    ):
+        rc = cmd_email(
+            client,
+            sender_session_id="sender123",
+            recipients_raw="rajesh",
+            subject="From stdin",
+        )
+
+    assert rc == 0
+    kwargs = client.send_email_result.call_args.kwargs
+    assert kwargs["body_text"] == "# Heading\n\n## Subhead\n"
     assert kwargs["body_markdown"] is True
     assert "Email sent to rajesh <rajesh@example.com>" in capsys.readouterr().out
