@@ -37,6 +37,7 @@ from .codex_provider_policy import (
 )
 from .models import (
     AdoptionProposal,
+    CompletionStatus,
     Session,
     SessionStatus,
     NotificationChannel,
@@ -4627,6 +4628,7 @@ Provide ONLY the summary, no preamble or questions."""
         parent_session_id: str,
         recursive: bool = False,
         status: Optional[str] = None,
+        include_terminated: bool = False,
     ):
         """List child sessions of a parent."""
         if not app.state.session_manager:
@@ -4641,10 +4643,8 @@ Provide ONLY the summary, no preamble or questions."""
             if status == "running":
                 children = [s for s in children if s.status == SessionStatus.RUNNING]
             elif status == "completed":
-                from src.models import CompletionStatus
                 children = [s for s in children if s.completion_status == CompletionStatus.COMPLETED]
             elif status == "error":
-                from src.models import CompletionStatus
                 children = [s for s in children if s.completion_status == CompletionStatus.ERROR]
 
         # Handle recursive
@@ -4656,6 +4656,9 @@ Provide ONLY the summary, no preamble or questions."""
                 grandchildren = [s for s in all_sessions if s.parent_session_id == child.id]
                 all_descendants.extend(grandchildren)
             children = all_descendants
+
+        if not include_terminated:
+            children = [s for s in children if s.completion_status != CompletionStatus.KILLED]
 
         latest_action_getter = getattr(app.state.session_manager, "get_codex_latest_activity_action", None)
         codex_projection_enabled = _codex_rollout_enabled("enable_observability_projection")

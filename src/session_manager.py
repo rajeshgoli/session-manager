@@ -4424,6 +4424,9 @@ class SessionManager:
         if monitor_state and monitor_state.last_pattern == "permission":
             return ActivityState.WAITING_PERMISSION.value
 
+        if session.completion_status == CompletionStatus.KILLED:
+            return ActivityState.STOPPED.value
+
         if session.completion_status is not None:
             return ActivityState.WAITING_INPUT.value
 
@@ -4470,6 +4473,9 @@ class SessionManager:
 
     def _compute_codex_app_activity(self, session: Session) -> str:
         """Compute activity state for codex-app sessions (no tmux/output monitor)."""
+        if session.completion_status == CompletionStatus.KILLED:
+            return ActivityState.STOPPED.value
+
         if session.completion_status is not None:
             return ActivityState.WAITING_INPUT.value
 
@@ -4788,6 +4794,9 @@ class SessionManager:
                 )
             self.tmux.kill_session(session.tmux_session)
         session.status = SessionStatus.STOPPED
+        session.completion_status = CompletionStatus.KILLED
+        session.completion_message = "Terminated via sm kill"
+        session.completed_at = datetime.now()
         self.unregister_session_roles(session_id, persist=False)
         self._save_state()
 
@@ -4888,6 +4897,9 @@ class SessionManager:
             return False, session, f"Restore not supported for provider={session.provider}"
 
         session.error_message = None
+        session.completion_status = None
+        session.completion_message = None
+        session.completed_at = None
         session.status = SessionStatus.IDLE if session.provider == "codex-app" else SessionStatus.RUNNING
         session.last_activity = datetime.now()
         if session.provider == "codex-fork":

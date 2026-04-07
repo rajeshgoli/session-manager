@@ -135,11 +135,15 @@ class TestSessionLifecycle:
 
         # Verify status updated
         assert session.status == SessionStatus.STOPPED
+        assert session.completion_status == CompletionStatus.KILLED
+        assert session.completion_message == "Terminated via sm kill"
+        assert session.completed_at is not None
 
         # Verify state was saved (session still in dict but marked stopped)
         saved_state = json.loads(temp_state_file.read_text())
         assert len(saved_state["sessions"]) == 1
         assert saved_state["sessions"][0]["status"] == "stopped"
+        assert saved_state["sessions"][0]["completion_status"] == "killed"
 
     @pytest.mark.asyncio
     async def test_restore_session_flow_claude(self, session_manager, mock_tmux):
@@ -154,6 +158,9 @@ class TestSessionLifecycle:
         assert error is None
         assert restored is session
         assert restored.status == SessionStatus.RUNNING
+        assert restored.completion_status is None
+        assert restored.completion_message is None
+        assert restored.completed_at is None
         call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
         assert call_kwargs["command"] == "claude"
         assert call_kwargs["args"] == ["--resume", "restore-uuid"]

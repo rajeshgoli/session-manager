@@ -226,6 +226,19 @@ class TestFormatThinkingDuration:
 
 
 class TestCmdChildrenOutput:
+    def test_include_terminated_flag_is_forwarded(self, tmp_path):
+        client = _make_client([])
+
+        rc = cmd_children(client, "parent1", include_terminated=True, db_path=str(tmp_path / "tool_usage.db"))
+
+        assert rc == 0
+        client.list_children.assert_called_once_with(
+            parent_session_id="parent1",
+            recursive=False,
+            status_filter=None,
+            include_terminated=True,
+        )
+
     def test_running_claude_session_shows_thinking_and_last_tool(self, tmp_path, capsys):
         ts = (datetime.utcnow() - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
         db = _make_db(

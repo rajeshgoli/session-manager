@@ -640,6 +640,7 @@ class SessionManagerClient:
         parent_session_id: str,
         recursive: bool = False,
         status_filter: Optional[str] = None,
+        include_terminated: bool = False,
     ) -> Optional[dict]:
         """
         List child sessions.
@@ -648,6 +649,7 @@ class SessionManagerClient:
             parent_session_id: Parent session ID
             recursive: Include grandchildren
             status_filter: Filter by status (running, completed, error, all)
+            include_terminated: Include killed child sessions
 
         Returns:
             Dict with children list or None if unavailable
@@ -658,6 +660,8 @@ class SessionManagerClient:
             params.append("recursive=true")
         if status_filter:
             params.append(f"status={status_filter}")
+        if include_terminated:
+            params.append("include_terminated=true")
         if params:
             path += "?" + "&".join(params)
 
