@@ -205,6 +205,50 @@ class TestSessionEndpoints:
         assert data["agent_status_at"] == "2024-01-15T11:07:00"
         assert data["agent_task_completed_at"] == "2024-01-15T11:10:00"
 
+    def test_client_request_status_broadcasts_to_live_sessions(
+        self,
+        test_client,
+        mock_session_manager,
+        sample_session,
+    ):
+        second_session = Session(
+            id="idle456",
+            name="idle-session",
+            working_dir="/tmp/idle",
+            tmux_session="claude-idle456",
+            log_file="/tmp/idle.log",
+            status=SessionStatus.IDLE,
+            created_at=datetime(2024, 1, 15, 10, 30, 0),
+            last_activity=datetime(2024, 1, 15, 10, 45, 0),
+        )
+        mock_session_manager.list_sessions.return_value = [sample_session, second_session]
+        mock_session_manager.send_input = AsyncMock(
+            side_effect=[DeliveryResult.DELIVERED, DeliveryResult.QUEUED]
+        )
+
+        response = test_client.post("/client/request-status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "requested"
+        assert data["targeted_count"] == 2
+        assert data["delivered_count"] == 1
+        assert data["queued_count"] == 1
+        assert data["failed_count"] == 0
+        assert data["targeted_session_ids"] == ["test123", "idle456"]
+        mock_session_manager.list_sessions.assert_called_once_with()
+        expected_prompt = "[sm] user requests status, please update now using sm status"
+        mock_session_manager.send_input.assert_any_await(
+            session_id="test123",
+            text=expected_prompt,
+            delivery_mode="important",
+        )
+        mock_session_manager.send_input.assert_any_await(
+            session_id="idle456",
+            text=expected_prompt,
+            delivery_mode="important",
+        )
+
 
 class TestEmailBridgeEndpoints:
     """Tests for email bridge API endpoints."""

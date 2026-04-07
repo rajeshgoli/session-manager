@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.Campaign
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Terminal
@@ -160,8 +161,14 @@ fun WatchScreen(
                     userEmail = state.userEmail,
                     lastSync = state.lastSync,
                     refreshing = state.refreshing,
+                    requestingStatus = state.requestingStatus,
                     hasUpdate = updateState.availableUpdate != null,
                     onRefresh = { viewModel.refresh() },
+                    onRequestStatus = {
+                        viewModel.requestStatus { result ->
+                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
+                        }
+                    },
                     onOpenSettings = onNavigateToSettings,
                 )
             }
@@ -350,8 +357,10 @@ private fun HeaderBar(
     userEmail: String,
     lastSync: String?,
     refreshing: Boolean,
+    requestingStatus: Boolean,
     hasUpdate: Boolean,
     onRefresh: () -> Unit,
+    onRequestStatus: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     Surface(
@@ -384,6 +393,13 @@ private fun HeaderBar(
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onRequestStatus) {
+                    Icon(
+                        Icons.Rounded.Campaign,
+                        contentDescription = "Request status",
+                        tint = if (requestingStatus) Cyan else TextSecondary,
+                    )
+                }
                 IconButton(onClick = onRefresh) {
                     Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = if (refreshing) Cyan else TextSecondary)
                 }

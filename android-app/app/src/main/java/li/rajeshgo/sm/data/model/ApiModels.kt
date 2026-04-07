@@ -220,6 +220,22 @@ data class OutputResponse(
 )
 
 @Serializable
+data class RequestStatusResponse(
+    val status: String = "requested",
+    val prompt: String,
+    @SerialName("targeted_count")
+    val targetedCount: Int = 0,
+    @SerialName("delivered_count")
+    val deliveredCount: Int = 0,
+    @SerialName("queued_count")
+    val queuedCount: Int = 0,
+    @SerialName("failed_count")
+    val failedCount: Int = 0,
+    @SerialName("targeted_session_ids")
+    val targetedSessionIds: List<String> = emptyList(),
+)
+
+@Serializable
 data class ToolCallsResponse(
     @SerialName("tool_calls")
     val toolCalls: List<ToolCallRow> = emptyList(),

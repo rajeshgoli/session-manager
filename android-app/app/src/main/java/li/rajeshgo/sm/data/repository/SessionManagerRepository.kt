@@ -14,6 +14,7 @@ import li.rajeshgo.sm.data.model.AnalyticsSummary
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
+import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.ToolCallRow
 import li.rajeshgo.sm.data.remote.ApiService
@@ -189,6 +190,12 @@ class SessionManagerRepository {
         runCatching {
             val response = api(baseUrl, token).killSession(sessionId)
             check(response.status == "killed") { response.error ?: "Kill request failed" }
+        }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun requestStatus(baseUrl: String, token: String): Result<RequestStatusResponse> = withContext(Dispatchers.IO) {
+        runCatching {
+            api(baseUrl, token).requestStatus()
         }.mapFailure(::classifyWriteFailure)
     }
 

@@ -541,6 +541,17 @@ class AppArtifactDeployResponse(BaseModel):
     artifact_hash: str
 
 
+class ClientRequestStatusResponse(BaseModel):
+    """Response describing a roster-wide status refresh prompt."""
+    status: str = "requested"
+    prompt: str
+    targeted_count: int
+    delivered_count: int
+    queued_count: int
+    failed_count: int
+    targeted_session_ids: list[str] = Field(default_factory=list)
+
+
 class SendInputRequest(BaseModel):
     """Request to send input to a session."""
     text: str
@@ -2723,6 +2734,43 @@ def create_app(
         return {
             "sessions": [_mobile_session_payload(session) for session in sessions]
         }
+
+    @app.post("/client/request-status", response_model=ClientRequestStatusResponse)
+    async def request_client_status():
+        """Prompt all live sessions to refresh their self-reported status."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        prompt = "[sm] user requests status, please update now using sm status"
+        sessions = app.state.session_manager.list_sessions()
+
+        delivered_count = 0
+        queued_count = 0
+        failed_count = 0
+        targeted_session_ids: list[str] = []
+
+        for session in sessions:
+            targeted_session_ids.append(session.id)
+            result = await app.state.session_manager.send_input(
+                session_id=session.id,
+                text=prompt,
+                delivery_mode="important",
+            )
+            if result == DeliveryResult.DELIVERED:
+                delivered_count += 1
+            elif result == DeliveryResult.QUEUED:
+                queued_count += 1
+            else:
+                failed_count += 1
+
+        return ClientRequestStatusResponse(
+            prompt=prompt,
+            targeted_count=len(targeted_session_ids),
+            delivered_count=delivered_count,
+            queued_count=queued_count,
+            failed_count=failed_count,
+            targeted_session_ids=targeted_session_ids,
+        )
 
     @app.get("/sessions/{session_id}/attach-descriptor")
     async def get_attach_descriptor(session_id: str):
