@@ -74,7 +74,10 @@ def test_notify_server_reads_first_json_line_without_waiting_for_eof(tmp_path: P
             assert proc.poll() == 0
 
             proc.stdin.close()
-            stdout, stderr = proc.communicate(timeout=2)
+            proc.stdin = None
+            assert proc.wait(timeout=2) == 0
+            stdout = proc.stdout.read() if proc.stdout is not None else ""
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
             assert stdout == ""
             assert stderr == ""
 
