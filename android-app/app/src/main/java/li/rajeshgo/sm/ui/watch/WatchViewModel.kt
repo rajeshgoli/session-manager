@@ -209,40 +209,43 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             if (_uiState.value.requestingStatus) {
                 return@launch
             }
-            val serverUrl = settingsRepository.serverUrl.first()
-            val accessToken = settingsRepository.accessToken.first()
-            if (serverUrl.isBlank() || accessToken.isBlank()) {
-                onComplete(Result.failure(IllegalStateException("Sign in to request status")))
-                return@launch
-            }
-
             _uiState.value = _uiState.value.copy(requestingStatus = true)
-            val result = sessionRepository.requestStatus(serverUrl, accessToken)
-                .map { response ->
-                    buildString {
-                        append("Requested status from ")
-                        append(response.targetedCount)
-                        append(" sessions")
-                        if (response.deliveredCount > 0 || response.queuedCount > 0 || response.failedCount > 0) {
-                            append(" • ")
-                            append(response.deliveredCount)
-                            append(" now")
-                            append(" • ")
-                            append(response.queuedCount)
-                            append(" queued")
-                            if (response.failedCount > 0) {
+            try {
+                val serverUrl = settingsRepository.serverUrl.first()
+                val accessToken = settingsRepository.accessToken.first()
+                if (serverUrl.isBlank() || accessToken.isBlank()) {
+                    onComplete(Result.failure(IllegalStateException("Sign in to request status")))
+                    return@launch
+                }
+
+                val result = sessionRepository.requestStatus(serverUrl, accessToken)
+                    .map { response ->
+                        buildString {
+                            append("Requested status from ")
+                            append(response.targetedCount)
+                            append(" sessions")
+                            if (response.deliveredCount > 0 || response.queuedCount > 0 || response.failedCount > 0) {
                                 append(" • ")
-                                append(response.failedCount)
-                                append(" failed")
+                                append(response.deliveredCount)
+                                append(" now")
+                                append(" • ")
+                                append(response.queuedCount)
+                                append(" queued")
+                                if (response.failedCount > 0) {
+                                    append(" • ")
+                                    append(response.failedCount)
+                                    append(" failed")
+                                }
                             }
                         }
                     }
+                result.onSuccess {
+                    refresh()
                 }
-            _uiState.value = _uiState.value.copy(requestingStatus = false)
-            result.onSuccess {
-                refresh()
+                onComplete(result)
+            } finally {
+                _uiState.value = _uiState.value.copy(requestingStatus = false)
             }
-            onComplete(result)
         }
     }
 }
