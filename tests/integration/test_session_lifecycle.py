@@ -166,6 +166,38 @@ class TestSessionLifecycle:
         assert call_kwargs["args"] == ["--resume", "restore-uuid"]
 
     @pytest.mark.asyncio
+    async def test_restore_session_flow_stale_active_claude_missing_tmux(self, session_manager, mock_tmux):
+        """Idle/running Claude sessions with no tmux runtime are restoreable after reboot."""
+        session = await session_manager.create_session(working_dir="/tmp/test")
+        session.transcript_path = "/tmp/transcripts/stale-restore-uuid.jsonl"
+        session.status = SessionStatus.IDLE
+        mock_tmux.session_exists.return_value = False
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        assert restored.status == SessionStatus.RUNNING
+        call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
+        assert call_kwargs["command"] == "claude"
+        assert call_kwargs["args"] == ["--resume", "stale-restore-uuid"]
+
+    @pytest.mark.asyncio
+    async def test_restore_session_rejects_live_nonstopped_claude(self, session_manager, mock_tmux):
+        """Live non-stopped sessions still cannot be restored in place."""
+        session = await session_manager.create_session(working_dir="/tmp/test")
+        session.transcript_path = "/tmp/transcripts/live-restore-uuid.jsonl"
+        session.status = SessionStatus.IDLE
+        mock_tmux.session_exists.return_value = True
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is False
+        assert restored is session
+        assert error == "Session is not stopped"
+
+    @pytest.mark.asyncio
     async def test_restore_session_flow_codex_app(self, session_manager):
         """Stopped codex-app sessions resume by stored thread id."""
         session = Session(

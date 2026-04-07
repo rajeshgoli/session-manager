@@ -3,6 +3,7 @@
 import pytest
 import sys
 import argparse
+import os
 from unittest.mock import MagicMock, patch
 from io import StringIO
 
@@ -635,6 +636,19 @@ class TestRestoreCommand:
 
         assert args.command == "restore"
         assert args.session == "engineer-ticket2508"
+
+    def test_main_restore_allowed_without_managed_session(self):
+        mock_client = MagicMock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["sm", "restore", "dead123"]):
+                with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                    with patch("src.cli.main.commands.cmd_restore", return_value=0) as mock_cmd_restore:
+                        with pytest.raises(SystemExit) as exc_info:
+                            main()
+
+        assert exc_info.value.code == 0
+        mock_cmd_restore.assert_called_once_with(mock_client, "dead123")
 
 
 class TestSessionResolution:
