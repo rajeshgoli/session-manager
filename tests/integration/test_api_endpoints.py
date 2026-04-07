@@ -1634,6 +1634,71 @@ class TestClientBugReports:
         assert response.status_code == 413
         assert "client_state exceeds" in response.json()["detail"]
 
+    def test_client_bug_report_allows_text_only_submission_when_debug_state_is_disabled(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+        tmp_path,
+    ):
+        mock_session_manager.ensure_maintainer_session = AsyncMock(return_value=(sample_session, False))
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.QUEUED)
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=None,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={"paths": {"bug_reports_db": str(tmp_path / "bug_reports.db")}},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/client/bug-reports",
+            json={
+                "report_text": "text-only fallback",
+                "include_debug_state": False,
+                "client_state": {"route": "/watch/", "blob": "x" * 100_001},
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["maintainer_notified"] is True
+
+    def test_client_bug_report_allows_unauthenticated_submission_when_auth_is_disabled(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+        tmp_path,
+    ):
+        mock_session_manager.ensure_maintainer_session = AsyncMock(return_value=(sample_session, False))
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=None,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={"paths": {"bug_reports_db": str(tmp_path / "bug_reports.db")}},
+        )
+        client = TestClient(app, base_url="https://sm.example.com")
+
+        response = client.post(
+            "/client/bug-reports",
+            json={
+                "report_text": "remote host without auth config",
+                "include_debug_state": False,
+            },
+        )
+
+        assert response.status_code == 200
+        with sqlite3.connect(str(tmp_path / "bug_reports.db")) as conn:
+            row = conn.execute("SELECT reported_by FROM bug_reports").fetchone()
+        assert row == (None,)
+
 
 class TestSessionManagerUnavailable:
     """Tests for when session manager is unavailable."""

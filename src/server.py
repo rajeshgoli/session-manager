@@ -2953,7 +2953,7 @@ def create_app(
     async def submit_client_bug_report(request: Request, payload: ClientBugReportRequest):
         """Persist one app bug report and notify maintainer."""
         actor_email = _request_actor_email(request)
-        if actor_email is None:
+        if actor_email is None and _google_auth_requested(app.state.config):
             raise HTTPException(status_code=401, detail="Authentication required")
 
         report_text = str(payload.report_text or "").strip()
@@ -2969,14 +2969,15 @@ def create_app(
         route = None
         client_state = None
         if isinstance(payload.client_state, dict):
-            client_state = _validate_bug_report_json_payload(
-                "client_state",
-                payload.client_state,
-                BUG_REPORT_MAX_CLIENT_STATE_CHARS,
-            )
             route_value = payload.client_state.get("route")
             if isinstance(route_value, str):
                 route = route_value.strip() or None
+            if payload.include_debug_state:
+                client_state = _validate_bug_report_json_payload(
+                    "client_state",
+                    payload.client_state,
+                    BUG_REPORT_MAX_CLIENT_STATE_CHARS,
+                )
 
         server_state = (
             _bug_report_server_state(payload.selected_session_id)
