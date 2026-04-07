@@ -4638,9 +4638,6 @@ Provide ONLY the summary, no preamble or questions."""
         all_sessions = app.state.session_manager.list_sessions(include_stopped=True)
         children = [s for s in all_sessions if s.parent_session_id == parent_session_id]
 
-        if not include_terminated:
-            children = [s for s in children if s.completion_status != CompletionStatus.KILLED]
-
         # Filter by status if specified
         if status and status != "all":
             if status == "running":
@@ -4659,6 +4656,9 @@ Provide ONLY the summary, no preamble or questions."""
                 grandchildren = [s for s in all_sessions if s.parent_session_id == child.id]
                 all_descendants.extend(grandchildren)
             children = all_descendants
+
+        if not include_terminated:
+            children = [s for s in children if s.completion_status != CompletionStatus.KILLED]
 
         latest_action_getter = getattr(app.state.session_manager, "get_codex_latest_activity_action", None)
         codex_projection_enabled = _codex_rollout_enabled("enable_observability_projection")

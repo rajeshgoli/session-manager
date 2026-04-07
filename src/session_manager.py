@@ -4897,6 +4897,9 @@ class SessionManager:
             return False, session, f"Restore not supported for provider={session.provider}"
 
         session.error_message = None
+        session.completion_status = None
+        session.completion_message = None
+        session.completed_at = None
         session.status = SessionStatus.IDLE if session.provider == "codex-app" else SessionStatus.RUNNING
         session.last_activity = datetime.now()
         if session.provider == "codex-fork":

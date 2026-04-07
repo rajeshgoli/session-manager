@@ -158,6 +158,9 @@ class TestSessionLifecycle:
         assert error is None
         assert restored is session
         assert restored.status == SessionStatus.RUNNING
+        assert restored.completion_status is None
+        assert restored.completion_message is None
+        assert restored.completed_at is None
         call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
         assert call_kwargs["command"] == "claude"
         assert call_kwargs["args"] == ["--resume", "restore-uuid"]
