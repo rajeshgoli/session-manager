@@ -105,42 +105,46 @@ class BugReportStore:
         with self._lock:
             conn = self._get_conn()
             cursor = conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute(
-                """
-                INSERT INTO bug_reports (
-                    id,
-                    created_at,
-                    reported_by,
-                    report_text,
-                    selected_session_id,
-                    route,
-                    app_version,
-                    artifact_hash,
-                    include_debug_state,
-                    client_state_json,
-                    server_state_json,
-                    status,
-                    maintainer_delivery_result
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute(
+                    """
+                    INSERT INTO bug_reports (
+                        id,
+                        created_at,
+                        reported_by,
+                        report_text,
+                        selected_session_id,
+                        route,
+                        app_version,
+                        artifact_hash,
+                        include_debug_state,
+                        client_state_json,
+                        server_state_json,
+                        status,
+                        maintainer_delivery_result
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', NULL)
+                    """,
+                    (
+                        bug_id,
+                        created_at,
+                        reported_by,
+                        report_text,
+                        selected_session_id,
+                        route,
+                        app_version,
+                        artifact_hash,
+                        1 if include_debug_state else 0,
+                        self._to_json(client_state if include_debug_state else None),
+                        self._to_json(server_state if include_debug_state else None),
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', NULL)
-                """,
-                (
-                    bug_id,
-                    created_at,
-                    reported_by,
-                    report_text,
-                    selected_session_id,
-                    route,
-                    app_version,
-                    artifact_hash,
-                    1 if include_debug_state else 0,
-                    self._to_json(client_state if include_debug_state else None),
-                    self._to_json(server_state if include_debug_state else None),
-                ),
-            )
-            self._prune_locked(cursor)
-            conn.commit()
+                self._prune_locked(cursor)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
         return {
             "id": bug_id,

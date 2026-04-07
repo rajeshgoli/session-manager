@@ -36,3 +36,23 @@ def test_bug_report_store_updates_maintainer_delivery_result(tmp_path):
     assert report is not None
     assert report["maintainer_delivery_result"] == "delivered"
     assert report["status"] == "submitted"
+
+
+def test_bug_report_store_rolls_back_failed_transactions(tmp_path):
+    store = BugReportStore(str(tmp_path / "bug_reports.db"), max_reports=30)
+
+    store._bug_id = lambda now=None: "fixed-id"  # type: ignore[method-assign]
+    store.create_report(report_text="first")
+
+    try:
+        store.create_report(report_text="duplicate")
+    except Exception as exc:
+        assert "UNIQUE constraint failed" in str(exc)
+    else:
+        raise AssertionError("expected duplicate insert to fail")
+
+    store._bug_id = lambda now=None: "second-id"  # type: ignore[method-assign]
+    created = store.create_report(report_text="after rollback")
+
+    assert created["id"] == "second-id"
+    assert store.count_reports() == 2

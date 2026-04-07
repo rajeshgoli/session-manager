@@ -1602,6 +1602,38 @@ class TestClientBugReports:
 
         assert row == (0, None, None, "queued")
 
+    def test_client_bug_report_rejects_oversized_payloads(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+        tmp_path,
+    ):
+        mock_session_manager.ensure_maintainer_session = AsyncMock(return_value=(sample_session, False))
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.QUEUED)
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=None,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={"paths": {"bug_reports_db": str(tmp_path / "bug_reports.db")}},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/client/bug-reports",
+            json={
+                "report_text": "ok",
+                "include_debug_state": True,
+                "client_state": {"route": "/watch/", "blob": "x" * 100_001},
+            },
+        )
+
+        assert response.status_code == 413
+        assert "client_state exceeds" in response.json()["detail"]
+
 
 class TestSessionManagerUnavailable:
     """Tests for when session manager is unavailable."""

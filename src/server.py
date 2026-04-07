@@ -65,6 +65,9 @@ _EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS = 8
 APP_ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 APP_ARTIFACT_HASH_PATTERN = re.compile(r"^[0-9a-f]{8}$")
 APP_ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
+BUG_REPORT_MAX_TEXT_CHARS = 4000
+BUG_REPORT_MAX_CLIENT_STATE_CHARS = 100_000
+BUG_REPORT_MAX_SERVER_STATE_CHARS = 200_000
 DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
 DEFAULT_BUG_REPORTS_DB = Path(__file__).resolve().parents[1] / "data" / "bug_reports.db"
 DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
@@ -1544,6 +1547,24 @@ def create_app(
             return "local_bypass"
         return None
 
+    def _validate_bug_report_json_payload(
+        field_name: str,
+        payload: Optional[dict[str, Any]],
+        max_chars: int,
+    ) -> Optional[dict[str, Any]]:
+        if payload is None:
+            return None
+        try:
+            raw = json.dumps(payload, separators=(",", ":"), default=str)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{field_name} must be JSON serializable") from exc
+        if len(raw) > max_chars:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{field_name} exceeds {max_chars} serialized characters",
+            )
+        return payload
+
     def _client_bootstrap_payload() -> dict[str, Any]:
         external_access = _external_access_config()
         google_auth = _google_auth_config(app.state.config)
@@ -2938,10 +2959,21 @@ def create_app(
         report_text = str(payload.report_text or "").strip()
         if not report_text:
             raise HTTPException(status_code=400, detail="report_text is required")
+        if len(report_text) > BUG_REPORT_MAX_TEXT_CHARS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"report_text exceeds {BUG_REPORT_MAX_TEXT_CHARS} characters",
+            )
 
         store = _get_bug_report_store()
         route = None
+        client_state = None
         if isinstance(payload.client_state, dict):
+            client_state = _validate_bug_report_json_payload(
+                "client_state",
+                payload.client_state,
+                BUG_REPORT_MAX_CLIENT_STATE_CHARS,
+            )
             route_value = payload.client_state.get("route")
             if isinstance(route_value, str):
                 route = route_value.strip() or None
@@ -2951,6 +2983,11 @@ def create_app(
             if payload.include_debug_state
             else None
         )
+        server_state = _validate_bug_report_json_payload(
+            "server_state",
+            server_state,
+            BUG_REPORT_MAX_SERVER_STATE_CHARS,
+        )
         created = store.create_report(
             report_text=report_text,
             reported_by=actor_email,
@@ -2959,7 +2996,7 @@ def create_app(
             app_version=payload.app_version,
             artifact_hash=payload.artifact_hash,
             include_debug_state=payload.include_debug_state,
-            client_state=payload.client_state if isinstance(payload.client_state, dict) else None,
+            client_state=client_state,
             server_state=server_state,
         )
 
