@@ -1624,6 +1624,28 @@ def create_app(
             f"{ssh_username}@{public_ssh_host}",
             remote_command,
         ])
+        ssh_command = shlex.join(ssh_args)
+        cleanup_pattern = f"cloudflared access ssh --hostname {public_ssh_host}"
+        local_attach_script = (
+            "attach_cleanup() { "
+            "stty sane 2>/dev/null || true; "
+            "if command -v pkill >/dev/null 2>&1; then "
+            f"pkill -f {shlex.quote(cleanup_pattern)} 2>/dev/null || true; "
+            "fi; "
+            "}; "
+            "trap 'attach_cleanup; exit 130' INT TERM; "
+            f"printf 'Connecting to {tmux_session}...\\r\\n' >/dev/tty 2>/dev/null || true; "
+            f"{ssh_command}; "
+            "attach_status=$?; "
+            "if [ \"$attach_status\" -eq 255 ]; then "
+            "attach_cleanup; "
+            "printf 'Attach transport failed (255); retrying once...\\r\\n' >/dev/tty 2>/dev/null || true; "
+            f"{ssh_command}; "
+            "attach_status=$?; "
+            "fi; "
+            "attach_cleanup; "
+            "exit \"$attach_status\""
+        )
 
         return {
             "supported": True,
@@ -1631,7 +1653,7 @@ def create_app(
             "ssh_host": public_ssh_host,
             "ssh_username": ssh_username,
             "ssh_proxy_command": ssh_proxy_command or None,
-            "ssh_command": shlex.join(ssh_args),
+            "ssh_command": shlex.join(["sh", "-lc", local_attach_script]),
             "tmux_session": tmux_session,
             "runtime_mode": descriptor.get("runtime_mode"),
             "termux_package": "com.termux",
