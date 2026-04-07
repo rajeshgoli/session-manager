@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  Bug,
   Cable,
   Layers3,
   Pause,
@@ -10,6 +11,7 @@ import {
   Sparkles,
   Wifi,
   WifiOff,
+  X,
 } from 'lucide-react';
 import { Session, SessionDetail, ToolCallRow, ActivityActionRow } from './types';
 import {
@@ -28,6 +30,7 @@ const API_PATHS = ['/client/sessions', '/sessions', '/api/sessions'];
 const POLL_MS = 4000;
 const DETAIL_STALE_MS = 12000;
 const KILL_PATH = '/sessions/{id}/kill';
+const BUG_REPORT_PATH = '/client/bug-reports';
 
 async function fetchJson<T>(paths: string[]): Promise<T | null> {
   for (const path of paths) {
@@ -144,6 +147,11 @@ export default function App() {
   const [copiedAttachSessionId, setCopiedAttachSessionId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isBugReportOpen, setIsBugReportOpen] = useState(false);
+  const [bugReportText, setBugReportText] = useState('');
+  const [bugReportIncludeDebugState, setBugReportIncludeDebugState] = useState(true);
+  const [bugReportSessionId, setBugReportSessionId] = useState<string | null>(null);
+  const [isSubmittingBugReport, setIsSubmittingBugReport] = useState(false);
 
   const pollSessions = async () => {
     if (isPaused) {
@@ -233,6 +241,23 @@ export default function App() {
   const stats = useMemo(() => statsFromSessions(sessions), [sessions]);
 
   const showToast = (message: string) => setToast(message);
+
+  const openBugReport = (sessionId?: string | null) => {
+    setBugReportSessionId(sessionId || null);
+    setBugReportText('');
+    setBugReportIncludeDebugState(true);
+    setIsBugReportOpen(true);
+  };
+
+  const closeBugReport = (force = false) => {
+    if (isSubmittingBugReport && !force) {
+      return;
+    }
+    setIsBugReportOpen(false);
+    setBugReportText('');
+    setBugReportSessionId(null);
+    setBugReportIncludeDebugState(true);
+  };
 
   const toggleExpand = (sessionId: string) => {
     setExpandedSessions((prev) => {
@@ -343,6 +368,62 @@ export default function App() {
     }
   };
 
+  const handleSubmitBugReport = async () => {
+    const reportText = bugReportText.trim();
+    if (!reportText) {
+      showToast('Describe what went wrong first.');
+      return;
+    }
+
+    const clientState = {
+      route: `${window.location.pathname}${window.location.search}`,
+      search_query: searchQuery,
+      filter,
+      selected_session_id: bugReportSessionId,
+      expanded_session_ids: Array.from(expandedSessions),
+      visible_session_ids: sessions.map((session) => session.id),
+      last_sync_at: lastSync ? lastSync.toISOString() : null,
+      visible_error: error,
+      visible_toast: toast,
+      user_agent: navigator.userAgent,
+    };
+
+    setIsSubmittingBugReport(true);
+    try {
+      const response = await fetch(BUG_REPORT_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          report_text: reportText,
+          include_debug_state: bugReportIncludeDebugState,
+          selected_session_id: bugReportSessionId,
+          client_state: clientState,
+        }),
+      });
+
+      let payload: { bug_id?: string; detail?: string } | null = null;
+      try {
+        payload = (await response.json()) as { bug_id?: string; detail?: string };
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        showToast(payload?.detail || 'Bug report failed.');
+        return;
+      }
+
+      closeBugReport(true);
+      showToast(`Bug report submitted${payload?.bug_id ? `: ${payload.bug_id}` : '.'}`);
+    } catch {
+      showToast('Bug report failed.');
+    } finally {
+      setIsSubmittingBugReport(false);
+    }
+  };
+
+  const bugReportSession = bugReportSessionId ? sessionsById.get(bugReportSessionId) || null : null;
+
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.12),_transparent_28%),linear-gradient(180deg,_#0b0b10_0%,_#121219_28%,_#09090d_100%)] text-zinc-100 selection:bg-cyan-400/30">
       <div className="mx-auto flex min-h-screen w-full max-w-[1440px] flex-col px-4 pb-10 pt-5 sm:px-6 lg:px-8">
@@ -378,6 +459,14 @@ export default function App() {
               >
                 {isPaused ? <Play size={13} /> : <Pause size={13} />}
                 {isPaused ? 'resume polling' : 'pause polling'}
+              </button>
+              <button
+                type="button"
+                onClick={() => openBugReport(null)}
+                className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200 transition hover:border-amber-400/50 hover:text-amber-100"
+              >
+                <Bug size={13} />
+                Report bug
               </button>
             </div>
           </div>
@@ -456,6 +545,7 @@ export default function App() {
             onOpenTelegram={handleOpenTelegram}
             onKillSession={handleKillSession}
             onCopyAttach={handleCopyAttach}
+            onReportBug={(session) => openBugReport(session.id)}
           />
         ) : (
           <div className="flex flex-1 items-center justify-center rounded-[28px] border border-dashed border-zinc-800 bg-zinc-950/70 px-6 py-24 text-center shadow-[0_18px_60px_rgba(0,0,0,0.3)]">
@@ -471,6 +561,72 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {isBugReportOpen ? (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm">
+          <div className="w-full max-w-2xl rounded-[28px] border border-zinc-800 bg-zinc-950/95 p-5 shadow-[0_24px_80px_rgba(0,0,0,0.55)]">
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-amber-500/20 bg-amber-500/8 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-amber-200">
+                  <Bug size={12} />
+                  Report bug
+                </div>
+                <h2 className="text-2xl font-semibold tracking-[-0.03em] text-zinc-50">What went wrong?</h2>
+                <p className="mt-1 text-sm text-zinc-400">
+                  {bugReportSession
+                    ? `This report will include a snapshot for ${sessionDisplayName(bugReportSession)} [${bugReportSession.id}].`
+                    : 'This report will include the current watch state if debug capture stays enabled.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => closeBugReport()}
+                disabled={isSubmittingBugReport}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900/80 text-zinc-400 transition hover:border-zinc-700 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-600"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <textarea
+              value={bugReportText}
+              onChange={(event) => setBugReportText(event.target.value)}
+              placeholder="Describe the bug in one or two sentences."
+              className="min-h-[12rem] w-full rounded-[24px] border border-zinc-800 bg-zinc-950 px-4 py-4 text-sm leading-6 text-zinc-100 outline-none transition placeholder:text-zinc-600 focus:border-amber-400/50"
+            />
+
+            <label className="mt-4 flex items-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 px-4 py-3 text-sm text-zinc-300">
+              <input
+                type="checkbox"
+                checked={bugReportIncludeDebugState}
+                onChange={(event) => setBugReportIncludeDebugState(event.target.checked)}
+                className="h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-amber-300"
+              />
+              Include app debug state
+            </label>
+
+            <div className="mt-5 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => closeBugReport()}
+                disabled={isSubmittingBugReport}
+                className="rounded-full border border-zinc-800 bg-zinc-900/80 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-300 transition hover:border-zinc-700 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-500"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSubmitBugReport()}
+                disabled={isSubmittingBugReport}
+                className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200 transition hover:border-amber-400/50 hover:text-amber-100 disabled:cursor-not-allowed disabled:text-amber-500"
+              >
+                <Bug size={13} />
+                {isSubmittingBugReport ? 'Submitting...' : 'Submit bug'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className="fixed bottom-5 left-1/2 z-40 w-[min(92vw,34rem)] -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-950/95 px-4 py-3 text-center text-sm text-zinc-100 shadow-[0_20px_60px_rgba(0,0,0,0.5)] backdrop-blur-xl">

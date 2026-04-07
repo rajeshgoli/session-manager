@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  Bug,
   ChevronDown,
   ChevronRight,
   Copy,
@@ -18,6 +19,7 @@ interface WatchTableProps {
   onOpenTelegram: (session: Session) => void;
   onKillSession: (id: string, event: React.MouseEvent) => Promise<void>;
   onCopyAttach: (session: Session) => Promise<void>;
+  onReportBug: (session: Session) => void;
 }
 
 const GRID_CLASS =
@@ -107,6 +109,7 @@ function SessionDetailBlock({
   onOpenTelegram,
   onKillSession,
   onCopyAttach,
+  onReportBug,
 }: {
   session: Session;
   detailLines: string[];
@@ -115,6 +118,7 @@ function SessionDetailBlock({
   onOpenTelegram: (session: Session) => void;
   onKillSession: (id: string, event: React.MouseEvent) => Promise<void>;
   onCopyAttach: (session: Session) => Promise<void>;
+  onReportBug: (session: Session) => void;
 }) {
   const telegramLink = telegramDeepLink(session.telegram_chat_id, session.telegram_thread_id);
   const attach = attachCommand(session);
@@ -148,6 +152,14 @@ function SessionDetailBlock({
           <Trash2 size={13} />
           Kill session
         </button>
+        <button
+          type="button"
+          onClick={() => onReportBug(session)}
+          className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200 transition hover:border-amber-400/60"
+        >
+          <Bug size={13} />
+          Report bug
+        </button>
         {session.is_maintainer && (
           <span className="inline-flex items-center gap-2 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200">
             <ShieldAlert size={13} />
@@ -174,6 +186,7 @@ export function WatchTable({
   onOpenTelegram,
   onKillSession,
   onCopyAttach,
+  onReportBug,
 }: WatchTableProps) {
   return (
     <div className="overflow-hidden rounded-[28px] border border-zinc-800 bg-zinc-950/90 shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
@@ -229,6 +242,7 @@ export function WatchTable({
                         onOpenTelegram={onOpenTelegram}
                         onKillSession={onKillSession}
                         onCopyAttach={onCopyAttach}
+                        onReportBug={onReportBug}
                       />
                     ) : null}
                   </RowLabel>
