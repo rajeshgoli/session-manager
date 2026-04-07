@@ -37,6 +37,7 @@ from .codex_provider_policy import (
 )
 from .models import (
     AdoptionProposal,
+    CompletionStatus,
     Session,
     SessionStatus,
     NotificationChannel,
@@ -4627,6 +4628,7 @@ Provide ONLY the summary, no preamble or questions."""
         parent_session_id: str,
         recursive: bool = False,
         status: Optional[str] = None,
+        include_terminated: bool = False,
     ):
         """List child sessions of a parent."""
         if not app.state.session_manager:
@@ -4636,15 +4638,16 @@ Provide ONLY the summary, no preamble or questions."""
         all_sessions = app.state.session_manager.list_sessions(include_stopped=True)
         children = [s for s in all_sessions if s.parent_session_id == parent_session_id]
 
+        if not include_terminated:
+            children = [s for s in children if s.completion_status != CompletionStatus.KILLED]
+
         # Filter by status if specified
         if status and status != "all":
             if status == "running":
                 children = [s for s in children if s.status == SessionStatus.RUNNING]
             elif status == "completed":
-                from src.models import CompletionStatus
                 children = [s for s in children if s.completion_status == CompletionStatus.COMPLETED]
             elif status == "error":
-                from src.models import CompletionStatus
                 children = [s for s in children if s.completion_status == CompletionStatus.ERROR]
 
         # Handle recursive

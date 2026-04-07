@@ -104,6 +104,7 @@ class TestCliParsing:
         children_parser = subparsers.add_parser("children")
         children_parser.add_argument("session_id", nargs="?")
         children_parser.add_argument("--recursive", action="store_true")
+        children_parser.add_argument("--terminated", action="store_true")
         children_parser.add_argument("--status", choices=["running", "completed", "error", "all"])
         children_parser.add_argument("--json", action="store_true")
         children_parser.add_argument("--db-path", default=None)
@@ -511,6 +512,13 @@ class TestChildrenCommand:
             args = parser._get_parsed_args(["children", "--status", status])
             assert args.status == status
 
+    def test_children_terminated_flag(self):
+        """sm children --terminated includes killed children."""
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["children", "--terminated"])
+
+        assert args.terminated is True
+
     def test_children_json_flag(self):
         """sm children --json enables JSON output."""
         parser = TestCliParsing()
@@ -547,7 +555,7 @@ class TestChildrenCommandDispatch:
                             main()
 
         assert exc_info.value.code == 0
-        mock_cmd_children.assert_called_once_with(mock_client, "abc12345", False, None, False, None)
+        mock_cmd_children.assert_called_once_with(mock_client, "abc12345", False, None, False, False, None)
 
     def test_children_reports_missing_named_parent(self, capsys):
         mock_client = MagicMock()

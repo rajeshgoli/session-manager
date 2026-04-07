@@ -306,6 +306,7 @@ def main():
         help="Parent session ID, friendly name, or registry alias (defaults to current)",
     )
     children_parser.add_argument("--recursive", action="store_true", help="Include grandchildren")
+    children_parser.add_argument("--terminated", action="store_true", help="Include children terminated via sm kill")
     children_parser.add_argument("--status", choices=["running", "completed", "error", "all"], help="Filter by status")
     children_parser.add_argument("--json", action="store_true", help="Output JSON")
     children_parser.add_argument("--db-path", default=None, help="Override tool_usage.db path")
@@ -880,6 +881,7 @@ def main():
                 parent_id,
                 args.recursive,
                 args.status,
+                args.terminated,
                 args.json,
                 getattr(args, "db_path", None),
             )

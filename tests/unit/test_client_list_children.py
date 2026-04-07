@@ -35,3 +35,15 @@ def test_list_children_returns_data_on_success():
         result = client.list_children("abc12345")
     assert result == children_payload
     assert len(result["children"]) == 1
+
+
+def test_list_children_includes_terminated_query_param():
+    """list_children appends include_terminated=true when requested."""
+    client = _make_client()
+    with patch.object(client, "_request", return_value=({"children": []}, True, False)) as mock_request:
+        client.list_children("abc12345", include_terminated=True)
+
+    mock_request.assert_called_once_with(
+        "GET",
+        "/sessions/abc12345/children?include_terminated=true",
+    )

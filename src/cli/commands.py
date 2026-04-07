@@ -1833,6 +1833,7 @@ def cmd_children(
     parent_session_id: str,
     recursive: bool = False,
     status_filter: Optional[str] = None,
+    include_terminated: bool = False,
     json_output: bool = False,
     db_path: Optional[str] = None,
 ) -> int:
@@ -1844,6 +1845,7 @@ def cmd_children(
         parent_session_id: Parent session ID
         recursive: Include grandchildren
         status_filter: Filter by status (running, completed, error, all)
+        include_terminated: Include killed child sessions
         json_output: Output JSON format
         db_path: Override tool_usage.db path
 
@@ -1859,6 +1861,7 @@ def cmd_children(
         parent_session_id=parent_session_id,
         recursive=recursive,
         status_filter=status_filter,
+        include_terminated=include_terminated,
     )
 
     if result is None:
