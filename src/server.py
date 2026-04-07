@@ -2751,6 +2751,11 @@ def create_app(
 
         for session in sessions:
             targeted_session_ids.append(session.id)
+            try:
+                _enforce_session_input_gates(session, session.id)
+            except HTTPException:
+                failed_count += 1
+                continue
             result = await app.state.session_manager.send_input(
                 session_id=session.id,
                 text=prompt,

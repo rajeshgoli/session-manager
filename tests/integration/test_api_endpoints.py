@@ -249,6 +249,42 @@ class TestSessionEndpoints:
             delivery_mode="important",
         )
 
+    def test_client_request_status_skips_gated_codex_app_sessions(
+        self,
+        test_client,
+        mock_session_manager,
+        sample_session,
+    ):
+        gated_session = Session(
+            id="codexpend",
+            name="codex-app-codexpend",
+            working_dir="/tmp/codex",
+            provider="codex-app",
+            status=SessionStatus.RUNNING,
+        )
+        mock_session_manager.list_sessions.return_value = [sample_session, gated_session]
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+        mock_session_manager.has_pending_codex_requests.return_value = True
+        mock_session_manager.is_codex_rollout_enabled.side_effect = (
+            lambda key: True if key == "enable_structured_requests" else False
+        )
+
+        response = test_client.post("/client/request-status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["targeted_count"] == 2
+        assert data["delivered_count"] == 1
+        assert data["queued_count"] == 0
+        assert data["failed_count"] == 1
+        assert data["targeted_session_ids"] == ["test123", "codexpend"]
+        mock_session_manager.send_input.assert_awaited_once()
+        mock_session_manager.send_input.assert_awaited_with(
+            session_id="test123",
+            text="[sm] user requests status, please update now using sm status",
+            delivery_mode="important",
+        )
+
 
 class TestEmailBridgeEndpoints:
     """Tests for email bridge API endpoints."""
