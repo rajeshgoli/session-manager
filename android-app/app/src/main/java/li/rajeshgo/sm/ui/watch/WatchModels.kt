@@ -166,6 +166,8 @@ fun filterSections(sections: List<WatchSection>, statusFilter: String, query: St
             append(' ')
             append(session.provider ?: "")
             append(' ')
+            append(session.agentStatusText ?: "")
+            append(' ')
             append(session.aliases.joinToString(" "))
         }.lowercase()
         return haystack.contains(normalizedQuery)
@@ -246,6 +248,12 @@ fun lastSummary(session: ClientSession): String {
             session.lastToolCall?.let { "$tool (${ageFromIso(it)})" } ?: tool
         } ?: session.lastToolCall?.let { "tool (${ageFromIso(it)})" } ?: "-"
     }
+}
+
+fun statusSummary(session: ClientSession): String? {
+    val text = session.agentStatusText?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val ageSuffix = session.agentStatusAt?.let { " (${ageFromIso(it)})" } ?: ""
+    return "$text$ageSuffix"
 }
 
 fun parentLabel(session: ClientSession, sessionsById: Map<String, ClientSession>): String {

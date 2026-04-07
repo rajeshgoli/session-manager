@@ -592,6 +592,16 @@ private fun SessionRow(
                             fontFamily = FontFamily.Monospace,
                         )
                         Spacer(Modifier.height(6.dp))
+                        statusSummary(session)?.let { status ->
+                            Text(
+                                text = status,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Cyan,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Spacer(Modifier.height(6.dp))
+                        }
                         val secondaryLine = buildString {
                             if (parentLabel != "-") {
                                 append("Parent ")
