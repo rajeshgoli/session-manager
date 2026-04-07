@@ -11,6 +11,7 @@ import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
 import li.rajeshgo.sm.data.model.KillSessionRequest
 import li.rajeshgo.sm.data.model.KillSessionResponse
 import li.rajeshgo.sm.data.model.OutputResponse
+import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionListResponse
 import li.rajeshgo.sm.data.model.ToolCallsResponse
 import retrofit2.http.Body
@@ -40,6 +41,9 @@ interface ApiService {
 
     @GET("client/sessions/{session_id}")
     suspend fun getClientSession(@Path("session_id") sessionId: String): ClientSession
+
+    @POST("client/request-status")
+    suspend fun requestStatus(): RequestStatusResponse
 
     @GET("sessions/{session_id}/output")
     suspend fun getSessionOutput(
