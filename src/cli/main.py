@@ -694,10 +694,10 @@ def main():
         )
         sys.exit(1)
 
-    # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, new, attach, output, clear
+    # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, restore, new, attach, output, clear
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
-        "subagents", "children", "kill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
+        "subagents", "children", "kill", "restore", "unkill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server",
         "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", None
     ]

@@ -4808,7 +4808,11 @@ class SessionManager:
         session = self.sessions.get(session_id)
         if not session:
             return False, None, "Session not found"
-        if session.status != SessionStatus.STOPPED:
+        tmux_runtime_missing = (
+            session.provider != "codex-app"
+            and not self.tmux.session_exists(session.tmux_session)
+        )
+        if session.status != SessionStatus.STOPPED and not tmux_runtime_missing:
             return False, session, "Session is not stopped"
 
         resume_id = self.get_session_resume_id(session)
