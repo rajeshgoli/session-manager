@@ -2,6 +2,7 @@
 
 import pytest
 import json
+import sqlite3
 from datetime import datetime
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
@@ -21,6 +22,8 @@ def mock_session_manager():
     mock.message_queue_manager = None
     mock.is_codex_rollout_enabled = MagicMock(return_value=True)
     mock.validate_friendly_name_update = MagicMock(return_value=None)
+    mock.get_attach_descriptor = MagicMock(return_value=None)
+    mock.get_session_aliases = MagicMock(return_value=[])
     mock._save_state = MagicMock()
     return mock
 
@@ -1482,6 +1485,122 @@ class TestQueueEndpoints:
         data = response.json()
         assert data["is_idle"] is True
         assert data["pending_count"] == 2
+
+
+class TestClientBugReports:
+    def test_client_bug_report_persists_snapshot_and_notifies_maintainer(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+        tmp_path,
+    ):
+        mock_session_manager.list_sessions.return_value = [sample_session]
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.get_activity_state.return_value = "working"
+        mock_session_manager.ensure_maintainer_session = AsyncMock(return_value=(sample_session, False))
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=None,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={
+                "paths": {"bug_reports_db": str(tmp_path / "bug_reports.db")},
+                "bug_reports": {"max_reports": 30},
+            },
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/client/bug-reports",
+            json={
+                "report_text": "attach goes blank after ctrl-c",
+                "include_debug_state": True,
+                "selected_session_id": sample_session.id,
+                "client_state": {
+                    "route": "/watch/",
+                    "search_query": "maintainer",
+                    "expanded_session_ids": [sample_session.id],
+                },
+                "app_version": "0.1.0-test",
+                "artifact_hash": "deadbeef",
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "submitted"
+        assert payload["bug_id"].startswith("BR-")
+        assert payload["maintainer_notified"] is True
+
+        mock_session_manager.ensure_maintainer_session.assert_awaited_once()
+        mock_session_manager.send_input.assert_awaited_once()
+        notify_text = mock_session_manager.send_input.await_args.kwargs["text"]
+        assert "[app bug]" in notify_text
+        assert sample_session.id in notify_text
+
+        with sqlite3.connect(str(tmp_path / "bug_reports.db")) as conn:
+            row = conn.execute(
+                """
+                SELECT report_text, selected_session_id, route, reported_by, include_debug_state,
+                       client_state_json, server_state_json, maintainer_delivery_result
+                FROM bug_reports
+                WHERE id = ?
+                """,
+                (payload["bug_id"],),
+            ).fetchone()
+
+        assert row is not None
+        assert row[0] == "attach goes blank after ctrl-c"
+        assert row[1] == sample_session.id
+        assert row[2] == "/watch/"
+        assert row[3] == "local_bypass"
+        assert row[4] == 1
+        assert '"search_query":"maintainer"' in row[5]
+        assert '"selected_session"' in row[6]
+        assert row[7] == "delivered"
+
+    def test_client_bug_report_can_skip_debug_snapshot(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+        tmp_path,
+    ):
+        mock_session_manager.ensure_maintainer_session = AsyncMock(return_value=(sample_session, False))
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.QUEUED)
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=None,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={"paths": {"bug_reports_db": str(tmp_path / "bug_reports.db")}},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/client/bug-reports",
+            json={
+                "report_text": "generic app bug",
+                "include_debug_state": False,
+                "client_state": {"route": "/watch/"},
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["maintainer_notified"] is True
+
+        with sqlite3.connect(str(tmp_path / "bug_reports.db")) as conn:
+            row = conn.execute(
+                "SELECT include_debug_state, client_state_json, server_state_json, maintainer_delivery_result FROM bug_reports"
+            ).fetchone()
+
+        assert row == (0, None, None, "queued")
 
 
 class TestSessionManagerUnavailable:

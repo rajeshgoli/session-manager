@@ -48,6 +48,7 @@ from .models import (
 )
 from .cli.commands import validate_friendly_name
 from .cli.dispatch import get_auto_remind_config
+from .bug_report_store import BugReportStore
 from .mobile_analytics import MobileAnalyticsBuilder
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ APP_ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 APP_ARTIFACT_HASH_PATTERN = re.compile(r"^[0-9a-f]{8}$")
 APP_ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
 DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
+DEFAULT_BUG_REPORTS_DB = Path(__file__).resolve().parents[1] / "data" / "bug_reports.db"
 DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
 
 
@@ -551,6 +553,23 @@ class ClientRequestStatusResponse(BaseModel):
     queued_count: int
     failed_count: int
     targeted_session_ids: list[str] = Field(default_factory=list)
+
+
+class ClientBugReportRequest(BaseModel):
+    """Minimal app-submitted bug report payload."""
+    report_text: str
+    include_debug_state: bool = True
+    selected_session_id: Optional[str] = None
+    client_state: Optional[Dict[str, Any]] = None
+    app_version: Optional[str] = None
+    artifact_hash: Optional[str] = None
+
+
+class ClientBugReportResponse(BaseModel):
+    """Response returned after persisting one app bug report."""
+    status: str = "submitted"
+    bug_id: str
+    maintainer_notified: bool
 
 
 class SendInputRequest(BaseModel):
@@ -1054,6 +1073,7 @@ def create_app(
     app.state.output_monitor = output_monitor
     app.state.child_monitor = child_monitor
     app.state.email_handler = email_handler
+    app.state.bug_report_store = None
     app.state.infra_supervisor = None
     app.state.last_claude_output = {}  # Store last output per session from hooks
     app.state.pending_stop_notifications = set()  # Sessions where Stop hook had empty transcript
@@ -1464,6 +1484,31 @@ def create_app(
             return Path(configured).expanduser()
         return DEFAULT_APP_ARTIFACTS_ROOT
 
+    def _bug_reports_db_path() -> Path:
+        configured = ((app.state.config or {}).get("paths") or {}).get("bug_reports_db")
+        if configured:
+            return Path(configured).expanduser()
+        return DEFAULT_BUG_REPORTS_DB
+
+    def _bug_reports_max_rows() -> int:
+        configured = ((app.state.config or {}).get("bug_reports") or {}).get("max_reports")
+        if configured is None:
+            return 30
+        try:
+            return max(1, int(configured))
+        except (TypeError, ValueError):
+            return 30
+
+    def _get_bug_report_store() -> BugReportStore:
+        store = getattr(app.state, "bug_report_store", None)
+        if store is None:
+            store = BugReportStore(
+                db_path=str(_bug_reports_db_path()),
+                max_reports=_bug_reports_max_rows(),
+            )
+            app.state.bug_report_store = store
+        return store
+
     def _app_artifact_dir(app_name: str) -> Path:
         return _app_artifacts_root() / app_name
 
@@ -1491,13 +1536,114 @@ def create_app(
         if isinstance(device_auth, dict):
             email = str(device_auth.get("email") or "").strip().lower()
             return email or None
-        session_state = getattr(request, "session", {}) or {}
+        session_state = request.scope.get("session") or {}
         email = str(session_state.get("google_email") or "").strip().lower()
         if email:
             return email
         if _is_local_bypass_request(request, app.state.config):
             return "local_bypass"
         return None
+
+    def _client_bootstrap_payload() -> dict[str, Any]:
+        external_access = _external_access_config()
+        google_auth = _google_auth_config(app.state.config)
+        public_http_host = str(external_access.get("public_http_host") or "").strip()
+        public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
+        ssh_username = str(external_access.get("ssh_username") or "").strip()
+        google_server_client_id = str(google_auth.get("client_id") or "").strip()
+        termux_supported = bool(public_ssh_host and ssh_username and not _termux_attach_infra_issue())
+        return _response_dict(
+            ClientBootstrapResponse(
+                auth={
+                    "mode": "browser_session_cookie",
+                    "session_endpoint": "/auth/session",
+                    "login_endpoint": "/auth/google/login",
+                    "logout_endpoint": "/auth/logout",
+                    "device_auth_endpoint": "/auth/device/google",
+                    "device_auth_token_type": "Bearer",
+                    "google_server_client_id": google_server_client_id or None,
+                },
+                external_access={
+                    "public_http_host": public_http_host or None,
+                    "public_ssh_host": public_ssh_host or None,
+                    "ssh_username": ssh_username or None,
+                    "termux_attach_supported": termux_supported,
+                },
+                session_open_defaults={
+                    "preferred_action": "termux_attach" if termux_supported else "details",
+                    "termux_package": "com.termux",
+                },
+            )
+        )
+
+    def _bug_report_session_list_snapshot() -> list[dict[str, Any]]:
+        if not app.state.session_manager:
+            return []
+        sessions = app.state.session_manager.list_sessions()
+        return [_response_dict(_session_to_response(session)) for session in sessions]
+
+    def _bug_report_selected_session_snapshot(selected_session_id: Optional[str]) -> Optional[dict[str, Any]]:
+        if not selected_session_id or not app.state.session_manager:
+            return None
+        session = app.state.session_manager.get_session(selected_session_id)
+        if session is None:
+            return {
+                "id": selected_session_id,
+                "found": False,
+            }
+        return {
+            "found": True,
+            "session": _mobile_session_payload(session),
+        }
+
+    def _bug_report_server_state(selected_session_id: Optional[str]) -> dict[str, Any]:
+        return {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "bootstrap": _client_bootstrap_payload(),
+            "health": {
+                "status": "healthy",
+                "termux_attach_infra_issue": _termux_attach_infra_issue(),
+                "analytics_health_checks": _analytics_health_checks(),
+            },
+            "sessions": _bug_report_session_list_snapshot(),
+            "selected_session": _bug_report_selected_session_snapshot(selected_session_id),
+        }
+
+    async def _notify_maintainer_of_bug_report(
+        *,
+        bug_id: str,
+        report_text: str,
+        selected_session_id: Optional[str],
+        db_path: Path,
+    ) -> tuple[bool, str]:
+        if not app.state.session_manager:
+            return False, "session_manager_unavailable"
+
+        ensurer = getattr(app.state.session_manager, "ensure_maintainer_session", None)
+        if not callable(ensurer):
+            return False, "maintainer_bootstrap_unavailable"
+
+        session, created = await ensurer()
+        if created and app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
+            await app.state.output_monitor.start_monitoring(session)
+        await _sync_session_display_identity(session)
+
+        summary = " ".join((report_text or "").split())
+        if len(summary) > 160:
+            summary = f"{summary[:157]}..."
+        selected = selected_session_id or "-"
+        message = (
+            f"[app bug] {bug_id}\n"
+            f"report: {summary}\n"
+            f"session: {selected}\n"
+            f"db: {db_path}"
+        )
+        result = await app.state.session_manager.send_input(
+            session_id=session.id,
+            text=message,
+            delivery_mode="important",
+        )
+        return result in {DeliveryResult.DELIVERED, DeliveryResult.QUEUED}, result.value
 
     def _infra_check(name: str) -> Optional[dict[str, Any]]:
         supervisor = getattr(app.state, "infra_supervisor", None)
@@ -1870,35 +2016,7 @@ def create_app(
     @app.get("/client/bootstrap", response_model=ClientBootstrapResponse)
     async def client_bootstrap():
         """Return runtime bootstrap config for native/mobile clients."""
-        external_access = _external_access_config()
-        google_auth = _google_auth_config(app.state.config)
-        public_http_host = str(external_access.get("public_http_host") or "").strip()
-        public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
-        ssh_username = str(external_access.get("ssh_username") or "").strip()
-        google_server_client_id = str(google_auth.get("client_id") or "").strip()
-        termux_supported = bool(public_ssh_host and ssh_username and not _termux_attach_infra_issue())
-
-        return ClientBootstrapResponse(
-            auth={
-                "mode": "browser_session_cookie",
-                "session_endpoint": "/auth/session",
-                "login_endpoint": "/auth/google/login",
-                "logout_endpoint": "/auth/logout",
-                "device_auth_endpoint": "/auth/device/google",
-                "device_auth_token_type": "Bearer",
-                "google_server_client_id": google_server_client_id or None,
-            },
-            external_access={
-                "public_http_host": public_http_host or None,
-                "public_ssh_host": public_ssh_host or None,
-                "ssh_username": ssh_username or None,
-                "termux_attach_supported": termux_supported,
-            },
-            session_open_defaults={
-                "preferred_action": "termux_attach" if termux_supported else "details",
-                "termux_package": "com.termux",
-            },
-        )
+        return ClientBootstrapResponse(**_client_bootstrap_payload())
 
     @app.get("/client/analytics/summary")
     async def client_analytics_summary():
@@ -2808,6 +2926,60 @@ def create_app(
             queued_count=queued_count,
             failed_count=failed_count,
             targeted_session_ids=targeted_session_ids,
+        )
+
+    @app.post("/client/bug-reports", response_model=ClientBugReportResponse)
+    async def submit_client_bug_report(request: Request, payload: ClientBugReportRequest):
+        """Persist one app bug report and notify maintainer."""
+        actor_email = _request_actor_email(request)
+        if actor_email is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        report_text = str(payload.report_text or "").strip()
+        if not report_text:
+            raise HTTPException(status_code=400, detail="report_text is required")
+
+        store = _get_bug_report_store()
+        route = None
+        if isinstance(payload.client_state, dict):
+            route_value = payload.client_state.get("route")
+            if isinstance(route_value, str):
+                route = route_value.strip() or None
+
+        server_state = (
+            _bug_report_server_state(payload.selected_session_id)
+            if payload.include_debug_state
+            else None
+        )
+        created = store.create_report(
+            report_text=report_text,
+            reported_by=actor_email,
+            selected_session_id=payload.selected_session_id,
+            route=route,
+            app_version=payload.app_version,
+            artifact_hash=payload.artifact_hash,
+            include_debug_state=payload.include_debug_state,
+            client_state=payload.client_state if isinstance(payload.client_state, dict) else None,
+            server_state=server_state,
+        )
+
+        maintainer_notified = False
+        delivery_result = "not_attempted"
+        try:
+            maintainer_notified, delivery_result = await _notify_maintainer_of_bug_report(
+                bug_id=created["id"],
+                report_text=report_text,
+                selected_session_id=payload.selected_session_id,
+                db_path=store.db_path,
+            )
+        except Exception as exc:
+            logger.warning("Failed to notify maintainer about app bug report %s: %s", created["id"], exc)
+            delivery_result = f"failed:{type(exc).__name__}"
+
+        store.update_delivery_result(created["id"], delivery_result)
+        return ClientBugReportResponse(
+            bug_id=created["id"],
+            maintainer_notified=maintainer_notified,
         )
 
     @app.get("/sessions/{session_id}/attach-descriptor")
