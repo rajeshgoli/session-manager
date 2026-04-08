@@ -1795,18 +1795,10 @@ def create_app(
         local_attach_script = (
             "attach_cleanup() { "
             "stty sane 2>/dev/null || true; "
-            "if [ -n \"${attach_pid:-}\" ]; then "
-            "kill \"$attach_pid\" 2>/dev/null || true; "
-            "fi; "
             "}; "
             "run_attach() { "
-            "set -m 2>/dev/null || true; "
-            f"{ssh_command} & "
-            "attach_pid=$!; "
-            "fg %1 >/dev/null 2>&1 || wait \"$attach_pid\"; "
-            "attach_status=$?; "
-            "attach_pid=''; "
-            "return \"$attach_status\"; "
+            f"{ssh_command}; "
+            "return \"$?\"; "
             "}; "
             "trap 'attach_cleanup; exit 130' INT TERM; "
             f"printf 'Connecting to {tmux_session}...\\r\\n' >/dev/tty 2>/dev/null || true; "
@@ -1828,7 +1820,7 @@ def create_app(
             "ssh_host": public_ssh_host,
             "ssh_username": ssh_username,
             "ssh_proxy_command": ssh_proxy_command or None,
-            "ssh_command": shlex.join(["bash", "-lc", local_attach_script]),
+            "ssh_command": shlex.join(["sh", "-lc", local_attach_script]),
             "tmux_session": tmux_session,
             "runtime_mode": descriptor.get("runtime_mode"),
             "termux_package": "com.termux",
