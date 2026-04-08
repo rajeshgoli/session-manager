@@ -155,14 +155,14 @@ def test_client_sessions_include_termux_attach_metadata():
         "termux_package": "com.termux",
     }
     ssh_command = payload["termux_attach"]["ssh_command"]
-    assert ssh_command.startswith("bash -lc ")
+    assert ssh_command.startswith("sh -lc ")
     assert "Connecting to codex-fork-fork1001..." in ssh_command
     assert "Attach transport failed (255); retrying once..." in ssh_command
     assert "run_attach() {" in ssh_command
     assert "stty sane" in ssh_command
-    assert "attach_pid=$!" in ssh_command
-    assert "fg %1 >/dev/null 2>&1 || wait \"$attach_pid\"" in ssh_command
-    assert "kill \"$attach_pid\"" in ssh_command
+    assert "attach_pid=$!" not in ssh_command
+    assert "fg %1 >/dev/null 2>&1 || wait \"$attach_pid\"" not in ssh_command
+    assert "kill \"$attach_pid\"" not in ssh_command
     assert "pkill -P \"$attach_pid\"" not in ssh_command
     assert "ProxyCommand=cloudflared access ssh --hostname %h" in ssh_command
     assert "rajesh@ssh.sm.rajeshgo.li" in ssh_command
