@@ -3569,6 +3569,14 @@ class SessionManager:
                 continue
 
             reason = ", ".join(missing)
+            if missing == ["control_socket"]:
+                self._set_codex_fork_control_degraded(
+                    session,
+                    f"control socket missing: {control_socket_path}",
+                )
+                degraded.append(session.id)
+                continue
+
             ok, error = await self._restart_codex_fork_runtime(session, reason=reason)
             if ok:
                 healed.append(session.id)
