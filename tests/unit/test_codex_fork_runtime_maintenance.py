@@ -60,7 +60,7 @@ def test_prune_codex_fork_runtime_artifacts_removes_dead_files(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_maintain_codex_fork_runtime_artifacts_restarts_live_session_when_bridge_files_are_missing(tmp_path):
+async def test_maintain_codex_fork_runtime_artifacts_restarts_live_session_when_all_bridge_files_are_missing(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
     session = Session(
         id="heal1234",
@@ -93,6 +93,37 @@ async def test_maintain_codex_fork_runtime_artifacts_restarts_live_session_when_
     manager._start_codex_fork_event_monitor.assert_called_once_with(session)
     assert session.error_message is None
     assert session.status == SessionStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_maintain_codex_fork_runtime_artifacts_marks_control_only_loss_degraded_without_restart(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="control123",
+        name="codex-fork-control123",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+        log_file=str(tmp_path / "control123.log"),
+        provider_resume_id="resume-control123",
+    )
+    manager.sessions[session.id] = session
+    manager.tmux.session_exists = Mock(return_value=True)
+    manager.tmux.kill_session = Mock(return_value=True)
+    manager.tmux.create_session_with_command = Mock(return_value=True)
+    manager._stop_codex_fork_event_monitor = AsyncMock()
+    manager._start_codex_fork_event_monitor = Mock()
+    manager._codex_fork_event_stream_path(session).write_text("{}\n")
+
+    result = await manager.maintain_codex_fork_runtime_artifacts()
+
+    assert result["healed"] == []
+    assert result["degraded"] == [session.id]
+    manager.tmux.kill_session.assert_not_called()
+    manager.tmux.create_session_with_command.assert_not_called()
+    manager._start_codex_fork_event_monitor.assert_not_called()
+    assert session.error_message is not None
+    assert session.error_message.startswith("codex_fork_control_degraded: control socket missing:")
 
 
 @pytest.mark.asyncio
