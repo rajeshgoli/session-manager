@@ -80,3 +80,41 @@ def test_create_session_with_command_without_prompt_keeps_single_enter(tmp_path)
     assert sleep_calls[0] == controller.shell_export_settle_seconds
     assert sleep_calls[1] == controller._compute_settle_delay_seconds(launch_call[0][4])
     assert sleep_calls[2] == controller.claude_init_no_prompt_seconds
+
+
+def test_create_session_with_command_seeds_neutral_pane_title_before_launch(tmp_path):
+    controller = TmuxController(log_dir=str(tmp_path))
+    run_calls = []
+
+    def mock_run_tmux(*args, **kwargs):
+        run_calls.append((args, kwargs))
+        return None
+
+    with patch.object(controller, "session_exists", return_value=False), \
+         patch.object(controller, "_run_tmux", side_effect=mock_run_tmux), \
+         patch("time.sleep", side_effect=lambda secs: None):
+        ok = controller.create_session_with_command(
+            session_name="claude-test",
+            working_dir=str(tmp_path),
+            log_file=str(tmp_path / "claude-test.log"),
+            session_id="sess547",
+            command="claude",
+            args=["--dangerously-skip-permissions"],
+            initial_prompt=None,
+        )
+
+    assert ok is True
+    new_session_call = next(
+        call for call in run_calls
+        if call[0][:4] == ("new-session", "-d", "-s", "claude-test")
+    )
+    pane_title_call = next(
+        call for call in run_calls
+        if call[0] == ("select-pane", "-t", "claude-test", "-T", "claude-test")
+    )
+    pipe_pane_call = next(
+        call for call in run_calls
+        if call[0][:3] == ("pipe-pane", "-t", "claude-test")
+    )
+
+    assert run_calls.index(new_session_call) < run_calls.index(pane_title_call) < run_calls.index(pipe_pane_call)
