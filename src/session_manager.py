@@ -440,6 +440,7 @@ class SessionManager:
         thread_id: int,
         *,
         persist: bool = True,
+        revive_deleted: bool = False,
     ) -> None:
         """Create or refresh a durable Telegram topic registry entry."""
         if not chat_id or not thread_id:
@@ -447,7 +448,7 @@ class SessionManager:
 
         key = (chat_id, thread_id)
         existing = self.telegram_topic_registry.get(key)
-        if existing is not None and existing.deleted_at is not None:
+        if existing is not None and existing.deleted_at is not None and not revive_deleted:
             return
         now = datetime.now()
         created_at = existing.created_at if existing else session.created_at
@@ -686,6 +687,14 @@ class SessionManager:
 
                     # Verify tmux session still exists (Claude/Codex CLI)
                     if self.tmux.session_exists(session.tmux_session):
+                        if session.telegram_chat_id and session.telegram_thread_id:
+                            self._upsert_telegram_topic_record(
+                                session,
+                                session.telegram_chat_id,
+                                session.telegram_thread_id,
+                                persist=True,
+                                revive_deleted=True,
+                            )
                         if (
                             session.provider == "codex-fork"
                             and session.status == SessionStatus.STOPPED
@@ -3047,7 +3056,12 @@ class SessionManager:
             session.telegram_chat_id = chat_id
             session.telegram_thread_id = message_id
             if message_id:
-                self._upsert_telegram_topic_record(session, chat_id, message_id)
+                self._upsert_telegram_topic_record(
+                    session,
+                    chat_id,
+                    message_id,
+                    revive_deleted=True,
+                )
             self._save_state()
 
     async def send_input(
