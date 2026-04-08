@@ -82,6 +82,19 @@ class TmuxController:
         except Exception:
             return None
 
+    def _initialize_pane_title(self, session_name: str) -> None:
+        """Seed a fresh pane with a neutral title before provider-specific updates arrive."""
+        try:
+            self._run_tmux(
+                "select-pane",
+                "-t", session_name,
+                "-T", session_name,
+                check=False,
+            )
+        except Exception:
+            # Non-fatal: pane title is best-effort only.
+            pass
+
     def _exit_copy_mode_if_needed(self, session_name: str) -> tuple[Optional[int], Optional[int]]:
         """Exit tmux copy-mode on active pane when present."""
         before = self._get_pane_in_mode(session_name)
@@ -329,6 +342,7 @@ class TmuxController:
                 "-s", session_name,
                 "-c", str(working_path),
             )
+            self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file
             self._run_tmux(
@@ -431,6 +445,7 @@ class TmuxController:
                 "-s", session_name,
                 "-c", str(working_path),
             )
+            self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file
             self._run_tmux(
