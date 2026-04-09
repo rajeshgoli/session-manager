@@ -660,9 +660,22 @@ class SessionManager:
             True if state loaded successfully (or no state file exists),
             False if an error occurred during loading.
         """
-        if self.state_file.exists():
+        state_path = self.state_file
+        if (
+            not state_path.exists()
+            and self.state_file == self.default_state_file
+            and self.legacy_state_file.exists()
+        ):
+            state_path = self.legacy_state_file
+            logger.warning(
+                "Configured state file %s missing; falling back to legacy state path %s for startup load",
+                self.state_file,
+                self.legacy_state_file,
+            )
+
+        if state_path.exists():
             try:
-                with open(self.state_file) as f:
+                with open(state_path) as f:
                     data = json.load(f)
                 legacy_codex_sessions: list[dict] = []
                 cleaned_sessions: list[dict] = []
@@ -810,8 +823,8 @@ class SessionManager:
 
                 return True
             except Exception as e:
-                logger.error(f"CRITICAL: Failed to load state from {self.state_file}: {e}")
-                logger.error(f"Session state may be lost! Please check {self.state_file}")
+                logger.error(f"CRITICAL: Failed to load state from {state_path}: {e}")
+                logger.error(f"Session state may be lost! Please check {state_path}")
                 return False
         return True  # No state file is not an error
 
