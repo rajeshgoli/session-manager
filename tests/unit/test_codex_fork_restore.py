@@ -192,3 +192,46 @@ def test_load_state_falls_back_to_legacy_tmp_state_when_migration_copy_fails(tmp
     assert restored is not None
     assert restored.provider_resume_id == "resume-copy-fail"
     assert not durable_state_file.exists()
+
+
+def test_load_state_falls_back_to_legacy_when_durable_file_is_unreadable(tmp_path):
+    legacy_state_file = tmp_path / "legacy-sessions.json"
+    home = tmp_path / "home"
+    durable_state_file = home / ".local" / "share" / "claude-sessions" / "sessions.json"
+    durable_state_file.parent.mkdir(parents=True, exist_ok=True)
+    durable_state_file.write_text("{broken json")
+    session = Session(
+        id="legacyparsefallback",
+        name="claude-legacyparsefallback",
+        working_dir=str(tmp_path / "workspace"),
+        tmux_session="claude-legacyparsefallback",
+        log_file=str(tmp_path / "legacyparsefallback.log"),
+        provider="claude",
+        status=SessionStatus.STOPPED,
+        provider_resume_id="resume-parse-fallback",
+    )
+    legacy_state_file.write_text(
+        json.dumps(
+            {
+                "sessions": [session.to_dict()],
+                "em_topic": None,
+                "maintainer_session_id": None,
+                "agent_registrations": [],
+                "adoption_proposals": [],
+            }
+        )
+    )
+
+    with patch("src.session_manager.LEGACY_TMP_SESSION_STATE_FILE", str(legacy_state_file)):
+        with patch("src.session_manager.TmuxController") as mock_tmux_cls:
+            mock_tmux_cls.return_value.session_exists.return_value = False
+            with patch.dict("os.environ", {"HOME": str(home)}):
+                manager = SessionManager(
+                    log_dir=str(tmp_path / "logs"),
+                    state_file=str(durable_state_file).replace(str(home), "~", 1),
+                    config={},
+                )
+
+    restored = manager.get_session(session.id)
+    assert restored is not None
+    assert restored.provider_resume_id == "resume-parse-fallback"
