@@ -126,6 +126,22 @@ async def test_send_notification_noisy_logs_error():
 
 
 @pytest.mark.asyncio
+async def test_rename_forum_topic_treats_not_modified_as_success():
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.edit_forum_topic = AsyncMock(side_effect=Exception("Topic_not_modified"))
+
+    result = await tg.rename_forum_topic(chat_id=10000, topic_id=50000, name="agent [abc123]")
+
+    assert result is True
+    tg.bot.edit_forum_topic.assert_awaited_once_with(
+        chat_id=10000,
+        message_thread_id=50000,
+        name="agent [abc123]",
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_notification_chunks_oversized_plain_text():
     """Oversized plain-text messages should be sent as numbered chunks."""
     tg = TelegramBot.__new__(TelegramBot)

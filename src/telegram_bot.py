@@ -358,15 +358,18 @@ class TelegramBot:
         if not self.bot:
             raise RuntimeError("Bot not initialized")
 
+        send_kwargs = {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_to_message_id": reply_to_message_id,
+            "message_thread_id": message_thread_id,
+            "reply_markup": reply_markup,
+        }
+        if parse_mode is not None:
+            send_kwargs["parse_mode"] = parse_mode
+
         try:
-            message = await self.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_to_message_id=reply_to_message_id,
-                message_thread_id=message_thread_id,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-            )
+            message = await self.bot.send_message(**send_kwargs)
         except Exception:
             self._queue_telegram_telemetry(
                 direction="out",
@@ -1563,6 +1566,9 @@ Provide ONLY the summary, no preamble or questions."""
             await self.bot.edit_forum_topic(chat_id=chat_id, message_thread_id=topic_id, name=name)
             return True
         except Exception as e:
+            if "Topic_not_modified" in str(e):
+                logger.debug("Forum topic already named %s: chat=%s, topic=%s", name, chat_id, topic_id)
+                return True
             logger.error(f"Failed to rename forum topic: {e}")
             return False
 

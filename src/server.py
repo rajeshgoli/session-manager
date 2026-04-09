@@ -68,6 +68,7 @@ APP_ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
 BUG_REPORT_MAX_TEXT_CHARS = 4000
 BUG_REPORT_MAX_CLIENT_STATE_CHARS = 100_000
 BUG_REPORT_MAX_SERVER_STATE_CHARS = 200_000
+DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS = 1.0
 DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
 DEFAULT_BUG_REPORTS_DB = Path(__file__).resolve().parents[1] / "data" / "bug_reports.db"
 DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
@@ -1852,15 +1853,70 @@ def create_app(
         base["primary_action"] = _mobile_primary_action(termux_attach, descriptor)
         return base
 
-    async def _sync_session_display_identity(session: Session) -> None:
+    async def _sync_session_display_identity(
+        session: Session,
+        display_name: Optional[str] = None,
+        *,
+        telegram_timeout_seconds: Optional[float] = None,
+    ) -> None:
         """Propagate the canonical display name to tmux and Telegram surfaces."""
-        display_name = _effective_session_name(session)
+        display_name = display_name or _effective_session_name(session)
+        tmux_synced = True
         if getattr(session, "provider", "claude") != "codex-app":
-            app.state.session_manager.tmux.set_status_bar(session.tmux_session, display_name)
-        if session.telegram_thread_id and app.state.notifier:
-            success = await app.state.notifier.rename_session_topic(session, display_name)
-            if not success:
-                logger.warning(f"Failed to rename Telegram topic for session {session.id}")
+            tmux_synced = bool(app.state.session_manager.tmux.set_status_bar(session.tmux_session, display_name))
+        telegram_synced = True
+        if session.telegram_thread_id:
+            telegram_bot = getattr(app.state.notifier, "telegram", None) if app.state.notifier else None
+            if app.state.notifier and telegram_bot:
+                try:
+                    rename_coro = app.state.notifier.rename_session_topic(session, display_name)
+                    if telegram_timeout_seconds is not None:
+                        success = await asyncio.wait_for(rename_coro, timeout=telegram_timeout_seconds)
+                    else:
+                        success = await rename_coro
+                except asyncio.TimeoutError:
+                    success = False
+                    logger.warning(
+                        "Timed out renaming Telegram topic for session %s after %.2fs",
+                        session.id,
+                        telegram_timeout_seconds,
+                    )
+                if not success:
+                    telegram_synced = False
+                    logger.warning(f"Failed to rename Telegram topic for session {session.id}")
+            else:
+                telegram_synced = False
+        if tmux_synced and telegram_synced:
+            if (
+                session.display_identity_synced_name != display_name
+                or session.display_identity_synced_at_ns is None
+                or session.display_identity_synced_chat_id != session.telegram_chat_id
+                or session.display_identity_synced_thread_id != session.telegram_thread_id
+            ):
+                session.display_identity_synced_name = display_name
+                session.display_identity_synced_at_ns = time.time_ns()
+                session.display_identity_synced_chat_id = session.telegram_chat_id
+                session.display_identity_synced_thread_id = session.telegram_thread_id
+                app.state.session_manager._save_state()
+
+    async def _ensure_session_display_identity_synced(session: Session) -> None:
+        """Sync external display surfaces when lazy identity discovery changed the effective name."""
+        if not app.state.session_manager:
+            return
+        if session.status == SessionStatus.STOPPED:
+            return
+        display_name = _effective_session_name(session)
+        if (
+            session.display_identity_synced_name == display_name
+            and session.display_identity_synced_chat_id == session.telegram_chat_id
+            and session.display_identity_synced_thread_id == session.telegram_thread_id
+        ):
+            return
+        await _sync_session_display_identity(
+            session,
+            display_name,
+            telegram_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
+        )
 
     def _configure_watch_frontend() -> None:
         """Serve the mobile dashboard if static assets exist in web/sm-watch/dist."""
@@ -2878,6 +2934,9 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
         sessions = app.state.session_manager.list_sessions(include_stopped=include_stopped)
+        await asyncio.gather(
+            *(_ensure_session_display_identity_synced(s) for s in sessions),
+        )
 
         return {
             "sessions": [
@@ -2893,6 +2952,9 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
         sessions = app.state.session_manager.list_sessions()
+        await asyncio.gather(
+            *(_ensure_session_display_identity_synced(s) for s in sessions),
+        )
         return {
             "sessions": [_mobile_session_payload(session) for session in sessions]
         }
@@ -3050,6 +3112,7 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
+        await _ensure_session_display_identity_synced(session)
         return _session_to_response(session)
 
     @app.get("/client/sessions/{session_id}")
@@ -3062,6 +3125,7 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
+        await _ensure_session_display_identity_synced(session)
         return _mobile_session_payload(session)
 
     @app.get("/sessions/{session_id}/codex-events")
