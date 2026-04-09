@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from src.models import AgentRegistration, Session, SessionStatus
@@ -87,3 +88,64 @@ def test_load_state_preserves_stopped_restore_target_without_tmux_runtime(tmp_pa
     assert restored.status == SessionStatus.STOPPED
     assert restored.provider_resume_id == "019d5bac-3980-7291-8b17-b61f5e618748"
     assert [s.id for s in manager.list_sessions(include_stopped=True)] == [session.id]
+
+
+def test_state_file_expands_user_and_creates_parent_dir(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    with patch("src.session_manager.TmuxController") as mock_tmux_cls:
+        mock_tmux_cls.return_value.session_exists.return_value = False
+        manager = SessionManager(
+            log_dir=str(tmp_path / "logs"),
+            state_file="~/.local/share/claude-sessions/sessions.json",
+            config={},
+        )
+
+    expected_state_path = home / ".local" / "share" / "claude-sessions" / "sessions.json"
+    assert manager.state_file == expected_state_path
+    assert expected_state_path.parent.exists()
+
+
+def test_load_state_migrates_legacy_tmp_state_file_when_durable_target_missing(tmp_path):
+    legacy_state_file = tmp_path / "legacy-sessions.json"
+    home = tmp_path / "home"
+    durable_state_file = home / ".local" / "share" / "claude-sessions" / "sessions.json"
+    session = Session(
+        id="legacy123",
+        name="claude-legacy123",
+        working_dir=str(tmp_path / "workspace"),
+        tmux_session="claude-legacy123",
+        log_file=str(tmp_path / "legacy.log"),
+        provider="claude",
+        status=SessionStatus.STOPPED,
+        provider_resume_id="resume-legacy123",
+    )
+    legacy_state_file.write_text(
+        json.dumps(
+            {
+                "sessions": [session.to_dict()],
+                "em_topic": None,
+                "maintainer_session_id": None,
+                "agent_registrations": [],
+                "adoption_proposals": [],
+            }
+        )
+    )
+
+    with patch("src.session_manager.LEGACY_TMP_SESSION_STATE_FILE", str(legacy_state_file)):
+        with patch("src.session_manager.TmuxController") as mock_tmux_cls:
+            mock_tmux_cls.return_value.session_exists.return_value = False
+            with patch.dict("os.environ", {"HOME": str(home)}):
+                manager = SessionManager(
+                    log_dir=str(tmp_path / "logs"),
+                    state_file=str(durable_state_file).replace(str(home), "~", 1),
+                    config={},
+                )
+
+    restored = manager.get_session(session.id)
+    assert restored is not None
+    assert restored.provider_resume_id == "resume-legacy123"
+    assert durable_state_file.exists()
+    assert json.loads(durable_state_file.read_text())["sessions"][0]["id"] == session.id
+    assert legacy_state_file.exists()

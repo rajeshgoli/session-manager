@@ -45,6 +45,10 @@ from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_p
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LOG_DIR = "/tmp/claude-sessions"
+DEFAULT_SESSION_STATE_FILE = "~/.local/share/claude-sessions/sessions.json"
+LEGACY_TMP_SESSION_STATE_FILE = "/tmp/claude-sessions/sessions.json"
+
 DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
     As engineer, act as the Session Manager maintainer service agent for this repository.
@@ -132,13 +136,16 @@ class SessionManager:
 
     def __init__(
         self,
-        log_dir: str = "/tmp/claude-sessions",
-        state_file: str = "/tmp/claude-sessions/sessions.json",
+        log_dir: str = DEFAULT_LOG_DIR,
+        state_file: str = DEFAULT_SESSION_STATE_FILE,
         config: Optional[dict] = None,
     ):
-        self.log_dir = Path(log_dir)
+        self.log_dir = Path(log_dir).expanduser()
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file = Path(state_file)
+        self.state_file = Path(state_file).expanduser()
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.default_state_file = Path(DEFAULT_SESSION_STATE_FILE).expanduser()
+        self.legacy_state_file = Path(LEGACY_TMP_SESSION_STATE_FILE)
         self.config = config or {}
         self.process_generation = uuid.uuid4().hex[:12]
 
@@ -373,9 +380,35 @@ class SessionManager:
         self.maintainer_session_id: Optional[str] = None
 
         self._load_telegram_topic_registry()
+        self._migrate_legacy_state_file_if_needed()
 
         # Load existing sessions from state file
         self._load_state()
+
+    def _migrate_legacy_state_file_if_needed(self) -> None:
+        """Copy a pre-durable temp-backed session registry into the configured path once."""
+        if self.state_file != self.default_state_file:
+            return
+        if self.state_file == self.legacy_state_file:
+            return
+        if self.state_file.exists() or not self.legacy_state_file.exists():
+            return
+
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.legacy_state_file, self.state_file)
+            logger.info(
+                "Migrated session state from legacy path %s to %s",
+                self.legacy_state_file,
+                self.state_file,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to migrate legacy state file from %s to %s: %s",
+                self.legacy_state_file,
+                self.state_file,
+                exc,
+            )
 
     def _load_telegram_topic_registry(self) -> bool:
         """Load the durable Telegram topic registry from disk."""
