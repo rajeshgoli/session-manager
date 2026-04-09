@@ -45,6 +45,10 @@ from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_p
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LOG_DIR = "/tmp/claude-sessions"
+DEFAULT_SESSION_STATE_FILE = "~/.local/share/claude-sessions/sessions.json"
+LEGACY_TMP_SESSION_STATE_FILE = "/tmp/claude-sessions/sessions.json"
+
 DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
     As engineer, act as the Session Manager maintainer service agent for this repository.
@@ -132,13 +136,16 @@ class SessionManager:
 
     def __init__(
         self,
-        log_dir: str = "/tmp/claude-sessions",
-        state_file: str = "/tmp/claude-sessions/sessions.json",
+        log_dir: str = DEFAULT_LOG_DIR,
+        state_file: str = DEFAULT_SESSION_STATE_FILE,
         config: Optional[dict] = None,
     ):
-        self.log_dir = Path(log_dir)
+        self.log_dir = Path(log_dir).expanduser()
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file = Path(state_file)
+        self.state_file = Path(state_file).expanduser()
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.default_state_file = Path(DEFAULT_SESSION_STATE_FILE).expanduser()
+        self.legacy_state_file = Path(LEGACY_TMP_SESSION_STATE_FILE)
         self.config = config or {}
         self.process_generation = uuid.uuid4().hex[:12]
 
@@ -373,9 +380,35 @@ class SessionManager:
         self.maintainer_session_id: Optional[str] = None
 
         self._load_telegram_topic_registry()
+        self._migrate_legacy_state_file_if_needed()
 
         # Load existing sessions from state file
         self._load_state()
+
+    def _migrate_legacy_state_file_if_needed(self) -> None:
+        """Copy a pre-durable temp-backed session registry into the configured path once."""
+        if self.state_file != self.default_state_file:
+            return
+        if self.state_file == self.legacy_state_file:
+            return
+        if self.state_file.exists() or not self.legacy_state_file.exists():
+            return
+
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.legacy_state_file, self.state_file)
+            logger.info(
+                "Migrated session state from legacy path %s to %s",
+                self.legacy_state_file,
+                self.state_file,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to migrate legacy state file from %s to %s: %s",
+                self.legacy_state_file,
+                self.state_file,
+                exc,
+            )
 
     def _load_telegram_topic_registry(self) -> bool:
         """Load the durable Telegram topic registry from disk."""
@@ -627,160 +660,202 @@ class SessionManager:
             True if state loaded successfully (or no state file exists),
             False if an error occurred during loading.
         """
-        if self.state_file.exists():
+        state_path = self.state_file
+        if (
+            not state_path.exists()
+            and self.state_file == self.default_state_file
+            and self.legacy_state_file.exists()
+        ):
+            state_path = self.legacy_state_file
+            logger.warning(
+                "Configured state file %s missing; falling back to legacy state path %s for startup load",
+                self.state_file,
+                self.legacy_state_file,
+            )
+
+        if state_path.exists():
             try:
-                with open(self.state_file) as f:
+                with open(state_path) as f:
                     data = json.load(f)
-                legacy_codex_sessions: list[dict] = []
-                cleaned_sessions: list[dict] = []
-                retired_codex_app_sessions = False
-                registry_backfilled = False
-                for session_data in data.get("sessions", []):
-                    raw_provider = session_data.get("provider")
-                    raw_tmux_session = session_data.get("tmux_session")
-                    raw_log_file = session_data.get("log_file")
-                    raw_codex_thread_id = session_data.get("codex_thread_id")
-                    is_legacy_codex_app = (
-                        raw_provider == "codex"
-                        and (
-                            raw_codex_thread_id is not None
-                            or (not raw_tmux_session and not raw_log_file)
-                        )
+            except Exception as e:
+                if (
+                    state_path == self.state_file
+                    and self.state_file == self.default_state_file
+                    and self.legacy_state_file.exists()
+                ):
+                    logger.warning(
+                        "Failed to read configured state file %s (%s); falling back to legacy state path %s",
+                        self.state_file,
+                        e,
+                        self.legacy_state_file,
                     )
-                    if is_legacy_codex_app:
-                        legacy_codex_sessions.append(session_data)
-                        name = session_data.get("name") or session_data.get("id", "unknown")
-                        logger.warning(
-                            f"Dropping legacy codex app session from state: {name}"
-                        )
-                        continue
-                    cleaned_sessions.append(session_data)
-                    session = Session.from_dict(session_data)
-                    if session.telegram_chat_id and session.telegram_thread_id:
-                        key = (session.telegram_chat_id, session.telegram_thread_id)
-                        if key not in self.telegram_topic_registry:
-                            registry_backfilled = True
-                        self._upsert_telegram_topic_record(
-                            session,
-                            session.telegram_chat_id,
-                            session.telegram_thread_id,
-                            persist=False,
-                        )
-                    # Codex app-server sessions are restored without tmux
-                    if session.provider == "codex-app":
-                        if (
-                            self.codex_provider_mapping_phase == "post_cutover"
-                            and not (
-                                session.status == SessionStatus.STOPPED
-                                and session.error_message == CODEX_APP_RETIRED_SESSION_REASON
-                            )
-                        ):
-                            self._retire_codex_app_session_state(
-                                session,
-                                reason=CODEX_APP_RETIRED_SESSION_REASON,
-                                cleanup_queue=False,
-                            )
-                            retired_codex_app_sessions = True
-                        self.sessions[session.id] = session
-                        logger.info(f"Restored codex app session: {session.name}")
-                        continue
+                    try:
+                        with open(self.legacy_state_file) as f:
+                            data = json.load(f)
+                        state_path = self.legacy_state_file
+                    except Exception as legacy_exc:
+                        logger.error(f"CRITICAL: Failed to load state from {self.legacy_state_file}: {legacy_exc}")
+                        logger.error(f"Session state may be lost! Please check {self.legacy_state_file}")
+                        return False
+                else:
+                    logger.error(f"CRITICAL: Failed to load state from {state_path}: {e}")
+                    logger.error(f"Session state may be lost! Please check {state_path}")
+                    return False
 
-                    # Verify tmux session still exists (Claude/Codex CLI)
-                    if self.tmux.session_exists(session.tmux_session):
-                        if session.telegram_chat_id and session.telegram_thread_id:
-                            self._upsert_telegram_topic_record(
-                                session,
-                                session.telegram_chat_id,
-                                session.telegram_thread_id,
-                                persist=True,
-                                revive_deleted=True,
-                            )
-                        if (
-                            session.provider == "codex-fork"
-                            and session.status == SessionStatus.STOPPED
-                            and self._codex_fork_runtime_reachable(session)
-                        ):
-                            session.status = SessionStatus.IDLE
-                            session.completion_status = None
-                            session.completion_message = None
-                            logger.info(
-                                "Healed stopped codex-fork session %s because detached runtime is still reachable",
-                                session.name,
-                            )
-                        self.sessions[session.id] = session
-                        if session.provider == "codex-fork":
-                            self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
-                        logger.info(f"Restored session: {session.name}")
-                    else:
-                        if session.status == SessionStatus.STOPPED:
-                            self.sessions[session.id] = session
-                            logger.info(
-                                "Restored stopped session record without live tmux runtime: %s",
-                                session.name,
-                            )
-                            continue
-                        logger.warning(f"Session {session.name} no longer exists in tmux")
-                        # Collect orphaned Telegram forum topics for cleanup at startup.
-                        # Only collect if chat_id matches the known forum group —
-                        # in non-forum chats, telegram_thread_id is a reply message_id,
-                        # not a forum topic, so delete_forum_topic would fail.
-                        if (
-                            session.telegram_chat_id
-                            and session.telegram_thread_id
-                            and self.default_forum_chat_id
-                            and session.telegram_chat_id == self.default_forum_chat_id
-                        ):
-                            self.orphaned_topics.append(
-                                (session.telegram_chat_id, session.telegram_thread_id)
-                            )
-                            logger.info(
-                                f"Collected orphaned topic: chat={session.telegram_chat_id}, "
-                                f"thread={session.telegram_thread_id} from dead session {session.name}"
-                            )
-                if legacy_codex_sessions:
-                    preserved_state = {key: value for key, value in data.items() if key != "sessions"}
-                    self._rewrite_state_raw(cleaned_sessions, extra_state=preserved_state)
-                if registry_backfilled:
-                    self._save_telegram_topic_registry()
-
-                # Load EM topic continuity field (backward compat: missing = None)
-                self.em_topic = data.get("em_topic")
-                self.maintainer_session_id = data.get("maintainer_session_id")
-                self.agent_registrations = {}
-                raw_last_session_ids = data.get("agent_role_last_session_ids", {})
-                self.agent_role_last_session_ids = (
-                    {
-                        self.normalize_agent_role(str(role)): str(session_id)
-                        for role, session_id in raw_last_session_ids.items()
-                        if self.normalize_agent_role(str(role)) and str(session_id).strip()
-                    }
-                    if isinstance(raw_last_session_ids, dict)
-                    else {}
-                )
-                for registration_data in data.get("agent_registrations", []):
-                    registration = AgentRegistration.from_dict(registration_data)
-                    self.agent_registrations[registration.role] = registration
-                    self.agent_role_last_session_ids[registration.role] = registration.session_id
-                if self.maintainer_session_id and "maintainer" not in self.agent_registrations:
-                    self.agent_registrations["maintainer"] = AgentRegistration(
-                        role="maintainer",
-                        session_id=self.maintainer_session_id,
-                    )
-                    self.agent_role_last_session_ids["maintainer"] = self.maintainer_session_id
-                self.adoption_proposals = {}
-                for proposal_data in data.get("adoption_proposals", []):
-                    proposal = AdoptionProposal.from_dict(proposal_data)
-                    self.adoption_proposals[proposal.id] = proposal
-                registry_changed = self._prune_agent_registrations(persist=False)
-                if retired_codex_app_sessions or registry_changed:
-                    self._save_state()
-
+            try:
+                self._hydrate_state_from_data(data)
                 return True
             except Exception as e:
-                logger.error(f"CRITICAL: Failed to load state from {self.state_file}: {e}")
-                logger.error(f"Session state may be lost! Please check {self.state_file}")
+                logger.error(f"CRITICAL: Failed to load state from {state_path}: {e}")
+                logger.error(f"Session state may be lost! Please check {state_path}")
                 return False
         return True  # No state file is not an error
+
+    def _hydrate_state_from_data(self, data: dict) -> None:
+        """Apply parsed state payload to the in-memory session manager."""
+        legacy_codex_sessions: list[dict] = []
+        cleaned_sessions: list[dict] = []
+        retired_codex_app_sessions = False
+        registry_backfilled = False
+        for session_data in data.get("sessions", []):
+            raw_provider = session_data.get("provider")
+            raw_tmux_session = session_data.get("tmux_session")
+            raw_log_file = session_data.get("log_file")
+            raw_codex_thread_id = session_data.get("codex_thread_id")
+            is_legacy_codex_app = (
+                raw_provider == "codex"
+                and (
+                    raw_codex_thread_id is not None
+                    or (not raw_tmux_session and not raw_log_file)
+                )
+            )
+            if is_legacy_codex_app:
+                legacy_codex_sessions.append(session_data)
+                name = session_data.get("name") or session_data.get("id", "unknown")
+                logger.warning(
+                    f"Dropping legacy codex app session from state: {name}"
+                )
+                continue
+            cleaned_sessions.append(session_data)
+            session = Session.from_dict(session_data)
+            if session.telegram_chat_id and session.telegram_thread_id:
+                key = (session.telegram_chat_id, session.telegram_thread_id)
+                if key not in self.telegram_topic_registry:
+                    registry_backfilled = True
+                self._upsert_telegram_topic_record(
+                    session,
+                    session.telegram_chat_id,
+                    session.telegram_thread_id,
+                    persist=False,
+                )
+            # Codex app-server sessions are restored without tmux
+            if session.provider == "codex-app":
+                if (
+                    self.codex_provider_mapping_phase == "post_cutover"
+                    and not (
+                        session.status == SessionStatus.STOPPED
+                        and session.error_message == CODEX_APP_RETIRED_SESSION_REASON
+                    )
+                ):
+                    self._retire_codex_app_session_state(
+                        session,
+                        reason=CODEX_APP_RETIRED_SESSION_REASON,
+                        cleanup_queue=False,
+                    )
+                    retired_codex_app_sessions = True
+                self.sessions[session.id] = session
+                logger.info(f"Restored codex app session: {session.name}")
+                continue
+
+            # Verify tmux session still exists (Claude/Codex CLI)
+            if self.tmux.session_exists(session.tmux_session):
+                if session.telegram_chat_id and session.telegram_thread_id:
+                    self._upsert_telegram_topic_record(
+                        session,
+                        session.telegram_chat_id,
+                        session.telegram_thread_id,
+                        persist=True,
+                        revive_deleted=True,
+                    )
+                if (
+                    session.provider == "codex-fork"
+                    and session.status == SessionStatus.STOPPED
+                    and self._codex_fork_runtime_reachable(session)
+                ):
+                    session.status = SessionStatus.IDLE
+                    session.completion_status = None
+                    session.completion_message = None
+                    logger.info(
+                        "Healed stopped codex-fork session %s because detached runtime is still reachable",
+                        session.name,
+                    )
+                self.sessions[session.id] = session
+                if session.provider == "codex-fork":
+                    self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
+                logger.info(f"Restored session: {session.name}")
+            else:
+                if session.status == SessionStatus.STOPPED:
+                    self.sessions[session.id] = session
+                    logger.info(
+                        "Restored stopped session record without live tmux runtime: %s",
+                        session.name,
+                    )
+                    continue
+                logger.warning(f"Session {session.name} no longer exists in tmux")
+                # Collect orphaned Telegram forum topics for cleanup at startup.
+                # Only collect if chat_id matches the known forum group —
+                # in non-forum chats, telegram_thread_id is a reply message_id,
+                # not a forum topic, so delete_forum_topic would fail.
+                if (
+                    session.telegram_chat_id
+                    and session.telegram_thread_id
+                    and self.default_forum_chat_id
+                    and session.telegram_chat_id == self.default_forum_chat_id
+                ):
+                    self.orphaned_topics.append(
+                        (session.telegram_chat_id, session.telegram_thread_id)
+                    )
+                    logger.info(
+                        f"Collected orphaned topic: chat={session.telegram_chat_id}, "
+                        f"thread={session.telegram_thread_id} from dead session {session.name}"
+                    )
+        if legacy_codex_sessions:
+            preserved_state = {key: value for key, value in data.items() if key != "sessions"}
+            self._rewrite_state_raw(cleaned_sessions, extra_state=preserved_state)
+        if registry_backfilled:
+            self._save_telegram_topic_registry()
+
+        # Load EM topic continuity field (backward compat: missing = None)
+        self.em_topic = data.get("em_topic")
+        self.maintainer_session_id = data.get("maintainer_session_id")
+        self.agent_registrations = {}
+        raw_last_session_ids = data.get("agent_role_last_session_ids", {})
+        self.agent_role_last_session_ids = (
+            {
+                self.normalize_agent_role(str(role)): str(session_id)
+                for role, session_id in raw_last_session_ids.items()
+                if self.normalize_agent_role(str(role)) and str(session_id).strip()
+            }
+            if isinstance(raw_last_session_ids, dict)
+            else {}
+        )
+        for registration_data in data.get("agent_registrations", []):
+            registration = AgentRegistration.from_dict(registration_data)
+            self.agent_registrations[registration.role] = registration
+            self.agent_role_last_session_ids[registration.role] = registration.session_id
+        if self.maintainer_session_id and "maintainer" not in self.agent_registrations:
+            self.agent_registrations["maintainer"] = AgentRegistration(
+                role="maintainer",
+                session_id=self.maintainer_session_id,
+            )
+            self.agent_role_last_session_ids["maintainer"] = self.maintainer_session_id
+        self.adoption_proposals = {}
+        for proposal_data in data.get("adoption_proposals", []):
+            proposal = AdoptionProposal.from_dict(proposal_data)
+            self.adoption_proposals[proposal.id] = proposal
+        registry_changed = self._prune_agent_registrations(persist=False)
+        if retired_codex_app_sessions or registry_changed:
+            self._save_state()
 
     def _rewrite_state_raw(self, sessions_data: list[dict], extra_state: Optional[dict] = None) -> bool:
         """Rewrite state file with provided session data (used for one-time cleanup)."""

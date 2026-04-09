@@ -17,7 +17,7 @@ import yaml
 import uvicorn
 
 from .models import Session, SessionStatus, NotificationEvent, UserInput, DeliveryResult
-from .session_manager import SessionManager
+from .session_manager import SessionManager, DEFAULT_SESSION_STATE_FILE
 from .output_monitor import OutputMonitor
 from .telegram_bot import TelegramBot
 from .email_handler import EmailHandler
@@ -220,7 +220,7 @@ class SessionManagerApp:
 
         # Paths
         self.log_dir = config.get("paths", {}).get("log_dir", "/tmp/claude-sessions")
-        self.state_file = config.get("paths", {}).get("state_file", "/tmp/claude-sessions/sessions.json")
+        self.state_file = config.get("paths", {}).get("state_file", DEFAULT_SESSION_STATE_FILE)
 
         # Initialize components
         self.session_manager = SessionManager(
