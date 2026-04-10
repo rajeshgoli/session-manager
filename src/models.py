@@ -310,6 +310,10 @@ class Session:
     native_title: Optional[str] = None  # Provider-native display title (e.g. Claude /rename)
     native_title_updated_at_ns: Optional[int] = None  # Last provider-native title change time
     native_title_source_mtime_ns: Optional[int] = None  # Transcript mtime used when syncing native_title
+    display_identity_synced_name: Optional[str] = None  # Last effective name propagated to external surfaces
+    display_identity_synced_at_ns: Optional[int] = None  # Last external display sync time
+    display_identity_synced_chat_id: Optional[int] = None  # Telegram chat identity covered by last display sync
+    display_identity_synced_thread_id: Optional[int] = None  # Telegram thread/topic covered by last display sync
     current_task: Optional[str] = None  # What the session is currently working on
     git_remote_url: Optional[str] = None  # Git remote URL for repo matching
     subagents: List[Subagent] = field(default_factory=list)  # Subagents spawned by this session
@@ -395,6 +399,10 @@ class Session:
             "native_title": self.native_title,
             "native_title_updated_at_ns": self.native_title_updated_at_ns,
             "native_title_source_mtime_ns": self.native_title_source_mtime_ns,
+            "display_identity_synced_name": self.display_identity_synced_name,
+            "display_identity_synced_at_ns": self.display_identity_synced_at_ns,
+            "display_identity_synced_chat_id": self.display_identity_synced_chat_id,
+            "display_identity_synced_thread_id": self.display_identity_synced_thread_id,
             "current_task": self.current_task,
             "git_remote_url": self.git_remote_url,
             "subagents": [s.to_dict() for s in self.subagents],
@@ -481,6 +489,10 @@ class Session:
             native_title=data.get("native_title"),
             native_title_updated_at_ns=data.get("native_title_updated_at_ns"),
             native_title_source_mtime_ns=data.get("native_title_source_mtime_ns"),
+            display_identity_synced_name=data.get("display_identity_synced_name"),
+            display_identity_synced_at_ns=data.get("display_identity_synced_at_ns"),
+            display_identity_synced_chat_id=data.get("display_identity_synced_chat_id"),
+            display_identity_synced_thread_id=data.get("display_identity_synced_thread_id"),
             current_task=data.get("current_task"),
             git_remote_url=data.get("git_remote_url"),
             subagents=subagents,
