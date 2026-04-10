@@ -98,6 +98,11 @@ export interface Session {
   primary_action?: PrimaryAction | null;
 }
 
+export interface EnsureMaintainerResponse {
+  created: boolean;
+  session: Session;
+}
+
 export interface WatchSection {
   repoKey: string;
   repoLabel: string;
