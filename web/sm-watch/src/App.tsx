@@ -13,7 +13,7 @@ import {
   WifiOff,
   X,
 } from 'lucide-react';
-import { Session, SessionDetail, ToolCallRow, ActivityActionRow } from './types';
+import { Session, SessionDetail, ToolCallRow, ActivityActionRow, EnsureMaintainerResponse } from './types';
 import {
   StatusFilter,
   ageFromIso,
@@ -31,6 +31,7 @@ const POLL_MS = 4000;
 const DETAIL_STALE_MS = 12000;
 const KILL_PATH = '/sessions/{id}/kill';
 const BUG_REPORT_PATH = '/client/bug-reports';
+const MAINTAINER_ENSURE_PATH = '/maintainer/ensure';
 
 async function fetchJson<T>(paths: string[]): Promise<T | null> {
   for (const path of paths) {
@@ -152,6 +153,7 @@ export default function App() {
   const [bugReportIncludeDebugState, setBugReportIncludeDebugState] = useState(true);
   const [bugReportSessionId, setBugReportSessionId] = useState<string | null>(null);
   const [isSubmittingBugReport, setIsSubmittingBugReport] = useState(false);
+  const [isEnsuringMaintainer, setIsEnsuringMaintainer] = useState(false);
 
   const pollSessions = async () => {
     if (isPaused) {
@@ -422,6 +424,60 @@ export default function App() {
     }
   };
 
+  const handleEnsureMaintainer = async () => {
+    setIsEnsuringMaintainer(true);
+    try {
+      const response = await fetch(MAINTAINER_ENSURE_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+
+      if (response.status === 401) {
+        const nextPath = window.location.pathname || '/watch/';
+        window.location.assign(`/auth/google/login?next=${encodeURIComponent(nextPath)}`);
+        return;
+      }
+
+      let payload: (Partial<EnsureMaintainerResponse> & { detail?: string }) | null = null;
+      try {
+        payload = (await response.json()) as Partial<EnsureMaintainerResponse> & { detail?: string };
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        showToast(payload?.detail || 'Maintainer wake failed.');
+        return;
+      }
+
+      const session = payload?.session;
+      if (!session) {
+        showToast('Maintainer wake response was incomplete.');
+        return;
+      }
+
+      setSessions((prev) => {
+        const index = prev.findIndex((candidate) => candidate.id === session.id);
+        if (index === -1) {
+          return [session, ...prev];
+        }
+        const next = [...prev];
+        next[index] = session;
+        return next;
+      });
+      setIsConnected(true);
+      setLastSync(new Date());
+      setError(null);
+      showToast(`Maintainer ${payload?.created ? 'started' : 'ready'}: ${sessionDisplayName(session)} [${session.id}]`);
+      void pollSessions();
+    } catch {
+      showToast('Maintainer wake failed.');
+    } finally {
+      setIsEnsuringMaintainer(false);
+    }
+  };
+
   const bugReportSession = bugReportSessionId ? sessionsById.get(bugReportSessionId) || null : null;
 
   return (
@@ -459,6 +515,15 @@ export default function App() {
               >
                 {isPaused ? <Play size={13} /> : <Pause size={13} />}
                 {isPaused ? 'resume polling' : 'pause polling'}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleEnsureMaintainer()}
+                disabled={isEnsuringMaintainer}
+                className="inline-flex items-center gap-2 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-100 transition hover:border-cyan-400/50 hover:text-cyan-50 disabled:cursor-not-allowed disabled:text-cyan-500"
+              >
+                <Shield size={13} />
+                {isEnsuringMaintainer ? 'Starting...' : 'Wake maintainer'}
               </button>
               <button
                 type="button"
