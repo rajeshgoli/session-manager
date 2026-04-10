@@ -148,11 +148,23 @@ async def test_cleanup_deletes_topics_when_session_record_is_missing():
 
 
 @pytest.mark.asyncio
-async def test_cleanup_skips_em_live_tmux_non_forum_deleted_and_codex_app_topics():
+async def test_cleanup_deletes_orphaned_codex_app_topics():
+    record = _make_record("goneapp", thread_id=54321, provider="codex-app", tmux_session="")
+    app = _make_app({}, records=[record])
+
+    result = await app._cleanup_stale_telegram_topics_once()
+
+    assert result == {"deleted": 1, "skipped": 0}
+    assert record.deleted_at is not None
+    app.session_manager.mark_telegram_topic_deleted.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_skips_em_live_tmux_non_forum_deleted_and_live_codex_app_topics():
     live = _make_session("live1", thread_id=10002, tmux_session="claude-live1")
     sessions = {
         "live1": live,
-        "app1": _make_session("app1", provider="codex-app", tmux_session=""),
+        "app1": _make_session("app1", provider="codex-app", thread_id=10005, tmux_session=""),
     }
     records = [
         _make_record("em1", thread_id=10001, is_em_topic=True),
@@ -218,6 +230,22 @@ async def test_cleanup_deletes_duplicate_topic_for_live_session():
         live_tmux_sessions={"claude-live1"},
         records=[old_record, current_record],
     )
+
+    result = await app._cleanup_stale_telegram_topics_once()
+
+    assert result == {"deleted": 1, "skipped": 1}
+    assert old_record.deleted_at is not None
+    assert current_record.deleted_at is None
+    assert session.telegram_thread_id == 20002
+    app.telegram_bot.delete_forum_topic.assert_awaited_once_with(-1003506774897, 20001)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deletes_duplicate_topic_for_live_codex_app_session():
+    session = _make_session("app1", provider="codex-app", thread_id=20002, tmux_session="")
+    old_record = _make_record("app1", provider="codex-app", thread_id=20001, tmux_session="")
+    current_record = _make_record("app1", provider="codex-app", thread_id=20002, tmux_session="")
+    app = _make_app({"app1": session}, records=[old_record, current_record])
 
     result = await app._cleanup_stale_telegram_topics_once()
 
