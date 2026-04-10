@@ -60,6 +60,66 @@ def test_android_sshd_repairs_via_launch_agent_when_listener_is_down(monkeypatch
     assert result["details"]["actions"] == ["bootstrap", "kickstart"]
 
 
+def test_android_tunnel_reports_warning_when_launch_agent_missing(tmp_path):
+    supervisor = InfrastructureSupervisor(
+        {
+            "external_access": {
+                "public_ssh_host": "sm-ssh.example.com",
+                "ssh_proxy_command": "cloudflared access ssh --hostname %h",
+            },
+            "infra_supervisor": {
+                "android_tunnel": {
+                    "launch_agent_plist": str(tmp_path / "missing_tunnel.plist"),
+                }
+            },
+        }
+    )
+
+    supervisor._ensure_android_sshd = lambda: {"status": "ok"}
+    supervisor._ensure_tmux_base = lambda: {"status": "ok"}
+    supervisor._ensure_ac_caffeinate = lambda: {"status": "ok"}
+
+    result = supervisor.ensure_now()["android_tunnel"]
+
+    assert result["status"] == "warning"
+    assert "launch agent is missing" in result["message"]
+    assert result["details"]["attach_ready"] is False
+
+
+def test_android_tunnel_repairs_via_launch_agent_when_down(monkeypatch, tmp_path):
+    plist_path = tmp_path / "com.rajesh.sm-android-tunnel.plist"
+    plist_path.write_text("<plist/>")
+
+    supervisor = InfrastructureSupervisor(
+        {
+            "external_access": {
+                "public_ssh_host": "sm-ssh.example.com",
+                "ssh_proxy_command": "cloudflared access ssh --hostname %h",
+            },
+            "infra_supervisor": {
+                "android_tunnel": {
+                    "launch_agent_plist": str(plist_path),
+                    "launch_agent_label": "com.rajesh.sm-android-tunnel",
+                }
+            },
+        }
+    )
+
+    states = iter([False, True])
+    monkeypatch.setattr(supervisor, "_ensure_android_sshd", lambda: {"status": "ok"})
+    monkeypatch.setattr(supervisor, "_ensure_tmux_base", lambda: {"status": "ok"})
+    monkeypatch.setattr(supervisor, "_ensure_ac_caffeinate", lambda: {"status": "ok"})
+    monkeypatch.setattr(supervisor, "_launch_agent_running", lambda label: next(states))
+    monkeypatch.setattr(supervisor, "_repair_launch_agent", lambda label, path: ["bootstrap", "kickstart"])
+
+    result = supervisor.ensure_now()["android_tunnel"]
+
+    assert result["status"] == "warning"
+    assert "was down and was restarted" in result["message"]
+    assert result["details"]["attach_ready"] is True
+    assert result["details"]["actions"] == ["bootstrap", "kickstart"]
+
+
 def test_tmux_base_is_recreated_when_missing(monkeypatch):
     supervisor = InfrastructureSupervisor({})
     monkeypatch.setattr(supervisor, "_ensure_android_sshd", lambda: {"status": "ok"})
