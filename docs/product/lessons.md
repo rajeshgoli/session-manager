@@ -18,3 +18,4 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - Mobile attach readiness depends on both local `sm-android-sshd` and the public cloudflared tunnel. If Termux reports `websocket: bad handshake`, check `com.rajesh.sm-android-tunnel` before debugging tmux or app code.
 - Telegram topic cleanup must treat `Topic_id_invalid` as already-cleaned remote state and tombstone the local registry record; otherwise one invalid topic can stay active and fail deletion forever.
 - Codex app Telegram topics may have no tmux session name. Cleanup must decide whether those records are routable from the live Session Manager session, not from tmux existence alone.
+- Live `sm send <friendly-name>` routing must beat registered-email fallback in every mode. When triaging reports about named agents going to email, verify against the running merged service first and keep regression coverage around the CLI resolver path.

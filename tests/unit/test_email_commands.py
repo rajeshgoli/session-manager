@@ -3,6 +3,8 @@
 import sys
 from unittest.mock import Mock, patch
 
+import pytest
+
 from src.cli.commands import cmd_email, cmd_send
 
 
@@ -56,6 +58,54 @@ def test_cmd_send_email_fallback_rejects_track(capsys):
     assert rc == 1
     client.send_email_result.assert_not_called()
     assert "email fallback only supports plain sequential sends" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("delivery_mode", "expected_snippet"),
+    [
+        ("sequential", "Input sent to em-2773-new (live123)"),
+        ("urgent", "Input sent to em-2773-new (live123) (interrupted)"),
+    ],
+)
+def test_cmd_send_prefers_live_named_session_over_email_fallback(
+    delivery_mode: str,
+    expected_snippet: str,
+    capsys,
+):
+    client = Mock()
+    client.session_id = "sender123"
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {
+            "id": "live123",
+            "friendly_name": "em-2773-new",
+            "status": "idle",
+            "provider": "claude",
+        }
+    ]
+    client.send_input.return_value = (True, False)
+
+    rc = cmd_send(client, "em-2773-new", "routing check", delivery_mode=delivery_mode)
+
+    assert rc == 0
+    client.ensure_role.assert_not_called()
+    client.send_email_result.assert_not_called()
+    client.send_input.assert_called_once_with(
+        "live123",
+        "routing check",
+        sender_session_id="sender123",
+        delivery_mode=delivery_mode,
+        from_sm_send=True,
+        timeout_seconds=None,
+        notify_on_delivery=False,
+        notify_after_seconds=None,
+        notify_on_stop=True,
+        remind_soft_threshold=None,
+        remind_hard_threshold=None,
+        remind_cancel_on_reply_session_id=None,
+        parent_session_id=None,
+    )
+    assert expected_snippet in capsys.readouterr().out
 
 
 def test_cmd_email_reads_markdown_file_and_calls_api(tmp_path, capsys):
