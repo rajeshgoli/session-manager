@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -426,6 +427,51 @@ def test_get_session_resyncs_lazy_native_title_to_telegram(tmp_path: Path) -> No
     assert isinstance(session.display_identity_synced_at_ns, int)
     assert session.display_identity_synced_chat_id == 123
     assert session.display_identity_synced_thread_id == 456
+
+
+def test_list_sessions_does_not_wait_for_lazy_display_sync(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+
+    def slow_status_bar(*args, **kwargs):
+        time.sleep(1)
+        return True
+
+    def slow_live_title(*args, **kwargs):
+        time.sleep(1)
+        return "⠂ live-native-title"
+
+    manager.tmux.get_pane_title.side_effect = slow_live_title
+    manager.tmux.set_status_bar.side_effect = slow_status_bar
+
+    session = _claude_session(tmp_path, None)
+    session.native_title = "cached-native-title"
+    session.native_title_updated_at_ns = time.time_ns()
+    session.telegram_chat_id = 123
+    session.telegram_thread_id = 456
+    manager.sessions[session.id] = session
+
+    async def slow_rename(*args, **kwargs):
+        await asyncio.sleep(1)
+        return True
+
+    notifier = MagicMock()
+    notifier.rename_session_topic = AsyncMock(side_effect=slow_rename)
+
+    client = create_app(session_manager=manager, notifier=notifier, config={})
+
+    from fastapi.testclient import TestClient
+
+    start = time.monotonic()
+    response = TestClient(client).get("/sessions")
+    elapsed = time.monotonic() - start
+
+    assert response.status_code == 200
+    assert response.json()["sessions"][0]["friendly_name"] == "cached-native-title"
+    assert elapsed < 0.5
+    manager.tmux.get_pane_title.assert_not_called()
+    manager.tmux.set_status_bar.assert_not_called()
+    notifier.rename_session_topic.assert_not_awaited()
 
 
 def test_get_session_does_not_resync_when_display_identity_is_current(tmp_path: Path) -> None:
