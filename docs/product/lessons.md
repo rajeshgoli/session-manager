@@ -17,3 +17,4 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - List/readiness paths such as `/sessions`, `/client/sessions`, `sm all`, and `sm me` must not perform live display identity discovery or external sync. Use cached session identity there so stale tmux panes, transcript discovery, or Telegram topic drift cannot block the maintainer queue.
 - Mobile attach readiness depends on both local `sm-android-sshd` and the public cloudflared tunnel. If Termux reports `websocket: bad handshake`, check `com.rajesh.sm-android-tunnel` before debugging tmux or app code.
 - Telegram topic cleanup must treat `Topic_id_invalid` as already-cleaned remote state and tombstone the local registry record; otherwise one invalid topic can stay active and fail deletion forever.
+- Codex app Telegram topics may have no tmux session name. Cleanup must decide whether those records are routable from the live Session Manager session, not from tmux existence alone.
