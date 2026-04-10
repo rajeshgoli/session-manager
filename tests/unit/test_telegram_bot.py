@@ -142,6 +142,40 @@ async def test_rename_forum_topic_treats_not_modified_as_success():
 
 
 @pytest.mark.asyncio
+async def test_delete_forum_topic_treats_absent_topic_as_success():
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.delete_forum_topic = AsyncMock(side_effect=Exception("Topic_id_invalid"))
+    tg._topic_sessions = {(10000, 50000): "sess123"}
+    tg._session_threads = {"sess123": (10000, 50000)}
+
+    result = await tg.delete_forum_topic(chat_id=10000, topic_id=50000)
+
+    assert result is True
+    assert tg._topic_sessions == {}
+    assert tg._session_threads == {}
+    tg.bot.delete_forum_topic.assert_awaited_once_with(
+        chat_id=10000,
+        message_thread_id=50000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_forum_topic_preserves_current_session_thread_mapping():
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.delete_forum_topic = AsyncMock()
+    tg._topic_sessions = {(10000, 50000): "sess123"}
+    tg._session_threads = {"sess123": (10000, 50001)}
+
+    result = await tg.delete_forum_topic(chat_id=10000, topic_id=50000)
+
+    assert result is True
+    assert tg._topic_sessions == {}
+    assert tg._session_threads == {"sess123": (10000, 50001)}
+
+
+@pytest.mark.asyncio
 async def test_send_notification_chunks_oversized_plain_text():
     """Oversized plain-text messages should be sent as numbered chunks."""
     tg = TelegramBot.__new__(TelegramBot)

@@ -610,7 +610,7 @@ class SessionManagerApp:
                 await self.session_manager._ensure_telegram_topic(session)
 
     async def _cleanup_stale_telegram_topics_once(self) -> dict[str, int]:
-        """Delete Telegram topics for non-EM sessions whose tmux runtime is gone."""
+        """Delete Telegram topics that no longer correspond to a routable session."""
         if not self.telegram_bot or not self.telegram_topic_cleanup_enabled:
             return {"deleted": 0, "skipped": 0}
 
@@ -618,6 +618,12 @@ class SessionManagerApp:
         if not default_chat_id:
             return {"deleted": 0, "skipped": 0}
 
+        current_em_topic = getattr(self.session_manager, "em_topic", None) or {}
+        current_em_key = (
+            current_em_topic.get("chat_id"),
+            current_em_topic.get("thread_id"),
+        )
+        has_current_em_topic = all(current_em_key)
         deleted = 0
         skipped = 0
         changed = False
@@ -625,8 +631,12 @@ class SessionManagerApp:
         for record in list(self.session_manager.telegram_topic_registry.values()):
             if (
                 record.deleted_at is not None
-                or record.is_em_topic
                 or record.chat_id != default_chat_id
+            ):
+                skipped += 1
+                continue
+            if record.is_em_topic and (
+                not has_current_em_topic or (record.chat_id, record.thread_id) == current_em_key
             ):
                 skipped += 1
                 continue
@@ -644,9 +654,14 @@ class SessionManagerApp:
                 skipped += 1
                 continue
 
-            if tmux_session and self.session_manager.tmux.session_exists(tmux_session):
+            stale_reason = None
+            if session and session.telegram_thread_id and record.thread_id != session.telegram_thread_id:
+                stale_reason = f"session now points to topic {session.telegram_thread_id}"
+            elif tmux_session and self.session_manager.tmux.session_exists(tmux_session):
                 skipped += 1
                 continue
+            else:
+                stale_reason = f"no live runtime remained for {tmux_session or record.session_id}"
 
             if await self.telegram_bot.delete_forum_topic(record.chat_id, record.thread_id):
                 self.session_manager.mark_telegram_topic_deleted(
@@ -659,9 +674,9 @@ class SessionManagerApp:
                 deleted += 1
                 changed = True
                 logger.info(
-                    "Deleted stale Telegram topic for session %s because no live runtime remained for %s",
+                    "Deleted stale Telegram topic for session %s because %s",
                     record.session_id,
-                    tmux_session or record.session_id,
+                    stale_reason,
                 )
             else:
                 skipped += 1

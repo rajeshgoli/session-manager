@@ -245,6 +245,19 @@ class TelegramBot:
             "follow",
         }
 
+    @staticmethod
+    def _is_forum_topic_absent_error(error: Exception) -> bool:
+        """Return True for Telegram errors that mean the topic is already gone."""
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "topic_id_invalid",
+                "message thread not found",
+                "topic not found",
+            )
+        )
+
     def load_session_threads(self, sessions: list[Session]):
         """Load thread and topic mappings from existing sessions (call on startup)."""
         for session in sessions:
@@ -1534,15 +1547,25 @@ Provide ONLY the summary, no preamble or questions."""
         """Delete a forum topic and clean up in-memory mappings."""
         if not self.bot:
             return False
+        def _remove_deleted_topic_mapping() -> None:
+            session_id = self._topic_sessions.pop((chat_id, topic_id), None)
+            if session_id and self._session_threads.get(session_id) == (chat_id, topic_id):
+                self._session_threads.pop(session_id, None)
+
         try:
             await self.bot.delete_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
-            # Clean up in-memory mappings
-            session_id = self._topic_sessions.pop((chat_id, topic_id), None)
-            if session_id:
-                self._session_threads.pop(session_id, None)
+            _remove_deleted_topic_mapping()
             logger.info(f"Deleted forum topic: chat={chat_id}, topic={topic_id}")
             return True
         except Exception as e:
+            if self._is_forum_topic_absent_error(e):
+                _remove_deleted_topic_mapping()
+                logger.info(
+                    "Forum topic already absent during delete: chat=%s, topic=%s",
+                    chat_id,
+                    topic_id,
+                )
+                return True
             logger.error(f"Failed to delete forum topic (chat={chat_id}, topic={topic_id}): {e}")
             return False
 

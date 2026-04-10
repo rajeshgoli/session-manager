@@ -57,6 +57,7 @@ def _make_app(
     live_tmux_sessions: set[str] | None = None,
     delete_ok: bool = True,
     records: list[TelegramTopicRecord] | None = None,
+    em_topic: dict | None = None,
 ) -> SessionManagerApp:
     app = SessionManagerApp.__new__(SessionManagerApp)
     app.telegram_bot = SimpleNamespace(
@@ -89,6 +90,7 @@ def _make_app(
 
     app.session_manager = SimpleNamespace(
         default_forum_chat_id=-1003506774897,
+        em_topic=em_topic,
         orphaned_topics=[],
         sessions=sessions,
         telegram_topic_registry=registry,
@@ -147,7 +149,7 @@ async def test_cleanup_deletes_topics_when_session_record_is_missing():
 
 @pytest.mark.asyncio
 async def test_cleanup_skips_em_live_tmux_non_forum_deleted_and_codex_app_topics():
-    live = _make_session("live1", tmux_session="claude-live1")
+    live = _make_session("live1", thread_id=10002, tmux_session="claude-live1")
     sessions = {
         "live1": live,
         "app1": _make_session("app1", provider="codex-app", tmux_session=""),
@@ -167,12 +169,63 @@ async def test_cleanup_skips_em_live_tmux_non_forum_deleted_and_codex_app_topics
         _make_record("app1", thread_id=10005, provider="codex-app", tmux_session=""),
     ]
     app = _make_app(sessions, live_tmux_sessions={"claude-live1"}, records=records)
+    app.session_manager.em_topic = {"chat_id": -1003506774897, "thread_id": 10001}
 
     result = await app._cleanup_stale_telegram_topics_once()
 
     assert result == {"deleted": 0, "skipped": 5}
     app.telegram_bot.delete_forum_topic.assert_not_awaited()
     app.session_manager._save_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deletes_obsolete_em_topic_when_not_continuity_topic():
+    obsolete_em = _make_record("oldem1", thread_id=10001, is_em_topic=True)
+    current_em = _make_record("currentem", thread_id=10002, is_em_topic=True)
+    app = _make_app(
+        {},
+        records=[obsolete_em, current_em],
+        em_topic={"chat_id": -1003506774897, "thread_id": 10002},
+    )
+
+    result = await app._cleanup_stale_telegram_topics_once()
+
+    assert result == {"deleted": 1, "skipped": 1}
+    assert obsolete_em.deleted_at is not None
+    assert current_em.deleted_at is None
+    app.telegram_bot.delete_forum_topic.assert_awaited_once_with(-1003506774897, 10001)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_em_topics_when_continuity_topic_is_unknown():
+    em_record = _make_record("oldem1", thread_id=10001, is_em_topic=True)
+    app = _make_app({}, records=[em_record], em_topic=None)
+
+    result = await app._cleanup_stale_telegram_topics_once()
+
+    assert result == {"deleted": 0, "skipped": 1}
+    assert em_record.deleted_at is None
+    app.telegram_bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deletes_duplicate_topic_for_live_session():
+    session = _make_session("live1", thread_id=20002, tmux_session="claude-live1")
+    old_record = _make_record("live1", thread_id=20001, tmux_session="claude-live1")
+    current_record = _make_record("live1", thread_id=20002, tmux_session="claude-live1")
+    app = _make_app(
+        {"live1": session},
+        live_tmux_sessions={"claude-live1"},
+        records=[old_record, current_record],
+    )
+
+    result = await app._cleanup_stale_telegram_topics_once()
+
+    assert result == {"deleted": 1, "skipped": 1}
+    assert old_record.deleted_at is not None
+    assert current_record.deleted_at is None
+    assert session.telegram_thread_id == 20002
+    app.telegram_bot.delete_forum_topic.assert_awaited_once_with(-1003506774897, 20001)
 
 
 @pytest.mark.asyncio
