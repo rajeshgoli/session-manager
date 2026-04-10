@@ -1721,6 +1721,7 @@ def create_app(
         snapshot = snapshotter() or {}
         labels = {
             "android_sshd": "Android attach SSHD",
+            "android_tunnel": "Android attach tunnel",
             "tmux_base": "tmux base",
             "ac_caffeinate": "AC caffeinate",
         }
@@ -1744,16 +1745,18 @@ def create_app(
         public_ssh_host = str((_external_access_config().get("public_ssh_host") or "")).strip()
         if not public_ssh_host:
             return None
-        infra_status = _infra_check("android_sshd")
-        if not infra_status:
-            return None
-        details = infra_status.get("details") or {}
-        attach_ready = details.get("attach_ready")
         issue = None
-        if attach_ready is not True and not (
-            attach_ready is None and str(infra_status.get("status") or "").lower() in {"ok", "warning"}
-        ):
-            issue = str(infra_status.get("message") or "android attach sshd is unavailable")
+        for check_name in ("android_sshd", "android_tunnel"):
+            infra_status = _infra_check(check_name)
+            if not infra_status:
+                continue
+            details = infra_status.get("details") or {}
+            attach_ready = details.get("attach_ready")
+            if attach_ready is not True and not (
+                attach_ready is None and str(infra_status.get("status") or "").lower() in {"ok", "warning"}
+            ):
+                issue = str(infra_status.get("message") or f"{check_name} is unavailable")
+                break
         attach_infra_cache["issue"] = issue
         attach_infra_cache["expires_at"] = now + 5.0
         return issue

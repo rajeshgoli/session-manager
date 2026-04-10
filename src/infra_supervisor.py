@@ -47,6 +47,18 @@ class InfrastructureSupervisor:
                 str(self._home / ".local/share/session-manager/android-sshd/sshd_config"),
             )
         ).expanduser()
+        self._android_tunnel_label = str(
+            supervisor_config.get("android_tunnel", {}).get(
+                "launch_agent_label",
+                "com.rajesh.sm-android-tunnel",
+            )
+        )
+        self._android_tunnel_plist = Path(
+            supervisor_config.get("android_tunnel", {}).get(
+                "launch_agent_plist",
+                str(self._home / "Library/LaunchAgents/com.rajesh.sm-android-tunnel.plist"),
+            )
+        ).expanduser()
 
         self._caffeinate_label = str(
             supervisor_config.get("ac_caffeinate", {}).get("launch_agent_label", "com.rajesh.sm-ac-caffeinate")
@@ -87,6 +99,7 @@ class InfrastructureSupervisor:
         """Run one repair pass immediately."""
         results = {
             "android_sshd": self._ensure_android_sshd(),
+            "android_tunnel": self._ensure_android_tunnel(),
             "tmux_base": self._ensure_tmux_base(),
             "ac_caffeinate": self._ensure_ac_caffeinate(),
         }
@@ -148,6 +161,52 @@ class InfrastructureSupervisor:
             attach_ready=False,
             actions=actions,
             listeners=self._format_targets(listener_targets),
+        )
+
+    def _ensure_android_tunnel(self) -> dict[str, Any]:
+        public_ssh_host = str(
+            ((self.config.get("external_access") or {}).get("public_ssh_host") or "")
+        ).strip()
+        ssh_proxy_command = str(
+            ((self.config.get("external_access") or {}).get("ssh_proxy_command") or "")
+        ).strip()
+        if not public_ssh_host:
+            return self._result("ok", "external ssh attach is not configured", attach_ready=False)
+        if "cloudflared" not in ssh_proxy_command:
+            return self._result(
+                "ok",
+                "external ssh attach does not use a managed cloudflared tunnel",
+                attach_ready=True,
+            )
+        if not self._android_tunnel_plist.exists():
+            return self._result(
+                "warning",
+                "android attach cloudflared tunnel launch agent is missing",
+                attach_ready=False,
+                plist=str(self._android_tunnel_plist),
+            )
+
+        if self._launch_agent_running(self._android_tunnel_label):
+            return self._result("ok", "android attach cloudflared tunnel is running", attach_ready=True)
+
+        actions = self._repair_launch_agent(self._android_tunnel_label, self._android_tunnel_plist)
+        if self._launch_agent_running(self._android_tunnel_label):
+            logger.warning(
+                "Recovered android attach cloudflared tunnel via launchctl (%s)",
+                ", ".join(actions) or "no-op",
+            )
+            return self._result(
+                "warning",
+                "android attach cloudflared tunnel was down and was restarted",
+                attach_ready=True,
+                actions=actions,
+            )
+
+        return self._result(
+            "error",
+            "android attach cloudflared tunnel is unavailable",
+            attach_ready=False,
+            actions=actions,
         )
 
     def _ensure_tmux_base(self) -> dict[str, Any]:
