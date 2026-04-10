@@ -1121,7 +1121,39 @@ def create_app(
             return state
         return _fallback_activity_state(session)
 
-    def _effective_session_name(session: Session) -> str:
+    def _cached_session_name(session: Session) -> str:
+        sm = app.state.session_manager
+        if sm:
+            getter = getattr(sm, "get_primary_session_alias", None)
+            if callable(getter):
+                primary_alias = getter(session.id)
+                if isinstance(primary_alias, str) and primary_alias:
+                    return primary_alias
+
+        provider = getattr(session, "provider", "claude")
+        native_title = session.native_title if provider == "claude" else None
+        friendly_name_updated_at_ns = int(session.friendly_name_updated_at_ns or 0)
+        native_title_updated_at_ns = int(
+            session.native_title_updated_at_ns
+            or session.native_title_source_mtime_ns
+            or 0
+        )
+        if session.friendly_name and native_title:
+            if friendly_name_updated_at_ns >= native_title_updated_at_ns:
+                return session.friendly_name
+            return native_title
+        if session.friendly_name and session.friendly_name_is_explicit:
+            return session.friendly_name
+        if native_title:
+            return native_title
+        if session.friendly_name:
+            return session.friendly_name
+        return session.name or session.id
+
+    def _effective_session_name(session: Session, *, sync_native_title: bool = True) -> str:
+        if not sync_native_title:
+            return _cached_session_name(session)
+
         sm = app.state.session_manager
         if sm:
             getter = getattr(sm, "get_effective_session_name", None)
@@ -1129,7 +1161,7 @@ def create_app(
                 display_name = getter(session)
                 if isinstance(display_name, str) and display_name:
                     return display_name
-        return session.friendly_name or session.name or session.id
+        return _cached_session_name(session)
 
     def _email_handler_or_503():
         handler = getattr(app.state, "email_handler", None)
@@ -1359,7 +1391,11 @@ def create_app(
             _append_warning("failed to persist spawn monitoring state", exc)
         return warnings
 
-    def _session_to_response(session: Session) -> SessionResponse:
+    def _session_to_response(
+        session: Session,
+        *,
+        sync_display_name: bool = True,
+    ) -> SessionResponse:
         provider = getattr(session, "provider", "claude")
         last_action_summary: Optional[str] = None
         last_action_at: Optional[str] = None
@@ -1391,7 +1427,10 @@ def create_app(
             last_activity=session.last_activity.isoformat(),
             tmux_session=session.tmux_session,
             provider=provider,
-            friendly_name=_effective_session_name(session),
+            friendly_name=_effective_session_name(
+                session,
+                sync_native_title=sync_display_name,
+            ),
             telegram_chat_id=session.telegram_chat_id,
             telegram_thread_id=session.telegram_thread_id,
             current_task=session.current_task,
@@ -1844,8 +1883,14 @@ def create_app(
             "label": "View details",
         }
 
-    def _mobile_session_payload(session: Session) -> dict[str, Any]:
-        base = _response_dict(_session_to_response(session))
+    def _mobile_session_payload(
+        session: Session,
+        *,
+        sync_display_name: bool = True,
+    ) -> dict[str, Any]:
+        base = _response_dict(
+            _session_to_response(session, sync_display_name=sync_display_name)
+        )
         descriptor = _attach_descriptor(session)
         termux_attach = _termux_attach_metadata(session, descriptor)
         base["attach_descriptor"] = descriptor
@@ -1863,7 +1908,13 @@ def create_app(
         display_name = display_name or _effective_session_name(session)
         tmux_synced = True
         if getattr(session, "provider", "claude") != "codex-app":
-            tmux_synced = bool(app.state.session_manager.tmux.set_status_bar(session.tmux_session, display_name))
+            tmux_synced = bool(
+                await asyncio.to_thread(
+                    app.state.session_manager.tmux.set_status_bar,
+                    session.tmux_session,
+                    display_name,
+                )
+            )
         telegram_synced = True
         if session.telegram_thread_id:
             telegram_bot = getattr(app.state.notifier, "telegram", None) if app.state.notifier else None
@@ -2934,13 +2985,10 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
         sessions = app.state.session_manager.list_sessions(include_stopped=include_stopped)
-        await asyncio.gather(
-            *(_ensure_session_display_identity_synced(s) for s in sessions),
-        )
 
         return {
             "sessions": [
-                _session_to_response(s)
+                _session_to_response(s, sync_display_name=False)
                 for s in sessions
             ]
         }
@@ -2952,11 +3000,11 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
         sessions = app.state.session_manager.list_sessions()
-        await asyncio.gather(
-            *(_ensure_session_display_identity_synced(s) for s in sessions),
-        )
         return {
-            "sessions": [_mobile_session_payload(session) for session in sessions]
+            "sessions": [
+                _mobile_session_payload(session, sync_display_name=False)
+                for session in sessions
+            ]
         }
 
     @app.post("/client/request-status", response_model=ClientRequestStatusResponse)
