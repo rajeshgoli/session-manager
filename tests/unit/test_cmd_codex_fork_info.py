@@ -90,11 +90,46 @@ def test_cmd_codex_fork_info_json_output(monkeypatch, capsys):
     assert "\"latest_upstream_release_tag\": \"rust-v0.120.0\"" in output
 
 
+def test_cmd_codex_fork_info_reports_probe_skip(monkeypatch, capsys):
+    client = _FakeClient(
+        runtime={
+            "command": "codex",
+            "artifact_ref": "abc123",
+            "event_schema_version": 2,
+        }
+    )
+    monkeypatch.setattr(commands, "_collect_codex_fork_maintenance_info", lambda payload: {
+        "binary_path": "codex",
+        "binary_exists": False,
+        "maintenance_probe_status": "skipped",
+        "maintenance_probe_reason": "runtime command is not a filesystem path and could not be resolved via PATH",
+        "build_recommended": False,
+        "build_reasons": [],
+        "sync_recommended": False,
+        "sync_reasons": [],
+    })
+    rc = commands.cmd_codex_fork_info(client)
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "maintenance_probe_status: skipped" in output
+    assert "maintenance_probe_reason: runtime command is not a filesystem path" in output
+
+
 def test_cmd_codex_fork_info_unavailable(capsys):
     client = _FakeClient(runtime=None, rollout=None)
     rc = commands.cmd_codex_fork_info(client)
     assert rc == 1
     assert "endpoint unavailable or incompatible" in capsys.readouterr().err
+
+
+def test_collect_codex_fork_maintenance_info_skips_unresolved_bare_command(monkeypatch):
+    monkeypatch.setattr(commands, "_resolve_runtime_binary_path", lambda command: None)
+
+    info = commands._collect_codex_fork_maintenance_info({"command": "codex"})
+
+    assert info["maintenance_probe_status"] == "skipped"
+    assert info["build_recommended"] is False
+    assert info["sync_recommended"] is False
 
 
 def test_collect_codex_fork_maintenance_info_tracks_latest_release(monkeypatch, tmp_path):

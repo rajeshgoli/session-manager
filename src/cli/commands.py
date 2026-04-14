@@ -2,6 +2,7 @@
 
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -2555,6 +2556,12 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
         branch = maintenance.get("branch")
         if branch:
             print(f"- branch: {branch}")
+        maintenance_probe_status = maintenance.get("maintenance_probe_status")
+        if maintenance_probe_status:
+            print(f"- maintenance_probe_status: {maintenance_probe_status}")
+        maintenance_probe_reason = maintenance.get("maintenance_probe_reason")
+        if maintenance_probe_reason:
+            print(f"- maintenance_probe_reason: {maintenance_probe_reason}")
         fork_head = maintenance.get("fork_head")
         upstream_head = maintenance.get("upstream_head")
         if fork_head:
@@ -2616,11 +2623,24 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
     if not command:
         return {}
 
-    binary_path = Path(command).expanduser()
+    binary_path = _resolve_runtime_binary_path(command)
+    binary_path_display = str(binary_path) if binary_path is not None else command
+    if binary_path is None:
+        return {
+            "binary_path": binary_path_display,
+            "binary_exists": False,
+            "maintenance_probe_status": "skipped",
+            "maintenance_probe_reason": "runtime command is not a filesystem path and could not be resolved via PATH",
+            "build_recommended": False,
+            "build_reasons": [],
+            "sync_recommended": False,
+            "sync_reasons": [],
+        }
+
     repo_root = _find_git_repo_root(binary_path)
     if repo_root is None:
         return {
-            "binary_path": str(binary_path),
+            "binary_path": binary_path_display,
             "binary_exists": binary_path.exists(),
             "build_recommended": not binary_path.exists(),
             "build_reasons": ["local codex binary is missing"] if not binary_path.exists() else [],
@@ -2632,7 +2652,7 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
     release_build_script = checkout_root / "scripts" / "codex_fork" / "release_artifacts.sh"
     maintenance_spec = checkout_root / "specs" / "546_codex_fork_release_sync_mechanism.md"
     info: dict[str, object] = {
-        "binary_path": str(binary_path),
+        "binary_path": binary_path_display,
         "binary_exists": binary_path.exists(),
         "repo_root": str(repo_root),
         "build_recommended": False,
@@ -2775,6 +2795,19 @@ def _run_text_command(args: list[str]) -> Optional[str]:
         return None
     output = result.stdout.strip()
     return output or None
+
+
+def _resolve_runtime_binary_path(command: str) -> Optional[Path]:
+    """Resolve one runtime command into a local binary path when safe."""
+    command = (command or "").strip()
+    if not command:
+        return None
+    if os.path.sep in command or (os.path.altsep and os.path.altsep in command) or command.startswith("~"):
+        return Path(command).expanduser()
+    resolved = shutil.which(command)
+    if not resolved:
+        return None
+    return Path(resolved)
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
