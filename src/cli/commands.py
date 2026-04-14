@@ -2129,6 +2129,12 @@ def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
     if provider == "codex-app":
         print("No tmux attach for Codex app sessions.")
         return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(
+            f"Automatic attach skipped: current shell is not interactive. "
+            f"Run `sm attach {target_session_id}` from an interactive terminal."
+        )
+        return 0
     return cmd_attach(client, target_session_id)
 
 

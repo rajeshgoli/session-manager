@@ -39,6 +39,8 @@ def test_cmd_restore_attaches_to_tmux_session(monkeypatch, capsys):
         calls.append((args, check))
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(commands.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(commands.sys.stdout, "isatty", lambda: True)
 
     session = {"id": "dead123", "friendly_name": "engineer-ticket2508", "status": "stopped"}
     restored = {
@@ -53,6 +55,26 @@ def test_cmd_restore_attaches_to_tmux_session(monkeypatch, capsys):
     assert calls == [(["tmux", "attach", "-t", "claude-dead123"], True)]
     stdout = capsys.readouterr().out
     assert "Session restored: dead123" in stdout
+
+
+def test_cmd_restore_skips_attach_without_interactive_terminal(monkeypatch, capsys):
+    monkeypatch.setattr(commands.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(commands.sys.stdout, "isatty", lambda: False)
+
+    session = {"id": "deadtty", "friendly_name": "review-tty", "status": "stopped"}
+    restored = {
+        "id": "deadtty",
+        "provider": "codex-fork",
+        "tmux_session": "codex-fork-deadtty",
+    }
+
+    rc = commands.cmd_restore(_RestoreClient(session, restored), "review-tty")
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "Session restored: deadtty" in stdout
+    assert "Automatic attach skipped: current shell is not interactive." in stdout
+    assert "sm attach deadtty" in stdout
 
 
 def test_cmd_restore_codex_app_is_headless(capsys):
