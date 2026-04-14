@@ -11,6 +11,7 @@ import json
 # Default API endpoint
 DEFAULT_API_URL = "http://127.0.0.1:8420"
 DEFAULT_API_TIMEOUT = 5.0  # seconds
+DEFAULT_SEND_API_TIMEOUT = 15.0  # seconds
 KILL_TIMEOUT = 30  # seconds (kill triggers cleanup that may involve network I/O)
 
 
@@ -27,6 +28,22 @@ def _read_api_timeout() -> float:
 
 
 API_TIMEOUT = _read_api_timeout()
+
+
+def _read_send_api_timeout() -> float:
+    """Return the dedicated CLI timeout for sm send resolution/delivery requests."""
+    raw = os.environ.get("SM_SEND_API_TIMEOUT")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return max(API_TIMEOUT, DEFAULT_SEND_API_TIMEOUT)
+
+
+SEND_API_TIMEOUT = _read_send_api_timeout()
 
 
 class SessionManagerClient:
@@ -130,15 +147,19 @@ class SessionManagerClient:
         except Exception:
             return None, None, True
 
-    def get_session(self, session_id: str) -> Optional[dict]:
+    def get_session(self, session_id: str, timeout: Optional[float] = None) -> Optional[dict]:
         """Get session details."""
-        data, success, _ = self._request("GET", f"/sessions/{session_id}")
+        data, success, _ = self._request("GET", f"/sessions/{session_id}", timeout=timeout)
         return data if success else None
 
-    def list_sessions(self, include_stopped: bool = False) -> Optional[list]:
+    def list_sessions(
+        self,
+        include_stopped: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Optional[list]:
         """List all sessions."""
         path = "/sessions?include_stopped=true" if include_stopped else "/sessions"
-        data, success, _ = self._request("GET", path)
+        data, success, _ = self._request("GET", path, timeout=timeout)
         if success and data:
             return data.get("sessions", [])
         return None
@@ -426,6 +447,7 @@ class SessionManagerClient:
         remind_hard_threshold: Optional[int] = None,
         remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> tuple[bool, bool]:
         """
         Send text input to a session.
@@ -467,7 +489,8 @@ class SessionManagerClient:
         data, success, unavailable = self._request(
             "POST",
             f"/sessions/{session_id}/input",
-            payload
+            payload,
+            timeout=timeout,
         )
         return success, unavailable
 
@@ -486,6 +509,7 @@ class SessionManagerClient:
         remind_hard_threshold: Optional[int] = None,
         remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> dict:
         """Send input and return full API result metadata."""
         payload = {"text": text, "delivery_mode": delivery_mode, "from_sm_send": from_sm_send}
@@ -512,6 +536,7 @@ class SessionManagerClient:
             "POST",
             f"/sessions/{session_id}/input",
             payload,
+            timeout=timeout,
         )
         if unavailable:
             return {"ok": False, "unavailable": True, "status_code": None, "detail": None}

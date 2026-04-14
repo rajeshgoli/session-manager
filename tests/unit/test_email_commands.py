@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from src.cli.client import SEND_API_TIMEOUT
 from src.cli.commands import cmd_email, cmd_send
 
 
@@ -104,8 +105,42 @@ def test_cmd_send_prefers_live_named_session_over_email_fallback(
         remind_hard_threshold=None,
         remind_cancel_on_reply_session_id=None,
         parent_session_id=None,
+        timeout=SEND_API_TIMEOUT,
     )
     assert expected_snippet in capsys.readouterr().out
+
+
+def test_cmd_send_resolution_timeout_returns_unavailable_without_email_fallback(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+    client.get_session.return_value = None
+    client.list_sessions.return_value = None
+
+    rc = cmd_send(client, "fcb79e8b", "routing check")
+
+    assert rc == 2
+    client.ensure_role.assert_not_called()
+    client.send_email_result.assert_not_called()
+    assert "request timed out" in capsys.readouterr().err
+
+
+def test_cmd_send_uses_extended_timeout_for_resolution_and_delivery(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+    client.get_session.return_value = {
+        "id": "live123",
+        "friendly_name": "worker",
+        "status": "running",
+        "provider": "claude",
+    }
+    client.send_input.return_value = (True, False)
+
+    rc = cmd_send(client, "live123", "routing check")
+
+    assert rc == 0
+    client.get_session.assert_called_once_with("live123", timeout=SEND_API_TIMEOUT)
+    assert client.send_input.call_args.kwargs["timeout"] == SEND_API_TIMEOUT
+    assert "Input sent to worker (live123)" in capsys.readouterr().out
 
 
 def test_cmd_email_reads_markdown_file_and_calls_api(tmp_path, capsys):

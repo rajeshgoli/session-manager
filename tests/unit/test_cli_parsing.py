@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from io import StringIO
 
 from src.cli.main import main, _normalize_optional_track_args
-from src.cli.commands import resolve_session_id, parse_duration
+from src.cli.commands import parse_duration, resolve_session_id, resolve_session_id_with_status
 
 
 class TestCliParsing:
@@ -663,7 +663,7 @@ class TestSessionResolution:
 
         assert session_id == "abc123"
         assert session["id"] == "abc123"
-        mock_client.get_session.assert_called_with("abc123")
+        mock_client.get_session.assert_called_with("abc123", timeout=None)
 
     def test_resolve_by_friendly_name(self):
         """Can resolve session by friendly name."""
@@ -747,7 +747,19 @@ class TestSessionResolution:
 
         assert session_id == "dead123"
         assert session["status"] == "stopped"
-        mock_client.list_sessions.assert_called_once_with(include_stopped=True)
+        mock_client.list_sessions.assert_called_once_with(include_stopped=True, timeout=None)
+
+    def test_resolve_with_status_reports_unavailable(self):
+        """Status-aware resolution preserves transport unavailability."""
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = None
+        mock_client.list_sessions.return_value = None
+
+        session_id, session, unavailable = resolve_session_id_with_status(mock_client, "anything")
+
+        assert session_id is None
+        assert session is None
+        assert unavailable is True
 
 
 class TestParseDuration:
