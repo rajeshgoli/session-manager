@@ -135,6 +135,8 @@ async def test_cleanup_kill_forum_mode(output_monitor_factory, forum_session):
         chat_id=chat_id,
         message=f"Session stopped [{forum_session.id}]",
         thread_id=thread_id,
+        allow_reply_fallback=True,
+        session_id=forum_session.id,
     )
 
     # close_forum_topic called because forum send succeeded
@@ -168,6 +170,8 @@ async def test_cleanup_kill_reply_thread_mode(output_monitor_factory, reply_sess
         chat_id=chat_id,
         message=f"Session stopped [{reply_session.id}]",
         thread_id=thread_id,
+        allow_reply_fallback=True,
+        session_id=reply_session.id,
     )
 
     # close_forum_topic NOT called (forum send failed, send_with_fallback returned None)
@@ -246,6 +250,8 @@ async def test_cleanup_notification_failure_still_cleans_mappings(
         chat_id=chat_id,
         message=f"Session stopped [{forum_session.id}]",
         thread_id=thread_id,
+        allow_reply_fallback=False,
+        session_id=forum_session.id,
     )
 
     # Mappings cleaned up despite notification failure
@@ -299,6 +305,7 @@ def test_clear_sends_notification_forum_mode(forum_session):
         chat_id=chat_id,
         message=f"Context cleared [{forum_session.id}] — ready for new task",
         thread_id=thread_id,
+        session_id=forum_session.id,
     )
 
 
@@ -319,6 +326,7 @@ def test_clear_sends_notification_reply_thread_mode(reply_session):
         chat_id=chat_id,
         message=f"Context cleared [{reply_session.id}] — ready for new task",
         thread_id=thread_id,
+        session_id=reply_session.id,
     )
 
 

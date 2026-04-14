@@ -80,6 +80,7 @@ async def test_cleanup_accesses_correct_telegram_attribute(output_monitor, mock_
         message=f"Session stopped [{mock_session.id}]",
         thread_id=67890,
         allow_reply_fallback=False,
+        session_id=mock_session.id,
     )
 
 

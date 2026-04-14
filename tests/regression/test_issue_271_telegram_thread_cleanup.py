@@ -111,6 +111,8 @@ async def test_close_session_topic_sends_message_and_closes_forum_topic():
         chat_id=chat_id,
         message=f"Session completed [{session.id}]: Work done",
         thread_id=thread_id,
+        allow_reply_fallback=False,
+        session_id=session.id,
     )
 
     # Forum topic closed via bot

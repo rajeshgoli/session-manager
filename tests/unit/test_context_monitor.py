@@ -868,7 +868,7 @@ class TestCompactionSuppressRemind:
         session._is_compacting = True
         _post_event(client, session.id, event="compaction_complete")
         queue_mgr = mock_session_manager.message_queue_manager
-        queue_mgr.reset_remind.assert_called_once_with(session.id)
+        queue_mgr.reset_remind.assert_called_once_with(session.id, force_tracked=True)
 
     def test_compaction_complete_returns_logged_status(self, client, session):
         """compaction_complete returns compaction_complete_logged status."""

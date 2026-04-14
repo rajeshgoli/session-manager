@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
@@ -27,15 +28,23 @@ def test_client_analytics_summary_reports_live_metrics():
         temp_root = Path(temp_dir)
         message_queue_db = temp_root / "message_queue.db"
         server_log = temp_root / "session-manager.log"
+        now = datetime.now(UTC)
+        start_time = now - timedelta(hours=2)
+        spawn_a = now - timedelta(hours=1, minutes=50)
+        self_heal = now - timedelta(hours=1, minutes=40)
+        spawn_b = now - timedelta(hours=50)
+        send_a = now - timedelta(hours=1, minutes=30)
+        send_b = now - timedelta(minutes=30)
+        track_send = now - timedelta(minutes=15)
 
         message_queue_db.write_bytes(b"")
         server_log.write_text(
             "\n".join(
                 [
-                    "2026-03-30 10:00:00,000 - __main__ - INFO - Starting Claude Session Manager...",
-                    "2026-03-30 10:10:00,000 - src.session_manager - INFO - Created session claude-11111111 (id=11111111)",
-                    "2026-03-30 10:20:00,000 - src.infra_supervisor - WARNING - Recovered android attach sshd via launchctl (bootstrap, kickstart)",
-                    "2026-03-30 11:10:00,000 - src.session_manager - INFO - Created session codex-fork-22222222 (id=22222222)",
+                    f"{start_time.strftime('%Y-%m-%d %H:%M:%S')},000 - __main__ - INFO - Starting Claude Session Manager...",
+                    f"{spawn_a.strftime('%Y-%m-%d %H:%M:%S')},000 - src.session_manager - INFO - Created session claude-11111111 (id=11111111)",
+                    f"{self_heal.strftime('%Y-%m-%d %H:%M:%S')},000 - src.infra_supervisor - WARNING - Recovered android attach sshd via launchctl (bootstrap, kickstart)",
+                    f"{spawn_b.strftime('%Y-%m-%d %H:%M:%S')},000 - src.session_manager - INFO - Created session codex-fork-22222222 (id=22222222)",
                 ]
             )
         )
@@ -84,19 +93,28 @@ def test_client_analytics_summary_reports_live_metrics():
                 INSERT INTO message_queue
                 (id, target_session_id, text, queued_at, message_category, from_sm_send)
                 VALUES
-                ('m1', '11111111', 'msg', '2026-03-30T10:30:00+00:00', NULL, 1),
-                ('m2', '11111111', 'msg', '2026-03-30T11:30:00+00:00', NULL, 1),
-                ('m3', '22222222', 'track', '2026-03-30T11:45:00+00:00', 'track_remind', 0)
+                ('m1', '11111111', 'msg', ?, NULL, 1),
+                ('m2', '11111111', 'msg', ?, NULL, 1),
+                ('m3', '22222222', 'track', ?, 'track_remind', 0)
                 """
+                ,
+                (send_a.isoformat(), send_b.isoformat(), track_send.isoformat()),
             )
             conn.execute(
                 """
                 INSERT INTO remind_registrations
                 (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds, registered_at, last_reset_at, soft_fired, is_active, cancel_on_reply_session_id)
                 VALUES
-                ('r1', '11111111', 300, 600, '2026-03-30T10:00:00+00:00', '2026-03-30T10:00:00+00:00', 1, 1, 'owner-1'),
-                ('r2', '22222222', 300, 600, '2026-03-30T10:00:00+00:00', '2026-03-30T10:00:00+00:00', 0, 1, 'owner-2')
+                ('r1', '11111111', 300, 600, ?, ?, 1, 1, 'owner-1'),
+                ('r2', '22222222', 300, 600, ?, ?, 0, 1, 'owner-2')
                 """
+                ,
+                (
+                    start_time.isoformat(),
+                    start_time.isoformat(),
+                    start_time.isoformat(),
+                    start_time.isoformat(),
+                ),
             )
             conn.commit()
 
@@ -133,7 +151,7 @@ def test_client_analytics_summary_reports_live_metrics():
         payload = response.json()
         assert payload["kpis"]["active_sessions"]["value"] == 2
         assert payload["kpis"]["sends_24h"]["value"] == 2
-        assert payload["kpis"]["spawns_24h"]["value"] == 2
+        assert payload["kpis"]["spawns_24h"]["value"] == 1
         assert payload["kpis"]["active_tracks"]["value"] == 2
         assert payload["kpis"]["overdue_tracks"]["value"] == 1
         assert payload["totals"]["tokens_live"] == 2000
