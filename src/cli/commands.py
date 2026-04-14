@@ -2,11 +2,12 @@
 
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -2518,6 +2519,11 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
         print("Error: Failed to fetch codex-fork runtime metadata (endpoint unavailable or incompatible)", file=sys.stderr)
         return 1
 
+    maintenance = _collect_codex_fork_maintenance_info(payload)
+    if maintenance:
+        payload = dict(payload)
+        payload["maintenance"] = maintenance
+
     if json_output:
         print(json_lib.dumps(payload, indent=2))
         return 0
@@ -2542,7 +2548,279 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
     print(f"- artifact_platforms: {platforms}")
     print(f"- rollback_provider: {rollback_provider}")
     print(f"- rollback_command: {rollback_command}")
+    if maintenance:
+        print("Codex-fork maintenance status")
+        repo_root = maintenance.get("repo_root")
+        if repo_root:
+            print(f"- repo_root: {repo_root}")
+        branch = maintenance.get("branch")
+        if branch:
+            print(f"- branch: {branch}")
+        maintenance_probe_status = maintenance.get("maintenance_probe_status")
+        if maintenance_probe_status:
+            print(f"- maintenance_probe_status: {maintenance_probe_status}")
+        maintenance_probe_reason = maintenance.get("maintenance_probe_reason")
+        if maintenance_probe_reason:
+            print(f"- maintenance_probe_reason: {maintenance_probe_reason}")
+        fork_head = maintenance.get("fork_head")
+        upstream_head = maintenance.get("upstream_head")
+        if fork_head:
+            print(f"- fork_head: {fork_head}")
+        if upstream_head:
+            print(f"- upstream_head: {upstream_head}")
+        ahead = maintenance.get("divergence_ahead")
+        behind = maintenance.get("divergence_behind")
+        if ahead is not None and behind is not None:
+            print(f"- divergence: ahead {ahead} / behind {behind}")
+        binary_mtime = maintenance.get("binary_mtime")
+        if binary_mtime:
+            print(f"- binary_mtime: {binary_mtime}")
+        head_commit_committed_at = maintenance.get("head_commit_committed_at")
+        if head_commit_committed_at:
+            print(f"- head_commit_committed_at: {head_commit_committed_at}")
+        if "binary_older_than_fork_head" in maintenance:
+            print(f"- binary_older_than_fork_head: {maintenance.get('binary_older_than_fork_head')}")
+        release_tag = maintenance.get("latest_upstream_release_tag")
+        release_published_at = maintenance.get("latest_upstream_release_published_at")
+        if release_tag:
+            release_line = release_tag
+            if release_published_at:
+                release_line = f"{release_line} ({release_published_at})"
+            print(f"- latest_upstream_release: {release_line}")
+        if "latest_upstream_release_newer_than_binary" in maintenance:
+            print(
+                f"- latest_upstream_release_newer_than_binary: "
+                f"{maintenance.get('latest_upstream_release_newer_than_binary')}"
+            )
+        release_commit = maintenance.get("latest_upstream_release_commit")
+        if release_commit:
+            print(f"- latest_upstream_release_commit: {release_commit}")
+        if "fork_contains_latest_upstream_release" in maintenance:
+            print(
+                f"- fork_contains_latest_upstream_release: "
+                f"{maintenance.get('fork_contains_latest_upstream_release')}"
+            )
+        release_build_script = maintenance.get("release_build_script")
+        if release_build_script:
+            print(f"- release_build_script: {release_build_script}")
+        maintenance_spec = maintenance.get("maintenance_spec")
+        if maintenance_spec:
+            print(f"- maintenance_spec: {maintenance_spec}")
+        print(f"- build_recommended: {maintenance.get('build_recommended', False)}")
+        for reason in maintenance.get("build_reasons", []):
+            print(f"  build_reason: {reason}")
+        print(f"- sync_recommended: {maintenance.get('sync_recommended', False)}")
+        for reason in maintenance.get("sync_reasons", []):
+            print(f"  sync_reason: {reason}")
     return 0
+
+
+def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, object]:
+    """Best-effort local maintenance metadata for the codex-fork checkout."""
+    import json
+
+    command = str(runtime_payload.get("command") or "").strip()
+    if not command:
+        return {}
+
+    binary_path = _resolve_runtime_binary_path(command)
+    binary_path_display = str(binary_path) if binary_path is not None else command
+    if binary_path is None:
+        return {
+            "binary_path": binary_path_display,
+            "binary_exists": False,
+            "maintenance_probe_status": "skipped",
+            "maintenance_probe_reason": "runtime command is not a filesystem path and could not be resolved via PATH",
+            "build_recommended": False,
+            "build_reasons": [],
+            "sync_recommended": False,
+            "sync_reasons": [],
+        }
+
+    repo_root = _find_git_repo_root(binary_path)
+    if repo_root is None:
+        return {
+            "binary_path": binary_path_display,
+            "binary_exists": binary_path.exists(),
+            "build_recommended": not binary_path.exists(),
+            "build_reasons": ["local codex binary is missing"] if not binary_path.exists() else [],
+            "sync_recommended": False,
+            "sync_reasons": [],
+        }
+
+    checkout_root = Path(__file__).resolve().parents[2]
+    release_build_script = checkout_root / "scripts" / "codex_fork" / "release_artifacts.sh"
+    maintenance_spec = checkout_root / "specs" / "546_codex_fork_release_sync_mechanism.md"
+    info: dict[str, object] = {
+        "binary_path": binary_path_display,
+        "binary_exists": binary_path.exists(),
+        "repo_root": str(repo_root),
+        "build_recommended": False,
+        "build_reasons": [],
+        "sync_recommended": False,
+        "sync_reasons": [],
+    }
+    build_reasons: list[str] = []
+    sync_reasons: list[str] = []
+    binary_mtime_dt: Optional[datetime] = None
+    if binary_path.exists():
+        binary_mtime_dt = datetime.fromtimestamp(binary_path.stat().st_mtime, tz=timezone.utc)
+        info["binary_mtime"] = binary_mtime_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+    else:
+        build_reasons.append("local codex binary is missing")
+    if release_build_script.exists():
+        info["release_build_script"] = str(release_build_script)
+    if maintenance_spec.exists():
+        info["maintenance_spec"] = str(maintenance_spec)
+
+    branch = _run_text_command(["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"])
+    if branch:
+        info["branch"] = branch
+
+    fork_head = _run_text_command(["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"])
+    if fork_head:
+        info["fork_head"] = fork_head
+    head_commit_committed_at = _run_text_command(["git", "-C", str(repo_root), "log", "-1", "--format=%cI", "HEAD"])
+    head_commit_dt = _parse_iso_datetime(head_commit_committed_at)
+    if head_commit_committed_at:
+        info["head_commit_committed_at"] = head_commit_committed_at
+    if binary_mtime_dt and head_commit_dt is not None:
+        binary_older_than_fork_head = binary_mtime_dt < head_commit_dt
+        info["binary_older_than_fork_head"] = binary_older_than_fork_head
+        if binary_older_than_fork_head:
+            build_reasons.append("local codex binary predates the current fork HEAD commit")
+
+    fetch_rc = _run_command(["git", "-C", str(repo_root), "fetch", "upstream", "main", "--tags", "--quiet"])
+    if fetch_rc == 0:
+        upstream_head = _run_text_command(["git", "-C", str(repo_root), "rev-parse", "--short", "upstream/main"])
+        divergence = _run_text_command(["git", "-C", str(repo_root), "rev-list", "--left-right", "--count", "HEAD...upstream/main"])
+        if upstream_head:
+            info["upstream_head"] = upstream_head
+        if divergence:
+            parts = divergence.split()
+            if len(parts) == 2 and all(part.isdigit() for part in parts):
+                ahead, behind = (int(parts[0]), int(parts[1]))
+                info["divergence_ahead"] = ahead
+                info["divergence_behind"] = behind
+    else:
+        info["upstream_fetch_status"] = "unavailable"
+
+    release_raw = _run_text_command(
+        [
+            "gh",
+            "release",
+            "view",
+            "-R",
+            "openai/codex",
+            "--json",
+            "tagName,publishedAt,name",
+        ]
+    )
+    if release_raw:
+        try:
+            release_payload = json.loads(release_raw)
+        except Exception:
+            release_payload = {}
+        release_tag = str(release_payload.get("tagName") or "").strip()
+        release_published_at = str(release_payload.get("publishedAt") or "").strip()
+        if release_tag:
+            info["latest_upstream_release_tag"] = release_tag
+        if release_published_at:
+            info["latest_upstream_release_published_at"] = release_published_at
+        if fetch_rc == 0 and release_tag:
+            release_commit = _run_text_command(
+                ["git", "-C", str(repo_root), "rev-list", "-n", "1", f"refs/tags/{release_tag}"]
+            )
+            if release_commit:
+                info["latest_upstream_release_commit"] = release_commit
+                contains_release = _run_command(
+                    ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", release_commit, "HEAD"]
+                )
+                if contains_release is not None:
+                    info["fork_contains_latest_upstream_release"] = contains_release == 0
+                    if contains_release != 0:
+                        sync_reasons.append(f"fork does not yet contain upstream release {release_tag}")
+        if binary_mtime_dt and release_tag:
+            release_published_dt = _parse_iso_datetime(release_published_at)
+            if release_published_dt is not None:
+                release_newer_than_binary = release_published_dt > binary_mtime_dt
+                info["latest_upstream_release_newer_than_binary"] = release_newer_than_binary
+                if release_newer_than_binary:
+                    build_reasons.append(f"local codex binary predates upstream release {release_tag}")
+
+    info["build_recommended"] = bool(build_reasons)
+    info["build_reasons"] = build_reasons
+    info["sync_recommended"] = bool(sync_reasons)
+    info["sync_reasons"] = sync_reasons
+    return info
+
+
+def _find_git_repo_root(path: Path) -> Optional[Path]:
+    """Walk upward from a file path until a git repo root is found."""
+    candidate = path.expanduser().resolve()
+    if candidate.is_file():
+        candidate = candidate.parent
+    for current in [candidate, *candidate.parents]:
+        if (current / ".git").exists():
+            return current
+    return None
+
+
+def _run_command(args: list[str]) -> Optional[int]:
+    """Run one subprocess and return its exit code, or None when unavailable."""
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    return result.returncode
+
+
+def _run_text_command(args: list[str]) -> Optional[str]:
+    """Run one subprocess and return stripped stdout on success."""
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _resolve_runtime_binary_path(command: str) -> Optional[Path]:
+    """Resolve one runtime command into a local binary path when safe."""
+    command = (command or "").strip()
+    if not command:
+        return None
+    if os.path.sep in command or (os.path.altsep and os.path.altsep in command) or command.startswith("~"):
+        return Path(command).expanduser()
+    resolved = shutil.which(command)
+    if not resolved:
+        return None
+    return Path(resolved)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse one ISO timestamp, including GitHub's Z suffix."""
+    if not value:
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
 
 
 def cmd_codex_rollout_gates(client: SessionManagerClient, json_output: bool = False) -> int:
