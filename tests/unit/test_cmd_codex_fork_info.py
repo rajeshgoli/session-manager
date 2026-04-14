@@ -1,3 +1,5 @@
+import os
+
 from src.cli import commands
 
 
@@ -33,10 +35,21 @@ def test_cmd_codex_fork_info_text_output(monkeypatch, capsys):
         "upstream_head": "up123",
         "divergence_ahead": 10,
         "divergence_behind": 1226,
+        "binary_mtime": "2026-04-01T10:00:00Z",
+        "head_commit_committed_at": "2026-04-10T09:00:00+00:00",
+        "binary_older_than_fork_head": True,
         "latest_upstream_release_tag": "rust-v0.120.0",
         "latest_upstream_release_published_at": "2026-04-11T02:53:49Z",
+        "latest_upstream_release_newer_than_binary": True,
         "latest_upstream_release_commit": "96254a763",
         "fork_contains_latest_upstream_release": False,
+        "release_build_script": "/repo/scripts/codex_fork/release_artifacts.sh",
+        "maintenance_spec": "/repo/specs/546_codex_fork_release_sync_mechanism.md",
+        "build_recommended": True,
+        "build_reasons": [
+            "local codex binary predates the current fork HEAD commit",
+            "local codex binary predates upstream release rust-v0.120.0",
+        ],
         "sync_recommended": True,
         "sync_reasons": ["fork does not yet contain upstream release rust-v0.120.0"],
     })
@@ -46,9 +59,13 @@ def test_cmd_codex_fork_info_text_output(monkeypatch, capsys):
     assert "Codex-fork runtime metadata" in output
     assert "artifact_ref: abc123" in output
     assert "event_schema_version: 2" in output
+    assert "binary_older_than_fork_head: True" in output
     assert "latest_upstream_release: rust-v0.120.0 (2026-04-11T02:53:49Z)" in output
+    assert "latest_upstream_release_newer_than_binary: True" in output
+    assert "build_recommended: True" in output
+    assert "build_reason: local codex binary predates the current fork HEAD commit" in output
     assert "fork_contains_latest_upstream_release: False" in output
-    assert "reason: fork does not yet contain upstream release rust-v0.120.0" in output
+    assert "sync_reason: fork does not yet contain upstream release rust-v0.120.0" in output
 
 
 def test_cmd_codex_fork_info_json_output(monkeypatch, capsys):
@@ -87,6 +104,8 @@ def test_collect_codex_fork_maintenance_info_tracks_latest_release(monkeypatch, 
     binary_path = repo_root / "codex-rs" / "target" / "release" / "codex"
     binary_path.parent.mkdir(parents=True)
     binary_path.write_text("binary")
+    old_timestamp = 1_775_000_000
+    os.utime(binary_path, (old_timestamp, old_timestamp))
 
     def _fake_run_text(args):
         cmd = " ".join(args)
@@ -94,6 +113,8 @@ def test_collect_codex_fork_maintenance_info_tracks_latest_release(monkeypatch, 
             return "main"
         if "rev-parse --short HEAD" in cmd:
             return "fork123"
+        if "log -1 --format=%cI HEAD" in cmd:
+            return "2026-04-10T09:00:00+00:00"
         if "rev-parse --short upstream/main" in cmd:
             return "up456"
         if "rev-list --left-right --count HEAD...upstream/main" in cmd:
@@ -119,6 +140,11 @@ def test_collect_codex_fork_maintenance_info_tracks_latest_release(monkeypatch, 
 
     assert info["latest_upstream_release_tag"] == "rust-v0.120.0"
     assert info["latest_upstream_release_commit"] == "releasecommit"
+    assert info["binary_older_than_fork_head"] is True
+    assert info["latest_upstream_release_newer_than_binary"] is True
+    assert info["build_recommended"] is True
+    assert info["release_build_script"].endswith("scripts/codex_fork/release_artifacts.sh")
+    assert info["maintenance_spec"].endswith("specs/546_codex_fork_release_sync_mechanism.md")
     assert info["fork_contains_latest_upstream_release"] is False
     assert info["sync_recommended"] is True
     assert info["sync_reasons"] == ["fork does not yet contain upstream release rust-v0.120.0"]

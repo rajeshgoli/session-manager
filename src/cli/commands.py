@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -2568,6 +2568,11 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
         binary_mtime = maintenance.get("binary_mtime")
         if binary_mtime:
             print(f"- binary_mtime: {binary_mtime}")
+        head_commit_committed_at = maintenance.get("head_commit_committed_at")
+        if head_commit_committed_at:
+            print(f"- head_commit_committed_at: {head_commit_committed_at}")
+        if "binary_older_than_fork_head" in maintenance:
+            print(f"- binary_older_than_fork_head: {maintenance.get('binary_older_than_fork_head')}")
         release_tag = maintenance.get("latest_upstream_release_tag")
         release_published_at = maintenance.get("latest_upstream_release_published_at")
         if release_tag:
@@ -2575,6 +2580,11 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
             if release_published_at:
                 release_line = f"{release_line} ({release_published_at})"
             print(f"- latest_upstream_release: {release_line}")
+        if "latest_upstream_release_newer_than_binary" in maintenance:
+            print(
+                f"- latest_upstream_release_newer_than_binary: "
+                f"{maintenance.get('latest_upstream_release_newer_than_binary')}"
+            )
         release_commit = maintenance.get("latest_upstream_release_commit")
         if release_commit:
             print(f"- latest_upstream_release_commit: {release_commit}")
@@ -2583,9 +2593,18 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
                 f"- fork_contains_latest_upstream_release: "
                 f"{maintenance.get('fork_contains_latest_upstream_release')}"
             )
+        release_build_script = maintenance.get("release_build_script")
+        if release_build_script:
+            print(f"- release_build_script: {release_build_script}")
+        maintenance_spec = maintenance.get("maintenance_spec")
+        if maintenance_spec:
+            print(f"- maintenance_spec: {maintenance_spec}")
+        print(f"- build_recommended: {maintenance.get('build_recommended', False)}")
+        for reason in maintenance.get("build_reasons", []):
+            print(f"  build_reason: {reason}")
         print(f"- sync_recommended: {maintenance.get('sync_recommended', False)}")
         for reason in maintenance.get("sync_reasons", []):
-            print(f"  reason: {reason}")
+            print(f"  sync_reason: {reason}")
     return 0
 
 
@@ -2603,20 +2622,36 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
         return {
             "binary_path": str(binary_path),
             "binary_exists": binary_path.exists(),
+            "build_recommended": not binary_path.exists(),
+            "build_reasons": ["local codex binary is missing"] if not binary_path.exists() else [],
             "sync_recommended": False,
             "sync_reasons": [],
         }
 
+    checkout_root = Path(__file__).resolve().parents[2]
+    release_build_script = checkout_root / "scripts" / "codex_fork" / "release_artifacts.sh"
+    maintenance_spec = checkout_root / "specs" / "546_codex_fork_release_sync_mechanism.md"
     info: dict[str, object] = {
         "binary_path": str(binary_path),
         "binary_exists": binary_path.exists(),
         "repo_root": str(repo_root),
+        "build_recommended": False,
+        "build_reasons": [],
         "sync_recommended": False,
         "sync_reasons": [],
     }
-    reasons: list[str] = []
+    build_reasons: list[str] = []
+    sync_reasons: list[str] = []
+    binary_mtime_dt: Optional[datetime] = None
     if binary_path.exists():
-        info["binary_mtime"] = datetime.fromtimestamp(binary_path.stat().st_mtime).isoformat(timespec="seconds")
+        binary_mtime_dt = datetime.fromtimestamp(binary_path.stat().st_mtime, tz=timezone.utc)
+        info["binary_mtime"] = binary_mtime_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+    else:
+        build_reasons.append("local codex binary is missing")
+    if release_build_script.exists():
+        info["release_build_script"] = str(release_build_script)
+    if maintenance_spec.exists():
+        info["maintenance_spec"] = str(maintenance_spec)
 
     branch = _run_text_command(["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"])
     if branch:
@@ -2625,6 +2660,15 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
     fork_head = _run_text_command(["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"])
     if fork_head:
         info["fork_head"] = fork_head
+    head_commit_committed_at = _run_text_command(["git", "-C", str(repo_root), "log", "-1", "--format=%cI", "HEAD"])
+    head_commit_dt = _parse_iso_datetime(head_commit_committed_at)
+    if head_commit_committed_at:
+        info["head_commit_committed_at"] = head_commit_committed_at
+    if binary_mtime_dt and head_commit_dt is not None:
+        binary_older_than_fork_head = binary_mtime_dt < head_commit_dt
+        info["binary_older_than_fork_head"] = binary_older_than_fork_head
+        if binary_older_than_fork_head:
+            build_reasons.append("local codex binary predates the current fork HEAD commit")
 
     fetch_rc = _run_command(["git", "-C", str(repo_root), "fetch", "upstream", "main", "--tags", "--quiet"])
     if fetch_rc == 0:
@@ -2675,10 +2719,19 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
                 if contains_release is not None:
                     info["fork_contains_latest_upstream_release"] = contains_release == 0
                     if contains_release != 0:
-                        reasons.append(f"fork does not yet contain upstream release {release_tag}")
+                        sync_reasons.append(f"fork does not yet contain upstream release {release_tag}")
+        if binary_mtime_dt and release_tag:
+            release_published_dt = _parse_iso_datetime(release_published_at)
+            if release_published_dt is not None:
+                release_newer_than_binary = release_published_dt > binary_mtime_dt
+                info["latest_upstream_release_newer_than_binary"] = release_newer_than_binary
+                if release_newer_than_binary:
+                    build_reasons.append(f"local codex binary predates upstream release {release_tag}")
 
-    info["sync_recommended"] = bool(reasons)
-    info["sync_reasons"] = reasons
+    info["build_recommended"] = bool(build_reasons)
+    info["build_reasons"] = build_reasons
+    info["sync_recommended"] = bool(sync_reasons)
+    info["sync_reasons"] = sync_reasons
     return info
 
 
@@ -2722,6 +2775,19 @@ def _run_text_command(args: list[str]) -> Optional[str]:
         return None
     output = result.stdout.strip()
     return output or None
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse one ISO timestamp, including GitHub's Z suffix."""
+    if not value:
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
 
 
 def cmd_codex_rollout_gates(client: SessionManagerClient, json_output: bool = False) -> int:
