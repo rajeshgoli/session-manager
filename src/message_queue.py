@@ -1807,7 +1807,7 @@ class MessageQueueManager:
                 logger.error(f"Failed to deliver messages to {session_id}")
 
     async def _deliver_urgent(self, session_id: str, msg: QueuedMessage):
-        """Deliver an urgent message immediately, interrupting Claude."""
+        """Deliver an urgent message immediately using provider-specific interrupt behavior."""
         # Skip delivery if session is paused for recovery
         if session_id in self._paused_sessions:
             logger.debug(f"Session {session_id} paused for recovery, deferring urgent delivery")
@@ -1819,7 +1819,11 @@ class MessageQueueManager:
             return
 
         try:
-            if getattr(session, "provider", "claude") == "codex-app":
+            provider = getattr(session, "provider", None)
+            if not isinstance(provider, str) or not provider:
+                provider = "claude"
+
+            if provider == "codex-app":
                 success = await self.session_manager._deliver_urgent(session, msg.text)
                 if success:
                     self._mark_delivered(msg.id)
@@ -1891,15 +1895,34 @@ class MessageQueueManager:
                     # Wait for Claude to show prompt after wake-up (#175)
                     await self._wait_for_claude_prompt_async(session.tmux_session)
 
-                # Send Escape to interrupt any streaming (async, non-blocking)
-                proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session, "Escape",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
+                if provider == "claude":
+                    backgrounded = await self.session_manager.tmux.background_claude_task_async(
+                        session.tmux_session
+                    )
+                    if not backgrounded:
+                        logger.error(f"Failed to background Claude task for urgent delivery to {session_id}")
+                        return
 
-                # Wait for Claude to show idle prompt before sending payload (#175)
+                    # Claude may remain focused on the live task output after backgrounding.
+                    # Wait for a prompt, then interrupt that watch state before injecting.
+                    await self._wait_for_claude_prompt_async(session.tmux_session)
+
+                    proc = await asyncio.create_subprocess_exec(
+                        "tmux", "send-keys", "-t", session.tmux_session, "Escape",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
+                else:
+                    # Non-Claude tmux providers retain the existing interrupt behavior.
+                    proc = await asyncio.create_subprocess_exec(
+                        "tmux", "send-keys", "-t", session.tmux_session, "Escape",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
+
+                # Wait for the prompt before sending payload (#175)
                 await self._wait_for_claude_prompt_async(session.tmux_session)
 
                 # Inject message directly (use async version to avoid blocking)
@@ -2922,7 +2945,7 @@ class MessageQueueManager:
                     else:
                         self.queue_message(
                             target_session_id=target_session_id,
-                            text='[sm remind] Status overdue. Run: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete',
+                            text='[sm remind] Status overdue. This interrupt came from Session Manager because your status is overdue, not from the user. Run: sm status "message" — if waiting on others: sm turn-complete — if done: sm task-complete — then continue your prior work unless this reminder reveals a blocker.',
                             delivery_mode="urgent",
                         )
                     # Reset cycle so it restarts

@@ -673,6 +673,42 @@ class TmuxController:
             logger.error(f"Failed to send input: {e}")
             return False
 
+    async def send_key_async(self, session_name: str, key: str) -> bool:
+        """
+        Send a single key to a tmux session asynchronously.
+
+        Args:
+            session_name: Target session name
+            key: Key to send, e.g. "Escape" or "C-b"
+
+        Returns:
+            True if key sent successfully
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", session_name, key,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self.send_keys_timeout_seconds
+            )
+            if proc.returncode != 0:
+                logger.error(f"Failed to send key async: {stderr.decode()}")
+                return False
+            logger.info(f"Sent key to {session_name} (async): {key}")
+            return True
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout sending key {key} to {session_name}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to send key async: {e}")
+            return False
+
+    async def background_claude_task_async(self, session_name: str) -> bool:
+        """Send Claude's background-task keybinding to a tmux session."""
+        return await self.send_key_async(session_name, "C-b")
+
     def send_key(self, session_name: str, key: str) -> bool:
         """
         Send a single key to a tmux session (e.g., 'y', 'n', 'Enter').

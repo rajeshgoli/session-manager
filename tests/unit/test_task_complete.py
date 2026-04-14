@@ -312,6 +312,7 @@ class TestRemindMessageIncludesTaskCompleteHint:
         # Both soft and hard messages should have the hint
         assert source.count("sm task-complete") >= 2
         assert source.count("sm turn-complete") >= 2
+        assert "not from the user" in source
 
 
 # ---------------------------------------------------------------------------

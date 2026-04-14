@@ -323,9 +323,11 @@ async def test_deliver_urgent_uses_async_escape():
     mock_session_manager = Mock()
     mock_session = Mock()
     mock_session.tmux_session = "tmux-test"
+    mock_session.provider = "claude"
     mock_session_manager.get_session = Mock(return_value=mock_session)
     mock_session_manager.tmux = Mock()
     mock_session_manager.tmux.send_input_async = AsyncMock(return_value=True)
+    mock_session_manager.tmux.background_claude_task_async = AsyncMock(return_value=True)
 
     manager = MessageQueueManager(
         session_manager=mock_session_manager,
@@ -367,9 +369,11 @@ async def test_message_queue_no_blocking_in_delivery_path():
     mock_session_manager = Mock()
     mock_session = Mock()
     mock_session.tmux_session = "tmux-test"
+    mock_session.provider = "claude"
     mock_session_manager.get_session = Mock(return_value=mock_session)
     mock_session_manager.tmux = Mock()
     mock_session_manager.tmux.send_input_async = AsyncMock(return_value=True)
+    mock_session_manager.tmux.background_claude_task_async = AsyncMock(return_value=True)
 
     manager = MessageQueueManager(
         session_manager=mock_session_manager,

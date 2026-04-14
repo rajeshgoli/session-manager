@@ -22,6 +22,7 @@ def mock_session_manager():
     manager.get_session = Mock()
     manager.tmux = Mock()
     manager.tmux.send_input_async = AsyncMock(return_value=True)
+    manager.tmux.background_claude_task_async = AsyncMock(return_value=True)
     manager._save_state = Mock()
     manager._deliver_direct = AsyncMock(return_value=True)
     return manager
@@ -102,7 +103,9 @@ async def test_urgent_delivery_to_completed_session_wakes_up_first(
     assert first_call[3] == "claude-test-123"
     assert first_call[4] == "Enter"
 
-    # Second call should be Escape (to interrupt)
+    mock_session_manager.tmux.background_claude_task_async.assert_awaited_once_with("claude-test-123")
+
+    # Second subprocess call should be Escape (after Claude backgrounding)
     second_call = subprocess_calls[1]
     assert second_call[0] == "tmux"
     assert second_call[1] == "send-keys"
@@ -155,7 +158,9 @@ async def test_urgent_delivery_to_running_session_no_wake_up(
     # Verify subprocess calls - should NOT start with wake-up Enter
     assert len(subprocess_calls) >= 1
 
-    # First call should be Escape (NOT Enter)
+    mock_session_manager.tmux.background_claude_task_async.assert_awaited_once_with("claude-test-456")
+
+    # First subprocess call should be Escape (wake-up Enter is not used)
     first_call = subprocess_calls[0]
     assert first_call[0] == "tmux"
     assert first_call[1] == "send-keys"
@@ -208,6 +213,8 @@ async def test_urgent_delivery_to_error_session_no_wake_up(
     # Verify subprocess calls - should NOT start with wake-up Enter
     assert len(subprocess_calls) >= 1
 
+    mock_session_manager.tmux.background_claude_task_async.assert_awaited_once_with("claude-test-error")
+
     # First call should be Escape (NOT Enter)
     first_call = subprocess_calls[0]
     assert first_call[4] == "Escape"
@@ -257,9 +264,51 @@ async def test_urgent_delivery_to_abandoned_session_no_wake_up(
     # Verify subprocess calls - should NOT start with wake-up Enter
     assert len(subprocess_calls) >= 1
 
+    mock_session_manager.tmux.background_claude_task_async.assert_awaited_once_with("claude-test-abandoned")
+
     # First call should be Escape (NOT Enter)
     first_call = subprocess_calls[0]
     assert first_call[4] == "Escape"
+
+
+@pytest.mark.asyncio
+async def test_urgent_delivery_to_codex_fork_session_keeps_escape_path(
+    message_queue, mock_session_manager
+):
+    """codex-fork urgent delivery keeps the existing Escape path."""
+    session = Session(
+        id="test-fork",
+        name="test-session",
+        working_dir="/tmp/test",
+        tmux_session="codex-fork-test",
+        provider="codex-fork",
+        completion_status=None,
+        friendly_name="fork-agent",
+    )
+    mock_session_manager.get_session.return_value = session
+
+    msg = QueuedMessage(
+        id="msg-fork",
+        target_session_id="test-fork",
+        text="urgent task",
+        delivery_mode="urgent",
+    )
+
+    subprocess_calls = []
+
+    async def mock_subprocess(*args, **kwargs):
+        subprocess_calls.append(args)
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+        message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
+        await message_queue._deliver_urgent("test-fork", msg)
+
+    mock_session_manager.tmux.background_claude_task_async.assert_not_awaited()
+    assert subprocess_calls[0][4] == "Escape"
 
 
 @pytest.mark.asyncio
