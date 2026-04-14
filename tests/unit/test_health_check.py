@@ -9,6 +9,7 @@ Verifies all health check components:
 """
 
 import json
+import sqlite3
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -301,6 +302,54 @@ class TestMessageQueueCheck:
 
         assert data["checks"]["message_queue"]["status"] == "warning"
         assert data["checks"]["message_queue"]["details"]["db_exists"] is False
+
+    def test_message_queue_uses_message_queue_table(self, mock_session_manager, mock_output_monitor, mock_child_monitor, mock_notifier):
+        """Health check reads the real message_queue table, not a legacy messages table."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = Path(f.name)
+
+        try:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE message_queue (
+                        id TEXT PRIMARY KEY,
+                        target_session_id TEXT NOT NULL,
+                        sender_session_id TEXT,
+                        sender_name TEXT,
+                        text TEXT NOT NULL,
+                        delivery_mode TEXT DEFAULT 'sequential',
+                        queued_at TIMESTAMP NOT NULL,
+                        timeout_at TIMESTAMP,
+                        notify_on_delivery INTEGER DEFAULT 0,
+                        notify_after_seconds INTEGER,
+                        delivered_at TIMESTAMP
+                    );
+                    INSERT INTO message_queue (id, target_session_id, text, queued_at, delivered_at)
+                    VALUES ('msg-1', 'sess-1', 'hello', datetime('now', '-2 hours'), NULL);
+                    """
+                )
+
+            mock_mq = MagicMock()
+            mock_mq.db_path = db_path
+            mock_session_manager.message_queue_manager = mock_mq
+
+            app = create_app(
+                session_manager=mock_session_manager,
+                notifier=mock_notifier,
+                output_monitor=mock_output_monitor,
+                child_monitor=mock_child_monitor,
+            )
+            client = TestClient(app)
+
+            response = client.get("/health/detailed")
+            data = response.json()
+
+            assert data["checks"]["message_queue"]["status"] == "warning"
+            assert data["checks"]["message_queue"]["details"]["pending"] == 1
+            assert data["checks"]["message_queue"]["details"]["stuck"] == 1
+        finally:
+            db_path.unlink(missing_ok=True)
 
 
 class TestTelegramCheck:

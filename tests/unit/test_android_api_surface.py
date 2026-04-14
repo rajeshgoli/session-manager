@@ -165,6 +165,7 @@ def test_client_sessions_include_termux_attach_metadata():
     assert "kill \"$attach_pid\"" not in ssh_command
     assert "pkill -P \"$attach_pid\"" not in ssh_command
     assert "ProxyCommand=cloudflared access ssh --hostname %h" in ssh_command
+    assert "StrictHostKeyChecking=accept-new" in ssh_command
     assert "rajesh@ssh.sm.rajeshgo.li" in ssh_command
     assert "exec tmux attach-session -d -t \"$SM_TMUX_SESSION\"" in ssh_command
     assert payload["primary_action"] == {

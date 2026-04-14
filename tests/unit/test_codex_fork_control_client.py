@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,61 +23,63 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.asyncio
 async def test_deliver_direct_uses_control_socket_primary_path(tmp_path):
-    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
-    session = Session(
-        id="cfctl1",
-        name="codex-fork-cfctl1",
-        working_dir=str(tmp_path),
-        provider="codex-fork",
-        status=SessionStatus.RUNNING,
-    )
-    manager.sessions[session.id] = session
-    manager.tmux.send_input_async = AsyncMock(return_value=True)
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="cfctl-") as short_dir:
+        short_root = Path(short_dir)
+        manager = SessionManager(log_dir=str(short_root), state_file=str(short_root / "state.json"))
+        session = Session(
+            id="cfctl1",
+            name="codex-fork-cfctl1",
+            working_dir=str(short_root),
+            provider="codex-fork",
+            status=SessionStatus.RUNNING,
+        )
+        manager.sessions[session.id] = session
+        manager.tmux.send_input_async = AsyncMock(return_value=True)
 
-    socket_path = manager._codex_fork_control_socket_path(session)
-    if socket_path.exists():
-        socket_path.unlink()
-
-    seen_commands: list[str] = []
-
-    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        raw = await reader.readline()
-        request = json.loads(raw.decode("utf-8"))
-        seen_commands.append(request["command"])
-        if request["command"] == "get_epoch":
-            response = {
-                "request_id": request["request_id"],
-                "ok": True,
-                "epoch": "epoch-1",
-                "result": {"epoch": "epoch-1"},
-            }
-        else:
-            assert request["command"] == "submit_message"
-            assert request["expected_epoch"] == "epoch-1"
-            assert request["message"] == "hello world"
-            response = {
-                "request_id": request["request_id"],
-                "ok": True,
-                "epoch": "epoch-1",
-                "result": {"status": "accepted"},
-            }
-        writer.write((json.dumps(response) + "\n").encode("utf-8"))
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-
-    server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
-    try:
-        success = await manager._deliver_direct(session, "hello world")
-        assert success is True
-        assert seen_commands == ["get_epoch", "submit_message"]
-        manager.tmux.send_input_async.assert_not_called()
-        assert session.error_message is None
-    finally:
-        server.close()
-        await server.wait_closed()
+        socket_path = manager._codex_fork_control_socket_path(session)
         if socket_path.exists():
             socket_path.unlink()
+
+        seen_commands: list[str] = []
+
+        async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            raw = await reader.readline()
+            request = json.loads(raw.decode("utf-8"))
+            seen_commands.append(request["command"])
+            if request["command"] == "get_epoch":
+                response = {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "epoch": "epoch-1",
+                    "result": {"epoch": "epoch-1"},
+                }
+            else:
+                assert request["command"] == "submit_message"
+                assert request["expected_epoch"] == "epoch-1"
+                assert request["message"] == "hello world"
+                response = {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "epoch": "epoch-1",
+                    "result": {"status": "accepted"},
+                }
+            writer.write((json.dumps(response) + "\n").encode("utf-8"))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
+        try:
+            success = await manager._deliver_direct(session, "hello world")
+            assert success is True
+            assert seen_commands == ["get_epoch", "submit_message"]
+            manager.tmux.send_input_async.assert_not_called()
+            assert session.error_message is None
+        finally:
+            server.close()
+            await server.wait_closed()
+            if socket_path.exists():
+                socket_path.unlink()
 
 
 @pytest.mark.asyncio

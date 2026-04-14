@@ -1814,6 +1814,7 @@ def create_app(
         ssh_args = ["ssh"]
         if ssh_proxy_command:
             ssh_args.extend(["-o", f"ProxyCommand={ssh_proxy_command}"])
+        ssh_args.extend(["-o", "StrictHostKeyChecking=accept-new"])
         remote_attach_script = (
             "PATH=/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/bin:/bin:$PATH; "
             "export PATH; "
@@ -2685,12 +2686,12 @@ def create_app(
             cursor = conn.cursor()
 
             # Count total pending
-            cursor.execute("SELECT COUNT(*) FROM messages WHERE delivered_at IS NULL")
+            cursor.execute("SELECT COUNT(*) FROM message_queue WHERE delivered_at IS NULL")
             pending_count = cursor.fetchone()[0]
 
             # Count stuck messages (queued > 1 hour ago and not delivered)
             cursor.execute("""
-                SELECT COUNT(*) FROM messages
+                SELECT COUNT(*) FROM message_queue
                 WHERE delivered_at IS NULL
                 AND datetime(queued_at) < datetime('now', '-1 hour')
             """)
@@ -2698,7 +2699,7 @@ def create_app(
 
             # Count expired messages still in queue
             cursor.execute("""
-                SELECT COUNT(*) FROM messages
+                SELECT COUNT(*) FROM message_queue
                 WHERE delivered_at IS NULL
                 AND timeout_at IS NOT NULL
                 AND datetime(timeout_at) < datetime('now')

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tempfile
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -58,6 +58,8 @@ async def test_send_input_detects_role_when_unset():
     queue_mgr = Mock()
     queue_mgr.delivery_states = {}
     queue_mgr.queue_message = Mock()
+    queue_mgr.deliver_queued_message_now = AsyncMock(return_value=True)
+    queue_mgr.queue_message.return_value = Mock(id="msg-1")
     manager.message_queue_manager = queue_mgr
 
     result = await manager.send_input(session.id, "As engineer, implement ticket 287.")
@@ -77,6 +79,8 @@ async def test_send_input_does_not_override_existing_role():
     queue_mgr = Mock()
     queue_mgr.delivery_states = {}
     queue_mgr.queue_message = Mock()
+    queue_mgr.deliver_queued_message_now = AsyncMock(return_value=True)
+    queue_mgr.queue_message.return_value = Mock(id="msg-2")
     manager.message_queue_manager = queue_mgr
 
     result = await manager.send_input(session.id, "As engineer, implement ticket 287.")
