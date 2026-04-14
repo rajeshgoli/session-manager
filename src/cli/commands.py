@@ -167,7 +167,10 @@ def resolve_session_id_with_status(
     try:
         sessions = client.list_sessions(include_stopped=include_stopped, timeout=timeout)
     except TypeError:
-        sessions = client.list_sessions()
+        try:
+            sessions = client.list_sessions(include_stopped=include_stopped)
+        except TypeError:
+            sessions = client.list_sessions()
     if sessions is None:
         return None, None, True
 

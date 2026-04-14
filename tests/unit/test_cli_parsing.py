@@ -781,6 +781,31 @@ class TestSessionResolution:
         assert unavailable is False
         mock_client.get_session.assert_called_with("abc123")
 
+    def test_resolve_with_status_preserves_include_stopped_for_legacy_list_sessions(self):
+        """Legacy list_sessions fallbacks still honor include_stopped."""
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = None
+
+        def _legacy_list_sessions(*args, **kwargs):
+            if "timeout" in kwargs:
+                raise TypeError("legacy client does not accept timeout")
+            if kwargs.get("include_stopped") is True:
+                return [{"id": "dead123", "friendly_name": "stopped-worker", "status": "stopped"}]
+            return []
+
+        mock_client.list_sessions.side_effect = _legacy_list_sessions
+
+        session_id, session, unavailable = resolve_session_id_with_status(
+            mock_client,
+            "stopped-worker",
+            include_stopped=True,
+            timeout=15.0,
+        )
+
+        assert session_id == "dead123"
+        assert session["status"] == "stopped"
+        assert unavailable is False
+
 
 class TestParseDuration:
     """Tests for duration parsing utility."""
