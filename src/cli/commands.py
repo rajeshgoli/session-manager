@@ -156,7 +156,10 @@ def resolve_session_id_with_status(
         return None, None, False
 
     # Try as session ID first
-    session = client.get_session(identifier, timeout=timeout)
+    try:
+        session = client.get_session(identifier, timeout=timeout)
+    except TypeError:
+        session = client.get_session(identifier)
     if session:
         return identifier, session, False
 

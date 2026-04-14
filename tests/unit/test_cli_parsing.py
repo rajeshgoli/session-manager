@@ -761,6 +761,26 @@ class TestSessionResolution:
         assert session is None
         assert unavailable is True
 
+    def test_resolve_with_status_falls_back_for_legacy_get_session_signature(self):
+        """Legacy clients without a timeout kwarg still resolve by ID."""
+        mock_client = MagicMock()
+
+        def _legacy_get_session(session_id):
+            return {"id": session_id, "name": "legacy"}
+
+        mock_client.get_session.side_effect = _legacy_get_session
+
+        session_id, session, unavailable = resolve_session_id_with_status(
+            mock_client,
+            "abc123",
+            timeout=15.0,
+        )
+
+        assert session_id == "abc123"
+        assert session["name"] == "legacy"
+        assert unavailable is False
+        mock_client.get_session.assert_called_with("abc123")
+
 
 class TestParseDuration:
     """Tests for duration parsing utility."""
