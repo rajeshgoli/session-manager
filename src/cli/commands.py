@@ -14,7 +14,7 @@ _BASH_DISPLAY_WIDTH = 80
 UNAVAILABLE_MESSAGE = "Error: Session manager unavailable or request timed out"
 UNAVAILABLE_STATUS_MESSAGE = "You: Session manager unavailable or request timed out"
 
-from .client import SessionManagerClient
+from .client import SEND_API_TIMEOUT, SessionManagerClient
 from .formatting import format_session_line, format_relative_time, format_status_list
 from ..lock_manager import LockManager
 from ..codex_provider_policy import (
@@ -125,6 +125,22 @@ def resolve_session_id(
     *,
     include_stopped: bool = False,
 ) -> tuple[Optional[str], Optional[dict]]:
+    """Backward-compatible wrapper over resolve_session_id_with_status()."""
+    session_id, session, _ = resolve_session_id_with_status(
+        client,
+        identifier,
+        include_stopped=include_stopped,
+    )
+    return session_id, session
+
+
+def resolve_session_id_with_status(
+    client: SessionManagerClient,
+    identifier: str,
+    *,
+    include_stopped: bool = False,
+    timeout: Optional[float] = None,
+) -> tuple[Optional[str], Optional[dict], bool]:
     """
     Resolve a session identifier (ID or friendly name) to session ID and details.
 
@@ -133,37 +149,43 @@ def resolve_session_id(
         identifier: Session ID or friendly name
 
     Returns:
-        Tuple of (session_id, session_dict) or (None, None) if not found/unavailable
+        Tuple of (session_id, session_dict, unavailable)
     """
     # Reject empty or blank identifiers
     if not identifier or not identifier.strip():
-        return None, None
+        return None, None, False
 
     # Try as session ID first
-    session = client.get_session(identifier)
+    try:
+        session = client.get_session(identifier, timeout=timeout)
+    except TypeError:
+        session = client.get_session(identifier)
     if session:
-        return identifier, session
+        return identifier, session, False
 
     # Not found by ID, try as friendly name
     try:
-        sessions = client.list_sessions(include_stopped=include_stopped)
+        sessions = client.list_sessions(include_stopped=include_stopped, timeout=timeout)
     except TypeError:
-        sessions = client.list_sessions()
+        try:
+            sessions = client.list_sessions(include_stopped=include_stopped)
+        except TypeError:
+            sessions = client.list_sessions()
     if sessions is None:
-        return None, None  # Session manager unavailable
+        return None, None, True
 
     # Search aliases before friendly names so durable handles like
     # "maintainer" cannot be shadowed by an arbitrary session name.
     for s in sessions:
         aliases = s.get("aliases") or []
         if identifier in aliases:
-            return s["id"], s
+            return s["id"], s, False
 
     for s in sessions:
         if s.get("friendly_name") == identifier:
-            return s["id"], s
+            return s["id"], s, False
 
-    return None, None  # Not found
+    return None, None, False
 
 
 def validate_friendly_name(name: str) -> tuple[bool, str]:
@@ -1298,7 +1320,14 @@ def cmd_send(
     effective_notify_after = wait_seconds if wait_seconds is not None else notify_after_seconds
 
     # Resolve identifier to session ID and get session details
-    session_id, session = resolve_session_id(client, identifier)
+    session_id, session, resolve_unavailable = resolve_session_id_with_status(
+        client,
+        identifier,
+        timeout=SEND_API_TIMEOUT,
+    )
+    if resolve_unavailable:
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
     if session_id is None:
         ensure_result = client.ensure_role(identifier, requester_session_id=sender_session_id)
         if ensure_result.get("unavailable"):
@@ -1322,7 +1351,7 @@ def cmd_send(
                 print(f"Error: {detail or 'Failed to bootstrap role'}", file=sys.stderr)
                 return 1
             # Check if it's unavailable or not found
-            sessions = client.list_sessions()
+            sessions = client.list_sessions(timeout=SEND_API_TIMEOUT)
             if sessions is None:
                 print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
@@ -1376,6 +1405,7 @@ def cmd_send(
         remind_hard_threshold=remind_hard_threshold,
         remind_cancel_on_reply_session_id=sender_session_id if track_seconds is not None else None,
         parent_session_id=parent_session_id,
+        timeout=SEND_API_TIMEOUT,
     )
 
     if unavailable:
