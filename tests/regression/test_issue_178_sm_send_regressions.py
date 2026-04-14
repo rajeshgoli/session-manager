@@ -41,6 +41,7 @@ def mock_session_manager():
     manager.get_session = Mock()
     manager.tmux = Mock()
     manager.tmux.send_input_async = AsyncMock(return_value=True)
+    manager.tmux.background_claude_task_async = AsyncMock(return_value=True)
     manager._save_state = Mock()
     manager._deliver_direct = AsyncMock(return_value=True)
     return manager

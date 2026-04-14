@@ -31,6 +31,7 @@ def mock_session_manager():
     manager.get_session = Mock()
     manager.tmux = Mock()
     manager.tmux.send_input_async = AsyncMock(return_value=True)
+    manager.tmux.background_claude_task_async = AsyncMock(return_value=True)
     manager._save_state = Mock()
     manager._deliver_direct = AsyncMock(return_value=True)
     return manager
@@ -105,16 +106,20 @@ class TestBugA_PromptDetectionBeforeDelivery:
         )
 
         call_order = []
-
-        # Track call order: Escape send-keys, then prompt wait, then deliver
-        original_wait = message_queue._wait_for_claude_prompt_async
+        wait_count = 0
 
         async def mock_wait(*args, **kwargs):
-            call_order.append("wait_for_prompt")
+            nonlocal wait_count
+            wait_count += 1
+            call_order.append(f"wait_for_prompt_{wait_count}")
             return True
 
         async def mock_deliver(*args, **kwargs):
             call_order.append("deliver_direct")
+            return True
+
+        async def mock_background(*args, **kwargs):
+            call_order.append("background_send")
             return True
 
         async def mock_subprocess(*args, **kwargs):
@@ -125,17 +130,22 @@ class TestBugA_PromptDetectionBeforeDelivery:
             return proc
 
         with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+            mock_session_manager.tmux.background_claude_task_async = AsyncMock(side_effect=mock_background)
             message_queue._wait_for_claude_prompt_async = AsyncMock(side_effect=mock_wait)
             mock_session_manager._deliver_direct = AsyncMock(side_effect=mock_deliver)
 
             await message_queue._deliver_urgent("test-175a", msg)
 
-        # Verify order: escape first, then prompt wait, then deliver
+        # Verify order: background first, then prompt wait, escape, prompt wait, deliver
+        assert "background_send" in call_order
         assert "escape_send" in call_order
-        assert "wait_for_prompt" in call_order
+        assert "wait_for_prompt_1" in call_order
+        assert "wait_for_prompt_2" in call_order
         assert "deliver_direct" in call_order
-        assert call_order.index("escape_send") < call_order.index("wait_for_prompt")
-        assert call_order.index("wait_for_prompt") < call_order.index("deliver_direct")
+        assert call_order.index("background_send") < call_order.index("wait_for_prompt_1")
+        assert call_order.index("wait_for_prompt_1") < call_order.index("escape_send")
+        assert call_order.index("escape_send") < call_order.index("wait_for_prompt_2")
+        assert call_order.index("wait_for_prompt_2") < call_order.index("deliver_direct")
 
     @pytest.mark.asyncio
     async def test_urgent_delivery_no_longer_uses_sleep_delay(
@@ -172,6 +182,7 @@ class TestBugA_PromptDetectionBeforeDelivery:
 
         with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", side_effect=tracking_sleep):
+            mock_session_manager.tmux.background_claude_task_async = AsyncMock(return_value=True)
             message_queue._wait_for_claude_prompt_async = AsyncMock(return_value=True)
 
             await message_queue._deliver_urgent("test-175a2", msg)
@@ -467,3 +478,21 @@ class TestBugB_TwoCallSendInput:
         source = inspect.getsource(tmux_controller.send_input_async)
         assert 'text + "\\r"' not in source
         assert "payload = text" not in source
+
+    @pytest.mark.asyncio
+    async def test_background_claude_task_async_sends_single_ctrl_b(self, tmux_controller):
+        """background_claude_task_async sends exactly one Ctrl+B and no trailing key."""
+        subprocess_calls = []
+
+        async def mock_subprocess(*args, **kwargs):
+            subprocess_calls.append(args)
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.returncode = 0
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess):
+            result = await tmux_controller.background_claude_task_async("claude-test")
+
+        assert result is True
+        assert subprocess_calls == [("tmux", "send-keys", "-t", "claude-test", "C-b")]
