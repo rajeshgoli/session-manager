@@ -1,10 +1,17 @@
-# sm#570: non-destructive overdue remind handling
+# sm#570: non-destructive urgent delivery for Claude
 
 Issue: #570
 
 ## Goal
 
-When `sm remind` hits its hard threshold, avoid destructively interrupting tmux-backed Claude sessions before the overdue reminder is delivered. Also make the reminder text explicitly say the interrupt came from Session Manager, not from the user.
+Avoid destructively interrupting tmux-backed Claude sessions when Session Manager needs immediate delivery.
+
+This applies to:
+
+- `sm remind` hard-threshold overdue interrupts
+- `sm send --urgent`
+
+For overdue remind copy specifically, also make the text explicitly say the interrupt came from Session Manager, not from the user.
 
 ## Observed current behavior
 
@@ -61,7 +68,7 @@ Negative probe against a second disposable Claude child:
 
 Interpretation:
 
-- Current `sm remind` hard-threshold behavior is destructive for tmux-backed Claude sessions because it uses the same raw `Escape` path as a true interrupt.
+- Current urgent delivery is destructive for tmux-backed Claude sessions because it uses the same raw `Escape` path as a true interrupt.
 - For tmux automation, a single injected `Ctrl+B` is sufficient.
 - We should **not** automate `Ctrl+B b`; it can leak a literal `b` into the Claude composer without backgrounding the task.
 - The Claude docs say tmux users press it twice because the first keypress is consumed by tmux as the interactive prefix. `tmux send-keys` bypasses that prefix handling and sends the control key directly to Claude.
@@ -80,11 +87,21 @@ Disposable session probe:
 7. Result:
    - `■ Conversation interrupted - tell the model what to do differently.`
 
+Additional live probe against `provider="codex-fork"` on April 14, 2026:
+
+1. Spawned a disposable `codex-fork` child via `sm spawn codex-fork ...`.
+2. Instructed it to run `sleep 300` in the foreground and report if an external keypress backgrounded it.
+3. Injected `Ctrl+B`, then later a second `Ctrl+B`.
+4. Observed result:
+   - child continued reporting `sleep 300` as foreground/alive
+   - no observable background transition
+   - no child report indicating backgrounding
+
 Interpretation:
 
-- Codex currently advertises `esc to interrupt`, not a background shortcut.
-- The tmux `Ctrl+B` experiment did not yield a reliable backgrounding behavior.
-- We should not reuse the Claude-specific backgrounding path for Codex.
+- Codex and codex-fork currently advertise `esc to interrupt`, not a background shortcut.
+- The live tmux `Ctrl+B` experiment did not yield a reliable backgrounding behavior for either Codex or codex-fork.
+- We should not reuse the Claude-specific backgrounding path for Codex or codex-fork.
 
 ## External documentation
 
@@ -94,17 +111,43 @@ Interpretation:
   - note: `Tmux users press twice`
   - `Ctrl+C`: cancel current input or generation
 
+### Claude `Ctrl+B` then `Escape` urgent probe
+
+Additional live probe against a real Claude child on April 14, 2026:
+
+1. Spawned a disposable Claude child via `sm spawn claude ...`.
+2. Instructed it to run `sleep 300` in Bash in the foreground.
+3. Injected exactly one `Ctrl+B`.
+4. Confirmed from the child output that `sleep 300` moved to the background and stayed alive.
+5. Injected `Escape`.
+6. Injected a probe message asking the child to verify whether the backgrounded sleep was still alive and whether the message arrived.
+7. Child reported:
+   - `claude urgent probe result: backgrounded, sleep alive, message received`
+
+Interpretation:
+
+- For tmux-backed Claude, `Ctrl+B` followed by `Escape` is a viable urgent-delivery sequence.
+- `Ctrl+B` preserves the running task by backgrounding it.
+- Follow-up `Escape` is still useful because it gets Claude out of passive task-watching mode and reliably accepts the injected urgent message.
+
 ## Chosen approach
 
-Split hard-remind delivery by provider family.
+Split urgent delivery by provider family.
 
-### 1. tmux-backed Claude sessions: background first, then inject remind
+### 1. tmux-backed Claude sessions: background, then interrupt, then inject
 
-For providers that use the Claude tmux UI path, replace the hard-remind pre-injection interrupt with Claude-compatible backgrounding:
+For providers that use the Claude tmux UI path, replace destructive urgent delivery with this sequence:
 
-1. Send exactly one `Ctrl+B` to the target tmux pane instead of `Escape`.
-2. Wait for Claude to return to a prompt-ready state.
-3. Inject the overdue reminder text as urgent/direct input.
+1. Send exactly one `Ctrl+B` to the target tmux pane.
+2. Wait for Claude to return to a prompt-ready state with the active task backgrounded.
+3. Send `Escape`.
+4. Wait for Claude to be prompt-ready again.
+5. Inject the urgent payload.
+
+Apply this to:
+
+- hard-threshold `sm remind` delivery
+- `sm send --urgent`
 
 The overdue reminder text should change to something like:
 
@@ -115,10 +158,11 @@ The overdue reminder text should change to something like:
 Why this is the right behavior:
 
 - It preserves the running Claude task instead of cancelling it.
+- It still gets Claude’s attention after the task is backgrounded.
 - It tells the agent exactly why the prompt appeared.
 - It reduces the chance that the agent mistakes the interrupt for a user redirect and goes idle.
 
-### 2. Codex and codex-app: keep the existing interrupt path
+### 2. Codex, codex-fork, and codex-app: keep the existing interrupt path
 
 Do not apply the Claude `Ctrl+B` backgrounding path to:
 
@@ -141,9 +185,15 @@ Why:
 
 ### Queue / delivery logic
 
-- Introduce a provider-aware urgent remind pre-delivery path in `src/message_queue.py`.
-- Use Claude backgrounding only for tmux-backed Claude sessions.
-- Keep existing urgent delivery for all other providers.
+- Introduce a provider-aware urgent pre-delivery path in `src/message_queue.py`.
+- For tmux-backed Claude urgent delivery:
+  - background with a single `Ctrl+B`
+  - wait for prompt
+  - send `Escape`
+  - wait for prompt again
+  - inject the urgent payload
+- Use this path for both hard-remind urgent delivery and `sm send --urgent`.
+- Keep existing urgent delivery for codex, codex-fork, and codex-app.
 
 ### tmux controller support
 
@@ -158,24 +208,28 @@ Why:
 
 ## Acceptance mapping
 
-1. For tmux-backed Claude sessions, hard-threshold remind no longer cancels a running Claude bash task before delivering the message.
+1. For tmux-backed Claude sessions, urgent delivery no longer cancels a running Claude bash task before delivering the message.
 2. The Claude path sends exactly one injected `Ctrl+B`, not `Ctrl+B b`.
-3. The hard-threshold remind text explicitly states that the interrupt came from Session Manager because status is overdue, not from the user.
-4. The reminder text tells the agent to continue prior work after sending status unless blocked.
-5. Codex, codex-app, and codex-fork remain on their existing interrupt path.
-6. Existing remind dedup behavior still works because the prefix remains `"[sm remind]"`.
+3. The Claude path follows backgrounding with `Escape` before injecting the urgent payload.
+4. `sm send --urgent` uses the same non-destructive Claude path.
+5. The hard-threshold remind text explicitly states that the interrupt came from Session Manager because status is overdue, not from the user.
+6. The reminder text tells the agent to continue prior work after sending status unless blocked.
+7. Codex, codex-app, and codex-fork remain on their existing interrupt path.
+8. Existing remind dedup behavior still works because the prefix remains `"[sm remind]"`.
 
 ## Tests to add during implementation
 
-- Unit test: hard remind for Claude-backed tmux session sends `Ctrl+B` instead of `Escape` before prompt wait.
-- Unit test: Claude-backed hard remind does not append a literal `b` or any extra key after the single `Ctrl+B` background key.
+- Unit test: Claude-backed urgent delivery sends `Ctrl+B`, waits for prompt, sends `Escape`, waits for prompt, then injects payload.
+- Unit test: Claude-backed urgent delivery does not append a literal `b` or any extra key after the single `Ctrl+B` background key.
+- Unit test: `sm send --urgent` for Claude uses the non-destructive path.
 - Unit test: hard remind for Codex-backed session still uses the existing urgent interrupt path.
+- Unit test: hard remind for codex-fork still uses the existing urgent interrupt path.
 - Unit test: hard remind text contains `not from the user`.
 - Regression test: remind dedup still recognizes the new hard-remind text via the unchanged `"[sm remind]"` prefix.
 
 ## Risks
 
-- Claude may background work only for certain active states, so prompt readiness must stay state-based rather than sleep-based.
+- Claude may background work only for certain active states, so both post-`Ctrl+B` and post-`Escape` readiness must stay state-based rather than sleep-based.
 - If we accidentally apply the Claude path to Codex, we risk undefined provider behavior.
 - The longer reminder copy could affect tests or any code that asserts exact strings.
 
