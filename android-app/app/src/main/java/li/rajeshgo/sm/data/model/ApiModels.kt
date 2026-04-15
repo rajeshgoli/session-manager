@@ -107,6 +107,12 @@ data class EnsureMaintainerResponse(
 )
 
 @Serializable
+data class EnsureMaintainerRequest(
+    @SerialName("requester_session_id")
+    val requesterSessionId: String? = null,
+)
+
+@Serializable
 data class ClientSession(
     val id: String,
     val name: String,

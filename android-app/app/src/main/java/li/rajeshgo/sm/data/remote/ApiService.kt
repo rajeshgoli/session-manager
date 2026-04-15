@@ -8,6 +8,7 @@ import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthRequest
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
+import li.rajeshgo.sm.data.model.EnsureMaintainerRequest
 import li.rajeshgo.sm.data.model.EnsureMaintainerResponse
 import li.rajeshgo.sm.data.model.KillSessionRequest
 import li.rajeshgo.sm.data.model.KillSessionResponse
@@ -47,7 +48,9 @@ interface ApiService {
     suspend fun requestStatus(): RequestStatusResponse
 
     @POST("maintainer/ensure")
-    suspend fun ensureMaintainer(): EnsureMaintainerResponse
+    suspend fun ensureMaintainer(
+        @Body request: EnsureMaintainerRequest = EnsureMaintainerRequest(),
+    ): EnsureMaintainerResponse
 
     @GET("sessions/{session_id}/output")
     suspend fun getSessionOutput(
