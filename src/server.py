@@ -22,10 +22,11 @@ from urllib.parse import urlencode, urlparse
 import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token as google_id_token
-from fastapi import FastAPI, HTTPException, Body, Request, Query
+from fastapi import FastAPI, HTTPException, Body, Request, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.requests import ClientDisconnect
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -76,6 +77,33 @@ DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
 
 def _is_valid_app_artifact_name(app_name: str) -> bool:
     return bool(APP_ARTIFACT_NAME_PATTERN.fullmatch(app_name))
+
+
+async def _decode_json_request(
+    request: Request,
+    *,
+    endpoint_name: str,
+) -> Optional[dict[str, Any]]:
+    """Decode one JSON request body without blocking the event loop on parsing."""
+    try:
+        raw_body = await request.body()
+    except ClientDisconnect:
+        logger.debug("Client disconnected before %s request body completed", endpoint_name)
+        return None
+
+    if not raw_body:
+        raise HTTPException(status_code=400, detail="Request body is required")
+
+    try:
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(None, json.loads, raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON object body required")
+
+    return payload
 
 
 def _is_valid_app_artifact_hash(artifact_hash: str) -> bool:
@@ -4300,7 +4328,7 @@ Provide ONLY the summary, no preamble or questions."""
         )
 
     @app.post("/hooks/claude")
-    async def claude_hook(payload: dict = Body(...)):
+    async def claude_hook(request: Request):
         """
         Webhook endpoint for Claude Code hooks.
 
@@ -4308,6 +4336,10 @@ Provide ONLY the summary, no preamble or questions."""
         """
         import json
         from pathlib import Path
+
+        payload = await _decode_json_request(request, endpoint_name="/hooks/claude")
+        if payload is None:
+            return Response(status_code=204)
 
         hook_event = payload.get("hook_event_name", "unknown")
         logger.info(f"Hook received: {hook_event}")
@@ -5564,10 +5596,10 @@ Provide ONLY the summary, no preamble or questions."""
         """
         Receive tool usage events from Claude Code hooks.
         """
-        import asyncio
-
         start = time.monotonic()
-        data = await request.json()
+        data = await _decode_json_request(request, endpoint_name="/hooks/tool-use")
+        if data is None:
+            return Response(status_code=204)
         parse_time = time.monotonic() - start
 
         # Our session ID (injected by hook script)
@@ -5669,7 +5701,7 @@ Provide ONLY the summary, no preamble or questions."""
             asyncio.create_task(app.state.tool_logger.log(
                 session_id=session_manager_id,
                 claude_session_id=claude_session_id,
-                session_name=_effective_session_name(session) if session else None,
+                session_name=_cached_session_name(session) if session else None,
                 parent_session_id=session.parent_session_id if session else None,
                 hook_type=hook_type,
                 tool_name=tool_name,
@@ -5700,7 +5732,9 @@ Provide ONLY the summary, no preamble or questions."""
         - context usage update (from status line script): stores tokens_used, sends
           warning at warning_percentage and critical at critical_percentage (one-shot per cycle)
         """
-        data = await request.json()
+        data = await _decode_json_request(request, endpoint_name="/hooks/context-usage")
+        if data is None:
+            return Response(status_code=204)
         session_id = data.get("session_id")
 
         session = app.state.session_manager.get_session(session_id) if session_id and app.state.session_manager else None
