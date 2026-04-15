@@ -193,12 +193,12 @@ class SessionManager:
         self.maintainer_friendly_name = str(
             maintainer_config.get("friendly_name", "sm-maintainer")
         ).strip() or "sm-maintainer"
-        preferred_providers = maintainer_config.get("preferred_providers", ["codex", "claude"])
+        preferred_providers = maintainer_config.get("preferred_providers", ["codex-fork", "codex", "claude"])
         if isinstance(preferred_providers, list):
             normalized_providers = [str(provider).strip() for provider in preferred_providers if str(provider).strip()]
         else:
-            normalized_providers = ["codex", "claude"]
-        self.maintainer_preferred_providers = normalized_providers or ["codex", "claude"]
+            normalized_providers = ["codex-fork", "codex", "claude"]
+        self.maintainer_preferred_providers = normalized_providers or ["codex-fork", "codex", "claude"]
         raw_bootstrap_prompt = maintainer_config.get(
             "bootstrap_prompt",
             DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT,
