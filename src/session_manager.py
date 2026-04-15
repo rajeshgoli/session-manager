@@ -2022,6 +2022,7 @@ class SessionManager:
                         fallback_reason,
                     )
                     session.provider = effective_provider
+                    provider = effective_provider
 
             # Select model (override or default)
             selected_model = model or default_model

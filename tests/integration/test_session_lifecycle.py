@@ -134,6 +134,7 @@ class TestSessionLifecycle:
         call_kwargs = mock_tmux.create_session_with_command.call_args[1]
         assert call_kwargs["command"] == "codex"
         assert call_kwargs["args"] == ["--dangerously-bypass-approvals-and-sandbox"]
+        assert session.id not in session_manager.codex_fork_runtime_owner
 
     @pytest.mark.asyncio
     async def test_kill_session_flow(self, session_manager, mock_tmux, temp_state_file):
