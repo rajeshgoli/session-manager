@@ -47,9 +47,8 @@ private fun sortSessions(left: ClientSession, right: ClientSession): Int {
 }
 
 private fun sessionPriority(session: ClientSession): Int {
-    val activity = activityLabel(session.activityState)
     return when {
-        session.status == "running" || activity == "working" || activity == "thinking" || activity == "waiting" -> 0
+        isOperationallyActive(session) -> 0
         session.status == "idle" -> 1
         session.status == "stopped" -> 2
         else -> 3
@@ -57,6 +56,21 @@ private fun sessionPriority(session: ClientSession): Int {
 }
 
 fun isActiveSession(session: ClientSession): Boolean = sessionPriority(session) == 0
+
+fun isOperationallyActive(session: ClientSession): Boolean {
+    val activity = activityLabel(session.activityState)
+    return session.status == "running" || activity == "working" || activity == "thinking" || activity == "waiting"
+}
+
+fun projectedStatusLabel(session: ClientSession): String {
+    return when {
+        session.status == "running" -> "running"
+        session.status == "stopped" -> "stopped"
+        isOperationallyActive(session) -> "active"
+        session.status.isNotBlank() -> session.status
+        else -> "idle"
+    }
+}
 
 private fun nodePriority(node: WatchSessionNode): Int {
     val childPriorities = node.sameRepoChildren.map(::nodePriority)
@@ -145,7 +159,7 @@ fun filterSections(sections: List<WatchSection>, statusFilter: String, query: St
     val normalizedQuery = query.trim().lowercase()
 
     fun matches(session: ClientSession): Boolean {
-        if (statusFilter != "all" && session.status != statusFilter) {
+        if (statusFilter != "all" && !matchesStatusFilter(session, statusFilter)) {
             return false
         }
         if (normalizedQuery.isBlank()) {
@@ -189,6 +203,16 @@ fun filterSections(sections: List<WatchSection>, statusFilter: String, query: St
     return sections.mapNotNull { section ->
         val roots = section.roots.mapNotNull(::filterNode)
         if (roots.isEmpty()) null else section.copy(roots = roots)
+    }
+}
+
+fun matchesStatusFilter(session: ClientSession, statusFilter: String): Boolean {
+    return when (statusFilter) {
+        "all" -> true
+        "running" -> isOperationallyActive(session)
+        "idle" -> !isOperationallyActive(session) && session.status != "stopped"
+        "stopped" -> session.status == "stopped"
+        else -> session.status == statusFilter
     }
 }
 
