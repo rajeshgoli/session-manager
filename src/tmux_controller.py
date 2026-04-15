@@ -1,6 +1,7 @@
 """tmux operations for spawning and controlling Claude Code sessions."""
 
 import asyncio
+import os
 import shlex
 import subprocess
 import shutil
@@ -18,6 +19,7 @@ class TmuxController:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.config = config or {}
+        self.last_error_message: Optional[str] = None
 
         # Load timeout configuration with fallbacks
         timeouts = self.config.get("timeouts", {})
@@ -33,6 +35,35 @@ class TmuxController:
         self.send_keys_settle_per_extra_line = tmux_timeouts.get("send_keys_settle_per_extra_line", 0.015)
         self.submit_verify_seconds = tmux_timeouts.get("submit_verify_seconds", 0.6)
         self.submit_retry_seconds = tmux_timeouts.get("submit_retry_seconds", 0.6)
+
+    def _resolve_launch_command(
+        self,
+        command: str,
+        *,
+        working_path: Path,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Resolve and validate one CLI launch command before creating tmux state."""
+        raw_command = str(command or "").strip()
+        if not raw_command:
+            return None, "Launch command is empty"
+
+        if raw_command.startswith("~") or "/" in raw_command:
+            candidate = Path(raw_command).expanduser()
+            if not candidate.is_absolute():
+                candidate = (working_path / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            if not candidate.exists():
+                return None, f"Launch command does not exist: {candidate}"
+            if not candidate.is_file():
+                return None, f"Launch command is not a file: {candidate}"
+            if not os.access(candidate, os.X_OK):
+                return None, f"Launch command is not executable: {candidate}"
+            return str(candidate), None
+
+        if shutil.which(raw_command) is None:
+            return None, f"Launch command not found on PATH: {raw_command}"
+        return raw_command, None
 
     def _run_tmux(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run a tmux command."""
@@ -318,13 +349,25 @@ class TmuxController:
         Returns:
             True if session created successfully
         """
+        self.last_error_message = None
         if self.session_exists(session_name):
             logger.warning(f"Session {session_name} already exists")
+            self.last_error_message = f"Tmux session already exists: {session_name}"
             return False
 
         working_path = Path(working_dir).expanduser().resolve()
         if not working_path.exists():
-            logger.error(f"Working directory does not exist: {working_dir}")
+            self.last_error_message = f"Working directory does not exist: {working_dir}"
+            logger.error(self.last_error_message)
+            return False
+
+        launch_command, command_error = self._resolve_launch_command(
+            "claude",
+            working_path=working_path,
+        )
+        if command_error:
+            self.last_error_message = command_error
+            logger.error(command_error)
             return False
 
         # Ensure log file parent directory exists
@@ -385,14 +428,16 @@ class TmuxController:
             self._run_tmux(
                 "send-keys",
                 "-t", session_name,
-                "claude",
+                launch_command,
                 "Enter",
             )
 
+            self.last_error_message = None
             logger.info(f"Created session {session_name} (id={session_id}) in {working_dir}")
             return True
 
         except subprocess.CalledProcessError as e:
+            self.last_error_message = f"Failed to create tmux session: {e.stderr}"
             logger.error(f"Failed to create session: {e.stderr}")
             return False
 
@@ -423,13 +468,25 @@ class TmuxController:
         Returns:
             True if session created successfully
         """
+        self.last_error_message = None
         if self.session_exists(session_name):
             logger.warning(f"Session {session_name} already exists")
+            self.last_error_message = f"Tmux session already exists: {session_name}"
             return False
 
         working_path = Path(working_dir).expanduser().resolve()
         if not working_path.exists():
-            logger.error(f"Working directory does not exist: {working_dir}")
+            self.last_error_message = f"Working directory does not exist: {working_dir}"
+            logger.error(self.last_error_message)
+            return False
+
+        launch_command, command_error = self._resolve_launch_command(
+            command,
+            working_path=working_path,
+        )
+        if command_error:
+            self.last_error_message = command_error
+            logger.error(command_error)
             return False
 
         # Ensure log file parent directory exists
@@ -484,7 +541,7 @@ class TmuxController:
             time.sleep(self.shell_export_settle_seconds)
 
             # Build Claude command with args and model
-            cmd_parts = [command]
+            cmd_parts = [launch_command]
             if args:
                 cmd_parts.extend(args)
             if model:
@@ -520,10 +577,12 @@ class TmuxController:
 
             # Log command without prompt payload to avoid leaking sensitive content
             log_parts = [p for p in cmd_parts if p != "--" and p != shlex.quote(initial_prompt)] if initial_prompt else cmd_parts
+            self.last_error_message = None
             logger.info(f"Created child session {session_name} (id={session_id}) with command {' '.join(log_parts)}")
             return True
 
         except subprocess.CalledProcessError as e:
+            self.last_error_message = f"Failed to create tmux session: {e.stderr}"
             logger.error(f"Failed to create session: {e.stderr}")
             return False
 
