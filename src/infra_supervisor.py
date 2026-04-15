@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -59,6 +60,11 @@ class InfrastructureSupervisor:
                 str(self._home / "Library/LaunchAgents/com.rajesh.sm-android-tunnel.plist"),
             )
         ).expanduser()
+        raw_probe_timeout = supervisor_config.get("android_tunnel", {}).get("public_probe_timeout_seconds", 10)
+        try:
+            self._android_tunnel_probe_timeout_seconds = max(3, int(raw_probe_timeout))
+        except (TypeError, ValueError):
+            self._android_tunnel_probe_timeout_seconds = 10
 
         self._caffeinate_label = str(
             supervisor_config.get("ac_caffeinate", {}).get("launch_agent_label", "com.rajesh.sm-ac-caffeinate")
@@ -167,6 +173,9 @@ class InfrastructureSupervisor:
         public_ssh_host = str(
             ((self.config.get("external_access") or {}).get("public_ssh_host") or "")
         ).strip()
+        ssh_username = str(
+            ((self.config.get("external_access") or {}).get("ssh_username") or "")
+        ).strip()
         ssh_proxy_command = str(
             ((self.config.get("external_access") or {}).get("ssh_proxy_command") or "")
         ).strip()
@@ -186,11 +195,56 @@ class InfrastructureSupervisor:
                 plist=str(self._android_tunnel_plist),
             )
 
+        def probe_public_path() -> tuple[bool, Optional[str]]:
+            if not ssh_username:
+                return True, None
+            return self._probe_android_public_ssh(
+                public_ssh_host=public_ssh_host,
+                ssh_username=ssh_username,
+                ssh_proxy_command=ssh_proxy_command,
+            )
+
         if self._launch_agent_running(self._android_tunnel_label):
-            return self._result("ok", "android attach cloudflared tunnel is running", attach_ready=True)
+            probe_ok, probe_error = probe_public_path()
+            if probe_ok:
+                return self._result(
+                    "ok",
+                    "android attach cloudflared tunnel is running",
+                    attach_ready=True,
+                )
+            actions = self._repair_launch_agent(self._android_tunnel_label, self._android_tunnel_plist)
+            if self._launch_agent_running(self._android_tunnel_label):
+                probe_ok, probe_error = probe_public_path()
+                if probe_ok:
+                    logger.warning(
+                        "Recovered android attach cloudflared tunnel public path via launchctl (%s)",
+                        ", ".join(actions) or "no-op",
+                    )
+                    return self._result(
+                        "warning",
+                        "android attach cloudflared tunnel was unhealthy and was restarted",
+                        attach_ready=True,
+                        actions=actions,
+                    )
+            return self._result(
+                "error",
+                "android attach cloudflared tunnel public SSH path is unhealthy",
+                attach_ready=False,
+                actions=actions,
+                public_probe_error=probe_error,
+            )
 
         actions = self._repair_launch_agent(self._android_tunnel_label, self._android_tunnel_plist)
         if self._launch_agent_running(self._android_tunnel_label):
+            probe_ok, probe_error = probe_public_path()
+            if not probe_ok:
+                return self._result(
+                    "error",
+                    "android attach cloudflared tunnel public SSH path is unhealthy",
+                    attach_ready=False,
+                    actions=actions,
+                    public_probe_error=probe_error,
+                )
             logger.warning(
                 "Recovered android attach cloudflared tunnel via launchctl (%s)",
                 ", ".join(actions) or "no-op",
@@ -208,6 +262,62 @@ class InfrastructureSupervisor:
             attach_ready=False,
             actions=actions,
         )
+
+    def _probe_android_public_ssh(
+        self,
+        *,
+        public_ssh_host: str,
+        ssh_username: str,
+        ssh_proxy_command: str,
+    ) -> tuple[bool, Optional[str]]:
+        ssh_bin = shutil.which("ssh") or next(
+            (candidate for candidate in ("/usr/bin/ssh", "/opt/homebrew/bin/ssh", "/usr/local/bin/ssh") if Path(candidate).exists()),
+            None,
+        )
+        if not ssh_bin:
+            return False, "ssh binary is unavailable"
+
+        command = [ssh_bin]
+        if ssh_proxy_command:
+            command.extend(["-o", f"ProxyCommand={ssh_proxy_command}"])
+        command.extend(
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                f"ConnectTimeout={self._android_tunnel_probe_timeout_seconds}",
+                "-T",
+                f"{ssh_username}@{public_ssh_host}",
+                "exit",
+            ]
+        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self._android_tunnel_probe_timeout_seconds + 2,
+            )
+        except subprocess.TimeoutExpired:
+            return False, (
+                f"public ssh probe timed out after {self._android_tunnel_probe_timeout_seconds + 2}s: "
+                f"{shlex.join(command)}"
+            )
+        except FileNotFoundError as exc:
+            missing = exc.filename or "dependency"
+            return False, f"public ssh probe failed: {missing} is unavailable"
+
+        if result.returncode == 0:
+            return True, None
+
+        detail = ((result.stderr or "").strip() or (result.stdout or "").strip())
+        if detail:
+            last_line = detail.splitlines()[-1].strip()
+            if last_line:
+                return False, last_line
+        return False, f"public ssh probe exited {result.returncode}"
 
     def _ensure_tmux_base(self) -> dict[str, Any]:
         tmux_bin = shutil.which("tmux") or next(

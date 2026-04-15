@@ -101,6 +101,12 @@ data class SessionListResponse(
 )
 
 @Serializable
+data class EnsureMaintainerResponse(
+    val created: Boolean = false,
+    val session: ClientSession,
+)
+
+@Serializable
 data class ClientSession(
     val id: String,
     val name: String,

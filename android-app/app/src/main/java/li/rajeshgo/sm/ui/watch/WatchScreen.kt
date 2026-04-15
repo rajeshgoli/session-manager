@@ -162,10 +162,16 @@ fun WatchScreen(
                     lastSync = state.lastSync,
                     refreshing = state.refreshing,
                     requestingStatus = state.requestingStatus,
+                    ensuringMaintainer = state.ensuringMaintainer,
                     hasUpdate = updateState.availableUpdate != null,
                     onRefresh = { viewModel.refresh() },
                     onRequestStatus = {
                         viewModel.requestStatus { result ->
+                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
+                        }
+                    },
+                    onEnsureMaintainer = {
+                        viewModel.ensureMaintainer { result ->
                             toast = result.exceptionOrNull()?.message ?: result.getOrNull()
                         }
                     },
@@ -358,9 +364,11 @@ private fun HeaderBar(
     lastSync: String?,
     refreshing: Boolean,
     requestingStatus: Boolean,
+    ensuringMaintainer: Boolean,
     hasUpdate: Boolean,
     onRefresh: () -> Unit,
     onRequestStatus: () -> Unit,
+    onEnsureMaintainer: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     Surface(
@@ -393,6 +401,22 @@ private fun HeaderBar(
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
+                AssistChip(
+                    onClick = onEnsureMaintainer,
+                    enabled = !ensuringMaintainer,
+                    label = {
+                        Text(
+                            text = if (ensuringMaintainer) "Starting..." else "Wake maintainer",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    colors = AssistChipDefaults.assistChipColors(
+                        containerColor = if (ensuringMaintainer) Cyan.copy(alpha = 0.18f) else PanelMuted,
+                        labelColor = if (ensuringMaintainer) Color.White else TextSecondary,
+                    ),
+                )
+                Spacer(Modifier.width(6.dp))
                 IconButton(onClick = onRequestStatus) {
                     Icon(
                         Icons.Rounded.Campaign,
