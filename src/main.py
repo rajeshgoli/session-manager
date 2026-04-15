@@ -607,7 +607,7 @@ class SessionManagerApp:
                         durable_topic.thread_id,
                     )
                     continue
-                await self.session_manager._ensure_telegram_topic(session)
+                self.session_manager._schedule_telegram_topic_ensure(session)
 
     async def _cleanup_stale_telegram_topics_once(self) -> dict[str, int]:
         """Delete Telegram topics that no longer correspond to a routable session."""

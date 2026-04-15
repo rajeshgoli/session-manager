@@ -358,6 +358,187 @@ class TestSessionLifecycle:
         assert call_kwargs["command"] == "codex"
         assert call_kwargs["args"] == ["resume", "resume-fallback-123", "--dangerously-bypass-approvals-and-sandbox"]
 
+    @pytest.mark.asyncio
+    async def test_restore_session_defers_telegram_topic_creation(
+        self,
+        session_manager,
+        mock_tmux,
+    ):
+        """Restore should not wait on Telegram topic creation before returning."""
+        session = Session(
+            id="restoretopic",
+            name="codex-restoretopic",
+            working_dir="/tmp/test",
+            tmux_session="codex-restoretopic",
+            provider="codex",
+            log_file="/tmp/restoretopic.log",
+            status=SessionStatus.STOPPED,
+            provider_resume_id="resume-topic-123",
+            telegram_chat_id=123456,
+        )
+        session_manager.sessions[session.id] = session
+        mock_tmux.session_exists.return_value = False
+
+        with patch.object(session_manager, "_schedule_telegram_topic_ensure") as schedule_topic:
+            success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        schedule_topic.assert_called_once_with(session, 123456)
+
+    @pytest.mark.asyncio
+    async def test_restore_session_clears_stale_task_complete_marker(
+        self,
+        session_manager,
+        mock_tmux,
+    ):
+        """Explicit restore should make a session active again, not reapable."""
+        session = Session(
+            id="restorecomplete",
+            name="codex-restorecomplete",
+            working_dir="/tmp/test",
+            tmux_session="codex-restorecomplete",
+            provider="codex",
+            log_file="/tmp/restorecomplete.log",
+            status=SessionStatus.STOPPED,
+            provider_resume_id="resume-complete-123",
+            agent_task_completed_at=datetime.now(),
+        )
+        session_manager.sessions[session.id] = session
+        mock_tmux.session_exists.return_value = False
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        assert restored.agent_task_completed_at is None
+
+    @pytest.mark.asyncio
+    async def test_ensure_telegram_topic_serializes_concurrent_calls(self, session_manager):
+        """Concurrent ensure calls should create only one Telegram topic per session."""
+        session = Session(
+            id="telegramlock",
+            name="codex-telegramlock",
+            working_dir="/tmp/test",
+            tmux_session="codex-telegramlock",
+            provider="codex",
+            log_file="/tmp/telegramlock.log",
+            status=SessionStatus.IDLE,
+            telegram_chat_id=123456,
+            telegram_thread_id=None,
+        )
+
+        calls = 0
+
+        async def topic_creator(session_id: str, chat_id: int, topic_name: str) -> int:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            return 77777
+
+        session_manager.set_topic_creator(topic_creator)
+
+        await asyncio.gather(
+            session_manager._ensure_telegram_topic(session, session.telegram_chat_id),
+            session_manager._ensure_telegram_topic(session, session.telegram_chat_id),
+        )
+
+        assert calls == 1
+        assert session.telegram_thread_id == 77777
+
+    @pytest.mark.asyncio
+    async def test_schedule_telegram_topic_ensure_deduplicates_pending_task(self, session_manager):
+        """Repeated deferred ensures for one session should reuse the in-flight task."""
+        session = Session(
+            id="telegramdedupe",
+            name="codex-telegramdedupe",
+            working_dir="/tmp/test",
+            tmux_session="codex-telegramdedupe",
+            provider="codex",
+            log_file="/tmp/telegramdedupe.log",
+            status=SessionStatus.IDLE,
+            telegram_chat_id=123456,
+            telegram_thread_id=None,
+        )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def fake_ensure(target_session, explicit_chat_id=None):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+
+        with patch.object(session_manager, "_ensure_telegram_topic", side_effect=fake_ensure):
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            await asyncio.wait_for(started.wait(), timeout=1)
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            await asyncio.sleep(0)
+            assert calls == 1
+            release.set()
+            await asyncio.gather(*list(session_manager._pending_telegram_topic_tasks))
+
+    @pytest.mark.asyncio
+    async def test_schedule_telegram_topic_ensure_keeps_replacement_task_mapping(self, session_manager):
+        """A finishing older task must not clear a newer task's in-flight mapping."""
+        session = Session(
+            id="telegramreplace",
+            name="codex-telegramreplace",
+            working_dir="/tmp/test",
+            tmux_session="codex-telegramreplace",
+            provider="codex",
+            log_file="/tmp/telegramreplace.log",
+            status=SessionStatus.IDLE,
+            telegram_chat_id=123456,
+            telegram_thread_id=None,
+        )
+
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_started = asyncio.Event()
+        second_release = asyncio.Event()
+        calls = 0
+
+        async def fake_ensure(target_session, explicit_chat_id=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await first_release.wait()
+                return
+            second_started.set()
+            await second_release.wait()
+
+        with patch.object(session_manager, "_ensure_telegram_topic", side_effect=fake_ensure):
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            first_task = session_manager._pending_telegram_topic_tasks_by_session[session.id]
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+
+            first_release.set()
+            await asyncio.wait_for(first_task, timeout=1)
+
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            second_task = session_manager._pending_telegram_topic_tasks_by_session[session.id]
+            await asyncio.wait_for(second_started.wait(), timeout=1)
+
+            session_manager._clear_pending_telegram_topic_task(session.id, first_task)
+
+            assert session_manager._pending_telegram_topic_tasks_by_session[session.id] is second_task
+
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            await asyncio.sleep(0)
+
+            assert calls == 2
+            assert session_manager._pending_telegram_topic_tasks_by_session[session.id] is second_task
+
+            second_release.set()
+            await asyncio.wait_for(second_task, timeout=1)
+            assert session.id not in session_manager._pending_telegram_topic_tasks_by_session
+
     def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
         """Codex-fork restore id can be recovered from persisted lifecycle events."""
         session = Session(

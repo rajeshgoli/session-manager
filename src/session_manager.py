@@ -176,6 +176,8 @@ class SessionManager:
         self.telegram_topic_registry: dict[tuple[int, int], TelegramTopicRecord] = {}
         self._topic_creator: Optional[Callable[..., Awaitable[Optional[int]]]] = None
         self._pending_telegram_topic_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_telegram_topic_tasks_by_session: dict[str, asyncio.Task[Any]] = {}
+        self._telegram_topic_ensure_locks: dict[str, asyncio.Lock] = {}
         self.adoption_proposals: dict[str, AdoptionProposal] = {}
         self.agent_registrations: dict[str, AgentRegistration] = {}
         self.agent_role_last_session_ids: dict[str, str] = {}
@@ -2122,6 +2124,10 @@ class SessionManager:
         explicit_chat_id: Optional[int] = None,
     ) -> None:
         """Ensure Telegram topic creation runs in the background for a session."""
+        existing_task = self._pending_telegram_topic_tasks_by_session.get(session.id)
+        if existing_task is not None and not existing_task.done():
+            return
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -2138,8 +2144,25 @@ class SessionManager:
                 )
 
         task = loop.create_task(_runner())
+        self._pending_telegram_topic_tasks_by_session[session.id] = task
         self._pending_telegram_topic_tasks.add(task)
         task.add_done_callback(self._pending_telegram_topic_tasks.discard)
+        task.add_done_callback(
+            lambda completed_task, session_id=session.id: self._clear_pending_telegram_topic_task(
+                session_id,
+                completed_task,
+            )
+        )
+
+    def _clear_pending_telegram_topic_task(
+        self,
+        session_id: str,
+        completed_task: asyncio.Task[Any],
+    ) -> None:
+        """Drop the in-flight mapping only if it still points at this task."""
+        current_task = self._pending_telegram_topic_tasks_by_session.get(session_id)
+        if current_task is completed_task:
+            self._pending_telegram_topic_tasks_by_session.pop(session_id, None)
 
     def set_topic_creator(self, creator: Callable[..., Awaitable[Optional[int]]]):
         """Set the callback used to create Telegram forum topics.
@@ -2156,41 +2179,43 @@ class SessionManager:
             session: The session to ensure a topic for
             explicit_chat_id: Chat ID passed by the caller (e.g. from Telegram /new)
         """
-        changed = False
+        lock = self._telegram_topic_ensure_locks.setdefault(session.id, asyncio.Lock())
+        async with lock:
+            changed = False
 
-        # 1. Ensure chat_id is set (explicit > existing > default)
-        if not session.telegram_chat_id:
-            chat_id = explicit_chat_id or self.default_forum_chat_id
-            if chat_id:
-                session.telegram_chat_id = chat_id
-                changed = True
+            # 1. Ensure chat_id is set (explicit > existing > default)
+            if not session.telegram_chat_id:
+                chat_id = explicit_chat_id or self.default_forum_chat_id
+                if chat_id:
+                    session.telegram_chat_id = chat_id
+                    changed = True
 
-        # 2. Create topic if chat_id is set but thread_id is missing
-        if session.telegram_chat_id and not session.telegram_thread_id and self._topic_creator:
-            display_name = self.get_effective_session_name(session) or "session"
-            topic_name = f"{display_name} [{session.id}]"
-            try:
-                thread_id = await self._topic_creator(
-                    session.id, session.telegram_chat_id, topic_name
-                )
-                if thread_id:
-                    session.telegram_thread_id = thread_id
-                    self._upsert_telegram_topic_record(
-                        session,
-                        session.telegram_chat_id,
-                        thread_id,
+            # 2. Create topic if chat_id is set but thread_id is missing
+            if session.telegram_chat_id and not session.telegram_thread_id and self._topic_creator:
+                display_name = self.get_effective_session_name(session) or "session"
+                topic_name = f"{display_name} [{session.id}]"
+                try:
+                    thread_id = await self._topic_creator(
+                        session.id, session.telegram_chat_id, topic_name
                     )
-                    self._save_state()  # Persist IMMEDIATELY — minimize race window
-                    changed = False     # Already saved; prevent redundant outer save
-                    logger.info(
-                        f"Auto-created topic for session {session.id}: "
-                        f"chat={session.telegram_chat_id}, thread={thread_id}"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to auto-create topic for session {session.id}: {e}")
+                    if thread_id:
+                        session.telegram_thread_id = thread_id
+                        self._upsert_telegram_topic_record(
+                            session,
+                            session.telegram_chat_id,
+                            thread_id,
+                        )
+                        self._save_state()  # Persist IMMEDIATELY — minimize race window
+                        changed = False     # Already saved; prevent redundant outer save
+                        logger.info(
+                            f"Auto-created topic for session {session.id}: "
+                            f"chat={session.telegram_chat_id}, thread={thread_id}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to auto-create topic for session {session.id}: {e}")
 
-        if changed:
-            self._save_state()
+            if changed:
+                self._save_state()
 
     async def create_session(
         self,
@@ -5071,6 +5096,7 @@ class SessionManager:
         session.completion_status = None
         session.completion_message = None
         session.completed_at = None
+        session.agent_task_completed_at = None
         session.status = SessionStatus.IDLE if session.provider == "codex-app" else SessionStatus.RUNNING
         session.last_activity = datetime.now()
         if session.provider == "codex-fork":
@@ -5087,7 +5113,9 @@ class SessionManager:
             self.message_queue_manager.mark_session_idle(session.id)
         self._save_state()
         if session.telegram_chat_id:
-            await self._ensure_telegram_topic(session, session.telegram_chat_id)
+            # Topic creation can make slow Telegram API calls; keep restore on the
+            # runtime path and let topic repair complete in the background.
+            self._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
         logger.info("Restored session %s (%s)", session.id, session.provider)
         return True, session, None
 
