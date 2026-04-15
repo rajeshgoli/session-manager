@@ -3970,7 +3970,11 @@ class SessionManager:
                 return False
 
             logger.warning("Falling back to tmux input path for codex-fork session %s", session.id)
-            fallback_success = await self.tmux.send_input_async(session.tmux_session, text)
+            fallback_success = await self.tmux.send_input_async(
+                session.tmux_session,
+                text,
+                verify_codex_submit=True,
+            )
             if fallback_success and self.message_queue_manager:
                 self.message_queue_manager.mark_session_active(session.id)
             return fallback_success
@@ -3979,6 +3983,7 @@ class SessionManager:
             session.tmux_session,
             text,
             verify_claude_submit=(session.provider == "claude"),
+            verify_codex_submit=(session.provider == "codex"),
         )
         if success and self.message_queue_manager:
             self.message_queue_manager.mark_session_active(session.id)

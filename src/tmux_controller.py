@@ -242,6 +242,33 @@ class TmuxController:
         lowered = composer_text.lower()
         return "queued messages" in lowered or "queued message" in lowered
 
+    def _looks_like_codex_deferred_send_banner(self, pane_text: Optional[str]) -> bool:
+        """Return True when Codex parked a message behind its deferred-send banner."""
+        if not pane_text:
+            return False
+        lowered = pane_text.lower()
+        return "submitted after next tool call" in lowered
+
+    def _extract_active_codex_region(self, pane_text: Optional[str]) -> Optional[str]:
+        """Return the active bottom-of-pane Codex region near the live prompt/banner."""
+        if not pane_text:
+            return None
+
+        lines = pane_text.splitlines()
+        if not lines:
+            return None
+
+        prompt_indexes = [index for index, line in enumerate(lines) if line.lstrip().startswith("›")]
+        if prompt_indexes:
+            prompt_index = prompt_indexes[-1]
+            start = max(0, prompt_index - 8)
+            end = min(len(lines), prompt_index + 4)
+            region = "\n".join(lines[start:end]).strip()
+            return region or None
+
+        region = "\n".join(lines[-16:]).strip()
+        return region or None
+
     def _normalize_for_compare(self, text: str) -> str:
         """Collapse whitespace for approximate pane-vs-payload comparison."""
         return " ".join((text or "").split())
@@ -292,6 +319,49 @@ class TmuxController:
 
         logger.warning(
             "Claude submit verification resent Enter for %s after composer stayed populated",
+            session_name,
+        )
+        return True
+
+    async def _verify_codex_submit_async(self, session_name: str, text: str) -> bool:
+        """Interrupt once if Codex parked the payload behind its deferred-send banner."""
+        normalized_text = self._normalize_for_compare(text)
+        if not normalized_text:
+            return False
+        normalized_preview = normalized_text[:120]
+
+        async def _capture_deferred_payload() -> bool:
+            pane = await self._capture_pane_async(session_name)
+            active_region = self._extract_active_codex_region(pane)
+            if not self._looks_like_codex_deferred_send_banner(active_region):
+                return False
+            normalized_pane = self._normalize_for_compare(active_region or "")
+            return normalized_preview in normalized_pane
+
+        await asyncio.sleep(self.submit_verify_seconds)
+        first_match = await _capture_deferred_payload()
+        if not first_match:
+            return False
+
+        await asyncio.sleep(self.submit_retry_seconds)
+        second_match = await _capture_deferred_payload()
+        if not second_match:
+            return False
+
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", session_name, "Escape",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=self.send_keys_timeout_seconds
+        )
+        if proc.returncode != 0:
+            logger.error(f"Failed to send Escape during Codex submit verification: {stderr.decode()}")
+            return False
+
+        logger.warning(
+            "Codex submit verification sent Escape for %s after deferred-send banner persisted",
             session_name,
         )
         return True
@@ -653,6 +723,7 @@ class TmuxController:
         session_name: str,
         text: str,
         verify_claude_submit: bool = False,
+        verify_codex_submit: bool = False,
     ) -> bool:
         """
         Send input text to a tmux session (ASYNC - non-blocking).
@@ -708,6 +779,8 @@ class TmuxController:
 
             if verify_claude_submit:
                 await self._verify_claude_submit_async(session_name, text)
+            if verify_codex_submit:
+                await self._verify_codex_submit_async(session_name, text)
 
             line_count = (text or "").count("\n") + 1
             if mode_before == 1 or settle_delay > self.send_keys_settle_seconds:
