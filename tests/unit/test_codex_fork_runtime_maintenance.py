@@ -127,6 +127,70 @@ async def test_maintain_codex_fork_runtime_artifacts_marks_control_only_loss_deg
 
 
 @pytest.mark.asyncio
+async def test_maintain_codex_fork_runtime_artifacts_surfaces_launch_failure(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="launchfail",
+        name="codex-fork-launchfail",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+        log_file=str(tmp_path / "launchfail.log"),
+        provider_resume_id="resume-launchfail",
+    )
+    manager.sessions[session.id] = session
+    manager.tmux.session_exists = Mock(return_value=True)
+    manager.tmux.kill_session = Mock(return_value=True)
+    manager.tmux.create_session_with_command = Mock(return_value=False)
+    manager.tmux.last_error_message = "Launch command does not exist: /missing/codex"
+    manager._stop_codex_fork_event_monitor = AsyncMock()
+    manager._start_codex_fork_event_monitor = Mock()
+
+    result = await manager.maintain_codex_fork_runtime_artifacts()
+
+    assert result["healed"] == []
+    assert result["degraded"] == [session.id]
+    assert session.error_message == (
+        "codex_fork_runtime_artifacts_missing: event_stream, control_socket "
+        "(Launch command does not exist: /missing/codex)"
+    )
+    manager._start_codex_fork_event_monitor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maintain_codex_fork_runtime_artifacts_falls_back_to_codex_when_fork_missing(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="fallbackheal",
+        name="codex-fork-fallbackheal",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+        log_file=str(tmp_path / "fallbackheal.log"),
+        provider_resume_id="resume-fallbackheal",
+    )
+    manager.sessions[session.id] = session
+    manager.codex_fork_command = "/missing/codex-fork"
+    manager.codex_cli_command = "codex"
+    manager.codex_cli_args = ["--dangerously-bypass-approvals-and-sandbox"]
+    manager.tmux.session_exists = Mock(return_value=True)
+    manager.tmux.kill_session = Mock(return_value=True)
+    manager.tmux.create_session_with_command = Mock(return_value=True)
+    manager._stop_codex_fork_event_monitor = AsyncMock()
+    manager._start_codex_fork_event_monitor = Mock()
+
+    result = await manager.maintain_codex_fork_runtime_artifacts()
+
+    assert result["healed"] == [session.id]
+    assert result["degraded"] == []
+    assert session.provider == "codex"
+    _, kwargs = manager.tmux.create_session_with_command.call_args
+    assert kwargs["command"] == "codex"
+    assert kwargs["args"] == ["resume", "resume-fallbackheal", "--dangerously-bypass-approvals-and-sandbox"]
+    manager._start_codex_fork_event_monitor.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_maintain_codex_fork_runtime_artifacts_marks_unhealable_session_degraded(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
     session = Session(

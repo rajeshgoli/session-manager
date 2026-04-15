@@ -113,6 +113,30 @@ class TestSessionLifecycle:
         assert session.spawned_at is not None
 
     @pytest.mark.asyncio
+    async def test_create_session_flow_codex_fork_falls_back_to_codex_when_fork_missing(
+        self,
+        session_manager,
+        mock_tmux,
+    ):
+        """codex-fork create falls back to codex when the fork binary is unavailable."""
+        session_manager.codex_fork_command = "/missing/codex-fork"
+        session_manager.codex_cli_command = "codex"
+        session_manager.codex_cli_args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+        with patch.object(session_manager, "_get_git_remote_url_async", new_callable=AsyncMock, return_value=None):
+            session = await session_manager.create_session(
+                working_dir="/tmp/test-workspace",
+                provider="codex-fork",
+            )
+
+        assert session is not None
+        assert session.provider == "codex"
+        call_kwargs = mock_tmux.create_session_with_command.call_args[1]
+        assert call_kwargs["command"] == "codex"
+        assert call_kwargs["args"] == ["--dangerously-bypass-approvals-and-sandbox"]
+        assert session.id not in session_manager.codex_fork_runtime_owner
+
+    @pytest.mark.asyncio
     async def test_kill_session_flow(self, session_manager, mock_tmux, temp_state_file):
         """Full session kill: tmux killed, state updated."""
         # First create a session
@@ -270,6 +294,69 @@ class TestSessionLifecycle:
         call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
         assert call_kwargs["command"] == session_manager.codex_cli_command
         assert call_kwargs["args"] == ["resume", resume_id, *session_manager.codex_cli_args]
+
+    @pytest.mark.asyncio
+    async def test_restore_session_flow_codex_fork_surfaces_preflight_launch_error(
+        self,
+        session_manager,
+        mock_tmux,
+    ):
+        """Stopped codex-fork sessions stay stopped when tmux launch preflight fails."""
+        session = Session(
+            id="forkrestore",
+            name="codex-fork-forkrestore",
+            working_dir="/tmp/test",
+            tmux_session="codex-fork-forkrestore",
+            provider="codex-fork",
+            log_file="/tmp/forkrestore.log",
+            status=SessionStatus.STOPPED,
+            provider_resume_id="resume-fork-123",
+        )
+        session_manager.sessions[session.id] = session
+        mock_tmux.session_exists.return_value = False
+        mock_tmux.create_session_with_command.return_value = False
+        mock_tmux.last_error_message = "Launch command does not exist: /missing/codex"
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is False
+        assert restored is session
+        assert error == "Launch command does not exist: /missing/codex"
+        assert restored.status == SessionStatus.STOPPED
+        assert restored.error_message == "Launch command does not exist: /missing/codex"
+
+    @pytest.mark.asyncio
+    async def test_restore_session_flow_codex_fork_falls_back_to_codex_when_fork_missing(
+        self,
+        session_manager,
+        mock_tmux,
+    ):
+        """Stopped codex-fork sessions can resume via codex when the fork binary is unavailable."""
+        session = Session(
+            id="forkfallback",
+            name="codex-fork-forkfallback",
+            working_dir="/tmp/test",
+            tmux_session="codex-fork-forkfallback",
+            provider="codex-fork",
+            log_file="/tmp/forkfallback.log",
+            status=SessionStatus.STOPPED,
+            provider_resume_id="resume-fallback-123",
+        )
+        session_manager.sessions[session.id] = session
+        session_manager.codex_fork_command = "/missing/codex-fork"
+        session_manager.codex_cli_command = "codex"
+        session_manager.codex_cli_args = ["--dangerously-bypass-approvals-and-sandbox"]
+        mock_tmux.session_exists.return_value = False
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        assert restored.provider == "codex"
+        call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
+        assert call_kwargs["command"] == "codex"
+        assert call_kwargs["args"] == ["resume", "resume-fallback-123", "--dangerously-bypass-approvals-and-sandbox"]
 
     def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
         """Codex-fork restore id can be recovered from persisted lifecycle events."""

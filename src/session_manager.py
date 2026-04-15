@@ -1011,6 +1011,80 @@ class SessionManager:
         return self.log_dir / f"{session.id}.codex-fork.control.sock"
 
     @staticmethod
+    def _resolve_cli_command(
+        command: str,
+        *,
+        working_dir: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Resolve one CLI command path the same way tmux launch preflight does."""
+        raw_command = str(command or "").strip()
+        if not raw_command:
+            return None, "Launch command is empty"
+
+        working_path = Path(working_dir).expanduser().resolve()
+        if raw_command.startswith("~") or "/" in raw_command:
+            candidate = Path(raw_command).expanduser()
+            if not candidate.is_absolute():
+                candidate = (working_path / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            if not candidate.exists():
+                return None, f"Launch command does not exist: {candidate}"
+            if not candidate.is_file():
+                return None, f"Launch command is not a file: {candidate}"
+            if not os.access(candidate, os.X_OK):
+                return None, f"Launch command is not executable: {candidate}"
+            return str(candidate), None
+
+        if shutil.which(raw_command) is None:
+            return None, f"Launch command not found on PATH: {raw_command}"
+        return raw_command, None
+
+    def _build_codex_fork_launch_spec(
+        self,
+        session: Session,
+        *,
+        resume_id: Optional[str] = None,
+    ) -> tuple[str, list[str], str, Optional[str]]:
+        """Return launch command/args, falling back to codex when codex-fork is unavailable."""
+        _, fork_error = self._resolve_cli_command(
+            self.codex_fork_command,
+            working_dir=session.working_dir,
+        )
+        if fork_error:
+            args = list(self.codex_cli_args)
+            if resume_id:
+                args = ["resume", resume_id, *args]
+            return (
+                self.codex_cli_command,
+                args,
+                "codex",
+                f"Configured codex-fork runtime unavailable; falling back to codex: {fork_error}",
+            )
+
+        args = list(self.codex_fork_args)
+        if resume_id:
+            args = ["resume", resume_id, *args]
+        event_stream_path = self._codex_fork_event_stream_path(session)
+        control_socket_path = self._codex_fork_control_socket_path(session)
+        event_stream_path.parent.mkdir(parents=True, exist_ok=True)
+        if event_stream_path.exists():
+            event_stream_path.unlink()
+        if control_socket_path.exists():
+            control_socket_path.unlink()
+        args.extend(
+            [
+                "--event-stream",
+                str(event_stream_path),
+                "--event-schema-version",
+                str(self.codex_fork_event_schema_version),
+                "--control-socket",
+                str(control_socket_path),
+            ]
+        )
+        return self.codex_fork_command, args, "codex-fork", None
+
+    @staticmethod
     def _codex_fork_session_id_from_artifact_name(name: str) -> Optional[str]:
         """Extract the owning session id from one codex-fork runtime artifact filename."""
         if name.endswith(".codex-fork.events.jsonl"):
@@ -1934,27 +2008,21 @@ class SessionManager:
                 args = self.codex_cli_args
                 default_model = self.codex_default_model
             else:
-                # Codex-fork config with explicit lifecycle bridge flags
-                command = self.codex_fork_command
-                args = list(self.codex_fork_args)
-                default_model = self.codex_fork_default_model
-                event_stream_path = self._codex_fork_event_stream_path(session)
-                control_socket_path = self._codex_fork_control_socket_path(session)
-                event_stream_path.parent.mkdir(parents=True, exist_ok=True)
-                if event_stream_path.exists():
-                    event_stream_path.unlink()
-                if control_socket_path.exists():
-                    control_socket_path.unlink()
-                args.extend(
-                    [
-                        "--event-stream",
-                        str(event_stream_path),
-                        "--event-schema-version",
-                        str(self.codex_fork_event_schema_version),
-                        "--control-socket",
-                        str(control_socket_path),
-                    ]
+                # Codex-fork config with codex fallback when the fork binary is unavailable.
+                command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(session)
+                default_model = (
+                    self.codex_fork_default_model
+                    if effective_provider == "codex-fork"
+                    else self.codex_default_model
                 )
+                if effective_provider != session.provider:
+                    logger.warning(
+                        "Falling back from codex-fork to codex for %s: %s",
+                        session.id,
+                        fallback_reason,
+                    )
+                    session.provider = effective_provider
+                    provider = effective_provider
 
             # Select model (override or default)
             selected_model = model or default_model
@@ -1971,7 +2039,11 @@ class SessionManager:
                 model=selected_model if model else None,  # Only pass if explicitly set
                 initial_prompt=initial_prompt,
             ):
-                logger.error(f"Failed to create tmux session for {session.name}")
+                tmux_error = getattr(self.tmux, "last_error_message", None)
+                if tmux_error:
+                    logger.error("Failed to create tmux session for %s: %s", session.name, tmux_error)
+                else:
+                    logger.error(f"Failed to create tmux session for {session.name}")
                 return None
         elif provider == "codex-app":
             try:
@@ -3569,25 +3641,17 @@ class SessionManager:
         if session.tmux_session and self.tmux.session_exists(session.tmux_session):
             self.tmux.kill_session(session.tmux_session)
 
-        command = self.codex_fork_command
-        args = ["resume", resume_id, *self.codex_fork_args]
-        event_stream_path = self._codex_fork_event_stream_path(session)
-        control_socket_path = self._codex_fork_control_socket_path(session)
-        event_stream_path.parent.mkdir(parents=True, exist_ok=True)
-        if event_stream_path.exists():
-            event_stream_path.unlink()
-        if control_socket_path.exists():
-            control_socket_path.unlink()
-        args.extend(
-            [
-                "--event-stream",
-                str(event_stream_path),
-                "--event-schema-version",
-                str(self.codex_fork_event_schema_version),
-                "--control-socket",
-                str(control_socket_path),
-            ]
+        command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
+            session,
+            resume_id=resume_id,
         )
+        if effective_provider != session.provider:
+            logger.warning(
+                "Falling back from codex-fork to codex while recreating %s: %s",
+                session.id,
+                fallback_reason,
+            )
+            session.provider = effective_provider
 
         if not self.tmux.create_session_with_command(
             session.tmux_session,
@@ -3597,20 +3661,26 @@ class SessionManager:
             command=command,
             args=args,
         ):
+            tmux_error = getattr(self.tmux, "last_error_message", None)
             session.error_message = f"codex_fork_runtime_artifacts_missing: {reason}"
+            if tmux_error:
+                session.error_message = f"{session.error_message} ({tmux_error})"
             self._save_state()
-            return False, "failed to recreate Codex session runtime"
+            return False, tmux_error or "failed to recreate Codex session runtime"
 
         session.error_message = None
         session.status = SessionStatus.RUNNING
         session.last_activity = datetime.now()
-        self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
-        self._set_codex_fork_lifecycle_state(
-            session_id=session.id,
-            state="running",
-            cause_event_type="runtime_artifacts_restored",
-        )
-        self._start_codex_fork_event_monitor(session)
+        if session.provider == "codex-fork":
+            self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
+            self._set_codex_fork_lifecycle_state(
+                session_id=session.id,
+                state="running",
+                cause_event_type="runtime_artifacts_restored",
+            )
+            self._start_codex_fork_event_monitor(session)
+        else:
+            self.codex_fork_runtime_owner.pop(session.id, None)
         self._save_state()
         logger.info("Recreated codex-fork runtime artifacts for %s after %s", session.id, reason)
         return True, ""
@@ -4933,7 +5003,11 @@ class SessionManager:
                 command=command,
                 args=args,
             ):
-                return False, session, "Failed to restore Claude session runtime"
+                tmux_error = getattr(self.tmux, "last_error_message", None)
+                if tmux_error:
+                    session.error_message = tmux_error
+                    self._save_state()
+                return False, session, tmux_error or "Failed to restore Claude session runtime"
         elif session.provider in ("codex", "codex-fork"):
             if not resume_id:
                 return False, session, "No Codex resume id is available for this session"
@@ -4941,25 +5015,17 @@ class SessionManager:
                 command = self.codex_cli_command
                 args = ["resume", resume_id, *self.codex_cli_args]
             else:
-                command = self.codex_fork_command
-                args = ["resume", resume_id, *self.codex_fork_args]
-                event_stream_path = self._codex_fork_event_stream_path(session)
-                control_socket_path = self._codex_fork_control_socket_path(session)
-                event_stream_path.parent.mkdir(parents=True, exist_ok=True)
-                if event_stream_path.exists():
-                    event_stream_path.unlink()
-                if control_socket_path.exists():
-                    control_socket_path.unlink()
-                args.extend(
-                    [
-                        "--event-stream",
-                        str(event_stream_path),
-                        "--event-schema-version",
-                        str(self.codex_fork_event_schema_version),
-                        "--control-socket",
-                        str(control_socket_path),
-                    ]
+                command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
+                    session,
+                    resume_id=resume_id,
                 )
+                if effective_provider != session.provider:
+                    logger.warning(
+                        "Falling back from codex-fork to codex while restoring %s: %s",
+                        session.id,
+                        fallback_reason,
+                    )
+                    session.provider = effective_provider
             if not self.tmux.create_session_with_command(
                 session.tmux_session,
                 session.working_dir,
@@ -4968,7 +5034,11 @@ class SessionManager:
                 command=command,
                 args=args,
             ):
-                return False, session, "Failed to restore Codex session runtime"
+                tmux_error = getattr(self.tmux, "last_error_message", None)
+                if tmux_error:
+                    session.error_message = tmux_error
+                    self._save_state()
+                return False, session, tmux_error or "Failed to restore Codex session runtime"
         elif session.provider == "codex-app":
             thread_id = session.codex_thread_id or resume_id
             if not thread_id:

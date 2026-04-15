@@ -43,7 +43,7 @@ sm codex-fork-info --json
 2. If `sync_recommended: True`, perform the upstream sync in the fork worktree:
 
 ```bash
-cd /Users/rajesh/worktrees/codex-fork
+cd /Users/rajesh/Desktop/automation/codex-fork
 git fetch upstream main --tags
 ```
 

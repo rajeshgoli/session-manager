@@ -118,3 +118,23 @@ def test_create_session_with_command_seeds_neutral_pane_title_before_launch(tmp_
     )
 
     assert run_calls.index(new_session_call) < run_calls.index(pane_title_call) < run_calls.index(pipe_pane_call)
+
+
+def test_create_session_with_command_rejects_missing_filesystem_command(tmp_path):
+    controller = TmuxController(log_dir=str(tmp_path))
+    missing_command = tmp_path / "missing" / "codex"
+
+    with patch.object(controller, "session_exists", return_value=False), \
+         patch.object(controller, "_run_tmux") as run_tmux:
+        ok = controller.create_session_with_command(
+            session_name="codex-test",
+            working_dir=str(tmp_path),
+            log_file=str(tmp_path / "codex-test.log"),
+            session_id="sess582",
+            command=str(missing_command),
+            args=["--dangerously-bypass-approvals-and-sandbox"],
+        )
+
+    assert ok is False
+    assert controller.last_error_message == f"Launch command does not exist: {missing_command}"
+    run_tmux.assert_not_called()
