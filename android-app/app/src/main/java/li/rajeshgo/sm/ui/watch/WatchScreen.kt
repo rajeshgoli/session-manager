@@ -442,7 +442,7 @@ private fun FooterControls(
     onQueryChange: (String) -> Unit,
     onFilterChange: (String) -> Unit,
 ) {
-    val running = sessions.count { it.status == "running" }
+    val active = sessions.count(::isOperationallyActive)
     val working = sessions.count { it.activityState == "working" }
     val thinking = sessions.count { it.activityState == "thinking" }
     val maintainers = sessions.count { it.isMaintainer }
@@ -478,7 +478,7 @@ private fun FooterControls(
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 SummaryBadge(label = "${sessions.size} sessions", tint = MaterialTheme.colorScheme.onSurface)
-                SummaryBadge(label = "$running running", tint = Emerald)
+                SummaryBadge(label = "$active active", tint = Emerald)
                 SummaryBadge(label = "$working working", tint = Emerald)
                 SummaryBadge(label = "$thinking thinking", tint = Cyan)
                 if (maintainers > 0) {
@@ -683,7 +683,7 @@ private fun SessionRow(
                 Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatusChip(label = activityLabel(session.activityState), tint = activityTint(session.activityState))
-                        StatusChip(label = session.status, tint = statusTint(session.status))
+                        StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
                         StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
                         if (session.role != null) StatusChip(label = session.role, tint = Violet)
                     }
@@ -820,14 +820,14 @@ private fun sessionLastActivityEpoch(session: ClientSession): Long {
     return parseIso(session.lastActivity)?.toEpochSecond() ?: Long.MIN_VALUE
 }
 
-private fun statusDot(session: ClientSession): Color = when (session.status) {
-    "running" -> Emerald
+private fun statusDot(session: ClientSession): Color = when (projectedStatusLabel(session)) {
+    "running", "active" -> Emerald
     "stopped" -> Rose
     else -> TextMuted
 }
 
-private fun statusTint(status: String?): Color = when (status) {
-    "running" -> Emerald
+private fun statusTint(session: ClientSession): Color = when (projectedStatusLabel(session)) {
+    "running", "active" -> Emerald
     "stopped" -> Rose
     else -> TextSecondary
 }
