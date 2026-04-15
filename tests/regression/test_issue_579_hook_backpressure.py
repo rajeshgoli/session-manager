@@ -133,3 +133,28 @@ def test_hook_tool_use_logs_cached_session_name_without_live_title_sync():
     tool_logger.log.assert_awaited_once()
     assert tool_logger.log.await_args.kwargs["session_name"] == "cached-friendly-name"
 
+
+def test_empty_hook_body_returns_400():
+    """Empty hook calls should fail loudly instead of being treated as valid no-ops."""
+    app = create_app(session_manager=MagicMock(), output_monitor=_output_monitor(), config={})
+    client = TestClient(app)
+
+    response = client.post("/hooks/tool-use", content=b"", headers={"Content-Type": "application/json"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Request body is required"
+
+
+def test_invalid_non_utf_hook_body_returns_400():
+    """Malformed byte payloads should be treated as invalid JSON, not server errors."""
+    app = create_app(session_manager=MagicMock(), output_monitor=_output_monitor(), config={})
+    client = TestClient(app)
+
+    response = client.post(
+        "/hooks/context-usage",
+        content=b"\x80\x81\x82",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid JSON body"

@@ -92,12 +92,12 @@ async def _decode_json_request(
         return None
 
     if not raw_body:
-        return {}
+        raise HTTPException(status_code=400, detail="Request body is required")
 
     try:
         loop = asyncio.get_running_loop()
         payload = await loop.run_in_executor(None, json.loads, raw_body)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
 
     if not isinstance(payload, dict):
