@@ -415,6 +415,73 @@ class TestSessionLifecycle:
         assert restored is session
         assert restored.agent_task_completed_at is None
 
+    @pytest.mark.asyncio
+    async def test_ensure_telegram_topic_serializes_concurrent_calls(self, session_manager):
+        """Concurrent ensure calls should create only one Telegram topic per session."""
+        session = Session(
+            id="telegramlock",
+            name="codex-telegramlock",
+            working_dir="/tmp/test",
+            tmux_session="codex-telegramlock",
+            provider="codex",
+            log_file="/tmp/telegramlock.log",
+            status=SessionStatus.IDLE,
+            telegram_chat_id=123456,
+            telegram_thread_id=None,
+        )
+
+        calls = 0
+
+        async def topic_creator(session_id: str, chat_id: int, topic_name: str) -> int:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            return 77777
+
+        session_manager.set_topic_creator(topic_creator)
+
+        await asyncio.gather(
+            session_manager._ensure_telegram_topic(session, session.telegram_chat_id),
+            session_manager._ensure_telegram_topic(session, session.telegram_chat_id),
+        )
+
+        assert calls == 1
+        assert session.telegram_thread_id == 77777
+
+    @pytest.mark.asyncio
+    async def test_schedule_telegram_topic_ensure_deduplicates_pending_task(self, session_manager):
+        """Repeated deferred ensures for one session should reuse the in-flight task."""
+        session = Session(
+            id="telegramdedupe",
+            name="codex-telegramdedupe",
+            working_dir="/tmp/test",
+            tmux_session="codex-telegramdedupe",
+            provider="codex",
+            log_file="/tmp/telegramdedupe.log",
+            status=SessionStatus.IDLE,
+            telegram_chat_id=123456,
+            telegram_thread_id=None,
+        )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def fake_ensure(target_session, explicit_chat_id=None):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+
+        with patch.object(session_manager, "_ensure_telegram_topic", side_effect=fake_ensure):
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            await asyncio.wait_for(started.wait(), timeout=1)
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            await asyncio.sleep(0)
+            assert calls == 1
+            release.set()
+            await asyncio.gather(*list(session_manager._pending_telegram_topic_tasks))
+
     def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
         """Codex-fork restore id can be recovered from persisted lifecycle events."""
         session = Session(
