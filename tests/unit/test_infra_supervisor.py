@@ -120,6 +120,81 @@ def test_android_tunnel_repairs_via_launch_agent_when_down(monkeypatch, tmp_path
     assert result["details"]["actions"] == ["bootstrap", "kickstart"]
 
 
+def test_android_tunnel_reports_error_when_public_probe_fails(monkeypatch, tmp_path):
+    plist_path = tmp_path / "com.rajesh.sm-android-tunnel.plist"
+    plist_path.write_text("<plist/>")
+
+    supervisor = InfrastructureSupervisor(
+        {
+            "external_access": {
+                "public_ssh_host": "sm-ssh.example.com",
+                "ssh_username": "rajesh",
+                "ssh_proxy_command": "cloudflared access ssh --hostname %h",
+            },
+            "infra_supervisor": {
+                "android_tunnel": {
+                    "launch_agent_plist": str(plist_path),
+                    "launch_agent_label": "com.rajesh.sm-android-tunnel",
+                }
+            },
+        }
+    )
+
+    monkeypatch.setattr(supervisor, "_launch_agent_running", lambda label: True)
+    monkeypatch.setattr(supervisor, "_repair_launch_agent", lambda label, path: ["kickstart"])
+    monkeypatch.setattr(
+        supervisor,
+        "_probe_android_public_ssh",
+        lambda **kwargs: (False, "Connection timed out during banner exchange"),
+    )
+
+    result = supervisor.ensure_now()["android_tunnel"]
+
+    assert result["status"] == "error"
+    assert "public SSH path is unhealthy" in result["message"]
+    assert result["details"]["attach_ready"] is False
+    assert result["details"]["actions"] == ["kickstart"]
+    assert result["details"]["public_probe_error"] == "Connection timed out during banner exchange"
+
+
+def test_android_tunnel_restart_recovers_public_probe(monkeypatch, tmp_path):
+    plist_path = tmp_path / "com.rajesh.sm-android-tunnel.plist"
+    plist_path.write_text("<plist/>")
+
+    supervisor = InfrastructureSupervisor(
+        {
+            "external_access": {
+                "public_ssh_host": "sm-ssh.example.com",
+                "ssh_username": "rajesh",
+                "ssh_proxy_command": "cloudflared access ssh --hostname %h",
+            },
+            "infra_supervisor": {
+                "android_tunnel": {
+                    "launch_agent_plist": str(plist_path),
+                    "launch_agent_label": "com.rajesh.sm-android-tunnel",
+                }
+            },
+        }
+    )
+
+    probe_results = iter(
+        [
+            (False, "Connection timed out during banner exchange"),
+            (True, None),
+        ]
+    )
+    monkeypatch.setattr(supervisor, "_launch_agent_running", lambda label: True)
+    monkeypatch.setattr(supervisor, "_repair_launch_agent", lambda label, path: ["kickstart"])
+    monkeypatch.setattr(supervisor, "_probe_android_public_ssh", lambda **kwargs: next(probe_results))
+
+    result = supervisor.ensure_now()["android_tunnel"]
+
+    assert result["status"] == "warning"
+    assert "was unhealthy and was restarted" in result["message"]
+    assert result["details"]["attach_ready"] is True
+    assert result["details"]["actions"] == ["kickstart"]
+
+
 def test_tmux_base_is_recreated_when_missing(monkeypatch):
     supervisor = InfrastructureSupervisor({})
     monkeypatch.setattr(supervisor, "_ensure_android_sshd", lambda: {"status": "ok"})

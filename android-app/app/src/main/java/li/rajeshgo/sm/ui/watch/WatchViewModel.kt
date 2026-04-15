@@ -27,6 +27,7 @@ data class WatchUiState(
     val loading: Boolean = true,
     val refreshing: Boolean = false,
     val requestingStatus: Boolean = false,
+    val ensuringMaintainer: Boolean = false,
     val lastSync: String? = null,
     val error: String? = null,
 )
@@ -245,6 +246,58 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 onComplete(result)
             } finally {
                 _uiState.value = _uiState.value.copy(requestingStatus = false)
+            }
+        }
+    }
+
+    fun ensureMaintainer(onComplete: (Result<String>) -> Unit) {
+        viewModelScope.launch {
+            if (_uiState.value.ensuringMaintainer) {
+                return@launch
+            }
+            _uiState.value = _uiState.value.copy(ensuringMaintainer = true)
+            try {
+                val serverUrl = settingsRepository.serverUrl.first()
+                val accessToken = settingsRepository.accessToken.first()
+                if (serverUrl.isBlank() || accessToken.isBlank()) {
+                    onComplete(Result.failure(IllegalStateException("Sign in to wake maintainer")))
+                    return@launch
+                }
+
+                val result = sessionRepository.ensureMaintainer(serverUrl, accessToken)
+                    .map { response ->
+                        val session = response.session
+                        val nextSessions = _uiState.value.sessions.toMutableList()
+                        val existingIndex = nextSessions.indexOfFirst { it.id == session.id }
+                        if (existingIndex >= 0) {
+                            nextSessions[existingIndex] = session
+                        } else {
+                            nextSessions.add(0, session)
+                        }
+                        _uiState.value = _uiState.value.copy(
+                            sessions = nextSessions,
+                            lastSync = java.time.OffsetDateTime.now().toString(),
+                            error = null,
+                        )
+                        "Maintainer ${if (response.created) "started" else "ready"}: ${sessionDisplayName(session)} [${session.id}]"
+                    }
+
+                if (result.exceptionOrNull() is SessionManagerAuthException) {
+                    settingsRepository.clearAuth()
+                    _uiState.value = _uiState.value.copy(
+                        sessions = emptyList(),
+                        expandedSessionIds = emptySet(),
+                        detailsBySessionId = emptyMap(),
+                        lastSync = null,
+                        userEmail = "",
+                    )
+                }
+                result.onSuccess {
+                    refresh()
+                }
+                onComplete(result)
+            } finally {
+                _uiState.value = _uiState.value.copy(ensuringMaintainer = false)
             }
         }
     }

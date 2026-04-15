@@ -63,6 +63,37 @@ def test_list_sessions_exposes_maintainer_alias(tmp_path):
     assert payload["is_maintainer"] is True
 
 
+def test_get_session_resolves_maintainer_alias(tmp_path):
+    manager = _manager(tmp_path)
+    session = _session("maint123", tmp_path)
+    manager.sessions[session.id] = session
+    manager.set_maintainer_session(session.id)
+
+    client = TestClient(create_app(session_manager=manager))
+    response = client.get("/sessions/maintainer")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "maint123"
+    assert payload["friendly_name"] == "maintainer"
+    assert payload["aliases"] == ["maintainer"]
+
+
+def test_get_client_session_resolves_maintainer_alias(tmp_path):
+    manager = _manager(tmp_path)
+    session = _session("maint123", tmp_path)
+    manager.sessions[session.id] = session
+    manager.set_maintainer_session(session.id)
+
+    client = TestClient(create_app(session_manager=manager))
+    response = client.get("/client/sessions/maintainer")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "maint123"
+    assert payload["aliases"] == ["maintainer"]
+
+
 def test_put_maintainer_requires_self_auth(tmp_path):
     manager = _manager(tmp_path)
     session = _session("maint123", tmp_path)

@@ -1515,6 +1515,23 @@ def create_app(
             created_at=registration.created_at.isoformat(),
         )
 
+    def _resolve_session_or_registry_role(session_id: str):
+        """Resolve a direct session id first, then fall back to a live registry role."""
+        if not app.state.session_manager:
+            return None
+
+        session = app.state.session_manager.get_session(session_id)
+        if session is not None:
+            return session
+
+        getter = getattr(app.state.session_manager, "lookup_agent_registration", None)
+        if not callable(getter):
+            return None
+        registration = getter(session_id)
+        if registration is None:
+            return None
+        return app.state.session_manager.get_session(registration.session_id)
+
     def _job_watch_to_response(registration) -> JobWatchResponse:
         target_session = app.state.session_manager.get_session(registration.target_session_id)
         return JobWatchResponse(
@@ -3187,7 +3204,7 @@ def create_app(
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        session = app.state.session_manager.get_session(session_id)
+        session = _resolve_session_or_registry_role(session_id)
 
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -3201,7 +3218,7 @@ def create_app(
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        session = app.state.session_manager.get_session(session_id)
+        session = _resolve_session_or_registry_role(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
