@@ -249,6 +249,26 @@ class TmuxController:
         lowered = pane_text.lower()
         return "submitted after next tool call" in lowered
 
+    def _extract_active_codex_region(self, pane_text: Optional[str]) -> Optional[str]:
+        """Return the active bottom-of-pane Codex region near the live prompt/banner."""
+        if not pane_text:
+            return None
+
+        lines = pane_text.splitlines()
+        if not lines:
+            return None
+
+        prompt_indexes = [index for index, line in enumerate(lines) if line.lstrip().startswith("›")]
+        if prompt_indexes:
+            prompt_index = prompt_indexes[-1]
+            start = max(0, prompt_index - 8)
+            end = min(len(lines), prompt_index + 4)
+            region = "\n".join(lines[start:end]).strip()
+            return region or None
+
+        region = "\n".join(lines[-16:]).strip()
+        return region or None
+
     def _normalize_for_compare(self, text: str) -> str:
         """Collapse whitespace for approximate pane-vs-payload comparison."""
         return " ".join((text or "").split())
@@ -312,9 +332,10 @@ class TmuxController:
 
         async def _capture_deferred_payload() -> bool:
             pane = await self._capture_pane_async(session_name)
-            if not self._looks_like_codex_deferred_send_banner(pane):
+            active_region = self._extract_active_codex_region(pane)
+            if not self._looks_like_codex_deferred_send_banner(active_region):
                 return False
-            normalized_pane = self._normalize_for_compare(pane or "")
+            normalized_pane = self._normalize_for_compare(active_region or "")
             return normalized_preview in normalized_pane
 
         await asyncio.sleep(self.submit_verify_seconds)

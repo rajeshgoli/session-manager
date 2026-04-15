@@ -98,6 +98,48 @@ async def test_send_input_async_does_not_interrupt_codex_without_deferred_banner
 
 
 @pytest.mark.asyncio
+async def test_send_input_async_ignores_stale_codex_deferred_banner_history(tmux_controller):
+    stale_history_pane = """
+• Messages to be submitted after next tool call (press esc to interrupt and send immediately)
+  ↳ [Input from: maintainer (83f53095) via sm send]
+    busy repro ping: reply exactly DURING_SLEEP_OK
+
+... older output omitted ...
+
+• DURING_SLEEP_OK
+
+  1 background terminal running · /ps to view · /stop to close
+
+› Summarize recent commits
+"""
+    subprocess_calls = []
+
+    async def mock_subprocess(*args, **kwargs):
+        subprocess_calls.append(args)
+        proc = AsyncMock()
+        if args[1] == "capture-pane":
+            proc.communicate = AsyncMock(return_value=(stale_history_pane.encode(), b""))
+        else:
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    with patch.object(tmux_controller, "session_exists", return_value=True), \
+         patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
+         patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+         patch("asyncio.sleep", new_callable=AsyncMock):
+        result = await tmux_controller.send_input_async(
+            "codex-test",
+            "busy repro ping: reply exactly DURING_SLEEP_OK",
+            verify_codex_submit=True,
+        )
+
+    assert result is True
+    escape_calls = [call for call in subprocess_calls if call[1] == "send-keys" and call[-1] == "Escape"]
+    assert len(escape_calls) == 0
+
+
+@pytest.mark.asyncio
 async def test_deliver_direct_enables_codex_submit_verification(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
     session = Session(
