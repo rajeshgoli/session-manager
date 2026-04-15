@@ -747,6 +747,20 @@ class SessionManagerApp:
     async def _handle_status_change(self, session_id: str, status: SessionStatus):
         """Handle status changes from the output monitor."""
         self.session_manager.update_session_status(session_id, status)
+        if not self.message_queue:
+            return
+
+        session = self.session_manager.get_session(session_id)
+        if not session or session.provider != "codex":
+            return
+
+        if status == SessionStatus.IDLE:
+            self.message_queue.mark_session_idle(
+                session_id,
+                completion_transition=True,
+            )
+        elif status == SessionStatus.RUNNING:
+            self.message_queue.mark_session_active(session_id)
 
     async def start(self):
         """Start all components."""
