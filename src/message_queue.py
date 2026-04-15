@@ -120,6 +120,7 @@ class MessageQueueManager:
         # Value: datetime when stop notification was sent
         self._recent_stop_notifications: Dict[Tuple[str, str], datetime] = {}
         self._pending_stop_notify_tasks: Dict[str, asyncio.Task] = {}
+        self._codex_idle_reconcile_tasks: Dict[str, asyncio.Task] = {}
         self._telegram_mirror_queue: Optional[asyncio.Queue[tuple[str, object, str, str]]] = None
         self._telegram_mirror_worker_task: Optional[asyncio.Task] = None
 
@@ -949,6 +950,9 @@ class MessageQueueManager:
         for task in self._pending_stop_notify_tasks.values():
             task.cancel()
         self._pending_stop_notify_tasks.clear()
+        for task in self._codex_idle_reconcile_tasks.values():
+            task.cancel()
+        self._codex_idle_reconcile_tasks.clear()
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
@@ -1006,6 +1010,7 @@ class MessageQueueManager:
                 stop, without engaging skip-fence logic.
         """
         state = self._get_or_create_state(session_id)
+        self._cancel_codex_idle_reconcile(session_id)
         logger.info(f"Session {session_id} marked idle")
 
         # Check for pending handoff — takes priority over all other Stop hook logic (#196).
@@ -1124,6 +1129,7 @@ class MessageQueueManager:
     def mark_session_active(self, session_id: str):
         """Mark a session as active (not idle)."""
         state = self._get_or_create_state(session_id)
+        self._cancel_codex_idle_reconcile(session_id)
         state.is_idle = False
         self._cancel_pending_stop_notification(session_id)
         if state.stop_notify_delay_seconds > 0:
@@ -1137,6 +1143,61 @@ class MessageQueueManager:
         if session and session.status != SessionStatus.STOPPED:
             session.status = SessionStatus.RUNNING
         logger.debug(f"Session {session_id} marked active")
+
+    def _cancel_codex_idle_reconcile(self, session_id: str) -> None:
+        """Cancel any in-flight plain-Codex idle reconcile task for one session."""
+        task = self._codex_idle_reconcile_tasks.pop(session_id, None)
+        if task:
+            task.cancel()
+
+    def _schedule_codex_idle_reconcile(self, session_id: str) -> None:
+        """Watch a plain tmux-backed Codex session for prompt return after delivery."""
+        self._cancel_codex_idle_reconcile(session_id)
+        task = asyncio.create_task(self._reconcile_codex_idle_after_delivery(session_id))
+        self._codex_idle_reconcile_tasks[session_id] = task
+
+    async def _reconcile_codex_idle_after_delivery(self, session_id: str) -> None:
+        """Mark plain Codex sessions idle once the prompt returns after a delivered turn."""
+        prompt_count = 0
+        timeout_at = datetime.now() + timedelta(seconds=60)
+        current_task = asyncio.current_task()
+
+        try:
+            while datetime.now() < timeout_at:
+                session = self.session_manager.get_session(session_id)
+                if not session or getattr(session, "provider", "claude") != "codex":
+                    return
+
+                if self.get_pending_messages(session_id):
+                    prompt_count = 0
+                    await asyncio.sleep(self.watch_poll_interval)
+                    continue
+
+                prompt_visible = False
+                if session.tmux_session:
+                    prompt_visible = await self._check_idle_prompt(session.tmux_session)
+
+                if prompt_visible:
+                    prompt_count += 1
+                    if prompt_count >= 2:
+                        self.mark_session_idle(session_id, completion_transition=True)
+                        session.status = SessionStatus.IDLE
+                        session.last_activity = datetime.now()
+                        self.session_manager._save_state()
+                        logger.info(
+                            "Reconciled plain codex session %s idle after prompt returned",
+                            session_id,
+                        )
+                        return
+                else:
+                    prompt_count = 0
+
+                await asyncio.sleep(self.watch_poll_interval)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._codex_idle_reconcile_tasks.get(session_id) is current_task:
+                self._codex_idle_reconcile_tasks.pop(session_id, None)
 
     def is_session_idle(self, session_id: str) -> bool:
         """Check if a session is idle."""
@@ -1803,6 +1864,8 @@ class MessageQueueManager:
                 session.last_activity = datetime.now()
                 session.status = SessionStatus.RUNNING
                 self.session_manager._save_state()
+                if getattr(session, "provider", "claude") == "codex":
+                    self._schedule_codex_idle_reconcile(session_id)
             else:
                 logger.error(f"Failed to deliver messages to {session_id}")
 
