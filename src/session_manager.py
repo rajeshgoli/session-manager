@@ -5087,7 +5087,9 @@ class SessionManager:
             self.message_queue_manager.mark_session_idle(session.id)
         self._save_state()
         if session.telegram_chat_id:
-            await self._ensure_telegram_topic(session, session.telegram_chat_id)
+            # Topic creation can make slow Telegram API calls; keep restore on the
+            # runtime path and let topic repair complete in the background.
+            self._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
         logger.info("Restored session %s (%s)", session.id, session.provider)
         return True, session, None
 

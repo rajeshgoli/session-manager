@@ -358,6 +358,35 @@ class TestSessionLifecycle:
         assert call_kwargs["command"] == "codex"
         assert call_kwargs["args"] == ["resume", "resume-fallback-123", "--dangerously-bypass-approvals-and-sandbox"]
 
+    @pytest.mark.asyncio
+    async def test_restore_session_defers_telegram_topic_creation(
+        self,
+        session_manager,
+        mock_tmux,
+    ):
+        """Restore should not wait on Telegram topic creation before returning."""
+        session = Session(
+            id="restoretopic",
+            name="codex-restoretopic",
+            working_dir="/tmp/test",
+            tmux_session="codex-restoretopic",
+            provider="codex",
+            log_file="/tmp/restoretopic.log",
+            status=SessionStatus.STOPPED,
+            provider_resume_id="resume-topic-123",
+            telegram_chat_id=123456,
+        )
+        session_manager.sessions[session.id] = session
+        mock_tmux.session_exists.return_value = False
+
+        with patch.object(session_manager, "_schedule_telegram_topic_ensure") as schedule_topic:
+            success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        schedule_topic.assert_called_once_with(session, 123456)
+
     def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
         """Codex-fork restore id can be recovered from persisted lifecycle events."""
         session = Session(

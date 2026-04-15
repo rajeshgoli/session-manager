@@ -109,6 +109,7 @@ def _make_app(
         ),
         mark_telegram_topic_deleted=Mock(side_effect=_mark_deleted),
         _ensure_telegram_topic=AsyncMock(),
+        _schedule_telegram_topic_ensure=Mock(),
         tmux=SimpleNamespace(session_exists=lambda tmux_name: tmux_name in live_tmux_sessions),
     )
     return app
@@ -287,6 +288,17 @@ async def test_reconcile_reuses_durable_topic_before_creating_new_one():
     )
     assert app.telegram_bot._session_threads[session.id] == (record.chat_id, record.thread_id)
     app.session_manager._save_state.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_defers_missing_topic_creation():
+    session = _make_session("sess2", thread_id=None)
+    app = _make_app({"sess2": session})
+
+    await app._reconcile_telegram_topics()
+
+    app.session_manager._ensure_telegram_topic.assert_not_awaited()
+    app.session_manager._schedule_telegram_topic_ensure.assert_called_once_with(session)
 
 
 def test_load_state_backfills_durable_topic_registry(tmp_path):
