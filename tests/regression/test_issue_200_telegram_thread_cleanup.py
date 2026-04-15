@@ -6,8 +6,9 @@ Bug:
 - Clear path: no Telegram notification at all.
 
 Fix:
-- Kill path: send "Session stopped [id]" via try-and-fallback, then close_forum_topic
-  (forum) or leave thread open (reply-thread). delete_forum_topic no longer used.
+- Kill path: send "Session stopped [id]" via try-and-fallback, then delete the
+  forum topic when forum delivery succeeds. Reply-thread cleanup still leaves
+  the thread open because it is not a forum topic.
 - Clear path: send "Context cleared [id] — ready for new task" via try-and-fallback.
 """
 
@@ -95,6 +96,7 @@ def _make_telegram_bot(send_forum_returns=1):
     tg.bot = AsyncMock()
     tg._topic_sessions = {}
     tg._session_threads = {}
+    tg.delete_forum_topic = AsyncMock(return_value=True)
 
     # send_with_fallback returns the forum result: non-None = forum succeeded,
     # None = forum failed (fallback attempted internally).
@@ -120,7 +122,7 @@ def output_monitor_factory():
 
 @pytest.mark.asyncio
 async def test_cleanup_kill_forum_mode(output_monitor_factory, forum_session):
-    """Kill with forum topic: 'Session stopped' sent via message_thread_id, topic closed."""
+    """Kill with forum topic: 'Session stopped' sent via message_thread_id, topic deleted."""
     chat_id = forum_session.telegram_chat_id
     thread_id = forum_session.telegram_thread_id
 
@@ -139,13 +141,8 @@ async def test_cleanup_kill_forum_mode(output_monitor_factory, forum_session):
         session_id=forum_session.id,
     )
 
-    # close_forum_topic called because forum send succeeded
-    tg.bot.close_forum_topic.assert_called_once_with(
-        chat_id=chat_id, message_thread_id=thread_id
-    )
-
-    # delete_forum_topic NOT called (replaced by close + stop message)
-    tg.bot.delete_forum_topic.assert_not_called()
+    tg.delete_forum_topic.assert_called_once_with(chat_id, thread_id)
+    tg.bot.close_forum_topic.assert_not_called()
 
     # In-memory mappings cleaned up
     assert (chat_id, thread_id) not in tg._topic_sessions
@@ -174,11 +171,9 @@ async def test_cleanup_kill_reply_thread_mode(output_monitor_factory, reply_sess
         session_id=reply_session.id,
     )
 
-    # close_forum_topic NOT called (forum send failed, send_with_fallback returned None)
+    # close/delete NOT called (forum send failed, send_with_fallback returned None)
     tg.bot.close_forum_topic.assert_not_called()
-
-    # delete_forum_topic NOT called (old code path removed)
-    tg.bot.delete_forum_topic.assert_not_called()
+    tg.delete_forum_topic.assert_not_called()
 
     # In-memory mappings cleaned up
     assert reply_session.id not in tg._session_threads
@@ -187,7 +182,7 @@ async def test_cleanup_kill_reply_thread_mode(output_monitor_factory, reply_sess
 @pytest.mark.asyncio
 async def test_cleanup_kill_post_restart_reply_thread(output_monitor_factory, reply_session):
     """Post-restart scenario: reply-thread session in _topic_sessions. Kill sends reply-thread
-    notification (not forum), close_forum_topic NOT called."""
+    notification (not forum), close/delete not called."""
     chat_id = reply_session.telegram_chat_id
     thread_id = reply_session.telegram_thread_id
 
@@ -204,6 +199,7 @@ async def test_cleanup_kill_post_restart_reply_thread(output_monitor_factory, re
 
     # Fallback (reply-thread) path was taken
     tg.bot.close_forum_topic.assert_not_called()
+    tg.delete_forum_topic.assert_not_called()
     tg.send_with_fallback.assert_called_once()
 
     # Mappings removed
@@ -224,6 +220,7 @@ async def test_cleanup_no_telegram_configured(output_monitor_factory, no_tg_sess
     # No Telegram calls made
     tg.send_with_fallback.assert_not_called()
     tg.bot.close_forum_topic.assert_not_called()
+    tg.delete_forum_topic.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -349,5 +346,6 @@ def test_clear_thread_remains_open_after_clear(forum_session):
     resp = client.post(f"/sessions/{forum_session.id}/clear", json={})
     assert resp.status_code == 200
 
-    # close_forum_topic must NOT be called — the thread stays open
+    # close/delete must NOT be called — the thread stays open
     tg.bot.close_forum_topic.assert_not_called()
+    tg.delete_forum_topic.assert_not_called()

@@ -115,6 +115,27 @@ def test_non_codex_idle_status_beats_recent_last_activity_without_queue_state():
     assert manager.get_activity_state(session.id) == "idle"
 
 
+def test_plain_codex_idle_status_uses_recent_activity_grace_window():
+    manager = _make_manager()
+    session = Session(
+        id="codex-idle1",
+        name="codex-codex-idle1",
+        working_dir="/tmp",
+        provider="codex",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.output_monitor = SimpleNamespace(
+        get_session_state=lambda _sid: MonitorState(is_output_flowing=False)
+    )
+
+    session.last_activity = datetime.now() - timedelta(seconds=5)
+    assert manager.get_activity_state(session.id) == "thinking"
+
+    session.last_activity = datetime.now() - timedelta(seconds=45)
+    assert manager.get_activity_state(session.id) == "idle"
+
+
 def test_codex_app_uses_queue_tristate_and_completion():
     manager = _make_manager()
     session = Session(

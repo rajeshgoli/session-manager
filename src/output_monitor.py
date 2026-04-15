@@ -512,18 +512,18 @@ class OutputMonitor:
 
     async def close_session_topic(self, session: Session, message: str = "Completed"):
         """
-        Close the Telegram forum topic for a completed session.
+        Retire the Telegram forum topic for a completed session.
 
         Unlike cleanup_session(), this method:
         - Does NOT remove the session from session_manager.sessions
         - Does NOT affect codex-app session state
-        - Only closes the Telegram topic and cleans up in-memory mappings
+        - Only retires the Telegram topic and cleans up in-memory mappings
 
-        Used by ChildMonitor on task completion to close child session topics
+        Used by ChildMonitor on task completion to retire child session topics
         without destroying the session record (needed for sm children --status completed).
         """
         session_id = session.id
-        logger.info(f"Closing Telegram topic for completed session {session_id}")
+        logger.info(f"Retiring Telegram topic for completed session {session_id}")
 
         if session.telegram_thread_id and session.telegram_chat_id:
             notifier = getattr(self._session_manager, 'notifier', None) if self._session_manager else None
@@ -546,14 +546,13 @@ class OutputMonitor:
                 )
 
                 if msg_id is not None:
-                    # Confirmed forum topic — close it
-                    try:
-                        await telegram_bot.bot.close_forum_topic(
-                            chat_id=chat_id, message_thread_id=thread_id
-                        )
-                        logger.info(f"Closed Telegram forum topic for completed session {session_id}")
-                    except Exception as e:
-                        logger.warning(f"Could not close forum topic for {session_id}: {e}")
+                    await self._delete_forum_topic_if_possible(
+                        telegram_bot,
+                        session,
+                        chat_id,
+                        thread_id,
+                        reason="completed-session cleanup",
+                    )
 
                 # Clean up in-memory mappings
                 telegram_bot._topic_sessions.pop((chat_id, thread_id), None)
@@ -635,14 +634,13 @@ class OutputMonitor:
                     logger.warning(f"Could not send cleanup notification for {session_id}: {e}")
 
                 if msg_id is not None:
-                    # Confirmed forum topic — close it (keeps history visible, marks resolved)
-                    try:
-                        await telegram_bot.bot.close_forum_topic(
-                            chat_id=chat_id, message_thread_id=thread_id
-                        )
-                        logger.info(f"Closed Telegram forum topic for session {session_id}")
-                    except Exception as e:
-                        logger.warning(f"Could not close forum topic for {session_id}: {e}")
+                    await self._delete_forum_topic_if_possible(
+                        telegram_bot,
+                        session,
+                        chat_id,
+                        thread_id,
+                        reason="session cleanup",
+                    )
 
                 # Clean up in-memory mappings
                 telegram_bot._topic_sessions.pop((chat_id, thread_id), None)
@@ -656,13 +654,6 @@ class OutputMonitor:
             if callable(unregister_roles):
                 unregister_roles(session_id, persist=False)
             if session.telegram_chat_id and session.telegram_thread_id:
-                mark_deleted = getattr(self._session_manager, "mark_telegram_topic_deleted", None)
-                if callable(mark_deleted):
-                    mark_deleted(
-                        session.telegram_chat_id,
-                        session.telegram_thread_id,
-                        session=session,
-                    )
                 session.telegram_thread_id = None
             if not preserve_record and session_id in self._session_manager.sessions:
                 del self._session_manager.sessions[session_id]
@@ -689,6 +680,38 @@ class OutputMonitor:
         self._output_history.pop(session_id, None)
         self._tasks.pop(session_id, None)
         logger.info(f"Completed cleanup for session {session_id}")
+
+    async def _delete_forum_topic_if_possible(
+        self,
+        telegram_bot: object,
+        session: Session,
+        chat_id: int,
+        thread_id: int,
+        *,
+        reason: str,
+    ) -> bool:
+        """Delete a forum topic after its final message and tombstone only on success."""
+        delete_forum_topic = getattr(telegram_bot, "delete_forum_topic", None)
+        if not callable(delete_forum_topic):
+            logger.warning(
+                "Telegram bot has no delete_forum_topic helper during %s for %s",
+                reason,
+                session.id,
+            )
+            return False
+
+        try:
+            deleted = await delete_forum_topic(chat_id, thread_id)
+        except Exception as e:
+            logger.warning(f"Could not delete forum topic for {session.id} during {reason}: {e}")
+            return False
+
+        if deleted and self._session_manager:
+            mark_deleted = getattr(self._session_manager, "mark_telegram_topic_deleted", None)
+            if callable(mark_deleted):
+                mark_deleted(chat_id, thread_id, session=session)
+
+        return deleted
 
     def _should_allow_reply_fallback(self, session: Session, telegram_bot: object) -> bool:
         """Return whether cleanup sends may fall back to reply-thread mode."""

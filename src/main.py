@@ -651,8 +651,13 @@ class SessionManagerApp:
                 tmux_session = record.tmux_session
 
             stale_reason = None
-            if session and session.telegram_thread_id and record.thread_id != session.telegram_thread_id:
-                stale_reason = f"session now points to topic {session.telegram_thread_id}"
+            if session and session.telegram_thread_id != record.thread_id:
+                active_topic = session.telegram_thread_id
+                stale_reason = (
+                    f"session no longer points to this topic (active={active_topic})"
+                    if active_topic
+                    else "session retired this topic"
+                )
             elif provider == "codex-app" and session:
                 skipped += 1
                 continue

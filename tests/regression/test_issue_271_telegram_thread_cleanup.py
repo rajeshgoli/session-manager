@@ -91,8 +91,8 @@ def _make_output_monitor(session_manager):
 
 
 @pytest.mark.asyncio
-async def test_close_session_topic_sends_message_and_closes_forum_topic():
-    """close_session_topic() sends a completion message and closes the forum topic."""
+async def test_close_session_topic_sends_message_and_deletes_forum_topic():
+    """close_session_topic() sends a completion message and deletes the forum topic."""
     session = _make_forum_session()
     chat_id = session.telegram_chat_id
     thread_id = session.telegram_thread_id
@@ -115,10 +115,8 @@ async def test_close_session_topic_sends_message_and_closes_forum_topic():
         session_id=session.id,
     )
 
-    # Forum topic closed via bot
-    tg.bot.close_forum_topic.assert_called_once_with(
-        chat_id=chat_id, message_thread_id=thread_id
-    )
+    tg.delete_forum_topic.assert_called_once_with(chat_id, thread_id)
+    tg.bot.close_forum_topic.assert_not_called()
 
     # In-memory mappings cleaned up
     assert (chat_id, thread_id) not in tg._topic_sessions
@@ -173,11 +171,12 @@ async def test_close_session_topic_no_telegram_configured():
 
     tg.send_with_fallback.assert_not_called()
     tg.bot.close_forum_topic.assert_not_called()
+    tg.delete_forum_topic.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_close_session_topic_forum_send_fails_skips_close():
-    """If send_with_fallback returns None (forum failed), close_forum_topic is not called."""
+async def test_close_session_topic_forum_send_fails_skips_delete():
+    """If send_with_fallback returns None (forum failed), delete_forum_topic is not called."""
     session = _make_forum_session()
     tg = _make_telegram_bot(send_forum_returns=None)
     mgr = _make_session_manager({session.id: session}, tg)
@@ -187,18 +186,19 @@ async def test_close_session_topic_forum_send_fails_skips_close():
 
     # send attempted
     tg.send_with_fallback.assert_called_once()
-    # but forum close NOT called (forum send failed → not a confirmed forum topic)
+    # but forum delete NOT called (forum send failed → not a confirmed forum topic)
     tg.bot.close_forum_topic.assert_not_called()
+    tg.delete_forum_topic.assert_not_called()
     # mappings still cleaned up
     assert session.id not in tg._session_threads
 
 
 @pytest.mark.asyncio
-async def test_close_session_topic_forum_close_error_does_not_raise():
-    """If close_forum_topic raises, close_session_topic handles it gracefully."""
+async def test_close_session_topic_delete_error_does_not_raise():
+    """If delete_forum_topic raises, close_session_topic handles it gracefully."""
     session = _make_forum_session()
     tg = _make_telegram_bot(send_forum_returns=555)
-    tg.bot.close_forum_topic = AsyncMock(side_effect=Exception("API error"))
+    tg.delete_forum_topic = AsyncMock(side_effect=Exception("API error"))
 
     mgr = _make_session_manager({session.id: session}, tg)
     monitor = _make_output_monitor(mgr)
@@ -206,7 +206,7 @@ async def test_close_session_topic_forum_close_error_does_not_raise():
     # Must not raise
     await monitor.close_session_topic(session, message="Completed")
 
-    # Mappings still cleaned up despite close_forum_topic failure
+    # Mappings still cleaned up despite delete_forum_topic failure
     assert session.id not in tg._session_threads
     assert session.telegram_thread_id is None
 
