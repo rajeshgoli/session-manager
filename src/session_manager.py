@@ -5071,6 +5071,7 @@ class SessionManager:
         session.completion_status = None
         session.completion_message = None
         session.completed_at = None
+        session.agent_task_completed_at = None
         session.status = SessionStatus.IDLE if session.provider == "codex-app" else SessionStatus.RUNNING
         session.last_activity = datetime.now()
         if session.provider == "codex-fork":

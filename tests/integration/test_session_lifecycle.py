@@ -387,6 +387,34 @@ class TestSessionLifecycle:
         assert restored is session
         schedule_topic.assert_called_once_with(session, 123456)
 
+    @pytest.mark.asyncio
+    async def test_restore_session_clears_stale_task_complete_marker(
+        self,
+        session_manager,
+        mock_tmux,
+    ):
+        """Explicit restore should make a session active again, not reapable."""
+        session = Session(
+            id="restorecomplete",
+            name="codex-restorecomplete",
+            working_dir="/tmp/test",
+            tmux_session="codex-restorecomplete",
+            provider="codex",
+            log_file="/tmp/restorecomplete.log",
+            status=SessionStatus.STOPPED,
+            provider_resume_id="resume-complete-123",
+            agent_task_completed_at=datetime.now(),
+        )
+        session_manager.sessions[session.id] = session
+        mock_tmux.session_exists.return_value = False
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        assert restored.agent_task_completed_at is None
+
     def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
         """Codex-fork restore id can be recovered from persisted lifecycle events."""
         session = Session(
