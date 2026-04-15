@@ -2148,11 +2148,21 @@ class SessionManager:
         self._pending_telegram_topic_tasks.add(task)
         task.add_done_callback(self._pending_telegram_topic_tasks.discard)
         task.add_done_callback(
-            lambda completed_task, session_id=session.id: self._pending_telegram_topic_tasks_by_session.pop(
+            lambda completed_task, session_id=session.id: self._clear_pending_telegram_topic_task(
                 session_id,
-                None,
+                completed_task,
             )
         )
+
+    def _clear_pending_telegram_topic_task(
+        self,
+        session_id: str,
+        completed_task: asyncio.Task[Any],
+    ) -> None:
+        """Drop the in-flight mapping only if it still points at this task."""
+        current_task = self._pending_telegram_topic_tasks_by_session.get(session_id)
+        if current_task is completed_task:
+            self._pending_telegram_topic_tasks_by_session.pop(session_id, None)
 
     def set_topic_creator(self, creator: Callable[..., Awaitable[Optional[int]]]):
         """Set the callback used to create Telegram forum topics.

@@ -482,6 +482,63 @@ class TestSessionLifecycle:
             release.set()
             await asyncio.gather(*list(session_manager._pending_telegram_topic_tasks))
 
+    @pytest.mark.asyncio
+    async def test_schedule_telegram_topic_ensure_keeps_replacement_task_mapping(self, session_manager):
+        """A finishing older task must not clear a newer task's in-flight mapping."""
+        session = Session(
+            id="telegramreplace",
+            name="codex-telegramreplace",
+            working_dir="/tmp/test",
+            tmux_session="codex-telegramreplace",
+            provider="codex",
+            log_file="/tmp/telegramreplace.log",
+            status=SessionStatus.IDLE,
+            telegram_chat_id=123456,
+            telegram_thread_id=None,
+        )
+
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_started = asyncio.Event()
+        second_release = asyncio.Event()
+        calls = 0
+
+        async def fake_ensure(target_session, explicit_chat_id=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await first_release.wait()
+                return
+            second_started.set()
+            await second_release.wait()
+
+        with patch.object(session_manager, "_ensure_telegram_topic", side_effect=fake_ensure):
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            first_task = session_manager._pending_telegram_topic_tasks_by_session[session.id]
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+
+            first_release.set()
+            await asyncio.wait_for(first_task, timeout=1)
+
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            second_task = session_manager._pending_telegram_topic_tasks_by_session[session.id]
+            await asyncio.wait_for(second_started.wait(), timeout=1)
+
+            session_manager._clear_pending_telegram_topic_task(session.id, first_task)
+
+            assert session_manager._pending_telegram_topic_tasks_by_session[session.id] is second_task
+
+            session_manager._schedule_telegram_topic_ensure(session, session.telegram_chat_id)
+            await asyncio.sleep(0)
+
+            assert calls == 2
+            assert session_manager._pending_telegram_topic_tasks_by_session[session.id] is second_task
+
+            second_release.set()
+            await asyncio.wait_for(second_task, timeout=1)
+            assert session.id not in session_manager._pending_telegram_topic_tasks_by_session
+
     def test_get_session_resume_id_recovers_codex_fork_event(self, session_manager):
         """Codex-fork restore id can be recovered from persisted lifecycle events."""
         session = Session(
