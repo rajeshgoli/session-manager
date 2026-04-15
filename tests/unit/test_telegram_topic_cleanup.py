@@ -242,6 +242,23 @@ async def test_cleanup_deletes_duplicate_topic_for_live_session():
 
 
 @pytest.mark.asyncio
+async def test_cleanup_deletes_retired_topic_for_live_session_even_while_tmux_survives():
+    session = _make_session("live1", thread_id=None, tmux_session="claude-live1")
+    retired_record = _make_record("live1", thread_id=20001, tmux_session="claude-live1")
+    app = _make_app(
+        {"live1": session},
+        live_tmux_sessions={"claude-live1"},
+        records=[retired_record],
+    )
+
+    result = await app._cleanup_stale_telegram_topics_once()
+
+    assert result == {"deleted": 1, "skipped": 0}
+    assert retired_record.deleted_at is not None
+    app.telegram_bot.delete_forum_topic.assert_awaited_once_with(-1003506774897, 20001)
+
+
+@pytest.mark.asyncio
 async def test_cleanup_deletes_duplicate_topic_for_live_codex_app_session():
     session = _make_session("app1", provider="codex-app", thread_id=20002, tmux_session="")
     old_record = _make_record("app1", provider="codex-app", thread_id=20001, tmux_session="")
