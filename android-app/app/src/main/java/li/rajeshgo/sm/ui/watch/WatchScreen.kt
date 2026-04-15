@@ -27,8 +27,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Campaign
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.SupportAgent
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.UnfoldLess
 import androidx.compose.material.icons.rounded.UnfoldMore
@@ -37,6 +39,8 @@ import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -90,6 +94,7 @@ import li.rajeshgo.sm.util.launchTermuxAttach
 import li.rajeshgo.sm.util.termuxAttachCommand
 
 private const val WATCH_AUTO_REFRESH_MS = 5000L
+private const val WATCH_TOAST_MS = 3500L
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -136,6 +141,14 @@ fun WatchScreen(
         while (coroutineContext.isActive) {
             delay(WATCH_AUTO_REFRESH_MS)
             viewModel.refresh()
+        }
+    }
+
+    LaunchedEffect(toast) {
+        val currentToast = toast ?: return@LaunchedEffect
+        delay(WATCH_TOAST_MS)
+        if (toast == currentToast) {
+            toast = null
         }
     }
 
@@ -371,6 +384,8 @@ private fun HeaderBar(
     onEnsureMaintainer: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
+
     Surface(
         shape = RoundedCornerShape(18.dp),
         color = Panel,
@@ -401,31 +416,64 @@ private fun HeaderBar(
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
-                AssistChip(
-                    onClick = onEnsureMaintainer,
-                    enabled = !ensuringMaintainer,
-                    label = {
-                        Text(
-                            text = if (ensuringMaintainer) "Starting..." else "Wake maintainer",
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                Box {
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(
+                            Icons.Rounded.MoreVert,
+                            contentDescription = "Watch actions",
+                            tint = if (refreshing || requestingStatus || ensuringMaintainer) Cyan else TextSecondary,
                         )
-                    },
-                    colors = AssistChipDefaults.assistChipColors(
-                        containerColor = if (ensuringMaintainer) Cyan.copy(alpha = 0.18f) else PanelMuted,
-                        labelColor = if (ensuringMaintainer) Color.White else TextSecondary,
-                    ),
-                )
-                Spacer(Modifier.width(6.dp))
-                IconButton(onClick = onRequestStatus) {
-                    Icon(
-                        Icons.Rounded.Campaign,
-                        contentDescription = "Request status",
-                        tint = if (requestingStatus) Cyan else TextSecondary,
-                    )
-                }
-                IconButton(onClick = onRefresh) {
-                    Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = if (refreshing) Cyan else TextSecondary)
+                    }
+                    DropdownMenu(
+                        expanded = menuExpanded,
+                        onDismissRequest = { menuExpanded = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(if (ensuringMaintainer) "Wake maintainer (starting...)" else "Wake maintainer") },
+                            onClick = {
+                                menuExpanded = false
+                                onEnsureMaintainer()
+                            },
+                            enabled = !ensuringMaintainer,
+                            leadingIcon = {
+                                Icon(
+                                    Icons.Rounded.SupportAgent,
+                                    contentDescription = null,
+                                    tint = if (ensuringMaintainer) Cyan else TextSecondary,
+                                )
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (requestingStatus) "Request status (sending...)" else "Request status") },
+                            onClick = {
+                                menuExpanded = false
+                                onRequestStatus()
+                            },
+                            enabled = !requestingStatus,
+                            leadingIcon = {
+                                Icon(
+                                    Icons.Rounded.Campaign,
+                                    contentDescription = null,
+                                    tint = if (requestingStatus) Cyan else TextSecondary,
+                                )
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (refreshing) "Refresh (running...)" else "Refresh") },
+                            onClick = {
+                                menuExpanded = false
+                                onRefresh()
+                            },
+                            enabled = !refreshing,
+                            leadingIcon = {
+                                Icon(
+                                    Icons.Rounded.Refresh,
+                                    contentDescription = null,
+                                    tint = if (refreshing) Cyan else TextSecondary,
+                                )
+                            },
+                        )
+                    }
                 }
                 SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
             }
