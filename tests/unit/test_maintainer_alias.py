@@ -132,7 +132,7 @@ def test_cmd_maintainer_clear(capsys):
     assert "cleared" in capsys.readouterr().out
 
 
-def test_ensure_maintainer_session_prefers_codex_and_registers_alias(tmp_path):
+def test_ensure_maintainer_session_prefers_codex_fork_and_registers_alias(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     manager = _manager(tmp_path)
@@ -158,7 +158,7 @@ def test_ensure_maintainer_session_prefers_codex_and_registers_alias(tmp_path):
 
     assert created is True
     assert session.id == "maint001"
-    assert session.provider == "codex"
+    assert session.provider == "codex-fork"
     assert session.role == "maintainer"
     assert session.auto_bootstrapped_role == "maintainer"
     assert manager.lookup_agent_registration("maintainer").session_id == session.id
@@ -172,10 +172,11 @@ def test_maintainer_legacy_fallback_defaults_task_complete_ttl(tmp_path):
     spec = manager.get_service_role_bootstrap_spec("maintainer")
 
     assert spec is not None
+    assert spec["preferred_providers"] == ["codex-fork", "codex", "claude"]
     assert spec["task_complete_ttl_seconds"] == 600
 
 
-def test_ensure_maintainer_session_falls_back_to_claude(tmp_path):
+def test_ensure_maintainer_session_falls_back_to_codex_when_fork_unavailable(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     manager = _manager(tmp_path)
@@ -193,7 +194,35 @@ def test_ensure_maintainer_session_falls_back_to_claude(tmp_path):
         manager.sessions[session.id] = session
         return session
 
-    manager._provider_entrypoint_available = Mock(side_effect=lambda provider: provider != "codex")
+    manager._provider_entrypoint_available = Mock(side_effect=lambda provider: provider != "codex-fork")
+    manager._create_session_common = AsyncMock(side_effect=_fake_create_session_common)
+
+    session, created = asyncio.run(manager.ensure_maintainer_session())
+
+    assert created is True
+    assert session.provider == "codex"
+    manager._create_session_common.assert_awaited_once()
+
+
+def test_ensure_maintainer_session_falls_back_to_claude_when_codex_and_fork_unavailable(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    manager = _manager(tmp_path)
+    manager.maintainer_working_dir = str(repo_dir)
+
+    async def _fake_create_session_common(**kwargs):
+        session = Session(
+            id="maint005",
+            working_dir=kwargs["working_dir"],
+            provider=kwargs["provider"],
+            friendly_name=kwargs["friendly_name"],
+            log_file=str(tmp_path / "maint005.log"),
+            status=SessionStatus.RUNNING,
+        )
+        manager.sessions[session.id] = session
+        return session
+
+    manager._provider_entrypoint_available = Mock(side_effect=lambda provider: provider == "claude")
     manager._create_session_common = AsyncMock(side_effect=_fake_create_session_common)
 
     session, created = asyncio.run(manager.ensure_maintainer_session())
@@ -232,7 +261,7 @@ def test_post_ensure_maintainer_bootstraps_session(tmp_path):
     assert payload["created"] is True
     assert payload["session"]["id"] == "maint003"
     assert payload["session"]["aliases"] == ["maintainer"]
-    assert payload["session"]["provider"] == "codex"
+    assert payload["session"]["provider"] == "codex-fork"
 
 
 def test_maintainer_fallback_uses_bootstrap_prompt_file(tmp_path):
@@ -393,8 +422,8 @@ def test_cmd_send_bootstraps_maintainer_when_missing(capsys):
             "session": {
                 "id": "maint004",
                 "friendly_name": "sm-maintainer",
-                "name": "codex-maint004",
-                "provider": "codex",
+                "name": "codex-fork-maint004",
+                "provider": "codex-fork",
             },
         },
     }
@@ -407,7 +436,7 @@ def test_cmd_send_bootstraps_maintainer_when_missing(capsys):
     client.send_input.assert_called_once()
     assert client.send_input.call_args[0][0] == "maint004"
     output = capsys.readouterr().out
-    assert "Role bootstrapped: maintainer -> sm-maintainer (maint004) [codex]" in output
+    assert "Role bootstrapped: maintainer -> sm-maintainer (maint004) [codex-fork]" in output
     assert "Input sent to sm-maintainer (maint004)" in output
 
 

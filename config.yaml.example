@@ -224,6 +224,7 @@ service_roles:
     working_dir: "/path/to/session-manager"
     friendly_name: "maintainer"
     preferred_providers:
+      - "codex-fork"
       - "codex"
       - "claude"
     bootstrap_prompt_file: "docs/product/maintainer_bootstrap.md"
