@@ -1086,6 +1086,24 @@ class SessionManager:
         )
         return self.codex_fork_command, args, "codex-fork", None
 
+    def get_provider_create_rejection(
+        self,
+        provider: str,
+        *,
+        working_dir: str,
+    ) -> Optional[str]:
+        """Return a user-facing rejection reason when a fresh provider create cannot proceed."""
+        if provider != "codex-fork":
+            return None
+
+        _, fork_error = self._resolve_cli_command(
+            self.codex_fork_command,
+            working_dir=working_dir,
+        )
+        if fork_error:
+            return f"Configured codex-fork runtime unavailable: {fork_error}"
+        return None
+
     @staticmethod
     def _codex_fork_session_id_from_artifact_name(name: str) -> Optional[str]:
         """Extract the owning session id from one codex-fork runtime artifact filename."""
@@ -1974,6 +1992,11 @@ class SessionManager:
         Returns:
             Created Session or None on failure
         """
+        provider_rejection = self.get_provider_create_rejection(provider, working_dir=working_dir)
+        if provider_rejection:
+            logger.error("Rejecting %s session create in %s: %s", provider, working_dir, provider_rejection)
+            return None
+
         # Create session object with common fields
         session = Session(
             working_dir=working_dir,

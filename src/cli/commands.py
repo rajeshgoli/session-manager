@@ -1762,6 +1762,9 @@ def cmd_spawn(
     if result.get("error"):
         print(f"Error: {result['error']}", file=sys.stderr)
         return 1
+    if result.get("detail"):
+        print(f"Error: {result['detail']}", file=sys.stderr)
+        return 1
 
     # Success
     child_id = result["session_id"]
@@ -2187,15 +2190,21 @@ def cmd_new(
 
     # Create session via API
     print(f"Creating session in {working_dir}...")
-    session = client.create_session(
+    result = client.create_session_result(
         working_dir,
         provider=provider,
         parent_session_id=parent_session_id,
     )
 
-    if session is None:
+    if result.get("unavailable"):
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to create session"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    session = result.get("data") or {}
 
     session_id = session.get("id")
     provider = session.get("provider", provider)
@@ -2267,14 +2276,20 @@ def cmd_codex_2(
         return 1
 
     print(f"Creating codex-fork session in {working_dir}...")
-    session = client.create_session(
+    result = client.create_session_result(
         working_dir,
         provider="codex-fork",
         parent_session_id=parent_session_id,
     )
-    if session is None:
+    if result.get("unavailable"):
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to create codex-fork session"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    session = result.get("data") or {}
 
     session_id = session.get("id")
     if not session_id:

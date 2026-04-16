@@ -2972,6 +2972,12 @@ def create_app(
         creation_rejection = _codex_app_create_rejection(provider)
         if creation_rejection:
             raise HTTPException(status_code=400, detail=creation_rejection)
+        provider_rejection = app.state.session_manager.get_provider_create_rejection(
+            provider,
+            working_dir=request.working_dir,
+        )
+        if provider_rejection:
+            raise HTTPException(status_code=503, detail=provider_rejection)
         session = await app.state.session_manager.create_session(
             working_dir=request.working_dir,
             name=request.name,
@@ -3011,6 +3017,12 @@ def create_app(
         creation_rejection = _codex_app_create_rejection(provider)
         if creation_rejection:
             raise HTTPException(status_code=400, detail=creation_rejection)
+        provider_rejection = app.state.session_manager.get_provider_create_rejection(
+            provider,
+            working_dir=working_dir,
+        )
+        if provider_rejection:
+            raise HTTPException(status_code=503, detail=provider_rejection)
         session = await app.state.session_manager.create_session(
             working_dir=working_dir,
             telegram_chat_id=None,  # No Telegram association
@@ -4847,13 +4859,20 @@ Provide ONLY the summary, no preamble or questions."""
         creation_rejection = _codex_app_create_rejection(selected_provider)
         if creation_rejection:
             raise HTTPException(status_code=400, detail=creation_rejection)
+        selected_working_dir = request.working_dir or parent_session.working_dir
+        provider_rejection = app.state.session_manager.get_provider_create_rejection(
+            selected_provider,
+            working_dir=selected_working_dir,
+        )
+        if provider_rejection:
+            raise HTTPException(status_code=503, detail=provider_rejection)
         child_session = await app.state.session_manager.spawn_child_session(
             parent_session_id=request.parent_session_id,
             prompt=request.prompt,
             name=request.name,
             wait=request.wait,
             model=request.model,
-            working_dir=request.working_dir or parent_session.working_dir,
+            working_dir=selected_working_dir,
             provider=provider,
             defer_telegram_topic=True,
         )
