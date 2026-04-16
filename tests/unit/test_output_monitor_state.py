@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -46,6 +47,20 @@ async def test_permission_pattern_takes_precedence_over_completion_when_batched(
     )
 
     assert monitor.get_session_state(session.id).last_pattern == "permission"
+
+
+@pytest.mark.asyncio
+async def test_refresh_claude_native_title_is_rate_limited():
+    monitor = OutputMonitor(config={"timeouts": {"output_monitor": {"native_title_refresh_interval_seconds": 60}}})
+    session = _make_session("title123")
+    sync = Mock(return_value="test_speed_fix")
+    session_manager = SimpleNamespace(sync_claude_native_title=sync)
+    monitor.set_session_manager(session_manager)
+
+    await monitor._refresh_claude_native_title_if_due(session)
+    await monitor._refresh_claude_native_title_if_due(session)
+
+    sync.assert_called_once_with(session, True)
 
 
 def test_output_bytes_window_tracks_last_10_seconds():

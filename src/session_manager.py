@@ -3091,6 +3091,10 @@ class SessionManager:
             return session.native_title
 
         if session.native_title_source_mtime_ns == current_mtime_ns:
+            if live_title and live_title != session.native_title:
+                session.native_title = live_title
+                session.native_title_updated_at_ns = time.time_ns()
+                state_changed = True
             if state_changed and persist:
                 self._save_state()
             return session.native_title
@@ -3107,11 +3111,15 @@ class SessionManager:
                 self._save_state()
             return session.native_title
 
-        title_changed = native_title != session.native_title
-        session.native_title = native_title
+        effective_native_title = live_title or native_title
+        title_changed = effective_native_title != session.native_title
+        session.native_title = effective_native_title
         session.native_title_source_mtime_ns = synced_mtime_ns
         if title_changed:
-            session.native_title_updated_at_ns = synced_mtime_ns
+            if live_title and live_title != native_title:
+                session.native_title_updated_at_ns = time.time_ns()
+            else:
+                session.native_title_updated_at_ns = synced_mtime_ns
         if (state_changed or title_changed) and persist:
             self._save_state()
         return session.native_title

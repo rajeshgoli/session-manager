@@ -105,6 +105,7 @@ class OutputMonitor:
         self._monitor_states: dict[str, MonitorState] = {}  # Activity projection state (#288)
         self._no_output_cycles: dict[str, int] = {}  # Consecutive polls without output (#288)
         self._output_history: dict[str, list[tuple[datetime, int]]] = {}  # Output bytes timestamps (#288)
+        self._last_native_title_refresh: dict[str, datetime] = {}  # Background Claude title syncs
 
         # Load timeout configuration with fallbacks
         timeouts = self.config.get("timeouts", {})
@@ -112,6 +113,7 @@ class OutputMonitor:
         self._idle_cooldown = monitor_timeouts.get("idle_cooldown_seconds", 300)
         self._permission_debounce = monitor_timeouts.get("permission_debounce_seconds", 30)
         self._cleanup_notify_timeout = monitor_timeouts.get("cleanup_notify_timeout_seconds", 2)
+        self._native_title_refresh_interval = monitor_timeouts.get("native_title_refresh_interval_seconds", 5)
 
     def set_event_callback(self, callback: Callable[[NotificationEvent], Awaitable[None]]):
         """Set the callback for notification events."""
@@ -187,12 +189,28 @@ class OutputMonitor:
         self._monitor_states.pop(session_id, None)
         self._no_output_cycles.pop(session_id, None)
         self._output_history.pop(session_id, None)
+        self._last_native_title_refresh.pop(session_id, None)
 
     async def stop_all(self):
         """Stop all monitoring tasks."""
         self._running = False
         for session_id in list(self._tasks.keys()):
             await self.stop_monitoring(session_id)
+
+    async def _refresh_claude_native_title_if_due(self, session: Session):
+        """Refresh cached Claude native titles without adding live work to read APIs."""
+        if getattr(session, "provider", "claude") != "claude" or not self._session_manager:
+            return
+
+        now = datetime.now()
+        last_refresh = self._last_native_title_refresh.get(session.id)
+        if last_refresh and (now - last_refresh).total_seconds() < self._native_title_refresh_interval:
+            return
+        self._last_native_title_refresh[session.id] = now
+
+        sync_title = getattr(self._session_manager, "sync_claude_native_title", None)
+        if callable(sync_title):
+            await asyncio.to_thread(sync_title, session, True)
 
     async def _monitor_loop(self, session: Session):
         """Main monitoring loop for a session."""
@@ -260,6 +278,8 @@ class OutputMonitor:
                         last_time, last_succeeded = recovery_state
                         if not last_succeeded and datetime.now() - last_time > CRASH_DEBOUNCE_FAILURE:
                             await self._flush_pending_crash_recovery(session)
+
+                await self._refresh_claude_native_title_if_due(session)
 
             except asyncio.CancelledError:
                 break

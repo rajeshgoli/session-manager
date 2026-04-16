@@ -340,6 +340,25 @@ def test_transcript_mtime_churn_does_not_override_later_sm_name(tmp_path: Path) 
     assert manager.get_effective_session_name(session.id) == "sm-renamed-later"
 
 
+def test_sync_claude_native_title_uses_live_title_when_transcript_title_is_missing(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.get_pane_title.return_value = "✳ test_speed_fix"
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "still working"}]}},
+    )
+    session = _claude_session(tmp_path, transcript)
+    session.native_title_source_mtime_ns = transcript.stat().st_mtime_ns
+    manager.sessions[session.id] = session
+
+    assert manager.sync_claude_native_title(session.id) == "test_speed_fix"
+    assert session.native_title == "test_speed_fix"
+    assert isinstance(session.native_title_updated_at_ns, int)
+
+
 def test_claude_hook_resyncs_tmux_and_telegram_when_native_title_changes(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manager.tmux = MagicMock()
