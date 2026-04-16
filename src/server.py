@@ -5328,7 +5328,7 @@ Provide ONLY the summary, no preamble or questions."""
             friendly = _effective_session_name(session)
             queue_mgr.queue_message(
                 target_session_id=em_id,
-                text=f"[sm task-complete] agent {session_id}({friendly}) completed its task. Clear context with: sm clear {session_id}",
+                text=f"[sm task-complete] agent {session_id}({friendly}) completed its task.",
                 delivery_mode="important",
             )
             em_notified = True
