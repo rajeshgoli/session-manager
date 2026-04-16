@@ -146,7 +146,16 @@ def test_list_sessions_include_stopped_uses_query_flag():
     with patch.object(client, "_request", return_value=(payload, True, False)) as req:
         result = client.list_sessions(include_stopped=True)
     assert result == []
-    req.assert_called_once_with("GET", "/sessions?include_stopped=true")
+    req.assert_called_once_with("GET", "/sessions?include_stopped=true", timeout=None)
+
+
+def test_list_sessions_passes_explicit_timeout():
+    client = _make_client()
+    payload = {"sessions": []}
+    with patch.object(client, "_request", return_value=(payload, True, False)) as req:
+        result = client.list_sessions(include_stopped=True, timeout=7)
+    assert result == []
+    req.assert_called_once_with("GET", "/sessions?include_stopped=true", timeout=7)
 
 
 def test_restore_session_uses_explicit_empty_json_body():
