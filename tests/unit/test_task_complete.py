@@ -167,8 +167,10 @@ class TestTaskCompleteNotifiesEmViaParentWake:
 
         # EM should have received a queued message
         msgs = mq.get_pending_messages("em000001")
-        assert any("[sm task-complete]" in m.text for m in msgs)
-        assert any("abc12345" in m.text for m in msgs)
+        assert any(
+            m.text == "[sm task-complete] agent abc12345(worker-1) completed its task."
+            for m in msgs
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +215,10 @@ class TestTaskCompleteFallsBackToSessionParent:
         assert data["em_notified"] is True
 
         msgs = queue_mgr.get_pending_messages("em000001")
-        assert any("[sm task-complete]" in m.text for m in msgs)
-        assert any("child001" in m.text for m in msgs)
+        assert any(
+            m.text == "[sm task-complete] agent child001(child-worker) completed its task."
+            for m in msgs
+        )
 
 
 # ---------------------------------------------------------------------------
