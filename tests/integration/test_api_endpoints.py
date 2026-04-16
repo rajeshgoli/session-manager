@@ -24,6 +24,7 @@ def mock_session_manager():
     mock.validate_friendly_name_update = MagicMock(return_value=None)
     mock.get_attach_descriptor = MagicMock(return_value=None)
     mock.get_session_aliases = MagicMock(return_value=[])
+    mock.get_provider_create_rejection = MagicMock(return_value=None)
     mock._save_state = MagicMock()
     return mock
 
@@ -880,6 +881,21 @@ class TestEmailBridgeEndpoints:
         )
         assert response.status_code == 500
 
+    def test_create_session_rejects_missing_codex_fork_runtime(self, test_client, mock_session_manager):
+        """POST /sessions returns 503 with detail when codex-fork is unavailable."""
+        mock_session_manager.get_provider_create_rejection.return_value = (
+            "Configured codex-fork runtime unavailable: Launch command does not exist: /missing/codex"
+        )
+
+        response = test_client.post(
+            "/sessions",
+            json={"working_dir": "/tmp/test", "provider": "codex-fork"},
+        )
+
+        assert response.status_code == 503
+        assert "Configured codex-fork runtime unavailable" in response.json()["detail"]
+        mock_session_manager.create_session.assert_not_called()
+
     def test_kill_session(self, test_client, mock_session_manager, sample_session, mock_output_monitor):
         """DELETE /sessions/{id} kills session."""
         mock_session_manager.get_session.return_value = sample_session
@@ -1193,6 +1209,31 @@ class TestSpawnChildSession:
         data = response.json()
         assert data["session_id"] == "child456"
         assert data["parent_session_id"] == "test123"
+
+    def test_spawn_child_session_rejects_missing_codex_fork_runtime(
+        self,
+        test_client,
+        mock_session_manager,
+        sample_session,
+    ):
+        """POST /sessions/spawn returns 503 with detail when codex-fork is unavailable."""
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.get_provider_create_rejection.return_value = (
+            "Configured codex-fork runtime unavailable: Launch command does not exist: /missing/codex"
+        )
+
+        response = test_client.post(
+            "/sessions/spawn",
+            json={
+                "parent_session_id": "test123",
+                "prompt": "Test task",
+                "provider": "codex-fork",
+            },
+        )
+
+        assert response.status_code == 503
+        assert "Configured codex-fork runtime unavailable" in response.json()["detail"]
+        mock_session_manager.spawn_child_session.assert_not_called()
 
 
 class TestUpdateSession:

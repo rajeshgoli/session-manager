@@ -91,6 +91,18 @@ class TestCmdSpawnClientWiring:
         client.get_session.assert_not_called()
         client.register_remind.assert_not_called()
 
+    def test_spawn_failure_surfaces_detail(self, capsys):
+        client = _make_client(
+            spawn_result={
+                "detail": "Configured codex-fork runtime unavailable: Launch command does not exist: /missing/codex"
+            }
+        )
+
+        rc = cmd_spawn(client, "eng111bb", "codex", "Implement feature X")
+
+        assert rc == 1
+        assert "Configured codex-fork runtime unavailable" in capsys.readouterr().err
+
     def test_spawn_unavailable_skips_followup_work(self):
         client = _make_client(spawn_unavailable=True)
 
@@ -201,6 +213,7 @@ class TestSpawnEndpointMonitoring:
         mock_sm = MagicMock()
         mock_sm._save_state = MagicMock()
         mock_sm.message_queue_manager = MagicMock()
+        mock_sm.get_provider_create_rejection.return_value = None
         mock_output_monitor = MagicMock()
         mock_output_monitor.start_monitoring = AsyncMock()
         app.state.session_manager = mock_sm

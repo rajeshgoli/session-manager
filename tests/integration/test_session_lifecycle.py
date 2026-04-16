@@ -113,15 +113,13 @@ class TestSessionLifecycle:
         assert session.spawned_at is not None
 
     @pytest.mark.asyncio
-    async def test_create_session_flow_codex_fork_falls_back_to_codex_when_fork_missing(
+    async def test_create_session_flow_codex_fork_rejects_when_fork_missing(
         self,
         session_manager,
         mock_tmux,
     ):
-        """codex-fork create falls back to codex when the fork binary is unavailable."""
+        """Fresh codex-fork create fails before tmux/session identity allocation when the fork binary is unavailable."""
         session_manager.codex_fork_command = "/missing/codex-fork"
-        session_manager.codex_cli_command = "codex"
-        session_manager.codex_cli_args = ["--dangerously-bypass-approvals-and-sandbox"]
 
         with patch.object(session_manager, "_get_git_remote_url_async", new_callable=AsyncMock, return_value=None):
             session = await session_manager.create_session(
@@ -129,12 +127,8 @@ class TestSessionLifecycle:
                 provider="codex-fork",
             )
 
-        assert session is not None
-        assert session.provider == "codex"
-        call_kwargs = mock_tmux.create_session_with_command.call_args[1]
-        assert call_kwargs["command"] == "codex"
-        assert call_kwargs["args"] == ["--dangerously-bypass-approvals-and-sandbox"]
-        assert session.id not in session_manager.codex_fork_runtime_owner
+        assert session is None
+        mock_tmux.create_session_with_command.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_kill_session_flow(self, session_manager, mock_tmux, temp_state_file):
