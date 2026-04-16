@@ -209,6 +209,25 @@ class TestSessionEndpoints:
         assert data["agent_status_at"] == "2024-01-15T11:07:00"
         assert data["agent_task_completed_at"] == "2024-01-15T11:10:00"
 
+    def test_get_session_uses_cached_display_name_only(self, test_client, mock_session_manager, sample_session):
+        """GET /sessions/{id} must not trigger live native-title sync on read."""
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.get_activity_state.return_value = "thinking"
+        sample_session.provider = "claude"
+        sample_session.native_title = "Cached Native Title"
+        sample_session.friendly_name = "Cached Friendly Name"
+        sample_session.friendly_name_is_explicit = False
+        sample_session.friendly_name_updated_at_ns = 1
+        sample_session.native_title_updated_at_ns = 2
+        mock_session_manager.get_effective_session_name.side_effect = AssertionError(
+            "GET /sessions/{id} should not call live display-name resolution"
+        )
+
+        response = test_client.get("/sessions/test123")
+
+        assert response.status_code == 200
+        assert response.json()["friendly_name"] == "Cached Native Title"
+
     def test_client_request_status_broadcasts_to_live_sessions(
         self,
         test_client,
