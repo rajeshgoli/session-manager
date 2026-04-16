@@ -3221,8 +3221,7 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        await _ensure_session_display_identity_synced(session)
-        return _session_to_response(session)
+        return _session_to_response(session, sync_display_name=False)
 
     @app.get("/client/sessions/{session_id}")
     async def get_client_session(session_id: str):
@@ -5088,7 +5087,7 @@ Provide ONLY the summary, no preamble or questions."""
                 {
                     "id": s.id,
                     "name": s.name,
-                    "friendly_name": _effective_session_name(s),
+                    "friendly_name": _effective_session_name(s, sync_native_title=False),
                     "status": s.status.value,
                     "activity_state": _get_activity_state(s),
                     "completion_status": s.completion_status.value if s.completion_status else None,

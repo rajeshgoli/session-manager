@@ -413,7 +413,7 @@ def test_claude_hook_resyncs_tmux_and_telegram_when_native_title_changes(tmp_pat
     assert session.display_identity_synced_thread_id == 456
 
 
-def test_get_session_resyncs_lazy_native_title_to_telegram(tmp_path: Path) -> None:
+def test_get_session_uses_cached_identity_without_lazy_resync(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manager.tmux = MagicMock()
     manager.tmux.set_status_bar.return_value = True
@@ -439,13 +439,13 @@ def test_get_session_resyncs_lazy_native_title_to_telegram(tmp_path: Path) -> No
     response = TestClient(client).get(f"/sessions/{session.id}")
 
     assert response.status_code == 200
-    assert response.json()["friendly_name"] == "lazy-native-title"
-    manager.tmux.set_status_bar.assert_called_with(session.tmux_session, "lazy-native-title")
-    notifier.rename_session_topic.assert_awaited_once_with(session, "lazy-native-title")
-    assert session.display_identity_synced_name == "lazy-native-title"
-    assert isinstance(session.display_identity_synced_at_ns, int)
-    assert session.display_identity_synced_chat_id == 123
-    assert session.display_identity_synced_thread_id == 456
+    assert response.json()["friendly_name"] == session.name
+    manager.tmux.set_status_bar.assert_not_called()
+    notifier.rename_session_topic.assert_not_awaited()
+    assert session.display_identity_synced_name is None
+    assert session.display_identity_synced_at_ns is None
+    assert session.display_identity_synced_chat_id is None
+    assert session.display_identity_synced_thread_id is None
 
 
 def test_list_sessions_does_not_wait_for_lazy_display_sync(tmp_path: Path) -> None:
@@ -552,13 +552,13 @@ def test_get_session_does_not_mark_telegram_synced_when_bot_missing(tmp_path: Pa
     response = TestClient(client).get(f"/sessions/{session.id}")
 
     assert response.status_code == 200
-    manager.tmux.set_status_bar.assert_called_with(session.tmux_session, "lazy-native-title")
+    manager.tmux.set_status_bar.assert_not_called()
     notifier.rename_session_topic.assert_not_awaited()
     assert session.display_identity_synced_name is None
     assert session.display_identity_synced_at_ns is None
 
 
-def test_get_session_resyncs_when_telegram_thread_changes(tmp_path: Path) -> None:
+def test_get_session_does_not_resync_when_telegram_thread_changes(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manager.tmux = MagicMock()
 
@@ -588,12 +588,12 @@ def test_get_session_resyncs_when_telegram_thread_changes(tmp_path: Path) -> Non
     response = TestClient(client).get(f"/sessions/{session.id}")
 
     assert response.status_code == 200
-    notifier.rename_session_topic.assert_awaited_once_with(session, "stable-native-title")
+    notifier.rename_session_topic.assert_not_awaited()
     assert session.display_identity_synced_chat_id == 123
-    assert session.display_identity_synced_thread_id == 456
+    assert session.display_identity_synced_thread_id == 111
 
 
-def test_get_session_bounds_lazy_telegram_rename_timeout(tmp_path: Path, monkeypatch) -> None:
+def test_get_session_does_not_start_lazy_telegram_rename(tmp_path: Path, monkeypatch) -> None:
     import src.server as server_module
 
     monkeypatch.setattr(server_module, "DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS", 0.01)
@@ -624,7 +624,7 @@ def test_get_session_bounds_lazy_telegram_rename_timeout(tmp_path: Path, monkeyp
     response = TestClient(client).get(f"/sessions/{session.id}")
 
     assert response.status_code == 200
-    notifier.rename_session_topic.assert_awaited_once_with(session, "lazy-native-title")
+    notifier.rename_session_topic.assert_not_awaited()
     assert session.display_identity_synced_name is None
     assert session.display_identity_synced_at_ns is None
     assert session.display_identity_synced_chat_id is None
@@ -656,8 +656,8 @@ def test_get_session_does_not_mark_synced_when_tmux_update_fails(tmp_path: Path)
     response = TestClient(client).get(f"/sessions/{session.id}")
 
     assert response.status_code == 200
-    manager.tmux.set_status_bar.assert_called_once_with(session.tmux_session, "lazy-native-title")
-    notifier.rename_session_topic.assert_awaited_once_with(session, "lazy-native-title")
+    manager.tmux.set_status_bar.assert_not_called()
+    notifier.rename_session_topic.assert_not_awaited()
     assert session.display_identity_synced_name is None
     assert session.display_identity_synced_at_ns is None
     assert session.display_identity_synced_chat_id is None
