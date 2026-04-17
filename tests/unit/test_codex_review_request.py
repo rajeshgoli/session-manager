@@ -518,6 +518,37 @@ def test_codex_review_request_endpoints_roundtrip(mock_session_manager):
     assert cancel_response.json()["is_active"] is False
 
 
+def test_codex_review_request_endpoint_maps_operational_failures(mock_session_manager):
+    queue_mgr = MagicMock()
+    queue_mgr.register_codex_review_request = AsyncMock(side_effect=RuntimeError("gh timed out"))
+    mock_session_manager.message_queue_manager = queue_mgr
+    app = create_app(session_manager=mock_session_manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/codex-review-requests",
+        json={
+            "pr_number": 42,
+            "repo": "owner/repo",
+            "requester_session_id": "agent618",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "gh timed out"
+
+    queue_mgr.register_codex_review_request = AsyncMock(side_effect=TimeoutError("gh hung"))
+    response = client.post(
+        "/codex-review-requests",
+        json={
+            "pr_number": 42,
+            "repo": "owner/repo",
+            "requester_session_id": "agent618",
+        },
+    )
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Failed to request Codex review: gh hung"
+
+
 class TestClientCodexReviewRequest:
     """Tests for SessionManagerClient codex review request helpers."""
 

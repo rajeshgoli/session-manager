@@ -5663,6 +5663,11 @@ Provide ONLY the summary, no preamble or questions."""
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to request Codex review: {exc}",
+            ) from exc
 
         return _codex_review_request_to_response(registration)
 
