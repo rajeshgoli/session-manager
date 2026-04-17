@@ -97,6 +97,8 @@ async def test_register_codex_review_request_persists_and_lists(mq, mock_session
 
     assert reg.id in mq._codex_review_requests
     assert mq.list_codex_review_requests(notify_session_id="agent618")[0].pr_number == 42
+    assert reg.requested_at == datetime(2026, 4, 17, 0, 0, 0)
+    assert reg.next_retry_at == datetime(2026, 4, 17, 0, 10, 0)
 
     conn = sqlite3.connect(temp_db_path)
     row = conn.execute(

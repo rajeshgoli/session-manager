@@ -939,7 +939,7 @@ class MessageQueueManager:
 
         latest_comment_id = comment_result.get("comment_id") or None
         latest_comment_url = comment_result.get("comment_url")
-        latest_posted_at = self._parse_iso_datetime(comment_result.get("posted_at")) or datetime.now()
+        latest_posted_at = self._parse_iso_datetime(comment_result.get("posted_at")) or datetime.now(timezone.utc).replace(tzinfo=None)
 
         if latest_comment_id:
             try:
@@ -1134,7 +1134,7 @@ class MessageQueueManager:
                     self.cancel_codex_review_request(request_id)
                     return
 
-                now = datetime.now()
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
                 registration.last_polled_at = now
                 updates: dict[str, object] = {"last_polled_at": now}
 

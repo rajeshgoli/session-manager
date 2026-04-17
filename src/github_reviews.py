@@ -47,17 +47,21 @@ def _split_repo(repo: str) -> tuple[str, str]:
         raise RuntimeError(f"Invalid repo {repo!r}; expected owner/repo") from exc
 
 
-def _gh_api_json(repo: str, endpoint: str) -> Any:
+def _gh_api_json(repo: str, endpoint: str, *, paginate: bool = False) -> Any:
     """Call `gh api` for one repo-scoped endpoint and decode JSON."""
     owner, repo_name = _split_repo(repo)
+    command = [
+        "gh",
+        "api",
+        f"repos/{owner}/{repo_name}/{endpoint.lstrip('/')}",
+        "-H",
+        "Accept: application/vnd.github+json",
+    ]
+    if paginate:
+        command.extend(["--paginate", "--slurp"])
+
     result = subprocess.run(
-        [
-            "gh",
-            "api",
-            f"repos/{owner}/{repo_name}/{endpoint.lstrip('/')}",
-            "-H",
-            "Accept: application/vnd.github+json",
-        ],
+        command,
         capture_output=True,
         text=True,
         timeout=30,
@@ -67,7 +71,16 @@ def _gh_api_json(repo: str, endpoint: str) -> Any:
     payload = result.stdout.strip()
     if not payload:
         return None
-    return json.loads(payload)
+    decoded = json.loads(payload)
+    if paginate and isinstance(decoded, list):
+        flattened: list[Any] = []
+        for page in decoded:
+            if isinstance(page, list):
+                flattened.extend(page)
+            else:
+                flattened.append(page)
+        return flattened
+    return decoded
 
 
 def is_codex_actor(payload: Optional[dict]) -> bool:
@@ -165,19 +178,19 @@ def fetch_issue_comment_reactions(repo: str, comment_id: int) -> list[dict]:
     """Fetch explicit reactions for one issue comment."""
     if comment_id <= 0:
         return []
-    payload = _gh_api_json(repo, f"issues/comments/{comment_id}/reactions")
+    payload = _gh_api_json(repo, f"issues/comments/{comment_id}/reactions", paginate=True)
     return payload if isinstance(payload, list) else []
 
 
 def fetch_pr_issue_comments(repo: str, pr_number: int) -> list[dict]:
     """Fetch all issue comments for one PR."""
-    payload = _gh_api_json(repo, f"issues/{pr_number}/comments")
+    payload = _gh_api_json(repo, f"issues/{pr_number}/comments", paginate=True)
     return payload if isinstance(payload, list) else []
 
 
 def fetch_pr_reviews(repo: str, pr_number: int) -> list[dict]:
     """Fetch all PR reviews for one PR."""
-    payload = _gh_api_json(repo, f"pulls/{pr_number}/reviews")
+    payload = _gh_api_json(repo, f"pulls/{pr_number}/reviews", paginate=True)
     return payload if isinstance(payload, list) else []
 
 

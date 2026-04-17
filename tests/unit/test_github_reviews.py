@@ -212,6 +212,15 @@ class TestCodexHelpers:
         assert fetch_issue_comment_reactions("owner/repo", 99) == [{"id": 1}]
 
     @patch("src.github_reviews.subprocess.run")
+    def test_fetch_helpers_flatten_paginated_results(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([[{"id": 1}], [{"id": 2}]]),
+        )
+
+        assert fetch_pr_reviews("owner/repo", 42) == [{"id": 1}, {"id": 2}]
+
+    @patch("src.github_reviews.subprocess.run")
     def test_fetch_issue_comment_returns_dict(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
