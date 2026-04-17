@@ -3310,6 +3310,190 @@ def cmd_watch_job_cancel(client: SessionManagerClient, watch_id: str) -> int:
     return 0
 
 
+def cmd_request_codex_review_create(
+    client: SessionManagerClient,
+    current_session_id: Optional[str],
+    pr_number: int,
+    repo: Optional[str],
+    steer: Optional[str],
+    notify_target: Optional[str],
+    poll_interval_seconds: int,
+    retry_interval_seconds: int,
+) -> int:
+    """Create one durable Codex PR review request (#618)."""
+    effective_notify_target = notify_target or current_session_id
+    if not effective_notify_target:
+        print(
+            "Error: No notify target. Use --notify or run from within a managed session.",
+            file=sys.stderr,
+        )
+        return 2
+
+    result = client.create_codex_review_request(
+        pr_number=pr_number,
+        repo=repo,
+        steer=steer,
+        notify_target=effective_notify_target,
+        requester_session_id=current_session_id,
+        poll_interval_seconds=poll_interval_seconds,
+        retry_interval_seconds=retry_interval_seconds,
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to create Codex review request"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    payload = result.get("data") or {}
+    target_name = payload.get("notify_name") or payload.get("notify_session_id") or effective_notify_target
+    print(f"Review requested for PR #{pr_number}, will sm send you when review arrives.")
+    print(f"  Request: {payload.get('id', 'unknown')} -> {target_name}")
+    return 0
+
+
+def cmd_request_codex_review_list(
+    client: SessionManagerClient,
+    current_session_id: Optional[str],
+    notify_target: Optional[str],
+    list_all: bool,
+    include_inactive: bool,
+    json_output: bool = False,
+    repo: Optional[str] = None,
+    pr_number: Optional[int] = None,
+) -> int:
+    """List durable Codex PR review requests (#618)."""
+    import json as json_lib
+
+    effective_notify_target = notify_target
+    if not effective_notify_target and not list_all:
+        if current_session_id:
+            effective_notify_target = current_session_id
+        else:
+            print("Error: No session context. Use --notify or --all.", file=sys.stderr)
+            return 2
+
+    requests = client.list_codex_review_requests(
+        notify_target=effective_notify_target,
+        repo=repo,
+        pr_number=pr_number,
+        include_inactive=include_inactive,
+    )
+    if requests is None:
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+
+    if json_output:
+        print(json_lib.dumps(requests, indent=2))
+        return 0
+
+    if not requests:
+        print("No Codex review requests.")
+        return 0
+
+    headers = ["ID", "PR", "Notify", "State", "Attempts", "Pickup", "Next Retry"]
+    rows = []
+    for request in requests:
+        rows.append([
+            str(request.get("id", "")),
+            f"{request.get('repo', '?')}#{request.get('pr_number', '?')}",
+            str(request.get("notify_name") or request.get("notify_session_id") or ""),
+            str(request.get("state") or ("active" if request.get("is_active", True) else "inactive")),
+            str(request.get("attempt_count", 0)),
+            "yes" if request.get("pickup_detected_at") else "-",
+            str(request.get("next_retry_at") or "-"),
+        ])
+
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
+
+    print("  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers)))
+    print("  ".join("-" * widths[idx] for idx in range(len(headers))))
+    for row in rows:
+        print("  ".join(value.ljust(widths[idx]) for idx, value in enumerate(row)))
+    return 0
+
+
+def cmd_request_codex_review_status(
+    client: SessionManagerClient,
+    current_session_id: Optional[str],
+    request_id: Optional[str],
+    pr_number: Optional[int],
+    notify_target: Optional[str],
+    list_all: bool,
+    json_output: bool = False,
+) -> int:
+    """Show one durable Codex PR review request (#618)."""
+    import json as json_lib
+
+    payload = None
+    if request_id:
+        result = client.get_codex_review_request(request_id)
+        if result.get("unavailable"):
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        if not result.get("ok"):
+            detail = result.get("detail") or "Codex review request not found"
+            print(f"Error: {detail}", file=sys.stderr)
+            return 1
+        payload = result.get("data") or {}
+    else:
+        effective_notify_target = notify_target
+        if not effective_notify_target and not list_all:
+            if current_session_id:
+                effective_notify_target = current_session_id
+            else:
+                print("Error: No session context. Use --notify, --all, or a request ID.", file=sys.stderr)
+                return 2
+        requests = client.list_codex_review_requests(
+            notify_target=effective_notify_target,
+            pr_number=pr_number,
+            include_inactive=True,
+        )
+        if requests is None:
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        if not requests:
+            print("Error: No Codex review request found", file=sys.stderr)
+            return 1
+        payload = requests[-1]
+
+    if json_output:
+        print(json_lib.dumps(payload, indent=2))
+        return 0
+
+    print(f"Request: {payload.get('id', 'unknown')}")
+    print(f"PR: {payload.get('repo', '?')}#{payload.get('pr_number', '?')}")
+    print(f"Notify: {payload.get('notify_name') or payload.get('notify_session_id') or '-'}")
+    print(f"State: {payload.get('state') or '-'}")
+    print(f"Attempts: {payload.get('attempt_count', 0)}")
+    print(f"Pickup: {payload.get('pickup_detected_at') or '-'}")
+    print(f"Review landed: {payload.get('review_landed_at') or '-'}")
+    print(f"Review source: {payload.get('review_source') or '-'}")
+    print(f"Next retry: {payload.get('next_retry_at') or '-'}")
+    print(f"Last error: {payload.get('last_error') or '-'}")
+    return 0
+
+
+def cmd_request_codex_review_cancel(client: SessionManagerClient, request_id: str) -> int:
+    """Cancel one durable Codex PR review request (#618)."""
+    result = client.cancel_codex_review_request(request_id)
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to cancel Codex review request"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    payload = result.get("data") or {}
+    print(f"Cancelled Codex review request: {payload.get('id', request_id)}")
+    return 0
+
+
 def cmd_review(
     client: SessionManagerClient,
     parent_session_id: Optional[str],

@@ -101,6 +101,20 @@ class TestCliParsing:
         watch_job_cancel = watch_job_subparsers.add_parser("cancel")
         watch_job_cancel.add_argument("watch_id")
 
+        # sm request-codex-review
+        request_codex_review_parser = subparsers.add_parser("request-codex-review")
+        request_codex_review_parser.add_argument("action_or_pr")
+        request_codex_review_parser.add_argument("request_id", nargs="?")
+        request_codex_review_parser.add_argument("--repo")
+        request_codex_review_parser.add_argument("--notify")
+        request_codex_review_parser.add_argument("--steer")
+        request_codex_review_parser.add_argument("--all", action="store_true")
+        request_codex_review_parser.add_argument("--inactive", action="store_true")
+        request_codex_review_parser.add_argument("--json", action="store_true")
+        request_codex_review_parser.add_argument("--pr", dest="status_pr", type=int)
+        request_codex_review_parser.add_argument("--poll-interval", dest="poll_interval_seconds", type=int, default=30)
+        request_codex_review_parser.add_argument("--retry-interval", dest="retry_interval_seconds", type=int, default=600)
+
         # sm children
         children_parser = subparsers.add_parser("children")
         children_parser.add_argument("session_id", nargs="?")
@@ -603,6 +617,46 @@ class TestOutputCommand:
         args = parser._get_parsed_args(["output", "session123", "--lines", "100"])
 
         assert args.lines == 100
+
+
+class TestRequestCodexReviewCommand:
+    """Tests for 'sm request-codex-review' command parsing and dispatch."""
+
+    def test_request_codex_review_create_parses_pr_and_options(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(
+            [
+                "request-codex-review",
+                "618",
+                "--repo",
+                "owner/repo",
+                "--notify",
+                "maintainer",
+                "--steer",
+                "focus on races",
+            ]
+        )
+
+        assert args.command == "request-codex-review"
+        assert args.action_or_pr == "618"
+        assert args.repo == "owner/repo"
+        assert args.notify == "maintainer"
+        assert args.steer == "focus on races"
+        assert args.poll_interval_seconds == 30
+        assert args.retry_interval_seconds == 600
+
+    def test_main_request_codex_review_dispatches_create(self):
+        mock_client = MagicMock()
+
+        with patch.dict(os.environ, {"CLAUDE_SESSION_MANAGER_ID": "agent618"}, clear=True):
+            with patch.object(sys, "argv", ["sm", "request-codex-review", "618"]):
+                with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                    with patch("src.cli.main.commands.cmd_request_codex_review_create", return_value=0) as mock_cmd:
+                        with pytest.raises(SystemExit) as exc_info:
+                            main()
+
+        assert exc_info.value.code == 0
+        mock_cmd.assert_called_once()
 
 
 class TestCodexTuiCommand:

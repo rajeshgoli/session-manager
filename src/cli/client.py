@@ -1108,6 +1108,92 @@ class SessionManagerClient:
             return None
         return data
 
+    def create_codex_review_request(
+        self,
+        *,
+        pr_number: int,
+        repo: Optional[str] = None,
+        steer: Optional[str] = None,
+        notify_target: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
+        poll_interval_seconds: int = 30,
+        retry_interval_seconds: int = 600,
+    ) -> dict:
+        """Create one durable Codex PR review request."""
+        payload = {
+            "pr_number": pr_number,
+            "poll_interval_seconds": poll_interval_seconds,
+            "retry_interval_seconds": retry_interval_seconds,
+        }
+        if repo:
+            payload["repo"] = repo
+        if steer:
+            payload["steer"] = steer
+        if notify_target:
+            payload["notify_target"] = notify_target
+        if requester_session_id:
+            payload["requester_session_id"] = requester_session_id
+
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            "/codex-review-requests",
+            payload,
+            timeout=30,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def list_codex_review_requests(
+        self,
+        *,
+        notify_target: Optional[str] = None,
+        repo: Optional[str] = None,
+        pr_number: Optional[int] = None,
+        include_inactive: bool = False,
+    ) -> Optional[list]:
+        """List durable Codex PR review requests."""
+        params = []
+        if notify_target:
+            params.append(f"notify_target={urllib.parse.quote(notify_target)}")
+        if repo:
+            params.append(f"repo={urllib.parse.quote(repo)}")
+        if pr_number is not None:
+            params.append(f"pr_number={pr_number}")
+        if include_inactive:
+            params.append("include_inactive=true")
+        suffix = f"?{'&'.join(params)}" if params else ""
+        data, success, unavailable = self._request("GET", f"/codex-review-requests{suffix}")
+        if unavailable or not success or not data:
+            return None
+        return data.get("requests", [])
+
+    def get_codex_review_request(self, request_id: str) -> dict:
+        """Fetch one durable Codex PR review request by id."""
+        data, status_code, unavailable = self._request_with_status(
+            "GET",
+            f"/codex-review-requests/{urllib.parse.quote(request_id)}",
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def cancel_codex_review_request(self, request_id: str) -> dict:
+        """Cancel one durable Codex PR review request by id."""
+        data, status_code, unavailable = self._request_with_status(
+            "DELETE",
+            f"/codex-review-requests/{urllib.parse.quote(request_id)}",
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
     def get_review_results(self, session_id: str) -> Optional[dict]:
         """Get parsed review results for a session.
 

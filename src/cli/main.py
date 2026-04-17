@@ -270,6 +270,30 @@ def main():
     watch_job_cancel_parser = watch_job_subparsers.add_parser("cancel", help="Cancel a durable external job watch")
     watch_job_cancel_parser.add_argument("watch_id", help="Watch ID to cancel")
 
+    # sm request-codex-review <pr>|list|status|cancel
+    request_codex_review_parser = subparsers.add_parser(
+        "request-codex-review",
+        help="Request and durably watch a Codex PR review",
+    )
+    request_codex_review_parser.add_argument(
+        "action_or_pr",
+        help="PR number to request, or one of: list, status, cancel",
+    )
+    request_codex_review_parser.add_argument(
+        "request_id",
+        nargs="?",
+        help="Request ID for status/cancel",
+    )
+    request_codex_review_parser.add_argument("--repo", help="Repository in owner/repo format")
+    request_codex_review_parser.add_argument("--notify", help="Session ID or registry role to notify")
+    request_codex_review_parser.add_argument("--steer", help="Optional Codex review steer text")
+    request_codex_review_parser.add_argument("--all", action="store_true", help="List/status across all notify targets")
+    request_codex_review_parser.add_argument("--inactive", action="store_true", help="Include inactive requests when listing")
+    request_codex_review_parser.add_argument("--json", action="store_true", help="Output JSON for list/status")
+    request_codex_review_parser.add_argument("--pr", dest="status_pr", type=int, help="Filter status/list by PR number")
+    request_codex_review_parser.add_argument("--poll-interval", dest="poll_interval_seconds", type=int, default=30, help="Polling cadence in seconds (default: 30)")
+    request_codex_review_parser.add_argument("--retry-interval", dest="retry_interval_seconds", type=int, default=600, help="Re-ping cadence in seconds (default: 600)")
+
     # sm spawn "<prompt>"
     spawn_parser = subparsers.add_parser("spawn", help="Spawn a child agent session")
     spawn_parser.add_argument(
@@ -699,7 +723,7 @@ def main():
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "restore", "unkill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server",
-        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", None
+        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
     ]
     # Commands that require session_id: self-directed managed-session actions
     requires_session_id = ["spawn", "adopt", "maintainer", "register", "unregister"]
@@ -848,6 +872,49 @@ def main():
             sys.exit(commands.cmd_watch_job_cancel(client, args.watch_id))
         print("Error: watch-job subcommand required (add, list, cancel)", file=sys.stderr)
         sys.exit(2)
+    elif args.command == "request-codex-review":
+        action = args.action_or_pr
+        if action == "list":
+            sys.exit(commands.cmd_request_codex_review_list(
+                client,
+                current_session_id=session_id,
+                notify_target=args.notify,
+                list_all=args.all,
+                include_inactive=args.inactive,
+                json_output=args.json,
+                repo=args.repo,
+                pr_number=args.status_pr,
+            ))
+        if action == "status":
+            sys.exit(commands.cmd_request_codex_review_status(
+                client,
+                current_session_id=session_id,
+                request_id=args.request_id,
+                pr_number=args.status_pr,
+                notify_target=args.notify,
+                list_all=args.all,
+                json_output=args.json,
+            ))
+        if action == "cancel":
+            if not args.request_id:
+                print("Error: request ID required for cancel", file=sys.stderr)
+                sys.exit(1)
+            sys.exit(commands.cmd_request_codex_review_cancel(client, args.request_id))
+        try:
+            pr_number = int(action)
+        except ValueError:
+            print("Error: first argument must be a PR number, list, status, or cancel", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(commands.cmd_request_codex_review_create(
+            client,
+            current_session_id=session_id,
+            pr_number=pr_number,
+            repo=args.repo,
+            steer=args.steer,
+            notify_target=args.notify,
+            poll_interval_seconds=args.poll_interval_seconds,
+            retry_interval_seconds=args.retry_interval_seconds,
+        ))
     elif args.command == "spawn":
         provider = "codex-fork" if args.provider == "codex" else args.provider
         sys.exit(commands.cmd_spawn(
