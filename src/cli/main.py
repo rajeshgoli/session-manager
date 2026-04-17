@@ -891,6 +891,7 @@ def main():
                 current_session_id=session_id,
                 request_id=args.request_id,
                 pr_number=args.status_pr,
+                repo=args.repo,
                 notify_target=args.notify,
                 list_all=args.all,
                 json_output=args.json,

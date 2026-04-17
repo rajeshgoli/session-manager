@@ -39,6 +39,11 @@ def _coerce_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _github_since_value(dt: datetime) -> str:
+    """Render one UTC timestamp for GitHub REST `since=` parameters."""
+    return _coerce_utc(dt).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _split_repo(repo: str) -> tuple[str, str]:
     """Split owner/repo into its path components."""
     try:
@@ -182,9 +187,17 @@ def fetch_issue_comment_reactions(repo: str, comment_id: int) -> list[dict]:
     return payload if isinstance(payload, list) else []
 
 
-def fetch_pr_issue_comments(repo: str, pr_number: int) -> list[dict]:
-    """Fetch all issue comments for one PR."""
-    payload = _gh_api_json(repo, f"issues/{pr_number}/comments", paginate=True)
+def fetch_pr_issue_comments(
+    repo: str,
+    pr_number: int,
+    *,
+    since: Optional[datetime] = None,
+) -> list[dict]:
+    """Fetch issue comments for one PR, optionally filtered by update time."""
+    endpoint = f"issues/{pr_number}/comments"
+    if since is not None:
+        endpoint = f"{endpoint}?since={_github_since_value(since)}"
+    payload = _gh_api_json(repo, endpoint, paginate=True)
     return payload if isinstance(payload, list) else []
 
 
@@ -211,22 +224,23 @@ def find_fresh_codex_review_or_comment(
     since_utc = _coerce_utc(since)
     candidates: list[dict[str, Any]] = []
 
-    for review in fetch_pr_reviews(repo, pr_number):
-        submitted_at = _parse_github_datetime(review.get("submitted_at"))
-        if submitted_at and submitted_at > since_utc and is_codex_actor(review):
+    latest_review = fetch_latest_codex_review(repo, pr_number)
+    if latest_review:
+        submitted_at = _parse_github_datetime(latest_review.get("submitted_at"))
+        if submitted_at and submitted_at > since_utc:
             candidates.append(
                 {
                     "source": "review",
                     "created_at": submitted_at,
-                    "id": review.get("id"),
-                    "url": review.get("html_url") or review.get("_links", {}).get("html", {}).get("href"),
-                    "state": review.get("state"),
-                    "body": review.get("body"),
-                    "actor": review.get("user", {}).get("login"),
+                    "id": latest_review.get("id"),
+                    "url": latest_review.get("html_url") or latest_review.get("pull_request_url"),
+                    "state": latest_review.get("state"),
+                    "body": latest_review.get("body"),
+                    "actor": latest_review.get("user", {}).get("login"),
                 }
             )
 
-    for comment in fetch_pr_issue_comments(repo, pr_number):
+    for comment in fetch_pr_issue_comments(repo, pr_number, since=since_utc):
         created_at = _parse_github_datetime(comment.get("created_at"))
         if created_at and created_at > since_utc and is_codex_actor(comment):
             candidates.append(
@@ -263,12 +277,11 @@ def poll_for_codex_review(
 
     while time.monotonic() < deadline:
         try:
-            for review in fetch_pr_reviews(repo, pr_number):
+            review = fetch_latest_codex_review(repo, pr_number)
+            if review:
                 user_login = review.get("user", {}).get("login", "")
                 submitted_at = _parse_github_datetime(review.get("submitted_at"))
-                if not submitted_at:
-                    continue
-                if "codex" in user_login.lower() and submitted_at > since_utc:
+                if submitted_at and "codex" in user_login.lower() and submitted_at > since_utc:
                     logger.info(
                         "Found Codex review on PR #%s: user=%s submitted_at=%s",
                         pr_number,
@@ -293,10 +306,48 @@ def poll_for_codex_review(
 def fetch_latest_codex_review(repo: str, pr_number: int) -> Optional[dict]:
     """Fetch the most recent Codex-authored PR review on one PR."""
     try:
-        reviews = fetch_pr_reviews(repo, pr_number)
-        for review in reversed(reviews):
-            if "codex" in review.get("user", {}).get("login", "").lower():
-                return review
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(pr_number),
+                "--repo",
+                repo,
+                "--json",
+                "url,latestReviews",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"gh pr view failed: {result.stderr.strip()}")
+        payload = json.loads(result.stdout or "{}")
+        pr_url = payload.get("url")
+        latest_reviews = payload.get("latestReviews") or []
+        freshest_match = None
+        freshest_submitted_at = None
+        for review in latest_reviews:
+            author = (review.get("author") or {}).get("login", "")
+            if "codex" not in author.lower():
+                continue
+            submitted_at = _parse_github_datetime(review.get("submittedAt"))
+            if submitted_at is None:
+                continue
+            if freshest_submitted_at is None or submitted_at > freshest_submitted_at:
+                freshest_submitted_at = submitted_at
+                freshest_match = {
+                    "id": review.get("id"),
+                    "user": {"login": author},
+                    "submitted_at": review.get("submittedAt"),
+                    "state": review.get("state"),
+                    "body": review.get("body"),
+                    "html_url": review.get("url") or pr_url,
+                    "pull_request_url": pr_url,
+                }
+        if freshest_match:
+            return freshest_match
     except Exception as exc:
         logger.warning("Failed to fetch Codex review for PR #%s: %s", pr_number, exc)
     return None

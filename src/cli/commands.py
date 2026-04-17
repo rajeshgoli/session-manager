@@ -3436,6 +3436,7 @@ def cmd_request_codex_review_status(
     current_session_id: Optional[str],
     request_id: Optional[str],
     pr_number: Optional[int],
+    repo: Optional[str],
     notify_target: Optional[str],
     list_all: bool,
     json_output: bool = False,
@@ -3464,6 +3465,7 @@ def cmd_request_codex_review_status(
                 return 2
         result = client.list_codex_review_requests(
             notify_target=effective_notify_target,
+            repo=repo,
             pr_number=pr_number,
             include_inactive=True,
         )
