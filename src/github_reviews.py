@@ -279,20 +279,6 @@ def detect_codex_pickup(repo: str, comment_id: int) -> bool:
     return False
 
 
-def get_codex_request_reaction_state(repo: str, comment_id: int) -> dict[str, bool]:
-    """Return pickup/clean-pass reaction state for one Codex review request comment."""
-    picked_up = False
-    clean_pass = False
-    for reaction in fetch_issue_comment_reactions(repo, comment_id):
-        if not is_codex_actor(reaction):
-            continue
-        if reaction.get("content") == "eyes":
-            picked_up = True
-        elif reaction.get("content") == "+1":
-            clean_pass = True
-    return {"picked_up": picked_up, "clean_pass": clean_pass}
-
-
 def find_fresh_codex_review_or_comment(
     repo: str,
     pr_number: int,

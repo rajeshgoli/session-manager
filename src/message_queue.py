@@ -26,9 +26,9 @@ from .models import (
     SessionStatus,
 )
 from .github_reviews import (
+    detect_codex_pickup,
     fetch_issue_comment,
     find_fresh_codex_review_or_comment,
-    get_codex_request_reaction_state,
     get_pr_repo_from_git,
     post_pr_review_comment,
     validate_open_pr,
@@ -1236,10 +1236,10 @@ class MessageQueueManager:
                 registration.last_polled_at = now
                 updates: dict[str, object] = {"last_polled_at": now}
 
-                if registration.latest_request_comment_id:
+                if registration.latest_request_comment_id and not registration.pickup_detected_at:
                     try:
-                        reaction_state = await asyncio.to_thread(
-                            get_codex_request_reaction_state,
+                        picked_up = await asyncio.to_thread(
+                            detect_codex_pickup,
                             registration.repo,
                             registration.latest_request_comment_id,
                         )
@@ -1253,51 +1253,13 @@ class MessageQueueManager:
                             exc,
                         )
                     else:
-                        if reaction_state.get("picked_up") and not registration.pickup_detected_at:
+                        if picked_up:
                             registration.pickup_detected_at = now
                             registration.pickup_source = "reaction"
                             registration.last_error = None
                             updates["pickup_detected_at"] = now
                             updates["pickup_source"] = "reaction"
                             updates["last_error"] = None
-                        if reaction_state.get("clean_pass"):
-                            clean_match = {
-                                "source": "reaction",
-                                "created_at": now.isoformat(),
-                                "id": registration.latest_request_comment_id,
-                                "url": registration.latest_request_comment_url,
-                            }
-                            registration.review_landed_at = now
-                            registration.review_source = "reaction"
-                            registration.review_comment_id = registration.latest_request_comment_id
-                            registration.review_url = registration.latest_request_comment_url
-                            registration.state = "completed"
-                            registration.is_active = False
-                            registration.last_error = None
-                            updates.update(
-                                {
-                                    "review_landed_at": registration.review_landed_at,
-                                    "review_source": registration.review_source,
-                                    "review_comment_id": registration.review_comment_id,
-                                    "review_url": registration.review_url,
-                                    "state": "completed",
-                                    "is_active": False,
-                                    "last_error": None,
-                                }
-                            )
-                            self.queue_message(
-                                target_session_id=registration.notify_session_id,
-                                text=self._render_codex_review_landed_message(registration, clean_match),
-                                delivery_mode="sequential",
-                            )
-                            self._update_codex_review_request_db(request_id, **updates)
-                            logger.info(
-                                "Codex review request %s completed via clean-pass reaction for %s PR #%s",
-                                request_id,
-                                registration.repo,
-                                registration.pr_number,
-                            )
-                            return
 
                 try:
                     review_match = await asyncio.to_thread(

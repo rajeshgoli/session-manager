@@ -207,10 +207,7 @@ async def test_codex_review_request_task_completes_and_queues_message(mq):
         return None
 
     with patch("asyncio.sleep", side_effect=immediate_sleep):
-        with patch(
-            "src.message_queue.get_codex_request_reaction_state",
-            return_value={"picked_up": False, "clean_pass": False},
-        ):
+        with patch("src.message_queue.detect_codex_pickup", return_value=False):
             with patch(
                 "src.message_queue.find_fresh_codex_review_or_comment",
                 return_value={
@@ -251,10 +248,7 @@ async def test_codex_review_request_task_still_checks_review_when_pickup_lookup_
         return None
 
     with patch("asyncio.sleep", side_effect=immediate_sleep):
-        with patch(
-            "src.message_queue.get_codex_request_reaction_state",
-            side_effect=RuntimeError("boom"),
-        ):
+        with patch("src.message_queue.detect_codex_pickup", side_effect=RuntimeError("boom")):
             with patch(
                 "src.message_queue.find_fresh_codex_review_or_comment",
                 return_value={
@@ -268,43 +262,6 @@ async def test_codex_review_request_task_still_checks_review_when_pickup_lookup_
 
     assert reg.state == "completed"
     assert reg.is_active is False
-    mq.queue_message.assert_called_once()
-    assert "Codex review for PR #42 is here" in mq.queue_message.call_args.kwargs["text"]
-
-
-@pytest.mark.asyncio
-async def test_codex_review_request_task_completes_on_clean_pass_reaction(mq):
-    reg = CodexReviewRequestRegistration(
-        id="req125",
-        repo="owner/repo",
-        pr_number=42,
-        requester_session_id="agent618",
-        notify_session_id="agent618",
-        steer=None,
-        requested_at=datetime(2026, 4, 17, 0, 0, 0),
-        latest_request_comment_id=321,
-        latest_request_comment_url="https://github.com/owner/repo/pull/42#issuecomment-321",
-        latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
-        attempt_count=1,
-        next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
-    )
-    mq._codex_review_requests[reg.id] = reg
-    mq.queue_message = MagicMock()
-
-    async def immediate_sleep(_seconds):
-        return None
-
-    with patch("asyncio.sleep", side_effect=immediate_sleep):
-        with patch(
-            "src.message_queue.get_codex_request_reaction_state",
-            return_value={"picked_up": True, "clean_pass": True},
-        ):
-            await mq._run_codex_review_request_task(reg.id)
-
-    assert reg.state == "completed"
-    assert reg.is_active is False
-    assert reg.review_source == "reaction"
-    assert reg.review_comment_id == 321
     mq.queue_message.assert_called_once()
     assert "Codex review for PR #42 is here" in mq.queue_message.call_args.kwargs["text"]
 
@@ -472,10 +429,7 @@ async def test_codex_review_request_retry_persists_attempt_when_comment_refresh_
             reg.is_active = False
 
     with patch("asyncio.sleep", side_effect=immediate_sleep):
-        with patch(
-            "src.message_queue.get_codex_request_reaction_state",
-            return_value={"picked_up": False, "clean_pass": False},
-        ):
+        with patch("src.message_queue.detect_codex_pickup", return_value=False):
             with patch("src.message_queue.find_fresh_codex_review_or_comment", return_value=None):
                 with patch(
                     "src.message_queue.post_pr_review_comment",
