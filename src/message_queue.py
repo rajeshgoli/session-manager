@@ -17,12 +17,21 @@ from types import SimpleNamespace
 from typing import Optional, Dict, List, Callable, Awaitable, Tuple
 
 from .models import (
+    CodexReviewRequestRegistration,
     JobWatchRegistration,
     ParentWakeRegistration,
     QueuedMessage,
     RemindRegistration,
     SessionDeliveryState,
     SessionStatus,
+)
+from .github_reviews import (
+    detect_codex_pickup,
+    fetch_issue_comment,
+    find_fresh_codex_review_or_comment,
+    get_pr_repo_from_git,
+    post_pr_review_comment,
+    validate_open_pr,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,6 +115,11 @@ class MessageQueueManager:
         # Durable external job watches (#377): keyed by watch_id
         self._job_watches: Dict[str, JobWatchRegistration] = {}
         self._job_watch_tasks: Dict[str, asyncio.Task] = {}
+
+        # Durable Codex PR review requests (#618): keyed by request_id
+        self._codex_review_requests: Dict[str, CodexReviewRequestRegistration] = {}
+        self._codex_review_request_tasks: Dict[str, asyncio.Task] = {}
+        self._codex_review_request_creation_locks: Dict[tuple[str, int, str], asyncio.Lock] = {}
 
         # Periodic remind registrations (#188): keyed by target_session_id (one-active-per-target)
         self._remind_registrations: Dict[str, RemindRegistration] = {}
@@ -303,6 +317,40 @@ class MessageQueueManager:
         if "last_file_offset" not in job_watch_columns:
             cursor.execute("ALTER TABLE job_watch_registrations ADD COLUMN last_file_offset INTEGER")
             logger.info("Migrated job_watch_registrations: added last_file_offset column")
+
+        # Durable Codex PR review requests (#618)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS codex_review_request_registrations (
+                id TEXT PRIMARY KEY,
+                repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                requester_session_id TEXT,
+                notify_session_id TEXT NOT NULL,
+                steer TEXT,
+                requested_at TIMESTAMP NOT NULL,
+                latest_request_comment_id INTEGER,
+                latest_request_comment_url TEXT,
+                latest_request_posted_at TIMESTAMP,
+                attempt_count INTEGER NOT NULL,
+                next_retry_at TIMESTAMP,
+                poll_interval_seconds INTEGER NOT NULL,
+                retry_interval_seconds INTEGER NOT NULL,
+                pickup_detected_at TIMESTAMP,
+                pickup_source TEXT,
+                review_landed_at TIMESTAMP,
+                review_source TEXT,
+                review_comment_id INTEGER,
+                review_url TEXT,
+                last_polled_at TIMESTAMP,
+                last_error TEXT,
+                state TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_codex_review_notify_active
+            ON codex_review_request_registrations(notify_session_id, is_active)
+        """)
 
         self._db_conn.commit()
         logger.info(f"Message queue database initialized at {self.db_path} (WAL mode enabled)")
@@ -793,6 +841,579 @@ class MessageQueueManager:
                 reg.label,
             )
 
+    # =========================================================================
+    # Durable Codex PR review requests (#618)
+    # =========================================================================
+
+    @staticmethod
+    def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+        """Parse one ISO datetime string when present."""
+        if not value:
+            return None
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    async def _resolve_codex_review_repo(
+        self,
+        repo: Optional[str],
+        requester_session_id: Optional[str],
+    ) -> str:
+        """Resolve the GitHub repo for one request."""
+        if repo:
+            return repo
+
+        if requester_session_id:
+            requester = self.session_manager.get_session(requester_session_id)
+            if requester and getattr(requester, "working_dir", None):
+                resolved = await asyncio.to_thread(get_pr_repo_from_git, requester.working_dir)
+                if resolved:
+                    return resolved
+
+        raise ValueError("Could not determine GitHub repo without requester session context; pass --repo explicitly")
+
+    @staticmethod
+    def _row_to_codex_review_request_registration(
+        row: tuple,
+    ) -> CodexReviewRequestRegistration:
+        """Hydrate one Codex review request registration from SQLite."""
+        return CodexReviewRequestRegistration(
+            id=row[0],
+            repo=row[1],
+            pr_number=row[2],
+            requester_session_id=row[3],
+            notify_session_id=row[4],
+            steer=row[5],
+            requested_at=datetime.fromisoformat(row[6]),
+            latest_request_comment_id=row[7],
+            latest_request_comment_url=row[8],
+            latest_request_posted_at=datetime.fromisoformat(row[9]) if row[9] else None,
+            attempt_count=row[10],
+            next_retry_at=datetime.fromisoformat(row[11]) if row[11] else None,
+            poll_interval_seconds=row[12],
+            retry_interval_seconds=row[13],
+            pickup_detected_at=datetime.fromisoformat(row[14]) if row[14] else None,
+            pickup_source=row[15],
+            review_landed_at=datetime.fromisoformat(row[16]) if row[16] else None,
+            review_source=row[17],
+            review_comment_id=row[18],
+            review_url=row[19],
+            last_polled_at=datetime.fromisoformat(row[20]) if row[20] else None,
+            last_error=row[21],
+            state=row[22],
+            is_active=bool(row[23]),
+        )
+
+    def _load_codex_review_request_from_db(
+        self,
+        request_id: str,
+    ) -> Optional[CodexReviewRequestRegistration]:
+        """Load one Codex review request registration from SQLite."""
+        row = self._execute_query(
+            """
+            SELECT id, repo, pr_number, requester_session_id, notify_session_id, steer,
+                   requested_at, latest_request_comment_id, latest_request_comment_url,
+                   latest_request_posted_at, attempt_count, next_retry_at,
+                   poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+                   pickup_source, review_landed_at, review_source, review_comment_id,
+                   review_url, last_polled_at, last_error, state, is_active
+            FROM codex_review_request_registrations
+            WHERE id = ?
+            """,
+            (request_id,),
+        )
+        if not row:
+            return None
+        return self._row_to_codex_review_request_registration(row[0])
+
+    def _load_codex_review_requests_from_db(
+        self,
+        *,
+        notify_session_id: Optional[str] = None,
+        repo: Optional[str] = None,
+        pr_number: Optional[int] = None,
+        include_inactive: bool = False,
+    ) -> list[CodexReviewRequestRegistration]:
+        """Load Codex review request registrations from SQLite."""
+        where_clauses = []
+        params: list[object] = []
+        if notify_session_id:
+            where_clauses.append("notify_session_id = ?")
+            params.append(notify_session_id)
+        if repo:
+            where_clauses.append("repo = ?")
+            params.append(repo)
+        if pr_number is not None:
+            where_clauses.append("pr_number = ?")
+            params.append(pr_number)
+        if not include_inactive:
+            where_clauses.append("is_active = 1")
+
+        query = """
+            SELECT id, repo, pr_number, requester_session_id, notify_session_id, steer,
+                   requested_at, latest_request_comment_id, latest_request_comment_url,
+                   latest_request_posted_at, attempt_count, next_retry_at,
+                   poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+                   pickup_source, review_landed_at, review_source, review_comment_id,
+                   review_url, last_polled_at, last_error, state, is_active
+            FROM codex_review_request_registrations
+        """
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+        query += " ORDER BY requested_at"
+
+        rows = self._execute_query(query, tuple(params))
+        return [self._row_to_codex_review_request_registration(row) for row in rows]
+
+    def _find_active_codex_review_request(
+        self,
+        repo: str,
+        pr_number: int,
+        notify_session_id: str,
+    ) -> Optional[CodexReviewRequestRegistration]:
+        """Return an active duplicate request when one already exists."""
+        for registration in self._codex_review_requests.values():
+            if not registration.is_active:
+                continue
+            if (
+                registration.repo == repo
+                and registration.pr_number == pr_number
+                and registration.notify_session_id == notify_session_id
+            ):
+                return registration
+        return None
+
+    async def register_codex_review_request(
+        self,
+        *,
+        pr_number: int,
+        notify_session_id: str,
+        requester_session_id: Optional[str] = None,
+        repo: Optional[str] = None,
+        steer: Optional[str] = None,
+        poll_interval_seconds: int = 30,
+        retry_interval_seconds: int = 600,
+    ) -> CodexReviewRequestRegistration:
+        """Create one durable Codex PR review request and start watching it."""
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be > 0")
+        if retry_interval_seconds <= 0:
+            raise ValueError("retry_interval_seconds must be > 0")
+
+        notify_session = self.session_manager.get_session(notify_session_id)
+        if not notify_session:
+            raise ValueError(f"Notify session {notify_session_id} not found")
+        if requester_session_id and not self.session_manager.get_session(requester_session_id):
+            raise ValueError(f"Requester session {requester_session_id} not found")
+
+        resolved_repo = await self._resolve_codex_review_repo(repo, requester_session_id)
+        creation_key = (resolved_repo, pr_number, notify_session_id)
+        creation_lock = self._codex_review_request_creation_locks.setdefault(creation_key, asyncio.Lock())
+        async with creation_lock:
+            if self._find_active_codex_review_request(resolved_repo, pr_number, notify_session_id):
+                raise ValueError(
+                    f"Active Codex review request already exists for {resolved_repo} PR #{pr_number}"
+                )
+
+            await asyncio.to_thread(validate_open_pr, resolved_repo, pr_number)
+            comment_result = await asyncio.to_thread(post_pr_review_comment, resolved_repo, pr_number, steer)
+
+            latest_comment_id = comment_result.get("comment_id") or None
+            latest_comment_url = comment_result.get("comment_url")
+            latest_posted_at = self._parse_iso_datetime(comment_result.get("posted_at")) or datetime.now(timezone.utc).replace(tzinfo=None)
+
+            if latest_comment_id:
+                try:
+                    latest_comment = await asyncio.to_thread(fetch_issue_comment, resolved_repo, latest_comment_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to refresh posted Codex review request comment %s on %s PR #%s: %s",
+                        latest_comment_id,
+                        resolved_repo,
+                        pr_number,
+                        exc,
+                    )
+                else:
+                    if latest_comment:
+                        latest_comment_url = latest_comment.get("html_url") or latest_comment_url
+                        latest_posted_at = (
+                            self._parse_iso_datetime(latest_comment.get("created_at")) or latest_posted_at
+                        )
+
+            request_id = uuid.uuid4().hex[:12]
+            registration = CodexReviewRequestRegistration(
+                id=request_id,
+                repo=resolved_repo,
+                pr_number=pr_number,
+                requester_session_id=requester_session_id,
+                notify_session_id=notify_session_id,
+                steer=steer,
+                requested_at=latest_posted_at,
+                latest_request_comment_id=latest_comment_id,
+                latest_request_comment_url=latest_comment_url,
+                latest_request_posted_at=latest_posted_at,
+                attempt_count=1,
+                next_retry_at=latest_posted_at + timedelta(seconds=retry_interval_seconds),
+                poll_interval_seconds=poll_interval_seconds,
+                retry_interval_seconds=retry_interval_seconds,
+            )
+            self._codex_review_requests[request_id] = registration
+            self._execute(
+                """
+                INSERT OR REPLACE INTO codex_review_request_registrations
+                (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+                 requested_at, latest_request_comment_id, latest_request_comment_url,
+                 latest_request_posted_at, attempt_count, next_retry_at,
+                 poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+                 pickup_source, review_landed_at, review_source, review_comment_id,
+                 review_url, last_polled_at, last_error, state, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    registration.id,
+                    registration.repo,
+                    registration.pr_number,
+                    registration.requester_session_id,
+                    registration.notify_session_id,
+                    registration.steer,
+                    registration.requested_at.isoformat(),
+                    registration.latest_request_comment_id,
+                    registration.latest_request_comment_url,
+                    registration.latest_request_posted_at.isoformat() if registration.latest_request_posted_at else None,
+                    registration.attempt_count,
+                    registration.next_retry_at.isoformat() if registration.next_retry_at else None,
+                    registration.poll_interval_seconds,
+                    registration.retry_interval_seconds,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    registration.state,
+                ),
+            )
+
+            task = asyncio.create_task(self._run_codex_review_request_task(registration.id))
+            self._codex_review_request_tasks[registration.id] = task
+            logger.info(
+                "Registered Codex review request %s for %s PR #%s notify=%s",
+                registration.id,
+                registration.repo,
+                registration.pr_number,
+                registration.notify_session_id,
+            )
+            return registration
+
+    def list_codex_review_requests(
+        self,
+        *,
+        notify_session_id: Optional[str] = None,
+        repo: Optional[str] = None,
+        pr_number: Optional[int] = None,
+        include_inactive: bool = False,
+    ) -> list[CodexReviewRequestRegistration]:
+        """List durable Codex review requests."""
+        requests = self._load_codex_review_requests_from_db(
+            notify_session_id=notify_session_id,
+            repo=repo,
+            pr_number=pr_number,
+            include_inactive=include_inactive,
+        )
+        resolved_requests = []
+        for request in requests:
+            resolved = self._codex_review_requests.get(request.id, request)
+            self._codex_review_requests[request.id] = resolved
+            resolved_requests.append(resolved)
+        return resolved_requests
+
+    def get_codex_review_request(self, request_id: str) -> Optional[CodexReviewRequestRegistration]:
+        """Fetch one durable Codex review request by id."""
+        registration = self._codex_review_requests.get(request_id)
+        if registration is not None:
+            return registration
+        registration = self._load_codex_review_request_from_db(request_id)
+        if registration is not None:
+            self._codex_review_requests[request_id] = registration
+        return registration
+
+    def cancel_codex_review_request(
+        self,
+        request_id: str,
+        *,
+        state: str = "cancelled",
+        last_error: Optional[str] = None,
+    ) -> Optional[CodexReviewRequestRegistration]:
+        """Cancel one durable Codex review request."""
+        registration = self._codex_review_requests.get(request_id)
+        if registration is None:
+            return None
+        if not registration.is_active:
+            return registration
+
+        registration.is_active = False
+        registration.state = state
+        if last_error is not None:
+            registration.last_error = last_error
+        self._update_codex_review_request_db(
+            request_id,
+            is_active=False,
+            state=registration.state,
+            last_error=registration.last_error,
+        )
+        task = self._codex_review_request_tasks.pop(request_id, None)
+        if task:
+            task.cancel()
+        logger.info("Cancelled Codex review request %s (%s)", request_id, state)
+        return registration
+
+    def _update_codex_review_request_db(self, request_id: str, **kwargs) -> None:
+        """Persist one partial Codex review request update."""
+        if not kwargs:
+            return
+        parts = []
+        values = []
+        for key, value in kwargs.items():
+            parts.append(f"{key} = ?")
+            if isinstance(value, datetime):
+                values.append(value.isoformat())
+            elif isinstance(value, bool):
+                values.append(1 if value else 0)
+            else:
+                values.append(value)
+        values.append(request_id)
+        self._execute(
+            f"UPDATE codex_review_request_registrations SET {', '.join(parts)} WHERE id = ?",
+            tuple(values),
+        )
+
+    def _render_codex_review_landed_message(
+        self,
+        registration: CodexReviewRequestRegistration,
+        match: dict,
+    ) -> str:
+        """Render the factual wake message for one landed review/comment."""
+        noun = "comment" if match.get("source") == "comment" else "review"
+        message = f"[sm review] Codex {noun} for PR #{registration.pr_number} is here."
+        url = match.get("url")
+        if url:
+            message = f"{message} {url}"
+        return message
+
+    async def _run_codex_review_request_task(self, request_id: str) -> None:
+        """Poll GitHub until one Codex review request completes or is cancelled."""
+        try:
+            while True:
+                registration = self._codex_review_requests.get(request_id)
+                if registration is None or not registration.is_active:
+                    return
+
+                await asyncio.sleep(registration.poll_interval_seconds)
+
+                registration = self._codex_review_requests.get(request_id)
+                if registration is None or not registration.is_active:
+                    return
+
+                if not self.session_manager.get_session(registration.notify_session_id):
+                    logger.info(
+                        "Auto-cancelled Codex review request %s because notify session %s no longer exists",
+                        request_id,
+                        registration.notify_session_id,
+                    )
+                    self.cancel_codex_review_request(request_id)
+                    return
+
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                registration.last_polled_at = now
+                updates: dict[str, object] = {"last_polled_at": now}
+
+                if registration.latest_request_comment_id and not registration.pickup_detected_at:
+                    try:
+                        picked_up = await asyncio.to_thread(
+                            detect_codex_pickup,
+                            registration.repo,
+                            registration.latest_request_comment_id,
+                        )
+                    except Exception as exc:
+                        registration.last_error = f"pickup detection failed: {exc}"
+                        updates["last_error"] = registration.last_error
+                        logger.warning(
+                            "Codex review pickup check failed for %s PR #%s: %s",
+                            registration.repo,
+                            registration.pr_number,
+                            exc,
+                        )
+                    else:
+                        if picked_up:
+                            registration.pickup_detected_at = now
+                            registration.pickup_source = "reaction"
+                            registration.last_error = None
+                            updates["pickup_detected_at"] = now
+                            updates["pickup_source"] = "reaction"
+                            updates["last_error"] = None
+
+                try:
+                    review_match = await asyncio.to_thread(
+                        find_fresh_codex_review_or_comment,
+                        registration.repo,
+                        registration.pr_number,
+                        registration.latest_request_posted_at or registration.requested_at,
+                    )
+                    if review_match:
+                        registration.review_landed_at = (
+                            self._parse_iso_datetime(review_match.get("created_at")) or now
+                        )
+                        registration.review_source = review_match.get("source")
+                        registration.review_comment_id = review_match.get("id")
+                        registration.review_url = review_match.get("url")
+                        registration.state = "completed"
+                        registration.is_active = False
+                        registration.last_error = None
+                        updates.update(
+                            {
+                                "review_landed_at": registration.review_landed_at,
+                                "review_source": registration.review_source,
+                                "review_comment_id": registration.review_comment_id,
+                                "review_url": registration.review_url,
+                                "state": "completed",
+                                "is_active": False,
+                                "last_error": None,
+                            }
+                        )
+                        self.queue_message(
+                            target_session_id=registration.notify_session_id,
+                            text=self._render_codex_review_landed_message(registration, review_match),
+                            delivery_mode="sequential",
+                        )
+                        self._update_codex_review_request_db(request_id, **updates)
+                        logger.info(
+                            "Codex review request %s completed for %s PR #%s",
+                            request_id,
+                            registration.repo,
+                            registration.pr_number,
+                        )
+                        return
+
+                    if registration.next_retry_at and now >= registration.next_retry_at:
+                        comment_result = await asyncio.to_thread(
+                            post_pr_review_comment,
+                            registration.repo,
+                            registration.pr_number,
+                            registration.steer,
+                        )
+                        latest_comment_id = comment_result.get("comment_id") or None
+                        latest_comment_url = comment_result.get("comment_url")
+                        latest_posted_at = (
+                            self._parse_iso_datetime(comment_result.get("posted_at")) or now
+                        )
+                        if latest_comment_id:
+                            try:
+                                latest_comment = await asyncio.to_thread(
+                                    fetch_issue_comment,
+                                    registration.repo,
+                                    latest_comment_id,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Codex review comment refresh failed for %s PR #%s comment %s: %s",
+                                    registration.repo,
+                                    registration.pr_number,
+                                    latest_comment_id,
+                                    exc,
+                                )
+                            else:
+                                if latest_comment:
+                                    latest_comment_url = latest_comment.get("html_url") or latest_comment_url
+                                    latest_posted_at = (
+                                        self._parse_iso_datetime(latest_comment.get("created_at")) or latest_posted_at
+                                    )
+
+                        registration.attempt_count += 1
+                        registration.latest_request_comment_id = latest_comment_id
+                        registration.latest_request_comment_url = latest_comment_url
+                        registration.latest_request_posted_at = latest_posted_at
+                        registration.pickup_detected_at = None
+                        registration.pickup_source = None
+                        registration.next_retry_at = latest_posted_at + timedelta(
+                            seconds=registration.retry_interval_seconds
+                        )
+                        registration.last_error = None
+                        updates.update(
+                            {
+                                "attempt_count": registration.attempt_count,
+                                "latest_request_comment_id": registration.latest_request_comment_id,
+                                "latest_request_comment_url": registration.latest_request_comment_url,
+                                "latest_request_posted_at": registration.latest_request_posted_at,
+                                "pickup_detected_at": None,
+                                "pickup_source": None,
+                                "next_retry_at": registration.next_retry_at,
+                                "last_error": None,
+                            }
+                        )
+
+                except Exception as exc:
+                    registration.last_error = str(exc)
+                    updates["last_error"] = registration.last_error
+                    if registration.next_retry_at and registration.next_retry_at <= now:
+                        registration.next_retry_at = now + timedelta(seconds=registration.retry_interval_seconds)
+                        updates["next_retry_at"] = registration.next_retry_at
+                    logger.warning(
+                        "Codex review request poll failed for %s PR #%s: %s",
+                        registration.repo,
+                        registration.pr_number,
+                        exc,
+                    )
+
+                self._update_codex_review_request_db(request_id, **updates)
+
+        except asyncio.CancelledError:
+            logger.info("Codex review request task cancelled for %s", request_id)
+        finally:
+            self._codex_review_request_tasks.pop(request_id, None)
+
+    async def _recover_codex_review_requests(self) -> None:
+        """Recover active Codex review requests on server restart."""
+        registrations = self._load_codex_review_requests_from_db(include_inactive=True)
+
+        for registration in registrations:
+            if registration.is_active and not self.session_manager.get_session(registration.notify_session_id):
+                self._update_codex_review_request_db(
+                    registration.id,
+                    is_active=False,
+                    state="cancelled",
+                    last_error="Notify session no longer exists",
+                )
+                registration.is_active = False
+                registration.state = "cancelled"
+                registration.last_error = "Notify session no longer exists"
+                self._codex_review_requests[registration.id] = registration
+                logger.info(
+                    "Skipped recovery for Codex review request %s because notify session %s is gone",
+                    registration.id,
+                    registration.notify_session_id,
+                )
+                continue
+
+            self._codex_review_requests[registration.id] = registration
+            if registration.is_active:
+                task = asyncio.create_task(self._run_codex_review_request_task(registration.id))
+                self._codex_review_request_tasks[registration.id] = task
+                logger.info(
+                    "Recovered Codex review request %s for %s PR #%s",
+                    registration.id,
+                    registration.repo,
+                    registration.pr_number,
+                )
+
     def _execute(self, query: str, params=()) -> sqlite3.Cursor:
         """
         Execute a database query with thread-safety.
@@ -910,6 +1531,8 @@ class MessageQueueManager:
         await self._recover_parent_wake_registrations()
         # Recover active external job watches (#377)
         await self._recover_job_watches()
+        # Recover active Codex review requests (#618)
+        await self._recover_codex_review_requests()
         # Recover pending messages - trigger delivery for sessions with queued messages
         await self._recover_pending_messages()
         logger.info("Message queue manager started")
@@ -947,6 +1570,9 @@ class MessageQueueManager:
         for task in self._job_watch_tasks.values():
             task.cancel()
         self._job_watch_tasks.clear()
+        for task in self._codex_review_request_tasks.values():
+            task.cancel()
+        self._codex_review_request_tasks.clear()
         for task in self._pending_stop_notify_tasks.values():
             task.cancel()
         self._pending_stop_notify_tasks.clear()

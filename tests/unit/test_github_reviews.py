@@ -8,8 +8,17 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from src.github_reviews import (
+    detect_codex_pickup,
+    find_fresh_codex_review_or_comment,
+    fetch_issue_comment,
+    fetch_issue_comment_reactions,
+    fetch_latest_codex_review,
+    fetch_pr_issue_comments,
+    fetch_pr_reviews,
+    is_codex_actor,
     post_pr_review_comment,
     poll_for_codex_review,
+    validate_open_pr,
     get_pr_repo_from_git,
 )
 
@@ -72,27 +81,24 @@ class TestPostPrReviewComment:
 
         result = post_pr_review_comment("owner/repo", 42)
         assert result["comment_id"] == 0
+        assert result["comment_url"] == "https://github.com/owner/repo/pull/42"
 
 
 class TestPollForCodexReview:
     """Tests for poll_for_codex_review()."""
 
     @patch("src.github_reviews.time.sleep")
-    @patch("src.github_reviews.subprocess.run")
-    def test_finds_codex_review(self, mock_run, mock_sleep):
+    @patch("src.github_reviews._resolve_review_snapshot_to_rest_review")
+    @patch("src.github_reviews._fetch_latest_codex_review_snapshot")
+    def test_finds_codex_review(self, mock_fetch_snapshot, mock_resolve_review, mock_sleep):
         """Returns review when codex[bot] review is found after since."""
         since = datetime(2026, 2, 14, 10, 0, 0)
-        review_data = [
-            {
-                "user": {"login": "codex[bot]"},
-                "submitted_at": "2026-02-14T10:05:00Z",
-                "state": "COMMENTED",
-            }
-        ]
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout=json.dumps(review_data),
-        )
+        mock_fetch_snapshot.return_value = {
+            "user": {"login": "codex[bot]"},
+            "submitted_at": "2026-02-14T10:05:00Z",
+            "state": "COMMENTED",
+        }
+        mock_resolve_review.return_value = mock_fetch_snapshot.return_value
 
         result = poll_for_codex_review("owner/repo", 42, since, timeout=60)
 
@@ -102,14 +108,11 @@ class TestPollForCodexReview:
 
     @patch("src.github_reviews.time.sleep")
     @patch("src.github_reviews.time.monotonic")
-    @patch("src.github_reviews.subprocess.run")
-    def test_returns_none_on_timeout(self, mock_run, mock_monotonic, mock_sleep):
+    @patch("src.github_reviews._fetch_latest_codex_review_snapshot")
+    def test_returns_none_on_timeout(self, mock_fetch_snapshot, mock_monotonic, mock_sleep):
         """Returns None when no review found within timeout."""
         since = datetime(2026, 2, 14, 10, 0, 0)
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="[]",
-        )
+        mock_fetch_snapshot.return_value = None
         # Simulate time passing: start, check, after sleep, check (past deadline)
         mock_monotonic.side_effect = [0, 0, 0, 31, 31]
 
@@ -118,21 +121,15 @@ class TestPollForCodexReview:
         assert result is None
 
     @patch("src.github_reviews.time.sleep")
-    @patch("src.github_reviews.subprocess.run")
-    def test_ignores_old_reviews(self, mock_run, mock_sleep):
+    @patch("src.github_reviews._fetch_latest_codex_review_snapshot")
+    def test_ignores_old_reviews(self, mock_fetch_snapshot, mock_sleep):
         """Ignores reviews submitted before since timestamp."""
         since = datetime(2026, 2, 14, 10, 0, 0)
-        review_data = [
-            {
-                "user": {"login": "codex[bot]"},
-                "submitted_at": "2026-02-14T09:00:00Z",  # Before since
-                "state": "COMMENTED",
-            }
-        ]
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout=json.dumps(review_data),
-        )
+        mock_fetch_snapshot.return_value = {
+            "user": {"login": "codex[bot]"},
+            "submitted_at": "2026-02-14T09:00:00Z",  # Before since
+            "state": "COMMENTED",
+        }
 
         # Make it timeout after one iteration
         with patch("src.github_reviews.time.monotonic", side_effect=[0, 0, 0, 100]):
@@ -165,6 +162,156 @@ class TestGetPrRepoFromGit:
 
         result = get_pr_repo_from_git("/tmp/workspace")
         assert result is None
+
+
+class TestCodexHelpers:
+    """Tests for newer GitHub review helper primitives (#618)."""
+
+    @patch("src.github_reviews.subprocess.run")
+    def test_validate_open_pr_returns_payload(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"number": 42, "state": "OPEN", "url": "https://example/pr/42"}),
+        )
+
+        result = validate_open_pr("owner/repo", 42)
+
+        assert result["state"] == "OPEN"
+
+    @patch("src.github_reviews.subprocess.run")
+    def test_validate_open_pr_rejects_closed_pr(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"number": 42, "state": "MERGED"}),
+        )
+
+        with pytest.raises(RuntimeError, match="not OPEN"):
+            validate_open_pr("owner/repo", 42)
+
+    @patch("src.github_reviews.subprocess.run")
+    def test_fetch_helpers_decode_json(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([{"id": 1}]),
+        )
+
+        assert fetch_pr_reviews("owner/repo", 42) == [{"id": 1}]
+        assert fetch_pr_issue_comments("owner/repo", 42) == [{"id": 1}]
+        assert fetch_issue_comment_reactions("owner/repo", 99) == [{"id": 1}]
+
+    @patch("src.github_reviews.subprocess.run")
+    def test_fetch_issue_comments_supports_since(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps([{"id": 1}]))
+
+        fetch_pr_issue_comments("owner/repo", 42, since=datetime(2026, 4, 16, 18, 27, 57))
+
+        command = mock_run.call_args[0][0]
+        assert any("since=2026-04-16T18:27:57Z" in token for token in command)
+
+    @patch("src.github_reviews.subprocess.run")
+    def test_fetch_helpers_flatten_paginated_results(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([[{"id": 1}], [{"id": 2}]]),
+        )
+
+        assert fetch_pr_reviews("owner/repo", 42) == [{"id": 1}, {"id": 2}]
+
+    @patch("src.github_reviews.subprocess.run")
+    def test_fetch_issue_comment_returns_dict(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"id": 123, "html_url": "https://example/comment/123"}),
+        )
+
+        result = fetch_issue_comment("owner/repo", 123)
+        assert result["id"] == 123
+
+    def test_is_codex_actor_matches_bot_login_or_app(self):
+        assert is_codex_actor({"user": {"login": "chatgpt-codex-connector[bot]"}})
+        assert is_codex_actor({"performed_via_github_app": {"slug": "chatgpt-codex-connector"}})
+        assert not is_codex_actor({"user": {"login": "octocat"}})
+
+    @patch("src.github_reviews.fetch_issue_comment_reactions")
+    def test_detect_codex_pickup_requires_codex_eyes(self, mock_reactions):
+        mock_reactions.return_value = [
+            {"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}},
+        ]
+        assert detect_codex_pickup("owner/repo", 12345) is True
+
+        mock_reactions.return_value = [
+            {"content": "eyes", "user": {"login": "octocat"}},
+            {"content": "+1", "user": {"login": "chatgpt-codex-connector[bot]"}},
+        ]
+        assert detect_codex_pickup("owner/repo", 12345) is False
+
+    @patch("src.github_reviews.fetch_pr_issue_comments")
+    @patch("src.github_reviews._resolve_review_snapshot_to_rest_review")
+    @patch("src.github_reviews._fetch_latest_codex_review_snapshot")
+    def test_find_fresh_codex_review_or_comment_prefers_newer_than_since(self, mock_latest_review, mock_resolve_review, mock_comments):
+        since = datetime(2026, 4, 16, 18, 27, 57)
+        mock_latest_review.return_value = {
+            "id": 100,
+            "user": {"login": "codex[bot]"},
+            "submitted_at": "2026-04-16T18:20:00Z",
+            "html_url": "https://example/review/100",
+            "state": "COMMENTED",
+        }
+        mock_resolve_review.return_value = mock_latest_review.return_value
+        mock_comments.return_value = [
+            {
+                "id": 200,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "performed_via_github_app": {"slug": "chatgpt-codex-connector"},
+                "created_at": "2026-04-16T18:32:59Z",
+                "html_url": "https://example/comment/200",
+                "body": "Codex Review: clean",
+            }
+        ]
+
+        result = find_fresh_codex_review_or_comment("owner/repo", 42, since)
+
+        assert result is not None
+        assert result["source"] == "comment"
+        assert result["id"] == 200
+
+    @patch("src.github_reviews.fetch_pr_reviews")
+    @patch("src.github_reviews.subprocess.run")
+    def test_fetch_latest_codex_review_uses_pr_view_latest_reviews(self, mock_run, mock_fetch_reviews):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "url": "https://github.com/owner/repo/pull/42",
+                    "latestReviews": [
+                        {
+                            "id": "R_kw123",
+                            "author": {"login": "chatgpt-codex-connector[bot]"},
+                            "submittedAt": "2026-04-16T18:32:59Z",
+                            "state": "COMMENTED",
+                            "body": "clean",
+                        }
+                    ],
+                }
+            ),
+        )
+        mock_fetch_reviews.return_value = [
+            {
+                "id": 123,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "submitted_at": "2026-04-16T18:32:59Z",
+                "state": "COMMENTED",
+                "body": "clean",
+                "html_url": "https://github.com/owner/repo/pull/42#pullrequestreview-123",
+            }
+        ]
+
+        result = fetch_latest_codex_review("owner/repo", 42)
+
+        assert result is not None
+        assert result["user"]["login"] == "chatgpt-codex-connector[bot]"
+        assert result["id"] == 123
+        assert result["html_url"] == "https://github.com/owner/repo/pull/42#pullrequestreview-123"
 
     @patch("src.github_reviews.subprocess.run")
     def test_returns_none_on_exception(self, mock_run):

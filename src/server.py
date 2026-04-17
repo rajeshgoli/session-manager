@@ -673,6 +673,47 @@ class JobWatchResponse(BaseModel):
     is_active: bool = True
 
 
+class CodexReviewRequestCreateRequest(BaseModel):
+    """Request to create a durable Codex PR review request."""
+    pr_number: int = Field(gt=0)
+    repo: Optional[str] = None
+    steer: Optional[str] = None
+    notify_target: Optional[str] = None
+    requester_session_id: Optional[str] = None
+    poll_interval_seconds: int = Field(default=30, gt=0)
+    retry_interval_seconds: int = Field(default=600, gt=0)
+
+
+class CodexReviewRequestResponse(BaseModel):
+    """Response payload for one durable Codex PR review request."""
+    id: str
+    repo: str
+    pr_number: int
+    requester_session_id: Optional[str] = None
+    requester_name: Optional[str] = None
+    notify_session_id: str
+    notify_name: Optional[str] = None
+    steer: Optional[str] = None
+    requested_at: str
+    latest_request_comment_id: Optional[int] = None
+    latest_request_comment_url: Optional[str] = None
+    latest_request_posted_at: Optional[str] = None
+    attempt_count: int
+    next_retry_at: Optional[str] = None
+    poll_interval_seconds: int
+    retry_interval_seconds: int
+    pickup_detected_at: Optional[str] = None
+    pickup_source: Optional[str] = None
+    review_landed_at: Optional[str] = None
+    review_source: Optional[str] = None
+    review_comment_id: Optional[str | int] = None
+    review_url: Optional[str] = None
+    last_polled_at: Optional[str] = None
+    last_error: Optional[str] = None
+    state: str
+    is_active: bool = True
+
+
 class AgentStatusRequest(BaseModel):
     """Request from an agent to self-report its current status (#188). text=None clears status (#283)."""
     text: Optional[str] = None
@@ -1554,6 +1595,42 @@ def create_app(
             last_notified_at=registration.last_notified_at.isoformat() if registration.last_notified_at else None,
             last_progress_text=registration.last_progress_text,
             last_event=registration.last_event,
+            is_active=registration.is_active,
+        )
+
+    def _codex_review_request_to_response(registration) -> CodexReviewRequestResponse:
+        requester = (
+            app.state.session_manager.get_session(registration.requester_session_id)
+            if registration.requester_session_id
+            else None
+        )
+        notify = app.state.session_manager.get_session(registration.notify_session_id)
+        return CodexReviewRequestResponse(
+            id=registration.id,
+            repo=registration.repo,
+            pr_number=registration.pr_number,
+            requester_session_id=registration.requester_session_id,
+            requester_name=_effective_session_name(requester) if requester else registration.requester_session_id,
+            notify_session_id=registration.notify_session_id,
+            notify_name=_effective_session_name(notify) if notify else registration.notify_session_id,
+            steer=registration.steer,
+            requested_at=registration.requested_at.isoformat(),
+            latest_request_comment_id=registration.latest_request_comment_id,
+            latest_request_comment_url=registration.latest_request_comment_url,
+            latest_request_posted_at=registration.latest_request_posted_at.isoformat() if registration.latest_request_posted_at else None,
+            attempt_count=registration.attempt_count,
+            next_retry_at=registration.next_retry_at.isoformat() if registration.next_retry_at else None,
+            poll_interval_seconds=registration.poll_interval_seconds,
+            retry_interval_seconds=registration.retry_interval_seconds,
+            pickup_detected_at=registration.pickup_detected_at.isoformat() if registration.pickup_detected_at else None,
+            pickup_source=registration.pickup_source,
+            review_landed_at=registration.review_landed_at.isoformat() if registration.review_landed_at else None,
+            review_source=registration.review_source,
+            review_comment_id=registration.review_comment_id,
+            review_url=registration.review_url,
+            last_polled_at=registration.last_polled_at.isoformat() if registration.last_polled_at else None,
+            last_error=registration.last_error,
+            state=registration.state,
             is_active=registration.is_active,
         )
 
@@ -5553,6 +5630,111 @@ Provide ONLY the summary, no preamble or questions."""
         if registration is None:
             raise HTTPException(status_code=404, detail="Job watch not found")
         return _job_watch_to_response(registration)
+
+    @app.post("/codex-review-requests", response_model=CodexReviewRequestResponse)
+    async def create_codex_review_request(request: CodexReviewRequestCreateRequest):
+        """Create one durable Codex PR review request (#618)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        notify_identifier = request.notify_target or request.requester_session_id
+        if not notify_identifier:
+            raise HTTPException(status_code=400, detail="notify_target or requester_session_id is required")
+
+        notify_session = _resolve_session_or_registry_role(notify_identifier)
+        if not notify_session:
+            raise HTTPException(status_code=404, detail="Notify target not found")
+
+        try:
+            registration = await queue_mgr.register_codex_review_request(
+                pr_number=request.pr_number,
+                repo=request.repo,
+                steer=request.steer,
+                requester_session_id=request.requester_session_id,
+                notify_session_id=notify_session.id,
+                poll_interval_seconds=request.poll_interval_seconds,
+                retry_interval_seconds=request.retry_interval_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to request Codex review: {exc}",
+            ) from exc
+
+        return _codex_review_request_to_response(registration)
+
+    @app.get("/codex-review-requests")
+    async def list_codex_review_requests(
+        notify_target: Optional[str] = Query(None),
+        repo: Optional[str] = Query(None),
+        pr_number: Optional[int] = Query(None),
+        include_inactive: bool = Query(False),
+    ):
+        """List durable Codex PR review requests (#618)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        notify_session_id = None
+        if notify_target:
+            notify_session = _resolve_session_or_registry_role(notify_target)
+            if not notify_session:
+                raise HTTPException(status_code=404, detail="Notify target not found")
+            notify_session_id = notify_session.id
+
+        registrations = queue_mgr.list_codex_review_requests(
+            notify_session_id=notify_session_id,
+            repo=repo,
+            pr_number=pr_number,
+            include_inactive=include_inactive,
+        )
+        return {
+            "requests": [
+                _response_dict(_codex_review_request_to_response(registration))
+                for registration in registrations
+            ]
+        }
+
+    @app.get("/codex-review-requests/{request_id}", response_model=CodexReviewRequestResponse)
+    async def get_codex_review_request(request_id: str):
+        """Fetch one durable Codex PR review request by id (#618)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        registration = queue_mgr.get_codex_review_request(request_id)
+        if registration is None:
+            raise HTTPException(status_code=404, detail="Codex review request not found")
+        return _codex_review_request_to_response(registration)
+
+    @app.delete("/codex-review-requests/{request_id}", response_model=CodexReviewRequestResponse)
+    async def cancel_codex_review_request(request_id: str):
+        """Cancel one durable Codex PR review request (#618)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_mgr = app.state.session_manager.message_queue_manager
+        if not queue_mgr:
+            raise HTTPException(status_code=503, detail="Message queue not configured")
+
+        registration = queue_mgr.cancel_codex_review_request(request_id)
+        if registration is None:
+            raise HTTPException(status_code=404, detail="Codex review request not found")
+        return _codex_review_request_to_response(registration)
 
     @app.post("/sessions/{session_id}/agent-status")
     async def set_agent_status(session_id: str, request: AgentStatusRequest):

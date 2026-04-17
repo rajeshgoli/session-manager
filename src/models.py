@@ -716,6 +716,94 @@ class JobWatchRegistration:
 
 
 @dataclass
+class CodexReviewRequestRegistration:
+    """Registration for a durable Codex GitHub PR review request."""
+    id: str
+    repo: str
+    pr_number: int
+    requester_session_id: Optional[str]
+    notify_session_id: str
+    steer: Optional[str]
+    requested_at: datetime
+    latest_request_comment_id: Optional[int]
+    latest_request_comment_url: Optional[str]
+    latest_request_posted_at: Optional[datetime]
+    attempt_count: int
+    next_retry_at: Optional[datetime]
+    poll_interval_seconds: int = 30
+    retry_interval_seconds: int = 600
+    pickup_detected_at: Optional[datetime] = None
+    pickup_source: Optional[str] = None
+    review_landed_at: Optional[datetime] = None
+    review_source: Optional[str] = None
+    review_comment_id: Optional[str | int] = None
+    review_url: Optional[str] = None
+    last_polled_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    state: str = "active"
+    is_active: bool = True
+
+    def to_dict(self) -> dict:
+        """Convert registration to a JSON-serializable dictionary."""
+        return {
+            "id": self.id,
+            "repo": self.repo,
+            "pr_number": self.pr_number,
+            "requester_session_id": self.requester_session_id,
+            "notify_session_id": self.notify_session_id,
+            "steer": self.steer,
+            "requested_at": self.requested_at.isoformat(),
+            "latest_request_comment_id": self.latest_request_comment_id,
+            "latest_request_comment_url": self.latest_request_comment_url,
+            "latest_request_posted_at": self.latest_request_posted_at.isoformat() if self.latest_request_posted_at else None,
+            "attempt_count": self.attempt_count,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
+            "poll_interval_seconds": self.poll_interval_seconds,
+            "retry_interval_seconds": self.retry_interval_seconds,
+            "pickup_detected_at": self.pickup_detected_at.isoformat() if self.pickup_detected_at else None,
+            "pickup_source": self.pickup_source,
+            "review_landed_at": self.review_landed_at.isoformat() if self.review_landed_at else None,
+            "review_source": self.review_source,
+            "review_comment_id": self.review_comment_id,
+            "review_url": self.review_url,
+            "last_polled_at": self.last_polled_at.isoformat() if self.last_polled_at else None,
+            "last_error": self.last_error,
+            "state": self.state,
+            "is_active": self.is_active,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CodexReviewRequestRegistration":
+        """Restore a registration from persisted state."""
+        return cls(
+            id=data["id"],
+            repo=data["repo"],
+            pr_number=int(data["pr_number"]),
+            requester_session_id=data.get("requester_session_id"),
+            notify_session_id=data["notify_session_id"],
+            steer=data.get("steer"),
+            requested_at=datetime.fromisoformat(data["requested_at"]),
+            latest_request_comment_id=data.get("latest_request_comment_id"),
+            latest_request_comment_url=data.get("latest_request_comment_url"),
+            latest_request_posted_at=datetime.fromisoformat(data["latest_request_posted_at"]) if data.get("latest_request_posted_at") else None,
+            attempt_count=int(data.get("attempt_count", 1)),
+            next_retry_at=datetime.fromisoformat(data["next_retry_at"]) if data.get("next_retry_at") else None,
+            poll_interval_seconds=int(data.get("poll_interval_seconds", 30)),
+            retry_interval_seconds=int(data.get("retry_interval_seconds", 600)),
+            pickup_detected_at=datetime.fromisoformat(data["pickup_detected_at"]) if data.get("pickup_detected_at") else None,
+            pickup_source=data.get("pickup_source"),
+            review_landed_at=datetime.fromisoformat(data["review_landed_at"]) if data.get("review_landed_at") else None,
+            review_source=data.get("review_source"),
+            review_comment_id=data.get("review_comment_id"),
+            review_url=data.get("review_url"),
+            last_polled_at=datetime.fromisoformat(data["last_polled_at"]) if data.get("last_polled_at") else None,
+            last_error=data.get("last_error"),
+            state=data.get("state", "active"),
+            is_active=bool(data.get("is_active", True)),
+        )
+
+
+@dataclass
 class SessionDeliveryState:
     """Tracks delivery state for a session."""
     session_id: str
