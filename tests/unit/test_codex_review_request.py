@@ -337,6 +337,35 @@ def test_recover_codex_review_requests_preserves_inactive_history(mock_session_m
     assert reg.id not in mq2._codex_review_request_tasks
 
 
+def test_cancel_codex_review_request_preserves_terminal_state(mq):
+    reg = CodexReviewRequestRegistration(
+        id="req-done",
+        repo="owner/repo",
+        pr_number=42,
+        requester_session_id="agent618",
+        notify_session_id="agent618",
+        steer=None,
+        requested_at=datetime(2026, 4, 17, 0, 0, 0),
+        latest_request_comment_id=None,
+        latest_request_comment_url=None,
+        latest_request_posted_at=None,
+        attempt_count=1,
+        next_retry_at=None,
+    )
+    reg.is_active = False
+    reg.state = "completed"
+    reg.review_landed_at = datetime(2026, 4, 17, 0, 1, 0)
+    mq._codex_review_requests[reg.id] = reg
+
+    with patch.object(mq, "_update_codex_review_request_db") as update_db:
+        cancelled = mq.cancel_codex_review_request(reg.id)
+
+    assert cancelled is reg
+    assert cancelled.state == "completed"
+    assert cancelled.is_active is False
+    update_db.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_register_codex_review_request_resolves_repo_via_to_thread(mq):
     seen_repo_resolution = False
@@ -369,6 +398,58 @@ async def test_register_codex_review_request_resolves_repo_via_to_thread(mq):
 
     assert reg.repo == "owner/repo"
     assert seen_repo_resolution is True
+
+
+@pytest.mark.asyncio
+async def test_codex_review_request_retry_persists_attempt_when_comment_refresh_fails(mq):
+    reg = CodexReviewRequestRegistration(
+        id="req-retry",
+        repo="owner/repo",
+        pr_number=42,
+        requester_session_id="agent618",
+        notify_session_id="agent618",
+        steer=None,
+        requested_at=datetime(2026, 4, 17, 0, 0, 0),
+        latest_request_comment_id=321,
+        latest_request_comment_url="https://github.com/owner/repo/pull/42#issuecomment-321",
+        latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
+        attempt_count=1,
+        next_retry_at=datetime(2026, 4, 17, 0, 0, 0),
+    )
+    mq._codex_review_requests[reg.id] = reg
+
+    async def immediate_sleep(_seconds):
+        return None
+
+    persisted_attempts = []
+
+    def capture_update(_request_id, **kwargs):
+        if "attempt_count" in kwargs:
+            persisted_attempts.append(kwargs)
+            reg.is_active = False
+
+    with patch("asyncio.sleep", side_effect=immediate_sleep):
+        with patch("src.message_queue.detect_codex_pickup", return_value=False):
+            with patch("src.message_queue.find_fresh_codex_review_or_comment", return_value=None):
+                with patch(
+                    "src.message_queue.post_pr_review_comment",
+                    return_value={
+                        "comment_id": 999,
+                        "comment_url": "https://github.com/owner/repo/pull/42#issuecomment-999",
+                        "posted_at": "2026-04-17T00:05:00+00:00",
+                    },
+                    ):
+                        with patch("src.message_queue.fetch_issue_comment", side_effect=RuntimeError("boom")):
+                            with patch.object(mq, "_update_codex_review_request_db", side_effect=capture_update):
+                                await mq._run_codex_review_request_task(reg.id)
+
+    assert reg.attempt_count == 2
+    assert reg.latest_request_comment_id == 999
+    assert reg.latest_request_comment_url.endswith("999")
+    assert reg.latest_request_posted_at == datetime(2026, 4, 17, 0, 5, 0)
+    assert persisted_attempts
+    assert persisted_attempts[-1]["attempt_count"] == 2
+    assert persisted_attempts[-1]["latest_request_comment_id"] == 999
 
 
 def test_codex_review_request_endpoints_roundtrip(mock_session_manager):

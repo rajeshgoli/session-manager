@@ -1157,6 +1157,8 @@ class MessageQueueManager:
         registration = self._codex_review_requests.get(request_id)
         if registration is None:
             return None
+        if not registration.is_active:
+            return registration
 
         registration.is_active = False
         registration.state = state
@@ -1314,16 +1316,26 @@ class MessageQueueManager:
                             self._parse_iso_datetime(comment_result.get("posted_at")) or now
                         )
                         if latest_comment_id:
-                            latest_comment = await asyncio.to_thread(
-                                fetch_issue_comment,
-                                registration.repo,
-                                latest_comment_id,
-                            )
-                            if latest_comment:
-                                latest_comment_url = latest_comment.get("html_url") or latest_comment_url
-                                latest_posted_at = (
-                                    self._parse_iso_datetime(latest_comment.get("created_at")) or latest_posted_at
+                            try:
+                                latest_comment = await asyncio.to_thread(
+                                    fetch_issue_comment,
+                                    registration.repo,
+                                    latest_comment_id,
                                 )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Codex review comment refresh failed for %s PR #%s comment %s: %s",
+                                    registration.repo,
+                                    registration.pr_number,
+                                    latest_comment_id,
+                                    exc,
+                                )
+                            else:
+                                if latest_comment:
+                                    latest_comment_url = latest_comment.get("html_url") or latest_comment_url
+                                    latest_posted_at = (
+                                        self._parse_iso_datetime(latest_comment.get("created_at")) or latest_posted_at
+                                    )
 
                         registration.attempt_count += 1
                         registration.latest_request_comment_id = latest_comment_id
