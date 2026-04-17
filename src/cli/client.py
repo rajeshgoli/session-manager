@@ -1153,7 +1153,7 @@ class SessionManagerClient:
         repo: Optional[str] = None,
         pr_number: Optional[int] = None,
         include_inactive: bool = False,
-    ) -> Optional[list]:
+    ) -> dict:
         """List durable Codex PR review requests."""
         params = []
         if notify_target:
@@ -1165,10 +1165,12 @@ class SessionManagerClient:
         if include_inactive:
             params.append("include_inactive=true")
         suffix = f"?{'&'.join(params)}" if params else ""
-        data, success, unavailable = self._request("GET", f"/codex-review-requests{suffix}")
-        if unavailable or not success or not data:
-            return None
-        return data.get("requests", [])
+        data, status_code, unavailable = self._request_with_status("GET", f"/codex-review-requests{suffix}")
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
 
     def get_codex_review_request(self, request_id: str) -> dict:
         """Fetch one durable Codex PR review request by id."""

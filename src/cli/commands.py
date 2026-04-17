@@ -3331,7 +3331,7 @@ def cmd_request_codex_review_create(
         return 2
 
     resolved_repo = repo
-    if resolved_repo is None and current_session_id is None:
+    if resolved_repo is None:
         resolved_repo = get_pr_repo_from_git(os.getcwd())
     if not resolved_repo and not current_session_id:
         print("Error: Could not determine GitHub repo; pass --repo explicitly.", file=sys.stderr)
@@ -3382,15 +3382,21 @@ def cmd_request_codex_review_list(
             print("Error: No session context. Use --notify or --all.", file=sys.stderr)
             return 2
 
-    requests = client.list_codex_review_requests(
+    result = client.list_codex_review_requests(
         notify_target=effective_notify_target,
         repo=repo,
         pr_number=pr_number,
         include_inactive=include_inactive,
     )
-    if requests is None:
+    if result.get("unavailable"):
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to list Codex review requests"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    payload = result.get("data") or {}
+    requests = payload.get("requests", [])
 
     if json_output:
         print(json_lib.dumps(requests, indent=2))
@@ -3456,14 +3462,20 @@ def cmd_request_codex_review_status(
             else:
                 print("Error: No session context. Use --notify, --all, or a request ID.", file=sys.stderr)
                 return 2
-        requests = client.list_codex_review_requests(
+        result = client.list_codex_review_requests(
             notify_target=effective_notify_target,
             pr_number=pr_number,
             include_inactive=True,
         )
-        if requests is None:
+        if result.get("unavailable"):
             print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
+        if not result.get("ok"):
+            detail = result.get("detail") or "Failed to list Codex review requests"
+            print(f"Error: {detail}", file=sys.stderr)
+            return 1
+        payload_data = result.get("data") or {}
+        requests = payload_data.get("requests", [])
         if not requests:
             print("Error: No Codex review request found", file=sys.stderr)
             return 1

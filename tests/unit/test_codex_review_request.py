@@ -581,6 +581,17 @@ class TestClientCodexReviewRequest:
             )
             assert result["ok"] is True
 
+    def test_list_request_preserves_api_error_detail(self):
+        client = SessionManagerClient()
+        with patch.object(client, "_request_with_status") as mock_request:
+            mock_request.return_value = ({"detail": "Notify target not found"}, 404, False)
+
+            result = client.list_codex_review_requests(notify_target="missing")
+
+            assert result["ok"] is False
+            assert result["unavailable"] is False
+            assert result["detail"] == "Notify target not found"
+
 
 def test_cmd_request_codex_review_create_list_status_cancel(capsys):
     client = MagicMock()
@@ -593,18 +604,24 @@ def test_cmd_request_codex_review_create_list_status_cancel(capsys):
             "notify_session_id": "agent618",
         },
     }
-    client.list_codex_review_requests.return_value = [
-        {
-            "id": "req123",
-            "repo": "owner/repo",
-            "pr_number": 42,
-            "notify_name": "maintainer",
-            "state": "active",
-            "attempt_count": 1,
-            "pickup_detected_at": None,
-            "next_retry_at": "2026-04-17T00:10:00",
-        }
-    ]
+    client.list_codex_review_requests.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "requests": [
+                {
+                    "id": "req123",
+                    "repo": "owner/repo",
+                    "pr_number": 42,
+                    "notify_name": "maintainer",
+                    "state": "active",
+                    "attempt_count": 1,
+                    "pickup_detected_at": None,
+                    "next_retry_at": "2026-04-17T00:10:00",
+                }
+            ]
+        },
+    }
     client.get_codex_review_request.return_value = {
         "ok": True,
         "unavailable": False,
@@ -694,7 +711,7 @@ def test_cmd_request_codex_review_create_infers_repo_outside_managed_session(cap
     assert call_kwargs["repo"] == "owner/repo"
 
 
-def test_cmd_request_codex_review_create_managed_session_defers_repo_inference(capsys):
+def test_cmd_request_codex_review_create_managed_session_prefers_cwd_repo(capsys):
     client = MagicMock()
     client.create_codex_review_request.return_value = {
         "ok": True,
@@ -702,7 +719,7 @@ def test_cmd_request_codex_review_create_managed_session_defers_repo_inference(c
         "data": {"id": "req123", "notify_name": "maintainer", "notify_session_id": "agent618"},
     }
 
-    with patch("src.cli.commands.get_pr_repo_from_git") as infer_repo:
+    with patch("src.cli.commands.get_pr_repo_from_git", return_value="owner/repo") as infer_repo:
         rc = cmd_request_codex_review_create(
             client,
             current_session_id="agent618",
@@ -715,9 +732,80 @@ def test_cmd_request_codex_review_create_managed_session_defers_repo_inference(c
         )
 
     assert rc == 0
-    infer_repo.assert_not_called()
+    infer_repo.assert_called_once()
+    call_kwargs = client.create_codex_review_request.call_args.kwargs
+    assert call_kwargs["repo"] == "owner/repo"
+
+
+def test_cmd_request_codex_review_create_managed_session_falls_back_when_cwd_repo_unknown(capsys):
+    client = MagicMock()
+    client.create_codex_review_request.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {"id": "req123", "notify_name": "maintainer", "notify_session_id": "agent618"},
+    }
+
+    with patch("src.cli.commands.get_pr_repo_from_git", return_value=None) as infer_repo:
+        rc = cmd_request_codex_review_create(
+            client,
+            current_session_id="agent618",
+            pr_number=42,
+            repo=None,
+            steer=None,
+            notify_target=None,
+            poll_interval_seconds=30,
+            retry_interval_seconds=600,
+        )
+
+    assert rc == 0
+    infer_repo.assert_called_once()
     call_kwargs = client.create_codex_review_request.call_args.kwargs
     assert call_kwargs["repo"] is None
+
+
+def test_cmd_request_codex_review_list_preserves_api_errors(capsys):
+    client = MagicMock()
+    client.list_codex_review_requests.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "detail": "Notify target not found",
+        "data": None,
+    }
+
+    rc = cmd_request_codex_review_list(
+        client,
+        current_session_id="agent618",
+        notify_target="missing",
+        list_all=False,
+        include_inactive=False,
+        json_output=False,
+    )
+
+    assert rc == 1
+    assert "Notify target not found" in capsys.readouterr().err
+
+
+def test_cmd_request_codex_review_status_preserves_list_api_errors(capsys):
+    client = MagicMock()
+    client.list_codex_review_requests.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "detail": "Notify target not found",
+        "data": None,
+    }
+
+    rc = cmd_request_codex_review_status(
+        client,
+        current_session_id=None,
+        request_id=None,
+        pr_number=42,
+        notify_target="missing",
+        list_all=False,
+        json_output=False,
+    )
+
+    assert rc == 1
+    assert "Notify target not found" in capsys.readouterr().err
 
 
 def test_cmd_request_codex_review_create_requires_repo_when_no_context(capsys):
