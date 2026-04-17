@@ -1133,19 +1133,32 @@ class MessageQueueManager:
                 registration.last_polled_at = now
                 updates: dict[str, object] = {"last_polled_at": now}
 
-                try:
-                    if registration.latest_request_comment_id and not registration.pickup_detected_at:
+                if registration.latest_request_comment_id and not registration.pickup_detected_at:
+                    try:
                         picked_up = await asyncio.to_thread(
                             detect_codex_pickup,
                             registration.repo,
                             registration.latest_request_comment_id,
                         )
+                    except Exception as exc:
+                        registration.last_error = f"pickup detection failed: {exc}"
+                        updates["last_error"] = registration.last_error
+                        logger.warning(
+                            "Codex review pickup check failed for %s PR #%s: %s",
+                            registration.repo,
+                            registration.pr_number,
+                            exc,
+                        )
+                    else:
                         if picked_up:
                             registration.pickup_detected_at = now
                             registration.pickup_source = "reaction"
+                            registration.last_error = None
                             updates["pickup_detected_at"] = now
                             updates["pickup_source"] = "reaction"
+                            updates["last_error"] = None
 
+                try:
                     review_match = await asyncio.to_thread(
                         find_fresh_codex_review_or_comment,
                         registration.repo,

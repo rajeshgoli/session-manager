@@ -225,6 +225,47 @@ async def test_codex_review_request_task_completes_and_queues_message(mq):
     assert "Codex comment for PR #42 is here" in mq.queue_message.call_args.kwargs["text"]
 
 
+@pytest.mark.asyncio
+async def test_codex_review_request_task_still_checks_review_when_pickup_lookup_fails(mq):
+    reg = CodexReviewRequestRegistration(
+        id="req124",
+        repo="owner/repo",
+        pr_number=42,
+        requester_session_id="agent618",
+        notify_session_id="agent618",
+        steer=None,
+        requested_at=datetime(2026, 4, 17, 0, 0, 0),
+        latest_request_comment_id=321,
+        latest_request_comment_url="https://github.com/owner/repo/pull/42#issuecomment-321",
+        latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
+        attempt_count=1,
+        next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
+    )
+    mq._codex_review_requests[reg.id] = reg
+    mq.queue_message = MagicMock()
+
+    async def immediate_sleep(_seconds):
+        return None
+
+    with patch("asyncio.sleep", side_effect=immediate_sleep):
+        with patch("src.message_queue.detect_codex_pickup", side_effect=RuntimeError("boom")):
+            with patch(
+                "src.message_queue.find_fresh_codex_review_or_comment",
+                return_value={
+                    "source": "review",
+                    "created_at": "2026-04-17T00:01:00+00:00",
+                    "id": 778,
+                    "url": "https://github.com/owner/repo/pull/42#pullrequestreview-778",
+                },
+            ):
+                await mq._run_codex_review_request_task(reg.id)
+
+    assert reg.state == "completed"
+    assert reg.is_active is False
+    mq.queue_message.assert_called_once()
+    assert "Codex review for PR #42 is here" in mq.queue_message.call_args.kwargs["text"]
+
+
 def test_recover_codex_review_requests_restores_active_records(mock_session_manager, temp_db_path):
     mq1 = MessageQueueManager(mock_session_manager, db_path=temp_db_path, config={}, notifier=None)
     mock_session_manager.message_queue_manager = mq1
@@ -467,6 +508,32 @@ def test_cmd_request_codex_review_create_infers_repo_outside_managed_session(cap
     assert rc == 0
     call_kwargs = client.create_codex_review_request.call_args.kwargs
     assert call_kwargs["repo"] == "owner/repo"
+
+
+def test_cmd_request_codex_review_create_managed_session_defers_repo_inference(capsys):
+    client = MagicMock()
+    client.create_codex_review_request.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {"id": "req123", "notify_name": "maintainer", "notify_session_id": "agent618"},
+    }
+
+    with patch("src.cli.commands.get_pr_repo_from_git") as infer_repo:
+        rc = cmd_request_codex_review_create(
+            client,
+            current_session_id="agent618",
+            pr_number=42,
+            repo=None,
+            steer=None,
+            notify_target=None,
+            poll_interval_seconds=30,
+            retry_interval_seconds=600,
+        )
+
+    assert rc == 0
+    infer_repo.assert_not_called()
+    call_kwargs = client.create_codex_review_request.call_args.kwargs
+    assert call_kwargs["repo"] is None
 
 
 def test_cmd_request_codex_review_create_requires_repo_when_no_context(capsys):

@@ -3330,7 +3330,9 @@ def cmd_request_codex_review_create(
         )
         return 2
 
-    resolved_repo = repo or get_pr_repo_from_git(os.getcwd())
+    resolved_repo = repo
+    if resolved_repo is None and current_session_id is None:
+        resolved_repo = get_pr_repo_from_git(os.getcwd())
     if not resolved_repo and not current_session_id:
         print("Error: Could not determine GitHub repo; pass --repo explicitly.", file=sys.stderr)
         return 1
