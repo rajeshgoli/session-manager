@@ -22,12 +22,6 @@ from src.models import CodexReviewRequestRegistration, Session, SessionStatus
 from src.server import create_app
 
 
-def noop_create_task(coro):
-    """Silently close coroutine without running it."""
-    coro.close()
-    return MagicMock()
-
-
 @pytest.fixture
 def temp_db_path(tmp_path):
     return str(tmp_path / "test_codex_review_request.db")
@@ -70,7 +64,7 @@ def mq(mock_session_manager, temp_db_path):
 
 @pytest.mark.asyncio
 async def test_register_codex_review_request_persists_and_lists(mq, mock_session_manager, temp_db_path):
-    with patch("asyncio.create_task", noop_create_task):
+    with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
         with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
@@ -112,7 +106,7 @@ async def test_register_codex_review_request_persists_and_lists(mq, mock_session
 
 @pytest.mark.asyncio
 async def test_register_codex_review_request_rejects_duplicates(mq):
-    with patch("asyncio.create_task", noop_create_task):
+    with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
         with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
@@ -136,6 +130,58 @@ async def test_register_codex_review_request_rejects_duplicates(mq):
                             requester_session_id="agent618",
                             notify_session_id="agent618",
                         )
+
+
+@pytest.mark.asyncio
+async def test_register_codex_review_request_requires_explicit_repo_without_requester_context(mq):
+    with pytest.raises(ValueError, match="pass --repo explicitly"):
+        await mq.register_codex_review_request(
+            pr_number=42,
+            repo=None,
+            requester_session_id=None,
+            notify_session_id="agent618",
+        )
+
+
+@pytest.mark.asyncio
+async def test_register_codex_review_request_serializes_duplicate_creation(mq):
+    comment_call_count = 0
+
+    def fake_post(*_args, **_kwargs):
+        nonlocal comment_call_count
+        comment_call_count += 1
+        return {
+            "comment_id": 321,
+            "comment_url": "https://github.com/owner/repo/pull/42#issuecomment-321",
+            "posted_at": "2026-04-17T00:00:00+00:00",
+        }
+
+    with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+            with patch("src.message_queue.post_pr_review_comment", side_effect=fake_post):
+                with patch("src.message_queue.fetch_issue_comment", return_value=None):
+                    first = asyncio.create_task(
+                        mq.register_codex_review_request(
+                            pr_number=42,
+                            repo="owner/repo",
+                            requester_session_id="agent618",
+                            notify_session_id="agent618",
+                        )
+                    )
+                    second = asyncio.create_task(
+                        mq.register_codex_review_request(
+                            pr_number=42,
+                            repo="owner/repo",
+                            requester_session_id="agent618",
+                            notify_session_id="agent618",
+                        )
+                    )
+                    first_result, second_result = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert isinstance(first_result, CodexReviewRequestRegistration)
+    assert isinstance(second_result, ValueError)
+    assert "already exists" in str(second_result)
+    assert comment_call_count == 1
 
 
 @pytest.mark.asyncio
@@ -183,7 +229,7 @@ def test_recover_codex_review_requests_restores_active_records(mock_session_mana
     mq1 = MessageQueueManager(mock_session_manager, db_path=temp_db_path, config={}, notifier=None)
     mock_session_manager.message_queue_manager = mq1
 
-    with patch("asyncio.create_task", noop_create_task):
+    with patch.object(mq1, "_run_codex_review_request_task", AsyncMock()):
         with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
@@ -204,7 +250,7 @@ def test_recover_codex_review_requests_restores_active_records(mock_session_mana
                     )
 
     mq2 = MessageQueueManager(mock_session_manager, db_path=temp_db_path, config={}, notifier=None)
-    with patch("asyncio.create_task", noop_create_task):
+    with patch.object(mq2, "_run_codex_review_request_task", AsyncMock()):
         asyncio.run(mq2._recover_codex_review_requests())
 
     recovered = mq2.list_codex_review_requests(notify_session_id="agent618")
@@ -396,3 +442,47 @@ def test_cmd_request_codex_review_create_list_status_cancel(capsys):
     rc = cmd_request_codex_review_cancel(client, "req123")
     assert rc == 0
     assert "Cancelled Codex review request: req123" in capsys.readouterr().out
+
+
+def test_cmd_request_codex_review_create_infers_repo_outside_managed_session(capsys):
+    client = MagicMock()
+    client.create_codex_review_request.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {"id": "req123", "notify_name": "maintainer", "notify_session_id": "maintainer"},
+    }
+
+    with patch("src.cli.commands.get_pr_repo_from_git", return_value="owner/repo"):
+        rc = cmd_request_codex_review_create(
+            client,
+            current_session_id=None,
+            pr_number=42,
+            repo=None,
+            steer=None,
+            notify_target="maintainer",
+            poll_interval_seconds=30,
+            retry_interval_seconds=600,
+        )
+
+    assert rc == 0
+    call_kwargs = client.create_codex_review_request.call_args.kwargs
+    assert call_kwargs["repo"] == "owner/repo"
+
+
+def test_cmd_request_codex_review_create_requires_repo_when_no_context(capsys):
+    client = MagicMock()
+
+    with patch("src.cli.commands.get_pr_repo_from_git", return_value=None):
+        rc = cmd_request_codex_review_create(
+            client,
+            current_session_id=None,
+            pr_number=42,
+            repo=None,
+            steer=None,
+            notify_target="maintainer",
+            poll_interval_seconds=30,
+            retry_interval_seconds=600,
+        )
+
+    assert rc == 1
+    assert "Could not determine GitHub repo" in capsys.readouterr().err

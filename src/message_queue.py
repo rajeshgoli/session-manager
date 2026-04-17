@@ -119,6 +119,7 @@ class MessageQueueManager:
         # Durable Codex PR review requests (#618): keyed by request_id
         self._codex_review_requests: Dict[str, CodexReviewRequestRegistration] = {}
         self._codex_review_request_tasks: Dict[str, asyncio.Task] = {}
+        self._codex_review_request_creation_locks: Dict[tuple[str, int, str], asyncio.Lock] = {}
 
         # Periodic remind registrations (#188): keyed by target_session_id (one-active-per-target)
         self._remind_registrations: Dict[str, RemindRegistration] = {}
@@ -869,23 +870,14 @@ class MessageQueueManager:
         if repo:
             return repo
 
-        candidate_dirs: list[str] = []
         if requester_session_id:
             requester = self.session_manager.get_session(requester_session_id)
             if requester and getattr(requester, "working_dir", None):
-                candidate_dirs.append(requester.working_dir)
-        candidate_dirs.append(str(Path.cwd()))
+                resolved = get_pr_repo_from_git(requester.working_dir)
+                if resolved:
+                    return resolved
 
-        seen: set[str] = set()
-        for working_dir in candidate_dirs:
-            if not working_dir or working_dir in seen:
-                continue
-            seen.add(working_dir)
-            resolved = get_pr_repo_from_git(working_dir)
-            if resolved:
-                return resolved
-
-        raise ValueError("Could not determine GitHub repo; pass --repo explicitly")
+        raise ValueError("Could not determine GitHub repo without requester session context; pass --repo explicitly")
 
     def _find_active_codex_review_request(
         self,
@@ -929,102 +921,105 @@ class MessageQueueManager:
             raise ValueError(f"Requester session {requester_session_id} not found")
 
         resolved_repo = self._resolve_codex_review_repo(repo, requester_session_id)
-        if self._find_active_codex_review_request(resolved_repo, pr_number, notify_session_id):
-            raise ValueError(
-                f"Active Codex review request already exists for {resolved_repo} PR #{pr_number}"
+        creation_key = (resolved_repo, pr_number, notify_session_id)
+        creation_lock = self._codex_review_request_creation_locks.setdefault(creation_key, asyncio.Lock())
+        async with creation_lock:
+            if self._find_active_codex_review_request(resolved_repo, pr_number, notify_session_id):
+                raise ValueError(
+                    f"Active Codex review request already exists for {resolved_repo} PR #{pr_number}"
+                )
+
+            await asyncio.to_thread(validate_open_pr, resolved_repo, pr_number)
+            comment_result = await asyncio.to_thread(post_pr_review_comment, resolved_repo, pr_number, steer)
+
+            latest_comment_id = comment_result.get("comment_id") or None
+            latest_comment_url = comment_result.get("comment_url")
+            latest_posted_at = self._parse_iso_datetime(comment_result.get("posted_at")) or datetime.now(timezone.utc).replace(tzinfo=None)
+
+            if latest_comment_id:
+                try:
+                    latest_comment = await asyncio.to_thread(fetch_issue_comment, resolved_repo, latest_comment_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to refresh posted Codex review request comment %s on %s PR #%s: %s",
+                        latest_comment_id,
+                        resolved_repo,
+                        pr_number,
+                        exc,
+                    )
+                else:
+                    if latest_comment:
+                        latest_comment_url = latest_comment.get("html_url") or latest_comment_url
+                        latest_posted_at = (
+                            self._parse_iso_datetime(latest_comment.get("created_at")) or latest_posted_at
+                        )
+
+            request_id = uuid.uuid4().hex[:12]
+            registration = CodexReviewRequestRegistration(
+                id=request_id,
+                repo=resolved_repo,
+                pr_number=pr_number,
+                requester_session_id=requester_session_id,
+                notify_session_id=notify_session_id,
+                steer=steer,
+                requested_at=latest_posted_at,
+                latest_request_comment_id=latest_comment_id,
+                latest_request_comment_url=latest_comment_url,
+                latest_request_posted_at=latest_posted_at,
+                attempt_count=1,
+                next_retry_at=latest_posted_at + timedelta(seconds=retry_interval_seconds),
+                poll_interval_seconds=poll_interval_seconds,
+                retry_interval_seconds=retry_interval_seconds,
+            )
+            self._codex_review_requests[request_id] = registration
+            self._execute(
+                """
+                INSERT OR REPLACE INTO codex_review_request_registrations
+                (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+                 requested_at, latest_request_comment_id, latest_request_comment_url,
+                 latest_request_posted_at, attempt_count, next_retry_at,
+                 poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+                 pickup_source, review_landed_at, review_source, review_comment_id,
+                 review_url, last_polled_at, last_error, state, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    registration.id,
+                    registration.repo,
+                    registration.pr_number,
+                    registration.requester_session_id,
+                    registration.notify_session_id,
+                    registration.steer,
+                    registration.requested_at.isoformat(),
+                    registration.latest_request_comment_id,
+                    registration.latest_request_comment_url,
+                    registration.latest_request_posted_at.isoformat() if registration.latest_request_posted_at else None,
+                    registration.attempt_count,
+                    registration.next_retry_at.isoformat() if registration.next_retry_at else None,
+                    registration.poll_interval_seconds,
+                    registration.retry_interval_seconds,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    registration.state,
+                ),
             )
 
-        await asyncio.to_thread(validate_open_pr, resolved_repo, pr_number)
-        comment_result = await asyncio.to_thread(post_pr_review_comment, resolved_repo, pr_number, steer)
-
-        latest_comment_id = comment_result.get("comment_id") or None
-        latest_comment_url = comment_result.get("comment_url")
-        latest_posted_at = self._parse_iso_datetime(comment_result.get("posted_at")) or datetime.now(timezone.utc).replace(tzinfo=None)
-
-        if latest_comment_id:
-            try:
-                latest_comment = await asyncio.to_thread(fetch_issue_comment, resolved_repo, latest_comment_id)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to refresh posted Codex review request comment %s on %s PR #%s: %s",
-                    latest_comment_id,
-                    resolved_repo,
-                    pr_number,
-                    exc,
-                )
-            else:
-                if latest_comment:
-                    latest_comment_url = latest_comment.get("html_url") or latest_comment_url
-                    latest_posted_at = (
-                        self._parse_iso_datetime(latest_comment.get("created_at")) or latest_posted_at
-                    )
-
-        request_id = uuid.uuid4().hex[:12]
-        registration = CodexReviewRequestRegistration(
-            id=request_id,
-            repo=resolved_repo,
-            pr_number=pr_number,
-            requester_session_id=requester_session_id,
-            notify_session_id=notify_session_id,
-            steer=steer,
-            requested_at=latest_posted_at,
-            latest_request_comment_id=latest_comment_id,
-            latest_request_comment_url=latest_comment_url,
-            latest_request_posted_at=latest_posted_at,
-            attempt_count=1,
-            next_retry_at=latest_posted_at + timedelta(seconds=retry_interval_seconds),
-            poll_interval_seconds=poll_interval_seconds,
-            retry_interval_seconds=retry_interval_seconds,
-        )
-        self._codex_review_requests[request_id] = registration
-        self._execute(
-            """
-            INSERT OR REPLACE INTO codex_review_request_registrations
-            (id, repo, pr_number, requester_session_id, notify_session_id, steer,
-             requested_at, latest_request_comment_id, latest_request_comment_url,
-             latest_request_posted_at, attempt_count, next_retry_at,
-             poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
-             pickup_source, review_landed_at, review_source, review_comment_id,
-             review_url, last_polled_at, last_error, state, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            """,
-            (
+            task = asyncio.create_task(self._run_codex_review_request_task(registration.id))
+            self._codex_review_request_tasks[registration.id] = task
+            logger.info(
+                "Registered Codex review request %s for %s PR #%s notify=%s",
                 registration.id,
                 registration.repo,
                 registration.pr_number,
-                registration.requester_session_id,
                 registration.notify_session_id,
-                registration.steer,
-                registration.requested_at.isoformat(),
-                registration.latest_request_comment_id,
-                registration.latest_request_comment_url,
-                registration.latest_request_posted_at.isoformat() if registration.latest_request_posted_at else None,
-                registration.attempt_count,
-                registration.next_retry_at.isoformat() if registration.next_retry_at else None,
-                registration.poll_interval_seconds,
-                registration.retry_interval_seconds,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                registration.state,
-            ),
-        )
-
-        task = asyncio.create_task(self._run_codex_review_request_task(registration.id))
-        self._codex_review_request_tasks[registration.id] = task
-        logger.info(
-            "Registered Codex review request %s for %s PR #%s notify=%s",
-            registration.id,
-            registration.repo,
-            registration.pr_number,
-            registration.notify_session_id,
-        )
-        return registration
+            )
+            return registration
 
     def list_codex_review_requests(
         self,

@@ -18,6 +18,7 @@ UNAVAILABLE_STATUS_MESSAGE = "You: Session manager unavailable or request timed 
 from .client import SEND_API_TIMEOUT, SessionManagerClient
 from .formatting import format_session_line, format_relative_time, format_status_list
 from ..lock_manager import LockManager
+from ..github_reviews import get_pr_repo_from_git
 from ..codex_provider_policy import (
     REMOVED_CODEX_SERVER_ENTRYPOINT_MESSAGE,
     get_codex_app_policy,
@@ -3329,9 +3330,14 @@ def cmd_request_codex_review_create(
         )
         return 2
 
+    resolved_repo = repo or get_pr_repo_from_git(os.getcwd())
+    if not resolved_repo and not current_session_id:
+        print("Error: Could not determine GitHub repo; pass --repo explicitly.", file=sys.stderr)
+        return 1
+
     result = client.create_codex_review_request(
         pr_number=pr_number,
-        repo=repo,
+        repo=resolved_repo,
         steer=steer,
         notify_target=effective_notify_target,
         requester_session_id=current_session_id,
