@@ -299,6 +299,78 @@ def test_recover_codex_review_requests_restores_active_records(mock_session_mana
     assert recovered[0].repo == "owner/repo"
 
 
+def test_recover_codex_review_requests_preserves_inactive_history(mock_session_manager, temp_db_path):
+    mq1 = MessageQueueManager(mock_session_manager, db_path=temp_db_path, config={}, notifier=None)
+    mock_session_manager.message_queue_manager = mq1
+
+    with patch.object(mq1, "_run_codex_review_request_task", AsyncMock()):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+            with patch(
+                "src.message_queue.post_pr_review_comment",
+                return_value={
+                    "comment_id": 321,
+                    "comment_url": "https://github.com/owner/repo/pull/42#issuecomment-321",
+                    "posted_at": "2026-04-17T00:00:00+00:00",
+                },
+            ):
+                with patch("src.message_queue.fetch_issue_comment", return_value=None):
+                    reg = asyncio.run(
+                        mq1.register_codex_review_request(
+                            pr_number=42,
+                            repo="owner/repo",
+                            requester_session_id="agent618",
+                            notify_session_id="agent618",
+                        )
+                    )
+    mq1.cancel_codex_review_request(reg.id)
+
+    mq2 = MessageQueueManager(mock_session_manager, db_path=temp_db_path, config={}, notifier=None)
+    with patch.object(mq2, "_run_codex_review_request_task", AsyncMock()):
+        asyncio.run(mq2._recover_codex_review_requests())
+
+    recovered = mq2.list_codex_review_requests(notify_session_id="agent618", include_inactive=True)
+    assert len(recovered) == 1
+    assert recovered[0].id == reg.id
+    assert recovered[0].state == "cancelled"
+    assert recovered[0].is_active is False
+    assert mq2.get_codex_review_request(reg.id) is not None
+    assert reg.id not in mq2._codex_review_request_tasks
+
+
+@pytest.mark.asyncio
+async def test_register_codex_review_request_resolves_repo_via_to_thread(mq):
+    seen_repo_resolution = False
+
+    async def fake_to_thread(func, *args, **kwargs):
+        nonlocal seen_repo_resolution
+        if func is infer_repo:
+            seen_repo_resolution = True
+        return func(*args, **kwargs)
+
+    with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+            with patch(
+                "src.message_queue.post_pr_review_comment",
+                return_value={
+                    "comment_id": 321,
+                    "comment_url": "https://github.com/owner/repo/pull/42#issuecomment-321",
+                    "posted_at": "2026-04-17T00:00:00+00:00",
+                },
+            ):
+                with patch("src.message_queue.fetch_issue_comment", return_value=None):
+                    with patch("src.message_queue.get_pr_repo_from_git", return_value="owner/repo") as infer_repo:
+                        with patch("src.message_queue.asyncio.to_thread", side_effect=fake_to_thread):
+                            reg = await mq.register_codex_review_request(
+                                pr_number=42,
+                                repo=None,
+                                requester_session_id="agent618",
+                                notify_session_id="agent618",
+                            )
+
+    assert reg.repo == "owner/repo"
+    assert seen_repo_resolution is True
+
+
 def test_codex_review_request_endpoints_roundtrip(mock_session_manager):
     queue_mgr = MagicMock()
     reg = CodexReviewRequestRegistration(
