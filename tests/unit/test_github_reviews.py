@@ -15,6 +15,7 @@ from src.github_reviews import (
     fetch_latest_codex_review,
     fetch_pr_issue_comments,
     fetch_pr_reviews,
+    get_codex_request_reaction_state,
     is_codex_actor,
     post_pr_review_comment,
     poll_for_codex_review,
@@ -242,6 +243,17 @@ class TestCodexHelpers:
             {"content": "+1", "user": {"login": "chatgpt-codex-connector[bot]"}},
         ]
         assert detect_codex_pickup("owner/repo", 12345) is False
+
+    @patch("src.github_reviews.fetch_issue_comment_reactions")
+    def test_get_codex_request_reaction_state_detects_clean_pass(self, mock_reactions):
+        mock_reactions.return_value = [
+            {"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}},
+            {"content": "+1", "user": {"login": "chatgpt-codex-connector[bot]"}},
+        ]
+
+        result = get_codex_request_reaction_state("owner/repo", 12345)
+
+        assert result == {"picked_up": True, "clean_pass": True}
 
     @patch("src.github_reviews.fetch_pr_issue_comments")
     @patch("src.github_reviews.fetch_latest_codex_review")
