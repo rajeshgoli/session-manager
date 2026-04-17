@@ -549,6 +549,39 @@ def test_codex_review_request_endpoint_maps_operational_failures(mock_session_ma
     assert response.json()["detail"] == "Failed to request Codex review: gh hung"
 
 
+def test_codex_review_request_endpoint_serializes_string_review_ids(mock_session_manager):
+    queue_mgr = MagicMock()
+    reg = CodexReviewRequestRegistration(
+        id="req123",
+        repo="owner/repo",
+        pr_number=42,
+        requester_session_id="agent618",
+        notify_session_id="agent618",
+        steer=None,
+        requested_at=datetime(2026, 4, 17, 0, 0, 0),
+        latest_request_comment_id=321,
+        latest_request_comment_url="https://github.com/owner/repo/pull/42#issuecomment-321",
+        latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
+        attempt_count=1,
+        next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
+        review_landed_at=datetime(2026, 4, 17, 0, 11, 0),
+        review_source="review",
+        review_comment_id="R_kw123",
+        review_url="https://github.com/owner/repo/pull/42",
+    )
+    reg.is_active = False
+    reg.state = "completed"
+    queue_mgr.get_codex_review_request.return_value = reg
+
+    mock_session_manager.message_queue_manager = queue_mgr
+    app = create_app(session_manager=mock_session_manager)
+    client = TestClient(app)
+
+    response = client.get("/codex-review-requests/req123")
+    assert response.status_code == 200
+    assert response.json()["review_comment_id"] == "R_kw123"
+
+
 class TestClientCodexReviewRequest:
     """Tests for SessionManagerClient codex review request helpers."""
 

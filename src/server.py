@@ -706,7 +706,7 @@ class CodexReviewRequestResponse(BaseModel):
     pickup_source: Optional[str] = None
     review_landed_at: Optional[str] = None
     review_source: Optional[str] = None
-    review_comment_id: Optional[int] = None
+    review_comment_id: Optional[str | int] = None
     review_url: Optional[str] = None
     last_polled_at: Optional[str] = None
     last_error: Optional[str] = None
