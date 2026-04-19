@@ -190,6 +190,69 @@ def resolve_session_id_with_status(
     return None, None, False
 
 
+def resolve_restore_session_id(
+    client: SessionManagerClient,
+    identifier: str,
+    *,
+    timeout: Optional[float] = None,
+) -> tuple[Optional[str], Optional[dict], bool, Optional[str]]:
+    """
+    Resolve a restore target.
+
+    Direct session IDs continue to win. For alias/friendly-name matches, prefer
+    a stopped session because restore only applies to stopped sessions.
+
+    Returns:
+        Tuple of (session_id, session_dict, unavailable, error_message)
+    """
+    if not identifier or not identifier.strip():
+        return None, None, False, None
+
+    try:
+        session = client.get_session(identifier, timeout=timeout)
+    except TypeError:
+        session = client.get_session(identifier)
+    if session:
+        return identifier, session, False, None
+
+    try:
+        sessions = client.list_sessions(include_stopped=True, timeout=timeout)
+    except TypeError:
+        try:
+            sessions = client.list_sessions(include_stopped=True)
+        except TypeError:
+            sessions = client.list_sessions()
+    if sessions is None:
+        return None, None, True, None
+
+    alias_matches = [s for s in sessions if identifier in (s.get("aliases") or [])]
+    name_matches = [s for s in sessions if s.get("friendly_name") == identifier]
+    candidates = alias_matches or name_matches
+    if not candidates:
+        return None, None, False, None
+
+    stopped_matches = [s for s in candidates if s.get("status") == "stopped"]
+    if len(stopped_matches) == 1:
+        stopped = stopped_matches[0]
+        return stopped["id"], stopped, False, None
+
+    if len(stopped_matches) > 1:
+        stopped_ids = ", ".join(s["id"] for s in stopped_matches)
+        return None, None, False, (
+            f"Multiple stopped sessions match '{identifier}': {stopped_ids}. "
+            "Use a session ID."
+        )
+
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        return candidate["id"], candidate, False, None
+
+    candidate_ids = ", ".join(s["id"] for s in candidates)
+    return None, None, False, (
+        f"Multiple sessions match '{identifier}': {candidate_ids}. Use a session ID."
+    )
+
+
 def validate_friendly_name(name: str) -> tuple[bool, str]:
     """
     Validate friendly name for shell compatibility.
@@ -2107,15 +2170,14 @@ def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
         1: Failed
         2: Session manager unavailable
     """
-    target_session_id, _ = resolve_session_id(client, target_identifier, include_stopped=True)
+    target_session_id, _, unavailable, error = resolve_restore_session_id(client, target_identifier)
+    if unavailable:
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
     if target_session_id is None:
-        try:
-            sessions = client.list_sessions(include_stopped=True)
-        except TypeError:
-            sessions = client.list_sessions()
-        if sessions is None:
-            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
-            return 2
+        if error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
         print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
         return 1
 
