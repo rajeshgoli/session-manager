@@ -3500,7 +3500,10 @@ def create_app(
 
         if friendly_name is not None or is_em is not None:
             app.state.session_manager._save_state()
-            await _sync_session_display_identity(session)
+            await _sync_session_display_identity(
+                session,
+                telegram_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
+            )
 
         return _session_to_response(session)
 
