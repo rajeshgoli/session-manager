@@ -65,11 +65,22 @@ class TmuxController:
             return None, f"Launch command not found on PATH: {raw_command}"
         return raw_command, None
 
-    def _run_tmux(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _run_tmux(
+        self,
+        *args: str,
+        check: bool = True,
+        timeout: Optional[float] = None,
+    ) -> subprocess.CompletedProcess:
         """Run a tmux command."""
         cmd = ["tmux"] + list(args)
         logger.debug(f"Running tmux command: {' '.join(cmd)}")
-        return subprocess.run(cmd, capture_output=True, text=True, check=check)
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=check,
+            timeout=timeout,
+        )
 
     def _compute_settle_delay_seconds(self, text: str) -> float:
         """Compute adaptive settle delay before Enter to reduce paste-mode races."""
@@ -371,13 +382,20 @@ class TmuxController:
         result = self._run_tmux("has-session", "-t", session_name, check=False)
         return result.returncode == 0
 
-    def set_status_bar(self, session_name: str, friendly_name: str) -> bool:
+    def set_status_bar(
+        self,
+        session_name: str,
+        friendly_name: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
         """
         Update tmux status bar to show friendly name.
 
         Args:
             session_name: tmux session name
             friendly_name: User-friendly name to display
+            timeout_seconds: Optional tmux command timeout
 
         Returns:
             True if successful
@@ -392,10 +410,18 @@ class TmuxController:
                 "set-option",
                 "-t", session_name,
                 "status-left",
-                f"[{friendly_name}] "
+                f"[{friendly_name}] ",
+                timeout=timeout_seconds,
             )
             logger.info(f"Updated status bar for {session_name} to show '{friendly_name}'")
             return True
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Timed out setting status bar for %s after %.2fs",
+                session_name,
+                timeout_seconds if timeout_seconds is not None else 0.0,
+            )
+            return False
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to set status bar: {e.stderr}")
             return False

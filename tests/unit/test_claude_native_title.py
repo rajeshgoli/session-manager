@@ -544,11 +544,7 @@ def test_get_client_session_bounds_slow_tmux_status_sync(
     session.telegram_thread_id = 456
     manager.sessions[session.id] = session
 
-    def slow_status_bar(*args, **kwargs):
-        time.sleep(2)
-        return True
-
-    manager.tmux.set_status_bar.side_effect = slow_status_bar
+    manager.tmux.set_status_bar.return_value = False
 
     notifier = MagicMock()
     notifier.rename_session_topic = AsyncMock(return_value=True)
@@ -563,11 +559,16 @@ def test_get_client_session_bounds_slow_tmux_status_sync(
 
     assert response.status_code == 200
     assert any(
-        "Timed out updating tmux status bar for session claude123" in record.message
+        "Failed to update tmux status bar for session claude123" in record.message
         for record in caplog.records
     )
     assert session.display_identity_synced_name is None
     assert session.display_identity_synced_at_ns is None
+    manager.tmux.set_status_bar.assert_called_once_with(
+        "claude-claude123",
+        "slow-sync-title",
+        timeout_seconds=1.0,
+    )
 
 
 def test_get_session_does_not_mark_telegram_synced_when_bot_missing(tmp_path: Path) -> None:

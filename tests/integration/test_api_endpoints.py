@@ -3,10 +3,10 @@
 import asyncio
 import pytest
 import json
-import re
 import sqlite3
 import time
 from datetime import datetime
+import subprocess
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 
@@ -1432,11 +1432,7 @@ class TestUpdateSession:
 
         mock_session_manager.get_session.return_value = session
 
-        def slow_status_bar(*args, **kwargs):
-            time.sleep(2)
-            return True
-
-        mock_session_manager.tmux.set_status_bar.side_effect = slow_status_bar
+        mock_session_manager.tmux.set_status_bar.return_value = False
 
         app = create_app(
             session_manager=mock_session_manager,
@@ -1447,27 +1443,21 @@ class TestUpdateSession:
         client = TestClient(app)
 
         with caplog.at_level(logging.WARNING):
-            start = time.monotonic()
             response = client.patch(
                 "/sessions/test123",
                 json={"friendly_name": "new-name"},
             )
-            elapsed = time.monotonic() - start
 
         assert response.status_code == 200
-        assert elapsed < 3.0
         assert any(
-            "Timed out updating tmux status bar for session test123" in record.message
+            "Failed to update tmux status bar for session test123" in record.message
             for record in caplog.records
         )
-        timing_records = [
-            record.message for record in caplog.records
-            if "PATCH /sessions/test123 took" in record.message
-        ]
-        assert timing_records
-        match = re.search(r"took ([0-9.]+)s", timing_records[-1])
-        assert match is not None
-        assert float(match.group(1)) < 1.5
+        mock_session_manager.tmux.set_status_bar.assert_called_once_with(
+            "claude-test123",
+            "new-name",
+            timeout_seconds=1.0,
+        )
 
     def test_patch_is_em_sets_flag(self, test_client, mock_session_manager, sample_session):
         """PATCH /sessions/{id} with is_em=true sets is_em flag and returns it in response (#256)."""

@@ -2035,23 +2035,16 @@ def create_app(
         display_name = display_name or _effective_session_name(session)
         tmux_synced = True
         if getattr(session, "provider", "claude") != "codex-app":
-            try:
-                tmux_update = asyncio.to_thread(
+            tmux_synced = bool(
+                await asyncio.to_thread(
                     app.state.session_manager.tmux.set_status_bar,
                     session.tmux_session,
                     display_name,
+                    timeout_seconds=tmux_timeout_seconds,
                 )
-                if tmux_timeout_seconds is not None:
-                    tmux_synced = bool(await asyncio.wait_for(tmux_update, timeout=tmux_timeout_seconds))
-                else:
-                    tmux_synced = bool(await tmux_update)
-            except asyncio.TimeoutError:
-                tmux_synced = False
-                logger.warning(
-                    "Timed out updating tmux status bar for session %s after %.2fs",
-                    session.id,
-                    tmux_timeout_seconds,
-                )
+            )
+            if not tmux_synced:
+                logger.warning("Failed to update tmux status bar for session %s", session.id)
         telegram_synced = True
         if session.telegram_thread_id:
             telegram_bot = getattr(app.state.notifier, "telegram", None) if app.state.notifier else None
