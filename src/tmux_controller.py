@@ -1,54 +1,15 @@
 """tmux operations for spawning and controlling Claude Code sessions."""
 
+import logging
 import asyncio
 import os
 import shlex
-import subprocess
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
-import logging
 
 logger = logging.getLogger(__name__)
-
-_TMUX_RESERVED_KEY_NAMES = {
-    "BSpace",
-    "BTab",
-    "DC",
-    "Delete",
-    "Down",
-    "End",
-    "Enter",
-    "Escape",
-    "Home",
-    "IC",
-    "Insert",
-    "Left",
-    "NPage",
-    "PageDown",
-    "PageUp",
-    "PPage",
-    "Right",
-    "Space",
-    "Tab",
-    "Up",
-}
-_TMUX_RESERVED_KEY_NAMES.update({f"F{i}" for i in range(1, 13)})
-_TMUX_RESERVED_KEY_ALIASES = {
-    "backspace",
-    "bs",
-    "del",
-    "esc",
-    "ins",
-    "pagedown",
-    "pageup",
-    "pgdn",
-    "pgup",
-    "return",
-}
-_TMUX_RESERVED_KEY_NAMES_NORMALIZED = {
-    name.lower() for name in (_TMUX_RESERVED_KEY_NAMES | _TMUX_RESERVED_KEY_ALIASES)
-}
 
 
 class TmuxController:
@@ -141,7 +102,7 @@ class TmuxController:
         payload = text or ""
         max_chunk_chars = max(1, int(self.send_keys_max_chunk_chars or 1))
         if len(payload) <= max_chunk_chars:
-            return self._sanitize_reserved_key_chunks([payload])
+            return [payload]
 
         chunks: list[str] = []
         remaining = payload
@@ -158,21 +119,7 @@ class TmuxController:
             chunks.append(remaining[:split_at])
             remaining = remaining[split_at:]
 
-        return self._sanitize_reserved_key_chunks(chunks)
-
-    def _sanitize_reserved_key_chunks(self, chunks: list[str]) -> list[str]:
-        """Ensure no chunk is interpreted by tmux as a named control key."""
-        sanitized: list[str] = []
-        pending = list(chunks)
-        while pending:
-            chunk = pending.pop(0)
-            normalized = chunk.lower()
-            if normalized in _TMUX_RESERVED_KEY_NAMES_NORMALIZED and len(chunk) > 1:
-                pending.insert(0, chunk[-1])
-                pending.insert(0, chunk[:-1])
-                continue
-            sanitized.append(chunk)
-        return sanitized
+        return chunks
 
     def _get_pane_in_mode(self, session_name: str) -> Optional[int]:
         """Return tmux pane_in_mode (1 copy-mode, 0 normal) for active pane."""
@@ -783,10 +730,9 @@ class TmuxController:
             settle_delay = self._compute_settle_delay_seconds(text)
             chunks = self._split_send_text_chunks(text)
             # Use subprocess with list arguments to prevent shell injection
-            # Note: -l flag causes issues with Claude Code, so we don't use it
             for chunk in chunks:
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "--", chunk],
+                    ["tmux", "send-keys", "-t", session_name, "-l", "--", chunk],
                     check=True,
                     capture_output=True,
                     text=True,
@@ -853,7 +799,7 @@ class TmuxController:
 
             for chunk in chunks:
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, '--', chunk,
+                    'tmux', 'send-keys', '-t', session_name, '-l', '--', chunk,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )

@@ -340,9 +340,10 @@ class TestBugB_TwoCallSendInput:
         assert text_call[1] == "send-keys"
         assert text_call[2] == "-t"
         assert text_call[3] == "claude-test"
-        assert text_call[4] == "--"
-        assert text_call[5] == "hello world"
-        assert "\r" not in text_call[5], "text call must not contain \\r"
+        assert text_call[4] == "-l"
+        assert text_call[5] == "--"
+        assert text_call[6] == "hello world"
+        assert "\r" not in text_call[6], "text call must not contain \\r"
 
         # Second call: send Enter as a separate keystroke
         enter_call = subprocess_calls[1]
@@ -358,7 +359,7 @@ class TestBugB_TwoCallSendInput:
         call_order = []
 
         async def mock_subprocess(*args, **kwargs):
-            call_order.append(("subprocess", args[4]))  # track the key argument
+            call_order.append(("subprocess", args[4]))  # track literal/text vs Enter call
             proc = AsyncMock()
             proc.communicate = AsyncMock(return_value=(b"", b""))
             proc.returncode = 0
@@ -381,7 +382,7 @@ class TestBugB_TwoCallSendInput:
         assert sleep_args[0] == tmux_controller.send_keys_settle_seconds
 
         # Verify order: text send → sleep → Enter send
-        text_idx = next(i for i, (t, k) in enumerate(call_order) if t == "subprocess" and k == "--")
+        text_idx = next(i for i, (t, k) in enumerate(call_order) if t == "subprocess" and k == "-l")
         sleep_idx = next(i for i, (t, _) in enumerate(call_order) if t == "sleep")
         enter_idx = next(i for i, (t, k) in enumerate(call_order) if t == "subprocess" and k == "Enter")
         assert text_idx < sleep_idx < enter_idx, (
@@ -477,16 +478,16 @@ class TestBugB_TwoCallSendInput:
             result = await tmux_controller.send_input_async("claude-test", payload)
 
         assert result is True
-        text_calls = [call for call in subprocess_calls if call[4] == "--"]
+        text_calls = [call for call in subprocess_calls if call[4] == "-l"]
         assert len(text_calls) > 1
         assert len(subprocess_calls) == len(text_calls) + 1
-        assert "".join(call[5] for call in text_calls) == payload
-        assert all(len(call[5]) <= 8 for call in text_calls)
+        assert "".join(call[6] for call in text_calls) == payload
+        assert all(len(call[6]) <= 8 for call in text_calls)
         assert subprocess_calls[-1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
 
     @pytest.mark.asyncio
-    async def test_reserved_key_name_chunk_is_split_literally(self, tmux_controller):
-        """A chunk equal to a tmux key name must be split so it is typed literally."""
+    async def test_reserved_key_name_chunk_is_sent_in_literal_mode(self, tmux_controller):
+        """A chunk equal to a tmux key name must be typed literally via -l mode."""
         tmux_controller.send_keys_max_chunk_chars = 5
         subprocess_calls = []
 
@@ -504,13 +505,13 @@ class TestBugB_TwoCallSendInput:
             result = await tmux_controller.send_input_async("claude-test", "Enter")
 
         assert result is True
-        text_calls = [call for call in subprocess_calls if call[4] == "--"]
-        assert [call[5] for call in text_calls] == ["Ente", "r"]
+        text_calls = [call for call in subprocess_calls if call[4] == "-l"]
+        assert [call[6] for call in text_calls] == ["Enter"]
         assert subprocess_calls[-1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
 
     @pytest.mark.asyncio
-    async def test_function_key_chunks_are_resanitized_until_non_reserved(self, tmux_controller):
-        """Chunks like F10 must be split repeatedly until no piece is a reserved key name."""
+    async def test_modifier_key_name_chunk_is_sent_in_literal_mode(self, tmux_controller):
+        """Modifier-style tmux key names like C-a must be typed literally via -l mode."""
         tmux_controller.send_keys_max_chunk_chars = 3
         subprocess_calls = []
 
@@ -525,16 +526,16 @@ class TestBugB_TwoCallSendInput:
              patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await tmux_controller.send_input_async("claude-test", "F10")
+            result = await tmux_controller.send_input_async("claude-test", "C-a")
 
         assert result is True
-        text_calls = [call for call in subprocess_calls if call[4] == "--"]
-        assert [call[5] for call in text_calls] == ["F", "1", "0"]
+        text_calls = [call for call in subprocess_calls if call[4] == "-l"]
+        assert [call[6] for call in text_calls] == ["C-a"]
         assert subprocess_calls[-1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
 
     @pytest.mark.asyncio
-    async def test_reserved_key_aliases_are_matched_case_insensitively(self, tmux_controller):
-        """Lowercase aliases like pgdn must also be split into literal text chunks."""
+    async def test_chunking_keeps_function_key_spelling_literal(self, tmux_controller):
+        """Chunks like F10 stay literal text and do not need reserved-name resplitting."""
         tmux_controller.send_keys_max_chunk_chars = 4
         subprocess_calls = []
 
@@ -549,11 +550,11 @@ class TestBugB_TwoCallSendInput:
              patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
              patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await tmux_controller.send_input_async("claude-test", "pgdn")
+            result = await tmux_controller.send_input_async("claude-test", "xxF10yy")
 
         assert result is True
-        text_calls = [call for call in subprocess_calls if call[4] == "--"]
-        assert [call[5] for call in text_calls] == ["pgd", "n"]
+        text_calls = [call for call in subprocess_calls if call[4] == "-l"]
+        assert [call[6] for call in text_calls] == ["xxF1", "0yy"]
         assert subprocess_calls[-1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
 
     @pytest.mark.asyncio
