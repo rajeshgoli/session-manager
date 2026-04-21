@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 from datetime import datetime
+import subprocess
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 
@@ -1406,6 +1407,57 @@ class TestUpdateSession:
         assert response.status_code == 200
         assert elapsed < 1.5
         assert any("Timed out renaming Telegram topic for session test123" in record.message for record in caplog.records)
+
+    def test_update_friendly_name_times_out_slow_tmux_status_sync(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        caplog,
+    ):
+        """PATCH /sessions/{id} bounds slow tmux status-bar updates."""
+        import logging
+        from src.server import create_app
+        from fastapi.testclient import TestClient
+
+        session = Session(
+            id="test123",
+            name="test-session",
+            working_dir="/tmp/test",
+            tmux_session="claude-test123",
+            log_file="/tmp/test.log",
+            status=SessionStatus.RUNNING,
+            created_at=datetime(2024, 1, 15, 10, 0, 0),
+            last_activity=datetime(2024, 1, 15, 11, 0, 0),
+        )
+
+        mock_session_manager.get_session.return_value = session
+
+        mock_session_manager.tmux.set_status_bar.return_value = False
+
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=None,
+            output_monitor=mock_output_monitor,
+            config={},
+        )
+        client = TestClient(app)
+
+        with caplog.at_level(logging.WARNING):
+            response = client.patch(
+                "/sessions/test123",
+                json={"friendly_name": "new-name"},
+            )
+
+        assert response.status_code == 200
+        assert any(
+            "Failed to update tmux status bar for session test123" in record.message
+            for record in caplog.records
+        )
+        mock_session_manager.tmux.set_status_bar.assert_called_once_with(
+            "claude-test123",
+            "new-name",
+            timeout_seconds=1.0,
+        )
 
     def test_patch_is_em_sets_flag(self, test_client, mock_session_manager, sample_session):
         """PATCH /sessions/{id} with is_em=true sets is_em flag and returns it in response (#256)."""

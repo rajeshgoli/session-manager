@@ -2028,6 +2028,7 @@ def create_app(
         session: Session,
         display_name: Optional[str] = None,
         *,
+        tmux_timeout_seconds: Optional[float] = None,
         telegram_timeout_seconds: Optional[float] = None,
     ) -> None:
         """Propagate the canonical display name to tmux and Telegram surfaces."""
@@ -2039,8 +2040,11 @@ def create_app(
                     app.state.session_manager.tmux.set_status_bar,
                     session.tmux_session,
                     display_name,
+                    timeout_seconds=tmux_timeout_seconds,
                 )
             )
+            if not tmux_synced:
+                logger.warning("Failed to update tmux status bar for session %s", session.id)
         telegram_synced = True
         if session.telegram_thread_id:
             telegram_bot = getattr(app.state.notifier, "telegram", None) if app.state.notifier else None
@@ -2092,6 +2096,7 @@ def create_app(
         await _sync_session_display_identity(
             session,
             display_name,
+            tmux_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
             telegram_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
         )
 
@@ -3502,6 +3507,7 @@ def create_app(
             app.state.session_manager._save_state()
             await _sync_session_display_identity(
                 session,
+                tmux_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
                 telegram_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
             )
 

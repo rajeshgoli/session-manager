@@ -527,6 +527,50 @@ def test_get_session_does_not_resync_when_display_identity_is_current(tmp_path: 
     notifier.rename_session_topic.assert_not_awaited()
 
 
+def test_get_client_session_bounds_slow_tmux_status_sync(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        {"type": "custom-title", "customTitle": "slow-sync-title"},
+    )
+    session = _claude_session(tmp_path, transcript)
+    session.telegram_chat_id = 123
+    session.telegram_thread_id = 456
+    manager.sessions[session.id] = session
+
+    manager.tmux.set_status_bar.return_value = False
+
+    notifier = MagicMock()
+    notifier.rename_session_topic = AsyncMock(return_value=True)
+
+    client = create_app(session_manager=manager, notifier=notifier, config={})
+
+    from fastapi.testclient import TestClient
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        response = TestClient(client).get(f"/client/sessions/{session.id}")
+
+    assert response.status_code == 200
+    assert any(
+        "Failed to update tmux status bar for session claude123" in record.message
+        for record in caplog.records
+    )
+    assert session.display_identity_synced_name is None
+    assert session.display_identity_synced_at_ns is None
+    manager.tmux.set_status_bar.assert_called_once_with(
+        "claude-claude123",
+        "slow-sync-title",
+        timeout_seconds=1.0,
+    )
+
+
 def test_get_session_does_not_mark_telegram_synced_when_bot_missing(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     manager.tmux = MagicMock()
