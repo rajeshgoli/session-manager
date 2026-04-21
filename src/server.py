@@ -2028,19 +2028,30 @@ def create_app(
         session: Session,
         display_name: Optional[str] = None,
         *,
+        tmux_timeout_seconds: Optional[float] = None,
         telegram_timeout_seconds: Optional[float] = None,
     ) -> None:
         """Propagate the canonical display name to tmux and Telegram surfaces."""
         display_name = display_name or _effective_session_name(session)
         tmux_synced = True
         if getattr(session, "provider", "claude") != "codex-app":
-            tmux_synced = bool(
-                await asyncio.to_thread(
+            try:
+                tmux_update = asyncio.to_thread(
                     app.state.session_manager.tmux.set_status_bar,
                     session.tmux_session,
                     display_name,
                 )
-            )
+                if tmux_timeout_seconds is not None:
+                    tmux_synced = bool(await asyncio.wait_for(tmux_update, timeout=tmux_timeout_seconds))
+                else:
+                    tmux_synced = bool(await tmux_update)
+            except asyncio.TimeoutError:
+                tmux_synced = False
+                logger.warning(
+                    "Timed out updating tmux status bar for session %s after %.2fs",
+                    session.id,
+                    tmux_timeout_seconds,
+                )
         telegram_synced = True
         if session.telegram_thread_id:
             telegram_bot = getattr(app.state.notifier, "telegram", None) if app.state.notifier else None
@@ -2092,6 +2103,7 @@ def create_app(
         await _sync_session_display_identity(
             session,
             display_name,
+            tmux_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
             telegram_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
         )
 
@@ -3502,6 +3514,7 @@ def create_app(
             app.state.session_manager._save_state()
             await _sync_session_display_identity(
                 session,
+                tmux_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
                 telegram_timeout_seconds=DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS,
             )
 
