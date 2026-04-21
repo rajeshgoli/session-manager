@@ -34,6 +34,21 @@ _TMUX_RESERVED_KEY_NAMES = {
     "Up",
 }
 _TMUX_RESERVED_KEY_NAMES.update({f"F{i}" for i in range(1, 13)})
+_TMUX_RESERVED_KEY_ALIASES = {
+    "backspace",
+    "bs",
+    "del",
+    "esc",
+    "ins",
+    "pagedown",
+    "pageup",
+    "pgdn",
+    "pgup",
+    "return",
+}
+_TMUX_RESERVED_KEY_NAMES_NORMALIZED = {
+    name.lower() for name in (_TMUX_RESERVED_KEY_NAMES | _TMUX_RESERVED_KEY_ALIASES)
+}
 
 
 class TmuxController:
@@ -151,7 +166,8 @@ class TmuxController:
         pending = list(chunks)
         while pending:
             chunk = pending.pop(0)
-            if chunk in _TMUX_RESERVED_KEY_NAMES and len(chunk) > 1:
+            normalized = chunk.lower()
+            if normalized in _TMUX_RESERVED_KEY_NAMES_NORMALIZED and len(chunk) > 1:
                 pending.insert(0, chunk[-1])
                 pending.insert(0, chunk[:-1])
                 continue
