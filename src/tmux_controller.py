@@ -148,11 +148,14 @@ class TmuxController:
     def _sanitize_reserved_key_chunks(self, chunks: list[str]) -> list[str]:
         """Ensure no chunk is interpreted by tmux as a named control key."""
         sanitized: list[str] = []
-        for chunk in chunks:
+        pending = list(chunks)
+        while pending:
+            chunk = pending.pop(0)
             if chunk in _TMUX_RESERVED_KEY_NAMES and len(chunk) > 1:
-                sanitized.extend([chunk[:-1], chunk[-1]])
-            else:
-                sanitized.append(chunk)
+                pending.insert(0, chunk[-1])
+                pending.insert(0, chunk[:-1])
+                continue
+            sanitized.append(chunk)
         return sanitized
 
     def _get_pane_in_mode(self, session_name: str) -> Optional[int]:
