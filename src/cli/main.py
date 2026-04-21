@@ -179,7 +179,7 @@ def main():
 
     # sm send <session-id> "<text>"
     send_parser = subparsers.add_parser("send", help="Send input to a session")
-    send_parser.add_argument("session_id", help="Target session ID")
+    send_parser.add_argument("session_id", help="Target session ID, friendly name, alias, or comma-delimited list")
     send_parser.add_argument("text", help="Text to send to the session")
     send_parser.add_argument("--sequential", action="store_true", help="Wait for idle before sending (default)")
     send_parser.add_argument("--important", action="store_true", help="Inject immediately, queue behind current work")

@@ -620,6 +620,37 @@ class SendInputRequest(BaseModel):
     parent_session_id: Optional[str] = None  # EM session to wake periodically after delivery (#225-C)
 
 
+class SendInputBatchRequest(SendInputRequest):
+    """Request to send the same input to multiple recipients."""
+    recipients: list[str] = Field(default_factory=list)
+
+
+class SendInputBatchResult(BaseModel):
+    """Per-recipient result returned by batch send."""
+    identifier: str
+    status: Literal["delivered", "queued", "emailed", "failed"]
+    delivery_kind: Literal["session", "email", "none"]
+    session_id: Optional[str] = None
+    target_name: Optional[str] = None
+    provider: Optional[str] = None
+    bootstrapped: bool = False
+    queue_position: Optional[int] = None
+    estimated_delivery: Optional[str] = None
+    email_username: Optional[str] = None
+    email_address: Optional[str] = None
+    detail: Optional[str] = None
+
+
+class SendInputBatchResponse(BaseModel):
+    """Aggregate response for one multi-recipient send."""
+    ok: bool
+    requested_count: int
+    success_count: int
+    failure_count: int
+    delivery_mode: str
+    results: list[SendInputBatchResult]
+
+
 class CodexRequestRespondRequest(BaseModel):
     """Structured response payload for codex request resolution."""
     decision: Optional[Literal["accept", "acceptForSession", "decline", "cancel"]] = None
@@ -1247,6 +1278,61 @@ def create_app(
                     identifiers.append(normalized)
         return identifiers
 
+    def _unique_identifiers(values: list[str]) -> list[str]:
+        identifiers: list[str] = []
+        seen: set[str] = set()
+        for identifier in _normalize_identifier_list(values):
+            if identifier in seen:
+                continue
+            identifiers.append(identifier)
+            seen.add(identifier)
+        return identifiers
+
+    def _detail_text(detail: Any) -> str:
+        if isinstance(detail, dict):
+            message = detail.get("message")
+            error_code = detail.get("error_code")
+            if message and error_code:
+                return f"{message} ({error_code})"
+            if message:
+                return str(message)
+            return json.dumps(detail, sort_keys=True)
+        return str(detail)
+
+    def _send_request_supports_email_fallback(request: SendInputRequest) -> bool:
+        return (
+            request.delivery_mode == "sequential"
+            and request.notify_after_seconds is None
+            and request.remind_soft_threshold is None
+            and request.remind_hard_threshold is None
+            and request.remind_cancel_on_reply_session_id is None
+        )
+
+    def _resolve_live_send_target(identifier: str) -> Optional[Session]:
+        session = _resolve_session_or_registry_role(identifier)
+        if session is not None:
+            return session
+        if not app.state.session_manager:
+            return None
+
+        lister = getattr(app.state.session_manager, "list_sessions", None)
+        alias_getter = getattr(app.state.session_manager, "get_session_aliases", None)
+        if not callable(lister):
+            return None
+        try:
+            sessions = lister(include_stopped=False)
+        except TypeError:
+            sessions = lister()
+
+        for candidate in sessions or []:
+            aliases = alias_getter(candidate.id) if callable(alias_getter) else []
+            if identifier in aliases:
+                return candidate
+        for candidate in sessions or []:
+            if _effective_session_name(candidate, sync_native_title=False) == identifier:
+                return candidate
+        return None
+
     async def _send_registered_email(request: SendEmailRequest) -> dict[str, Any]:
         handler = _email_handler_or_503()
         if not getattr(handler, "bridge_is_available", lambda: False)():
@@ -1284,6 +1370,149 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    async def _deliver_send_input_to_session(session: Session, request: SendInputRequest) -> dict[str, Any]:
+        """Deliver one send request to a resolved live session and serialize the outcome."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        _enforce_session_input_gates(session, session.id)
+
+        result = await app.state.session_manager.send_input(
+            session.id,
+            request.text,
+            sender_session_id=request.sender_session_id,
+            delivery_mode=request.delivery_mode,
+            from_sm_send=request.from_sm_send,
+            timeout_seconds=request.timeout_seconds,
+            notify_on_delivery=request.notify_on_delivery,
+            notify_after_seconds=request.notify_after_seconds,
+            notify_on_stop=request.notify_on_stop,
+            remind_soft_threshold=request.remind_soft_threshold,
+            remind_hard_threshold=request.remind_hard_threshold,
+            remind_cancel_on_reply_session_id=request.remind_cancel_on_reply_session_id,
+            parent_session_id=request.parent_session_id,
+        )
+
+        if result == DeliveryResult.FAILED:
+            raise HTTPException(status_code=500, detail="Failed to send input")
+
+        if app.state.output_monitor:
+            app.state.output_monitor.update_activity(session.id)
+
+        response = {
+            "status": result.value,
+            "session_id": session.id,
+            "delivery_mode": request.delivery_mode,
+        }
+        if result == DeliveryResult.QUEUED:
+            queue_mgr = app.state.session_manager.message_queue_manager
+            if queue_mgr:
+                queue_len = queue_mgr.get_queue_length(session.id)
+                response["queue_position"] = queue_len
+                response["estimated_delivery"] = "deferred"
+        return response
+
+    async def _deliver_send_input_to_identifier(
+        identifier: str,
+        request: SendInputBatchRequest,
+    ) -> SendInputBatchResult:
+        """Resolve and deliver one batch send target."""
+        session = _resolve_live_send_target(identifier)
+        bootstrapped = False
+
+        if session is None and app.state.session_manager:
+            ensurer = getattr(app.state.session_manager, "ensure_role_session", None)
+            if callable(ensurer):
+                try:
+                    session, bootstrapped = await ensurer(identifier)
+                except ValueError as exc:
+                    detail = str(exc)
+                    if "not configured for auto-bootstrap" not in detail:
+                        return SendInputBatchResult(
+                            identifier=identifier,
+                            status="failed",
+                            delivery_kind="none",
+                            detail=detail,
+                        )
+                except RuntimeError as exc:
+                    return SendInputBatchResult(
+                        identifier=identifier,
+                        status="failed",
+                        delivery_kind="none",
+                        detail=str(exc),
+                    )
+
+                if session is not None and bootstrapped:
+                    if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
+                        await app.state.output_monitor.start_monitoring(session)
+                    await _sync_session_display_identity(session)
+
+        if session is not None:
+            try:
+                delivery = await _deliver_send_input_to_session(session, request)
+            except HTTPException as exc:
+                return SendInputBatchResult(
+                    identifier=identifier,
+                    status="failed",
+                    delivery_kind="none",
+                    session_id=session.id,
+                    target_name=_effective_session_name(session, sync_native_title=False),
+                    provider=getattr(session, "provider", "claude"),
+                    bootstrapped=bootstrapped,
+                    detail=_detail_text(exc.detail),
+                )
+
+            return SendInputBatchResult(
+                identifier=identifier,
+                status=delivery["status"],
+                delivery_kind="session",
+                session_id=session.id,
+                target_name=_effective_session_name(session, sync_native_title=False),
+                provider=getattr(session, "provider", "claude"),
+                bootstrapped=bootstrapped,
+                queue_position=delivery.get("queue_position"),
+                estimated_delivery=delivery.get("estimated_delivery"),
+            )
+
+        if not _send_request_supports_email_fallback(request):
+            return SendInputBatchResult(
+                identifier=identifier,
+                status="failed",
+                delivery_kind="none",
+                detail="email fallback only supports plain sequential sends without --wait/--track/--urgent",
+            )
+
+        try:
+            email_payload = await _send_registered_email(
+                SendEmailRequest(
+                    requester_session_id=request.sender_session_id,
+                    recipients=[identifier],
+                    body_text=request.text,
+                    auto_subject=True,
+                )
+            )
+        except HTTPException as exc:
+            detail = exc.detail
+            if exc.status_code == 404 and str(detail).strip() == "Not Found":
+                detail = f"Session '{identifier}' not found"
+            return SendInputBatchResult(
+                identifier=identifier,
+                status="failed",
+                delivery_kind="none",
+                detail=_detail_text(detail),
+            )
+
+        recipients = email_payload.get("to") or []
+        first = recipients[0] if recipients and isinstance(recipients[0], dict) else {}
+        return SendInputBatchResult(
+            identifier=identifier,
+            status="emailed",
+            delivery_kind="email",
+            target_name=first.get("username"),
+            email_username=first.get("username"),
+            email_address=first.get("email"),
+        )
 
     async def _deliver_email_reply_to_session(payload: InboundEmailRequest, request: Optional[Request] = None) -> dict[str, Any]:
         handler = _email_handler_or_503()
@@ -3865,47 +4094,32 @@ def create_app(
         session = app.state.session_manager.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        return await _deliver_send_input_to_session(session, request)
 
-        _enforce_session_input_gates(session, session_id)
+    @app.post("/sessions/input-batch", response_model=SendInputBatchResponse)
+    async def send_input_batch(request: SendInputBatchRequest):
+        """Send the same input to multiple recipients with per-target results."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
 
-        result = await app.state.session_manager.send_input(
-            session_id,
-            request.text,
-            sender_session_id=request.sender_session_id,
+        recipients = _unique_identifiers(request.recipients)
+        if not recipients:
+            raise HTTPException(status_code=400, detail="At least one recipient is required")
+
+        results: list[SendInputBatchResult] = []
+        for identifier in recipients:
+            results.append(await _deliver_send_input_to_identifier(identifier, request))
+
+        success_count = sum(1 for item in results if item.status in {"delivered", "queued", "emailed"})
+        failure_count = len(results) - success_count
+        return SendInputBatchResponse(
+            ok=failure_count == 0,
+            requested_count=len(recipients),
+            success_count=success_count,
+            failure_count=failure_count,
             delivery_mode=request.delivery_mode,
-            from_sm_send=request.from_sm_send,
-            timeout_seconds=request.timeout_seconds,
-            notify_on_delivery=request.notify_on_delivery,
-            notify_after_seconds=request.notify_after_seconds,
-            notify_on_stop=request.notify_on_stop,
-            remind_soft_threshold=request.remind_soft_threshold,
-            remind_hard_threshold=request.remind_hard_threshold,
-            remind_cancel_on_reply_session_id=request.remind_cancel_on_reply_session_id,
-            parent_session_id=request.parent_session_id,
+            results=results,
         )
-
-        if result == DeliveryResult.FAILED:
-            raise HTTPException(status_code=500, detail="Failed to send input")
-
-        # Update activity in monitor
-        if app.state.output_monitor:
-            app.state.output_monitor.update_activity(session_id)
-
-        # Return delivery result with queue info if queued
-        response = {
-            "status": result.value,  # "delivered", "queued", or "failed"
-            "session_id": session_id,
-            "delivery_mode": request.delivery_mode,
-        }
-
-        if result == DeliveryResult.QUEUED:
-            queue_mgr = app.state.session_manager.message_queue_manager
-            if queue_mgr:
-                queue_len = queue_mgr.get_queue_length(session_id)
-                response["queue_position"] = queue_len
-                response["estimated_delivery"] = "deferred"
-
-        return response
 
     @app.post("/sessions/{session_id}/key")
     async def send_key(session_id: str, key: str = Body(..., embed=True)):
