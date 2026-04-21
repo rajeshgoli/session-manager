@@ -456,6 +456,35 @@ class TestBugB_TwoCallSendInput:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_long_payload_is_chunked_before_enter(self, tmux_controller):
+        """Long text is split across multiple send-keys calls before the final Enter."""
+        tmux_controller.send_keys_max_chunk_chars = 8
+        subprocess_calls = []
+
+        async def mock_subprocess(*args, **kwargs):
+            subprocess_calls.append(args)
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.returncode = 0
+            return proc
+
+        payload = "abcdefgh\nijklmnop\nqrstuvwx"
+
+        with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await tmux_controller.send_input_async("claude-test", payload)
+
+        assert result is True
+        text_calls = [call for call in subprocess_calls if call[4] == "--"]
+        assert len(text_calls) > 1
+        assert len(subprocess_calls) == len(text_calls) + 1
+        assert "".join(call[5] for call in text_calls) == payload
+        assert all(len(call[5]) <= 8 for call in text_calls)
+        assert subprocess_calls[-1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
+
+    @pytest.mark.asyncio
     async def test_no_dead_shlex_code(self, tmux_controller):
         """The dead shlex.quote(text) call has been removed."""
         import inspect

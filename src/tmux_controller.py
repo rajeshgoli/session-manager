@@ -33,6 +33,7 @@ class TmuxController:
         self.send_keys_settle_max_seconds = tmux_timeouts.get("send_keys_settle_max_seconds", 0.9)
         self.send_keys_settle_per_ki_chars = tmux_timeouts.get("send_keys_settle_per_ki_chars", 0.06)
         self.send_keys_settle_per_extra_line = tmux_timeouts.get("send_keys_settle_per_extra_line", 0.015)
+        self.send_keys_max_chunk_chars = int(tmux_timeouts.get("send_keys_max_chunk_chars", 4096))
         self.submit_verify_seconds = tmux_timeouts.get("submit_verify_seconds", 0.6)
         self.submit_retry_seconds = tmux_timeouts.get("submit_retry_seconds", 0.6)
 
@@ -95,6 +96,30 @@ class TmuxController:
             + max(0, line_count - 1) * float(self.send_keys_settle_per_extra_line)
         )
         return max(base, min(max_delay, base + extra))
+
+    def _split_send_text_chunks(self, text: str) -> list[str]:
+        """Split long send-keys payloads into bounded chunks to avoid argv limits."""
+        payload = text or ""
+        max_chunk_chars = max(1, int(self.send_keys_max_chunk_chars or 1))
+        if len(payload) <= max_chunk_chars:
+            return [payload]
+
+        chunks: list[str] = []
+        remaining = payload
+        while remaining:
+            if len(remaining) <= max_chunk_chars:
+                chunks.append(remaining)
+                break
+
+            split_at = max_chunk_chars
+            newline_idx = remaining.rfind("\n", 0, max_chunk_chars)
+            if newline_idx >= max_chunk_chars // 2:
+                split_at = newline_idx + 1
+
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+
+        return chunks
 
     def _get_pane_in_mode(self, session_name: str) -> Optional[int]:
         """Return tmux pane_in_mode (1 copy-mode, 0 normal) for active pane."""
@@ -703,16 +728,17 @@ class TmuxController:
             import time
             mode_before, mode_after = self._exit_copy_mode_if_needed(session_name)
             settle_delay = self._compute_settle_delay_seconds(text)
+            chunks = self._split_send_text_chunks(text)
             # Use subprocess with list arguments to prevent shell injection
             # Note: -l flag causes issues with Claude Code, so we don't use it
-            # Small delay between send-keys calls to avoid paste detection
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "--", text],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=self.send_keys_timeout_seconds
-            )
+            for chunk in chunks:
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "--", chunk],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.send_keys_timeout_seconds
+                )
             time.sleep(settle_delay)
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -770,19 +796,20 @@ class TmuxController:
         try:
             mode_before, mode_after = await self._exit_copy_mode_if_needed_async(session_name)
             settle_delay = self._compute_settle_delay_seconds(text)
+            chunks = self._split_send_text_chunks(text)
 
-            # Send text first
-            proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, '--', text,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self.send_keys_timeout_seconds
-            )
-            if proc.returncode != 0:
-                logger.error(f"Failed to send text: {stderr.decode()}")
-                return False
+            for chunk in chunks:
+                proc = await asyncio.create_subprocess_exec(
+                    'tmux', 'send-keys', '-t', session_name, '--', chunk,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=self.send_keys_timeout_seconds
+                )
+                if proc.returncode != 0:
+                    logger.error(f"Failed to send text: {stderr.decode()}")
+                    return False
 
             # Settle delay to avoid paste detection (#178)
             # Claude Code (Node.js TUI in raw mode) treats a rapid character burst
