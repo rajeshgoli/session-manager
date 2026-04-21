@@ -114,8 +114,8 @@ class TestRegression1_TwoCallSendInput:
         assert len(calls_made) == 2, f"Expected 2 subprocess calls, got {len(calls_made)}"
 
         # First call: text
-        assert calls_made[0][:6] == ["tmux", "send-keys", "-t", "claude-session", "--", "test payload"]
-        assert "\r" not in calls_made[0][5]
+        assert calls_made[0][:7] == ["tmux", "send-keys", "-t", "claude-session", "-l", "--", "test payload"]
+        assert "\r" not in calls_made[0][6]
 
         # Second call: Enter
         assert calls_made[1][:5] == ["tmux", "send-keys", "-t", "claude-session", "Enter"]
@@ -143,8 +143,8 @@ class TestRegression1_TwoCallSendInput:
              patch("asyncio.sleep", side_effect=mock_sleep):
             await tmux_controller.send_input_async("claude-session", "hello")
 
-        # Expect: send-keys:-- → sleep:0.3 → send-keys:Enter
-        assert event_log[0] == "send-keys:--"
+        # Expect: send-keys:-l → sleep:0.3 → send-keys:Enter
+        assert event_log[0] == "send-keys:-l"
         assert event_log[1] == f"sleep:{tmux_controller.send_keys_settle_seconds}"
         assert event_log[2] == "send-keys:Enter"
 
@@ -194,7 +194,7 @@ class TestRegression1_TwoCallSendInput:
             result = await tmux_controller.send_input_async("claude-session", "msg")
 
         assert result is False
-        assert call_count == 2
+        assert call_count == 3
 
     @pytest.mark.asyncio
     async def test_no_atomic_carriage_return_in_source(self, tmux_controller):
