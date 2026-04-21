@@ -1073,6 +1073,107 @@ class TestEmailBridgeEndpoints:
         )
         assert response.status_code == 404
 
+    def test_send_input_batch_delivers_to_multiple_sessions(self, test_client, mock_session_manager, sample_session):
+        """POST /sessions/input-batch sends one payload to multiple live sessions."""
+        second_session = Session(
+            id="other456",
+            name="other-session",
+            working_dir="/tmp/other",
+            tmux_session="claude-other456",
+            log_file="/tmp/other.log",
+            status=SessionStatus.RUNNING,
+            created_at=sample_session.created_at,
+            last_activity=sample_session.last_activity,
+            friendly_name="Other Session",
+        )
+        mock_session_manager.get_session.side_effect = lambda session_id: {
+            "test123": sample_session,
+            "other456": second_session,
+        }.get(session_id)
+        mock_session_manager.send_input = AsyncMock(
+            side_effect=[DeliveryResult.DELIVERED, DeliveryResult.QUEUED]
+        )
+        mock_session_manager.message_queue_manager = MagicMock()
+        mock_session_manager.message_queue_manager.get_queue_length.return_value = 2
+
+        response = test_client.post(
+            "/sessions/input-batch",
+            json={"recipients": ["test123", "other456"], "text": "Hello, team"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["success_count"] == 2
+        assert data["failure_count"] == 0
+        assert [item["status"] for item in data["results"]] == ["delivered", "queued"]
+        assert data["results"][1]["queue_position"] == 2
+        assert data["results"][1]["estimated_delivery"] == "deferred"
+        assert mock_session_manager.send_input.await_count == 2
+
+    def test_send_input_batch_falls_back_to_email_per_recipient(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_email_handler,
+        sample_session,
+    ):
+        """POST /sessions/input-batch can mix live session delivery with email fallback."""
+        sender_session = Session(
+            id="sender123",
+            name="sender-session",
+            working_dir="/tmp/sender",
+            tmux_session="claude-sender123",
+            log_file="/tmp/sender.log",
+            status=SessionStatus.RUNNING,
+            created_at=sample_session.created_at,
+            last_activity=sample_session.last_activity,
+            friendly_name="Sender Session",
+        )
+        mock_session_manager.get_session.side_effect = lambda session_id: {
+            "sender123": sender_session,
+            "test123": sample_session,
+        }.get(session_id)
+        mock_session_manager.ensure_role_session = AsyncMock(
+            side_effect=ValueError("Role not configured for auto-bootstrap")
+        )
+        mock_session_manager.send_input = AsyncMock(return_value=DeliveryResult.DELIVERED)
+        mock_email_handler.send_agent_email = AsyncMock(
+            return_value={
+                "to": [{"username": "orchestrator", "email": "orch@example.com"}],
+                "cc": [],
+                "subject": "status",
+            }
+        )
+
+        response = test_client.post(
+            "/sessions/input-batch",
+            json={
+                "recipients": ["test123", "d030a600"],
+                "text": "review landed",
+                "sender_session_id": "sender123",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert [item["status"] for item in data["results"]] == ["delivered", "emailed"]
+        assert data["results"][1]["email_username"] == "orchestrator"
+        assert data["results"][1]["email_address"] == "orch@example.com"
+        mock_email_handler.send_agent_email.assert_awaited_once_with(
+            sender_session_id="sender123",
+            sender_name="Sender Session",
+            sender_provider="claude",
+            to_identifiers=["d030a600"],
+            cc_identifiers=[],
+            subject=None,
+            body_text="review landed",
+            body_html=None,
+            body_markdown=False,
+            auto_subject=True,
+        )
+
 
 class TestHookEndpoints:
     """Tests for Claude Code hook endpoints."""

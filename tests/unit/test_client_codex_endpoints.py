@@ -46,6 +46,26 @@ def test_send_input_with_result_returns_409_detail():
     assert result["detail"]["error_code"] == "pending_structured_request"
 
 
+def test_send_input_batch_result_uses_batch_endpoint():
+    client = _make_client()
+    payload = {"ok": True, "results": []}
+    with patch.object(client, "_request_with_status", return_value=(payload, 200, False)) as req:
+        result = client.send_input_batch_result(["abc123", "def456"], "hello")
+    assert result["ok"] is True
+    assert result["status_code"] == 200
+    req.assert_called_once_with(
+        "POST",
+        "/sessions/input-batch",
+        {
+            "recipients": ["abc123", "def456"],
+            "text": "hello",
+            "delivery_mode": "sequential",
+            "from_sm_send": False,
+        },
+        timeout=None,
+    )
+
+
 def test_respond_codex_request_validation_error():
     client = _make_client()
     result = client.respond_codex_request(

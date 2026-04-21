@@ -143,6 +143,92 @@ def test_cmd_send_uses_extended_timeout_for_resolution_and_delivery(capsys):
     assert "Input sent to worker (live123)" in capsys.readouterr().out
 
 
+def test_cmd_send_multiple_recipients_uses_batch_endpoint(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+    client.send_input_batch_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "failure_count": 0,
+            "results": [
+                {
+                    "identifier": "owner123",
+                    "status": "delivered",
+                    "delivery_kind": "session",
+                    "session_id": "owner123",
+                    "target_name": "spec-owner-3004",
+                },
+                {
+                    "identifier": "d030a600",
+                    "status": "emailed",
+                    "delivery_kind": "email",
+                    "email_username": "orchestrator",
+                    "email_address": "orch@example.com",
+                },
+            ],
+        },
+    }
+
+    rc = cmd_send(client, "owner123, d030a600, owner123,", "review landed")
+
+    assert rc == 0
+    client.send_input.assert_not_called()
+    client.send_input_batch_result.assert_called_once_with(
+        ["owner123", "d030a600"],
+        "review landed",
+        sender_session_id="sender123",
+        delivery_mode="sequential",
+        from_sm_send=True,
+        timeout_seconds=None,
+        notify_on_delivery=False,
+        notify_after_seconds=None,
+        notify_on_stop=True,
+        remind_soft_threshold=None,
+        remind_hard_threshold=None,
+        remind_cancel_on_reply_session_id=None,
+        parent_session_id=None,
+        timeout=SEND_API_TIMEOUT,
+    )
+    output = capsys.readouterr().out
+    assert "Input sent to spec-owner-3004 (owner123)" in output
+    assert "Email sent to orchestrator <orch@example.com>" in output
+
+
+def test_cmd_send_multiple_recipients_returns_nonzero_on_partial_failure(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+    client.send_input_batch_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "failure_count": 1,
+            "results": [
+                {
+                    "identifier": "owner123",
+                    "status": "delivered",
+                    "delivery_kind": "session",
+                    "session_id": "owner123",
+                    "target_name": "spec-owner-3004",
+                },
+                {
+                    "identifier": "missing-user",
+                    "status": "failed",
+                    "delivery_kind": "none",
+                    "detail": "Session 'missing-user' not found",
+                },
+            ],
+        },
+    }
+
+    rc = cmd_send(client, "owner123,missing-user", "review landed")
+
+    assert rc == 1
+    output = capsys.readouterr()
+    assert "Input sent to spec-owner-3004 (owner123)" in output.out
+    assert "Error: missing-user: Session 'missing-user' not found" in output.err
+
+
 def test_cmd_email_reads_markdown_file_and_calls_api(tmp_path, capsys):
     body_path = tmp_path / "summary.md"
     body_path.write_text("# Summary\n\n- one\n- two\n", encoding="utf-8")

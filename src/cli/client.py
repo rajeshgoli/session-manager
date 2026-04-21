@@ -466,25 +466,20 @@ class SessionManagerClient:
         Returns:
             Tuple of (success, unavailable)
         """
-        payload = {"text": text, "delivery_mode": delivery_mode, "from_sm_send": from_sm_send}
-        if sender_session_id:
-            payload["sender_session_id"] = sender_session_id
-        if timeout_seconds is not None:
-            payload["timeout_seconds"] = timeout_seconds
-        if notify_on_delivery:
-            payload["notify_on_delivery"] = notify_on_delivery
-        if notify_after_seconds is not None:
-            payload["notify_after_seconds"] = notify_after_seconds
-        if notify_on_stop:
-            payload["notify_on_stop"] = notify_on_stop
-        if remind_soft_threshold is not None:
-            payload["remind_soft_threshold"] = remind_soft_threshold
-        if remind_hard_threshold is not None:
-            payload["remind_hard_threshold"] = remind_hard_threshold
-        if remind_cancel_on_reply_session_id is not None:
-            payload["remind_cancel_on_reply_session_id"] = remind_cancel_on_reply_session_id
-        if parent_session_id is not None:
-            payload["parent_session_id"] = parent_session_id
+        payload = self._build_send_input_payload(
+            text=text,
+            sender_session_id=sender_session_id,
+            delivery_mode=delivery_mode,
+            from_sm_send=from_sm_send,
+            timeout_seconds=timeout_seconds,
+            notify_on_delivery=notify_on_delivery,
+            notify_after_seconds=notify_after_seconds,
+            notify_on_stop=notify_on_stop,
+            remind_soft_threshold=remind_soft_threshold,
+            remind_hard_threshold=remind_hard_threshold,
+            remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
+            parent_session_id=parent_session_id,
+        )
 
         data, success, unavailable = self._request(
             "POST",
@@ -512,6 +507,96 @@ class SessionManagerClient:
         timeout: Optional[float] = None,
     ) -> dict:
         """Send input and return full API result metadata."""
+        payload = self._build_send_input_payload(
+            text=text,
+            sender_session_id=sender_session_id,
+            delivery_mode=delivery_mode,
+            from_sm_send=from_sm_send,
+            timeout_seconds=timeout_seconds,
+            notify_on_delivery=notify_on_delivery,
+            notify_after_seconds=notify_after_seconds,
+            notify_on_stop=notify_on_stop,
+            remind_soft_threshold=remind_soft_threshold,
+            remind_hard_threshold=remind_hard_threshold,
+            remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
+            parent_session_id=parent_session_id,
+        )
+
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/sessions/{session_id}/input",
+            payload,
+            timeout=timeout,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def send_input_batch_result(
+        self,
+        recipients: list[str],
+        text: str,
+        sender_session_id: Optional[str] = None,
+        delivery_mode: str = "sequential",
+        from_sm_send: bool = False,
+        timeout_seconds: Optional[int] = None,
+        notify_on_delivery: bool = False,
+        notify_after_seconds: Optional[int] = None,
+        notify_on_stop: bool = False,
+        remind_soft_threshold: Optional[int] = None,
+        remind_hard_threshold: Optional[int] = None,
+        remind_cancel_on_reply_session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> dict:
+        """Send the same input to multiple recipients in one API call."""
+        payload = self._build_send_input_payload(
+            text=text,
+            sender_session_id=sender_session_id,
+            delivery_mode=delivery_mode,
+            from_sm_send=from_sm_send,
+            timeout_seconds=timeout_seconds,
+            notify_on_delivery=notify_on_delivery,
+            notify_after_seconds=notify_after_seconds,
+            notify_on_stop=notify_on_stop,
+            remind_soft_threshold=remind_soft_threshold,
+            remind_hard_threshold=remind_hard_threshold,
+            remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
+            parent_session_id=parent_session_id,
+        )
+        payload["recipients"] = recipients
+
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            "/sessions/input-batch",
+            payload,
+            timeout=timeout,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    @staticmethod
+    def _build_send_input_payload(
+        *,
+        text: str,
+        sender_session_id: Optional[str] = None,
+        delivery_mode: str = "sequential",
+        from_sm_send: bool = False,
+        timeout_seconds: Optional[int] = None,
+        notify_on_delivery: bool = False,
+        notify_after_seconds: Optional[int] = None,
+        notify_on_stop: bool = False,
+        remind_soft_threshold: Optional[int] = None,
+        remind_hard_threshold: Optional[int] = None,
+        remind_cancel_on_reply_session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+    ) -> dict:
+        """Build the shared request payload used by send endpoints."""
         payload = {"text": text, "delivery_mode": delivery_mode, "from_sm_send": from_sm_send}
         if sender_session_id:
             payload["sender_session_id"] = sender_session_id
@@ -531,18 +616,7 @@ class SessionManagerClient:
             payload["remind_cancel_on_reply_session_id"] = remind_cancel_on_reply_session_id
         if parent_session_id is not None:
             payload["parent_session_id"] = parent_session_id
-
-        data, status_code, unavailable = self._request_with_status(
-            "POST",
-            f"/sessions/{session_id}/input",
-            payload,
-            timeout=timeout,
-        )
-        if unavailable:
-            return {"ok": False, "unavailable": True, "status_code": None, "detail": None}
-        ok = status_code in (200, 201)
-        detail = data.get("detail") if isinstance(data, dict) else None
-        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+        return payload
 
     def get_codex_events(
         self,

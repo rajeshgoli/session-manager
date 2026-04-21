@@ -1383,6 +1383,26 @@ def cmd_send(
         remind_hard_threshold = _track_hard_threshold_seconds(track_seconds)
 
     effective_notify_after = wait_seconds if wait_seconds is not None else notify_after_seconds
+    identifiers = _split_send_targets(identifier)
+    if not identifiers:
+        print("Error: at least one recipient is required", file=sys.stderr)
+        return 1
+    if len(identifiers) > 1:
+        return _cmd_send_batch(
+            client,
+            identifiers,
+            text,
+            delivery_mode=delivery_mode,
+            timeout_seconds=timeout_seconds,
+            notify_on_delivery=notify_on_delivery,
+            notify_after_seconds=effective_notify_after,
+            notify_on_stop=notify_on_stop,
+            remind_soft_threshold=remind_soft_threshold,
+            remind_hard_threshold=remind_hard_threshold,
+            parent_session_id=parent_session_id,
+            track_seconds=track_seconds,
+        )
+    identifier = identifiers[0]
 
     # Resolve identifier to session ID and get session details
     session_id, session, resolve_unavailable = resolve_session_id_with_status(
@@ -1492,23 +1512,158 @@ def cmd_send(
 
     # Show additional options if used
     extras = []
-    if timeout_seconds:
-        extras.append(f"timeout={timeout_seconds}s")
-    if notify_on_delivery:
-        extras.append("notify-on-delivery")
-    if effective_notify_after:
-        extras.append(f"wait={effective_notify_after}s")
-    if effective_notify_on_stop:
-        extras.append("notify-on-stop")
-    if remind_soft_threshold:
-        extras.append(f"remind={remind_soft_threshold}s soft"
-                      + (f"/{remind_hard_threshold}s hard" if remind_hard_threshold else ""))
-    if track_seconds:
-        extras.append(f"track={track_seconds}s")
+    extras = _send_option_labels(
+        timeout_seconds=timeout_seconds,
+        notify_on_delivery=notify_on_delivery,
+        notify_after_seconds=effective_notify_after,
+        notify_on_stop=effective_notify_on_stop,
+        remind_soft_threshold=remind_soft_threshold,
+        remind_hard_threshold=remind_hard_threshold,
+        track_seconds=track_seconds,
+    )
     if extras:
         print(f"  Options: {', '.join(extras)}")
 
     return 0
+
+
+def _cmd_send_batch(
+    client: SessionManagerClient,
+    identifiers: list[str],
+    text: str,
+    *,
+    delivery_mode: str,
+    timeout_seconds: Optional[int],
+    notify_on_delivery: bool,
+    notify_after_seconds: Optional[int],
+    notify_on_stop: bool,
+    remind_soft_threshold: Optional[int],
+    remind_hard_threshold: Optional[int],
+    parent_session_id: Optional[str],
+    track_seconds: Optional[int],
+) -> int:
+    """Send one message to multiple recipients in one backend request."""
+    sender_session_id = client.session_id
+    result = client.send_input_batch_result(
+        identifiers,
+        text,
+        sender_session_id=sender_session_id,
+        delivery_mode=delivery_mode,
+        from_sm_send=True,
+        timeout_seconds=timeout_seconds,
+        notify_on_delivery=notify_on_delivery,
+        notify_after_seconds=notify_after_seconds,
+        notify_on_stop=notify_on_stop,
+        remind_soft_threshold=remind_soft_threshold,
+        remind_hard_threshold=remind_hard_threshold,
+        remind_cancel_on_reply_session_id=sender_session_id if track_seconds is not None else None,
+        parent_session_id=parent_session_id,
+        timeout=SEND_API_TIMEOUT,
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to send input"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    payload = result.get("data") or {}
+    had_session_success = False
+    for item in payload.get("results") or []:
+        if item.get("bootstrapped"):
+            boot_name = item.get("target_name") or item.get("session_id") or item.get("identifier")
+            provider = item.get("provider") or "unknown"
+            print(f"Role bootstrapped: {item.get('identifier')} -> {boot_name} ({item.get('session_id')}) [{provider}]")
+
+        status = item.get("status")
+        if status == "emailed":
+            recipient_summary = _email_result_summary(item)
+            print(f"Email sent to {recipient_summary}")
+            continue
+
+        if status in {"delivered", "queued"}:
+            had_session_success = True
+            target_name = item.get("target_name") or item.get("session_id") or item.get("identifier")
+            session_id = item.get("session_id") or item.get("identifier")
+            if status == "queued":
+                print(f"Input queued for {target_name} ({session_id})")
+            elif delivery_mode == "urgent":
+                print(f"Input sent to {target_name} ({session_id}) (interrupted)")
+            else:
+                print(f"Input sent to {target_name} ({session_id})")
+            continue
+
+        identifier = item.get("identifier") or "<unknown>"
+        detail = item.get("detail") or "Failed to send input"
+        print(f"Error: {identifier}: {detail}", file=sys.stderr)
+
+    extras = _send_option_labels(
+        timeout_seconds=timeout_seconds,
+        notify_on_delivery=notify_on_delivery,
+        notify_after_seconds=notify_after_seconds,
+        notify_on_stop=notify_on_stop,
+        remind_soft_threshold=remind_soft_threshold,
+        remind_hard_threshold=remind_hard_threshold,
+        track_seconds=track_seconds,
+    )
+    if had_session_success and extras:
+        print(f"  Options: {', '.join(extras)}")
+
+    return 0 if (payload.get("failure_count") or 0) == 0 else 1
+
+
+def _email_result_summary(item: dict) -> str:
+    """Format one batch email result for CLI output."""
+    username = item.get("email_username")
+    email = item.get("email_address")
+    if username and email:
+        return f"{username} <{email}>"
+    return email or item.get("identifier") or "<unknown>"
+
+
+def _send_option_labels(
+    *,
+    timeout_seconds: Optional[int],
+    notify_on_delivery: bool,
+    notify_after_seconds: Optional[int],
+    notify_on_stop: bool,
+    remind_soft_threshold: Optional[int],
+    remind_hard_threshold: Optional[int],
+    track_seconds: Optional[int],
+) -> list[str]:
+    """Format the shared option summary shown after successful sends."""
+    extras = []
+    if timeout_seconds:
+        extras.append(f"timeout={timeout_seconds}s")
+    if notify_on_delivery:
+        extras.append("notify-on-delivery")
+    if notify_after_seconds:
+        extras.append(f"wait={notify_after_seconds}s")
+    if notify_on_stop:
+        extras.append("notify-on-stop")
+    if remind_soft_threshold:
+        extras.append(
+            f"remind={remind_soft_threshold}s soft"
+            + (f"/{remind_hard_threshold}s hard" if remind_hard_threshold else "")
+        )
+    if track_seconds:
+        extras.append(f"track={track_seconds}s")
+    return extras
+
+
+def _split_send_targets(raw_value: str) -> list[str]:
+    """Split and deduplicate comma-delimited send targets while preserving order."""
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw_value or "").split(","):
+        normalized = part.strip()
+        if not normalized or normalized in seen:
+            continue
+        identifiers.append(normalized)
+        seen.add(normalized)
+    return identifiers
 
 
 def _split_email_targets(raw_value: str) -> list[str]:
