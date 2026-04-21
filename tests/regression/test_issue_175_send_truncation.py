@@ -438,7 +438,74 @@ class TestBugB_TwoCallSendInput:
             result = await tmux_controller.send_input_async("claude-test", "test message")
 
         assert result is False
-        assert call_count == 2  # Both calls were made
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_clears_partial_input_when_later_chunk_fails(self, tmux_controller):
+        """A failed later chunk clears already-typed text so retries do not append to it."""
+        tmux_controller.send_keys_max_chunk_chars = 4
+        subprocess_calls = []
+        call_count = 0
+
+        async def mock_subprocess(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            subprocess_calls.append(args)
+            proc = AsyncMock()
+            if call_count == 1:
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+                proc.returncode = 0
+            elif call_count == 2:
+                proc.communicate = AsyncMock(return_value=(b"", b"chunk error"))
+                proc.returncode = 1
+            else:
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+                proc.returncode = 0
+            return proc
+
+        with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await tmux_controller.send_input_async("claude-test", "abcdefgh")
+
+        assert result is False
+        assert subprocess_calls[0] == ("tmux", "send-keys", "-t", "claude-test", "-l", "--", "abcd")
+        assert subprocess_calls[1] == ("tmux", "send-keys", "-t", "claude-test", "-l", "--", "efgh")
+        assert subprocess_calls[2] == ("tmux", "send-keys", "-t", "claude-test", "C-u")
+
+    @pytest.mark.asyncio
+    async def test_clears_partial_input_when_enter_fails(self, tmux_controller):
+        """A failed Enter clears the already-typed composer contents before returning."""
+        subprocess_calls = []
+        call_count = 0
+
+        async def mock_subprocess(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            subprocess_calls.append(args)
+            proc = AsyncMock()
+            if call_count == 1:
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+                proc.returncode = 0
+            elif call_count == 2:
+                proc.communicate = AsyncMock(return_value=(b"", b"enter error"))
+                proc.returncode = 1
+            else:
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+                proc.returncode = 0
+            return proc
+
+        with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await tmux_controller.send_input_async("claude-test", "test message")
+
+        assert result is False
+        assert subprocess_calls[0] == ("tmux", "send-keys", "-t", "claude-test", "-l", "--", "test message")
+        assert subprocess_calls[1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
+        assert subprocess_calls[2] == ("tmux", "send-keys", "-t", "claude-test", "C-u")
 
     @pytest.mark.asyncio
     async def test_returns_false_on_timeout(self, tmux_controller):

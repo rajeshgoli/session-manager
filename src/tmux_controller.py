@@ -175,6 +175,21 @@ class TmuxController:
         after = self._get_pane_in_mode(session_name)
         return before, after
 
+    def _clear_pending_input(self, session_name: str) -> bool:
+        """Best-effort clear of partially typed input after a failed send."""
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "C-u"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.send_keys_timeout_seconds,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Failed to clear pending input for %s after send failure: %s", session_name, exc)
+            return False
+
     async def _get_pane_in_mode_async(self, session_name: str) -> Optional[int]:
         """Async variant of pane mode query."""
         try:
@@ -210,6 +225,20 @@ class TmuxController:
             pass
         after = await self._get_pane_in_mode_async(session_name)
         return before, after
+
+    async def _clear_pending_input_async(self, session_name: str) -> bool:
+        """Best-effort clear of partially typed input after a failed send."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", session_name, "C-u",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=self.send_keys_timeout_seconds)
+            return proc.returncode == 0
+        except Exception as exc:
+            logger.warning("Failed to clear pending input for %s after send failure: %s", session_name, exc)
+            return False
 
     async def _capture_pane_async(self, session_name: str) -> Optional[str]:
         """Capture the full active tmux pane asynchronously."""
@@ -729,6 +758,7 @@ class TmuxController:
             mode_before, mode_after = self._exit_copy_mode_if_needed(session_name)
             settle_delay = self._compute_settle_delay_seconds(text)
             chunks = self._split_send_text_chunks(text)
+            text_injected = False
             # Use subprocess with list arguments to prevent shell injection
             for chunk in chunks:
                 subprocess.run(
@@ -738,6 +768,7 @@ class TmuxController:
                     text=True,
                     timeout=self.send_keys_timeout_seconds
                 )
+                text_injected = True
             time.sleep(settle_delay)
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, "Enter"],
@@ -763,9 +794,13 @@ class TmuxController:
             return True
 
         except subprocess.CalledProcessError as e:
+            if "text_injected" in locals() and text_injected:
+                self._clear_pending_input(session_name)
             logger.error(f"Failed to send input: {e.stderr}")
             return False
         except subprocess.TimeoutExpired:
+            if "text_injected" in locals() and text_injected:
+                self._clear_pending_input(session_name)
             logger.error(f"Timeout sending input to {session_name}")
             return False
 
@@ -796,6 +831,7 @@ class TmuxController:
             mode_before, mode_after = await self._exit_copy_mode_if_needed_async(session_name)
             settle_delay = self._compute_settle_delay_seconds(text)
             chunks = self._split_send_text_chunks(text)
+            text_injected = False
 
             for chunk in chunks:
                 proc = await asyncio.create_subprocess_exec(
@@ -807,8 +843,11 @@ class TmuxController:
                     proc.communicate(), timeout=self.send_keys_timeout_seconds
                 )
                 if proc.returncode != 0:
+                    if text_injected:
+                        await self._clear_pending_input_async(session_name)
                     logger.error(f"Failed to send text: {stderr.decode()}")
                     return False
+                text_injected = True
 
             # Settle delay to avoid paste detection (#178)
             # Claude Code (Node.js TUI in raw mode) treats a rapid character burst
@@ -826,6 +865,8 @@ class TmuxController:
                 proc.communicate(), timeout=self.send_keys_timeout_seconds
             )
             if proc.returncode != 0:
+                if text_injected:
+                    await self._clear_pending_input_async(session_name)
                 logger.error(f"Failed to send Enter: {stderr.decode()}")
                 return False
 
@@ -851,9 +892,13 @@ class TmuxController:
             return True
 
         except asyncio.TimeoutError:
+            if "text_injected" in locals() and text_injected:
+                await self._clear_pending_input_async(session_name)
             logger.error(f"Timeout sending input to {session_name}")
             return False
         except Exception as e:
+            if "text_injected" in locals() and text_injected:
+                await self._clear_pending_input_async(session_name)
             logger.error(f"Failed to send input: {e}")
             return False
 
