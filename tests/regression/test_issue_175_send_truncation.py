@@ -485,6 +485,30 @@ class TestBugB_TwoCallSendInput:
         assert subprocess_calls[-1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
 
     @pytest.mark.asyncio
+    async def test_reserved_key_name_chunk_is_split_literally(self, tmux_controller):
+        """A chunk equal to a tmux key name must be split so it is typed literally."""
+        tmux_controller.send_keys_max_chunk_chars = 5
+        subprocess_calls = []
+
+        async def mock_subprocess(*args, **kwargs):
+            subprocess_calls.append(args)
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.returncode = 0
+            return proc
+
+        with patch.object(tmux_controller, "session_exists", return_value=True), \
+             patch.object(tmux_controller, "_exit_copy_mode_if_needed_async", new=AsyncMock(return_value=(0, 0))), \
+             patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await tmux_controller.send_input_async("claude-test", "Enter")
+
+        assert result is True
+        text_calls = [call for call in subprocess_calls if call[4] == "--"]
+        assert [call[5] for call in text_calls] == ["Ente", "r"]
+        assert subprocess_calls[-1] == ("tmux", "send-keys", "-t", "claude-test", "Enter")
+
+    @pytest.mark.asyncio
     async def test_no_dead_shlex_code(self, tmux_controller):
         """The dead shlex.quote(text) call has been removed."""
         import inspect

@@ -11,6 +11,30 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_TMUX_RESERVED_KEY_NAMES = {
+    "BSpace",
+    "BTab",
+    "DC",
+    "Delete",
+    "Down",
+    "End",
+    "Enter",
+    "Escape",
+    "Home",
+    "IC",
+    "Insert",
+    "Left",
+    "NPage",
+    "PageDown",
+    "PageUp",
+    "PPage",
+    "Right",
+    "Space",
+    "Tab",
+    "Up",
+}
+_TMUX_RESERVED_KEY_NAMES.update({f"F{i}" for i in range(1, 13)})
+
 
 class TmuxController:
     """Controls tmux sessions for Claude Code."""
@@ -102,7 +126,7 @@ class TmuxController:
         payload = text or ""
         max_chunk_chars = max(1, int(self.send_keys_max_chunk_chars or 1))
         if len(payload) <= max_chunk_chars:
-            return [payload]
+            return self._sanitize_reserved_key_chunks([payload])
 
         chunks: list[str] = []
         remaining = payload
@@ -119,7 +143,17 @@ class TmuxController:
             chunks.append(remaining[:split_at])
             remaining = remaining[split_at:]
 
-        return chunks
+        return self._sanitize_reserved_key_chunks(chunks)
+
+    def _sanitize_reserved_key_chunks(self, chunks: list[str]) -> list[str]:
+        """Ensure no chunk is interpreted by tmux as a named control key."""
+        sanitized: list[str] = []
+        for chunk in chunks:
+            if chunk in _TMUX_RESERVED_KEY_NAMES and len(chunk) > 1:
+                sanitized.extend([chunk[:-1], chunk[-1]])
+            else:
+                sanitized.append(chunk)
+        return sanitized
 
     def _get_pane_in_mode(self, session_name: str) -> Optional[int]:
         """Return tmux pane_in_mode (1 copy-mode, 0 normal) for active pane."""
