@@ -1634,6 +1634,22 @@ class TestDirectDelivery244:
             VALUES (?, ?, ?, ?, ?)
         """, (msg_id, session_id, "Stuck message", "sequential", datetime.now().isoformat()))
 
+    def _insert_pending_message_with_category(
+        self,
+        mq,
+        session_id,
+        *,
+        msg_id,
+        text,
+        message_category,
+        delivery_mode="sequential",
+    ):
+        mq._execute("""
+            INSERT INTO message_queue
+            (id, target_session_id, text, delivery_mode, queued_at, message_category)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (msg_id, session_id, text, delivery_mode, datetime.now().isoformat(), message_category))
+
     @pytest.mark.asyncio
     async def test_sequential_delivery_without_idle_gate(self, mock_session_manager, temp_db_path):
         """Sequential delivery proceeds even when is_idle=False (no idle gate, sm#244)."""
@@ -1951,6 +1967,66 @@ class TestDirectDelivery244:
         )
 
         assert deliver_call_count <= 1
+
+    @pytest.mark.asyncio
+    async def test_native_rename_batches_alone_when_first_pending(self, mock_session_manager, temp_db_path):
+        """A queued native rename must stay a standalone slash command."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        session = MagicMock()
+        session.id = "target244renamea"
+        session.provider = "claude"
+        session.tmux_session = "claude-target244renamea"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+
+        self._insert_pending_message_with_category(
+            mq,
+            "target244renamea",
+            msg_id="rename244a",
+            text="/rename fresh-name",
+            message_category="native_rename",
+        )
+        self._insert_pending_message(mq, "target244renamea", msg_id="after244a")
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
+
+        await mq._try_deliver_messages("target244renamea")
+
+        mock_session_manager._deliver_direct.assert_awaited_once_with(session, "/rename fresh-name")
+        remaining = mq.get_pending_messages("target244renamea")
+        assert [msg.id for msg in remaining] == ["after244a"]
+
+    @pytest.mark.asyncio
+    async def test_native_rename_is_not_concatenated_after_regular_message(self, mock_session_manager, temp_db_path):
+        """Regular sequential text must not absorb a later native rename."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        session = MagicMock()
+        session.id = "target244renameb"
+        session.provider = "claude"
+        session.tmux_session = "claude-target244renameb"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+
+        self._insert_pending_message(mq, "target244renameb", msg_id="before244b")
+        self._insert_pending_message_with_category(
+            mq,
+            "target244renameb",
+            msg_id="rename244b",
+            text="/rename fresh-name",
+            message_category="native_rename",
+        )
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
+
+        await mq._try_deliver_messages("target244renameb")
+
+        mock_session_manager._deliver_direct.assert_awaited_once_with(session, "Stuck message")
+        remaining = mq.get_pending_messages("target244renameb")
+        assert [msg.id for msg in remaining] == ["rename244b"]
 
 
 class TestSkipFence232:

@@ -442,7 +442,11 @@ def test_claude_hook_resyncs_tmux_and_telegram_when_native_title_changes(tmp_pat
 
     assert response.status_code == 200
     assert session.native_title == "native-hook-title"
-    manager.tmux.set_status_bar.assert_called_with(session.tmux_session, "native-hook-title")
+    manager.tmux.set_status_bar.assert_called_with(
+        session.tmux_session,
+        "native-hook-title",
+        timeout_seconds=None,
+    )
     notifier.rename_session_topic.assert_awaited_with(session, "native-hook-title")
     assert session.display_identity_synced_name == "native-hook-title"
     assert isinstance(session.display_identity_synced_at_ns, int)

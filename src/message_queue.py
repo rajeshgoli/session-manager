@@ -2414,8 +2414,17 @@ class MessageQueueManager:
                 logger.debug(f"User typing detected at final gate, aborting delivery")
                 return
 
-            # Batch messages (up to max_batch_size)
+            # Batch messages (up to max_batch_size), but keep native slash-control
+            # commands isolated so they are never concatenated into free-form text.
             batch = messages[:self.max_batch_size]
+            native_rename_index = next(
+                (index for index, msg in enumerate(batch) if msg.message_category == "native_rename"),
+                None,
+            )
+            if native_rename_index == 0:
+                batch = batch[:1]
+            elif native_rename_index is not None:
+                batch = batch[:native_rename_index]
 
             # Format batch payload
             if len(batch) == 1:
