@@ -443,6 +443,10 @@ class SessionManagerApp:
                 session.friendly_name_is_explicit = True
             self.session_manager._save_state()
 
+            renamer = getattr(self.session_manager, "queue_claude_native_rename", None)
+            if callable(renamer):
+                await renamer(session, name)
+
             # Update tmux status bar to show friendly name
             if session.provider != "codex-app":
                 display_name = self.session_manager.get_effective_session_name(session) or name

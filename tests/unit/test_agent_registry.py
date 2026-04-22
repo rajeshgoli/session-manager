@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -162,6 +162,7 @@ def test_output_monitor_cleanup_unregisters_roles(tmp_path):
 
 def test_registry_endpoints_register_lookup_and_roster(tmp_path):
     manager = _manager(tmp_path)
+    manager.queue_claude_native_rename = AsyncMock(return_value=True)
     session = _session("role1234", tmp_path)
     manager.sessions[session.id] = session
     client = TestClient(create_app(session_manager=manager))
@@ -186,6 +187,7 @@ def test_registry_endpoints_register_lookup_and_roster(tmp_path):
     assert sessions_response.status_code == 200
     payload = sessions_response.json()["sessions"][0]
     assert payload["aliases"] == ["sm-maintainer"]
+    manager.queue_claude_native_rename.assert_awaited_once_with(session, "sm-maintainer")
 
 
 def test_register_route_rejects_live_conflict(tmp_path):
