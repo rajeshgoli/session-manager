@@ -258,7 +258,43 @@ def test_effective_name_prefers_newer_claude_native_title_over_older_explicit_sm
     manager.set_session_friendly_name(session, "older-sm-name", explicit=True, updated_at_ns=1)
 
     assert manager.get_effective_session_name(session.id) == "first-native-title"
-    assert session.native_title == "first-native-title"
+
+
+@pytest.mark.asyncio
+async def test_queue_claude_native_rename_queues_sequential_literal_command(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    session = _claude_session(tmp_path, None, friendly_name="before")
+    manager.sessions[session.id] = session
+    manager.message_queue_manager = MagicMock()
+
+    queued = await manager.queue_claude_native_rename(session, "after")
+
+    assert queued is True
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_called_once_with(
+        session.id,
+        "native_rename",
+    )
+    manager.message_queue_manager.queue_message.assert_called_once_with(
+        target_session_id=session.id,
+        text="/rename after",
+        delivery_mode="sequential",
+        message_category="native_rename",
+    )
+
+
+@pytest.mark.asyncio
+async def test_queue_claude_native_rename_ignores_non_claude_sessions(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    session = _claude_session(tmp_path, None)
+    session.provider = "codex-app"
+    manager.sessions[session.id] = session
+    manager.message_queue_manager = MagicMock()
+
+    queued = await manager.queue_claude_native_rename(session, "after")
+
+    assert queued is False
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_not_called()
+    manager.message_queue_manager.queue_message.assert_not_called()
 
 
 def test_effective_name_prefers_newer_sm_name_over_claude_native_title(tmp_path: Path) -> None:
@@ -277,6 +313,7 @@ def test_effective_name_prefers_newer_sm_name_over_claude_native_title(tmp_path:
     )
 
     assert manager.get_effective_session_name(session.id) == "sm-renamed-later"
+    assert session.native_title == "native-claude-title"
 
 
 def test_effective_name_refreshes_when_claude_transcript_title_changes(tmp_path: Path) -> None:

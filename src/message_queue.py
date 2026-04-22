@@ -2183,6 +2183,28 @@ class MessageQueueManager:
             )
         return count
 
+    def cancel_queued_messages_for_target(self, target_session_id: str, message_category: str) -> int:
+        """Delete undelivered target-facing messages for one category."""
+        rows = self._execute_query(
+            "SELECT COUNT(*) FROM message_queue "
+            "WHERE target_session_id = ? AND message_category = ? AND delivered_at IS NULL",
+            (target_session_id, message_category),
+        )
+        count = rows[0][0] if rows else 0
+        if count:
+            self._execute(
+                "DELETE FROM message_queue "
+                "WHERE target_session_id = ? AND message_category = ? AND delivered_at IS NULL",
+                (target_session_id, message_category),
+            )
+            logger.info(
+                "Cancelled %s queued %s message(s) for target=%s",
+                count,
+                message_category,
+                target_session_id,
+            )
+        return count
+
     # =========================================================================
     # User Input Detection and Management
     # =========================================================================

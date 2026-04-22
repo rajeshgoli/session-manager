@@ -25,6 +25,7 @@ def mock_session_manager():
     mock.message_queue_manager = None
     mock.is_codex_rollout_enabled = MagicMock(return_value=True)
     mock.validate_friendly_name_update = MagicMock(return_value=None)
+    mock.queue_claude_native_rename = AsyncMock(return_value=True)
     mock.get_attach_descriptor = MagicMock(return_value=None)
     mock.get_session_aliases = MagicMock(return_value=[])
     mock.get_provider_create_rejection = MagicMock(return_value=None)
@@ -1375,6 +1376,7 @@ class TestUpdateSession:
 
         data = response.json()
         assert data["friendly_name"] == "new-name"
+        mock_session_manager.queue_claude_native_rename.assert_awaited_once_with(sample_session, "new-name")
 
     def test_update_friendly_name_rejects_empty(self, test_client, mock_session_manager, sample_session):
         """PATCH /sessions/{id} rejects empty friendly name (Issue #105)."""

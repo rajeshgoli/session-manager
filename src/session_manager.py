@@ -3170,6 +3170,41 @@ class SessionManager:
         session.friendly_name_updated_at_ns = updated_at_ns or time.time_ns()
         return True
 
+    async def queue_claude_native_rename(
+        self,
+        session_or_id: Session | str | None,
+        friendly_name: str,
+    ) -> bool:
+        """Best-effort enqueue of a Claude-native `/rename` for one explicit SM name."""
+        if session_or_id is None:
+            return False
+        if isinstance(session_or_id, Session):
+            session = session_or_id
+        else:
+            session = self.sessions.get(session_or_id)
+        if session is None:
+            return False
+        if session.provider != "claude" or session.status == SessionStatus.STOPPED:
+            return False
+        if not session.tmux_session:
+            return False
+
+        rename_command = f"/rename {friendly_name}"
+        if not self.message_queue_manager:
+            return await self._deliver_direct(session, rename_command)
+
+        self.message_queue_manager.cancel_queued_messages_for_target(
+            session.id,
+            "native_rename",
+        )
+        self.message_queue_manager.queue_message(
+            target_session_id=session.id,
+            text=rename_command,
+            delivery_mode="sequential",
+            message_category="native_rename",
+        )
+        return True
+
     @staticmethod
     def _session_label_sort_key(session: Session) -> tuple[int, int]:
         """Return comparable timestamps for SM-managed and provider-native labels."""
