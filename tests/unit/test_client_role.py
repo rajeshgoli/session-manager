@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from src.cli.client import SessionManagerClient
+from src.cli.client import MUTATION_API_TIMEOUT, SessionManagerClient
 
 
 def _make_client() -> SessionManagerClient:
@@ -17,6 +17,7 @@ def test_set_role_sends_put_role_payload():
         captured["method"] = method
         captured["path"] = path
         captured["data"] = data
+        captured["timeout"] = timeout
         return {"id": "abc12345", "role": "engineer"}, True, False
 
     with patch.object(client, "_request", side_effect=fake_request):
@@ -25,6 +26,7 @@ def test_set_role_sends_put_role_payload():
     assert captured["method"] == "PUT"
     assert captured["path"] == "/sessions/abc12345/role"
     assert captured["data"] == {"role": "engineer"}
+    assert captured["timeout"] == MUTATION_API_TIMEOUT
     assert success is True
     assert unavailable is False
 
@@ -37,6 +39,7 @@ def test_clear_role_sends_delete():
         captured["method"] = method
         captured["path"] = path
         captured["data"] = data
+        captured["timeout"] = timeout
         return {"id": "abc12345", "role": None}, True, False
 
     with patch.object(client, "_request", side_effect=fake_request):
@@ -45,8 +48,24 @@ def test_clear_role_sends_delete():
     assert captured["method"] == "DELETE"
     assert captured["path"] == "/sessions/abc12345/role"
     assert captured["data"] is None
+    assert captured["timeout"] == MUTATION_API_TIMEOUT
     assert success is True
     assert unavailable is False
+
+
+def test_register_role_uses_mutation_timeout():
+    client = _make_client()
+
+    with patch.object(client, "_request_with_status", return_value=({"role": "reviewer"}, 200, False)) as req:
+        result = client.register_role("abc12345", "reviewer")
+
+    assert result["ok"] is True
+    req.assert_called_once_with(
+        "POST",
+        "/sessions/abc12345/registry",
+        {"requester_session_id": "abc12345", "role": "reviewer"},
+        timeout=MUTATION_API_TIMEOUT,
+    )
 
 
 def test_ensure_role_posts_generic_role_endpoint():

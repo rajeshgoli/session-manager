@@ -12,6 +12,7 @@ import json
 DEFAULT_API_URL = "http://127.0.0.1:8420"
 DEFAULT_API_TIMEOUT = 5.0  # seconds
 DEFAULT_SEND_API_TIMEOUT = 15.0  # seconds
+DEFAULT_MUTATION_API_TIMEOUT = 15.0  # seconds
 KILL_TIMEOUT = 30  # seconds (kill triggers cleanup that may involve network I/O)
 
 
@@ -44,6 +45,22 @@ def _read_send_api_timeout() -> float:
 
 
 SEND_API_TIMEOUT = _read_send_api_timeout()
+
+
+def _read_mutation_api_timeout() -> float:
+    """Return the dedicated CLI timeout for mutation-style session requests."""
+    raw = os.environ.get("SM_MUTATION_API_TIMEOUT")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return max(_read_api_timeout(), DEFAULT_MUTATION_API_TIMEOUT)
+
+
+MUTATION_API_TIMEOUT = _read_mutation_api_timeout()
 
 
 class SessionManagerClient:
@@ -187,6 +204,7 @@ class SessionManagerClient:
             "POST",
             f"/sessions/{session_id}/registry",
             {"requester_session_id": session_id, "role": role},
+            timeout=MUTATION_API_TIMEOUT,
         )
         if unavailable:
             return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
@@ -200,6 +218,7 @@ class SessionManagerClient:
             "DELETE",
             f"/sessions/{session_id}/registry",
             {"requester_session_id": session_id, "role": role},
+            timeout=MUTATION_API_TIMEOUT,
         )
         if unavailable:
             return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
@@ -256,7 +275,8 @@ class SessionManagerClient:
         data, success, unavailable = self._request(
             "PATCH",
             f"/sessions/{session_id}",
-            {"friendly_name": friendly_name}
+            {"friendly_name": friendly_name},
+            timeout=MUTATION_API_TIMEOUT,
         )
         return success, unavailable
 
@@ -270,7 +290,8 @@ class SessionManagerClient:
         data, success, unavailable = self._request(
             "PATCH",
             f"/sessions/{session_id}",
-            {"is_em": True}
+            {"is_em": True},
+            timeout=MUTATION_API_TIMEOUT,
         )
         return success, unavailable
 
@@ -285,6 +306,7 @@ class SessionManagerClient:
             "PUT",
             f"/sessions/{session_id}/role",
             {"role": role},
+            timeout=MUTATION_API_TIMEOUT,
         )
         return success, unavailable
 
@@ -298,6 +320,7 @@ class SessionManagerClient:
         data, success, unavailable = self._request(
             "DELETE",
             f"/sessions/{session_id}/role",
+            timeout=MUTATION_API_TIMEOUT,
         )
         return success, unavailable
 
@@ -312,6 +335,7 @@ class SessionManagerClient:
             "PUT",
             f"/sessions/{session_id}/maintainer",
             {"requester_session_id": session_id},
+            timeout=MUTATION_API_TIMEOUT,
         )
         return success, unavailable
 
@@ -326,6 +350,7 @@ class SessionManagerClient:
             "DELETE",
             f"/sessions/{session_id}/maintainer",
             {"requester_session_id": session_id},
+            timeout=MUTATION_API_TIMEOUT,
         )
         return success, unavailable
 
