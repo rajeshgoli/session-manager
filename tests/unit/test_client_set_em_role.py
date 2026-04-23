@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from src.cli.client import SessionManagerClient
+from src.cli.client import MUTATION_API_TIMEOUT, SessionManagerClient
 
 
 def _make_client() -> SessionManagerClient:
@@ -18,6 +18,7 @@ def test_set_em_role_sends_patch_with_is_em_true():
         captured["method"] = method
         captured["path"] = path
         captured["data"] = data
+        captured["timeout"] = timeout
         return {"id": "abc12345", "is_em": True}, True, False
 
     with patch.object(client, "_request", side_effect=fake_request):
@@ -26,6 +27,7 @@ def test_set_em_role_sends_patch_with_is_em_true():
     assert captured["method"] == "PATCH"
     assert captured["path"] == "/sessions/abc12345"
     assert captured["data"] == {"is_em": True}
+    assert captured["timeout"] == MUTATION_API_TIMEOUT
     assert success is True
     assert unavailable is False
 

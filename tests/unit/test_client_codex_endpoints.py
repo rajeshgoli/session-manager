@@ -3,7 +3,7 @@
 import urllib.request
 from unittest.mock import patch
 
-from src.cli.client import SessionManagerClient
+from src.cli.client import MUTATION_API_TIMEOUT, SessionManagerClient
 from src.cli.client import KILL_TIMEOUT
 
 
@@ -63,6 +63,20 @@ def test_send_input_batch_result_uses_batch_endpoint():
             "from_sm_send": False,
         },
         timeout=None,
+    )
+
+
+def test_update_friendly_name_uses_mutation_timeout():
+    client = _make_client()
+    with patch.object(client, "_request", return_value=({}, True, False)) as req:
+        success, unavailable = client.update_friendly_name("abc123", "friendly")
+    assert success is True
+    assert unavailable is False
+    req.assert_called_once_with(
+        "PATCH",
+        "/sessions/abc123",
+        {"friendly_name": "friendly"},
+        timeout=MUTATION_API_TIMEOUT,
     )
 
 
