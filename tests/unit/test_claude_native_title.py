@@ -107,6 +107,7 @@ async def test_create_session_common_marks_requested_friendly_name_explicit(tmp_
     manager.tmux.create_session_with_command.return_value = True
     manager._get_git_remote_url_async = AsyncMock(return_value=None)
     manager._ensure_telegram_topic = AsyncMock()
+    manager.message_queue_manager = MagicMock()
 
     session = await manager._create_session_common(
         working_dir=str(tmp_path),
@@ -118,6 +119,37 @@ async def test_create_session_common_marks_requested_friendly_name_explicit(tmp_
     assert session.friendly_name == "spawned-name"
     assert session.friendly_name_is_explicit is True
     assert isinstance(session.friendly_name_updated_at_ns, int)
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_called_once_with(
+        session.id,
+        "native_rename",
+    )
+    manager.message_queue_manager.queue_message.assert_called_once_with(
+        target_session_id=session.id,
+        text="/rename spawned-name",
+        delivery_mode="sequential",
+        message_category="native_rename",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_session_common_does_not_queue_unsafe_native_rename(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.create_session_with_command.return_value = True
+    manager._get_git_remote_url_async = AsyncMock(return_value=None)
+    manager._ensure_telegram_topic = AsyncMock()
+    manager.message_queue_manager = MagicMock()
+
+    session = await manager._create_session_common(
+        working_dir=str(tmp_path),
+        friendly_name="bad\n/clear",
+        provider="claude",
+    )
+
+    assert session is not None
+    assert session.friendly_name == "bad\n/clear"
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_not_called()
+    manager.message_queue_manager.queue_message.assert_not_called()
 
 
 def test_effective_name_discovers_matching_transcript_path_when_missing(tmp_path: Path) -> None:

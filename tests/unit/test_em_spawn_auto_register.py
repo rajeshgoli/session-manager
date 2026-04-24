@@ -355,6 +355,75 @@ class TestSpawnEndpointMonitoring:
         assert data["session_id"] == "child456"
         assert data["warnings"] == ["failed to register spawn tracking"]
 
+    def test_spawn_response_prefers_requested_friendly_name_over_native_title(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="eng111bb",
+            name="claude-eng111bb",
+            working_dir="/tmp/parent",
+            tmux_session="claude-eng111bb",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
+        )
+        child = Session(
+            id="child456",
+            name="claude-child456",
+            working_dir="/tmp/parent",
+            tmux_session="claude-child456",
+            log_file="/tmp/child.log",
+            status=SessionStatus.RUNNING,
+            parent_session_id="eng111bb",
+            spawned_at=datetime.now(),
+            friendly_name="requested-child-name",
+            friendly_name_is_explicit=True,
+            native_title="Prompt-derived Claude title",
+            native_title_updated_at_ns=999,
+            friendly_name_updated_at_ns=1,
+        )
+        mock_sm.get_session.side_effect = lambda sid: {"eng111bb": parent, "child456": child}.get(sid)
+        mock_sm.spawn_child_session = AsyncMock(return_value=child)
+        mock_sm.get_effective_session_name.return_value = "Prompt-derived Claude title"
+
+        response = tc.post(
+            "/sessions/spawn",
+            json={
+                "parent_session_id": "eng111bb",
+                "prompt": "Implement feature X",
+                "name": "requested-child-name",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["session_id"] == "child456"
+        assert data["friendly_name"] == "requested-child-name"
+
+    def test_spawn_rejects_invalid_friendly_name_before_create(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="eng111bb",
+            name="claude-eng111bb",
+            working_dir="/tmp/parent",
+            tmux_session="claude-eng111bb",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
+        )
+        mock_sm.get_session.return_value = parent
+        mock_sm.spawn_child_session = AsyncMock()
+
+        response = tc.post(
+            "/sessions/spawn",
+            json={
+                "parent_session_id": "eng111bb",
+                "prompt": "Implement feature X",
+                "name": "bad\n/clear",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Invalid name" in response.json()["detail"]
+        mock_sm.spawn_child_session.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Tests: MessageQueueManager.arm_stop_notify (sm#277)

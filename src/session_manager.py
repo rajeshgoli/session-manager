@@ -2133,6 +2133,22 @@ class SessionManager:
         if provider == "codex-app" and not initial_prompt and self.message_queue_manager:
             self.message_queue_manager.mark_session_idle(session.id)
 
+        if provider == "claude" and friendly_name:
+            try:
+                if self._is_safe_claude_native_rename_name(friendly_name):
+                    await self.queue_claude_native_rename(session, friendly_name)
+                else:
+                    logger.warning(
+                        "Skipping native Claude rename for session %s: unsafe friendly name",
+                        session.id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to queue native Claude rename for spawned session %s: %s",
+                    session.id,
+                    exc,
+                )
+
         # Log creation
         if parent_session_id:
             logger.info(f"Spawned child session {session.name} (id={session.id}, parent={parent_session_id})")
@@ -3204,6 +3220,15 @@ class SessionManager:
             message_category="native_rename",
         )
         return True
+
+    @staticmethod
+    def _is_safe_claude_native_rename_name(friendly_name: str) -> bool:
+        """Return True when a friendly name is safe to embed in `/rename <name>`."""
+        return (
+            bool(friendly_name)
+            and len(friendly_name) <= 32
+            and re.fullmatch(r"[a-zA-Z0-9_-]+", friendly_name) is not None
+        )
 
     @staticmethod
     def _session_label_sort_key(session: Session) -> tuple[int, int]:
