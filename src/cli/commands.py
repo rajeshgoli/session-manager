@@ -271,7 +271,7 @@ def validate_friendly_name(name: str) -> tuple[bool, str]:
     if len(name) > 32:
         return False, "Name too long (max 32 chars)"
 
-    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+    if not re.fullmatch(r'[a-zA-Z0-9_-]+', name):
         return False, "Name must be alphanumeric with - or _ only (no spaces)"
 
     return True, ""

@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 from io import StringIO
 
 from src.cli.main import main, _normalize_optional_track_args
-from src.cli.commands import parse_duration, resolve_session_id, resolve_session_id_with_status
+from src.cli.commands import (
+    parse_duration,
+    resolve_session_id,
+    resolve_session_id_with_status,
+    validate_friendly_name,
+)
 
 
 class TestCliParsing:
@@ -403,6 +408,28 @@ class TestSpawnCommand:
         args = parser._get_parsed_args(["spawn", "claude", "--json", "Test prompt"])
 
         assert args.json is True
+
+
+class TestFriendlyNameValidation:
+    """Tests for friendly-name validation shared by CLI and server paths."""
+
+    def test_rejects_trailing_newline(self):
+        valid, error = validate_friendly_name("agent\n")
+
+        assert valid is False
+        assert "alphanumeric" in error
+
+    def test_rejects_embedded_newline_command(self):
+        valid, error = validate_friendly_name("agent\n/clear")
+
+        assert valid is False
+        assert "alphanumeric" in error
+
+    def test_accepts_safe_name(self):
+        valid, error = validate_friendly_name("agent-123_ok")
+
+        assert valid is True
+        assert error == ""
 
 
 class TestWaitCommand:
