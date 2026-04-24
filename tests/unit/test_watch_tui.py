@@ -301,6 +301,27 @@ def test_dynamic_column_widths_prioritize_long_session_names():
     assert dynamic_widths["Role"] == len("Role")
 
 
+def test_dynamic_column_widths_fit_waiting_permission_activity():
+    rows, _, _ = build_watch_rows(
+        [
+            _session(
+                "s1",
+                "permission-agent",
+                "/tmp/repo",
+                activity_state="waiting_permission",
+            )
+        ]
+    )
+    session_row = next(row for row in rows if row.kind == "session")
+
+    dynamic_widths = _compute_column_widths(120, rows)
+    rendered = _session_line(session_row, dynamic_widths)
+
+    assert dynamic_widths["Activity"] >= len("waiting_permission")
+    assert "waiting_permission" in rendered
+    assert "waiting_per..." not in rendered
+
+
 def test_render_columns_uses_full_visible_width_except_reserved_footer_cell():
     assert _render_columns(80, 0) == 80
     assert _render_columns(80, 2) == 78

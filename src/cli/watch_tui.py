@@ -50,7 +50,7 @@ _DYNAMIC_COLUMN_CAPS = {
     "Parent": 36,
     "Role": 16,
     "Provider": 10,
-    "Activity": 14,
+    "Activity": 18,
     "Status": 10,
     "Last": 36,
     "Age": 6,
