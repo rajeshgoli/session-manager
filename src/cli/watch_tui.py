@@ -34,6 +34,27 @@ _COLUMN_SPECS = [
 ]
 _COLUMN_ORDER = [name for name, _, _, _ in _COLUMN_SPECS]
 _COLUMN_SEP = "  "
+_COLUMN_FLOORS = {
+    "Session": 8,
+    "ID": 4,
+    "Parent": 8,
+    "Role": 4,
+    "Provider": 6,
+    "Activity": 7,
+    "Status": 5,
+    "Last": 8,
+    "Age": 3,
+}
+_DYNAMIC_COLUMN_CAPS = {
+    "ID": 8,
+    "Parent": 36,
+    "Role": 16,
+    "Provider": 10,
+    "Activity": 18,
+    "Status": 10,
+    "Last": 36,
+    "Age": 6,
+}
 
 
 @dataclass
@@ -710,7 +731,11 @@ def _truncate(text: str, width: int, align: str = "left") -> str:
     return value.ljust(width)
 
 
-def _compute_column_widths(content_width: int) -> dict[str, int]:
+def _content_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text or ""))
+
+
+def _compute_static_column_widths(content_width: int) -> dict[str, int]:
     if content_width <= 10:
         return {name: 1 for name, _, _, _ in _COLUMN_SPECS}
 
@@ -738,11 +763,54 @@ def _compute_column_widths(content_width: int) -> dict[str, int]:
 
     deficit = min_total - content_width
     shrink_order = ["Last", "Session", "Parent", "Activity", "Role", "Provider", "Status", "Age"]
-    floor = {"Session": 8, "Parent": 8, "Last": 8, "Age": 3, "Role": 4, "Provider": 6, "Activity": 7, "Status": 5}
     while deficit > 0:
         changed = False
         for name in shrink_order:
-            if widths[name] > floor[name] and deficit > 0:
+            if widths[name] > _COLUMN_FLOORS[name] and deficit > 0:
+                widths[name] -= 1
+                deficit -= 1
+                changed = True
+        if not changed:
+            break
+
+    return widths
+
+
+def _compute_column_widths(content_width: int, rows: Optional[list[WatchRow]] = None) -> dict[str, int]:
+    if not rows:
+        return _compute_static_column_widths(content_width)
+    if content_width <= 10:
+        return {name: 1 for name, _, _, _ in _COLUMN_SPECS}
+
+    session_rows = [row for row in rows if row.kind == "session"]
+    if not session_rows:
+        return _compute_static_column_widths(content_width)
+
+    widths: dict[str, int] = {}
+    for name, _, _, _ in _COLUMN_SPECS:
+        if name == "ID":
+            widths[name] = _DYNAMIC_COLUMN_CAPS["ID"]
+            continue
+        desired = len(name)
+        for row in session_rows:
+            desired = max(desired, _content_len(row.columns.get(name, "")))
+        cap = _DYNAMIC_COLUMN_CAPS.get(name)
+        if cap is not None:
+            desired = min(desired, max(len(name), cap))
+        widths[name] = max(1, desired)
+
+    sep_total = len(_COLUMN_SEP) * (len(_COLUMN_SPECS) - 1)
+    used = sum(widths.values()) + sep_total
+    if used <= content_width:
+        widths["Session"] += content_width - used
+        return widths
+
+    deficit = used - content_width
+    shrink_order = ["Last", "Parent", "Role", "Activity", "Provider", "Status", "Session", "Age", "ID"]
+    while deficit > 0:
+        changed = False
+        for name in shrink_order:
+            if widths[name] > _COLUMN_FLOORS[name] and deficit > 0:
                 widths[name] -= 1
                 deficit -= 1
                 changed = True
@@ -973,7 +1041,7 @@ def _render(
     stdscr.addnstr(0, 0, title, _render_columns(width, 0), curses.A_BOLD | palette["header"])
 
     content_width = max(1, _render_columns(width, 2))
-    widths = _compute_column_widths(content_width)
+    widths = _compute_column_widths(content_width, rows)
     stdscr.addnstr(1, 2, _header_line(widths), _render_columns(width, 2), curses.A_BOLD | palette["header"])
 
     max_rows = max(0, height - _RESERVED_SCREEN_ROWS)
