@@ -5786,6 +5786,43 @@ class SessionManager:
             await asyncio.wait_for(proc.communicate(), timeout=5)
             await asyncio.sleep(0.3)
 
+            tmux_timeouts = self.config.get("timeouts", {}).get("tmux", {})
+            shell_fd_limit = int(tmux_timeouts.get("shell_fd_limit", 65536))
+            if shell_fd_limit > 0:
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "send-keys", "-t", session.tmux_session,
+                    f"ulimit -n {shell_fd_limit}", "Enter",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.sleep(0.3)
+
+            color_env = {
+                "TERM_PROGRAM": os.environ.get("TERM_PROGRAM"),
+                "TERM_PROGRAM_VERSION": os.environ.get("TERM_PROGRAM_VERSION"),
+                "COLORTERM": os.environ.get("COLORTERM"),
+                "CLICOLOR": os.environ.get("CLICOLOR"),
+                "CLICOLOR_FORCE": os.environ.get("CLICOLOR_FORCE"),
+                "FORCE_COLOR": os.environ.get("FORCE_COLOR"),
+            }
+            color_cmds = ["unset NO_COLOR"]
+            for name, value in color_env.items():
+                if value:
+                    color_cmds.append(f"export {name}={shlex.quote(value)}")
+                else:
+                    color_cmds.append(f"unset {name}")
+
+            for color_cmd in color_cmds:
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "send-keys", "-t", session.tmux_session,
+                    color_cmd, "Enter",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.sleep(0.1)
+
             # 7. Build resume command with config args
             claude_config = self.config.get("claude", {})
             command = claude_config.get("command", "claude")

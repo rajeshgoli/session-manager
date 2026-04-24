@@ -28,6 +28,24 @@ def test_create_session_with_command_sends_launch_and_enter_separately(tmp_path)
         )
 
     assert ok is True
+    assert (
+        ("send-keys", "-t", "codex-test", "ulimit -n 65536", "Enter"),
+        {},
+    ) in run_calls
+    ulimit_call = next(
+        call for call in run_calls
+        if call[0] == ("send-keys", "-t", "codex-test", "ulimit -n 65536", "Enter")
+    )
+    unset_call = next(
+        call for call in run_calls
+        if call[0] == ("send-keys", "-t", "codex-test", "unset CLAUDECODE", "Enter")
+    )
+    unset_no_color_call = next(
+        call for call in run_calls
+        if call[0] == ("send-keys", "-t", "codex-test", "unset NO_COLOR", "Enter")
+    )
+    assert run_calls.index(ulimit_call) < run_calls.index(unset_call)
+    assert run_calls.index(ulimit_call) < run_calls.index(unset_no_color_call) < run_calls.index(unset_call)
     launch_call = next(
         call for call in run_calls
         if call[0][:4] == ("send-keys", "-t", "codex-test", "--")
@@ -67,6 +85,24 @@ def test_create_session_with_command_without_prompt_keeps_single_enter(tmp_path)
         )
 
     assert ok is True
+    assert (
+        ("send-keys", "-t", "codex-test", "ulimit -n 65536", "Enter"),
+        {},
+    ) in run_calls
+    ulimit_call = next(
+        call for call in run_calls
+        if call[0] == ("send-keys", "-t", "codex-test", "ulimit -n 65536", "Enter")
+    )
+    unset_call = next(
+        call for call in run_calls
+        if call[0] == ("send-keys", "-t", "codex-test", "unset CLAUDECODE", "Enter")
+    )
+    unset_no_color_call = next(
+        call for call in run_calls
+        if call[0] == ("send-keys", "-t", "codex-test", "unset NO_COLOR", "Enter")
+    )
+    assert run_calls.index(ulimit_call) < run_calls.index(unset_call)
+    assert run_calls.index(ulimit_call) < run_calls.index(unset_no_color_call) < run_calls.index(unset_call)
     launch_call = next(
         call for call in run_calls
         if call[0][:4] == ("send-keys", "-t", "codex-test", "--")
