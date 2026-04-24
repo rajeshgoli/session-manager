@@ -545,7 +545,7 @@ def cmd_unregister(client: SessionManagerClient, session_id: Optional[str], role
 
 def cmd_lookup(client: SessionManagerClient, role: str) -> int:
     """
-    Resolve a durable registry role to its owning session ID.
+    Resolve a durable registry role or live session identifier to a session ID.
 
     Prints only the session ID on stdout so it can be used in command substitution.
     """
@@ -559,7 +559,14 @@ def cmd_lookup(client: SessionManagerClient, role: str) -> int:
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
-        detail = result.get("detail") or "Role not registered"
+        session_id, unavailable, error = _lookup_live_session_fallback(client, normalized_role)
+        if unavailable:
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        if session_id:
+            print(session_id)
+            return 0
+        detail = error or result.get("detail") or "Role not registered"
         print(f"Error: {detail}", file=sys.stderr)
         return 1
 
@@ -570,6 +577,56 @@ def cmd_lookup(client: SessionManagerClient, role: str) -> int:
         return 1
     print(session_id)
     return 0
+
+
+def _lookup_live_session_fallback(
+    client: SessionManagerClient,
+    identifier: str,
+) -> tuple[Optional[str], bool, Optional[str]]:
+    """Resolve lookup fallback by live session ID/name without changing send semantics."""
+    try:
+        session = client.get_session(identifier)
+    except TypeError:
+        session = client.get_session(identifier)
+    if session:
+        return session.get("id") or identifier, False, None
+
+    try:
+        sessions = client.list_sessions()
+    except TypeError:
+        sessions = client.list_sessions()
+    if sessions is None:
+        return None, True, None
+
+    for session in sessions:
+        aliases = session.get("aliases") or []
+        if identifier in aliases:
+            return session["id"], False, None
+
+    for session in sessions:
+        if session.get("friendly_name") == identifier or session.get("name") == identifier:
+            return session["id"], False, None
+
+    needle = identifier.casefold()
+    matches = [
+        session
+        for session in sessions
+        if any(
+            needle in str(value).casefold()
+            for value in (session.get("friendly_name"), session.get("name"))
+            if value
+        )
+    ]
+    if len(matches) == 1:
+        return matches[0]["id"], False, None
+    if len(matches) > 1:
+        labels = ", ".join(
+            f"{session.get('friendly_name') or session.get('name') or session['id']} ({session['id']})"
+            for session in matches[:5]
+        )
+        suffix = "" if len(matches) <= 5 else f", +{len(matches) - 5} more"
+        return None, False, f"Multiple sessions match '{identifier}': {labels}{suffix}"
+    return None, False, None
 
 
 def cmd_roster(client: SessionManagerClient) -> int:

@@ -283,6 +283,60 @@ def test_cmd_register_lookup_unregister_and_roster(capsys):
     assert "sess1234" in roster_output
 
 
+def test_cmd_lookup_falls_back_to_exact_session_name(capsys):
+    client = Mock()
+    client.lookup_role.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "detail": "Role not registered",
+    }
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {"id": "sess1234", "name": "claude-sess1234", "friendly_name": "super-orchestrator", "aliases": []},
+    ]
+
+    assert cmd_lookup(client, "super-orchestrator") == 0
+    assert capsys.readouterr().out.strip() == "sess1234"
+
+
+def test_cmd_lookup_falls_back_to_unique_session_name_fragment(capsys):
+    client = Mock()
+    client.lookup_role.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "detail": "Role not registered",
+    }
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {"id": "sess1234", "name": "claude-sess1234", "friendly_name": "em-super-orchestrator-3047", "aliases": []},
+        {"id": "other123", "name": "claude-other123", "friendly_name": "reviewer-3047", "aliases": []},
+    ]
+
+    assert cmd_lookup(client, "super-orchestrator") == 0
+    assert capsys.readouterr().out.strip() == "sess1234"
+
+
+def test_cmd_lookup_rejects_ambiguous_session_name_fragment(capsys):
+    client = Mock()
+    client.lookup_role.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "detail": "Role not registered",
+    }
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {"id": "sess1234", "name": "claude-sess1234", "friendly_name": "em-super-orchestrator-3047", "aliases": []},
+        {"id": "other123", "name": "claude-other123", "friendly_name": "backup-super-orchestrator", "aliases": []},
+    ]
+
+    assert cmd_lookup(client, "super-orchestrator") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Multiple sessions match 'super-orchestrator'" in captured.err
+    assert "em-super-orchestrator-3047 (sess1234)" in captured.err
+    assert "backup-super-orchestrator (other123)" in captured.err
+
+
 def test_main_register_lookup_roster_dispatch():
     with patch.dict(os.environ, {"CLAUDE_SESSION_MANAGER_ID": "sess1234"}, clear=False):
         with patch("sys.argv", ["sm", "register", "reviewer"]):
