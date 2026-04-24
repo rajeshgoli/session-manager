@@ -36,6 +36,7 @@ class TmuxController:
         self.send_keys_max_chunk_chars = int(tmux_timeouts.get("send_keys_max_chunk_chars", 4096))
         self.submit_verify_seconds = tmux_timeouts.get("submit_verify_seconds", 0.6)
         self.submit_retry_seconds = tmux_timeouts.get("submit_retry_seconds", 0.6)
+        self.shell_fd_limit = int(tmux_timeouts.get("shell_fd_limit", 65536))
 
     def _resolve_launch_command(
         self,
@@ -161,6 +162,67 @@ class TmuxController:
         except Exception:
             # Non-fatal: pane title is best-effort only.
             pass
+
+    def _prepare_managed_shell(self, session_name: str, session_id: Optional[str]) -> None:
+        """Set shell state inherited by Claude/Codex before launching the provider."""
+        if self.shell_fd_limit > 0:
+            self._run_tmux(
+                "send-keys",
+                "-t", session_name,
+                f"ulimit -n {self.shell_fd_limit}",
+                "Enter",
+            )
+
+        self._run_tmux(
+            "send-keys",
+            "-t", session_name,
+            "unset NO_COLOR",
+            "Enter",
+        )
+        color_env = {
+            "TERM_PROGRAM": os.environ.get("TERM_PROGRAM"),
+            "TERM_PROGRAM_VERSION": os.environ.get("TERM_PROGRAM_VERSION"),
+            "COLORTERM": os.environ.get("COLORTERM"),
+            "CLICOLOR": os.environ.get("CLICOLOR"),
+            "CLICOLOR_FORCE": os.environ.get("CLICOLOR_FORCE"),
+            "FORCE_COLOR": os.environ.get("FORCE_COLOR"),
+        }
+        for name, value in color_env.items():
+            if value:
+                color_cmd = f"export {name}={shlex.quote(value)}"
+            else:
+                color_cmd = f"unset {name}"
+            self._run_tmux(
+                "send-keys",
+                "-t", session_name,
+                color_cmd,
+                "Enter",
+            )
+
+        # Claude Code can leave this behind after exits; managed tmux panes are independent
+        # launches, so nested-session detection should not apply.
+        self._run_tmux(
+            "send-keys",
+            "-t", session_name,
+            "unset CLAUDECODE",
+            "Enter",
+        )
+        # Workaround for Claude Code bug: ToolSearch infinite loop (issues #20329, #20468, #20982)
+        self._run_tmux(
+            "send-keys",
+            "-t", session_name,
+            "export ENABLE_TOOL_SEARCH=false",
+            "Enter",
+        )
+
+        if session_id:
+            # Export session ID so it persists even if user exits and restarts the provider.
+            self._run_tmux(
+                "send-keys",
+                "-t", session_name,
+                f"export CLAUDE_SESSION_MANAGER_ID={session_id}",
+                "Enter",
+            )
 
     def _exit_copy_mode_if_needed(self, session_name: str) -> tuple[Optional[int], Optional[int]]:
         """Exit tmux copy-mode on active pane when present."""
@@ -544,31 +606,7 @@ class TmuxController:
                 f"cat >> {log_file}",
             )
 
-            # Set up environment variables first (persists in the shell)
-            # Unset CLAUDECODE to allow spawning Claude Code in child sessions
-            # (Claude Code sets this to detect nested sessions, but our tmux sessions are independent)
-            self._run_tmux(
-                "send-keys",
-                "-t", session_name,
-                "unset CLAUDECODE",
-                "Enter",
-            )
-            # Workaround for Claude Code bug: ToolSearch infinite loop (issues #20329, #20468, #20982)
-            self._run_tmux(
-                "send-keys",
-                "-t", session_name,
-                "export ENABLE_TOOL_SEARCH=false",
-                "Enter",
-            )
-
-            if session_id:
-                # Export session ID so it persists even if user exits and restarts Claude
-                self._run_tmux(
-                    "send-keys",
-                    "-t", session_name,
-                    f"export CLAUDE_SESSION_MANAGER_ID={session_id}",
-                    "Enter",
-                )
+            self._prepare_managed_shell(session_name, session_id)
 
             # Small delay to ensure exports complete
             import time
@@ -661,30 +699,7 @@ class TmuxController:
                 f"cat >> {log_file}",
             )
 
-            # Set up environment variables first (persists in the shell)
-            # Unset CLAUDECODE to allow spawning Claude Code in child sessions
-            self._run_tmux(
-                "send-keys",
-                "-t", session_name,
-                "unset CLAUDECODE",
-                "Enter",
-            )
-            # Workaround for Claude Code bug: ToolSearch infinite loop (issues #20329, #20468, #20982)
-            self._run_tmux(
-                "send-keys",
-                "-t", session_name,
-                "export ENABLE_TOOL_SEARCH=false",
-                "Enter",
-            )
-
-            if session_id:
-                # Export session ID so it persists
-                self._run_tmux(
-                    "send-keys",
-                    "-t", session_name,
-                    f"export CLAUDE_SESSION_MANAGER_ID={session_id}",
-                    "Enter",
-                )
+            self._prepare_managed_shell(session_name, session_id)
 
             # Small delay to ensure exports complete
             import time
