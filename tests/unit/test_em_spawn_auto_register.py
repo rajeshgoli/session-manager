@@ -127,6 +127,23 @@ class TestSpawnProviderAwareModel:
         assert "\x1b" not in err
         client.spawn_child.assert_not_called()
 
+    def test_claude_provider_model_id_forwarded(self):
+        client = _make_client()
+
+        rc = cmd_spawn(client, "eng111bb", "claude", "Implement feature X", model="claude-opus-4-6")
+
+        assert rc == 0
+        client.spawn_child.assert_called_once_with(
+            parent_session_id="eng111bb",
+            prompt="Implement feature X",
+            name=None,
+            wait=None,
+            model="claude-opus-4-6",
+            working_dir=None,
+            provider="claude",
+            track_seconds=None,
+        )
+
     def test_codex_model_forwarded(self):
         spawn_result = dict(_SPAWN_RESULT_CLAUDE)
         spawn_result["provider"] = "codex"

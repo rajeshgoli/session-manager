@@ -182,6 +182,30 @@ class TestSessionLifecycle:
         call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
         assert call_kwargs["command"] == "claude"
         assert call_kwargs["args"] == ["--resume", "restore-uuid"]
+        assert call_kwargs["model"] is None
+
+    @pytest.mark.asyncio
+    async def test_restore_session_flow_claude_preserves_explicit_model(self, session_manager, mock_tmux):
+        """Stopped Claude sessions restore with the explicit model used at spawn."""
+        parent = await session_manager.create_session(working_dir="/tmp/parent")
+        session = await session_manager.spawn_child_session(
+            parent_session_id=parent.id,
+            prompt="Test",
+            model="haiku",
+        )
+        assert session.model == "haiku"
+        session.transcript_path = "/tmp/transcripts/model-restore-uuid.jsonl"
+        session_manager.kill_session(session.id)
+
+        success, restored, error = await session_manager.restore_session(session.id)
+
+        assert success is True
+        assert error is None
+        assert restored is session
+        call_kwargs = mock_tmux.create_session_with_command.call_args_list[-1][1]
+        assert call_kwargs["command"] == "claude"
+        assert call_kwargs["args"] == ["--resume", "model-restore-uuid"]
+        assert call_kwargs["model"] == "haiku"
 
     @pytest.mark.asyncio
     async def test_restore_session_flow_stale_active_claude_missing_tmux(self, session_manager, mock_tmux):
@@ -696,6 +720,7 @@ class TestSpawnChildSession:
         # Verify tmux was called with model
         call_kwargs = mock_tmux.create_session_with_command.call_args[1]
         assert call_kwargs.get("model") == "haiku"
+        assert child.model == "haiku"
 
     @pytest.mark.asyncio
     async def test_spawn_with_friendly_name(self, session_manager, mock_tmux):
@@ -854,6 +879,7 @@ class TestSendInput:
             session.tmux_session,
             "Direct message",
             verify_claude_submit=True,
+            verify_codex_submit=False,
         )
 
 
