@@ -274,6 +274,33 @@ def test_session_line_truncates_deterministically():
     assert "..." in rendered
 
 
+def test_dynamic_column_widths_prioritize_long_session_names():
+    long_name = "owner-3047-s12_14_getevalabsorption"
+    rows, _, _ = build_watch_rows(
+        [
+            _session(
+                "s1",
+                long_name,
+                "/tmp/repo",
+                provider="claude",
+                status="running",
+                last_tool_name="Bash",
+                last_tool_call="2026-02-21T22:59:00",
+            )
+        ]
+    )
+    session_row = next(row for row in rows if row.kind == "session")
+
+    static_widths = _compute_column_widths(120)
+    dynamic_widths = _compute_column_widths(120, rows)
+    rendered = _session_line(session_row, dynamic_widths)
+
+    assert dynamic_widths["Session"] > static_widths["Session"]
+    assert dynamic_widths["Session"] >= len(session_row.columns["Session"])
+    assert long_name in rendered
+    assert dynamic_widths["Role"] == len("Role")
+
+
 def test_render_columns_uses_full_visible_width_except_reserved_footer_cell():
     assert _render_columns(80, 0) == 80
     assert _render_columns(80, 2) == 78
