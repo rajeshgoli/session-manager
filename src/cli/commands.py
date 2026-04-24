@@ -2019,9 +2019,9 @@ def cmd_spawn(
     if track_seconds is not None and track_seconds <= 0:
         print("Error: --track interval must be > 0", file=sys.stderr)
         return 1
-    if provider == "claude" and model is not None and model not in {"opus", "sonnet", "haiku"}:
+    if provider == "claude" and model is not None and not safe_model_pattern.match(model):
         print(
-            "Error: Invalid Claude model. Choose one of: opus, sonnet, haiku",
+            "Error: Invalid Claude model. Allowed characters: letters, numbers, ., _, :, /, -",
             file=sys.stderr,
         )
         return 1
