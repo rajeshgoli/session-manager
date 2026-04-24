@@ -304,6 +304,7 @@ class Session:
     error_message: Optional[str] = None
     transcript_path: Optional[str] = None  # Claude's transcript file path
     provider_resume_id: Optional[str] = None  # Provider-native conversation/thread/session id for restore
+    model: Optional[str] = None  # Explicit provider model passed at launch; replayed on restore
     friendly_name: Optional[str] = None  # Session Manager label for display
     friendly_name_is_explicit: bool = False  # True when sm name / PATCH explicitly set the label
     friendly_name_updated_at_ns: Optional[int] = None  # Last SM-side friendly-name update time
@@ -393,6 +394,7 @@ class Session:
             "error_message": self.error_message,
             "transcript_path": self.transcript_path,
             "provider_resume_id": self.provider_resume_id,
+            "model": self.model,
             "friendly_name": self.friendly_name,
             "friendly_name_is_explicit": self.friendly_name_is_explicit,
             "friendly_name_updated_at_ns": self.friendly_name_updated_at_ns,
@@ -483,6 +485,7 @@ class Session:
             error_message=data.get("error_message"),
             transcript_path=data.get("transcript_path"),
             provider_resume_id=data.get("provider_resume_id"),
+            model=data.get("model"),
             friendly_name=data.get("friendly_name"),
             friendly_name_is_explicit=bool(data.get("friendly_name_is_explicit", False)),
             friendly_name_updated_at_ns=data.get("friendly_name_updated_at_ns"),

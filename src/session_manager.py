@@ -2005,6 +2005,7 @@ class SessionManager:
             spawn_prompt=spawn_prompt,
             spawned_at=datetime.now() if parent_session_id else None,
             provider=provider,
+            model=model,
         )
 
         if friendly_name:
@@ -5127,6 +5128,7 @@ class SessionManager:
                 session_id=session.id,
                 command=command,
                 args=args,
+                model=session.model,
             ):
                 tmux_error = getattr(self.tmux, "last_error_message", None)
                 if tmux_error:
