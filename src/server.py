@@ -1269,6 +1269,14 @@ def create_app(
             return session.friendly_name
         return _effective_session_name(session)
 
+    def _validate_requested_friendly_name(name: Optional[str]) -> None:
+        """Apply the same friendly-name validation used by `sm name`."""
+        if name is None:
+            return
+        valid, error = validate_friendly_name(name)
+        if not valid:
+            raise HTTPException(status_code=400, detail=f"Invalid name: {error}")
+
     def _email_handler_or_503():
         handler = getattr(app.state, "email_handler", None)
         if handler is None:
@@ -5177,6 +5185,7 @@ Provide ONLY the summary, no preamble or questions."""
         )
         if provider_rejection:
             raise HTTPException(status_code=503, detail=provider_rejection)
+        _validate_requested_friendly_name(request.name)
         child_session = await app.state.session_manager.spawn_child_session(
             parent_session_id=request.parent_session_id,
             prompt=request.prompt,
@@ -5302,6 +5311,7 @@ Provide ONLY the summary, no preamble or questions."""
         if not parent:
             raise HTTPException(status_code=404, detail="Parent session not found")
 
+        _validate_requested_friendly_name(request.name)
         session = await app.state.session_manager.spawn_review_session(
             parent_session_id=request.parent_session_id,
             mode=request.mode,

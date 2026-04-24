@@ -201,6 +201,30 @@ class TestReviewEndpointErrorFix:
         data = response.json()
         assert "error" in data
 
+    def test_spawn_review_rejects_invalid_friendly_name_before_create(
+        self,
+        test_client,
+        mock_session_manager,
+        sample_session,
+    ):
+        """POST /sessions/review validates the requested friendly name before spawn."""
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.spawn_review_session = AsyncMock()
+
+        response = test_client.post(
+            "/sessions/review",
+            json={
+                "parent_session_id": "test123",
+                "mode": "branch",
+                "base_branch": "main",
+                "name": "bad\n/clear",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Invalid name" in response.json()["detail"]
+        mock_session_manager.spawn_review_session.assert_not_awaited()
+
 
 class TestCmdReviewPR:
     """Tests for cmd_review --pr dispatch path."""

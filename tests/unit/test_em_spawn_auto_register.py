@@ -398,6 +398,32 @@ class TestSpawnEndpointMonitoring:
         assert data["session_id"] == "child456"
         assert data["friendly_name"] == "requested-child-name"
 
+    def test_spawn_rejects_invalid_friendly_name_before_create(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="eng111bb",
+            name="claude-eng111bb",
+            working_dir="/tmp/parent",
+            tmux_session="claude-eng111bb",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
+        )
+        mock_sm.get_session.return_value = parent
+        mock_sm.spawn_child_session = AsyncMock()
+
+        response = tc.post(
+            "/sessions/spawn",
+            json={
+                "parent_session_id": "eng111bb",
+                "prompt": "Implement feature X",
+                "name": "bad\n/clear",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Invalid name" in response.json()["detail"]
+        mock_sm.spawn_child_session.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Tests: MessageQueueManager.arm_stop_notify (sm#277)
