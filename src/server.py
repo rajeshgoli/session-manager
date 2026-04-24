@@ -1263,6 +1263,12 @@ def create_app(
                     return display_name
         return _cached_session_name(session)
 
+    def _explicit_or_effective_session_name(session: Session) -> str:
+        """Prefer an operator-requested SM name on immediate mutation responses."""
+        if session.friendly_name and session.friendly_name_is_explicit:
+            return session.friendly_name
+        return _effective_session_name(session)
+
     def _email_handler_or_503():
         handler = getattr(app.state, "email_handler", None)
         if handler is None:
@@ -5200,7 +5206,7 @@ Provide ONLY the summary, no preamble or questions."""
         response = {
             "session_id": child_session.id,
             "name": child_session.name,
-            "friendly_name": _effective_session_name(child_session),
+            "friendly_name": _explicit_or_effective_session_name(child_session),
             "working_dir": child_session.working_dir,
             "parent_session_id": child_session.parent_session_id,
             "tmux_session": child_session.tmux_session,
@@ -5319,7 +5325,7 @@ Provide ONLY the summary, no preamble or questions."""
         return {
             "session_id": session.id,
             "name": session.name,
-            "friendly_name": _effective_session_name(session),
+            "friendly_name": _explicit_or_effective_session_name(session),
             "review_mode": request.mode,
             "base_branch": request.base_branch,
             "status": "started",

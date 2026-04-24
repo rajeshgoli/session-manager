@@ -2133,6 +2133,16 @@ class SessionManager:
         if provider == "codex-app" and not initial_prompt and self.message_queue_manager:
             self.message_queue_manager.mark_session_idle(session.id)
 
+        if provider == "claude" and friendly_name:
+            try:
+                await self.queue_claude_native_rename(session, friendly_name)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to queue native Claude rename for spawned session %s: %s",
+                    session.id,
+                    exc,
+                )
+
         # Log creation
         if parent_session_id:
             logger.info(f"Spawned child session {session.name} (id={session.id}, parent={parent_session_id})")
