@@ -299,6 +299,44 @@ def test_cmd_lookup_falls_back_to_exact_session_name(capsys):
     assert capsys.readouterr().out.strip() == "sess1234"
 
 
+def test_cmd_lookup_does_not_fallback_on_registry_error(capsys):
+    client = Mock()
+    client.lookup_role.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "status_code": 500,
+        "detail": "registry exploded",
+    }
+
+    assert cmd_lookup(client, "super-orchestrator") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "registry exploded" in captured.err
+    client.get_session.assert_not_called()
+    client.list_sessions.assert_not_called()
+
+
+def test_cmd_lookup_rejects_ambiguous_exact_session_name(capsys):
+    client = Mock()
+    client.lookup_role.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "detail": "Role not registered",
+    }
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {"id": "sess1234", "name": "claude-sess1234", "friendly_name": "super-orchestrator", "aliases": []},
+        {"id": "other123", "name": "claude-other123", "friendly_name": "super-orchestrator", "aliases": []},
+    ]
+
+    assert cmd_lookup(client, "super-orchestrator") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Multiple sessions match 'super-orchestrator'" in captured.err
+    assert "super-orchestrator (sess1234)" in captured.err
+    assert "super-orchestrator (other123)" in captured.err
+
+
 def test_cmd_lookup_falls_back_to_unique_session_name_fragment(capsys):
     client = Mock()
     client.lookup_role.return_value = {

@@ -559,6 +559,14 @@ def cmd_lookup(client: SessionManagerClient, role: str) -> int:
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
+        is_registry_miss = (
+            result.get("status_code") == 404
+            or (result.get("detail") or "") == "Role not registered"
+        )
+        if not is_registry_miss:
+            detail = result.get("detail") or "Role lookup failed"
+            print(f"Error: {detail}", file=sys.stderr)
+            return 1
         session_id, unavailable, error = _lookup_live_session_fallback(client, normalized_role)
         if unavailable:
             print(UNAVAILABLE_MESSAGE, file=sys.stderr)
@@ -577,6 +585,15 @@ def cmd_lookup(client: SessionManagerClient, role: str) -> int:
         return 1
     print(session_id)
     return 0
+
+
+def _lookup_ambiguous_match_error(identifier: str, matches: list[dict]) -> str:
+    labels = ", ".join(
+        f"{session.get('friendly_name') or session.get('name') or session['id']} ({session['id']})"
+        for session in matches[:5]
+    )
+    suffix = "" if len(matches) <= 5 else f", +{len(matches) - 5} more"
+    return f"Multiple sessions match '{identifier}': {labels}{suffix}"
 
 
 def _lookup_live_session_fallback(
@@ -598,14 +615,17 @@ def _lookup_live_session_fallback(
     if sessions is None:
         return None, True, None
 
-    for session in sessions:
-        aliases = session.get("aliases") or []
-        if identifier in aliases:
-            return session["id"], False, None
-
-    for session in sessions:
-        if session.get("friendly_name") == identifier or session.get("name") == identifier:
-            return session["id"], False, None
+    exact_matches = [
+        session
+        for session in sessions
+        if identifier in (session.get("aliases") or [])
+        or session.get("friendly_name") == identifier
+        or session.get("name") == identifier
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]["id"], False, None
+    if len(exact_matches) > 1:
+        return None, False, _lookup_ambiguous_match_error(identifier, exact_matches)
 
     needle = identifier.casefold()
     matches = [
@@ -620,12 +640,7 @@ def _lookup_live_session_fallback(
     if len(matches) == 1:
         return matches[0]["id"], False, None
     if len(matches) > 1:
-        labels = ", ".join(
-            f"{session.get('friendly_name') or session.get('name') or session['id']} ({session['id']})"
-            for session in matches[:5]
-        )
-        suffix = "" if len(matches) <= 5 else f", +{len(matches) - 5} more"
-        return None, False, f"Multiple sessions match '{identifier}': {labels}{suffix}"
+        return None, False, _lookup_ambiguous_match_error(identifier, matches)
     return None, False, None
 
 
