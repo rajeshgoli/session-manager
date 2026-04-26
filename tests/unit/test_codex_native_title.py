@@ -174,6 +174,35 @@ def test_codex_thread_name_event_respects_seq_dedupe(tmp_path):
     assert session.native_title == "newer-title"
 
 
+def test_codex_thread_name_event_without_timestamp_updates_title_without_regressing_order(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cf658",
+        name="codex-fork-cf658",
+        working_dir="/tmp",
+        provider="codex-fork",
+        provider_resume_id="thread-658",
+        native_title="old-title",
+        native_title_updated_at_ns=1777182385000000000,
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "thread_name_updated",
+            "seq": 11,
+            "session_epoch": 1,
+            "ts": "not-a-timestamp",
+            "payload": {"thread_id": "thread-658", "thread_name": "untimed-title"},
+        },
+    )
+
+    assert session.native_title == "untimed-title"
+    assert session.native_title_updated_at_ns == 1777182385000000000
+
+
 def test_codex_index_title_without_timestamp_does_not_beat_explicit_name(tmp_path):
     manager = _manager(tmp_path)
     session = Session(
@@ -199,6 +228,31 @@ def test_codex_index_title_without_timestamp_does_not_beat_explicit_name(tmp_pat
     assert changed is True
     assert session.native_title_updated_at_ns == 0
     assert manager.get_effective_session_name(session) == "explicit-reviewer"
+
+
+@pytest.mark.asyncio
+async def test_legacy_claude_native_rename_wrapper_queues_codex_fork_rename(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cf659",
+        name="codex-fork-cf659",
+        working_dir="/tmp",
+        tmux_session="codex-fork-cf659",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.message_queue_manager = MagicMock()
+
+    queued = await manager.queue_claude_native_rename(session, "legacy-codex")
+
+    assert queued is True
+    manager.message_queue_manager.queue_message.assert_called_once_with(
+        target_session_id=session.id,
+        text="/rename legacy-codex",
+        delivery_mode="sequential",
+        message_category="native_rename",
+    )
 
 
 def test_codex_session_index_backfills_native_title_on_startup(tmp_path):

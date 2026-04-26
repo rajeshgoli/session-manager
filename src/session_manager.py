@@ -1601,9 +1601,9 @@ class SessionManager:
         if not native_title:
             return False
 
-        incoming_updated_at_ns = updated_at_ns if updated_at_ns is not None else 0
+        incoming_updated_at_ns = updated_at_ns
         current_updated_at_ns = int(session.native_title_updated_at_ns or 0)
-        if current_updated_at_ns and incoming_updated_at_ns < current_updated_at_ns:
+        if incoming_updated_at_ns is not None and current_updated_at_ns and incoming_updated_at_ns < current_updated_at_ns:
             return False
 
         changed = False
@@ -1620,8 +1620,12 @@ class SessionManager:
         if session.native_title != native_title:
             session.native_title = native_title
             changed = True
-        if session.native_title_updated_at_ns != incoming_updated_at_ns:
-            session.native_title_updated_at_ns = incoming_updated_at_ns
+        if incoming_updated_at_ns is not None:
+            if session.native_title_updated_at_ns != incoming_updated_at_ns:
+                session.native_title_updated_at_ns = incoming_updated_at_ns
+                changed = True
+        elif session.native_title_updated_at_ns is None:
+            session.native_title_updated_at_ns = 0
             changed = True
         if session.native_title_source_mtime_ns is not None:
             session.native_title_source_mtime_ns = None
@@ -3428,15 +3432,7 @@ class SessionManager:
         session_or_id: Session | str | None,
         friendly_name: str,
     ) -> bool:
-        """Best-effort enqueue of a Claude-native `/rename` for one explicit SM name."""
-        if session_or_id is None:
-            return False
-        if isinstance(session_or_id, Session):
-            session = session_or_id
-        else:
-            session = self.sessions.get(session_or_id)
-        if session is None or session.provider != "claude":
-            return False
+        """Backward-compatible wrapper for provider-native `/rename` queueing."""
         return await self.queue_provider_native_rename(session_or_id, friendly_name)
 
     @staticmethod
