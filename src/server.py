@@ -1231,7 +1231,11 @@ def create_app(
                     return primary_alias
 
         provider = getattr(session, "provider", "claude")
-        native_title = session.native_title if provider == "claude" else None
+        native_title = (
+            session.native_title
+            if provider in {"claude", "codex", "codex-app", "codex-fork"}
+            else None
+        )
         friendly_name_updated_at_ns = int(session.friendly_name_updated_at_ns or 0)
         native_title_updated_at_ns = int(
             session.native_title_updated_at_ns
