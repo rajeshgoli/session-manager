@@ -76,6 +76,60 @@ def test_codex_native_title_does_not_override_newer_explicit_sm_name(tmp_path):
     assert manager.get_effective_session_name(session) == "sm-reviewer"
 
 
+def test_codex_thread_name_event_ignores_unknown_thread_id(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cf652",
+        name="codex-fork-cf652",
+        working_dir="/tmp",
+        provider="codex-fork",
+        provider_resume_id="real-thread",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "thread_name_updated",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {"thread_name": "native-reviewer"},
+            "session_id": "unknown",
+        },
+    )
+
+    assert session.provider_resume_id == "real-thread"
+    assert session.native_title == "native-reviewer"
+
+
+def test_codex_index_title_without_timestamp_does_not_beat_explicit_name(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cf653",
+        name="codex-fork-cf653",
+        working_dir="/tmp",
+        provider="codex-fork",
+        provider_resume_id="thread-653",
+        friendly_name="explicit-reviewer",
+        friendly_name_is_explicit=True,
+        friendly_name_updated_at_ns=100,
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    changed = manager._sync_codex_native_title(
+        session,
+        thread_name="index-reviewer",
+        updated_at_ns=None,
+        thread_id="thread-653",
+    )
+
+    assert changed is True
+    assert session.native_title_updated_at_ns == 0
+    assert manager.get_effective_session_name(session) == "explicit-reviewer"
+
+
 def test_codex_session_index_backfills_native_title_on_startup(tmp_path):
     index_path = tmp_path / "session_index.jsonl"
     index_path.write_text(
@@ -92,8 +146,8 @@ def test_codex_session_index_backfills_native_title_on_startup(tmp_path):
 
     state_file = tmp_path / "state.json"
     session = Session(
-        id="cf652",
-        name="codex-fork-cf652",
+        id="cf654",
+        name="codex-fork-cf654",
         working_dir="/tmp",
         provider="codex-fork",
         provider_resume_id="thread-652",
@@ -110,6 +164,6 @@ def test_codex_session_index_backfills_native_title_on_startup(tmp_path):
         config={"codex": {"session_index_path": str(index_path)}},
     )
 
-    restored = manager.sessions["cf652"]
+    restored = manager.sessions["cf654"]
     assert restored.native_title == "index-reviewer"
     assert manager.get_effective_session_name(restored) == "index-reviewer"

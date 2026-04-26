@@ -1498,6 +1498,16 @@ class SessionManager:
         title = re.sub(r"[\r\n\t]+", " ", value).strip()
         return title or None
 
+    @staticmethod
+    def _normalize_codex_thread_id(value: Any) -> Optional[str]:
+        """Normalize Codex thread IDs while rejecting bridge sentinel values."""
+        if not isinstance(value, str):
+            return None
+        thread_id = value.strip()
+        if not thread_id or thread_id.lower() in {"unknown", "none", "null"}:
+            return None
+        return thread_id
+
     def _read_codex_session_index(self) -> dict[str, tuple[str, Optional[int]]]:
         """Read Codex's local thread index keyed by provider resume/thread id."""
         index_path = self.codex_session_index_path
@@ -1546,13 +1556,13 @@ class SessionManager:
         if not native_title:
             return False
 
-        incoming_updated_at_ns = updated_at_ns or time.time_ns()
+        incoming_updated_at_ns = updated_at_ns if updated_at_ns is not None else 0
         current_updated_at_ns = int(session.native_title_updated_at_ns or 0)
         if current_updated_at_ns and incoming_updated_at_ns < current_updated_at_ns:
             return False
 
         changed = False
-        normalized_thread_id = str(thread_id or "").strip()
+        normalized_thread_id = self._normalize_codex_thread_id(thread_id)
         if normalized_thread_id:
             if session.provider == "codex-app":
                 if session.codex_thread_id != normalized_thread_id:
