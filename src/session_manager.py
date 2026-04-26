@@ -1490,6 +1490,38 @@ class SessionManager:
             value = value.replace(tzinfo=timezone.utc)
         return int(value.astimezone(timezone.utc).timestamp() * 1_000_000_000)
 
+    @classmethod
+    def _timestamp_to_epoch_ns(cls, value: Any) -> Optional[int]:
+        """Parse provider timestamps into epoch nanoseconds, preserving RFC3339 ns precision."""
+        if isinstance(value, datetime):
+            return cls._datetime_to_epoch_ns(value)
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+
+        match = re.fullmatch(
+            r"(?P<base>\d{4}-\d{2}-\d{2}[T ][0-9:.]+?)(?:\.(?P<fraction>\d{1,9}))?(?P<offset>Z|[+-]\d{2}:\d{2})?",
+            raw,
+        )
+        if match and match.group("fraction"):
+            base = match.group("base")
+            offset = match.group("offset") or "+00:00"
+            if offset == "Z":
+                offset = "+00:00"
+            try:
+                parsed_base = datetime.fromisoformat(f"{base}{offset}")
+            except ValueError:
+                return cls._datetime_to_epoch_ns(cls._parse_codex_fork_timestamp(raw))
+            if parsed_base.tzinfo is None:
+                parsed_base = parsed_base.replace(tzinfo=timezone.utc)
+            fraction_ns = int(match.group("fraction").ljust(9, "0")[:9])
+            base_seconds = int(parsed_base.astimezone(timezone.utc).timestamp())
+            return (base_seconds * 1_000_000_000) + fraction_ns
+
+        return cls._datetime_to_epoch_ns(cls._parse_codex_fork_timestamp(raw))
+
     @staticmethod
     def _normalize_provider_native_title(value: Any) -> Optional[str]:
         """Normalize provider-native title text for display/cache use."""
@@ -1528,9 +1560,7 @@ class SessionManager:
                     thread_name = self._normalize_provider_native_title(record.get("thread_name"))
                     if not thread_id or not thread_name:
                         continue
-                    updated_ns = self._datetime_to_epoch_ns(
-                        self._parse_codex_fork_timestamp(record.get("updated_at"))
-                    )
+                    updated_ns = self._timestamp_to_epoch_ns(record.get("updated_at"))
                     previous = indexed.get(thread_id)
                     previous_ns = previous[1] if previous else None
                     if previous is None or (updated_ns or 0) >= (previous_ns or 0):
@@ -1844,9 +1874,7 @@ class SessionManager:
         elif normalized == "thread_name_updated":
             session = self.sessions.get(session_id)
             if session:
-                event_timestamp_ns = self._datetime_to_epoch_ns(
-                    self._parse_codex_fork_timestamp(event.get("ts"))
-                )
+                event_timestamp_ns = self._timestamp_to_epoch_ns(event.get("ts"))
                 self._sync_codex_native_title(
                     session,
                     thread_name=payload.get("thread_name") or payload.get("name"),
@@ -2293,18 +2321,18 @@ class SessionManager:
         if provider == "codex-app" and not initial_prompt and self.message_queue_manager:
             self.message_queue_manager.mark_session_idle(session.id)
 
-        if provider == "claude" and friendly_name:
+        if provider in ("claude", "codex", "codex-fork") and friendly_name:
             try:
-                if self._is_safe_claude_native_rename_name(friendly_name):
-                    await self.queue_claude_native_rename(session, friendly_name)
+                if self._is_safe_provider_native_rename_name(friendly_name):
+                    await self.queue_provider_native_rename(session, friendly_name)
                 else:
                     logger.warning(
-                        "Skipping native Claude rename for session %s: unsafe friendly name",
+                        "Skipping provider-native rename for session %s: unsafe friendly name",
                         session.id,
                     )
             except Exception as exc:
                 logger.warning(
-                    "Failed to queue native Claude rename for spawned session %s: %s",
+                    "Failed to queue provider-native rename for spawned session %s: %s",
                     session.id,
                     exc,
                 )
@@ -3346,12 +3374,12 @@ class SessionManager:
         session.friendly_name_updated_at_ns = updated_at_ns or time.time_ns()
         return True
 
-    async def queue_claude_native_rename(
+    async def queue_provider_native_rename(
         self,
         session_or_id: Session | str | None,
         friendly_name: str,
     ) -> bool:
-        """Best-effort enqueue of a Claude-native `/rename` for one explicit SM name."""
+        """Best-effort enqueue of a provider-native `/rename` for one explicit SM name."""
         if session_or_id is None:
             return False
         if isinstance(session_or_id, Session):
@@ -3360,9 +3388,11 @@ class SessionManager:
             session = self.sessions.get(session_or_id)
         if session is None:
             return False
-        if session.provider != "claude" or session.status == SessionStatus.STOPPED:
+        if session.provider not in ("claude", "codex", "codex-fork") or session.status == SessionStatus.STOPPED:
             return False
         if not session.tmux_session:
+            return False
+        if not self._is_safe_provider_native_rename_name(friendly_name):
             return False
 
         rename_command = f"/rename {friendly_name}"
@@ -3381,14 +3411,32 @@ class SessionManager:
         )
         return True
 
+    async def queue_claude_native_rename(
+        self,
+        session_or_id: Session | str | None,
+        friendly_name: str,
+    ) -> bool:
+        """Best-effort enqueue of a Claude-native `/rename` for one explicit SM name."""
+        if session_or_id is None:
+            return False
+        if isinstance(session_or_id, Session):
+            session = session_or_id
+        else:
+            session = self.sessions.get(session_or_id)
+        if session is None or session.provider != "claude":
+            return False
+        return await self.queue_provider_native_rename(session_or_id, friendly_name)
+
     @staticmethod
-    def _is_safe_claude_native_rename_name(friendly_name: str) -> bool:
+    def _is_safe_provider_native_rename_name(friendly_name: str) -> bool:
         """Return True when a friendly name is safe to embed in `/rename <name>`."""
         return (
             bool(friendly_name)
             and len(friendly_name) <= 32
             and re.fullmatch(r"[a-zA-Z0-9_-]+", friendly_name) is not None
         )
+
+    _is_safe_claude_native_rename_name = _is_safe_provider_native_rename_name
 
     @staticmethod
     def _session_label_sort_key(session: Session) -> tuple[int, int]:

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from src.models import Session, SessionStatus
 from src.session_manager import SessionManager
@@ -46,8 +49,40 @@ def test_codex_fork_thread_name_event_updates_native_title(tmp_path):
     )
 
     assert session.native_title == "3047-reviewer"
-    assert session.native_title_updated_at_ns == 1777182384375958016
+    assert session.native_title_updated_at_ns == 1777182384375958000
     assert manager.get_effective_session_name(session) == "3047-reviewer"
+
+
+def test_codex_fork_thread_name_event_preserves_nanosecond_timestamp(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cf655",
+        name="codex-fork-cf655",
+        working_dir="/tmp",
+        provider="codex-fork",
+        provider_resume_id="thread-655",
+        native_title="old-title",
+        native_title_updated_at_ns=1777182384375958016,
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "thread_name_updated",
+            "seq": 2,
+            "session_epoch": 1,
+            "ts": "2026-04-26T05:46:25.123456789Z",
+            "payload": {
+                "thread_id": "thread-655",
+                "thread_name": "new-title",
+            },
+        },
+    )
+
+    assert session.native_title == "new-title"
+    assert session.native_title_updated_at_ns == 1777182385123456789
 
 
 def test_codex_native_title_does_not_override_newer_explicit_sm_name(tmp_path):
@@ -167,3 +202,61 @@ def test_codex_session_index_backfills_native_title_on_startup(tmp_path):
     restored = manager.sessions["cf654"]
     assert restored.native_title == "index-reviewer"
     assert manager.get_effective_session_name(restored) == "index-reviewer"
+
+
+@pytest.mark.asyncio
+async def test_queue_provider_native_rename_queues_codex_fork_rename(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cf656",
+        name="codex-fork-cf656",
+        working_dir="/tmp",
+        tmux_session="codex-fork-cf656",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.message_queue_manager = MagicMock()
+
+    queued = await manager.queue_provider_native_rename(session, "codex-reviewer")
+
+    assert queued is True
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_called_once_with(
+        session.id,
+        "native_rename",
+    )
+    manager.message_queue_manager.queue_message.assert_called_once_with(
+        target_session_id=session.id,
+        text="/rename codex-reviewer",
+        delivery_mode="sequential",
+        message_category="native_rename",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_session_common_queues_codex_native_rename_for_spawn_name(tmp_path):
+    manager = _manager(tmp_path)
+    manager.tmux = MagicMock()
+    manager.tmux.create_session_with_command.return_value = True
+    manager._get_git_remote_url_async = AsyncMock(return_value=None)
+    manager._ensure_telegram_topic = AsyncMock()
+    manager.message_queue_manager = MagicMock()
+
+    session = await manager._create_session_common(
+        working_dir=str(tmp_path),
+        friendly_name="spawned-codex",
+        provider="codex-fork",
+    )
+
+    assert session is not None
+    assert session.friendly_name == "spawned-codex"
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_called_once_with(
+        session.id,
+        "native_rename",
+    )
+    manager.message_queue_manager.queue_message.assert_called_once_with(
+        target_session_id=session.id,
+        text="/rename spawned-codex",
+        delivery_mode="sequential",
+        message_category="native_rename",
+    )
