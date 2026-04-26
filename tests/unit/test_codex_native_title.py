@@ -138,6 +138,42 @@ def test_codex_thread_name_event_ignores_unknown_thread_id(tmp_path):
     assert session.native_title == "native-reviewer"
 
 
+def test_codex_thread_name_event_respects_seq_dedupe(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cf657",
+        name="codex-fork-cf657",
+        working_dir="/tmp",
+        provider="codex-fork",
+        provider_resume_id="thread-657",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "thread_name_updated",
+            "seq": 10,
+            "session_epoch": 1,
+            "ts": "2026-04-26T05:46:25.000000000Z",
+            "payload": {"thread_id": "thread-657", "thread_name": "newer-title"},
+        },
+    )
+    manager.ingest_codex_fork_event(
+        session.id,
+        {
+            "event_type": "thread_name_updated",
+            "seq": 9,
+            "session_epoch": 1,
+            "ts": "2026-04-26T05:46:26.000000000Z",
+            "payload": {"thread_id": "thread-657", "thread_name": "replayed-title"},
+        },
+    )
+
+    assert session.native_title == "newer-title"
+
+
 def test_codex_index_title_without_timestamp_does_not_beat_explicit_name(tmp_path):
     manager = _manager(tmp_path)
     session = Session(

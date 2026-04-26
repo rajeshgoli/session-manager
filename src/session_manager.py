@@ -1248,6 +1248,7 @@ class SessionManager:
         payload: Optional[dict[str, Any]] = None,
         seq: Optional[int] = None,
         session_epoch: Optional[Any] = None,
+        event_timestamp_ns: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         """Apply one codex-fork lifecycle event to deterministic reducer state."""
         normalized = self._normalize_codex_fork_event_type(event_type)
@@ -1268,6 +1269,20 @@ class SessionManager:
             if last_seq is not None and seq <= last_seq:
                 return self.codex_fork_lifecycle.get(session_id)
             self.codex_fork_last_seq[session_id] = seq
+
+        if normalized == "thread_name_updated":
+            session = self.sessions.get(session_id)
+            if session:
+                thread_id = self._normalize_codex_thread_id(payload.get("thread_id") if payload else None)
+                if thread_id is None:
+                    thread_id = self._normalize_codex_thread_id(payload.get("session_id") if payload else None)
+                self._sync_codex_native_title(
+                    session,
+                    thread_name=(payload or {}).get("thread_name") or (payload or {}).get("name"),
+                    updated_at_ns=event_timestamp_ns,
+                    thread_id=thread_id,
+                )
+            return self.codex_fork_lifecycle.get(session_id)
 
         current_state = self.codex_fork_lifecycle.get(session_id, {}).get("state", "idle")
         next_state = current_state
@@ -1871,16 +1886,6 @@ class SessionManager:
                 event=event,
                 payload=payload,
             )
-        elif normalized == "thread_name_updated":
-            session = self.sessions.get(session_id)
-            if session:
-                event_timestamp_ns = self._timestamp_to_epoch_ns(event.get("ts"))
-                self._sync_codex_native_title(
-                    session,
-                    thread_name=payload.get("thread_name") or payload.get("name"),
-                    updated_at_ns=event_timestamp_ns,
-                    thread_id=payload.get("thread_id") or event.get("session_id"),
-                )
         elif normalized in {"turn_started", "turn_complete", "turn_aborted"}:
             payload_message = payload.get("last_agent_message")
             payload_preview = payload_message if isinstance(payload_message, str) else ""
@@ -1897,6 +1902,12 @@ class SessionManager:
                 provider="codex-fork",
                 schema_version=event.get("schema_version") if isinstance(event.get("schema_version"), int) else None,
             )
+        payload_for_reducer = payload_for_store
+        if normalized == "thread_name_updated" and isinstance(payload_for_store, dict):
+            event_thread_id = self._normalize_codex_thread_id(event.get("session_id"))
+            if event_thread_id and not self._normalize_codex_thread_id(payload_for_store.get("thread_id")):
+                payload_for_reducer = {**payload_for_store, "session_id": event_thread_id}
+
         turn_id = payload_for_store.get("turn_id") or event.get("turn_id")
         self.codex_event_store.append_event(
             session_id=session_id,
@@ -1912,9 +1923,10 @@ class SessionManager:
         return self._reduce_codex_fork_lifecycle(
             session_id=session_id,
             event_type=normalized,
-            payload=payload_for_store,
+            payload=payload_for_reducer,
             seq=seq,
             session_epoch=session_epoch,
+            event_timestamp_ns=self._timestamp_to_epoch_ns(event.get("ts")),
         )
 
     def _sync_session_resume_id(self, session: Session) -> bool:
