@@ -254,6 +254,9 @@ class SessionManager:
         self.codex_cli_command = codex_config.get("command", "codex")
         self.codex_cli_args = codex_config.get("args", [])
         self.codex_default_model = codex_config.get("default_model")
+        self.codex_session_index_path = Path(
+            codex_config.get("session_index_path", "~/.codex/session_index.jsonl")
+        ).expanduser()
         codex_fork_config = self.config.get("codex_fork", codex_config)
         self.codex_fork_command = codex_fork_config.get("command", self.codex_cli_command)
         self.codex_fork_args = codex_fork_config.get("args", self.codex_cli_args)
@@ -386,6 +389,8 @@ class SessionManager:
 
         # Load existing sessions from state file
         self._load_state()
+        if self.sync_codex_native_titles_from_index(persist=False):
+            self._save_state()
 
     def _migrate_legacy_state_file_if_needed(self) -> None:
         """Copy a pre-durable temp-backed session registry into the configured path once."""
@@ -1148,6 +1153,11 @@ class SessionManager:
         }
         return aliases.get(snake, snake)
 
+    @staticmethod
+    def _is_codex_native_title_provider(provider: str) -> bool:
+        """Return True when provider-native thread titles are safe display identities."""
+        return provider in {"codex", "codex-app", "codex-fork"}
+
     def _codex_fork_runtime_reachable(self, session: Session) -> bool:
         """Return True when a codex-fork detached runtime still answers on its control socket."""
         if getattr(session, "provider", "") != "codex-fork":
@@ -1238,6 +1248,7 @@ class SessionManager:
         payload: Optional[dict[str, Any]] = None,
         seq: Optional[int] = None,
         session_epoch: Optional[Any] = None,
+        event_timestamp_ns: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         """Apply one codex-fork lifecycle event to deterministic reducer state."""
         normalized = self._normalize_codex_fork_event_type(event_type)
@@ -1258,6 +1269,20 @@ class SessionManager:
             if last_seq is not None and seq <= last_seq:
                 return self.codex_fork_lifecycle.get(session_id)
             self.codex_fork_last_seq[session_id] = seq
+
+        if normalized == "thread_name_updated":
+            session = self.sessions.get(session_id)
+            if session:
+                thread_id = self._normalize_codex_thread_id(payload.get("thread_id") if payload else None)
+                if thread_id is None:
+                    thread_id = self._normalize_codex_thread_id(payload.get("session_id") if payload else None)
+                self._sync_codex_native_title(
+                    session,
+                    thread_name=(payload or {}).get("thread_name") or (payload or {}).get("name"),
+                    updated_at_ns=event_timestamp_ns,
+                    thread_id=thread_id,
+                )
+            return self.codex_fork_lifecycle.get(session_id)
 
         current_state = self.codex_fork_lifecycle.get(session_id, {}).get("state", "idle")
         next_state = current_state
@@ -1470,6 +1495,177 @@ class SessionManager:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _datetime_to_epoch_ns(value: Optional[datetime]) -> Optional[int]:
+        """Normalize one datetime to epoch nanoseconds."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(value.astimezone(timezone.utc).timestamp() * 1_000_000_000)
+
+    @classmethod
+    def _timestamp_to_epoch_ns(cls, value: Any) -> Optional[int]:
+        """Parse provider timestamps into epoch nanoseconds, preserving RFC3339 ns precision."""
+        if isinstance(value, datetime):
+            return cls._datetime_to_epoch_ns(value)
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+
+        match = re.fullmatch(
+            r"(?P<base>\d{4}-\d{2}-\d{2}[T ][0-9:.]+?)(?:\.(?P<fraction>\d{1,9}))?(?P<offset>Z|[+-]\d{2}:\d{2})?",
+            raw,
+        )
+        if match and match.group("fraction"):
+            base = match.group("base")
+            offset = match.group("offset") or "+00:00"
+            if offset == "Z":
+                offset = "+00:00"
+            try:
+                parsed_base = datetime.fromisoformat(f"{base}{offset}")
+            except ValueError:
+                return cls._datetime_to_epoch_ns(cls._parse_codex_fork_timestamp(raw))
+            if parsed_base.tzinfo is None:
+                parsed_base = parsed_base.replace(tzinfo=timezone.utc)
+            fraction_ns = int(match.group("fraction").ljust(9, "0")[:9])
+            base_seconds = int(parsed_base.astimezone(timezone.utc).timestamp())
+            return (base_seconds * 1_000_000_000) + fraction_ns
+
+        return cls._datetime_to_epoch_ns(cls._parse_codex_fork_timestamp(raw))
+
+    @staticmethod
+    def _normalize_provider_native_title(value: Any) -> Optional[str]:
+        """Normalize provider-native title text for display/cache use."""
+        if not isinstance(value, str):
+            return None
+        title = re.sub(r"[\r\n\t]+", " ", value).strip()
+        return title or None
+
+    @staticmethod
+    def _normalize_codex_thread_id(value: Any) -> Optional[str]:
+        """Normalize Codex thread IDs while rejecting bridge sentinel values."""
+        if not isinstance(value, str):
+            return None
+        thread_id = value.strip()
+        if not thread_id or thread_id.lower() in {"unknown", "none", "null"}:
+            return None
+        return thread_id
+
+    def _read_codex_session_index(self) -> dict[str, tuple[str, Optional[int]]]:
+        """Read Codex's local thread index keyed by provider resume/thread id."""
+        index_path = self.codex_session_index_path
+        if not index_path.exists():
+            return {}
+
+        indexed: dict[str, tuple[str, Optional[int]]] = {}
+        try:
+            with index_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    thread_id = str(record.get("id") or "").strip()
+                    thread_name = self._normalize_provider_native_title(record.get("thread_name"))
+                    if not thread_id or not thread_name:
+                        continue
+                    updated_ns = self._timestamp_to_epoch_ns(record.get("updated_at"))
+                    previous = indexed.get(thread_id)
+                    previous_ns = previous[1] if previous else None
+                    if previous is None or (updated_ns or 0) >= (previous_ns or 0):
+                        indexed[thread_id] = (thread_name, updated_ns)
+        except OSError as exc:
+            logger.debug("Failed reading Codex session index %s: %s", index_path, exc)
+        return indexed
+
+    def _sync_codex_native_title(
+        self,
+        session: Session,
+        *,
+        thread_name: Any,
+        updated_at_ns: Optional[int] = None,
+        thread_id: Any = None,
+        persist: bool = True,
+    ) -> bool:
+        """Cache one Codex provider-native thread title on the Session record."""
+        if not self._is_codex_native_title_provider(session.provider):
+            return False
+
+        native_title = self._normalize_provider_native_title(thread_name)
+        if not native_title:
+            return False
+
+        incoming_updated_at_ns = updated_at_ns
+        current_updated_at_ns = int(session.native_title_updated_at_ns or 0)
+        if incoming_updated_at_ns is not None and current_updated_at_ns and incoming_updated_at_ns < current_updated_at_ns:
+            return False
+
+        changed = False
+        normalized_thread_id = self._normalize_codex_thread_id(thread_id)
+        if normalized_thread_id:
+            if session.provider == "codex-app":
+                if session.codex_thread_id != normalized_thread_id:
+                    session.codex_thread_id = normalized_thread_id
+                    changed = True
+            elif session.provider_resume_id != normalized_thread_id:
+                session.provider_resume_id = normalized_thread_id
+                changed = True
+
+        if session.native_title != native_title:
+            session.native_title = native_title
+            changed = True
+        if incoming_updated_at_ns is not None:
+            if session.native_title_updated_at_ns != incoming_updated_at_ns:
+                session.native_title_updated_at_ns = incoming_updated_at_ns
+                changed = True
+        elif session.native_title_updated_at_ns is None:
+            session.native_title_updated_at_ns = 0
+            changed = True
+        if session.native_title_source_mtime_ns is not None:
+            session.native_title_source_mtime_ns = None
+            changed = True
+
+        if changed and persist:
+            self._save_state()
+        return changed
+
+    def sync_codex_native_titles_from_index(self, *, persist: bool = True) -> bool:
+        """Backfill Codex provider-native titles from Codex's local session index."""
+        indexed_titles = self._read_codex_session_index()
+        if not indexed_titles:
+            return False
+
+        changed = False
+        for session in self.sessions.values():
+            if not self._is_codex_native_title_provider(session.provider):
+                continue
+            thread_id = session.codex_thread_id if session.provider == "codex-app" else session.provider_resume_id
+            if not thread_id:
+                continue
+            indexed = indexed_titles.get(thread_id)
+            if not indexed:
+                continue
+            thread_name, updated_at_ns = indexed
+            changed = (
+                self._sync_codex_native_title(
+                    session,
+                    thread_name=thread_name,
+                    updated_at_ns=updated_at_ns,
+                    thread_id=thread_id,
+                    persist=False,
+                )
+                or changed
+            )
+
+        if changed and persist:
+            self._save_state()
+        return changed
 
     def _ingest_codex_fork_tool_use_event(
         self,
@@ -1710,6 +1906,12 @@ class SessionManager:
                 provider="codex-fork",
                 schema_version=event.get("schema_version") if isinstance(event.get("schema_version"), int) else None,
             )
+        payload_for_reducer = payload_for_store
+        if normalized == "thread_name_updated" and isinstance(payload_for_store, dict):
+            event_thread_id = self._normalize_codex_thread_id(event.get("session_id"))
+            if event_thread_id and not self._normalize_codex_thread_id(payload_for_store.get("thread_id")):
+                payload_for_reducer = {**payload_for_store, "session_id": event_thread_id}
+
         turn_id = payload_for_store.get("turn_id") or event.get("turn_id")
         self.codex_event_store.append_event(
             session_id=session_id,
@@ -1725,9 +1927,10 @@ class SessionManager:
         return self._reduce_codex_fork_lifecycle(
             session_id=session_id,
             event_type=normalized,
-            payload=payload_for_store,
+            payload=payload_for_reducer,
             seq=seq,
             session_epoch=session_epoch,
+            event_timestamp_ns=self._timestamp_to_epoch_ns(event.get("ts")),
         )
 
     def _sync_session_resume_id(self, session: Session) -> bool:
@@ -2134,18 +2337,18 @@ class SessionManager:
         if provider == "codex-app" and not initial_prompt and self.message_queue_manager:
             self.message_queue_manager.mark_session_idle(session.id)
 
-        if provider == "claude" and friendly_name:
+        if provider in ("claude", "codex", "codex-fork") and friendly_name:
             try:
-                if self._is_safe_claude_native_rename_name(friendly_name):
-                    await self.queue_claude_native_rename(session, friendly_name)
+                if self._is_safe_provider_native_rename_name(friendly_name):
+                    await self.queue_provider_native_rename(session, friendly_name)
                 else:
                     logger.warning(
-                        "Skipping native Claude rename for session %s: unsafe friendly name",
+                        "Skipping provider-native rename for session %s: unsafe friendly name",
                         session.id,
                     )
             except Exception as exc:
                 logger.warning(
-                    "Failed to queue native Claude rename for spawned session %s: %s",
+                    "Failed to queue provider-native rename for spawned session %s: %s",
                     session.id,
                     exc,
                 )
@@ -3187,12 +3390,12 @@ class SessionManager:
         session.friendly_name_updated_at_ns = updated_at_ns or time.time_ns()
         return True
 
-    async def queue_claude_native_rename(
+    async def queue_provider_native_rename(
         self,
         session_or_id: Session | str | None,
         friendly_name: str,
     ) -> bool:
-        """Best-effort enqueue of a Claude-native `/rename` for one explicit SM name."""
+        """Best-effort enqueue of a provider-native `/rename` for one explicit SM name."""
         if session_or_id is None:
             return False
         if isinstance(session_or_id, Session):
@@ -3201,9 +3404,11 @@ class SessionManager:
             session = self.sessions.get(session_or_id)
         if session is None:
             return False
-        if session.provider != "claude" or session.status == SessionStatus.STOPPED:
+        if session.provider not in ("claude", "codex", "codex-fork") or session.status == SessionStatus.STOPPED:
             return False
         if not session.tmux_session:
+            return False
+        if not self._is_safe_provider_native_rename_name(friendly_name):
             return False
 
         rename_command = f"/rename {friendly_name}"
@@ -3222,14 +3427,24 @@ class SessionManager:
         )
         return True
 
+    async def queue_claude_native_rename(
+        self,
+        session_or_id: Session | str | None,
+        friendly_name: str,
+    ) -> bool:
+        """Backward-compatible wrapper for provider-native `/rename` queueing."""
+        return await self.queue_provider_native_rename(session_or_id, friendly_name)
+
     @staticmethod
-    def _is_safe_claude_native_rename_name(friendly_name: str) -> bool:
+    def _is_safe_provider_native_rename_name(friendly_name: str) -> bool:
         """Return True when a friendly name is safe to embed in `/rename <name>`."""
         return (
             bool(friendly_name)
             and len(friendly_name) <= 32
             and re.fullmatch(r"[a-zA-Z0-9_-]+", friendly_name) is not None
         )
+
+    _is_safe_claude_native_rename_name = _is_safe_provider_native_rename_name
 
     @staticmethod
     def _session_label_sort_key(session: Session) -> tuple[int, int]:
@@ -3255,6 +3470,8 @@ class SessionManager:
         native_title = None
         if session.provider == "claude":
             native_title = self.sync_claude_native_title(session)
+        elif self._is_codex_native_title_provider(session.provider):
+            native_title = session.native_title
         friendly_name_updated_at_ns, native_title_updated_at_ns = self._session_label_sort_key(session)
         if session.friendly_name and native_title:
             if friendly_name_updated_at_ns >= native_title_updated_at_ns:

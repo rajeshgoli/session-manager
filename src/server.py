@@ -1231,7 +1231,11 @@ def create_app(
                     return primary_alias
 
         provider = getattr(session, "provider", "claude")
-        native_title = session.native_title if provider == "claude" else None
+        native_title = (
+            session.native_title
+            if provider in {"claude", "codex", "codex-app", "codex-fork"}
+            else None
+        )
         friendly_name_updated_at_ns = int(session.friendly_name_updated_at_ns or 0)
         native_title_updated_at_ns = int(
             session.native_title_updated_at_ns
@@ -3748,7 +3752,9 @@ def create_app(
 
         if friendly_name is not None or is_em is not None:
             app.state.session_manager._save_state()
-            renamer = getattr(app.state.session_manager, "queue_claude_native_rename", None)
+            renamer = getattr(app.state.session_manager, "queue_provider_native_rename", None)
+            if not callable(renamer):
+                renamer = getattr(app.state.session_manager, "queue_claude_native_rename", None)
             if friendly_name is not None and callable(renamer):
                 await renamer(session, friendly_name)
             await _sync_session_display_identity(
@@ -3951,7 +3957,9 @@ def create_app(
             registration = registrar(session_id, request.role)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        renamer = getattr(app.state.session_manager, "queue_claude_native_rename", None)
+        renamer = getattr(app.state.session_manager, "queue_provider_native_rename", None)
+        if not callable(renamer):
+            renamer = getattr(app.state.session_manager, "queue_claude_native_rename", None)
         if callable(renamer):
             await renamer(session, registration.role)
         await _sync_session_display_identity(session)
