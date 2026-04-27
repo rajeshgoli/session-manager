@@ -4988,20 +4988,25 @@ class SessionManager:
         """Return True when codex-fork TUI text shows active work not modeled by events."""
         if not pane_text:
             return False
+        pane_tail = "\n".join(
+            line
+            for line in pane_text.splitlines()[-5:]
+            if line.strip()
+        )
         markers = (
             "Working (",
             "Waiting for background terminal",
             "background terminal running",
             "background terminals running",
         )
-        return any(marker in pane_text for marker in markers)
+        return any(marker in pane_tail for marker in markers)
 
     def _codex_fork_pane_indicates_working(self, session: Session) -> bool:
         """Use the live codex-fork pane as a bounded correction for idle reducer gaps."""
         if not session.tmux_session:
             return False
         try:
-            pane_text = self.tmux.capture_pane(session.tmux_session, lines=20)
+            pane_text = self.tmux.capture_pane(session.tmux_session, lines=8)
         except Exception:
             logger.debug("Failed to capture codex-fork pane for activity projection", exc_info=True)
             return False
