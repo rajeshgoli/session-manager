@@ -717,3 +717,48 @@ def test_codex_fork_turn_diff_reasserts_running_after_restart_without_turn_start
     assert lifecycle["state"] == "running"
     assert lifecycle["cause_event_type"] == "turn_diff"
     assert manager.get_activity_state(session.id) == "working"
+
+
+def test_codex_fork_idle_reducer_checks_pane_for_background_terminal_work():
+    manager = _make_manager()
+    session = Session(
+        id="cf-bg",
+        name="codex-fork-cf-bg",
+        working_dir="/tmp",
+        tmux_session="codex-fork-cf-bg",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.codex_fork_lifecycle[session.id] = {
+        "state": "idle",
+        "cause_event_type": "turn_complete",
+        "updated_at": datetime.now().isoformat(),
+    }
+    manager.tmux.capture_pane = MagicMock(
+        return_value="• Working (17m 46s • esc to interrupt) · 1 background terminal running · /ps to view"
+    )
+
+    assert manager.get_activity_state(session.id) == "working"
+    manager.tmux.capture_pane.assert_called_once_with(session.tmux_session, lines=20)
+
+
+def test_codex_fork_idle_reducer_remains_idle_without_active_pane_markers():
+    manager = _make_manager()
+    session = Session(
+        id="cf-bg-idle",
+        name="codex-fork-cf-bg-idle",
+        working_dir="/tmp",
+        tmux_session="codex-fork-cf-bg-idle",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.codex_fork_lifecycle[session.id] = {
+        "state": "idle",
+        "cause_event_type": "turn_complete",
+        "updated_at": datetime.now().isoformat(),
+    }
+    manager.tmux.capture_pane = MagicMock(return_value="› tab to queue message")
+
+    assert manager.get_activity_state(session.id) == "idle"
