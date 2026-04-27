@@ -224,7 +224,13 @@ class OutputMonitor:
 
                 # Every ~30 polls (~30 seconds with default 1s interval), verify tmux still exists
                 if check_counter % 30 == 0:
-                    if self._session_manager and not self._session_manager.tmux.session_exists(session.tmux_session):
+                    session_exists = True
+                    if self._session_manager:
+                        session_exists = await asyncio.to_thread(
+                            self._session_manager.tmux.session_exists,
+                            session.tmux_session,
+                        )
+                    if not session_exists:
                         logger.info(f"Tmux session {session.tmux_session} no longer exists, cleaning up")
                         await self._handle_session_died(session)
                         break

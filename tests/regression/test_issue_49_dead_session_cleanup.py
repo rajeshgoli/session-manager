@@ -10,6 +10,7 @@ Tests verify that:
 
 import pytest
 import asyncio
+import time
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from datetime import datetime
@@ -254,6 +255,34 @@ async def test_monitor_checks_tmux_every_30_polls(output_monitor, mock_session, 
     # Should have checked tmux existence ~1 time (at poll 30)
     # With some timing variance, accept 1-2 calls
     assert 1 <= call_count <= 2
+
+
+@pytest.mark.asyncio
+async def test_monitor_tmux_check_does_not_block_event_loop(output_monitor, mock_session, mock_session_manager, tmp_path):
+    """Slow tmux probes must run off the event loop so API traffic can still be served."""
+    log_file = tmp_path / "test.log"
+    log_file.touch()
+    mock_session.log_file = str(log_file)
+    mock_session_manager.sessions[mock_session.id] = mock_session
+
+    def slow_session_exists(tmux_session):
+        time.sleep(0.3)
+        return True
+
+    mock_session_manager.tmux.session_exists = Mock(side_effect=slow_session_exists)
+
+    await output_monitor.start_monitoring(mock_session)
+
+    ticker_count = 0
+    deadline = asyncio.get_running_loop().time() + 3.4
+    while asyncio.get_running_loop().time() < deadline:
+        ticker_count += 1
+        await asyncio.sleep(0.05)
+
+    await output_monitor.stop_monitoring(mock_session.id)
+
+    assert mock_session_manager.tmux.session_exists.call_count >= 1
+    assert ticker_count >= 50
 
 
 @pytest.mark.asyncio

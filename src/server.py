@@ -4323,7 +4323,11 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        output = app.state.session_manager.capture_output(session_id, lines)
+        output = await asyncio.to_thread(
+            app.state.session_manager.capture_output,
+            session_id,
+            lines,
+        )
 
         return {"session_id": session_id, "output": output}
 
@@ -4450,7 +4454,11 @@ def create_app(
 
         try:
             # Get tmux output
-            tmux_output = app.state.session_manager.capture_output(session_id, lines)
+            tmux_output = await asyncio.to_thread(
+                app.state.session_manager.capture_output,
+                session_id,
+                lines,
+            )
 
             if not tmux_output:
                 raise HTTPException(status_code=404, detail="No output available for session")
@@ -5276,7 +5284,11 @@ Provide ONLY the summary, no preamble or questions."""
                 raise HTTPException(status_code=500, detail=f"Failed to fetch review: {e}")
         else:
             # TUI mode: capture tmux pane output
-            output = app.state.session_manager.capture_output(session_id, lines=500)
+            output = await asyncio.to_thread(
+                app.state.session_manager.capture_output,
+                session_id,
+                500,
+            )
             if not output:
                 raise HTTPException(status_code=404, detail="No output available from session")
 
