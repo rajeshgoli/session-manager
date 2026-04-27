@@ -88,6 +88,7 @@ def test_load_state_preserves_stopped_restore_target_without_tmux_runtime(tmp_pa
     assert restored.status == SessionStatus.STOPPED
     assert restored.provider_resume_id == "019d5bac-3980-7291-8b17-b61f5e618748"
     assert [s.id for s in manager.list_sessions(include_stopped=True)] == [session.id]
+    mock_tmux_cls.return_value.session_exists.assert_not_called()
 
 
 def test_state_file_expands_user_and_creates_parent_dir(tmp_path, monkeypatch):

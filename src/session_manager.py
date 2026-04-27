@@ -774,6 +774,33 @@ class SessionManager:
                 logger.info(f"Restored codex app session: {session.name}")
                 continue
 
+            if session.status == SessionStatus.STOPPED:
+                if session.provider == "codex-fork" and self._codex_fork_runtime_reachable(session):
+                    session.status = SessionStatus.IDLE
+                    session.completion_status = None
+                    session.completion_message = None
+                    logger.info(
+                        "Healed stopped codex-fork session %s because detached runtime is still reachable",
+                        session.name,
+                    )
+                    if session.telegram_chat_id and session.telegram_thread_id:
+                        self._upsert_telegram_topic_record(
+                            session,
+                            session.telegram_chat_id,
+                            session.telegram_thread_id,
+                            persist=True,
+                            revive_deleted=True,
+                        )
+                    self.sessions[session.id] = session
+                    self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
+                    continue
+                self.sessions[session.id] = session
+                logger.info(
+                    "Restored stopped session record without live tmux runtime check: %s",
+                    session.name,
+                )
+                continue
+
             # Verify tmux session still exists (Claude/Codex CLI)
             if self.tmux.session_exists(session.tmux_session):
                 if session.telegram_chat_id and session.telegram_thread_id:
@@ -784,30 +811,11 @@ class SessionManager:
                         persist=True,
                         revive_deleted=True,
                     )
-                if (
-                    session.provider == "codex-fork"
-                    and session.status == SessionStatus.STOPPED
-                    and self._codex_fork_runtime_reachable(session)
-                ):
-                    session.status = SessionStatus.IDLE
-                    session.completion_status = None
-                    session.completion_message = None
-                    logger.info(
-                        "Healed stopped codex-fork session %s because detached runtime is still reachable",
-                        session.name,
-                    )
                 self.sessions[session.id] = session
                 if session.provider == "codex-fork":
                     self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
                 logger.info(f"Restored session: {session.name}")
             else:
-                if session.status == SessionStatus.STOPPED:
-                    self.sessions[session.id] = session
-                    logger.info(
-                        "Restored stopped session record without live tmux runtime: %s",
-                        session.name,
-                    )
-                    continue
                 logger.warning(f"Session {session.name} no longer exists in tmux")
                 # Collect orphaned Telegram forum topics for cleanup at startup.
                 # Only collect if chat_id matches the known forum group —
@@ -1162,10 +1170,10 @@ class SessionManager:
         """Return True when a codex-fork detached runtime still answers on its control socket."""
         if getattr(session, "provider", "") != "codex-fork":
             return False
-        if not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
-            return False
         socket_path = self._codex_fork_control_socket_path(session)
         if not socket_path.exists():
+            return False
+        if not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
             return False
 
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
