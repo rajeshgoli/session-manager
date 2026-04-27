@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest.mock import patch
 
 from src.codex_event_store import CodexEventStore
 
 
 def test_append_and_get_events_sequence(tmp_path):
-    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"))
+    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"), startup_maintenance=False)
 
     first = store.append_event(
         session_id="sess1",
@@ -40,7 +41,9 @@ def test_history_gap_when_since_seq_is_older_than_retained(tmp_path):
         db_path=str(tmp_path / "codex_events.db"),
         retention_max_events_per_session=3,
         prune_every_writes=1,
+        startup_maintenance=False,
     )
+    store._prune_index_ready = True
 
     for idx in range(5):
         store.append_event(
@@ -58,7 +61,7 @@ def test_history_gap_when_since_seq_is_older_than_retained(tmp_path):
 
 
 def test_persistence_recovery_emits_marker_event(tmp_path):
-    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"))
+    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"), startup_maintenance=False)
 
     original_get_conn = store._get_conn
 
@@ -91,3 +94,34 @@ def test_persistence_recovery_emits_marker_event(tmp_path):
         "turn_started",
     ]
     assert page["history_gap"] is False
+
+
+def test_init_does_not_prune_on_startup_path(tmp_path):
+    with patch.object(CodexEventStore, "_prune_locked") as prune:
+        store = CodexEventStore(
+            db_path=str(tmp_path / "codex_events.db"),
+            startup_maintenance=False,
+        )
+
+    assert store._prune_index_ready is False
+    prune.assert_not_called()
+
+
+def test_startup_maintenance_adds_timestamp_index_and_prunes(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        startup_maintenance=False,
+    )
+
+    with patch.object(store, "_prune_locked") as prune:
+        store._run_startup_maintenance()
+
+    with sqlite3.connect(str(tmp_path / "codex_events.db")) as conn:
+        indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(codex_session_events)").fetchall()
+        }
+
+    assert "idx_codex_session_events_timestamp" in indexes
+    assert store._prune_index_ready is True
+    prune.assert_called_once()

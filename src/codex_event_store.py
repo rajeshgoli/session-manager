@@ -25,6 +25,7 @@ class CodexEventStore:
         retention_max_age_days: int = 14,
         prune_every_writes: int = 200,
         payload_preview_chars: int = 1500,
+        startup_maintenance: bool = True,
     ):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,8 +43,11 @@ class CodexEventStore:
         )
         self._persistence_degraded: set[str] = set()
         self._persisted_writes = 0
+        self._prune_index_ready = False
 
         self._init_db()
+        if startup_maintenance:
+            self._start_startup_maintenance()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -75,8 +79,30 @@ class CodexEventStore:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_codex_session_events_event_type ON codex_session_events(event_type)"
             )
-            self._prune_locked(cursor)
             conn.commit()
+
+    def _start_startup_maintenance(self) -> None:
+        thread = threading.Thread(
+            target=self._run_startup_maintenance,
+            name="codex-event-store-maintenance",
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_startup_maintenance(self) -> None:
+        try:
+            with self._lock:
+                conn = self._get_conn()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_codex_session_events_timestamp ON codex_session_events(timestamp)"
+                )
+                self._prune_index_ready = True
+                self._prune_locked(cursor)
+                conn.commit()
+                logger.info("Codex event store startup maintenance completed")
+        except Exception as exc:
+            logger.warning("Codex event store startup maintenance failed: %s", exc)
 
     def append_event(
         self,
@@ -161,7 +187,7 @@ class CodexEventStore:
                     self._append_ring_event_locked(item)
 
                 self._persisted_writes += len(persisted_events)
-                if self._persisted_writes % self.prune_every_writes == 0:
+                if self._prune_index_ready and self._persisted_writes % self.prune_every_writes == 0:
                     cursor.execute("BEGIN IMMEDIATE")
                     self._prune_locked(cursor)
                     conn.commit()
