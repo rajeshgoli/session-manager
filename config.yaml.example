@@ -71,6 +71,9 @@ timeouts:
     # Allows for Claude to process and respond
     async_send_timeout_seconds: 5
 
+    # Maximum time control APIs wait for immediate queue delivery before returning queued
+    input_delivery_wait_seconds: 1.0
+
     # Initial retry delay for failed deliveries (seconds)
     # Doubles on each retry up to max_retry_delay_seconds
     initial_retry_delay_seconds: 1.0

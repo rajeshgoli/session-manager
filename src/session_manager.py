@@ -150,6 +150,10 @@ class SessionManager:
         self.config = config or {}
         self.process_generation = uuid.uuid4().hex[:12]
         self._state_save_lock = threading.Lock()
+        mq_timeouts = self.config.get("timeouts", {}).get("message_queue", {})
+        self.input_delivery_wait_seconds = float(
+            mq_timeouts.get("input_delivery_wait_seconds", 1.0)
+        )
 
         self.tmux = TmuxController(log_dir=log_dir)
         self.sessions: dict[str, Session] = {}
@@ -3707,7 +3711,7 @@ class SessionManager:
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
                 _record_outgoing_sm_send_target()
-                delivered = await self.message_queue_manager.deliver_queued_message_now(
+                delivered = await self._deliver_queued_message_with_deadline(
                     session_id=session_id,
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
@@ -3738,7 +3742,7 @@ class SessionManager:
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 _record_outgoing_sm_send_target()
-                delivered = await self.message_queue_manager.deliver_queued_message_now(
+                delivered = await self._deliver_queued_message_with_deadline(
                     session_id=session_id,
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
@@ -3777,6 +3781,53 @@ class SessionManager:
             self._save_state()
 
         return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
+
+    async def _deliver_queued_message_with_deadline(
+        self,
+        session_id: str,
+        message_id: str,
+        delivery_mode: str,
+    ) -> bool:
+        """Attempt immediate queued delivery without letting control APIs wait on slow IO."""
+        if not self.message_queue_manager:
+            return False
+
+        delivery_coro = self.message_queue_manager.deliver_queued_message_now(
+            session_id=session_id,
+            message_id=message_id,
+            delivery_mode=delivery_mode,
+        )
+        task = asyncio.create_task(delivery_coro)
+        wait_seconds = max(0.0, self.input_delivery_wait_seconds)
+        if wait_seconds > 0:
+            done, _ = await asyncio.wait({task}, timeout=wait_seconds)
+            if task in done:
+                return bool(task.result())
+
+        def _log_delivery_failure(completed: asyncio.Task[Any]) -> None:
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "Background queued delivery was cancelled for %s message %s",
+                    session_id,
+                    message_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Background queued delivery failed for %s message %s",
+                    session_id,
+                    message_id,
+                )
+
+        task.add_done_callback(_log_delivery_failure)
+        logger.info(
+            "Queued delivery for %s message %s exceeded %.2fs control wait; continuing in background",
+            session_id,
+            message_id,
+            wait_seconds,
+        )
+        return False
 
     async def _notify_sm_send(
         self,

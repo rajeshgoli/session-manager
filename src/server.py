@@ -4487,7 +4487,6 @@ Provide ONLY the summary, no preamble or questions."""
             summary_timeout = server_timeouts.get("summary_generation_timeout_seconds", 60)
 
             # Use asyncio.create_subprocess_exec for non-blocking execution
-            import asyncio
             proc = await asyncio.create_subprocess_exec(
                 '/opt/homebrew/bin/claude', '--model', 'haiku', '--print',
                 stdin=asyncio.subprocess.PIPE,
@@ -4719,8 +4718,6 @@ Provide ONLY the summary, no preamble or questions."""
         native_title = None
         native_title_mtime_ns = None
         if transcript_path:
-            import asyncio
-
             def read_transcript():
                 """
                 Read transcript file synchronously (runs in thread pool).
@@ -4891,7 +4888,6 @@ Provide ONLY the summary, no preamble or questions."""
                 # Skip _restore_user_input if a handoff was triggered.
                 # mark_session_idle sets is_idle=False synchronously when a handoff is pending,
                 # so is_idle==False here reliably signals handoff in progress (#196).
-                import asyncio
                 state = queue_mgr.delivery_states.get(session_manager_id)
                 handoff_in_progress = state and not state.is_idle
                 if not handoff_in_progress:
@@ -5067,7 +5063,6 @@ Provide ONLY the summary, no preamble or questions."""
                             review_result = None
                             if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
                                 # PR mode: fetch from GitHub (async)
-                                import asyncio
                                 from .github_reviews import fetch_latest_codex_review
                                 codex_review = await asyncio.to_thread(
                                     fetch_latest_codex_review,
@@ -5273,7 +5268,6 @@ Provide ONLY the summary, no preamble or questions."""
 
         if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
             # GitHub PR mode: fetch review from GitHub API
-            import asyncio
             repo = review_config.pr_repo
             pr_number = review_config.pr_number
 
