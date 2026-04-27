@@ -4866,7 +4866,7 @@ Provide ONLY the summary, no preamble or questions."""
                             state_changed = True
 
                 if state_changed:
-                    app.state.session_manager._save_state()
+                    await asyncio.to_thread(app.state.session_manager._save_state)
 
                 if title_changed:
                     await _sync_session_display_identity(target_session)
@@ -4971,15 +4971,15 @@ Provide ONLY the summary, no preamble or questions."""
                         )
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        app.state.session_manager._save_state()
+                        await asyncio.to_thread(app.state.session_manager._save_state)
                         logger.info(f"Sent cleanup prompt for {len(cleanup_needed)} worktree(s)")
                     elif cleanup_needed and not notify_dirty:
                         # Track hashes even when muted so we don't repeatedly evaluate/signal.
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        app.state.session_manager._save_state()
+                        await asyncio.to_thread(app.state.session_manager._save_state)
                     elif prompt_state_changed:
-                        app.state.session_manager._save_state()
+                        await asyncio.to_thread(app.state.session_manager._save_state)
 
         if hook_event == "Stop" and not last_message and session_manager_id:
             # Transcript was empty/whitespace-only at Stop time (race condition:
@@ -5032,7 +5032,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Update session's last activity timestamp
                     from datetime import datetime
                     target_session.last_activity = datetime.now()
-                    app.state.session_manager._save_state()
+                    await asyncio.to_thread(app.state.session_manager._save_state)
 
                     from .models import NotificationEvent
                     event = NotificationEvent(
@@ -5042,10 +5042,21 @@ Provide ONLY the summary, no preamble or questions."""
                         context=last_message,
                         urgent=False,
                     )
-                    await app.state.notifier.notify(event, target_session)
                     # Mark response sent (starts idle cooldown)
                     if app.state.output_monitor:
                         app.state.output_monitor.mark_response_sent(target_session.id)
+
+                    async def _notify_response_event():
+                        try:
+                            await app.state.notifier.notify(event, target_session)
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to send Stop-hook response notification for %s: %s",
+                                target_session.id,
+                                exc,
+                            )
+
+                    asyncio.create_task(_notify_response_event())
 
                     # If session has a review_config, emit review_complete notification
                     if target_session.review_config:
