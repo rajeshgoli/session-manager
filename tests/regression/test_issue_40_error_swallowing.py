@@ -10,6 +10,7 @@ Tests verify that:
 
 import pytest
 import asyncio
+import concurrent.futures
 import json
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock, AsyncMock
@@ -202,7 +203,7 @@ def test_save_state_returns_false_on_permission_error(session_manager, temp_stat
 def test_save_state_logs_critical_error_on_failure(session_manager, temp_state_file, caplog):
     """Test that _save_state logs CRITICAL error on failure."""
     # Make save fail
-    with patch('pathlib.Path.rename', side_effect=OSError("Permission denied")):
+    with patch('pathlib.Path.replace', side_effect=OSError("Permission denied")):
         with caplog.at_level("ERROR"):
             result = session_manager._save_state()
 
@@ -224,15 +225,35 @@ def test_save_state_cleans_up_temp_file_on_error(session_manager, temp_state_fil
     )
     session_manager.sessions[session.id] = session
 
-    temp_file = Path(temp_state_file).with_suffix('.tmp')
-
     # Make rename fail
-    with patch('pathlib.Path.rename', side_effect=OSError("Error")):
+    with patch('pathlib.Path.replace', side_effect=OSError("Error")):
         result = session_manager._save_state()
 
     # Verify temp file was cleaned up
     assert result is False
-    assert not temp_file.exists()
+    assert not list(Path(temp_state_file).parent.glob("sessions.json.tmp.*"))
+
+
+def test_save_state_serializes_concurrent_writers(session_manager, temp_state_file):
+    """Concurrent saves must not race on a shared temp file."""
+    for idx in range(25):
+        session = Session(
+            id=f"test-{idx}",
+            name=f"test-{idx}",
+            working_dir="/tmp",
+            tmux_session=f"tmux-test-{idx}",
+            status=SessionStatus.RUNNING,
+        )
+        session_manager.sessions[session.id] = session
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda _: session_manager._save_state(), range(24)))
+
+    assert all(results)
+    assert not list(Path(temp_state_file).parent.glob("sessions.json.tmp.*"))
+    with open(temp_state_file) as f:
+        data = json.load(f)
+    assert len(data["sessions"]) == 25
 
 
 # =========================================================================

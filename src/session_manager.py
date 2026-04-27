@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import textwrap
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -148,6 +149,7 @@ class SessionManager:
         self.legacy_state_file = Path(LEGACY_TMP_SESSION_STATE_FILE)
         self.config = config or {}
         self.process_generation = uuid.uuid4().hex[:12]
+        self._state_save_lock = threading.Lock()
 
         self.tmux = TmuxController(log_dir=log_dir)
         self.sessions: dict[str, Session] = {}
@@ -901,54 +903,55 @@ class SessionManager:
         Returns:
             True if state saved successfully, False if an error occurred.
         """
-        try:
-            data = {
-                "sessions": [s.to_dict() for s in self.sessions.values()],
-                "em_topic": self.em_topic,
-                "maintainer_session_id": self.maintainer_session_id,
-                "agent_registrations": [
-                    registration.to_dict()
-                    for registration in sorted(
-                        self.agent_registrations.values(),
-                        key=lambda registration: (registration.role, registration.created_at),
-                    )
-                ],
-                "agent_role_last_session_ids": {
-                    role: self.agent_role_last_session_ids[role]
-                    for role in sorted(self.agent_role_last_session_ids)
-                    if self.agent_role_last_session_ids.get(role)
-                },
-                "adoption_proposals": [
-                    proposal.to_dict()
-                    for proposal in sorted(
-                        self.adoption_proposals.values(),
-                        key=lambda proposal: (proposal.created_at, proposal.id),
-                    )
-                ],
-            }
-
-            # Write to temporary file first
-            state_path = Path(self.state_file)
-            temp_file = state_path.with_suffix('.tmp')
-
-            with open(temp_file, "w") as f:
-                json.dump(data, f, indent=2)
-
-            # Atomic rename (POSIX guarantees atomicity)
-            temp_file.rename(state_path)
-            return True
-
-        except Exception as e:
-            logger.error(f"CRITICAL: Failed to save state to {self.state_file}: {e}")
-            logger.error(f"Session state NOT persisted! Data may be lost on restart.")
-            # Clean up temp file if it exists
+        temp_file: Optional[Path] = None
+        with self._state_save_lock:
             try:
-                temp_file = Path(self.state_file).with_suffix('.tmp')
-                if temp_file.exists():
-                    temp_file.unlink()
-            except Exception:
-                pass
-            return False
+                data = {
+                    "sessions": [s.to_dict() for s in self.sessions.values()],
+                    "em_topic": self.em_topic,
+                    "maintainer_session_id": self.maintainer_session_id,
+                    "agent_registrations": [
+                        registration.to_dict()
+                        for registration in sorted(
+                            self.agent_registrations.values(),
+                            key=lambda registration: (registration.role, registration.created_at),
+                        )
+                    ],
+                    "agent_role_last_session_ids": {
+                        role: self.agent_role_last_session_ids[role]
+                        for role in sorted(self.agent_role_last_session_ids)
+                        if self.agent_role_last_session_ids.get(role)
+                    },
+                    "adoption_proposals": [
+                        proposal.to_dict()
+                        for proposal in sorted(
+                            self.adoption_proposals.values(),
+                            key=lambda proposal: (proposal.created_at, proposal.id),
+                        )
+                    ],
+                }
+
+                state_path = Path(self.state_file)
+                temp_file = state_path.with_name(
+                    f"{state_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+                )
+
+                with open(temp_file, "w") as f:
+                    json.dump(data, f, indent=2)
+
+                # Atomic replace (POSIX guarantees atomicity).
+                temp_file.replace(state_path)
+                return True
+
+            except Exception as e:
+                logger.error(f"CRITICAL: Failed to save state to {self.state_file}: {e}")
+                logger.error(f"Session state NOT persisted! Data may be lost on restart.")
+                try:
+                    if temp_file is not None and temp_file.exists():
+                        temp_file.unlink()
+                except Exception:
+                    pass
+                return False
 
     def add_event_handler(self, handler: Callable[[NotificationEvent], Awaitable[None]]):
         """Register a handler for session events."""
