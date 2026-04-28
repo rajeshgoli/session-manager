@@ -284,11 +284,15 @@ def main():
         nargs="?",
         help="Request ID for status/cancel",
     )
-    request_codex_review_parser.add_argument("--repo", help="Repository in owner/repo format")
+    request_codex_review_parser.add_argument("--repo", help="Repository in owner/repo or host/owner/repo format")
     request_codex_review_parser.add_argument("--notify", help="Session ID or registry role to notify")
     request_codex_review_parser.add_argument("--steer", help="Optional Codex review steer text")
     request_codex_review_parser.add_argument("--all", action="store_true", help="List/status across all notify targets")
-    request_codex_review_parser.add_argument("--inactive", action="store_true", help="Include inactive requests when listing")
+    request_codex_review_parser.add_argument(
+        "--inactive",
+        action="store_true",
+        help="Include inactive requests when listing a notify target; --all includes them by default",
+    )
     request_codex_review_parser.add_argument("--json", action="store_true", help="Output JSON for list/status")
     request_codex_review_parser.add_argument("--pr", dest="status_pr", type=int, help="Filter status/list by PR number")
     request_codex_review_parser.add_argument("--poll-interval", dest="poll_interval_seconds", type=int, default=30, help="Polling cadence in seconds (default: 30)")
@@ -880,7 +884,7 @@ def main():
                 current_session_id=session_id,
                 notify_target=args.notify,
                 list_all=args.all,
-                include_inactive=args.inactive,
+                include_inactive=args.inactive or args.all,
                 json_output=args.json,
                 repo=args.repo,
                 pr_number=args.status_pr,
