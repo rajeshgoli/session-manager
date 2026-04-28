@@ -5036,8 +5036,6 @@ class SessionManager:
         if state_name == "running":
             return ActivityState.WORKING.value
         if state_name == "idle":
-            if self._codex_fork_pane_indicates_working(session):
-                return ActivityState.WORKING.value
             return ActivityState.IDLE.value
         if state_name == "waiting_on_approval":
             return ActivityState.WAITING_PERMISSION.value
