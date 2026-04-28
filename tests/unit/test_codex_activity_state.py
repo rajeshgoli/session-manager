@@ -719,7 +719,7 @@ def test_codex_fork_turn_diff_reasserts_running_after_restart_without_turn_start
     assert manager.get_activity_state(session.id) == "working"
 
 
-def test_codex_fork_idle_reducer_checks_pane_for_background_terminal_work():
+def test_codex_fork_idle_reducer_does_not_capture_pane_on_read_path():
     manager = _make_manager()
     session = Session(
         id="cf-bg",
@@ -739,8 +739,8 @@ def test_codex_fork_idle_reducer_checks_pane_for_background_terminal_work():
         return_value="• Working (17m 46s • esc to interrupt) · 1 background terminal running · /ps to view"
     )
 
-    assert manager.get_activity_state(session.id) == "working"
-    manager.tmux.capture_pane.assert_called_once_with(session.tmux_session, lines=8)
+    assert manager.get_activity_state(session.id) == "idle"
+    manager.tmux.capture_pane.assert_not_called()
 
 
 def test_codex_fork_idle_reducer_remains_idle_without_active_pane_markers():

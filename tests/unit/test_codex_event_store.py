@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest.mock import patch
 
 from src.codex_event_store import CodexEventStore
 
 
 def test_append_and_get_events_sequence(tmp_path):
-    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"))
+    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"), startup_maintenance=False)
 
     first = store.append_event(
         session_id="sess1",
@@ -39,7 +40,7 @@ def test_history_gap_when_since_seq_is_older_than_retained(tmp_path):
     store = CodexEventStore(
         db_path=str(tmp_path / "codex_events.db"),
         retention_max_events_per_session=3,
-        prune_every_writes=1,
+        startup_maintenance=False,
     )
 
     for idx in range(5):
@@ -49,6 +50,7 @@ def test_history_gap_when_since_seq_is_older_than_retained(tmp_path):
             turn_id="turn-1",
             payload={"idx": idx},
         )
+    store._run_startup_maintenance()
 
     page = store.get_events(session_id="sess-retention", since_seq=0, limit=10)
     assert page["history_gap"] is True
@@ -58,7 +60,7 @@ def test_history_gap_when_since_seq_is_older_than_retained(tmp_path):
 
 
 def test_persistence_recovery_emits_marker_event(tmp_path):
-    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"))
+    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"), startup_maintenance=False)
 
     original_get_conn = store._get_conn
 
@@ -91,3 +93,95 @@ def test_persistence_recovery_emits_marker_event(tmp_path):
         "turn_started",
     ]
     assert page["history_gap"] is False
+
+
+def test_init_does_not_prune_on_startup_path(tmp_path):
+    with patch.object(CodexEventStore, "_prune_locked") as prune:
+        store = CodexEventStore(
+            db_path=str(tmp_path / "codex_events.db"),
+            startup_maintenance=False,
+        )
+
+    assert store._prune_index_ready is False
+    prune.assert_not_called()
+
+
+def test_startup_maintenance_adds_timestamp_index_and_prunes_incrementally(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        startup_maintenance=False,
+    )
+
+    with patch.object(store, "_prune_incremental", return_value=0) as prune:
+        store._run_startup_maintenance()
+
+    with sqlite3.connect(str(tmp_path / "codex_events.db")) as conn:
+        indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(codex_session_events)").fetchall()
+        }
+
+    assert "idx_codex_session_events_timestamp" in indexes
+    assert store._prune_index_ready is True
+    prune.assert_called_once()
+
+
+def test_incremental_prune_deletes_only_one_small_batch(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        retention_max_events_per_session=3,
+        startup_maintenance=False,
+    )
+    store.prune_batch_size = 1
+
+    for idx in range(5):
+        store.append_event(
+            session_id="sess-batch",
+            event_type="turn_delta",
+            turn_id="turn-1",
+            payload={"idx": idx},
+        )
+
+    conn = store._get_conn()
+    first_pruned = store._prune_incremental(conn)
+    page = store.get_events(session_id="sess-batch", since_seq=0, limit=10)
+
+    assert first_pruned == 1
+    assert page["earliest_seq"] == 2
+
+
+def test_append_schedules_maintenance_when_prune_index_not_ready(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        prune_every_writes=1,
+        startup_maintenance=False,
+    )
+
+    with patch.object(store, "_start_startup_maintenance") as start_maintenance:
+        store.append_event(
+            session_id="sess-maint",
+            event_type="turn_delta",
+            turn_id="turn-1",
+            payload={"idx": 1},
+        )
+
+    start_maintenance.assert_called_once()
+
+
+def test_startup_maintenance_failure_rolls_back_and_allows_next_write(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        startup_maintenance=False,
+    )
+
+    with patch.object(store, "_prune_incremental", side_effect=sqlite3.OperationalError("forced")):
+        store._run_startup_maintenance()
+
+    event = store.append_event(
+        session_id="sess-after-failure",
+        event_type="turn_delta",
+        turn_id="turn-1",
+        payload={"idx": 1},
+    )
+
+    assert event["persisted"] is True

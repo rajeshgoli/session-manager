@@ -25,6 +25,7 @@ class CodexEventStore:
         retention_max_age_days: int = 14,
         prune_every_writes: int = 200,
         payload_preview_chars: int = 1500,
+        startup_maintenance: bool = True,
     ):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,6 +35,7 @@ class CodexEventStore:
         self.retention_max_age_days = max(1, retention_max_age_days)
         self.prune_every_writes = max(1, prune_every_writes)
         self.payload_preview_chars = max(200, payload_preview_chars)
+        self.prune_batch_size = 500
 
         self._lock = threading.Lock()
         self._conn: Optional[sqlite3.Connection] = None
@@ -42,8 +44,13 @@ class CodexEventStore:
         )
         self._persistence_degraded: set[str] = set()
         self._persisted_writes = 0
+        self._prune_index_ready = False
+        self._maintenance_running = False
+        self._maintenance_lock = threading.Lock()
 
         self._init_db()
+        if startup_maintenance:
+            self._start_startup_maintenance()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -75,8 +82,53 @@ class CodexEventStore:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_codex_session_events_event_type ON codex_session_events(event_type)"
             )
-            self._prune_locked(cursor)
             conn.commit()
+
+    def _start_startup_maintenance(self) -> None:
+        with self._maintenance_lock:
+            if self._maintenance_running:
+                return
+            self._maintenance_running = True
+        thread = threading.Thread(
+            target=self._run_startup_maintenance,
+            name="codex-event-store-maintenance",
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_startup_maintenance(self) -> None:
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            cursor = conn.cursor()
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_codex_session_events_timestamp ON codex_session_events(timestamp)"
+            )
+            conn.commit()
+            with self._lock:
+                self._prune_index_ready = True
+
+            pruned = self._prune_incremental(conn)
+            logger.info("Codex event store startup maintenance completed")
+            if pruned:
+                logger.info("Codex event store pruned %s stale event(s)", pruned)
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.warning("Codex event store startup maintenance failed: %s", exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            with self._maintenance_lock:
+                self._maintenance_running = False
 
     def append_event(
         self,
@@ -162,9 +214,10 @@ class CodexEventStore:
 
                 self._persisted_writes += len(persisted_events)
                 if self._persisted_writes % self.prune_every_writes == 0:
-                    cursor.execute("BEGIN IMMEDIATE")
-                    self._prune_locked(cursor)
-                    conn.commit()
+                    if not self._prune_index_ready:
+                        self._start_startup_maintenance()
+                    elif not self._maintenance_running:
+                        self._start_startup_maintenance()
 
                 return event
 
@@ -337,3 +390,67 @@ class CodexEventStore:
                     "DELETE FROM codex_session_events WHERE session_id = ? AND seq < ?",
                     (session_id, min_keep_seq),
                 )
+
+    def _prune_incremental(self, conn: sqlite3.Connection) -> int:
+        """Delete at most one small retention batch so foreground writes are not starved."""
+        cursor = conn.cursor()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_max_age_days)
+        cutoff_iso = cutoff.isoformat()
+
+        cursor.execute(
+            """
+            SELECT rowid
+            FROM codex_session_events
+            WHERE timestamp < ?
+            ORDER BY timestamp
+            LIMIT ?
+            """,
+            (cutoff_iso, self.prune_batch_size),
+        )
+        rowids = [row[0] for row in cursor.fetchall()]
+        if rowids:
+            return self._delete_rowids_batch(conn, rowids)
+
+        cursor.execute(
+            """
+            SELECT session_id, MAX(seq) - ? + 1 AS min_keep_seq
+            FROM codex_session_events
+            GROUP BY session_id
+            HAVING COUNT(*) > ?
+            LIMIT 1
+            """,
+            (self.retention_max_events_per_session, self.retention_max_events_per_session),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return 0
+
+        session_id, min_keep_seq = row
+        cursor.execute(
+            """
+            SELECT rowid
+            FROM codex_session_events
+            WHERE session_id = ? AND seq < ?
+            ORDER BY seq
+            LIMIT ?
+            """,
+            (session_id, int(min_keep_seq), self.prune_batch_size),
+        )
+        rowids = [row[0] for row in cursor.fetchall()]
+        if not rowids:
+            return 0
+        return self._delete_rowids_batch(conn, rowids)
+
+    def _delete_rowids_batch(self, conn: sqlite3.Connection, rowids: list[int]) -> int:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.executemany(
+                "DELETE FROM codex_session_events WHERE rowid = ?",
+                [(rowid,) for rowid in rowids],
+            )
+            conn.commit()
+            return len(rowids)
+        except Exception:
+            conn.rollback()
+            raise

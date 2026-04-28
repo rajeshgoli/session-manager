@@ -235,20 +235,16 @@ class OutputMonitor:
                         await self._handle_session_died(session)
                         break
 
-                # Check if log file exists
-                if not log_path.exists():
+                last_pos = self._file_positions.get(session.id, 0)
+                current_size, new_content = await asyncio.to_thread(
+                    self._read_new_log_content,
+                    log_path,
+                    last_pos,
+                )
+                if current_size is None:
                     continue
 
-                # Read new content
-                current_size = log_path.stat().st_size
-                last_pos = self._file_positions.get(session.id, 0)
-
                 if current_size > last_pos:
-                    # New content available
-                    with open(log_path, 'r', errors='ignore') as f:
-                        f.seek(last_pos)
-                        new_content = f.read()
-
                     self._file_positions[session.id] = current_size
                     now = datetime.now()
                     self._last_activity[session.id] = now
@@ -260,7 +256,9 @@ class OutputMonitor:
                     # Also update the Session model's last_activity
                     session.last_activity = now
                     # Save state to persist the update
-                    if self._save_state_callback:
+                    if self._session_manager:
+                        await self._session_manager._save_state_async()
+                    elif self._save_state_callback:
                         self._save_state_callback()
                     # Clear idle notification flag on new activity
                     self._notified_permissions.pop(f"{session.id}_idle", None)
@@ -292,6 +290,18 @@ class OutputMonitor:
             except Exception as e:
                 logger.error(f"Monitor error for session {session.id}: {e}")
                 await asyncio.sleep(5)  # Back off on error
+
+    @staticmethod
+    def _read_new_log_content(log_path: Path, last_pos: int) -> tuple[Optional[int], str]:
+        """Read newly appended log content off the event loop."""
+        if not log_path.exists():
+            return None, ""
+        current_size = log_path.stat().st_size
+        if current_size <= last_pos:
+            return current_size, ""
+        with open(log_path, 'r', errors='ignore') as f:
+            f.seek(last_pos)
+            return current_size, f.read()
 
     async def _analyze_content(self, session: Session, content: str):
         """Analyze new content for patterns."""
@@ -588,7 +598,7 @@ class OutputMonitor:
             # Null out session's thread_id to prevent double-close if cleanup_session fires later
             session.telegram_thread_id = None
             if self._session_manager:
-                self._session_manager._save_state()
+                await self._session_manager._save_state_async()
 
     async def cleanup_session(self, session: Session, preserve_record: bool = False):
         """
@@ -678,7 +688,7 @@ class OutputMonitor:
         if self._session_manager:
             unregister_roles = getattr(self._session_manager, "unregister_session_roles", None)
             if callable(unregister_roles):
-                unregister_roles(session_id, persist=False)
+                await asyncio.to_thread(unregister_roles, session_id, persist=False)
             if session.telegram_chat_id and session.telegram_thread_id:
                 session.telegram_thread_id = None
             if not preserve_record and session_id in self._session_manager.sessions:
@@ -686,7 +696,7 @@ class OutputMonitor:
                 logger.debug(f"Removed session {session_id} from sessions dict")
 
             # Save state
-            self._session_manager._save_state()
+            await self._session_manager._save_state_async()
 
             # Clean up hook output cache
             if hasattr(self._session_manager, 'app') and self._session_manager.app:
@@ -727,7 +737,18 @@ class OutputMonitor:
             return False
 
         try:
-            deleted = await delete_forum_topic(chat_id, thread_id)
+            deleted = await asyncio.wait_for(
+                delete_forum_topic(chat_id, thread_id),
+                timeout=self._cleanup_notify_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out deleting forum topic for %s during %s after %ss",
+                session.id,
+                reason,
+                self._cleanup_notify_timeout,
+            )
+            return False
         except Exception as e:
             logger.warning(f"Could not delete forum topic for {session.id} during {reason}: {e}")
             return False
@@ -735,7 +756,7 @@ class OutputMonitor:
         if deleted and self._session_manager:
             mark_deleted = getattr(self._session_manager, "mark_telegram_topic_deleted", None)
             if callable(mark_deleted):
-                mark_deleted(chat_id, thread_id, session=session)
+                await asyncio.to_thread(mark_deleted, chat_id, thread_id, session=session)
 
         return deleted
 
@@ -790,8 +811,20 @@ class OutputMonitor:
             session = self._session_manager.get_session(session_id)
             if session:
                 session.last_activity = now
-                if self._save_state_callback:
-                    self._save_state_callback()
+                if self._session_manager:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        self._session_manager._save_state()
+                    else:
+                        loop.create_task(self._session_manager._save_state_async())
+                elif self._save_state_callback:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        self._save_state_callback()
+                    else:
+                        loop.call_soon(self._save_state_callback)
         # Clear idle notification flag
         notified_key = f"{session_id}_idle"
         self._notified_permissions.pop(notified_key, None)

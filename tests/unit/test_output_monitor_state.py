@@ -13,6 +13,23 @@ from src.models import MonitorState, Session
 from src.output_monitor import OutputMonitor
 
 
+def test_read_new_log_content_reads_append_off_loop(tmp_path):
+    """The synchronous log-tail helper returns only newly appended content."""
+    log_file = tmp_path / "monitor.log"
+    log_file.write_text("first\nsecond\n")
+
+    first_size, first_content = OutputMonitor._read_new_log_content(log_file, 0)
+    assert first_size == log_file.stat().st_size
+    assert first_content == "first\nsecond\n"
+
+    with log_file.open("a") as handle:
+        handle.write("third\n")
+
+    second_size, second_content = OutputMonitor._read_new_log_content(log_file, first_size)
+    assert second_size == log_file.stat().st_size
+    assert second_content == "third\n"
+
+
 def _make_session(session_id: str = "mon12345") -> Session:
     return Session(
         id=session_id,

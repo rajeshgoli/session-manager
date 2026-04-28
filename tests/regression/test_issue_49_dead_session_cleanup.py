@@ -43,6 +43,7 @@ def mock_session_manager():
     manager.tmux = Mock()
     manager.tmux.session_exists = Mock(return_value=True)
     manager._save_state = Mock()
+    manager._save_state_async = AsyncMock(return_value=True)
     manager.app = Mock()
     manager.app.state = Mock()
     manager.app.state.last_claude_output = {}
@@ -105,7 +106,7 @@ async def test_monitor_detects_tmux_death(output_monitor, mock_session, mock_ses
     assert mock_session.status == SessionStatus.STOPPED
 
     # State should be saved
-    mock_session_manager._save_state.assert_called()
+    mock_session_manager._save_state_async.assert_awaited()
 
     # "Session stopped" notification should have been sent (try-and-fallback, #200)
     mock_session_manager.notifier.telegram.send_with_fallback.assert_called_once_with(
@@ -144,7 +145,7 @@ async def test_cleanup_session_full_workflow(output_monitor, mock_session, mock_
     # Verify all cleanup happened
     assert mock_session.status == SessionStatus.STOPPED
     assert mock_session.id not in mock_session_manager.sessions
-    assert mock_session_manager._save_state.called
+    assert mock_session_manager._save_state_async.await_count > 0
 
     # Telegram cleanup
     assert (12345, 67890) not in mock_session_manager.notifier.telegram._topic_sessions
@@ -182,7 +183,7 @@ async def test_cleanup_handles_telegram_notification_failure(output_monitor, moc
     # Verify cleanup still happened for other things
     assert mock_session.status == SessionStatus.STOPPED
     assert mock_session.id not in mock_session_manager.sessions
-    assert mock_session_manager._save_state.called
+    assert mock_session_manager._save_state_async.await_count > 0
 
 
 @pytest.mark.asyncio

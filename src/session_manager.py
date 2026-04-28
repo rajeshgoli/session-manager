@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import textwrap
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -148,6 +149,11 @@ class SessionManager:
         self.legacy_state_file = Path(LEGACY_TMP_SESSION_STATE_FILE)
         self.config = config or {}
         self.process_generation = uuid.uuid4().hex[:12]
+        self._state_save_lock = threading.Lock()
+        mq_timeouts = self.config.get("timeouts", {}).get("message_queue", {})
+        self.input_delivery_wait_seconds = float(
+            mq_timeouts.get("input_delivery_wait_seconds", 1.0)
+        )
 
         self.tmux = TmuxController(log_dir=log_dir)
         self.sessions: dict[str, Session] = {}
@@ -891,6 +897,58 @@ class SessionManager:
             logger.error(f"CRITICAL: Failed to rewrite state file {self.state_file}: {e}")
             return False
 
+    def _build_state_snapshot(self) -> dict:
+        return {
+            "sessions": [s.to_dict() for s in list(self.sessions.values())],
+            "em_topic": self.em_topic,
+            "maintainer_session_id": self.maintainer_session_id,
+            "agent_registrations": [
+                registration.to_dict()
+                for registration in sorted(
+                    list(self.agent_registrations.values()),
+                    key=lambda registration: (registration.role, registration.created_at),
+                )
+            ],
+            "agent_role_last_session_ids": {
+                role: self.agent_role_last_session_ids[role]
+                for role in sorted(list(self.agent_role_last_session_ids))
+                if self.agent_role_last_session_ids.get(role)
+            },
+            "adoption_proposals": [
+                proposal.to_dict()
+                for proposal in sorted(
+                    list(self.adoption_proposals.values()),
+                    key=lambda proposal: (proposal.created_at, proposal.id),
+                )
+            ],
+        }
+
+    def _write_state_snapshot(self, data: dict) -> bool:
+        temp_file: Optional[Path] = None
+        with self._state_save_lock:
+            try:
+                state_path = Path(self.state_file)
+                temp_file = state_path.with_name(
+                    f"{state_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+                )
+
+                with open(temp_file, "w") as f:
+                    json.dump(data, f, indent=2)
+
+                # Atomic replace (POSIX guarantees atomicity).
+                temp_file.replace(state_path)
+                return True
+
+            except Exception as e:
+                logger.error(f"CRITICAL: Failed to save state to {self.state_file}: {e}")
+                logger.error(f"Session state NOT persisted! Data may be lost on restart.")
+                try:
+                    if temp_file is not None and temp_file.exists():
+                        temp_file.unlink()
+                except Exception:
+                    pass
+                return False
+
     def _save_state(self) -> bool:
         """
         Save session state to disk using atomic file operations.
@@ -901,54 +959,12 @@ class SessionManager:
         Returns:
             True if state saved successfully, False if an error occurred.
         """
-        try:
-            data = {
-                "sessions": [s.to_dict() for s in self.sessions.values()],
-                "em_topic": self.em_topic,
-                "maintainer_session_id": self.maintainer_session_id,
-                "agent_registrations": [
-                    registration.to_dict()
-                    for registration in sorted(
-                        self.agent_registrations.values(),
-                        key=lambda registration: (registration.role, registration.created_at),
-                    )
-                ],
-                "agent_role_last_session_ids": {
-                    role: self.agent_role_last_session_ids[role]
-                    for role in sorted(self.agent_role_last_session_ids)
-                    if self.agent_role_last_session_ids.get(role)
-                },
-                "adoption_proposals": [
-                    proposal.to_dict()
-                    for proposal in sorted(
-                        self.adoption_proposals.values(),
-                        key=lambda proposal: (proposal.created_at, proposal.id),
-                    )
-                ],
-            }
+        return self._write_state_snapshot(self._build_state_snapshot())
 
-            # Write to temporary file first
-            state_path = Path(self.state_file)
-            temp_file = state_path.with_suffix('.tmp')
-
-            with open(temp_file, "w") as f:
-                json.dump(data, f, indent=2)
-
-            # Atomic rename (POSIX guarantees atomicity)
-            temp_file.rename(state_path)
-            return True
-
-        except Exception as e:
-            logger.error(f"CRITICAL: Failed to save state to {self.state_file}: {e}")
-            logger.error(f"Session state NOT persisted! Data may be lost on restart.")
-            # Clean up temp file if it exists
-            try:
-                temp_file = Path(self.state_file).with_suffix('.tmp')
-                if temp_file.exists():
-                    temp_file.unlink()
-            except Exception:
-                pass
-            return False
+    async def _save_state_async(self) -> bool:
+        """Snapshot mutable manager state on the event loop, then write it off-loop."""
+        data = self._build_state_snapshot()
+        return await asyncio.to_thread(self._write_state_snapshot, data)
 
     def add_event_handler(self, handler: Callable[[NotificationEvent], Awaitable[None]]):
         """Register a handler for session events."""
@@ -2266,7 +2282,8 @@ class SessionManager:
 
             # Create the tmux session with config args
             # NOTE: session.tmux_session is auto-set by __post_init__ to {provider}-{id}
-            if not self.tmux.create_session_with_command(
+            created = await asyncio.to_thread(
+                self.tmux.create_session_with_command,
                 session.tmux_session,
                 working_dir,
                 session.log_file,
@@ -2275,7 +2292,8 @@ class SessionManager:
                 args=args,
                 model=selected_model if model else None,  # Only pass if explicitly set
                 initial_prompt=initial_prompt,
-            ):
+            )
+            if not created:
                 tmux_error = getattr(self.tmux, "last_error_message", None)
                 if tmux_error:
                     logger.error("Failed to create tmux session for %s: %s", session.name, tmux_error)
@@ -3704,7 +3722,7 @@ class SessionManager:
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
                 _record_outgoing_sm_send_target()
-                delivered = await self.message_queue_manager.deliver_queued_message_now(
+                delivered = await self._deliver_queued_message_with_deadline(
                     session_id=session_id,
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
@@ -3735,7 +3753,7 @@ class SessionManager:
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 _record_outgoing_sm_send_target()
-                delivered = await self.message_queue_manager.deliver_queued_message_now(
+                delivered = await self._deliver_queued_message_with_deadline(
                     session_id=session_id,
                     message_id=msg.id,
                     delivery_mode=delivery_mode,
@@ -3774,6 +3792,53 @@ class SessionManager:
             self._save_state()
 
         return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
+
+    async def _deliver_queued_message_with_deadline(
+        self,
+        session_id: str,
+        message_id: str,
+        delivery_mode: str,
+    ) -> bool:
+        """Attempt immediate queued delivery without letting control APIs wait on slow IO."""
+        if not self.message_queue_manager:
+            return False
+
+        delivery_coro = self.message_queue_manager.deliver_queued_message_now(
+            session_id=session_id,
+            message_id=message_id,
+            delivery_mode=delivery_mode,
+        )
+        task = asyncio.create_task(delivery_coro)
+        wait_seconds = max(0.0, self.input_delivery_wait_seconds)
+        if wait_seconds > 0:
+            done, _ = await asyncio.wait({task}, timeout=wait_seconds)
+            if task in done:
+                return bool(task.result())
+
+        def _log_delivery_failure(completed: asyncio.Task[Any]) -> None:
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "Background queued delivery was cancelled for %s message %s",
+                    session_id,
+                    message_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Background queued delivery failed for %s message %s",
+                    session_id,
+                    message_id,
+                )
+
+        task.add_done_callback(_log_delivery_failure)
+        logger.info(
+            "Queued delivery for %s message %s exceeded %.2fs control wait; continuing in background",
+            session_id,
+            message_id,
+            wait_seconds,
+        )
+        return False
 
     async def _notify_sm_send(
         self,
@@ -4980,8 +5045,6 @@ class SessionManager:
         if state_name == "running":
             return ActivityState.WORKING.value
         if state_name == "idle":
-            if self._codex_fork_pane_indicates_working(session):
-                return ActivityState.WORKING.value
             return ActivityState.IDLE.value
         if state_name == "waiting_on_approval":
             return ActivityState.WAITING_PERMISSION.value

@@ -6,7 +6,9 @@ Tests:
 - API endpoint returns delivery status
 """
 
+import asyncio
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -295,6 +297,48 @@ class TestSendInputDeliveryResult:
             delivery_mode="sequential",
         )
         assert result == DeliveryResult.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_returns_queued_quickly_when_immediate_delivery_is_slow(self, session_manager, mock_message_queue):
+        """Slow recipient injection must not hold the control API open."""
+        session = Session(
+            id="test123",
+            name="test-session",
+            working_dir="/tmp",
+            tmux_session="claude-test123",
+        )
+        session_manager.sessions["test123"] = session
+        session_manager.message_queue_manager = mock_message_queue
+        session_manager.input_delivery_wait_seconds = 0.01
+        delivery_started = asyncio.Event()
+        delivery_finished = asyncio.Event()
+
+        async def slow_delivery(**_kwargs):
+            delivery_started.set()
+            await delivery_finished.wait()
+            return True
+
+        mock_message_queue.deliver_queued_message_now.side_effect = slow_delivery
+
+        started = time.monotonic()
+        result = await session_manager.send_input(
+            session_id="test123",
+            text="hello",
+            delivery_mode="sequential",
+        )
+        elapsed = time.monotonic() - started
+
+        assert result == DeliveryResult.QUEUED
+        assert elapsed < 0.2
+        assert delivery_started.is_set()
+        mock_message_queue.deliver_queued_message_now.assert_awaited_once_with(
+            session_id="test123",
+            message_id="msg-123",
+            delivery_mode="sequential",
+        )
+
+        delivery_finished.set()
+        await asyncio.sleep(0)
 
     @pytest.mark.asyncio
     async def test_urgent_returns_delivered(self, session_manager, mock_message_queue):

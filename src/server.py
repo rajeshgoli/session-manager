@@ -4487,7 +4487,6 @@ Provide ONLY the summary, no preamble or questions."""
             summary_timeout = server_timeouts.get("summary_generation_timeout_seconds", 60)
 
             # Use asyncio.create_subprocess_exec for non-blocking execution
-            import asyncio
             proc = await asyncio.create_subprocess_exec(
                 '/opt/homebrew/bin/claude', '--model', 'haiku', '--print',
                 stdin=asyncio.subprocess.PIPE,
@@ -4719,8 +4718,6 @@ Provide ONLY the summary, no preamble or questions."""
         native_title = None
         native_title_mtime_ns = None
         if transcript_path:
-            import asyncio
-
             def read_transcript():
                 """
                 Read transcript file synchronously (runs in thread pool).
@@ -4866,7 +4863,7 @@ Provide ONLY the summary, no preamble or questions."""
                             state_changed = True
 
                 if state_changed:
-                    app.state.session_manager._save_state()
+                    await app.state.session_manager._save_state_async()
 
                 if title_changed:
                     await _sync_session_display_identity(target_session)
@@ -4891,7 +4888,6 @@ Provide ONLY the summary, no preamble or questions."""
                 # Skip _restore_user_input if a handoff was triggered.
                 # mark_session_idle sets is_idle=False synchronously when a handoff is pending,
                 # so is_idle==False here reliably signals handoff in progress (#196).
-                import asyncio
                 state = queue_mgr.delivery_states.get(session_manager_id)
                 handoff_in_progress = state and not state.is_idle
                 if not handoff_in_progress:
@@ -4925,7 +4921,7 @@ Provide ONLY the summary, no preamble or questions."""
                     from .lock_manager import LockManager, is_worktree, get_worktree_status_hash
 
                     # Release all locks (silent)
-                    for repo_root in session.touched_repos:
+                    for repo_root in list(session.touched_repos):
                         lock_mgr = LockManager(working_dir=repo_root)
                         lock_mgr.release_lock(repo_root, session_manager_id)
                         logger.info(f"Released lock on {repo_root} for session {session_manager_id}")
@@ -4936,7 +4932,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Check for worktrees with uncommitted changes
                     cleanup_needed = []
                     prompt_state_changed = False
-                    for repo_root in session.touched_repos:
+                    for repo_root in list(session.touched_repos):
                         if not is_worktree(repo_root):
                             continue
 
@@ -4971,15 +4967,15 @@ Provide ONLY the summary, no preamble or questions."""
                         )
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        app.state.session_manager._save_state()
+                        await app.state.session_manager._save_state_async()
                         logger.info(f"Sent cleanup prompt for {len(cleanup_needed)} worktree(s)")
                     elif cleanup_needed and not notify_dirty:
                         # Track hashes even when muted so we don't repeatedly evaluate/signal.
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        app.state.session_manager._save_state()
+                        await app.state.session_manager._save_state_async()
                     elif prompt_state_changed:
-                        app.state.session_manager._save_state()
+                        await app.state.session_manager._save_state_async()
 
         if hook_event == "Stop" and not last_message and session_manager_id:
             # Transcript was empty/whitespace-only at Stop time (race condition:
@@ -5032,7 +5028,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Update session's last activity timestamp
                     from datetime import datetime
                     target_session.last_activity = datetime.now()
-                    app.state.session_manager._save_state()
+                    await app.state.session_manager._save_state_async()
 
                     from .models import NotificationEvent
                     event = NotificationEvent(
@@ -5042,10 +5038,21 @@ Provide ONLY the summary, no preamble or questions."""
                         context=last_message,
                         urgent=False,
                     )
-                    await app.state.notifier.notify(event, target_session)
                     # Mark response sent (starts idle cooldown)
                     if app.state.output_monitor:
                         app.state.output_monitor.mark_response_sent(target_session.id)
+
+                    async def _notify_response_event():
+                        try:
+                            await app.state.notifier.notify(event, target_session)
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to send Stop-hook response notification for %s: %s",
+                                target_session.id,
+                                exc,
+                            )
+
+                    asyncio.create_task(_notify_response_event())
 
                     # If session has a review_config, emit review_complete notification
                     if target_session.review_config:
@@ -5056,7 +5063,6 @@ Provide ONLY the summary, no preamble or questions."""
                             review_result = None
                             if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
                                 # PR mode: fetch from GitHub (async)
-                                import asyncio
                                 from .github_reviews import fetch_latest_codex_review
                                 codex_review = await asyncio.to_thread(
                                     fetch_latest_codex_review,
@@ -5262,7 +5268,6 @@ Provide ONLY the summary, no preamble or questions."""
 
         if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
             # GitHub PR mode: fetch review from GitHub API
-            import asyncio
             repo = review_config.pr_repo
             pr_number = review_config.pr_number
 
@@ -6124,27 +6129,33 @@ Provide ONLY the summary, no preamble or questions."""
                 else:
                     abs_path = str(Path(cwd) / file_path) if cwd else file_path
 
-                # Import lock manager functions
-                from .lock_manager import get_git_root, LockManager
+                def acquire_lock_sync() -> tuple[Optional[str], Optional[str]]:
+                    from .lock_manager import get_git_root, LockManager
 
-                # Find git repo root for this file
-                repo_root = get_git_root(abs_path)
+                    repo_root = get_git_root(abs_path)
+                    if not repo_root:
+                        return None, None
 
-                if repo_root:
-                    # Try to acquire lock
                     lock_mgr = LockManager(working_dir=repo_root)
                     lock_result = lock_mgr.try_acquire(repo_root, session_manager_id)
-
                     if lock_result.locked_by_other:
+                        return repo_root, lock_result.owner_session_id
+
+                    return repo_root, None
+
+                repo_root, locked_owner_id = await asyncio.to_thread(acquire_lock_sync)
+
+                if repo_root:
+                    if locked_owner_id:
                         # Get the other session's friendly name
                         other_session = None
                         if app.state.session_manager:
-                            other_session = app.state.session_manager.get_session(lock_result.owner_session_id)
+                            other_session = app.state.session_manager.get_session(locked_owner_id)
 
                         other_name = (
                             _effective_session_name(other_session)
                             if other_session is not None
-                            else lock_result.owner_session_id
+                            else locked_owner_id
                         )
 
                         return {
@@ -6154,11 +6165,9 @@ Provide ONLY the summary, no preamble or questions."""
                                      f"  git worktree add ../my-feature feature-branch\n"
                                      f"  Then edit ../my-feature/{Path(abs_path).relative_to(repo_root)}"
                         }
-
-                    # Lock acquired - track this repo
                     if session:
                         session.touched_repos.add(repo_root)
-                        app.state.session_manager._save_state()
+                        await app.state.session_manager._save_state_async()
 
         # Track worktree creation (PreToolUse for Bash)
         if hook_type == "PreToolUse" and tool_name == "Bash" and session:
@@ -6174,7 +6183,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Resolve to absolute path
                     abs_worktree = str((Path(cwd) / worktree_path).resolve()) if cwd else worktree_path
                     session.worktrees.append(abs_worktree)
-                    app.state.session_manager._save_state()
+                    await app.state.session_manager._save_state_async()
                     logger.info(f"Tracked worktree creation: {abs_worktree}")
 
         # Log to database (fire and forget - don't block response)
@@ -6283,7 +6292,7 @@ Provide ONLY the summary, no preamble or questions."""
             session.agent_status_text = None
             session.agent_status_at = None
             session.agent_task_completed_at = None
-            app.state.session_manager._save_state()
+            await app.state.session_manager._save_state_async()
             if queue_mgr:
                 queue_mgr.cancel_context_monitor_messages_from(session_id)
             return {"status": "flags_reset"}
