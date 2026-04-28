@@ -33,6 +33,7 @@ async def test_telegram_topic_title_retry_marks_identity_synced_on_success():
     app.notifier.rename_session_topic = AsyncMock(side_effect=[False, True])
     app.session_manager = MagicMock()
     app.session_manager.get_session.return_value = session
+    app.session_manager.get_effective_session_name.return_value = "3175-consultant"
     app.session_manager._save_state = MagicMock()
 
     await app._sync_telegram_topic_title_with_retries(
@@ -46,6 +47,50 @@ async def test_telegram_topic_title_retry_marks_identity_synced_on_success():
     assert session.display_identity_synced_chat_id == 123
     assert session.display_identity_synced_thread_id == 456
     app.session_manager._save_state.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_telegram_topic_title_retry_skips_stale_display_name():
+    session = _session()
+    app = SessionManagerApp.__new__(SessionManagerApp)
+    app.notifier = MagicMock()
+    app.notifier.rename_session_topic = AsyncMock(return_value=True)
+    app.session_manager = MagicMock()
+    app.session_manager.get_session.return_value = session
+    app.session_manager.get_effective_session_name.return_value = "newer-name"
+    app.session_manager._save_state = MagicMock()
+
+    await app._sync_telegram_topic_title_with_retries(
+        session.id,
+        "older-name",
+        attempts=1,
+    )
+
+    app.notifier.rename_session_topic.assert_not_awaited()
+    assert session.display_identity_synced_name is None
+    app.session_manager._save_state.assert_not_called()
+
+
+def test_queue_telegram_topic_title_sync_cancels_existing_task():
+    app = SessionManagerApp.__new__(SessionManagerApp)
+    app.notifier = MagicMock()
+    app.notifier.telegram = MagicMock()
+    existing = MagicMock()
+    existing.done.return_value = False
+    app._telegram_topic_title_sync_tasks = {"sess-title": existing}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        created = MagicMock()
+
+        def fake_create_task(coro):
+            coro.close()
+            return created
+
+        monkeypatch.setattr("src.main.asyncio.create_task", fake_create_task)
+        app._queue_telegram_topic_title_sync("sess-title", "new-name")
+
+    existing.cancel.assert_called_once()
+    assert app._telegram_topic_title_sync_tasks["sess-title"] is created
 
 
 @pytest.mark.asyncio

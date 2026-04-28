@@ -749,9 +749,17 @@ class SessionManagerApp:
         if not self.notifier or not getattr(self.notifier, "telegram", None):
             return
         try:
-            asyncio.create_task(
+            tasks = getattr(self, "_telegram_topic_title_sync_tasks", None)
+            if tasks is None:
+                tasks = {}
+                self._telegram_topic_title_sync_tasks = tasks
+            existing = tasks.pop(session_id, None)
+            if existing and not existing.done():
+                existing.cancel()
+            task = asyncio.create_task(
                 self._sync_telegram_topic_title_with_retries(session_id, display_name)
             )
+            tasks[session_id] = task
         except RuntimeError:
             logger.debug("Skipping Telegram topic title sync for %s: no event loop", session_id)
 
@@ -763,62 +771,79 @@ class SessionManagerApp:
         attempts: int = 5,
     ) -> None:
         delay_seconds = 2.0
-        for attempt in range(1, attempts + 1):
-            session = self.session_manager.get_session(session_id)
-            if (
-                not session
-                or session.status == SessionStatus.STOPPED
-                or not session.telegram_chat_id
-                or not session.telegram_thread_id
-            ):
-                return
-
-            try:
-                lock = getattr(self, "_telegram_topic_title_sync_lock", None)
-                if lock is None:
-                    lock = asyncio.Lock()
-                    self._telegram_topic_title_sync_lock = lock
-                async with lock:
-                    success = await asyncio.wait_for(
-                        self.notifier.rename_session_topic(session, display_name),
-                        timeout=5.0,
+        try:
+            for attempt in range(1, attempts + 1):
+                session = self.session_manager.get_session(session_id)
+                if (
+                    not session
+                    or session.status == SessionStatus.STOPPED
+                    or not session.telegram_chat_id
+                    or not session.telegram_thread_id
+                ):
+                    return
+                getter = getattr(self.session_manager, "get_effective_session_name", None)
+                current_display_name = getter(session) if callable(getter) else display_name
+                if current_display_name != display_name:
+                    logger.info(
+                        "Skipping stale Telegram topic title sync for session %s: %s != %s",
+                        session_id,
+                        display_name,
+                        current_display_name,
                     )
-            except asyncio.TimeoutError:
-                success = False
-                logger.warning(
-                    "Timed out syncing Telegram topic title for session %s on attempt %s/%s",
-                    session_id,
-                    attempt,
-                    attempts,
-                )
-            except Exception as exc:
-                success = False
-                logger.warning(
-                    "Failed syncing Telegram topic title for session %s on attempt %s/%s: %s",
-                    session_id,
-                    attempt,
-                    attempts,
-                    exc,
-                )
+                    return
 
-            if success:
-                session.display_identity_synced_name = display_name
-                session.display_identity_synced_at_ns = time.time_ns()
-                session.display_identity_synced_chat_id = session.telegram_chat_id
-                session.display_identity_synced_thread_id = session.telegram_thread_id
-                self.session_manager._save_state()
-                return
+                try:
+                    lock = getattr(self, "_telegram_topic_title_sync_lock", None)
+                    if lock is None:
+                        lock = asyncio.Lock()
+                        self._telegram_topic_title_sync_lock = lock
+                    async with lock:
+                        success = await asyncio.wait_for(
+                            self.notifier.rename_session_topic(session, display_name),
+                            timeout=5.0,
+                        )
+                except asyncio.TimeoutError:
+                    success = False
+                    logger.warning(
+                        "Timed out syncing Telegram topic title for session %s on attempt %s/%s",
+                        session_id,
+                        attempt,
+                        attempts,
+                    )
+                except Exception as exc:
+                    success = False
+                    logger.warning(
+                        "Failed syncing Telegram topic title for session %s on attempt %s/%s: %s",
+                        session_id,
+                        attempt,
+                        attempts,
+                        exc,
+                    )
 
-            if attempt < attempts:
-                await asyncio.sleep(delay_seconds)
-                delay_seconds = min(delay_seconds * 2, 30.0)
+                if success:
+                    session.display_identity_synced_name = display_name
+                    session.display_identity_synced_at_ns = time.time_ns()
+                    session.display_identity_synced_chat_id = session.telegram_chat_id
+                    session.display_identity_synced_thread_id = session.telegram_thread_id
+                    self.session_manager._save_state()
+                    return
 
-        logger.warning(
-            "Telegram topic title for session %s did not converge to %s after %s attempt(s)",
-            session_id,
-            display_name,
-            attempts,
-        )
+                if attempt < attempts:
+                    await asyncio.sleep(delay_seconds)
+                    delay_seconds = min(delay_seconds * 2, 30.0)
+
+            logger.warning(
+                "Telegram topic title for session %s did not converge to %s after %s attempt(s)",
+                session_id,
+                display_name,
+                attempts,
+            )
+        finally:
+            tasks = getattr(self, "_telegram_topic_title_sync_tasks", None)
+            if isinstance(tasks, dict):
+                current_task = asyncio.current_task()
+                if tasks.get(session_id) is current_task:
+                    tasks.pop(session_id, None)
 
     async def _handle_monitor_event(self, event: NotificationEvent):
         """Handle events from the output monitor."""
