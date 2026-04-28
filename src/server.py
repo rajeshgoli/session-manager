@@ -1,6 +1,7 @@
 """FastAPI server for hooks and API endpoints."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -104,6 +105,17 @@ async def _decode_json_request(
         raise HTTPException(status_code=400, detail="JSON object body required")
 
     return payload
+
+
+async def _save_session_manager_state(session_manager: object) -> bool:
+    """Persist manager state when the implementation is async, sync, or mocked."""
+    save_state = getattr(session_manager, "_save_state_async", None)
+    if not callable(save_state):
+        return False
+    result = save_state()
+    if inspect.isawaitable(result):
+        await result
+    return True
 
 
 def _is_valid_app_artifact_hash(artifact_hash: str) -> bool:
@@ -2391,7 +2403,7 @@ def create_app(
                         session.display_identity_synced_at_ns = time.time_ns()
                         session.display_identity_synced_chat_id = session.telegram_chat_id
                         session.display_identity_synced_thread_id = session.telegram_thread_id
-                        await app.state.session_manager._save_state_async()
+                        await _save_session_manager_state(app.state.session_manager)
                         return
 
                     if attempt < attempts:
@@ -4959,7 +4971,7 @@ Provide ONLY the summary, no preamble or questions."""
                             state_changed = True
 
                 if state_changed:
-                    await app.state.session_manager._save_state_async()
+                    await _save_session_manager_state(app.state.session_manager)
 
                 if title_changed:
                     await _sync_session_display_identity(target_session)
@@ -5063,15 +5075,15 @@ Provide ONLY the summary, no preamble or questions."""
                         )
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        await app.state.session_manager._save_state_async()
+                        await _save_session_manager_state(app.state.session_manager)
                         logger.info(f"Sent cleanup prompt for {len(cleanup_needed)} worktree(s)")
                     elif cleanup_needed and not notify_dirty:
                         # Track hashes even when muted so we don't repeatedly evaluate/signal.
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        await app.state.session_manager._save_state_async()
+                        await _save_session_manager_state(app.state.session_manager)
                     elif prompt_state_changed:
-                        await app.state.session_manager._save_state_async()
+                        await _save_session_manager_state(app.state.session_manager)
 
         if hook_event == "Stop" and not last_message and session_manager_id:
             # Transcript was empty/whitespace-only at Stop time (race condition:
@@ -5124,7 +5136,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Update session's last activity timestamp
                     from datetime import datetime
                     target_session.last_activity = datetime.now()
-                    await app.state.session_manager._save_state_async()
+                    await _save_session_manager_state(app.state.session_manager)
 
                     from .models import NotificationEvent
                     event = NotificationEvent(
@@ -6263,7 +6275,7 @@ Provide ONLY the summary, no preamble or questions."""
                         }
                     if session:
                         session.touched_repos.add(repo_root)
-                        await app.state.session_manager._save_state_async()
+                        await _save_session_manager_state(app.state.session_manager)
 
         # Track worktree creation (PreToolUse for Bash)
         if hook_type == "PreToolUse" and tool_name == "Bash" and session:
@@ -6279,7 +6291,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Resolve to absolute path
                     abs_worktree = str((Path(cwd) / worktree_path).resolve()) if cwd else worktree_path
                     session.worktrees.append(abs_worktree)
-                    await app.state.session_manager._save_state_async()
+                    await _save_session_manager_state(app.state.session_manager)
                     logger.info(f"Tracked worktree creation: {abs_worktree}")
 
         # Log to database (fire and forget - don't block response)
@@ -6388,7 +6400,7 @@ Provide ONLY the summary, no preamble or questions."""
             session.agent_status_text = None
             session.agent_status_at = None
             session.agent_task_completed_at = None
-            await app.state.session_manager._save_state_async()
+            await _save_session_manager_state(app.state.session_manager)
             if queue_mgr:
                 queue_mgr.cancel_context_monitor_messages_from(session_id)
             return {"status": "flags_reset"}

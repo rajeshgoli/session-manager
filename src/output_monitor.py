@@ -1,6 +1,7 @@
 """Async log file tailing and pattern detection for Claude sessions."""
 
 import asyncio
+import inspect
 import re
 import logging
 from datetime import datetime, timedelta
@@ -142,6 +143,37 @@ class OutputMonitor:
         """
         self._crash_recovery_callback = callback
 
+    async def _save_session_manager_state(self) -> bool:
+        """Persist manager state when the implementation is async, sync, or mocked."""
+        if not self._session_manager:
+            if self._save_state_callback:
+                self._save_state_callback()
+                return True
+            return False
+        manager_dict = vars(self._session_manager)
+        manager_type = type(self._session_manager)
+        save_state = getattr(self._session_manager, "_save_state_async", None)
+        has_real_async_save = (
+            callable(save_state)
+            and (
+                "_save_state_async" in manager_dict
+                or getattr(manager_type, "_save_state_async", None) is not None
+            )
+        )
+        if has_real_async_save:
+            result = save_state()
+            if inspect.isawaitable(result):
+                await result
+            return True
+        if self._save_state_callback:
+            self._save_state_callback()
+            return True
+        save_state_sync = getattr(self._session_manager, "_save_state", None)
+        if callable(save_state_sync):
+            save_state_sync()
+            return True
+        return False
+
     async def start_monitoring(self, session: Session, is_restored: bool = False):
         """Start monitoring a session's output."""
         if session.id in self._tasks:
@@ -257,7 +289,7 @@ class OutputMonitor:
                     session.last_activity = now
                     # Save state to persist the update
                     if self._session_manager:
-                        await self._session_manager._save_state_async()
+                        await self._save_session_manager_state()
                     elif self._save_state_callback:
                         self._save_state_callback()
                     # Clear idle notification flag on new activity
@@ -598,7 +630,7 @@ class OutputMonitor:
             # Null out session's thread_id to prevent double-close if cleanup_session fires later
             session.telegram_thread_id = None
             if self._session_manager:
-                await self._session_manager._save_state_async()
+                await self._save_session_manager_state()
 
     async def cleanup_session(self, session: Session, preserve_record: bool = False):
         """
@@ -696,7 +728,7 @@ class OutputMonitor:
                 logger.debug(f"Removed session {session_id} from sessions dict")
 
             # Save state
-            await self._session_manager._save_state_async()
+            await self._save_session_manager_state()
 
             # Clean up hook output cache
             if hasattr(self._session_manager, 'app') and self._session_manager.app:
