@@ -1589,9 +1589,20 @@ Provide ONLY the summary, no preamble or questions."""
             await self.bot.edit_forum_topic(chat_id=chat_id, message_thread_id=topic_id, name=name)
             return True
         except Exception as e:
-            if "Topic_not_modified" in str(e):
+            error_text = str(e).lower()
+            if "topic_not_modified" in error_text or "topic not modified" in error_text:
                 logger.debug("Forum topic already named %s: chat=%s, topic=%s", name, chat_id, topic_id)
                 return True
+            if self._is_forum_topic_absent_error(e):
+                session_id = self._topic_sessions.pop((chat_id, topic_id), None)
+                if session_id and self._session_threads.get(session_id) == (chat_id, topic_id):
+                    self._session_threads.pop(session_id, None)
+                logger.info(
+                    "Forum topic absent during rename: chat=%s, topic=%s",
+                    chat_id,
+                    topic_id,
+                )
+                return False
             logger.error(f"Failed to rename forum topic: {e}")
             return False
 
