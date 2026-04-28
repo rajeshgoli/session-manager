@@ -1080,7 +1080,7 @@ def _render(
             _flash_attr(flash_message, palette),
         )
 
-    footer = "j/k: move  +: create  Enter: attach  s: send  K: kill  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
+    footer = "j/k: move  +: create  Enter: attach  s: send  K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
     stdscr.refresh()
 
@@ -1326,14 +1326,14 @@ def run_watch_tui(
                         flash_message = "No session selected"
                         flash_until = time.monotonic() + 2.0
                         continue
-                    confirm = _prompt_input(stdscr, f"Kill {selected_session_id}? type yes: ")
+                    confirm = _prompt_input(stdscr, f"Retire {selected_session_id}? type yes: ")
                     if confirm.lower() != "yes":
-                        flash_message = "Kill canceled"
+                        flash_message = "Retire canceled"
                         flash_until = time.monotonic() + 2.0
                         continue
                     result = client.kill_session(None, selected_session_id)
                     if result and result.get("status") == "killed":
-                        flash_message = f"Killed {selected_session_id}"
+                        flash_message = f"Retired {selected_session_id}"
                     elif result is None:
                         flash_message = "Session manager unavailable"
                     elif isinstance(result, dict) and result.get("error"):
@@ -1341,7 +1341,7 @@ def run_watch_tui(
                     elif isinstance(result, dict) and result.get("detail"):
                         flash_message = str(result.get("detail"))
                     else:
-                        flash_message = "Failed to kill session"
+                        flash_message = "Failed to retire session"
                     flash_until = time.monotonic() + 2.5
                     next_refresh = 0.0
                     continue

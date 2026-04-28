@@ -2331,7 +2331,7 @@ def cmd_kill(
     target_identifier: str,
 ) -> int:
     """
-    Kill a child session (with parent-child ownership check).
+    Retire a child session (with parent-child ownership check).
 
     Args:
         client: API client
@@ -2355,7 +2355,8 @@ def cmd_kill(
             print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
             return 1
 
-    # Kill session with ownership check
+    # Retire session with ownership check. The API/client method retains the
+    # historical kill name for compatibility with existing callers.
     result = client.kill_session(
         requester_session_id=requester_session_id,
         target_session_id=target_session_id,
@@ -2375,12 +2376,12 @@ def cmd_kill(
         if detail:
             print(f"Error: {detail}", file=sys.stderr)
         else:
-            print("Error: Failed to kill session", file=sys.stderr)
+            print("Error: Failed to retire session", file=sys.stderr)
         return 1
 
     # Success - show friendly name if available
     name = session.get("friendly_name") or session.get("name") or target_session_id
-    print(f"Session {name} ({target_session_id}) terminated")
+    print(f"Session {name} ({target_session_id}) retired")
     return 0
 
 

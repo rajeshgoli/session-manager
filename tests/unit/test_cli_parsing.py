@@ -129,6 +129,12 @@ class TestCliParsing:
         children_parser.add_argument("--json", action="store_true")
         children_parser.add_argument("--db-path", default=None)
 
+        # sm kill / sm retire
+        kill_parser = subparsers.add_parser("kill")
+        kill_parser.add_argument("session_id")
+        retire_parser = subparsers.add_parser("retire")
+        retire_parser.add_argument("session_id")
+
         # sm restore
         restore_parser = subparsers.add_parser("restore")
         restore_parser.add_argument("session")
@@ -624,6 +630,30 @@ class TestChildrenCommandDispatch:
 
         assert exc_info.value.code == 2
         assert "Session manager unavailable or request timed out" in capsys.readouterr().err
+
+
+class TestRetireCommand:
+    """Tests for 'sm retire' command parsing and dispatch."""
+
+    def test_retire_alias_parses_like_kill(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["retire", "child123"])
+
+        assert args.command == "retire"
+        assert args.session_id == "child123"
+
+    def test_main_retire_routes_to_cmd_kill(self):
+        mock_client = MagicMock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["sm", "retire", "child123"]):
+                with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                    with patch("src.cli.main.commands.cmd_kill", return_value=0) as mock_cmd_kill:
+                        with pytest.raises(SystemExit) as exc_info:
+                            main()
+
+        assert exc_info.value.code == 0
+        mock_cmd_kill.assert_called_once_with(mock_client, None, "child123")
 
 
 class TestOutputCommand:
