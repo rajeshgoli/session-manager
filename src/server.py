@@ -2312,6 +2312,7 @@ def create_app(
                 if not success:
                     telegram_synced = False
                     logger.warning(f"Failed to rename Telegram topic for session {session.id}")
+                    _queue_telegram_display_identity_retry(session.id, display_name)
             else:
                 telegram_synced = False
         if tmux_synced and telegram_synced:
@@ -2326,6 +2327,101 @@ def create_app(
                 session.display_identity_synced_chat_id = session.telegram_chat_id
                 session.display_identity_synced_thread_id = session.telegram_thread_id
                 app.state.session_manager._save_state()
+
+    def _queue_telegram_display_identity_retry(
+        session_id: str,
+        display_name: str,
+        *,
+        attempts: int = 5,
+    ) -> None:
+        """Retry Telegram topic title convergence without blocking API paths."""
+        async def _retry() -> None:
+            delay_seconds = 2.0
+            try:
+                for attempt in range(1, attempts + 1):
+                    if not app.state.session_manager or not app.state.notifier:
+                        return
+                    session = app.state.session_manager.get_session(session_id)
+                    if (
+                        not session
+                        or session.status == SessionStatus.STOPPED
+                        or not session.telegram_chat_id
+                        or not session.telegram_thread_id
+                    ):
+                        return
+                    current_display_name = _effective_session_name(session, sync_native_title=False)
+                    if current_display_name != display_name:
+                        logger.info(
+                            "Skipping stale Telegram topic rename retry for session %s: %s != %s",
+                            session_id,
+                            display_name,
+                            current_display_name,
+                        )
+                        return
+                    try:
+                        lock = getattr(app.state, "telegram_display_identity_sync_lock", None)
+                        if lock is None:
+                            lock = asyncio.Lock()
+                            app.state.telegram_display_identity_sync_lock = lock
+                        async with lock:
+                            success = await asyncio.wait_for(
+                                app.state.notifier.rename_session_topic(session, display_name),
+                                timeout=5.0,
+                            )
+                    except asyncio.TimeoutError:
+                        success = False
+                        logger.warning(
+                            "Timed out retrying Telegram topic rename for session %s on attempt %s/%s",
+                            session_id,
+                            attempt,
+                            attempts,
+                        )
+                    except Exception as exc:
+                        success = False
+                        logger.warning(
+                            "Failed retrying Telegram topic rename for session %s on attempt %s/%s: %s",
+                            session_id,
+                            attempt,
+                            attempts,
+                            exc,
+                        )
+
+                    if success:
+                        session.display_identity_synced_name = display_name
+                        session.display_identity_synced_at_ns = time.time_ns()
+                        session.display_identity_synced_chat_id = session.telegram_chat_id
+                        session.display_identity_synced_thread_id = session.telegram_thread_id
+                        await app.state.session_manager._save_state_async()
+                        return
+
+                    if attempt < attempts:
+                        await asyncio.sleep(delay_seconds)
+                        delay_seconds = min(delay_seconds * 2, 30.0)
+
+                logger.warning(
+                    "Telegram topic title for session %s did not converge to %s after %s attempt(s)",
+                    session_id,
+                    display_name,
+                    attempts,
+                )
+            finally:
+                tasks = getattr(app.state, "telegram_display_identity_sync_tasks", None)
+                if isinstance(tasks, dict):
+                    current_task = asyncio.current_task()
+                    if tasks.get(session_id) is current_task:
+                        tasks.pop(session_id, None)
+
+        try:
+            tasks = getattr(app.state, "telegram_display_identity_sync_tasks", None)
+            if tasks is None:
+                tasks = {}
+                app.state.telegram_display_identity_sync_tasks = tasks
+            existing = tasks.pop(session_id, None)
+            if existing and not existing.done():
+                existing.cancel()
+            tasks[session_id] = asyncio.create_task(_retry())
+        except RuntimeError:
+            logger.debug("Skipping Telegram display identity retry for %s: no event loop", session_id)
 
     async def _ensure_session_display_identity_synced(session: Session) -> None:
         """Sync external display surfaces when lazy identity discovery changed the effective name."""
