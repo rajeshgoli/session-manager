@@ -169,6 +169,7 @@ async def test_send_input_async_uses_send_input_async(session_manager, mock_tmux
         "tmux-test",
         "test input",
         verify_claude_submit=True,
+        verify_codex_submit=False,
     )
     assert success == DeliveryResult.DELIVERED
 

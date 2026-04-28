@@ -40,6 +40,7 @@ def test_registry_alias_becomes_effective_api_name_and_syncs_surfaces(tmp_path):
     session.telegram_thread_id = 456
     manager.sessions[session.id] = session
     manager.tmux = MagicMock()
+    manager.queue_provider_native_rename = AsyncMock(return_value=True)
 
     notifier = MagicMock()
     notifier.rename_session_topic = AsyncMock(return_value=True)
@@ -60,7 +61,12 @@ def test_registry_alias_becomes_effective_api_name_and_syncs_surfaces(tmp_path):
     assert payload["friendly_name"] == "maintainer"
     assert payload["aliases"] == ["maintainer"]
 
-    manager.tmux.set_status_bar.assert_called_with(session.tmux_session, "maintainer")
+    manager.tmux.set_status_bar.assert_called_with(
+        session.tmux_session,
+        "maintainer",
+        timeout_seconds=None,
+    )
+    manager.queue_provider_native_rename.assert_awaited_once_with(session, "maintainer")
     notifier.rename_session_topic.assert_awaited_with(session, "maintainer")
 
 

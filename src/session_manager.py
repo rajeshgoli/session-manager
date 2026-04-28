@@ -3808,8 +3808,8 @@ class SessionManager:
             message_id=message_id,
             delivery_mode=delivery_mode,
         )
-        task = asyncio.create_task(delivery_coro)
-        wait_seconds = max(0.0, self.input_delivery_wait_seconds)
+        task = asyncio.ensure_future(delivery_coro)
+        wait_seconds = max(0.0, getattr(self, "input_delivery_wait_seconds", 1.0))
         if wait_seconds > 0:
             done, _ = await asyncio.wait({task}, timeout=wait_seconds)
             if task in done:
