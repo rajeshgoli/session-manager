@@ -47,6 +47,7 @@ class CodexEventStore:
         self._prune_index_ready = False
         self._maintenance_running = False
         self._maintenance_lock = threading.Lock()
+        self._pending_overflow_prune_sessions: set[str] = set()
 
         self._init_db()
         if startup_maintenance:
@@ -98,6 +99,7 @@ class CodexEventStore:
 
     def _run_startup_maintenance(self) -> None:
         conn: Optional[sqlite3.Connection] = None
+        pending_overflow_sessions: list[str] = []
         try:
             conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -110,7 +112,13 @@ class CodexEventStore:
             with self._lock:
                 self._prune_index_ready = True
 
-            pruned = self._prune_incremental(conn)
+            pending_overflow_sessions = self._pop_pending_overflow_prune_sessions()
+            pruned, remaining_overflow_sessions = self._prune_incremental(
+                conn,
+                pending_overflow_sessions,
+            )
+            self._mark_sessions_pending_overflow_prune(remaining_overflow_sessions)
+            pending_overflow_sessions = []
             logger.info("Codex event store startup maintenance completed")
             if pruned:
                 logger.info("Codex event store pruned %s stale event(s)", pruned)
@@ -120,6 +128,7 @@ class CodexEventStore:
                     conn.rollback()
                 except Exception:
                     pass
+            self._mark_sessions_pending_overflow_prune(pending_overflow_sessions)
             logger.warning("Codex event store startup maintenance failed: %s", exc)
         finally:
             if conn is not None:
@@ -213,6 +222,8 @@ class CodexEventStore:
                     self._append_ring_event_locked(item)
 
                 self._persisted_writes += len(persisted_events)
+                if latest_seq > self.retention_max_events_per_session:
+                    self._mark_session_pending_overflow_prune(session_id)
                 if self._persisted_writes % self.prune_every_writes == 0:
                     if not self._prune_index_ready:
                         self._start_startup_maintenance()
@@ -391,7 +402,27 @@ class CodexEventStore:
                     (session_id, min_keep_seq),
                 )
 
-    def _prune_incremental(self, conn: sqlite3.Connection) -> int:
+    def _mark_session_pending_overflow_prune(self, session_id: str) -> None:
+        with self._maintenance_lock:
+            self._pending_overflow_prune_sessions.add(session_id)
+
+    def _mark_sessions_pending_overflow_prune(self, session_ids: list[str]) -> None:
+        if not session_ids:
+            return
+        with self._maintenance_lock:
+            self._pending_overflow_prune_sessions.update(session_ids)
+
+    def _pop_pending_overflow_prune_sessions(self) -> list[str]:
+        with self._maintenance_lock:
+            sessions = sorted(self._pending_overflow_prune_sessions)
+            self._pending_overflow_prune_sessions.clear()
+            return sessions
+
+    def _prune_incremental(
+        self,
+        conn: sqlite3.Connection,
+        pending_overflow_sessions: Optional[list[str]] = None,
+    ) -> tuple[int, list[str]]:
         """Delete at most one small retention batch so foreground writes are not starved."""
         cursor = conn.cursor()
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_max_age_days)
@@ -409,23 +440,33 @@ class CodexEventStore:
         )
         rowids = [row[0] for row in cursor.fetchall()]
         if rowids:
-            return self._delete_rowids_batch(conn, rowids)
+            return self._delete_rowids_batch(conn, rowids), pending_overflow_sessions or []
 
-        cursor.execute(
-            """
-            SELECT session_id, MAX(seq) - ? + 1 AS min_keep_seq
-            FROM codex_session_events
-            GROUP BY session_id
-            HAVING COUNT(*) > ?
-            LIMIT 1
-            """,
-            (self.retention_max_events_per_session, self.retention_max_events_per_session),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return 0
+        pending_sessions = pending_overflow_sessions or []
+        for index, session_id in enumerate(pending_sessions):
+            cursor.execute(
+                "SELECT MAX(seq) FROM codex_session_events WHERE session_id = ?",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            max_seq = int(row[0] or 0) if row else 0
+            min_keep_seq = max_seq - self.retention_max_events_per_session + 1
+            if min_keep_seq <= 1:
+                continue
+            rowids = self._overflow_rowids_for_session(cursor, session_id, min_keep_seq)
+            if rowids:
+                remaining_sessions = pending_sessions[index:]
+                if len(rowids) < self.prune_batch_size:
+                    remaining_sessions = pending_sessions[index + 1 :]
+                return self._delete_rowids_batch(conn, rowids), remaining_sessions
+        return 0, []
 
-        session_id, min_keep_seq = row
+    def _overflow_rowids_for_session(
+        self,
+        cursor: sqlite3.Cursor,
+        session_id: str,
+        min_keep_seq: int,
+    ) -> list[int]:
         cursor.execute(
             """
             SELECT rowid
@@ -436,10 +477,7 @@ class CodexEventStore:
             """,
             (session_id, int(min_keep_seq), self.prune_batch_size),
         )
-        rowids = [row[0] for row in cursor.fetchall()]
-        if not rowids:
-            return 0
-        return self._delete_rowids_batch(conn, rowids)
+        return [row[0] for row in cursor.fetchall()]
 
     def _delete_rowids_batch(self, conn: sqlite3.Connection, rowids: list[int]) -> int:
         cursor = conn.cursor()

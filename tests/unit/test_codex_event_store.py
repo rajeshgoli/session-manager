@@ -112,7 +112,7 @@ def test_startup_maintenance_adds_timestamp_index_and_prunes_incrementally(tmp_p
         startup_maintenance=False,
     )
 
-    with patch.object(store, "_prune_incremental", return_value=0) as prune:
+    with patch.object(store, "_prune_incremental", return_value=(0, [])) as prune:
         store._run_startup_maintenance()
 
     with sqlite3.connect(str(tmp_path / "codex_events.db")) as conn:
@@ -143,11 +143,78 @@ def test_incremental_prune_deletes_only_one_small_batch(tmp_path):
         )
 
     conn = store._get_conn()
-    first_pruned = store._prune_incremental(conn)
+    first_pruned, remaining_sessions = store._prune_incremental(conn, ["sess-batch"])
     page = store.get_events(session_id="sess-batch", since_seq=0, limit=10)
 
     assert first_pruned == 1
+    assert remaining_sessions == ["sess-batch"]
     assert page["earliest_seq"] == 2
+
+
+def test_incremental_prune_requeues_unprocessed_overflow_sessions(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        retention_max_events_per_session=3,
+        startup_maintenance=False,
+    )
+    store.prune_batch_size = 10
+
+    for session_id in ("sess-a", "sess-b"):
+        for idx in range(5):
+            store.append_event(
+                session_id=session_id,
+                event_type="turn_delta",
+                turn_id="turn-1",
+                payload={"idx": idx},
+            )
+
+    conn = store._get_conn()
+    pruned, remaining_sessions = store._prune_incremental(conn, ["sess-a", "sess-b"])
+
+    assert pruned == 2
+    assert remaining_sessions == ["sess-b"]
+
+
+def test_incremental_prune_skips_global_overflow_scan_without_pending_session(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        retention_max_events_per_session=3,
+        startup_maintenance=False,
+    )
+
+    for idx in range(5):
+        store.append_event(
+            session_id="sess-batch",
+            event_type="turn_delta",
+            turn_id="turn-1",
+            payload={"idx": idx},
+        )
+
+    conn = store._get_conn()
+    pruned, remaining_sessions = store._prune_incremental(conn, [])
+    page = store.get_events(session_id="sess-batch", since_seq=0, limit=10)
+
+    assert pruned == 0
+    assert remaining_sessions == []
+    assert page["earliest_seq"] == 1
+
+
+def test_append_tracks_overflow_sessions_for_bounded_maintenance(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        retention_max_events_per_session=3,
+        startup_maintenance=False,
+    )
+
+    for idx in range(4):
+        store.append_event(
+            session_id="sess-overflow",
+            event_type="turn_delta",
+            turn_id="turn-1",
+            payload={"idx": idx},
+        )
+
+    assert store._pop_pending_overflow_prune_sessions() == ["sess-overflow"]
 
 
 def test_append_schedules_maintenance_when_prune_index_not_ready(tmp_path):
@@ -185,3 +252,16 @@ def test_startup_maintenance_failure_rolls_back_and_allows_next_write(tmp_path):
     )
 
     assert event["persisted"] is True
+
+
+def test_startup_maintenance_failure_requeues_pending_overflow_sessions(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        startup_maintenance=False,
+    )
+    store._mark_session_pending_overflow_prune("sess-pending")
+
+    with patch.object(store, "_prune_incremental", side_effect=sqlite3.OperationalError("forced")):
+        store._run_startup_maintenance()
+
+    assert store._pop_pending_overflow_prune_sessions() == ["sess-pending"]
