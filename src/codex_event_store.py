@@ -99,6 +99,7 @@ class CodexEventStore:
 
     def _run_startup_maintenance(self) -> None:
         conn: Optional[sqlite3.Connection] = None
+        pending_overflow_sessions: list[str] = []
         try:
             conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -117,6 +118,7 @@ class CodexEventStore:
                 pending_overflow_sessions,
             )
             self._mark_sessions_pending_overflow_prune(remaining_overflow_sessions)
+            pending_overflow_sessions = []
             logger.info("Codex event store startup maintenance completed")
             if pruned:
                 logger.info("Codex event store pruned %s stale event(s)", pruned)
@@ -126,6 +128,7 @@ class CodexEventStore:
                     conn.rollback()
                 except Exception:
                     pass
+            self._mark_sessions_pending_overflow_prune(pending_overflow_sessions)
             logger.warning("Codex event store startup maintenance failed: %s", exc)
         finally:
             if conn is not None:

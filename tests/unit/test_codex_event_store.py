@@ -252,3 +252,16 @@ def test_startup_maintenance_failure_rolls_back_and_allows_next_write(tmp_path):
     )
 
     assert event["persisted"] is True
+
+
+def test_startup_maintenance_failure_requeues_pending_overflow_sessions(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        startup_maintenance=False,
+    )
+    store._mark_session_pending_overflow_prune("sess-pending")
+
+    with patch.object(store, "_prune_incremental", side_effect=sqlite3.OperationalError("forced")):
+        store._run_startup_maintenance()
+
+    assert store._pop_pending_overflow_prune_sessions() == ["sess-pending"]
