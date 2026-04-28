@@ -110,12 +110,16 @@ async def _decode_json_request(
 async def _save_session_manager_state(session_manager: object) -> bool:
     """Persist manager state when the implementation is async, sync, or mocked."""
     save_state = getattr(session_manager, "_save_state_async", None)
-    if not callable(save_state):
-        return False
-    result = save_state()
-    if inspect.isawaitable(result):
-        await result
-    return True
+    if callable(save_state):
+        result = save_state()
+        if inspect.isawaitable(result):
+            await result
+        return True
+    save_state_sync = getattr(session_manager, "_save_state", None)
+    if callable(save_state_sync):
+        save_state_sync()
+        return True
+    return False
 
 
 def _is_valid_app_artifact_hash(artifact_hash: str) -> bool:
