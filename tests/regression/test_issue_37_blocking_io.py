@@ -115,6 +115,36 @@ async def test_spawn_child_session_async_no_blocking(session_manager, mock_tmux)
 
 
 @pytest.mark.asyncio
+async def test_spawn_child_session_offloads_tmux_creation(session_manager, mock_tmux):
+    """Session creation must not run synchronous tmux setup on the event loop."""
+    parent = Session(
+        id="parent-123",
+        name="parent",
+        working_dir="/tmp/test",
+        tmux_session="tmux-parent",
+        status=SessionStatus.RUNNING,
+    )
+    session_manager.sessions[parent.id] = parent
+    mock_tmux.create_session_with_command = Mock(return_value=True)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        assert func is mock_tmux.create_session_with_command
+        return func(*args, **kwargs)
+
+    with patch.object(session_manager, '_get_git_remote_url_async', return_value="https://github.com/test/repo.git"):
+        with patch("src.session_manager.asyncio.to_thread", side_effect=fake_to_thread) as mock_to_thread:
+            child = await session_manager.spawn_child_session(
+                parent_session_id=parent.id,
+                prompt="Test prompt",
+                name="child-session",
+            )
+
+    assert child is not None
+    mock_to_thread.assert_called_once()
+    mock_tmux.create_session_with_command.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_send_input_async_uses_send_input_async(session_manager, mock_tmux):
     """Test that send_input uses tmux.send_input_async (not blocking send_input)."""
     # Create session

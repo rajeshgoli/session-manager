@@ -2273,7 +2273,8 @@ class SessionManager:
 
             # Create the tmux session with config args
             # NOTE: session.tmux_session is auto-set by __post_init__ to {provider}-{id}
-            if not self.tmux.create_session_with_command(
+            created = await asyncio.to_thread(
+                self.tmux.create_session_with_command,
                 session.tmux_session,
                 working_dir,
                 session.log_file,
@@ -2282,7 +2283,8 @@ class SessionManager:
                 args=args,
                 model=selected_model if model else None,  # Only pass if explicitly set
                 initial_prompt=initial_prompt,
-            ):
+            )
+            if not created:
                 tmux_error = getattr(self.tmux, "last_error_message", None)
                 if tmux_error:
                     logger.error("Failed to create tmux session for %s: %s", session.name, tmux_error)
