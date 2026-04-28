@@ -256,6 +256,41 @@ def test_save_state_serializes_concurrent_writers(session_manager, temp_state_fi
     assert len(data["sessions"]) == 25
 
 
+@pytest.mark.asyncio
+async def test_save_state_async_snapshots_before_threaded_write(session_manager, temp_state_file):
+    """Async saves must not serialize live manager maps from worker threads."""
+    session_manager.sessions["initial"] = Session(
+        id="initial",
+        name="initial",
+        working_dir="/tmp",
+        tmux_session="tmux-initial",
+        status=SessionStatus.RUNNING,
+    )
+    original_write = session_manager._write_state_snapshot
+    saved_ids = []
+
+    def write_and_mutate(snapshot):
+        saved_ids.extend(session["id"] for session in snapshot["sessions"])
+        session_manager.sessions["late"] = Session(
+            id="late",
+            name="late",
+            working_dir="/tmp",
+            tmux_session="tmux-late",
+            status=SessionStatus.RUNNING,
+        )
+        return original_write(snapshot)
+
+    session_manager._write_state_snapshot = write_and_mutate
+
+    result = await session_manager._save_state_async()
+
+    assert result is True
+    assert saved_ids == ["initial"]
+    with open(temp_state_file) as f:
+        data = json.load(f)
+    assert [session["id"] for session in data["sessions"]] == ["initial"]
+
+
 # =========================================================================
 # Test 3: Transcript Reading Indicates Errors
 # =========================================================================

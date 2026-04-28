@@ -44,6 +44,8 @@ class CodexEventStore:
         self._persistence_degraded: set[str] = set()
         self._persisted_writes = 0
         self._prune_index_ready = False
+        self._maintenance_running = False
+        self._maintenance_lock = threading.Lock()
 
         self._init_db()
         if startup_maintenance:
@@ -82,6 +84,10 @@ class CodexEventStore:
             conn.commit()
 
     def _start_startup_maintenance(self) -> None:
+        with self._maintenance_lock:
+            if self._maintenance_running:
+                return
+            self._maintenance_running = True
         thread = threading.Thread(
             target=self._run_startup_maintenance,
             name="codex-event-store-maintenance",
@@ -90,19 +96,38 @@ class CodexEventStore:
         thread.start()
 
     def _run_startup_maintenance(self) -> None:
+        conn: Optional[sqlite3.Connection] = None
         try:
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            cursor = conn.cursor()
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_codex_session_events_timestamp ON codex_session_events(timestamp)"
+            )
+            conn.commit()
             with self._lock:
-                conn = self._get_conn()
-                cursor = conn.cursor()
-                cursor.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_codex_session_events_timestamp ON codex_session_events(timestamp)"
-                )
                 self._prune_index_ready = True
-                self._prune_locked(cursor)
-                conn.commit()
-                logger.info("Codex event store startup maintenance completed")
+
+            cursor.execute("BEGIN IMMEDIATE")
+            self._prune_locked(cursor)
+            conn.commit()
+            logger.info("Codex event store startup maintenance completed")
         except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             logger.warning("Codex event store startup maintenance failed: %s", exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            with self._maintenance_lock:
+                self._maintenance_running = False
 
     def append_event(
         self,
@@ -187,10 +212,11 @@ class CodexEventStore:
                     self._append_ring_event_locked(item)
 
                 self._persisted_writes += len(persisted_events)
-                if self._prune_index_ready and self._persisted_writes % self.prune_every_writes == 0:
-                    cursor.execute("BEGIN IMMEDIATE")
-                    self._prune_locked(cursor)
-                    conn.commit()
+                if self._persisted_writes % self.prune_every_writes == 0:
+                    if not self._prune_index_ready:
+                        self._start_startup_maintenance()
+                    elif not self._maintenance_running:
+                        self._start_startup_maintenance()
 
                 return event
 

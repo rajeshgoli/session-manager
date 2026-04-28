@@ -4863,7 +4863,7 @@ Provide ONLY the summary, no preamble or questions."""
                             state_changed = True
 
                 if state_changed:
-                    await asyncio.to_thread(app.state.session_manager._save_state)
+                    await app.state.session_manager._save_state_async()
 
                 if title_changed:
                     await _sync_session_display_identity(target_session)
@@ -4921,7 +4921,7 @@ Provide ONLY the summary, no preamble or questions."""
                     from .lock_manager import LockManager, is_worktree, get_worktree_status_hash
 
                     # Release all locks (silent)
-                    for repo_root in session.touched_repos:
+                    for repo_root in list(session.touched_repos):
                         lock_mgr = LockManager(working_dir=repo_root)
                         lock_mgr.release_lock(repo_root, session_manager_id)
                         logger.info(f"Released lock on {repo_root} for session {session_manager_id}")
@@ -4932,7 +4932,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Check for worktrees with uncommitted changes
                     cleanup_needed = []
                     prompt_state_changed = False
-                    for repo_root in session.touched_repos:
+                    for repo_root in list(session.touched_repos):
                         if not is_worktree(repo_root):
                             continue
 
@@ -4967,15 +4967,15 @@ Provide ONLY the summary, no preamble or questions."""
                         )
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        await asyncio.to_thread(app.state.session_manager._save_state)
+                        await app.state.session_manager._save_state_async()
                         logger.info(f"Sent cleanup prompt for {len(cleanup_needed)} worktree(s)")
                     elif cleanup_needed and not notify_dirty:
                         # Track hashes even when muted so we don't repeatedly evaluate/signal.
                         for repo_root, status_hash in cleanup_needed:
                             session.cleanup_prompted[repo_root] = status_hash
-                        await asyncio.to_thread(app.state.session_manager._save_state)
+                        await app.state.session_manager._save_state_async()
                     elif prompt_state_changed:
-                        await asyncio.to_thread(app.state.session_manager._save_state)
+                        await app.state.session_manager._save_state_async()
 
         if hook_event == "Stop" and not last_message and session_manager_id:
             # Transcript was empty/whitespace-only at Stop time (race condition:
@@ -5028,7 +5028,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Update session's last activity timestamp
                     from datetime import datetime
                     target_session.last_activity = datetime.now()
-                    await asyncio.to_thread(app.state.session_manager._save_state)
+                    await app.state.session_manager._save_state_async()
 
                     from .models import NotificationEvent
                     event = NotificationEvent(
@@ -6141,9 +6141,6 @@ Provide ONLY the summary, no preamble or questions."""
                     if lock_result.locked_by_other:
                         return repo_root, lock_result.owner_session_id
 
-                    if session:
-                        session.touched_repos.add(repo_root)
-                        app.state.session_manager._save_state()
                     return repo_root, None
 
                 repo_root, locked_owner_id = await asyncio.to_thread(acquire_lock_sync)
@@ -6168,6 +6165,9 @@ Provide ONLY the summary, no preamble or questions."""
                                      f"  git worktree add ../my-feature feature-branch\n"
                                      f"  Then edit ../my-feature/{Path(abs_path).relative_to(repo_root)}"
                         }
+                    if session:
+                        session.touched_repos.add(repo_root)
+                        await app.state.session_manager._save_state_async()
 
         # Track worktree creation (PreToolUse for Bash)
         if hook_type == "PreToolUse" and tool_name == "Bash" and session:
@@ -6183,7 +6183,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Resolve to absolute path
                     abs_worktree = str((Path(cwd) / worktree_path).resolve()) if cwd else worktree_path
                     session.worktrees.append(abs_worktree)
-                    await asyncio.to_thread(app.state.session_manager._save_state)
+                    await app.state.session_manager._save_state_async()
                     logger.info(f"Tracked worktree creation: {abs_worktree}")
 
         # Log to database (fire and forget - don't block response)
@@ -6292,7 +6292,7 @@ Provide ONLY the summary, no preamble or questions."""
             session.agent_status_text = None
             session.agent_status_at = None
             session.agent_task_completed_at = None
-            await asyncio.to_thread(app.state.session_manager._save_state)
+            await app.state.session_manager._save_state_async()
             if queue_mgr:
                 queue_mgr.cancel_context_monitor_messages_from(session_id)
             return {"status": "flags_reset"}

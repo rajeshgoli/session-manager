@@ -256,8 +256,10 @@ class OutputMonitor:
                     # Also update the Session model's last_activity
                     session.last_activity = now
                     # Save state to persist the update
-                    if self._save_state_callback:
-                        await asyncio.to_thread(self._save_state_callback)
+                    if self._session_manager:
+                        await self._session_manager._save_state_async()
+                    elif self._save_state_callback:
+                        self._save_state_callback()
                     # Clear idle notification flag on new activity
                     self._notified_permissions.pop(f"{session.id}_idle", None)
 
@@ -596,7 +598,7 @@ class OutputMonitor:
             # Null out session's thread_id to prevent double-close if cleanup_session fires later
             session.telegram_thread_id = None
             if self._session_manager:
-                await asyncio.to_thread(self._session_manager._save_state)
+                await self._session_manager._save_state_async()
 
     async def cleanup_session(self, session: Session, preserve_record: bool = False):
         """
@@ -694,7 +696,7 @@ class OutputMonitor:
                 logger.debug(f"Removed session {session_id} from sessions dict")
 
             # Save state
-            await asyncio.to_thread(self._session_manager._save_state)
+            await self._session_manager._save_state_async()
 
             # Clean up hook output cache
             if hasattr(self._session_manager, 'app') and self._session_manager.app:
@@ -809,13 +811,20 @@ class OutputMonitor:
             session = self._session_manager.get_session(session_id)
             if session:
                 session.last_activity = now
-                if self._save_state_callback:
+                if self._session_manager:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        self._session_manager._save_state()
+                    else:
+                        loop.create_task(self._session_manager._save_state_async())
+                elif self._save_state_callback:
                     try:
                         loop = asyncio.get_running_loop()
                     except RuntimeError:
                         self._save_state_callback()
                     else:
-                        loop.create_task(asyncio.to_thread(self._save_state_callback))
+                        loop.call_soon(self._save_state_callback)
         # Clear idle notification flag
         notified_key = f"{session_id}_idle"
         self._notified_permissions.pop(notified_key, None)

@@ -24,6 +24,7 @@ def _session_manager_with_session(session: Session) -> MagicMock:
     manager.get_session_aliases.return_value = []
     manager.get_primary_session_alias.return_value = None
     manager._save_state = MagicMock()
+    manager._save_state_async = AsyncMock(return_value=True)
     manager.message_queue_manager = MagicMock()
     manager.message_queue_manager.mark_session_active = MagicMock()
     return manager

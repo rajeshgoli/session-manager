@@ -897,44 +897,36 @@ class SessionManager:
             logger.error(f"CRITICAL: Failed to rewrite state file {self.state_file}: {e}")
             return False
 
-    def _save_state(self) -> bool:
-        """
-        Save session state to disk using atomic file operations.
+    def _build_state_snapshot(self) -> dict:
+        return {
+            "sessions": [s.to_dict() for s in list(self.sessions.values())],
+            "em_topic": self.em_topic,
+            "maintainer_session_id": self.maintainer_session_id,
+            "agent_registrations": [
+                registration.to_dict()
+                for registration in sorted(
+                    list(self.agent_registrations.values()),
+                    key=lambda registration: (registration.role, registration.created_at),
+                )
+            ],
+            "agent_role_last_session_ids": {
+                role: self.agent_role_last_session_ids[role]
+                for role in sorted(list(self.agent_role_last_session_ids))
+                if self.agent_role_last_session_ids.get(role)
+            },
+            "adoption_proposals": [
+                proposal.to_dict()
+                for proposal in sorted(
+                    list(self.adoption_proposals.values()),
+                    key=lambda proposal: (proposal.created_at, proposal.id),
+                )
+            ],
+        }
 
-        Uses temp file + rename to ensure atomic writes and prevent race conditions
-        when multiple async tasks call this method concurrently.
-
-        Returns:
-            True if state saved successfully, False if an error occurred.
-        """
+    def _write_state_snapshot(self, data: dict) -> bool:
         temp_file: Optional[Path] = None
         with self._state_save_lock:
             try:
-                data = {
-                    "sessions": [s.to_dict() for s in self.sessions.values()],
-                    "em_topic": self.em_topic,
-                    "maintainer_session_id": self.maintainer_session_id,
-                    "agent_registrations": [
-                        registration.to_dict()
-                        for registration in sorted(
-                            self.agent_registrations.values(),
-                            key=lambda registration: (registration.role, registration.created_at),
-                        )
-                    ],
-                    "agent_role_last_session_ids": {
-                        role: self.agent_role_last_session_ids[role]
-                        for role in sorted(self.agent_role_last_session_ids)
-                        if self.agent_role_last_session_ids.get(role)
-                    },
-                    "adoption_proposals": [
-                        proposal.to_dict()
-                        for proposal in sorted(
-                            self.adoption_proposals.values(),
-                            key=lambda proposal: (proposal.created_at, proposal.id),
-                        )
-                    ],
-                }
-
                 state_path = Path(self.state_file)
                 temp_file = state_path.with_name(
                     f"{state_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
@@ -956,6 +948,23 @@ class SessionManager:
                 except Exception:
                     pass
                 return False
+
+    def _save_state(self) -> bool:
+        """
+        Save session state to disk using atomic file operations.
+
+        Uses temp file + rename to ensure atomic writes and prevent race conditions
+        when multiple async tasks call this method concurrently.
+
+        Returns:
+            True if state saved successfully, False if an error occurred.
+        """
+        return self._write_state_snapshot(self._build_state_snapshot())
+
+    async def _save_state_async(self) -> bool:
+        """Snapshot mutable manager state on the event loop, then write it off-loop."""
+        data = self._build_state_snapshot()
+        return await asyncio.to_thread(self._write_state_snapshot, data)
 
     def add_event_handler(self, handler: Callable[[NotificationEvent], Awaitable[None]]):
         """Register a handler for session events."""

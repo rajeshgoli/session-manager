@@ -53,6 +53,7 @@ def mock_session_manager(session):
     mock.sessions = {session.id: session}
     mock.get_session = MagicMock(return_value=session)
     mock._save_state = MagicMock()
+    mock._save_state_async = AsyncMock(return_value=True)
     mock.message_queue_manager = MagicMock()
     return mock
 
@@ -96,7 +97,7 @@ class TestContextResetClearsAgentStatus:
 
     def test_context_reset_saves_state(self, client, mock_session_manager, session):
         _post_event(client, session.id, event="context_reset")
-        mock_session_manager._save_state.assert_called()
+        mock_session_manager._save_state_async.assert_awaited()
 
     def test_context_reset_still_returns_flags_reset(self, client, session):
         resp = _post_event(client, session.id, event="context_reset")

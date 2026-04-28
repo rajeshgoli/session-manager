@@ -40,10 +40,8 @@ def test_history_gap_when_since_seq_is_older_than_retained(tmp_path):
     store = CodexEventStore(
         db_path=str(tmp_path / "codex_events.db"),
         retention_max_events_per_session=3,
-        prune_every_writes=1,
         startup_maintenance=False,
     )
-    store._prune_index_ready = True
 
     for idx in range(5):
         store.append_event(
@@ -52,6 +50,7 @@ def test_history_gap_when_since_seq_is_older_than_retained(tmp_path):
             turn_id="turn-1",
             payload={"idx": idx},
         )
+    store._run_startup_maintenance()
 
     page = store.get_events(session_id="sess-retention", since_seq=0, limit=10)
     assert page["history_gap"] is True
@@ -125,3 +124,40 @@ def test_startup_maintenance_adds_timestamp_index_and_prunes(tmp_path):
     assert "idx_codex_session_events_timestamp" in indexes
     assert store._prune_index_ready is True
     prune.assert_called_once()
+
+
+def test_append_schedules_maintenance_when_prune_index_not_ready(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        prune_every_writes=1,
+        startup_maintenance=False,
+    )
+
+    with patch.object(store, "_start_startup_maintenance") as start_maintenance:
+        store.append_event(
+            session_id="sess-maint",
+            event_type="turn_delta",
+            turn_id="turn-1",
+            payload={"idx": 1},
+        )
+
+    start_maintenance.assert_called_once()
+
+
+def test_startup_maintenance_failure_rolls_back_and_allows_next_write(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        startup_maintenance=False,
+    )
+
+    with patch.object(store, "_prune_locked", side_effect=sqlite3.OperationalError("forced")):
+        store._run_startup_maintenance()
+
+    event = store.append_event(
+        session_id="sess-after-failure",
+        event_type="turn_delta",
+        turn_id="turn-1",
+        payload={"idx": 1},
+    )
+
+    assert event["persisted"] is True
