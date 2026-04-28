@@ -702,6 +702,17 @@ def test_cmd_request_codex_review_create_list_status_cancel(capsys):
     assert rc == 0
     assert "req123" in capsys.readouterr().out
 
+    rc = cmd_request_codex_review_list(
+        client,
+        current_session_id="agent618",
+        notify_target=None,
+        list_all=True,
+        include_inactive=False,
+        json_output=True,
+    )
+    assert rc == 0
+    assert client.list_codex_review_requests.call_args.kwargs["include_inactive"] is True
+
     rc = cmd_request_codex_review_status(
         client,
         current_session_id="agent618",

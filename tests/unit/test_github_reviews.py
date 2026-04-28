@@ -20,6 +20,7 @@ from src.github_reviews import (
     poll_for_codex_review,
     validate_open_pr,
     get_pr_repo_from_git,
+    _split_repo,
 )
 
 
@@ -166,6 +167,14 @@ class TestGetPrRepoFromGit:
 
 class TestCodexHelpers:
     """Tests for newer GitHub review helper primitives (#618)."""
+
+    def test_split_repo_accepts_host_qualified_repo(self):
+        assert _split_repo("owner/repo") == ("owner", "repo")
+        assert _split_repo("github.com/owner/repo") == ("owner", "repo")
+        assert _split_repo("https://github.com/owner/repo") == ("owner", "repo")
+
+        with pytest.raises(RuntimeError, match="expected owner/repo or host/owner/repo"):
+            _split_repo("repo")
 
     @patch("src.github_reviews.subprocess.run")
     def test_validate_open_pr_returns_payload(self, mock_run):

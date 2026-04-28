@@ -3675,7 +3675,7 @@ def cmd_request_codex_review_list(
         notify_target=effective_notify_target,
         repo=repo,
         pr_number=pr_number,
-        include_inactive=include_inactive,
+        include_inactive=include_inactive or list_all,
     )
     if result.get("unavailable"):
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)

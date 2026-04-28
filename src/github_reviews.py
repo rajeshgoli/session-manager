@@ -12,6 +12,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,17 @@ def _github_since_value(dt: datetime) -> str:
 
 
 def _split_repo(repo: str) -> tuple[str, str]:
-    """Split owner/repo into its path components."""
-    try:
-        return repo.split("/", 1)
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid repo {repo!r}; expected owner/repo") from exc
+    """Split owner/repo or host/owner/repo into REST owner/repo components."""
+    normalized = repo.strip()
+    parsed = urlparse(normalized)
+    if parsed.scheme and parsed.netloc:
+        normalized = parsed.path
+    parts = [part for part in normalized.strip("/").split("/") if part]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) == 3:
+        return parts[1], parts[2]
+    raise RuntimeError(f"Invalid repo {repo!r}; expected owner/repo or host/owner/repo")
 
 
 def _gh_api_json(repo: str, endpoint: str, *, paginate: bool = False) -> Any:
