@@ -35,6 +35,7 @@ class CodexEventStore:
         self.retention_max_age_days = max(1, retention_max_age_days)
         self.prune_every_writes = max(1, prune_every_writes)
         self.payload_preview_chars = max(200, payload_preview_chars)
+        self.prune_batch_size = 500
 
         self._lock = threading.Lock()
         self._conn: Optional[sqlite3.Connection] = None
@@ -109,10 +110,10 @@ class CodexEventStore:
             with self._lock:
                 self._prune_index_ready = True
 
-            cursor.execute("BEGIN IMMEDIATE")
-            self._prune_locked(cursor)
-            conn.commit()
+            pruned = self._prune_incremental(conn)
             logger.info("Codex event store startup maintenance completed")
+            if pruned:
+                logger.info("Codex event store pruned %s stale event(s)", pruned)
         except Exception as exc:
             if conn is not None:
                 try:
@@ -389,3 +390,67 @@ class CodexEventStore:
                     "DELETE FROM codex_session_events WHERE session_id = ? AND seq < ?",
                     (session_id, min_keep_seq),
                 )
+
+    def _prune_incremental(self, conn: sqlite3.Connection) -> int:
+        """Delete at most one small retention batch so foreground writes are not starved."""
+        cursor = conn.cursor()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_max_age_days)
+        cutoff_iso = cutoff.isoformat()
+
+        cursor.execute(
+            """
+            SELECT rowid
+            FROM codex_session_events
+            WHERE timestamp < ?
+            ORDER BY timestamp
+            LIMIT ?
+            """,
+            (cutoff_iso, self.prune_batch_size),
+        )
+        rowids = [row[0] for row in cursor.fetchall()]
+        if rowids:
+            return self._delete_rowids_batch(conn, rowids)
+
+        cursor.execute(
+            """
+            SELECT session_id, MAX(seq) - ? + 1 AS min_keep_seq
+            FROM codex_session_events
+            GROUP BY session_id
+            HAVING COUNT(*) > ?
+            LIMIT 1
+            """,
+            (self.retention_max_events_per_session, self.retention_max_events_per_session),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return 0
+
+        session_id, min_keep_seq = row
+        cursor.execute(
+            """
+            SELECT rowid
+            FROM codex_session_events
+            WHERE session_id = ? AND seq < ?
+            ORDER BY seq
+            LIMIT ?
+            """,
+            (session_id, int(min_keep_seq), self.prune_batch_size),
+        )
+        rowids = [row[0] for row in cursor.fetchall()]
+        if not rowids:
+            return 0
+        return self._delete_rowids_batch(conn, rowids)
+
+    def _delete_rowids_batch(self, conn: sqlite3.Connection, rowids: list[int]) -> int:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.executemany(
+                "DELETE FROM codex_session_events WHERE rowid = ?",
+                [(rowid,) for rowid in rowids],
+            )
+            conn.commit()
+            return len(rowids)
+        except Exception:
+            conn.rollback()
+            raise
