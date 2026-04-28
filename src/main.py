@@ -774,10 +774,15 @@ class SessionManagerApp:
                 return
 
             try:
-                success = await asyncio.wait_for(
-                    self.notifier.rename_session_topic(session, display_name),
-                    timeout=5.0,
-                )
+                lock = getattr(self, "_telegram_topic_title_sync_lock", None)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self._telegram_topic_title_sync_lock = lock
+                async with lock:
+                    success = await asyncio.wait_for(
+                        self.notifier.rename_session_topic(session, display_name),
+                        timeout=5.0,
+                    )
             except asyncio.TimeoutError:
                 success = False
                 logger.warning(

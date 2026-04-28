@@ -2349,10 +2349,15 @@ def create_app(
                 ):
                     return
                 try:
-                    success = await asyncio.wait_for(
-                        app.state.notifier.rename_session_topic(session, display_name),
-                        timeout=5.0,
-                    )
+                    lock = getattr(app.state, "telegram_display_identity_sync_lock", None)
+                    if lock is None:
+                        lock = asyncio.Lock()
+                        app.state.telegram_display_identity_sync_lock = lock
+                    async with lock:
+                        success = await asyncio.wait_for(
+                            app.state.notifier.rename_session_topic(session, display_name),
+                            timeout=5.0,
+                        )
                 except asyncio.TimeoutError:
                     success = False
                     logger.warning(
