@@ -742,7 +742,18 @@ class SessionManagerApp:
                     display_name = self.session_manager.get_effective_session_name(session)
                     if display_name:
                         self.session_manager.tmux.set_status_bar(session.tmux_session, display_name)
-                        self._queue_telegram_topic_title_sync(session.id, display_name)
+                        if self._telegram_topic_title_needs_sync(session, display_name):
+                            self._queue_telegram_topic_title_sync(session.id, display_name)
+
+    @staticmethod
+    def _telegram_topic_title_needs_sync(session: Session, display_name: str) -> bool:
+        if not session.telegram_chat_id or not session.telegram_thread_id:
+            return False
+        return (
+            session.display_identity_synced_name != display_name
+            or session.display_identity_synced_chat_id != session.telegram_chat_id
+            or session.display_identity_synced_thread_id != session.telegram_thread_id
+        )
 
     def _queue_telegram_topic_title_sync(self, session_id: str, display_name: str) -> None:
         """Best-effort Telegram title convergence that never blocks startup/requests."""

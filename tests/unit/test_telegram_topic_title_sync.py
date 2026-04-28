@@ -115,3 +115,23 @@ async def test_restore_monitoring_queues_telegram_topic_title_sync():
         session.id,
         "3175-super-em",
     )
+
+
+@pytest.mark.asyncio
+async def test_restore_monitoring_skips_already_synced_telegram_topic_title():
+    session = _session()
+    session.display_identity_synced_name = "3175-super-em"
+    session.display_identity_synced_chat_id = session.telegram_chat_id
+    session.display_identity_synced_thread_id = session.telegram_thread_id
+    app = SessionManagerApp.__new__(SessionManagerApp)
+    app.session_manager = MagicMock()
+    app.session_manager.list_sessions.return_value = [session]
+    app.session_manager.get_effective_session_name.return_value = "3175-super-em"
+    app.session_manager.tmux.set_status_bar.return_value = True
+    app.output_monitor = MagicMock()
+    app.output_monitor.start_monitoring = AsyncMock()
+    app._queue_telegram_topic_title_sync = MagicMock()
+
+    await app._restore_monitoring()
+
+    app._queue_telegram_topic_title_sync.assert_not_called()

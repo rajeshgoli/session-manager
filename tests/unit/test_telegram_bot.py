@@ -142,6 +142,32 @@ async def test_rename_forum_topic_treats_not_modified_as_success():
 
 
 @pytest.mark.asyncio
+async def test_rename_forum_topic_treats_spaced_not_modified_as_success():
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.edit_forum_topic = AsyncMock(side_effect=Exception("Topic not modified"))
+
+    result = await tg.rename_forum_topic(chat_id=10000, topic_id=50000, name="agent [abc123]")
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_rename_forum_topic_clears_absent_topic_mapping():
+    tg = TelegramBot.__new__(TelegramBot)
+    tg.bot = AsyncMock()
+    tg.bot.edit_forum_topic = AsyncMock(side_effect=Exception("Topic_id_invalid"))
+    tg._topic_sessions = {(10000, 50000): "sess123"}
+    tg._session_threads = {"sess123": (10000, 50000)}
+
+    result = await tg.rename_forum_topic(chat_id=10000, topic_id=50000, name="agent [abc123]")
+
+    assert result is False
+    assert tg._topic_sessions == {}
+    assert tg._session_threads == {}
+
+
+@pytest.mark.asyncio
 async def test_delete_forum_topic_treats_absent_topic_as_success():
     tg = TelegramBot.__new__(TelegramBot)
     tg.bot = AsyncMock()
