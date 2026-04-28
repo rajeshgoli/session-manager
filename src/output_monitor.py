@@ -235,20 +235,16 @@ class OutputMonitor:
                         await self._handle_session_died(session)
                         break
 
-                # Check if log file exists
-                if not log_path.exists():
+                last_pos = self._file_positions.get(session.id, 0)
+                current_size, new_content = await asyncio.to_thread(
+                    self._read_new_log_content,
+                    log_path,
+                    last_pos,
+                )
+                if current_size is None:
                     continue
 
-                # Read new content
-                current_size = log_path.stat().st_size
-                last_pos = self._file_positions.get(session.id, 0)
-
                 if current_size > last_pos:
-                    # New content available
-                    with open(log_path, 'r', errors='ignore') as f:
-                        f.seek(last_pos)
-                        new_content = f.read()
-
                     self._file_positions[session.id] = current_size
                     now = datetime.now()
                     self._last_activity[session.id] = now
@@ -292,6 +288,18 @@ class OutputMonitor:
             except Exception as e:
                 logger.error(f"Monitor error for session {session.id}: {e}")
                 await asyncio.sleep(5)  # Back off on error
+
+    @staticmethod
+    def _read_new_log_content(log_path: Path, last_pos: int) -> tuple[Optional[int], str]:
+        """Read newly appended log content off the event loop."""
+        if not log_path.exists():
+            return None, ""
+        current_size = log_path.stat().st_size
+        if current_size <= last_pos:
+            return current_size, ""
+        with open(log_path, 'r', errors='ignore') as f:
+            f.seek(last_pos)
+            return current_size, f.read()
 
     async def _analyze_content(self, session: Session, content: str):
         """Analyze new content for patterns."""

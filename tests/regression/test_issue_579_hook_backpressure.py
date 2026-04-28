@@ -5,7 +5,9 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -132,6 +134,57 @@ def test_hook_tool_use_logs_cached_session_name_without_live_title_sync():
     assert response.status_code == 200
     tool_logger.log.assert_awaited_once()
     assert tool_logger.log.await_args.kwargs["session_name"] == "cached-friendly-name"
+
+
+def test_hook_tool_use_offloads_git_lock_acquisition(monkeypatch, tmp_path):
+    """PreToolUse lock acquisition runs git/lock-file work off the event loop."""
+    session = Session(
+        id="sess579c",
+        name="claude-sess579c",
+        working_dir=str(tmp_path),
+        tmux_session="claude-sess579c",
+        status=SessionStatus.RUNNING,
+        provider="claude",
+        created_at=datetime.now(),
+        last_activity=datetime.now(),
+    )
+    manager = _session_manager_with_session(session)
+    app = create_app(session_manager=manager, output_monitor=_output_monitor(), config={})
+    app.state.tool_logger = MagicMock(log=AsyncMock(return_value=None))
+    client = TestClient(app)
+
+    calls: list[str] = []
+    original_to_thread = server_module.asyncio.to_thread
+
+    async def tracking_to_thread(func, *args, **kwargs):
+        calls.append(getattr(func, "__name__", repr(func)))
+        return await original_to_thread(func, *args, **kwargs)
+
+    class FakeLockManager:
+        def __init__(self, working_dir: str):
+            self.working_dir = working_dir
+
+        def try_acquire(self, repo_root: str, session_id: str):
+            return SimpleNamespace(locked_by_other=False, owner_session_id=None)
+
+    monkeypatch.setattr(server_module.asyncio, "to_thread", tracking_to_thread)
+    with patch("src.lock_manager.get_git_root", return_value=str(tmp_path)), \
+         patch("src.lock_manager.LockManager", FakeLockManager):
+        response = client.post(
+            "/hooks/tool-use",
+            json={
+                "session_manager_id": session.id,
+                "session_id": "native-579c",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Edit",
+                "tool_input": {"file_path": str(tmp_path / "file.py")},
+                "cwd": str(tmp_path),
+            },
+        )
+
+    assert response.status_code == 200
+    assert "acquire_lock_sync" in calls
+    assert str(tmp_path) in session.touched_repos
 
 
 def test_empty_hook_body_returns_400():

@@ -6129,27 +6129,36 @@ Provide ONLY the summary, no preamble or questions."""
                 else:
                     abs_path = str(Path(cwd) / file_path) if cwd else file_path
 
-                # Import lock manager functions
-                from .lock_manager import get_git_root, LockManager
+                def acquire_lock_sync() -> tuple[Optional[str], Optional[str]]:
+                    from .lock_manager import get_git_root, LockManager
 
-                # Find git repo root for this file
-                repo_root = get_git_root(abs_path)
+                    repo_root = get_git_root(abs_path)
+                    if not repo_root:
+                        return None, None
 
-                if repo_root:
-                    # Try to acquire lock
                     lock_mgr = LockManager(working_dir=repo_root)
                     lock_result = lock_mgr.try_acquire(repo_root, session_manager_id)
-
                     if lock_result.locked_by_other:
+                        return repo_root, lock_result.owner_session_id
+
+                    if session:
+                        session.touched_repos.add(repo_root)
+                        app.state.session_manager._save_state()
+                    return repo_root, None
+
+                repo_root, locked_owner_id = await asyncio.to_thread(acquire_lock_sync)
+
+                if repo_root:
+                    if locked_owner_id:
                         # Get the other session's friendly name
                         other_session = None
                         if app.state.session_manager:
-                            other_session = app.state.session_manager.get_session(lock_result.owner_session_id)
+                            other_session = app.state.session_manager.get_session(locked_owner_id)
 
                         other_name = (
                             _effective_session_name(other_session)
                             if other_session is not None
-                            else lock_result.owner_session_id
+                            else locked_owner_id
                         )
 
                         return {
@@ -6159,11 +6168,6 @@ Provide ONLY the summary, no preamble or questions."""
                                      f"  git worktree add ../my-feature feature-branch\n"
                                      f"  Then edit ../my-feature/{Path(abs_path).relative_to(repo_root)}"
                         }
-
-                    # Lock acquired - track this repo
-                    if session:
-                        session.touched_repos.add(repo_root)
-                        app.state.session_manager._save_state()
 
         # Track worktree creation (PreToolUse for Bash)
         if hook_type == "PreToolUse" and tool_name == "Bash" and session:
@@ -6179,7 +6183,7 @@ Provide ONLY the summary, no preamble or questions."""
                     # Resolve to absolute path
                     abs_worktree = str((Path(cwd) / worktree_path).resolve()) if cwd else worktree_path
                     session.worktrees.append(abs_worktree)
-                    app.state.session_manager._save_state()
+                    await asyncio.to_thread(app.state.session_manager._save_state)
                     logger.info(f"Tracked worktree creation: {abs_worktree}")
 
         # Log to database (fire and forget - don't block response)
@@ -6288,7 +6292,7 @@ Provide ONLY the summary, no preamble or questions."""
             session.agent_status_text = None
             session.agent_status_at = None
             session.agent_task_completed_at = None
-            app.state.session_manager._save_state()
+            await asyncio.to_thread(app.state.session_manager._save_state)
             if queue_mgr:
                 queue_mgr.cancel_context_monitor_messages_from(session_id)
             return {"status": "flags_reset"}
