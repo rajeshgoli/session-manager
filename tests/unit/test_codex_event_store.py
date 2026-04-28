@@ -143,11 +143,52 @@ def test_incremental_prune_deletes_only_one_small_batch(tmp_path):
         )
 
     conn = store._get_conn()
-    first_pruned = store._prune_incremental(conn)
+    first_pruned = store._prune_incremental(conn, ["sess-batch"])
     page = store.get_events(session_id="sess-batch", since_seq=0, limit=10)
 
     assert first_pruned == 1
     assert page["earliest_seq"] == 2
+
+
+def test_incremental_prune_skips_global_overflow_scan_without_pending_session(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        retention_max_events_per_session=3,
+        startup_maintenance=False,
+    )
+
+    for idx in range(5):
+        store.append_event(
+            session_id="sess-batch",
+            event_type="turn_delta",
+            turn_id="turn-1",
+            payload={"idx": idx},
+        )
+
+    conn = store._get_conn()
+    pruned = store._prune_incremental(conn, [])
+    page = store.get_events(session_id="sess-batch", since_seq=0, limit=10)
+
+    assert pruned == 0
+    assert page["earliest_seq"] == 1
+
+
+def test_append_tracks_overflow_sessions_for_bounded_maintenance(tmp_path):
+    store = CodexEventStore(
+        db_path=str(tmp_path / "codex_events.db"),
+        retention_max_events_per_session=3,
+        startup_maintenance=False,
+    )
+
+    for idx in range(4):
+        store.append_event(
+            session_id="sess-overflow",
+            event_type="turn_delta",
+            turn_id="turn-1",
+            payload={"idx": idx},
+        )
+
+    assert store._pop_pending_overflow_prune_sessions() == ["sess-overflow"]
 
 
 def test_append_schedules_maintenance_when_prune_index_not_ready(tmp_path):
