@@ -334,14 +334,16 @@ def main():
         help="Parent session ID, friendly name, or registry alias (defaults to current)",
     )
     children_parser.add_argument("--recursive", action="store_true", help="Include grandchildren")
-    children_parser.add_argument("--terminated", action="store_true", help="Include children terminated via sm kill")
+    children_parser.add_argument("--terminated", action="store_true", help="Include children retired via sm retire/sm kill")
     children_parser.add_argument("--status", choices=["running", "completed", "error", "all"], help="Filter by status")
     children_parser.add_argument("--json", action="store_true", help="Output JSON")
     children_parser.add_argument("--db-path", default=None, help="Override tool_usage.db path")
 
-    # sm kill <session-id>
-    kill_parser = subparsers.add_parser("kill", help="Terminate a child session")
-    kill_parser.add_argument("session_id", help="Session ID to terminate")
+    # sm retire <session-id> / sm kill <session-id>
+    kill_parser = subparsers.add_parser("kill", help="Retire a child session")
+    kill_parser.add_argument("session_id", help="Session ID to retire")
+    retire_parser = subparsers.add_parser("retire", help="Retire a child session")
+    retire_parser.add_argument("session_id", help="Session ID to retire")
 
     # sm restore <session-id-or-name>
     restore_parser = subparsers.add_parser(
@@ -722,10 +724,10 @@ def main():
         )
         sys.exit(1)
 
-    # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill, restore, new, attach, output, clear
+    # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill/retire, restore, new, attach, output, clear
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
-        "subagents", "children", "kill", "restore", "unkill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
+        "subagents", "children", "kill", "retire", "restore", "unkill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server",
         "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
     ]
@@ -958,7 +960,7 @@ def main():
                 getattr(args, "db_path", None),
             )
         )
-    elif args.command == "kill":
+    elif args.command in ("kill", "retire"):
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
     elif args.command in ("restore", "unkill"):
         sys.exit(commands.cmd_restore(client, args.session))
