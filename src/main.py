@@ -454,7 +454,7 @@ class SessionManagerApp:
 
             if session.telegram_thread_id and self.notifier:
                 display_name = self.session_manager.get_effective_session_name(session) or name
-                await self.notifier.rename_session_topic(session, display_name)
+                self._queue_telegram_topic_title_sync(session.id, display_name)
 
             return True
 
@@ -742,6 +742,78 @@ class SessionManagerApp:
                     display_name = self.session_manager.get_effective_session_name(session)
                     if display_name:
                         self.session_manager.tmux.set_status_bar(session.tmux_session, display_name)
+                        self._queue_telegram_topic_title_sync(session.id, display_name)
+
+    def _queue_telegram_topic_title_sync(self, session_id: str, display_name: str) -> None:
+        """Best-effort Telegram title convergence that never blocks startup/requests."""
+        if not self.notifier or not getattr(self.notifier, "telegram", None):
+            return
+        try:
+            asyncio.create_task(
+                self._sync_telegram_topic_title_with_retries(session_id, display_name)
+            )
+        except RuntimeError:
+            logger.debug("Skipping Telegram topic title sync for %s: no event loop", session_id)
+
+    async def _sync_telegram_topic_title_with_retries(
+        self,
+        session_id: str,
+        display_name: str,
+        *,
+        attempts: int = 5,
+    ) -> None:
+        delay_seconds = 2.0
+        for attempt in range(1, attempts + 1):
+            session = self.session_manager.get_session(session_id)
+            if (
+                not session
+                or session.status == SessionStatus.STOPPED
+                or not session.telegram_chat_id
+                or not session.telegram_thread_id
+            ):
+                return
+
+            try:
+                success = await asyncio.wait_for(
+                    self.notifier.rename_session_topic(session, display_name),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                success = False
+                logger.warning(
+                    "Timed out syncing Telegram topic title for session %s on attempt %s/%s",
+                    session_id,
+                    attempt,
+                    attempts,
+                )
+            except Exception as exc:
+                success = False
+                logger.warning(
+                    "Failed syncing Telegram topic title for session %s on attempt %s/%s: %s",
+                    session_id,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+
+            if success:
+                session.display_identity_synced_name = display_name
+                session.display_identity_synced_at_ns = time.time_ns()
+                session.display_identity_synced_chat_id = session.telegram_chat_id
+                session.display_identity_synced_thread_id = session.telegram_thread_id
+                self.session_manager._save_state()
+                return
+
+            if attempt < attempts:
+                await asyncio.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 2, 30.0)
+
+        logger.warning(
+            "Telegram topic title for session %s did not converge to %s after %s attempt(s)",
+            session_id,
+            display_name,
+            attempts,
+        )
 
     async def _handle_monitor_event(self, event: NotificationEvent):
         """Handle events from the output monitor."""
