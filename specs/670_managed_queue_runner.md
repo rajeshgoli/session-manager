@@ -1,8 +1,8 @@
-# sm#670: managed heavy-task queue
+# sm#670: managed local queue runner
 
 ## Scope
 
-Add a first-class Session Manager queue for local heavy commands so agents do not independently overload the operator's Mac with parallel test suites, benchmarks, and replay sweeps.
+Add a first-class Session Manager queue for local commands that can contend for shared machine resources, such as test suites, benchmarks, and replay sweeps.
 
 Primary UX:
 
@@ -13,9 +13,9 @@ sm queue run --type tests -- python -m pytest tests/unit -q
 Immediate response:
 
 ```text
-Accepted heavy job job_abc123 (tests).
+Accepted queue job job_abc123 (tests).
 State: running
-Log: /Users/rajesh/.local/share/claude-sessions/heavy-jobs/logs/job_abc123.log
+Log: /Users/rajesh/.local/share/claude-sessions/queue-runner/logs/job_abc123.log
 ```
 
 Terminal wake to the requester:
@@ -26,7 +26,7 @@ Terminal wake to the requester:
 
 ## Problem
 
-The host machine is a Mac laptop with 18 GB RAM and 12 cores. Multiple agents routinely run local heavy operations in parallel:
+The host machine is a Mac laptop with 18 GB RAM and 12 cores. Multiple agents routinely run local resource-intensive operations in parallel:
 
 1. full Python test suites
 2. performance benchmarks
@@ -39,7 +39,7 @@ That creates three concrete failures:
 2. Memory pressure builds and all agents lose time to swap and UI latency.
 3. Degenerate OOM can destabilize the whole machine and kill every in-flight session.
 
-Agents currently have no reliable view of other agents' local workload. Memory rules like "do not run more than one heavy replay" are advisory and fail under sprint fan-out. Session Manager already owns agent coordination, durable background wakeups, and operator-visible state, so it should own local heavy-work admission too.
+Agents currently have no reliable view of other agents' local workload. Memory rules like "do not run more than one replay" are advisory and fail under sprint fan-out. Session Manager already owns agent coordination, durable background wakeups, and operator-visible state, so it should own local queue admission too.
 
 ## Current Behavior
 
@@ -53,7 +53,7 @@ The new feature should reuse the durable request and notification patterns from 
 
 ## Goals
 
-1. Give agents one standard way to submit local heavy commands instead of running them directly.
+1. Give agents one standard way to submit local queued commands instead of running resource-intensive work directly.
 2. Queue or run submitted jobs based on declared workload type and host resource gates.
 3. Return immediately with a job id and log path so agents can continue or tail the log directly.
 4. Wake the requester when a delayed job starts and when any job completes.
@@ -174,18 +174,20 @@ V1 has two gates:
 Memory preflight reads macOS memory pressure/free memory before starting a job. Default policy:
 
 ```yaml
-heavy_task_queue:
+queue_runner:
   memory:
     min_free_bytes: 2147483648
     retry_interval_seconds: 10
 ```
+
+The 2 GB default is a conservative first-pass guardrail, not a measured optimum: it is roughly 11% of the host's 18 GB RAM and leaves room for macOS, active agents, browser/Telegram clients, and filesystem cache before admitting another queued command. The value is configurable and should be tuned after the observability samples below show real workload profiles.
 
 If the gate fails, the job remains pending with holding reason `memory_pressure`. SM does not fail the job just because memory is low; it waits until memory recovers or the job is cancelled.
 
 Perf cooldown protects measurement quality:
 
 ```yaml
-heavy_task_queue:
+queue_runner:
   perf_cooldown_seconds: 30
 ```
 
@@ -200,7 +202,7 @@ SM starts jobs itself after admission, rather than asking the agent to start a p
 Implementation shape:
 
 1. Persist a job record at submission time.
-2. Allocate a job directory under `~/.local/share/claude-sessions/heavy-jobs/<job-id>/`.
+2. Allocate a job directory under `~/.local/share/claude-sessions/queue-runner/<job-id>/`.
 3. Write command metadata and any submitted script file into that directory.
 4. At run start, launch a wrapper process detached from the SM request handler.
 5. Redirect stdout and stderr to `logs/<job-id>.log`.
@@ -271,13 +273,13 @@ Completion notification includes:
 Add REST endpoints:
 
 ```text
-POST   /heavy-jobs
-GET    /heavy-jobs
-GET    /heavy-jobs/{job_id}
-DELETE /heavy-jobs/{job_id}
+POST   /queue-jobs
+GET    /queue-jobs
+GET    /queue-jobs/{job_id}
+DELETE /queue-jobs/{job_id}
 ```
 
-`POST /heavy-jobs` accepts:
+`POST /queue-jobs` accepts:
 
 ```json
 {
@@ -343,13 +345,13 @@ Startup recovery must not block API readiness on long filesystem scans. Bound re
 Logs live under:
 
 ```text
-~/.local/share/claude-sessions/heavy-jobs/logs/<job-id>.log
+~/.local/share/claude-sessions/queue-runner/logs/<job-id>.log
 ```
 
 The CLI returns this path immediately. Agents that want live output should tail it directly:
 
 ```bash
-tail -f ~/.local/share/claude-sessions/heavy-jobs/logs/job_abc123.log
+tail -f ~/.local/share/claude-sessions/queue-runner/logs/job_abc123.log
 ```
 
 No `sm queue log` command is required for v1. Direct file access is simpler for local agents and avoids adding a streaming API before there is evidence it is needed.
@@ -368,9 +370,9 @@ Retention runs in a background maintenance task and must not run synchronously o
 Add:
 
 ```yaml
-heavy_task_queue:
+queue_runner:
   enabled: true
-  state_dir: "~/.local/share/claude-sessions/heavy-jobs"
+  state_dir: "~/.local/share/claude-sessions/queue-runner"
   max_running_jobs: 2
   perf_cooldown_seconds: 30
   cancel_grace_seconds: 10
@@ -401,6 +403,31 @@ ID  Type  State  Notify  Label  Queued  Started  Runtime  Holding  Log
 
 `sm watch` integration is optional for v1 implementation, but the data model should make it easy to add a compact queue summary later.
 
+## Resource Observability
+
+While at least one queue job is pending or running, SM should sample host load periodically for later analysis. This is not used for scheduling decisions in v1 except for the memory preflight gate; it is for post hoc reconstruction of contention.
+
+Default sampling:
+
+```yaml
+queue_runner:
+  resource_sampling:
+    enabled: true
+    interval_seconds: 15
+```
+
+Each sample records:
+
+1. timestamp
+2. pending job count by type
+3. running job count by type
+4. total running queue jobs
+5. memory free / active / wired / compressed from macOS-native counters
+6. CPU load average and process CPU percentage for queue job process groups when available
+7. GPU load when a non-blocking macOS source is available; otherwise `null`
+
+Sampling must run in a background task and must not block job admission, `/health`, or list/status APIs. Missing CPU/GPU fields are acceptable; the important v1 guarantee is a durable time series that correlates queue occupancy with memory and CPU pressure.
+
 ## Security and Safety
 
 1. This feature executes arbitrary local commands from already-authorized local agents. It does not introduce remote command execution.
@@ -419,6 +446,7 @@ ID  Type  State  Notify  Label  Queued  Started  Runtime  Holding  Log
 6. Running jobs survive SM restart when their OS process survives.
 7. Restart recovery completes without delaying `/health` readiness on large historical logs.
 8. Tests cover CLI parsing for argv and stdin script modes, scheduler admission, cancellation, timeout, restart recovery, and completion notifications.
+9. Tests cover that resource sampling starts when the queue becomes non-empty, stops when it drains, and tolerates unavailable optional metrics.
 
 ## Deferred
 
@@ -426,7 +454,7 @@ ID  Type  State  Notify  Label  Queued  Started  Runtime  Holding  Log
 2. `sm queue log` streaming convenience command.
 3. `sm wait-task` or any blocking wait command.
 4. Automatic retry/resubmit for displaced or failed jobs.
-5. CPU load average gates.
+5. CPU/GPU load gates.
 6. `sm watch` full queue panel.
 7. Persona or memory-rule edits that tell all agents to use the queue by default.
 
