@@ -83,6 +83,148 @@ async def test_deliver_direct_uses_control_socket_primary_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_provider_native_rename_uses_control_socket_primary_path(tmp_path):
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="cfctl-rename-") as short_dir:
+        short_root = Path(short_dir)
+        manager = SessionManager(log_dir=str(short_root), state_file=str(short_root / "state.json"))
+        session = Session(
+            id="cfctl_rename1",
+            name="codex-fork-cfctl_rename1",
+            working_dir=str(short_root),
+            provider="codex-fork",
+            tmux_session="codex-fork-cfctl_rename1",
+            status=SessionStatus.RUNNING,
+        )
+        manager.sessions[session.id] = session
+        manager.tmux.rename_codex_thread_async = AsyncMock(return_value=True)
+
+        socket_path = manager._codex_fork_control_socket_path(session)
+        if socket_path.exists():
+            socket_path.unlink()
+
+        seen_commands: list[str] = []
+
+        async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            raw = await reader.readline()
+            request = json.loads(raw.decode("utf-8"))
+            seen_commands.append(request["command"])
+            if request["command"] == "get_epoch":
+                response = {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "epoch": "epoch-rename",
+                    "result": {"epoch": "epoch-rename"},
+                }
+            else:
+                assert request["command"] == "set_thread_name"
+                assert request["expected_epoch"] == "epoch-rename"
+                assert request["name"] == "worker-rename"
+                response = {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "epoch": "epoch-rename",
+                    "result": {"status": "accepted"},
+                }
+            writer.write((json.dumps(response) + "\n").encode("utf-8"))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
+        try:
+            success = await manager._deliver_provider_native_rename(session, "worker-rename")
+            assert success is True
+            assert seen_commands == ["get_epoch", "set_thread_name"]
+            manager.tmux.rename_codex_thread_async.assert_not_called()
+            assert session.error_message is None
+        finally:
+            server.close()
+            await server.wait_closed()
+            if socket_path.exists():
+                socket_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_provider_native_rename_falls_back_to_tmux_when_control_rejects_command(tmp_path):
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="cfctl-rename-old-") as short_dir:
+        short_root = Path(short_dir)
+        manager = SessionManager(log_dir=str(short_root), state_file=str(short_root / "state.json"))
+        session = Session(
+            id="cfctl_rename2",
+            name="codex-fork-cfctl_rename2",
+            working_dir=str(short_root),
+            provider="codex-fork",
+            tmux_session="codex-fork-cfctl_rename2",
+            status=SessionStatus.RUNNING,
+        )
+        manager.sessions[session.id] = session
+        manager.tmux.rename_codex_thread_async = AsyncMock(return_value=True)
+
+        socket_path = manager._codex_fork_control_socket_path(session)
+        if socket_path.exists():
+            socket_path.unlink()
+
+        async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            raw = await reader.readline()
+            request = json.loads(raw.decode("utf-8"))
+            if request["command"] == "get_epoch":
+                response = {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "epoch": "epoch-old",
+                    "result": {"epoch": "epoch-old"},
+                }
+            else:
+                response = {
+                    "request_id": request["request_id"],
+                    "ok": False,
+                    "epoch": "epoch-old",
+                    "error": {"code": "invalid_request", "message": "unknown command"},
+                }
+            writer.write((json.dumps(response) + "\n").encode("utf-8"))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_unix_server(handle_client, path=str(socket_path))
+        try:
+            success = await manager._deliver_provider_native_rename(session, "worker-fallback")
+            assert success is True
+            manager.tmux.rename_codex_thread_async.assert_awaited_once_with(
+                session.tmux_session,
+                "worker-fallback",
+            )
+        finally:
+            server.close()
+            await server.wait_closed()
+            if socket_path.exists():
+                socket_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_provider_native_rename_returns_failure_when_fallback_disabled(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    manager.codex_fork_control_tmux_fallback_enabled = False
+    session = Session(
+        id="cfctl_rename3",
+        name="codex-fork-cfctl_rename3",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        tmux_session="codex-fork-cfctl_rename3",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    manager.tmux.rename_codex_thread_async = AsyncMock(return_value=True)
+
+    success = await manager._deliver_provider_native_rename(session, "worker-no-fallback")
+
+    assert success is False
+    manager.tmux.rename_codex_thread_async.assert_not_called()
+    assert session.error_message is not None
+    assert session.error_message.startswith("codex_fork_control_degraded:")
+
+
+@pytest.mark.asyncio
 async def test_deliver_direct_falls_back_to_tmux_when_control_unavailable(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
     session = Session(

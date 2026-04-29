@@ -3446,7 +3446,7 @@ class SessionManager:
 
         rename_command = f"/rename {friendly_name}"
         if not self.message_queue_manager:
-            return await self._deliver_direct(session, rename_command)
+            return await self._deliver_provider_native_rename(session, friendly_name)
 
         self.message_queue_manager.cancel_queued_messages_for_target(
             session.id,
@@ -3467,6 +3467,61 @@ class SessionManager:
     ) -> bool:
         """Backward-compatible wrapper for provider-native `/rename` queueing."""
         return await self.queue_provider_native_rename(session_or_id, friendly_name)
+
+    def extract_provider_native_rename_name(self, text: str) -> Optional[str]:
+        """Extract the safe target name from a queued provider-native rename command."""
+        match = re.fullmatch(r"/rename\s+([a-zA-Z0-9_-]{1,32})", (text or "").strip())
+        if not match:
+            return None
+        friendly_name = match.group(1)
+        if not self._is_safe_provider_native_rename_name(friendly_name):
+            return None
+        return friendly_name
+
+    async def _deliver_provider_native_rename(self, session: Session, friendly_name: str) -> bool:
+        """Deliver a provider-native rename using the provider's real TUI contract."""
+        if not self._is_safe_provider_native_rename_name(friendly_name):
+            return False
+        if session.provider == "codex-fork":
+            success, reason = await self._rename_codex_fork_thread_via_control(session, friendly_name)
+            if success:
+                self._clear_codex_fork_control_degraded(session)
+                return True
+            if not self.codex_fork_control_tmux_fallback_enabled:
+                logger.warning(
+                    "Codex-fork control rename failed for %s and tmux fallback is disabled: %s",
+                    session.id,
+                    reason,
+                )
+                self._set_codex_fork_control_degraded(session, reason)
+                return False
+            logger.warning(
+                "Codex-fork control rename failed for %s, falling back to tmux dialog: %s",
+                session.id,
+                reason,
+            )
+            return await self.tmux.rename_codex_thread_async(session.tmux_session, friendly_name)
+        if session.provider == "codex":
+            return await self.tmux.rename_codex_thread_async(session.tmux_session, friendly_name)
+        if session.provider == "claude":
+            return await self._deliver_direct(session, f"/rename {friendly_name}")
+        return False
+
+    async def _rename_codex_fork_thread_via_control(
+        self,
+        session: Session,
+        friendly_name: str,
+    ) -> tuple[bool, str]:
+        """Rename a codex-fork thread through its control socket without touching the TUI prompt."""
+        if session.provider != "codex-fork":
+            return False, "session is not codex-fork"
+        if not self._is_safe_provider_native_rename_name(friendly_name):
+            return False, "unsafe thread name"
+        return await self._send_codex_fork_control_command(
+            session=session,
+            command="set_thread_name",
+            payload={"name": friendly_name},
+        )
 
     @staticmethod
     def _is_safe_provider_native_rename_name(friendly_name: str) -> bool:

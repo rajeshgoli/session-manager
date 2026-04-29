@@ -1981,6 +1981,8 @@ class TestDirectDelivery244:
         session.last_activity = datetime.now()
         mock_session_manager.get_session = MagicMock(return_value=session)
         mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+        mock_session_manager.extract_provider_native_rename_name = MagicMock(return_value="fresh-name")
+        mock_session_manager._deliver_provider_native_rename = AsyncMock(return_value=True)
 
         self._insert_pending_message_with_category(
             mq,
@@ -1994,7 +1996,9 @@ class TestDirectDelivery244:
 
         await mq._try_deliver_messages("target244renamea")
 
-        mock_session_manager._deliver_direct.assert_awaited_once_with(session, "/rename fresh-name")
+        mock_session_manager.extract_provider_native_rename_name.assert_called_once_with("/rename fresh-name")
+        mock_session_manager._deliver_provider_native_rename.assert_awaited_once_with(session, "fresh-name")
+        mock_session_manager._deliver_direct.assert_not_awaited()
         remaining = mq.get_pending_messages("target244renamea")
         assert [msg.id for msg in remaining] == ["after244a"]
 
@@ -2011,6 +2015,8 @@ class TestDirectDelivery244:
         session.last_activity = datetime.now()
         mock_session_manager.get_session = MagicMock(return_value=session)
         mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+        mock_session_manager.extract_provider_native_rename_name = MagicMock(return_value="fresh-name")
+        mock_session_manager._deliver_provider_native_rename = AsyncMock(return_value=True)
 
         self._insert_pending_message(mq, "target244renameb", msg_id="before244b")
         self._insert_pending_message_with_category(

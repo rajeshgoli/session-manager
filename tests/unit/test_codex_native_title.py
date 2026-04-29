@@ -324,6 +324,35 @@ async def test_queue_provider_native_rename_queues_codex_fork_rename(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_queue_provider_native_rename_direct_plain_codex_uses_interactive_tmux(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="cx660",
+        name="codex-cx660",
+        working_dir="/tmp",
+        tmux_session="codex-cx660",
+        provider="codex",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.message_queue_manager = None
+    manager.tmux.rename_codex_thread_async = AsyncMock(return_value=True)
+
+    queued = await manager.queue_provider_native_rename(session, "codex-reviewer")
+
+    assert queued is True
+    manager.tmux.rename_codex_thread_async.assert_awaited_once_with(session.tmux_session, "codex-reviewer")
+
+
+def test_extract_provider_native_rename_name_rejects_unsafe(tmp_path):
+    manager = _manager(tmp_path)
+
+    assert manager.extract_provider_native_rename_name("/rename safe-name_1") == "safe-name_1"
+    assert manager.extract_provider_native_rename_name("/rename bad name") is None
+    assert manager.extract_provider_native_rename_name("hello") is None
+
+
+@pytest.mark.asyncio
 async def test_create_session_common_queues_codex_native_rename_for_spawn_name(tmp_path):
     manager = _manager(tmp_path)
     manager.tmux = MagicMock()

@@ -2441,7 +2441,14 @@ class MessageQueueManager:
 
             # Inject the message (use async version to avoid blocking event loop)
             logger.info(f"Delivering {len(batch)} message(s) to {session_id}")
-            success = await self.session_manager._deliver_direct(session, payload)
+            if len(batch) == 1 and batch[0].message_category == "native_rename":
+                friendly_name = self.session_manager.extract_provider_native_rename_name(payload)
+                success = bool(
+                    friendly_name
+                    and await self.session_manager._deliver_provider_native_rename(session, friendly_name)
+                )
+            else:
+                success = await self.session_manager._deliver_direct(session, payload)
 
             if success:
                 # Mark session as active
