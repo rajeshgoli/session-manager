@@ -47,6 +47,24 @@ def test_codex_rename_prompt_detection():
     assert not controller._looks_like_codex_rename_prompt("› /rename worker")
 
 
+def test_codex_rename_prompt_detection_uses_active_region_only():
+    controller = TmuxController()
+    pane_text = """Name thread
+old-name
+Press enter to confirm or esc to go back
+
+› normal prompt text
+
+  gpt-5.5 xhigh · ~/repo
+"""
+
+    active_region = controller._extract_active_codex_region(pane_text)
+
+    assert active_region is not None
+    assert "normal prompt text" in active_region
+    assert not controller._looks_like_codex_rename_prompt(active_region)
+
+
 @pytest.mark.asyncio
 async def test_rename_codex_thread_uses_interactive_dialog(monkeypatch):
     controller = TmuxController()

@@ -398,9 +398,8 @@ class TmuxController:
         prompt_indexes = [index for index, line in enumerate(lines) if line.lstrip().startswith("›")]
         if prompt_indexes:
             prompt_index = prompt_indexes[-1]
-            start = max(0, prompt_index - 8)
             end = min(len(lines), prompt_index + 4)
-            region = "\n".join(lines[start:end]).strip()
+            region = "\n".join(lines[prompt_index:end]).strip()
             return region or None
 
         region = "\n".join(lines[-16:]).strip()
@@ -980,7 +979,8 @@ class TmuxController:
             deadline = asyncio.get_running_loop().time() + 5.0
             while asyncio.get_running_loop().time() < deadline:
                 pane_text = await self._capture_pane_async(session_name)
-                if self._looks_like_codex_rename_prompt(pane_text):
+                active_region = self._extract_active_codex_region(pane_text)
+                if self._looks_like_codex_rename_prompt(active_region):
                     prompt_seen = True
                     break
                 await asyncio.sleep(0.2)
