@@ -19,6 +19,7 @@ ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 # (title + column header + flash + footer)
 _RESERVED_SCREEN_ROWS = 4
+_RETIRE_CONFIRM_SECONDS = 5.0
 
 # name, min_width, weight, align
 _COLUMN_SPECS = [
@@ -77,6 +78,31 @@ class DetailSnapshot:
     fetched_at: float
     loading: bool = False
     last_error: Optional[str] = None
+
+
+@dataclass
+class RetireConfirmation:
+    """Armed retire confirmation for one selected session."""
+
+    session_id: str
+    expires_at: float
+
+
+def _retire_confirmation_matches(
+    confirmation: Optional[RetireConfirmation],
+    selected_session_id: Optional[str],
+    now: float,
+) -> bool:
+    return bool(
+        confirmation
+        and selected_session_id
+        and confirmation.session_id == selected_session_id
+        and now <= confirmation.expires_at
+    )
+
+
+def _arm_retire_confirmation(session_id: str, now: float) -> RetireConfirmation:
+    return RetireConfirmation(session_id=session_id, expires_at=now + _RETIRE_CONFIRM_SECONDS)
 
 
 class DetailFetchWorker:
@@ -1080,7 +1106,7 @@ def _render(
             _flash_attr(flash_message, palette),
         )
 
-    footer = "j/k: move  +: create  Enter: attach  s: send  K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
+    footer = "j/k: move  +: create  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
     stdscr.refresh()
 
@@ -1121,6 +1147,7 @@ def run_watch_tui(
             spinner_index = 0
             scroll_offset = 0
             next_refresh = 0.0
+            retire_confirmation: Optional[RetireConfirmation] = None
 
             while True:
                 now = time.monotonic()
@@ -1164,6 +1191,8 @@ def run_watch_tui(
 
                 if flash_message and now >= flash_until:
                     flash_message = None
+                if retire_confirmation and now > retire_confirmation.expires_at:
+                    retire_confirmation = None
 
                 max_rows = max(0, stdscr.getmaxyx()[0] - _RESERVED_SCREEN_ROWS)
                 selected_row_idx = None
@@ -1201,6 +1230,9 @@ def run_watch_tui(
 
                 if key in (ord("q"), 27):
                     break
+
+                if key != ord("K"):
+                    retire_confirmation = None
 
                 if key in (ord("j"), curses.KEY_DOWN):
                     if selectable:
@@ -1323,14 +1355,17 @@ def run_watch_tui(
 
                 if key in (ord("K"),):
                     if not selected_session_id:
+                        retire_confirmation = None
                         flash_message = "No session selected"
                         flash_until = time.monotonic() + 2.0
                         continue
-                    confirm = _prompt_input(stdscr, f"Retire {selected_session_id}? type yes: ")
-                    if confirm.lower() != "yes":
-                        flash_message = "Retire canceled"
-                        flash_until = time.monotonic() + 2.0
+                    now = time.monotonic()
+                    if not _retire_confirmation_matches(retire_confirmation, selected_session_id, now):
+                        retire_confirmation = _arm_retire_confirmation(selected_session_id, now)
+                        flash_message = f"Press K again to retire {selected_session_id}"
+                        flash_until = retire_confirmation.expires_at
                         continue
+                    retire_confirmation = None
                     result = client.kill_session(None, selected_session_id)
                     if result and result.get("status") == "killed":
                         flash_message = f"Retired {selected_session_id}"

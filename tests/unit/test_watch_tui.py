@@ -7,17 +7,28 @@ import time
 from src.cli.watch_tui import (
     DetailFetchWorker,
     DetailSnapshot,
+    _arm_retire_confirmation,
     _create_watch_session,
     _compute_column_widths,
     _default_create_working_dir,
     _normalize_create_working_dir,
     _render_columns,
+    _retire_confirmation_matches,
     _resolve_create_provider,
     _session_line,
     build_watch_rows,
     can_attach_session,
     filter_sessions,
 )
+
+
+def test_retire_confirmation_requires_same_session_before_expiry():
+    confirmation = _arm_retire_confirmation("agent-a", 10.0)
+
+    assert _retire_confirmation_matches(confirmation, "agent-a", 12.0)
+    assert not _retire_confirmation_matches(confirmation, "agent-b", 12.0)
+    assert not _retire_confirmation_matches(confirmation, "agent-a", 16.0)
+    assert not _retire_confirmation_matches(None, "agent-a", 12.0)
 
 
 def _session(
