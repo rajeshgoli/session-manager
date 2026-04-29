@@ -569,8 +569,8 @@ class QueueRunner:
     def _memory_gate_passes(self) -> bool:
         if self.min_free_bytes <= 0:
             return True
-        free = self._read_free_memory_bytes()
-        return free is None or free >= self.min_free_bytes
+        available = self._read_free_memory_bytes()
+        return available is None or available >= self.min_free_bytes
 
     def _read_free_memory_bytes(self) -> Optional[int]:
         try:
@@ -578,17 +578,20 @@ class QueueRunner:
         except Exception:
             return None
         page_size = 4096
-        free_pages = 0
+        available_pages = 0
         for line in output.splitlines():
             if "page size of" in line:
                 parts = [part for part in line.split() if part.isdigit()]
                 if parts:
                     page_size = int(parts[0])
-            if line.startswith(("Pages free:", "Pages speculative:")):
+            # macOS keeps reclaimable memory in the inactive queue. Literal
+            # free pages can be very low even when memory_pressure reports the
+            # machine is healthy, so the queue gate should use available pages.
+            if line.startswith(("Pages free:", "Pages speculative:", "Pages inactive:")):
                 digits = "".join(ch for ch in line if ch.isdigit())
                 if digits:
-                    free_pages += int(digits)
-        return free_pages * page_size if free_pages else None
+                    available_pages += int(digits)
+        return available_pages * page_size if available_pages else None
 
     async def _start_job_locked(self, job: QueueJob) -> None:
         assert job.wrapper_path and job.log_path
