@@ -1505,6 +1505,94 @@ class SessionManagerClient:
         detail = data.get("detail") if isinstance(data, dict) else None
         return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
 
+    def create_queue_job(
+        self,
+        *,
+        job_type: str,
+        label: Optional[str],
+        argv: Optional[list[str]],
+        script: Optional[str],
+        cwd: str,
+        env: dict[str, str],
+        notify_target: Optional[str],
+        requester_session_id: Optional[str],
+        timeout_seconds: Optional[int],
+    ) -> dict:
+        """Create one managed local queue job."""
+        payload = {
+            "type": job_type,
+            "label": label,
+            "argv": argv,
+            "script": script,
+            "cwd": cwd,
+            "env": env,
+            "notify_target": notify_target,
+            "requester_session_id": requester_session_id,
+            "timeout_seconds": timeout_seconds,
+        }
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            "/queue-jobs",
+            payload,
+            timeout=MUTATION_API_TIMEOUT,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def list_queue_jobs(
+        self,
+        *,
+        notify_target: Optional[str] = None,
+        job_type: Optional[str] = None,
+        state: Optional[str] = None,
+        include_terminal: bool = False,
+    ) -> dict:
+        """List managed local queue jobs."""
+        params = []
+        if notify_target:
+            params.append(f"notify_target={urllib.parse.quote(notify_target)}")
+        if job_type:
+            params.append(f"type={urllib.parse.quote(job_type)}")
+        if state:
+            params.append(f"state={urllib.parse.quote(state)}")
+        if include_terminal:
+            params.append("include_terminal=true")
+        suffix = f"?{'&'.join(params)}" if params else ""
+        data, status_code, unavailable = self._request_with_status("GET", f"/queue-jobs{suffix}")
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def get_queue_job(self, job_id: str) -> dict:
+        """Fetch one managed local queue job."""
+        data, status_code, unavailable = self._request_with_status(
+            "GET",
+            f"/queue-jobs/{urllib.parse.quote(job_id)}",
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def cancel_queue_job(self, job_id: str) -> dict:
+        """Cancel one managed local queue job."""
+        data, status_code, unavailable = self._request_with_status(
+            "DELETE",
+            f"/queue-jobs/{urllib.parse.quote(job_id)}",
+            timeout=MUTATION_API_TIMEOUT,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
     def set_agent_status(self, session_id: str, text: str) -> tuple[bool, bool]:
         """Set agent self-reported status text and reset remind timer (#188)."""
         data, success, unavailable = self._request(

@@ -322,6 +322,30 @@ sm_send:
   # Delay after Escape in urgent mode (milliseconds)
   urgent_delay_ms: 500
 
+# Managed local queue runner for resource-contended commands
+queue_runner:
+  enabled: true
+  state_dir: "~/.local/share/claude-sessions/queue-runner"
+  max_running_jobs: 2
+  perf_cooldown_seconds: 30
+  cancel_grace_seconds: 10
+  memory:
+    min_free_bytes: 2147483648
+    retry_interval_seconds: 10
+  resource_sampling:
+    enabled: true
+    interval_seconds: 15
+  types:
+    tests:
+      max_concurrent: 2
+      default_timeout_seconds: 900
+    perf:
+      max_concurrent: 1
+      default_timeout_seconds: 2700
+    background:
+      max_concurrent: 2
+      default_timeout_seconds: 3600
+
 # Session defaults
 sessions:
   default_working_dir_behavior: "inherit"  # inherit | specify

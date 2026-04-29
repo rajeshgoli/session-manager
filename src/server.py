@@ -720,6 +720,43 @@ class JobWatchResponse(BaseModel):
     is_active: bool = True
 
 
+class QueueJobCreateRequest(BaseModel):
+    """Request to submit one managed local queue job."""
+    type: str = "tests"
+    label: Optional[str] = None
+    argv: Optional[list[str]] = None
+    script: Optional[str] = None
+    cwd: str
+    env: dict[str, str] = Field(default_factory=dict)
+    notify_target: Optional[str] = None
+    requester_session_id: Optional[str] = None
+    timeout_seconds: Optional[int] = Field(default=None, gt=0)
+
+
+class QueueJobResponse(BaseModel):
+    """Response payload for one managed local queue job."""
+    id: str
+    type: str
+    label: str
+    requester_session_id: Optional[str] = None
+    requester_name: Optional[str] = None
+    notify_session_id: str
+    notify_name: Optional[str] = None
+    cwd: str
+    argv: Optional[list[str]] = None
+    script_path: Optional[str] = None
+    timeout_seconds: int
+    state: str
+    holding_reason: Optional[str] = None
+    queued_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    pid: Optional[int] = None
+    process_group_id: Optional[int] = None
+    exit_code: Optional[int] = None
+    log_path: Optional[str] = None
+
+
 class CodexReviewRequestCreateRequest(BaseModel):
     """Request to create a durable Codex PR review request."""
     pr_number: int = Field(gt=0)
@@ -1859,6 +1896,36 @@ def create_app(
             last_progress_text=registration.last_progress_text,
             last_event=registration.last_event,
             is_active=registration.is_active,
+        )
+
+    def _queue_job_to_response(job) -> QueueJobResponse:
+        requester = (
+            app.state.session_manager.get_session(job.requester_session_id)
+            if job.requester_session_id
+            else None
+        )
+        notify = app.state.session_manager.get_session(job.notify_session_id)
+        return QueueJobResponse(
+            id=job.id,
+            type=job.type,
+            label=job.label,
+            requester_session_id=job.requester_session_id,
+            requester_name=_effective_session_name(requester) if requester else None,
+            notify_session_id=job.notify_session_id,
+            notify_name=_effective_session_name(notify) if notify else job.notify_session_id,
+            cwd=job.cwd,
+            argv=job.argv,
+            script_path=job.script_path,
+            timeout_seconds=job.timeout_seconds,
+            state=job.state,
+            holding_reason=job.holding_reason,
+            queued_at=job.queued_at.isoformat(),
+            started_at=job.started_at.isoformat() if job.started_at else None,
+            finished_at=job.finished_at.isoformat() if job.finished_at else None,
+            pid=job.pid,
+            process_group_id=job.process_group_id,
+            exit_code=job.exit_code,
+            log_path=job.log_path,
         )
 
     def _codex_review_request_to_response(registration) -> CodexReviewRequestResponse:
@@ -6012,6 +6079,100 @@ Provide ONLY the summary, no preamble or questions."""
         if registration is None:
             raise HTTPException(status_code=404, detail="Job watch not found")
         return _job_watch_to_response(registration)
+
+    @app.post("/queue-jobs", response_model=QueueJobResponse)
+    async def create_queue_job(request: QueueJobCreateRequest):
+        """Submit one managed local queue job (#672)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        notify_identifier = request.notify_target or request.requester_session_id
+        if not notify_identifier:
+            raise HTTPException(status_code=400, detail="notify_target or requester_session_id is required")
+        notify_session = _resolve_session_or_registry_role(notify_identifier)
+        if not notify_session:
+            raise HTTPException(status_code=404, detail="Notify target not found")
+
+        try:
+            job = await queue_runner.create_job(
+                job_type=request.type,
+                label=request.label,
+                argv=request.argv,
+                script=request.script,
+                cwd=request.cwd,
+                env=request.env,
+                notify_session_id=notify_session.id,
+                requester_session_id=request.requester_session_id,
+                timeout=request.timeout_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return _queue_job_to_response(job)
+
+    @app.get("/queue-jobs")
+    async def list_queue_jobs(
+        notify_target: Optional[str] = Query(None),
+        type: Optional[str] = Query(None),
+        state: Optional[str] = Query(None),
+        include_terminal: bool = Query(False),
+    ):
+        """List managed local queue jobs (#672)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        notify_session_id = None
+        if notify_target:
+            notify_session = _resolve_session_or_registry_role(notify_target)
+            if not notify_session:
+                raise HTTPException(status_code=404, detail="Notify target not found")
+            notify_session_id = notify_session.id
+
+        jobs = queue_runner.list_jobs(
+            notify_session_id=notify_session_id,
+            job_type=type,
+            state=state,
+            include_terminal=include_terminal,
+        )
+        return {"jobs": [_response_dict(_queue_job_to_response(job)) for job in jobs]}
+
+    @app.get("/queue-jobs/{job_id}", response_model=QueueJobResponse)
+    async def get_queue_job(job_id: str):
+        """Fetch one managed local queue job (#672)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        job = queue_runner.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Queue job not found")
+        return _queue_job_to_response(job)
+
+    @app.delete("/queue-jobs/{job_id}", response_model=QueueJobResponse)
+    async def cancel_queue_job(job_id: str):
+        """Cancel one managed local queue job (#672)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        job = await queue_runner.cancel_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Queue job not found")
+        return _queue_job_to_response(job)
 
     @app.post("/codex-review-requests", response_model=CodexReviewRequestResponse)
     async def create_codex_review_request(request: CodexReviewRequestCreateRequest):
