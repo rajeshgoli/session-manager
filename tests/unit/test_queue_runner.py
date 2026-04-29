@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from src.cli.commands import cmd_queue_run
 from src.models import Session, SessionStatus
 from src.queue_runner import QueueJob, QueueRunner
+import src.queue_runner as queue_runner_module
 from src.server import create_app
 from src.session_manager import SessionManager
 
@@ -62,6 +63,20 @@ def mock_sm(tmp_path):
     sm.lookup_agent_registration.return_value = None
     sm.message_queue_manager = MagicMock()
     return sm
+
+
+def test_memory_reader_counts_inactive_pages_as_available(mock_sm, tmp_path, monkeypatch):
+    runner = _runner(mock_sm, tmp_path, extra_config={"memory": {"min_free_bytes": 2 * 1024 * 1024 * 1024}})
+    vm_stat = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                3773.
+Pages active:                            329631.
+Pages inactive:                          329351.
+Pages speculative:                          836.
+"""
+    monkeypatch.setattr(queue_runner_module.subprocess, "check_output", lambda *args, **kwargs: vm_stat)
+
+    assert runner._read_free_memory_bytes() > 2 * 1024 * 1024 * 1024
+    assert runner._memory_gate_passes() is True
 
 
 @pytest.mark.asyncio
