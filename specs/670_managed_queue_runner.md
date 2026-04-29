@@ -67,6 +67,7 @@ The new feature should reuse the durable request and notification patterns from 
 3. Do not infer task type from arbitrary command text.
 4. Do not mutate task environment for determinism. If an agent wants `PYTHONHASHSEED=0`, it should pass it explicitly.
 5. Do not make synchronous waiting the primary workflow. Agents should rely on the completion wakeup or tail the returned log path.
+6. Do not manage parallelism inside the submitted command. Queue admission bounds across-job contention only; intra-job contention such as multiple `@pytest.mark.perf` tests inside one `pytest -n 4` invocation remains the test author's responsibility, typically through project-level serial markers or test runner configuration.
 
 ## CLI
 
@@ -122,13 +123,15 @@ Submission exits with code `0` when SM accepts the job, even if the command late
 
 V1 ships three built-in workload types. Their defaults are configurable in `config.yaml`, but the type names are stable CLI/API values.
 
-| Type | Max concurrent | Can displace | Can be displaced | Default timeout | Purpose |
+| Type | Max concurrent | Can displace | Can be displaced | Default timeout | Choose this when |
 | --- | ---: | --- | --- | --- | --- |
-| `tests` | 2 | no | no | 15m | Standard test suites where limited parallelism is useful. |
-| `perf` | 1 | `background` only | no | 45m | Benchmarks/replays where clean timing matters. |
-| `background` | 2 | no | yes | 60m | Low-priority safe-to-retry work such as corpus prep or fixture generation. |
+| `tests` | 2 | no | no | 15m | Output is content-deterministic and multiple instances can run safely. |
+| `perf` | 1 | `background` only | no | 45m | Output is wall-time-derived, such as benchmarks or latency measurements, and needs a quiet measurement window. |
+| `background` | 2 | no | yes | 60m | Work is long-running, content-producing, and safe to cancel/retry, such as corpus prep or fixture generation. |
 
 Unknown types are rejected in v1. If operators need more classes later, add config-defined custom types as a follow-up after the core queue is stable.
+
+The choice criterion is the output contract, not how long the command runs. A slow parity/hash/equality harness still belongs in `tests` if its pass/fail result is content-deterministic. Use `perf` only when the reported result is itself derived from runtime, latency, throughput, or another measurement that would be polluted by concurrent load.
 
 ## Scheduling Rules
 
