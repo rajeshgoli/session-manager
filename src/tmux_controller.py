@@ -398,11 +398,31 @@ class TmuxController:
         prompt_indexes = [index for index, line in enumerate(lines) if line.lstrip().startswith("›")]
         if prompt_indexes:
             prompt_index = prompt_indexes[-1]
+            start = max(0, prompt_index - 8)
+            end = min(len(lines), prompt_index + 4)
+            region = "\n".join(lines[start:end]).strip()
+            return region or None
+
+        region = "\n".join(lines[-16:]).strip()
+        return region or None
+
+    def _extract_active_codex_prompt_region(self, pane_text: Optional[str]) -> Optional[str]:
+        """Return only the live Codex prompt/dialog region, excluding stale scrollback."""
+        if not pane_text:
+            return None
+
+        lines = pane_text.splitlines()
+        if not lines:
+            return None
+
+        prompt_indexes = [index for index, line in enumerate(lines) if line.lstrip().startswith("›")]
+        if prompt_indexes:
+            prompt_index = prompt_indexes[-1]
             end = min(len(lines), prompt_index + 4)
             region = "\n".join(lines[prompt_index:end]).strip()
             return region or None
 
-        region = "\n".join(lines[-16:]).strip()
+        region = "\n".join(lines[-8:]).strip()
         return region or None
 
     def _normalize_for_compare(self, text: str) -> str:
@@ -979,7 +999,7 @@ class TmuxController:
             deadline = asyncio.get_running_loop().time() + 5.0
             while asyncio.get_running_loop().time() < deadline:
                 pane_text = await self._capture_pane_async(session_name)
-                active_region = self._extract_active_codex_region(pane_text)
+                active_region = self._extract_active_codex_prompt_region(pane_text)
                 if self._looks_like_codex_rename_prompt(active_region):
                     prompt_seen = True
                     break

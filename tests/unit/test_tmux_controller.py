@@ -47,7 +47,7 @@ def test_codex_rename_prompt_detection():
     assert not controller._looks_like_codex_rename_prompt("› /rename worker")
 
 
-def test_codex_rename_prompt_detection_uses_active_region_only():
+def test_codex_rename_prompt_detection_uses_prompt_region_only():
     controller = TmuxController()
     pane_text = """Name thread
 old-name
@@ -58,11 +58,32 @@ Press enter to confirm or esc to go back
   gpt-5.5 xhigh · ~/repo
 """
 
+    prompt_region = controller._extract_active_codex_prompt_region(pane_text)
+
+    assert prompt_region is not None
+    assert "normal prompt text" in prompt_region
+    assert "Name thread" not in prompt_region
+    assert not controller._looks_like_codex_rename_prompt(prompt_region)
+
+
+def test_codex_active_region_keeps_deferred_banner_above_prompt():
+    controller = TmuxController()
+    pane_text = """• running tool output
+
+Submitted after next tool call
+WAKE payload preview
+
+› queued prompt text
+
+  gpt-5.5 xhigh · ~/repo
+"""
+
     active_region = controller._extract_active_codex_region(pane_text)
 
     assert active_region is not None
-    assert "normal prompt text" in active_region
-    assert not controller._looks_like_codex_rename_prompt(active_region)
+    assert "Submitted after next tool call" in active_region
+    assert "WAKE payload preview" in active_region
+    assert controller._looks_like_codex_deferred_send_banner(active_region)
 
 
 @pytest.mark.asyncio
