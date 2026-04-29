@@ -1,6 +1,7 @@
 """Command implementations for sm CLI."""
 
 import os
+import json
 import re
 import shutil
 import sqlite3
@@ -3598,6 +3599,192 @@ def cmd_watch_job_cancel(client: SessionManagerClient, watch_id: str) -> int:
 
     payload = result.get("data") or {}
     print(f"Cancelled job watch: {payload.get('label', watch_id)} ({payload.get('id', watch_id)})")
+    return 0
+
+
+def _queue_env_from_cli(env_pairs: list[str]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in ("PATH", "PYTHONPATH", "VIRTUAL_ENV"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    for pair in env_pairs:
+        if "=" not in pair:
+            raise ValueError(f"--env must be KEY=VALUE, got {pair!r}")
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("--env key cannot be empty")
+        env[key] = value
+    return env
+
+
+def _print_queue_job(payload: dict) -> None:
+    print(f"Accepted queue job {payload.get('id', 'unknown')} ({payload.get('type', '?')}).")
+    print(f"State: {payload.get('state', '-')}")
+    if payload.get("holding_reason"):
+        print(f"Holding: {payload['holding_reason']}")
+    print(f"Log: {payload.get('log_path') or '-'}")
+
+
+def cmd_queue_run(
+    client: SessionManagerClient,
+    current_session_id: Optional[str],
+    *,
+    job_type: str,
+    label: Optional[str],
+    cwd: Optional[str],
+    timeout: Optional[str],
+    env_pairs: list[str],
+    notify_target: Optional[str],
+    command: list[str],
+    script_file: Optional[str],
+) -> int:
+    """Submit one managed local queue job."""
+    effective_notify = notify_target or current_session_id
+    if not effective_notify:
+        print("Error: No notify target. Use --notify or run from within a managed session.", file=sys.stderr)
+        return 2
+
+    argv = list(command or [])
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    script = None
+    if script_file:
+        if argv:
+            print("Error: Use either --script-file or command argv, not both.", file=sys.stderr)
+            return 1
+        if script_file == "-":
+            script = sys.stdin.read()
+        else:
+            script = Path(script_file).expanduser().read_text(encoding="utf-8")
+    elif not argv:
+        print("Error: Expected command after -- or --script-file.", file=sys.stderr)
+        return 1
+
+    try:
+        env = _queue_env_from_cli(env_pairs)
+        timeout_seconds = parse_duration(timeout) if timeout else None
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    result = client.create_queue_job(
+        job_type=job_type,
+        label=label,
+        argv=argv or None,
+        script=script,
+        cwd=str(Path(cwd or os.getcwd()).expanduser().resolve()),
+        env=env,
+        notify_target=effective_notify,
+        requester_session_id=current_session_id,
+        timeout_seconds=timeout_seconds,
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to create queue job"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    _print_queue_job(result.get("data") or {})
+    return 0
+
+
+def cmd_queue_list(
+    client: SessionManagerClient,
+    current_session_id: Optional[str],
+    *,
+    notify_target: Optional[str],
+    list_all: bool,
+    job_type: Optional[str],
+    state: Optional[str],
+    json_output: bool,
+) -> int:
+    effective_notify = notify_target
+    if not effective_notify and not list_all:
+        if current_session_id:
+            effective_notify = current_session_id
+        else:
+            print("Error: No session context. Use --notify or --all.", file=sys.stderr)
+            return 2
+    result = client.list_queue_jobs(
+        notify_target=effective_notify,
+        job_type=job_type,
+        state=state,
+        include_terminal=list_all or bool(state),
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to list queue jobs"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    jobs = (result.get("data") or {}).get("jobs", [])
+    if json_output:
+        print(json.dumps(jobs, indent=2))
+        return 0
+    if not jobs:
+        print("No queue jobs.")
+        return 0
+    headers = ["ID", "Type", "State", "Notify", "Label", "Holding", "Log"]
+    rows = [
+        [
+            str(job.get("id", "")),
+            str(job.get("type", "")),
+            str(job.get("state", "")),
+            str(job.get("notify_name") or job.get("notify_session_id") or ""),
+            str(job.get("label", "")),
+            str(job.get("holding_reason") or "-"),
+            str(job.get("log_path") or "-"),
+        ]
+        for job in jobs
+    ]
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], min(len(value), 80))
+    print("  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers)))
+    print("  ".join("-" * widths[idx] for idx in range(len(headers))))
+    for row in rows:
+        print("  ".join(value[: widths[idx]].ljust(widths[idx]) for idx, value in enumerate(row)))
+    return 0
+
+
+def cmd_queue_status(client: SessionManagerClient, job_id: str, json_output: bool = False) -> int:
+    result = client.get_queue_job(job_id)
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Queue job not found"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    payload = result.get("data") or {}
+    if json_output:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(f"Job: {payload.get('id', job_id)}")
+    print(f"Type: {payload.get('type', '-')}")
+    print(f"State: {payload.get('state', '-')}")
+    print(f"Holding: {payload.get('holding_reason') or '-'}")
+    print(f"Exit: {payload.get('exit_code') if payload.get('exit_code') is not None else '-'}")
+    print(f"Log: {payload.get('log_path') or '-'}")
+    return 0
+
+
+def cmd_queue_cancel(client: SessionManagerClient, job_id: str) -> int:
+    result = client.cancel_queue_job(job_id)
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to cancel queue job"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    payload = result.get("data") or {}
+    print(f"Cancelled queue job: {payload.get('id', job_id)} ({payload.get('state', '-')})")
     return 0
 
 

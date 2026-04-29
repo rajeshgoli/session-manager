@@ -43,6 +43,7 @@ from .codex_provider_policy import (
 )
 from .codex_request_ledger import CodexRequestLedger
 from .github_reviews import post_pr_review_comment, poll_for_codex_review, get_pr_repo_from_git
+from .queue_runner import QueueRunner
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +382,12 @@ class SessionManager:
 
         # Message queue manager (set by main app)
         self.message_queue_manager = None
+        queue_runner_config = dict(self.config)
+        if "queue_runner" not in queue_runner_config and self.state_file != self.default_state_file:
+            queue_runner_config["queue_runner"] = {
+                "state_dir": str(self.state_file.parent / "queue-runner")
+            }
+        self.queue_runner = QueueRunner(self, config=queue_runner_config)
 
         # Child monitor (set by main app)
         self.child_monitor = None
@@ -3906,6 +3913,7 @@ class SessionManager:
     async def start_background_tasks(self):
         """Start periodic maintenance tasks owned by SessionManager."""
         await self.codex_observability_logger.start_periodic_prune()
+        await self.queue_runner.start()
         await self.maintain_codex_fork_runtime_artifacts()
         for session in self.sessions.values():
             if session.provider == "codex-fork" and session.status != SessionStatus.STOPPED:
@@ -3922,6 +3930,7 @@ class SessionManager:
     async def stop_background_tasks(self):
         """Stop periodic maintenance tasks owned by SessionManager."""
         await self.codex_observability_logger.stop_periodic_prune()
+        await self.queue_runner.stop()
         if self._service_role_maintenance_task is not None:
             self._service_role_maintenance_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

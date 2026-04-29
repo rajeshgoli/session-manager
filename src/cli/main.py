@@ -270,6 +270,34 @@ def main():
     watch_job_cancel_parser = watch_job_subparsers.add_parser("cancel", help="Cancel a durable external job watch")
     watch_job_cancel_parser.add_argument("watch_id", help="Watch ID to cancel")
 
+    # sm queue run/list/status/cancel
+    queue_parser = subparsers.add_parser("queue", help="Manage local queue runner jobs")
+    queue_subparsers = queue_parser.add_subparsers(dest="queue_command")
+
+    queue_run_parser = queue_subparsers.add_parser("run", help="Submit a local command to the queue runner")
+    queue_run_parser.add_argument("--type", dest="job_type", choices=["tests", "perf", "background"], default="tests")
+    queue_run_parser.add_argument("--label", help="Human-readable job label")
+    queue_run_parser.add_argument("--cwd", help="Working directory (defaults to current directory)")
+    queue_run_parser.add_argument("--timeout", help="Timeout duration, e.g. 90s, 10m, 2h")
+    queue_run_parser.add_argument("--env", dest="env_pairs", action="append", default=[], help="Environment override KEY=VALUE")
+    queue_run_parser.add_argument("--notify", help="Session ID or registry role to notify")
+    queue_run_parser.add_argument("--script-file", help="Script file to run, or - for stdin")
+    queue_run_parser.add_argument("queue_argv", nargs=argparse.REMAINDER, help="Command argv after --")
+
+    queue_list_parser = queue_subparsers.add_parser("list", help="List queue runner jobs")
+    queue_list_parser.add_argument("--notify", help="Filter by notify session ID or registry role")
+    queue_list_parser.add_argument("--all", action="store_true", help="List all jobs instead of current session active jobs")
+    queue_list_parser.add_argument("--type", dest="job_type", choices=["tests", "perf", "background"])
+    queue_list_parser.add_argument("--state", choices=["pending", "running", "succeeded", "failed", "cancelled", "timed_out", "displaced", "done"])
+    queue_list_parser.add_argument("--json", action="store_true", help="Output JSON")
+
+    queue_status_parser = queue_subparsers.add_parser("status", help="Show one queue runner job")
+    queue_status_parser.add_argument("job_id", help="Queue job ID")
+    queue_status_parser.add_argument("--json", action="store_true", help="Output JSON")
+
+    queue_cancel_parser = queue_subparsers.add_parser("cancel", help="Cancel one queue runner job")
+    queue_cancel_parser.add_argument("job_id", help="Queue job ID")
+
     # sm request-codex-review <pr>|list|status|cancel
     request_codex_review_parser = subparsers.add_parser(
         "request-codex-review",
@@ -877,6 +905,36 @@ def main():
         if args.watch_job_command == "cancel":
             sys.exit(commands.cmd_watch_job_cancel(client, args.watch_id))
         print("Error: watch-job subcommand required (add, list, cancel)", file=sys.stderr)
+        sys.exit(2)
+    elif args.command == "queue":
+        if args.queue_command == "run":
+            sys.exit(commands.cmd_queue_run(
+                client,
+                current_session_id=session_id,
+                job_type=args.job_type,
+                label=args.label,
+                cwd=args.cwd,
+                timeout=args.timeout,
+                env_pairs=args.env_pairs,
+                notify_target=args.notify,
+                command=args.queue_argv,
+                script_file=args.script_file,
+            ))
+        if args.queue_command == "list":
+            sys.exit(commands.cmd_queue_list(
+                client,
+                current_session_id=session_id,
+                notify_target=args.notify,
+                list_all=args.all,
+                job_type=args.job_type,
+                state=args.state,
+                json_output=args.json,
+            ))
+        if args.queue_command == "status":
+            sys.exit(commands.cmd_queue_status(client, args.job_id, json_output=args.json))
+        if args.queue_command == "cancel":
+            sys.exit(commands.cmd_queue_cancel(client, args.job_id))
+        print("Error: queue subcommand required (run, list, status, cancel)", file=sys.stderr)
         sys.exit(2)
     elif args.command == "request-codex-review":
         action = args.action_or_pr
