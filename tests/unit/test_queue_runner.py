@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from src.cli.commands import cmd_queue_run
 from src.models import Session, SessionStatus
-from src.queue_runner import QueueRunner
+from src.queue_runner import QueueJob, QueueRunner
 from src.server import create_app
 from src.session_manager import SessionManager
 
@@ -95,6 +96,7 @@ async def test_queue_job_runs_and_notifies(mock_sm, tmp_path):
 async def test_memory_gate_holds_and_pending_cancel(mock_sm, tmp_path):
     runner = _runner(mock_sm, tmp_path)
     runner._memory_gate_passes = MagicMock(return_value=False)
+    runner._started = True
 
     job = await runner.create_job(
         job_type="tests",
@@ -111,9 +113,18 @@ async def test_memory_gate_holds_and_pending_cancel(mock_sm, tmp_path):
     assert runner.get_job(job.id).state == "pending"
     assert runner.get_job(job.id).holding_reason == "memory_pressure"
     assert "queued:" in mock_sm.message_queue_manager.queue_message.call_args_list[-1].kwargs["text"]
+    assert runner._scheduler_task is not None
+
+    runner._memory_gate_passes = MagicMock(return_value=True)
+    for _ in range(20):
+        if runner.get_job(job.id).state in {"running", "succeeded"}:
+            break
+        await asyncio.sleep(0.1)
+    assert runner.get_job(job.id).state in {"running", "succeeded"}
 
     cancelled = await runner.cancel_job(job.id)
-    assert cancelled.state == "cancelled"
+    await runner.stop()
+    assert cancelled.state in {"cancelled", "succeeded"}
     mock_sm.message_queue_manager.queue_message.assert_called()
 
 
@@ -341,3 +352,25 @@ def test_cmd_queue_run_captures_argv_and_env(tmp_path, monkeypatch):
     assert call["env"]["PATH"] == "/bin"
     assert call["env"]["EXTRA"] == "1"
     assert call["timeout_seconds"] == 10
+
+
+def test_subprocess_env_uses_captured_values_only(mock_sm, tmp_path):
+    runner = _runner(mock_sm, tmp_path)
+    queue_job = QueueJob(
+        id="manual",
+        type="tests",
+        label="manual",
+        requester_session_id="agent672",
+        notify_session_id="agent672",
+        cwd=str(tmp_path),
+        argv=[sys.executable, "-c", "print('x')"],
+        script_path=None,
+        env={"PATH": "/captured/bin", "CUSTOM": "yes"},
+        timeout_seconds=5,
+        state="pending",
+        holding_reason=None,
+        queued_at=datetime.now(),
+    )
+
+    env = runner._subprocess_env(queue_job)
+    assert env == {"PATH": "/captured/bin", "CUSTOM": "yes"}

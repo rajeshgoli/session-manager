@@ -382,6 +382,8 @@ class QueueRunner:
                 self._notify_queued(job)
                 job.queued_notified_at = datetime.now()
                 self._persist_job(job)
+            if job.state == "pending":
+                self._schedule()
         self._ensure_resource_sampler()
         return job
 
@@ -597,6 +599,7 @@ class QueueRunner:
             stdout=log_handle,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            env=self._subprocess_env(job),
         )
         log_handle.close()
         job.pid = process.pid
@@ -611,6 +614,12 @@ class QueueRunner:
         self._persist_job(job)
         task = asyncio.create_task(self._wait_for_job(job.id))
         self._completion_tasks[job.id] = task
+
+    def _subprocess_env(self, job: QueueJob) -> dict[str, str]:
+        env = {str(key): str(value) for key, value in job.env.items()}
+        if "PATH" not in env:
+            env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        return env
 
     async def _wait_for_job(self, job_id: str) -> None:
         try:
