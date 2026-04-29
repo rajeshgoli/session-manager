@@ -376,6 +376,16 @@ class TmuxController:
         lowered = pane_text.lower()
         return "submitted after next tool call" in lowered
 
+    def _looks_like_codex_rename_prompt(self, pane_text: Optional[str]) -> bool:
+        """Return True when Codex is asking for a thread name."""
+        if not pane_text:
+            return False
+        lowered = pane_text.lower()
+        return (
+            ("name thread" in lowered or "rename thread" in lowered)
+            and "press enter to confirm" in lowered
+        )
+
     def _extract_active_codex_region(self, pane_text: Optional[str]) -> Optional[str]:
         """Return the active bottom-of-pane Codex region near the live prompt/banner."""
         if not pane_text:
@@ -952,6 +962,40 @@ class TmuxController:
     async def background_claude_task_async(self, session_name: str) -> bool:
         """Send Claude's background-task keybinding to a tmux session."""
         return await self.send_key_async(session_name, "C-b")
+
+    async def rename_codex_thread_async(self, session_name: str, friendly_name: str) -> bool:
+        """Drive Codex's interactive /rename dialog using tmux keystrokes."""
+        if not self.session_exists(session_name):
+            logger.error(f"Session {session_name} does not exist")
+            return False
+
+        try:
+            await self._exit_copy_mode_if_needed_async(session_name)
+            if not await self.send_key_async(session_name, "C-u"):
+                return False
+            if not await self.send_input_async(session_name, "/rename"):
+                return False
+
+            prompt_seen = False
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while asyncio.get_running_loop().time() < deadline:
+                pane_text = await self._capture_pane_async(session_name)
+                if self._looks_like_codex_rename_prompt(pane_text):
+                    prompt_seen = True
+                    break
+                await asyncio.sleep(0.2)
+            if not prompt_seen:
+                logger.error(f"Codex rename prompt did not appear for {session_name}")
+                return False
+
+            if not await self.send_key_async(session_name, "C-u"):
+                return False
+            if not await self.send_input_async(session_name, friendly_name):
+                return False
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to rename Codex thread for {session_name}: {exc}")
+            return False
 
     def send_key(self, session_name: str, key: str) -> bool:
         """

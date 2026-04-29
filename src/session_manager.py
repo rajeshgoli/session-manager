@@ -3446,7 +3446,7 @@ class SessionManager:
 
         rename_command = f"/rename {friendly_name}"
         if not self.message_queue_manager:
-            return await self._deliver_direct(session, rename_command)
+            return await self._deliver_provider_native_rename(session, friendly_name)
 
         self.message_queue_manager.cancel_queued_messages_for_target(
             session.id,
@@ -3467,6 +3467,26 @@ class SessionManager:
     ) -> bool:
         """Backward-compatible wrapper for provider-native `/rename` queueing."""
         return await self.queue_provider_native_rename(session_or_id, friendly_name)
+
+    def extract_provider_native_rename_name(self, text: str) -> Optional[str]:
+        """Extract the safe target name from a queued provider-native rename command."""
+        match = re.fullmatch(r"/rename\s+([a-zA-Z0-9_-]{1,32})", (text or "").strip())
+        if not match:
+            return None
+        friendly_name = match.group(1)
+        if not self._is_safe_provider_native_rename_name(friendly_name):
+            return None
+        return friendly_name
+
+    async def _deliver_provider_native_rename(self, session: Session, friendly_name: str) -> bool:
+        """Deliver a provider-native rename using the provider's real TUI contract."""
+        if not self._is_safe_provider_native_rename_name(friendly_name):
+            return False
+        if session.provider in ("codex", "codex-fork"):
+            return await self.tmux.rename_codex_thread_async(session.tmux_session, friendly_name)
+        if session.provider == "claude":
+            return await self._deliver_direct(session, f"/rename {friendly_name}")
+        return False
 
     @staticmethod
     def _is_safe_provider_native_rename_name(friendly_name: str) -> bool:
