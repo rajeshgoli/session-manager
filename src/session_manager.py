@@ -3482,11 +3482,38 @@ class SessionManager:
         """Deliver a provider-native rename using the provider's real TUI contract."""
         if not self._is_safe_provider_native_rename_name(friendly_name):
             return False
-        if session.provider in ("codex", "codex-fork"):
+        if session.provider == "codex-fork":
+            success, reason = await self._rename_codex_fork_thread_via_control(session, friendly_name)
+            if success:
+                self._clear_codex_fork_control_degraded(session)
+                return True
+            logger.warning(
+                "Codex-fork control rename failed for %s, falling back to tmux dialog: %s",
+                session.id,
+                reason,
+            )
+            return await self.tmux.rename_codex_thread_async(session.tmux_session, friendly_name)
+        if session.provider == "codex":
             return await self.tmux.rename_codex_thread_async(session.tmux_session, friendly_name)
         if session.provider == "claude":
             return await self._deliver_direct(session, f"/rename {friendly_name}")
         return False
+
+    async def _rename_codex_fork_thread_via_control(
+        self,
+        session: Session,
+        friendly_name: str,
+    ) -> tuple[bool, str]:
+        """Rename a codex-fork thread through its control socket without touching the TUI prompt."""
+        if session.provider != "codex-fork":
+            return False, "session is not codex-fork"
+        if not self._is_safe_provider_native_rename_name(friendly_name):
+            return False, "unsafe thread name"
+        return await self._send_codex_fork_control_command(
+            session=session,
+            command="set_thread_name",
+            payload={"name": friendly_name},
+        )
 
     @staticmethod
     def _is_safe_provider_native_rename_name(friendly_name: str) -> bool:

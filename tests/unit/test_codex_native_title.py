@@ -324,14 +324,14 @@ async def test_queue_provider_native_rename_queues_codex_fork_rename(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_queue_provider_native_rename_direct_codex_uses_interactive_tmux(tmp_path):
+async def test_queue_provider_native_rename_direct_plain_codex_uses_interactive_tmux(tmp_path):
     manager = _manager(tmp_path)
     session = Session(
-        id="cf660",
-        name="codex-fork-cf660",
+        id="cx660",
+        name="codex-cx660",
         working_dir="/tmp",
-        tmux_session="codex-fork-cf660",
-        provider="codex-fork",
+        tmux_session="codex-cx660",
+        provider="codex",
         status=SessionStatus.IDLE,
     )
     manager.sessions[session.id] = session
