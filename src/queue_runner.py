@@ -191,6 +191,7 @@ class QueueRunner:
         self._scheduler_task: Optional[asyncio.Task[Any]] = None
         self._resource_sampler_task: Optional[asyncio.Task[Any]] = None
         self._lock = asyncio.Lock()
+        self._policy_lock = asyncio.Lock()
         self._started = False
         self._init_db()
         self._init_policy_db()
@@ -637,50 +638,50 @@ class QueueRunner:
 
         run_id = f"qpol_{uuid.uuid4().hex[:12]}"
         now = datetime.now()
-        failed_gates: list[str] = []
-        suppression_reason = None
-        with self._connect_policy() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if mode in {"token", "both"}:
-                rows = conn.execute(
-                    """
-                    SELECT dedupe_token FROM queue_policy_runs
-                    WHERE policy = ? AND decision = 'admitted' AND dedupe_token IS NOT NULL
-                    ORDER BY admitted_at DESC
-                    LIMIT ?
-                    """,
-                    (policy, token_window),
-                ).fetchall()
-                recent_tokens = {row["dedupe_token"] for row in rows}
-                if dedupe_token in recent_tokens:
-                    failed_gates.append("dedupe_token")
-            if mode in {"time", "both"}:
-                row = conn.execute(
-                    """
-                    SELECT admitted_at FROM queue_policy_runs
-                    WHERE policy = ? AND decision = 'admitted' AND admitted_at IS NOT NULL
-                    ORDER BY admitted_at DESC LIMIT 1
-                    """,
-                    (policy,),
-                ).fetchone()
-                if row and (now - datetime.fromisoformat(row["admitted_at"])).total_seconds() < min_interval:
-                    failed_gates.append("time_gate")
-            if failed_gates:
-                suppression_reason = "dedupe_token" if "dedupe_token" in failed_gates else "time_gate"
-                conn.execute(
-                    """
-                    INSERT INTO queue_policy_runs
-                    (id, policy, decision, suppression_reason, failed_gates_json, dedupe_token, requested_at, metadata_json)
-                    VALUES (?, ?, 'suppressed', ?, ?, ?, ?, ?)
-                    """,
-                    (run_id, policy, suppression_reason, json.dumps(failed_gates), dedupe_token, now.isoformat(), json.dumps(metadata or {})),
-                )
-                conn.commit()
-                self._prune_policy_runs(policy, policy_config)
-                return self.get_policy_run(run_id) or PolicyRun(
-                    id=run_id, policy=policy, decision="suppressed", suppression_reason=suppression_reason,
-                    failed_gates=failed_gates, dedupe_token=dedupe_token, requested_at=now, metadata=metadata or {},
-                )
+        async with self._policy_lock:
+            failed_gates: list[str] = []
+            suppression_reason = None
+            with self._connect_policy() as conn:
+                if mode in {"token", "both"}:
+                    rows = conn.execute(
+                        """
+                        SELECT dedupe_token FROM queue_policy_runs
+                        WHERE policy = ? AND decision = 'admitted' AND dedupe_token IS NOT NULL
+                        ORDER BY admitted_at DESC
+                        LIMIT ?
+                        """,
+                        (policy, token_window),
+                    ).fetchall()
+                    recent_tokens = {row["dedupe_token"] for row in rows}
+                    if dedupe_token in recent_tokens:
+                        failed_gates.append("dedupe_token")
+                if mode in {"time", "both"}:
+                    row = conn.execute(
+                        """
+                        SELECT admitted_at FROM queue_policy_runs
+                        WHERE policy = ? AND decision = 'admitted' AND admitted_at IS NOT NULL
+                        ORDER BY admitted_at DESC LIMIT 1
+                        """,
+                        (policy,),
+                    ).fetchone()
+                    if row and (now - datetime.fromisoformat(row["admitted_at"])).total_seconds() < min_interval:
+                        failed_gates.append("time_gate")
+                if failed_gates:
+                    suppression_reason = "dedupe_token" if "dedupe_token" in failed_gates else "time_gate"
+                    conn.execute(
+                        """
+                        INSERT INTO queue_policy_runs
+                        (id, policy, decision, suppression_reason, failed_gates_json, dedupe_token, requested_at, metadata_json)
+                        VALUES (?, ?, 'suppressed', ?, ?, ?, ?, ?)
+                        """,
+                        (run_id, policy, suppression_reason, json.dumps(failed_gates), dedupe_token, now.isoformat(), json.dumps(metadata or {})),
+                    )
+                    conn.commit()
+                    self._prune_policy_runs(policy, policy_config)
+                    return self.get_policy_run(run_id) or PolicyRun(
+                        id=run_id, policy=policy, decision="suppressed", suppression_reason=suppression_reason,
+                        failed_gates=failed_gates, dedupe_token=dedupe_token, requested_at=now, metadata=metadata or {},
+                    )
 
             configured_type = str(policy_config.get("type") or "background")
             if job_type and job_type != configured_type and not bool(policy_config.get("allow_type_override", False)):
@@ -692,21 +693,7 @@ class QueueRunner:
             effective_timeout = timeout if timeout is not None else policy_config.get("timeout_seconds")
             effective_label = label or (f"{policy}@{str(dedupe_token)[:12]}" if dedupe_token else policy)
             notify_session_id = requester_session_id if requester_session_id and self.session_manager.get_session(requester_session_id) else None
-            conn.execute(
-                """
-                INSERT INTO queue_policy_runs
-                (id, policy, decision, suppression_reason, failed_gates_json, dedupe_token, requested_at, admitted_at,
-                 notify_session_id, label, cwd, queue_type, command_json, metadata_json)
-                VALUES (?, ?, 'admitted', NULL, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id, policy, dedupe_token, now.isoformat(), now.isoformat(), notify_session_id,
-                    effective_label, str(effective_cwd), effective_type, json.dumps(argv) if argv else None, json.dumps(metadata or {}),
-                ),
-            )
-            conn.commit()
 
-        try:
             job = await self.create_job(
                 job_type=effective_type,
                 label=effective_label,
@@ -718,19 +705,27 @@ class QueueRunner:
                 requester_session_id=requester_session_id,
                 timeout=effective_timeout,
             )
-        except Exception:
+
+            admitted_at = datetime.now()
             with self._connect_policy() as conn:
                 conn.execute(
-                    "UPDATE queue_policy_runs SET decision='suppressed', suppression_reason='queue_create_failed', failed_gates_json=? WHERE id=?",
-                    (json.dumps(["queue_create_failed"]), run_id),
+                    """
+                    INSERT INTO queue_policy_runs
+                    (id, policy, decision, suppression_reason, failed_gates_json, dedupe_token, requested_at, admitted_at,
+                     queue_job_id, notify_session_id, label, cwd, queue_type, command_json, script_path, metadata_json)
+                    VALUES (?, ?, 'admitted', NULL, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id, policy, dedupe_token, now.isoformat(), admitted_at.isoformat(), job.id, notify_session_id,
+                        effective_label, str(effective_cwd), effective_type, json.dumps(argv) if argv else None, job.script_path, json.dumps(metadata or {}),
+                    ),
                 )
-            raise
-
-        with self._connect_policy() as conn:
-            conn.execute("UPDATE queue_policy_runs SET queue_job_id=?, script_path=? WHERE id=?", (job.id, job.script_path, run_id))
-        self._sync_policy_result_for_job(job)
-        self._prune_policy_runs(policy, policy_config)
-        return self.get_policy_run(run_id) or PolicyRun(id=run_id, policy=policy, decision="admitted", suppression_reason=None, failed_gates=[], dedupe_token=dedupe_token, requested_at=now)
+            self._sync_policy_result_for_job(job)
+            self._prune_policy_runs(policy, policy_config)
+            return self.get_policy_run(run_id) or PolicyRun(
+                id=run_id, policy=policy, decision="admitted", suppression_reason=None, failed_gates=[],
+                dedupe_token=dedupe_token, requested_at=now, admitted_at=admitted_at, queue_job_id=job.id,
+            )
 
     def _sync_policy_result_for_job(self, job: QueueJob) -> None:
         if not job.id:

@@ -542,6 +542,63 @@ async def test_policy_run_prunes_by_configured_retention(mock_sm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_policy_run_create_job_failure_does_not_consume_gate(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "policies": {
+                "ci": {
+                    "type": "tests",
+                    "cwd": str(tmp_path),
+                    "dedupe": {"mode": "token", "token_window": 3},
+                }
+            }
+        },
+    )
+    original_create_job = runner.create_job
+    calls = 0
+
+    async def flaky_create_job(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("boom")
+        return await original_create_job(**kwargs)
+
+    runner.create_job = flaky_create_job
+
+    with pytest.raises(ValueError, match="boom"):
+        await runner.create_policy_run(
+            policy="ci",
+            dedupe_token="same",
+            label="first",
+            argv=[sys.executable, "-c", "print('first')"],
+            script=None,
+            cwd=None,
+            env={},
+            requester_session_id="agent672",
+            timeout=None,
+        )
+
+    retry = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="same",
+        label="retry",
+        argv=[sys.executable, "-c", "print('retry')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+
+    assert retry.decision == "admitted"
+    assert retry.queue_job_id
+    assert [run.dedupe_token for run in runner.list_policy_runs(policy="ci")] == ["same"]
+
+
+@pytest.mark.asyncio
 async def test_policy_retention_preserves_token_window(mock_sm, tmp_path):
     runner = _runner(
         mock_sm,
