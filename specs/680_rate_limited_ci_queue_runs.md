@@ -38,15 +38,13 @@ The original user-defined rate-limit intent was:
 >
 > No more than one run per commit even after 30 minutes.
 
-The earlier brief also mentioned both 15 and 30 minutes. That was a typo: there is one configurable time constant per policy.
-
 The generalized interpretation is: each policy can enable a time gate, a bounded dedupe-token gate, or both. When both are enabled, a request must pass both gates before SM creates the underlying queue job. This composes to make admissions rarer, not more frequent.
 
 ## Problem
 
 `sm queue run` serializes local execution but accepts every valid request. CI and other automation can fire repeatedly during bursts: repeated workflow events for the same commit, many rapid pushes, or retries while the local host is busy. Without a durable admission policy, those requests can create a backlog of redundant background work.
 
-Session Manager should offer a reusable infrastructure primitive: named policy plus queued command. Consumers configure the policy once in `config.yaml`, then pass a small amount of request metadata at submission time. SM applies the configured gates, starts the job during normal queue lull periods, and records the outcome durably enough for later lookup.
+Session Manager should offer a reusable infrastructure primitive: named policy plus queued command. Consumers configure the policy once in `config.yaml`, then pass a small amount of request metadata at submission time. SM applies the configured gates and records the outcome durably enough for later lookup.
 
 ## Goals
 
@@ -85,7 +83,6 @@ queue_runner:
         token_window: 10        # remember last K admitted tokens
       cwd: /Users/rajesh/worktrees/3175-epic-to-dev
       timeout_seconds: 1800
-      notify: maintainer
       retention:
         admitted_runs: 200
         suppressed_runs: 200
@@ -101,9 +98,10 @@ Policy fields:
 | `dedupe.token_window` | required for `mode=token|both` | Number of recent admitted dedupe tokens to remember. Small values such as 10 are expected. |
 | `cwd` | no | Default working directory for admitted commands. CLI may override. |
 | `timeout_seconds` | no | Default timeout for the underlying queue job. CLI may override. |
-| `notify` | no | Default session or role to notify on start/completion. CLI may override. |
 | `retention.admitted_runs` | no | Number of admitted policy-run rows to retain per policy. |
 | `retention.suppressed_runs` | no | Number of suppressed request rows to retain per policy. |
+
+Notification routing is not policy configuration. The runtime submitter owns the notification target: if a live managed agent submits the run, SM records that session id and wakes it on start/completion while it remains routable. If CI or another non-agent process submits the run, no default wake target is inferred.
 
 The policy name is an infrastructure key. `fractal-ci` is just an operator-defined name, not a built-in project concept.
 
@@ -128,7 +126,6 @@ sm queue ci-history --policy POLICY [--limit N] [--include-suppressed] [--json]
 --timeout DURATION             override policy timeout
 --type tests|perf|background   override policy type only if policy allows overrides
 --env KEY=VALUE                repeatable explicit environment additions/overrides
---notify SESSION_OR_ROLE       override policy notify target
 --metadata KEY=VALUE           repeatable opaque caller metadata for lookup/debug
 ```
 
@@ -190,7 +187,7 @@ Admitted policy runs create normal queue jobs with policy-derived defaults. They
 3. They reuse existing logs, wrapper scripts, exit-code files, and completion notifications.
 4. They recover through the existing queue runner restart path.
 
-This means the policy layer controls admission frequency, not exact start time. A run admitted now may start later during a queue lull. The time gate is based on admission time, not process start time, because admission is the point where SM promises that a run will occur unless the queue job later fails, is cancelled, or is displaced.
+This means the policy layer controls admission frequency, not exact start time. The time gate is based on admission time, not process start time, because admission is the point where SM promises that a run will occur unless the queue job later fails, is cancelled, or is displaced.
 
 ## Concurrency
 
@@ -382,7 +379,7 @@ For admitted runs, reuse existing queue notifications for start/completion, but 
 [sm queue policy] fractal-ci token=1a2b3c4 completed: failed exit=1. Queue job: job_def456. Log: ...
 ```
 
-Suppressed requests do not notify by default. Automation receives the suppression response synchronously. A future operator setting can mirror suppressions to a session if that proves useful.
+Suppressed requests do not notify by default. Automation receives the suppression response synchronously. For admitted runs, the notification target is captured from the submitting managed agent when there is one. If the submitter is not a live managed agent, the run still records durable status and logs, but no wake is attempted.
 
 ## Failure Modes
 
