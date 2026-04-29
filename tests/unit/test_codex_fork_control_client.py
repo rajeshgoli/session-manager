@@ -202,6 +202,29 @@ async def test_provider_native_rename_falls_back_to_tmux_when_control_rejects_co
 
 
 @pytest.mark.asyncio
+async def test_provider_native_rename_returns_failure_when_fallback_disabled(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    manager.codex_fork_control_tmux_fallback_enabled = False
+    session = Session(
+        id="cfctl_rename3",
+        name="codex-fork-cfctl_rename3",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        tmux_session="codex-fork-cfctl_rename3",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    manager.tmux.rename_codex_thread_async = AsyncMock(return_value=True)
+
+    success = await manager._deliver_provider_native_rename(session, "worker-no-fallback")
+
+    assert success is False
+    manager.tmux.rename_codex_thread_async.assert_not_called()
+    assert session.error_message is not None
+    assert session.error_message.startswith("codex_fork_control_degraded:")
+
+
+@pytest.mark.asyncio
 async def test_deliver_direct_falls_back_to_tmux_when_control_unavailable(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
     session = Session(

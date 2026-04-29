@@ -3487,6 +3487,14 @@ class SessionManager:
             if success:
                 self._clear_codex_fork_control_degraded(session)
                 return True
+            if not self.codex_fork_control_tmux_fallback_enabled:
+                logger.warning(
+                    "Codex-fork control rename failed for %s and tmux fallback is disabled: %s",
+                    session.id,
+                    reason,
+                )
+                self._set_codex_fork_control_degraded(session, reason)
+                return False
             logger.warning(
                 "Codex-fork control rename failed for %s, falling back to tmux dialog: %s",
                 session.id,
