@@ -659,6 +659,9 @@ class QueueRunner:
                 notify=job.completion_notified_at is None,
             )
             return
+        if self._job_timed_out(job):
+            await self._terminate_job_locked(job, state="timed_out")
+            return
         if job.pid and self._pid_exists(job.pid):
             task = asyncio.create_task(self._poll_recovered_job(job.id))
             self._completion_tasks[job.id] = task
@@ -682,12 +685,20 @@ class QueueRunner:
                             notify=job.completion_notified_at is None,
                         )
                         return
+                    if self._job_timed_out(job):
+                        await self._terminate_job_locked(job, state="timed_out")
+                        return
                     if job.pid and not self._pid_exists(job.pid):
                         await self._finish_job_locked(job, "failed", exit_code=None, notify=job.completion_notified_at is None)
                         return
         finally:
             self._completion_tasks.pop(job_id, None)
             self._schedule()
+
+    def _job_timed_out(self, job: QueueJob) -> bool:
+        if not job.started_at:
+            return False
+        return (datetime.now() - job.started_at).total_seconds() >= job.timeout_seconds
 
     def _read_exit_code(self, job: QueueJob) -> Optional[int]:
         try:
@@ -793,18 +804,19 @@ class QueueRunner:
     async def _resource_sampler_loop(self) -> None:
         try:
             while True:
-                if not any(job.state in ACTIVE_STATES for job in self._jobs.values()):
+                jobs_snapshot = list(self._jobs.values())
+                if not any(job.state in ACTIVE_STATES for job in jobs_snapshot):
                     return
-                await asyncio.to_thread(self._record_resource_sample)
+                await asyncio.to_thread(self._record_resource_sample, jobs_snapshot)
                 await asyncio.sleep(self.resource_sampling_interval_seconds)
         except asyncio.CancelledError:
             raise
 
-    def _record_resource_sample(self) -> None:
-        pending = self._counts_by_type("pending")
-        running = self._counts_by_type("running")
+    def _record_resource_sample(self, jobs_snapshot: list[QueueJob]) -> None:
+        pending = self._counts_by_type("pending", jobs_snapshot)
+        running = self._counts_by_type("running", jobs_snapshot)
         memory = {"free_bytes": self._read_free_memory_bytes()}
-        cpu = self._read_cpu_sample()
+        cpu = self._read_cpu_sample(jobs_snapshot)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -823,14 +835,14 @@ class QueueRunner:
                 ),
             )
 
-    def _counts_by_type(self, state: str) -> dict[str, int]:
+    def _counts_by_type(self, state: str, jobs_snapshot: list[QueueJob]) -> dict[str, int]:
         return {
-            job_type: sum(1 for job in self._jobs.values() if job.state == state and job.type == job_type)
+            job_type: sum(1 for job in jobs_snapshot if job.state == state and job.type == job_type)
             for job_type in self.type_config
         }
 
-    def _read_cpu_sample(self) -> dict[str, Any]:
-        pids = [str(job.pid) for job in self._jobs.values() if job.state == "running" and job.pid]
+    def _read_cpu_sample(self, jobs_snapshot: list[QueueJob]) -> dict[str, Any]:
+        pids = [str(job.pid) for job in jobs_snapshot if job.state == "running" and job.pid]
         sample: dict[str, Any] = {"loadavg": os.getloadavg() if hasattr(os, "getloadavg") else None}
         if not pids:
             return sample

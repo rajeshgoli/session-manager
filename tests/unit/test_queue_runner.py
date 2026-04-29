@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -272,6 +272,40 @@ async def test_start_recovers_dead_running_job(mock_sm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_start_times_out_recovered_running_job(mock_sm, tmp_path):
+    runner = _runner(mock_sm, tmp_path)
+    job = await runner.create_job(
+        job_type="tests",
+        label="recovered-timeout",
+        argv=[sys.executable, "-c", "import time; time.sleep(10)"],
+        script=None,
+        cwd=str(tmp_path),
+        env={},
+        notify_session_id="agent672",
+        requester_session_id="agent672",
+        timeout=1,
+    )
+
+    for _ in range(20):
+        if runner.get_job(job.id).state == "running":
+            break
+        await asyncio.sleep(0.1)
+    assert runner.get_job(job.id).state == "running"
+
+    await runner.stop()
+    with sqlite3.connect(runner.db_path) as conn:
+        conn.execute(
+            "UPDATE queue_jobs SET started_at=? WHERE id=?",
+            ((datetime.now() - timedelta(seconds=5)).isoformat(), job.id),
+        )
+
+    recovered = _runner(mock_sm, tmp_path)
+    await recovered.start()
+    assert recovered.get_job(job.id).state == "timed_out"
+    await recovered.stop()
+
+
+@pytest.mark.asyncio
 async def test_resource_sampling_records_when_queue_non_empty(mock_sm, tmp_path):
     runner = _runner(mock_sm, tmp_path)
     runner._memory_gate_passes = MagicMock(return_value=False)
@@ -352,6 +386,34 @@ def test_cmd_queue_run_captures_argv_and_env(tmp_path, monkeypatch):
     assert call["env"]["PATH"] == "/bin"
     assert call["env"]["EXTRA"] == "1"
     assert call["timeout_seconds"] == 10
+
+
+def test_resource_sample_uses_supplied_job_snapshot(mock_sm, tmp_path):
+    runner = _runner(mock_sm, tmp_path)
+    queue_job = QueueJob(
+        id="snapshot",
+        type="tests",
+        label="snapshot",
+        requester_session_id="agent672",
+        notify_session_id="agent672",
+        cwd=str(tmp_path),
+        argv=[sys.executable, "-c", "print('x')"],
+        script_path=None,
+        env={},
+        timeout_seconds=5,
+        state="pending",
+        holding_reason=None,
+        queued_at=datetime.now(),
+    )
+
+    runner._jobs.clear()
+    runner._record_resource_sample([queue_job])
+
+    with sqlite3.connect(runner.db_path) as conn:
+        pending_json = conn.execute(
+            "SELECT pending_by_type_json FROM queue_resource_samples ORDER BY sampled_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert '"tests": 1' in pending_json
 
 
 def test_subprocess_env_uses_captured_values_only(mock_sm, tmp_path):
