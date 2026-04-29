@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from src.cli.commands import cmd_queue_run
+from src.cli.commands import cmd_queue_ci_run, cmd_queue_run
 from src.models import Session, SessionStatus
 from src.queue_runner import QueueJob, QueueRunner
 import src.queue_runner as queue_runner_module
@@ -400,6 +400,261 @@ def test_cmd_queue_run_captures_argv_and_env(tmp_path, monkeypatch):
     assert call["argv"] == [sys.executable, "-m", "pytest"]
     assert call["env"]["PATH"] == "/bin"
     assert call["env"]["EXTRA"] == "1"
+    assert call["timeout_seconds"] == 10
+
+
+@pytest.mark.asyncio
+async def test_policy_run_suppresses_recent_token(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "policies": {
+                "ci": {
+                    "type": "tests",
+                    "cwd": str(tmp_path),
+                    "dedupe": {"mode": "token", "token_window": 3},
+                }
+            }
+        },
+    )
+
+    first = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="abc123",
+        label=None,
+        argv=[sys.executable, "-c", "print('first')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+    second = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="abc123",
+        label=None,
+        argv=[sys.executable, "-c", "print('second')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+
+    assert first.decision == "admitted"
+    assert first.queue_job_id
+    assert first.notify_session_id == "agent672"
+    assert second.decision == "suppressed"
+    assert second.suppression_reason == "dedupe_token"
+    assert second.failed_gates == ["dedupe_token"]
+
+
+@pytest.mark.asyncio
+async def test_policy_run_suppresses_min_interval(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "policies": {
+                "ci": {
+                    "type": "tests",
+                    "cwd": str(tmp_path),
+                    "min_interval_seconds": 60,
+                    "dedupe": {"mode": "time"},
+                }
+            }
+        },
+    )
+
+    first = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="one",
+        label="first",
+        argv=[sys.executable, "-c", "print('first')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+    second = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="two",
+        label="second",
+        argv=[sys.executable, "-c", "print('second')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+
+    assert first.decision == "admitted"
+    assert second.decision == "suppressed"
+    assert second.suppression_reason == "time_gate"
+    assert second.failed_gates == ["time_gate"]
+
+
+@pytest.mark.asyncio
+async def test_policy_run_prunes_by_configured_retention(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "policies": {
+                "ci": {
+                    "type": "tests",
+                    "cwd": str(tmp_path),
+                    "dedupe": {"mode": "none"},
+                    "retention": {"admitted_runs": 1, "suppressed_runs": 1},
+                }
+            }
+        },
+    )
+
+    first = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="one",
+        label="first",
+        argv=[sys.executable, "-c", "print('first')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+    second = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="two",
+        label="second",
+        argv=[sys.executable, "-c", "print('second')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+
+    runs = runner.list_policy_runs(policy="ci", include_suppressed=True)
+    assert [run.id for run in runs] == [second.id]
+    assert runner.get_policy_run(first.id) is None
+
+
+@pytest.mark.asyncio
+async def test_policy_run_rejects_type_override_unless_enabled(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "policies": {
+                "ci": {
+                    "type": "background",
+                    "cwd": str(tmp_path),
+                    "dedupe": {"mode": "none"},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="type override"):
+        await runner.create_policy_run(
+            policy="ci",
+            dedupe_token=None,
+            label="override",
+            argv=[sys.executable, "-c", "print('override')"],
+            script=None,
+            cwd=None,
+            env={},
+            requester_session_id="agent672",
+            timeout=None,
+            job_type="tests",
+        )
+
+
+def test_queue_policy_run_endpoints_roundtrip(tmp_path):
+    session_manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+        config={
+            "queue_runner": {
+                "state_dir": str(tmp_path / "queue-runner"),
+                "memory": {"min_free_bytes": 0},
+                "policies": {
+                    "ci": {
+                        "type": "tests",
+                        "cwd": str(tmp_path),
+                        "dedupe": {"mode": "token", "token_window": 3},
+                    }
+                },
+            }
+        },
+    )
+    session = _session("agent672", tmp_path)
+    session_manager.sessions[session.id] = session
+    session_manager.message_queue_manager = MagicMock()
+
+    app = create_app(session_manager=session_manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/queue-policy-runs",
+        json={
+            "policy": "ci",
+            "dedupe_token": "abc123",
+            "argv": [sys.executable, "-c", "print('api')"],
+            "requester_session_id": "agent672",
+            "timeout_seconds": 5,
+            "metadata": {"source": "test"},
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["decision"] == "admitted"
+    assert payload["queue_job_id"]
+    assert client.get(f"/queue-policy-runs/{payload['id']}").status_code == 200
+    assert client.get("/queue-policy-runs/status?policy=ci&dedupe_token=abc123").json()["id"] == payload["id"]
+    assert client.get("/queue-policy-runs?policy=ci").json()["runs"]
+
+
+def test_cmd_queue_ci_run_captures_policy_args(tmp_path, monkeypatch):
+    client = MagicMock()
+    client.create_queue_policy_run.return_value = {
+        "ok": True,
+        "data": {
+            "id": "qpol_cli",
+            "policy": "ci",
+            "decision": "admitted",
+            "queue_job_id": "job_cli",
+            "status": "pending",
+            "log_path": "/tmp/job.log",
+        },
+    }
+    monkeypatch.setenv("PATH", "/bin")
+
+    code = cmd_queue_ci_run(
+        client,
+        "agent672",
+        policy="ci",
+        dedupe_token="abc123",
+        label="cli",
+        cwd=str(tmp_path),
+        timeout="10s",
+        job_type="tests",
+        env_pairs=["EXTRA=1"],
+        metadata_pairs=["commit=abc123"],
+        command=["--", sys.executable, "-m", "pytest"],
+        script_file=None,
+    )
+
+    assert code == 0
+    call = client.create_queue_policy_run.call_args.kwargs
+    assert call["policy"] == "ci"
+    assert call["dedupe_token"] == "abc123"
+    assert call["argv"] == [sys.executable, "-m", "pytest"]
+    assert call["env"]["PATH"] == "/bin"
+    assert call["env"]["EXTRA"] == "1"
+    assert call["metadata"] == {"commit": "abc123"}
     assert call["timeout_seconds"] == 10
 
 

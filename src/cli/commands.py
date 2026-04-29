@@ -3691,6 +3691,172 @@ def cmd_queue_run(
     return 0
 
 
+def _queue_metadata_from_cli(metadata_pairs: list[str]) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for pair in metadata_pairs:
+        if "=" not in pair:
+            raise ValueError(f"--metadata must be KEY=VALUE, got {pair!r}")
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("--metadata key cannot be empty")
+        metadata[key] = value
+    return metadata
+
+
+def _print_queue_policy_run(payload: dict) -> None:
+    decision = payload.get("decision", "unknown")
+    run_id = payload.get("id", "unknown")
+    policy = payload.get("policy", "?")
+    print(f"Queue policy run {run_id} ({policy}): {decision}")
+    if decision == "admitted":
+        print(f"Job: {payload.get('queue_job_id') or '-'}")
+        print(f"State: {payload.get('status') or 'pending'}")
+        print(f"Log: {payload.get('log_path') or '-'}")
+    else:
+        print(f"Suppressed: {payload.get('suppression_reason') or '-'}")
+        gates = payload.get("failed_gates") or []
+        if gates:
+            print(f"Failed gates: {', '.join(str(gate) for gate in gates)}")
+
+
+def cmd_queue_ci_run(
+    client: SessionManagerClient,
+    current_session_id: Optional[str],
+    *,
+    policy: str,
+    dedupe_token: Optional[str],
+    label: Optional[str],
+    cwd: Optional[str],
+    timeout: Optional[str],
+    job_type: Optional[str],
+    env_pairs: list[str],
+    metadata_pairs: list[str],
+    command: list[str],
+    script_file: Optional[str],
+) -> int:
+    """Submit one configured policy-controlled queue run."""
+    argv = list(command or [])
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    script = None
+    if script_file:
+        if argv:
+            print("Error: Use either --script-file or command argv, not both.", file=sys.stderr)
+            return 1
+        if script_file == "-":
+            script = sys.stdin.read()
+        else:
+            script = Path(script_file).expanduser().read_text(encoding="utf-8")
+    elif not argv:
+        print("Error: Expected command after -- or --script-file.", file=sys.stderr)
+        return 1
+
+    try:
+        env = _queue_env_from_cli(env_pairs)
+        metadata = _queue_metadata_from_cli(metadata_pairs)
+        timeout_seconds = parse_duration(timeout) if timeout else None
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    result = client.create_queue_policy_run(
+        policy=policy,
+        dedupe_token=dedupe_token,
+        label=label,
+        argv=argv or None,
+        script=script,
+        cwd=str(Path(cwd).expanduser().resolve()) if cwd else None,
+        env=env,
+        requester_session_id=current_session_id,
+        timeout_seconds=timeout_seconds,
+        job_type=job_type,
+        metadata=metadata,
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to create queue policy run"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    _print_queue_policy_run(result.get("data") or {})
+    return 0
+
+
+def cmd_queue_ci_status(
+    client: SessionManagerClient,
+    *,
+    policy: str,
+    dedupe_token: Optional[str],
+    run_id: Optional[str],
+    json_output: bool = False,
+) -> int:
+    result = client.get_queue_policy_status(policy=policy, dedupe_token=dedupe_token, run_id=run_id)
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Queue policy run not found"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    payload = result.get("data") or {}
+    if json_output:
+        print(json.dumps(payload, indent=2))
+        return 0
+    _print_queue_policy_run(payload)
+    if payload.get("exit_code") is not None:
+        print(f"Exit: {payload.get('exit_code')}")
+    return 0
+
+
+def cmd_queue_ci_history(
+    client: SessionManagerClient,
+    *,
+    policy: str,
+    limit: int,
+    include_suppressed: bool,
+    json_output: bool = False,
+) -> int:
+    result = client.list_queue_policy_runs(policy=policy, limit=limit, include_suppressed=include_suppressed)
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or "Failed to list queue policy runs"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    runs = (result.get("data") or {}).get("runs", [])
+    if json_output:
+        print(json.dumps(runs, indent=2))
+        return 0
+    if not runs:
+        print("No queue policy runs.")
+        return 0
+    headers = ["ID", "Policy", "Decision", "Status", "Token", "Job", "Reason"]
+    rows = [
+        [
+            str(run.get("id", "")),
+            str(run.get("policy", "")),
+            str(run.get("decision", "")),
+            str(run.get("status") or "-"),
+            str(run.get("dedupe_token") or "-"),
+            str(run.get("queue_job_id") or "-"),
+            str(run.get("suppression_reason") or "-"),
+        ]
+        for run in runs
+    ]
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], min(len(value), 80))
+    print("  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers)))
+    print("  ".join("-" * widths[idx] for idx in range(len(headers))))
+    for row in rows:
+        print("  ".join(value[: widths[idx]].ljust(widths[idx]) for idx, value in enumerate(row)))
+    return 0
+
+
 def cmd_queue_list(
     client: SessionManagerClient,
     current_session_id: Optional[str],

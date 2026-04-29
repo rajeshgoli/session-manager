@@ -1542,6 +1542,97 @@ class SessionManagerClient:
         detail = data.get("detail") if isinstance(data, dict) else None
         return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
 
+    def create_queue_policy_run(
+        self,
+        *,
+        policy: str,
+        dedupe_token: Optional[str],
+        label: Optional[str],
+        argv: Optional[list[str]],
+        script: Optional[str],
+        cwd: Optional[str],
+        env: dict[str, str],
+        requester_session_id: Optional[str],
+        timeout_seconds: Optional[int],
+        job_type: Optional[str],
+        metadata: Optional[dict[str, str]] = None,
+    ) -> dict:
+        """Create one configured policy-controlled queue run."""
+        payload = {
+            "policy": policy,
+            "dedupe_token": dedupe_token,
+            "label": label,
+            "argv": argv,
+            "script": script,
+            "cwd": cwd,
+            "env": env,
+            "requester_session_id": requester_session_id,
+            "timeout_seconds": timeout_seconds,
+            "type": job_type,
+            "metadata": metadata or {},
+        }
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            "/queue-policy-runs",
+            payload,
+            timeout=MUTATION_API_TIMEOUT,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def list_queue_policy_runs(
+        self,
+        *,
+        policy: str,
+        limit: int = 50,
+        include_suppressed: bool = False,
+    ) -> dict:
+        """List configured policy-controlled queue runs."""
+        params = [f"policy={urllib.parse.quote(policy)}", f"limit={int(limit)}"]
+        if include_suppressed:
+            params.append("include_suppressed=true")
+        data, status_code, unavailable = self._request_with_status("GET", f"/queue-policy-runs?{'&'.join(params)}")
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def get_queue_policy_run(self, run_id: str) -> dict:
+        """Fetch one configured policy-controlled queue run."""
+        data, status_code, unavailable = self._request_with_status(
+            "GET",
+            f"/queue-policy-runs/{urllib.parse.quote(run_id)}",
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def get_queue_policy_status(
+        self,
+        *,
+        policy: str,
+        dedupe_token: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> dict:
+        """Fetch status for the latest matching configured policy-controlled queue run."""
+        params = [f"policy={urllib.parse.quote(policy)}"]
+        if dedupe_token:
+            params.append(f"dedupe_token={urllib.parse.quote(dedupe_token)}")
+        if run_id:
+            params.append(f"id={urllib.parse.quote(run_id)}")
+        data, status_code, unavailable = self._request_with_status("GET", f"/queue-policy-runs/status?{'&'.join(params)}")
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
     def list_queue_jobs(
         self,
         *,

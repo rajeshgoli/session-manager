@@ -93,6 +93,7 @@ Policy fields:
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `type` | no | Underlying queue type: `tests`, `perf`, or `background`. Defaults to `background` for policy runs. |
+| `allow_type_override` | no | Boolean, default `false`. Allows `sm queue ci-run --type ...` to override configured `type`. |
 | `min_interval_seconds` | required for `mode=time|both` | Minimum elapsed time between admitted runs for this policy. |
 | `dedupe.mode` | no | `none`, `time`, `token`, or `both`. Defaults to `both` when `min_interval_seconds` and `token_window` are present; otherwise defaults to the gates that have enough config. |
 | `dedupe.token_window` | required for `mode=token|both` | Number of recent admitted dedupe tokens to remember. Small values such as 10 are expected. |

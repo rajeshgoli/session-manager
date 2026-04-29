@@ -740,7 +740,7 @@ class QueueJobResponse(BaseModel):
     label: str
     requester_session_id: Optional[str] = None
     requester_name: Optional[str] = None
-    notify_session_id: str
+    notify_session_id: Optional[str] = None
     notify_name: Optional[str] = None
     cwd: str
     argv: Optional[list[str]] = None
@@ -755,6 +755,48 @@ class QueueJobResponse(BaseModel):
     process_group_id: Optional[int] = None
     exit_code: Optional[int] = None
     log_path: Optional[str] = None
+
+
+class QueuePolicyRunCreateRequest(BaseModel):
+    """Request to submit one configured policy-controlled queue run."""
+    policy: str
+    dedupe_token: Optional[str] = None
+    label: Optional[str] = None
+    argv: Optional[list[str]] = None
+    script: Optional[str] = None
+    cwd: Optional[str] = None
+    env: dict[str, str] = Field(default_factory=dict)
+    requester_session_id: Optional[str] = None
+    timeout_seconds: Optional[int] = Field(default=None, gt=0)
+    type: Optional[str] = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class QueuePolicyRunResponse(BaseModel):
+    """Response payload for one configured policy-controlled queue run."""
+    id: str
+    policy: str
+    decision: str
+    suppression_reason: Optional[str] = None
+    failed_gates: list[str] = Field(default_factory=list)
+    dedupe_token: Optional[str] = None
+    requested_at: str
+    admitted_at: Optional[str] = None
+    queue_job_id: Optional[str] = None
+    notify_session_id: Optional[str] = None
+    label: Optional[str] = None
+    cwd: Optional[str] = None
+    queue_type: Optional[str] = None
+    command: Optional[list[str]] = None
+    script_path: Optional[str] = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+    status: Optional[str] = None
+    exit_code: Optional[int] = None
+    queued_at: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    log_path: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class CodexReviewRequestCreateRequest(BaseModel):
@@ -1904,7 +1946,11 @@ def create_app(
             if job.requester_session_id
             else None
         )
-        notify = app.state.session_manager.get_session(job.notify_session_id)
+        notify = (
+            app.state.session_manager.get_session(job.notify_session_id)
+            if job.notify_session_id
+            else None
+        )
         return QueueJobResponse(
             id=job.id,
             type=job.type,
@@ -6173,6 +6219,88 @@ Provide ONLY the summary, no preamble or questions."""
         if job is None:
             raise HTTPException(status_code=404, detail="Queue job not found")
         return _queue_job_to_response(job)
+
+    @app.post("/queue-policy-runs", response_model=QueuePolicyRunResponse)
+    async def create_queue_policy_run(request: QueuePolicyRunCreateRequest):
+        """Submit one configured policy-controlled queue run (#680)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        try:
+            run = await queue_runner.create_policy_run(
+                policy=request.policy,
+                dedupe_token=request.dedupe_token,
+                label=request.label,
+                argv=request.argv,
+                script=request.script,
+                cwd=request.cwd,
+                env=request.env,
+                requester_session_id=request.requester_session_id,
+                timeout=request.timeout_seconds,
+                job_type=request.type,
+                metadata=request.metadata,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return QueuePolicyRunResponse(**run.to_dict())
+
+    @app.get("/queue-policy-runs")
+    async def list_queue_policy_runs(
+        policy: str = Query(...),
+        limit: int = Query(50, ge=1, le=500),
+        include_suppressed: bool = Query(False),
+    ):
+        """List configured policy-controlled queue runs (#680)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        runs = queue_runner.list_policy_runs(policy=policy, limit=limit, include_suppressed=include_suppressed)
+        return {"runs": [run.to_dict() for run in runs]}
+
+    @app.get("/queue-policy-runs/status", response_model=QueuePolicyRunResponse)
+    async def get_queue_policy_run_status(
+        policy: str = Query(...),
+        dedupe_token: Optional[str] = Query(None),
+        id: Optional[str] = Query(None),
+    ):
+        """Fetch latest status for a configured policy-controlled queue run (#680)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        try:
+            run = queue_runner.get_policy_status(policy=policy, dedupe_token=dedupe_token, run_id=id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if run is None:
+            raise HTTPException(status_code=404, detail="Queue policy run not found")
+        return QueuePolicyRunResponse(**run.to_dict())
+
+    @app.get("/queue-policy-runs/{run_id}", response_model=QueuePolicyRunResponse)
+    async def get_queue_policy_run(run_id: str):
+        """Fetch one configured policy-controlled queue run (#680)."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        queue_runner = getattr(app.state.session_manager, "queue_runner", None)
+        if not queue_runner:
+            raise HTTPException(status_code=503, detail="Queue runner not configured")
+
+        run = queue_runner.get_policy_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Queue policy run not found")
+        return QueuePolicyRunResponse(**run.to_dict())
 
     @app.post("/codex-review-requests", response_model=CodexReviewRequestResponse)
     async def create_codex_review_request(request: CodexReviewRequestCreateRequest):
