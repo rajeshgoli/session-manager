@@ -542,6 +542,83 @@ async def test_policy_run_prunes_by_configured_retention(mock_sm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_policy_retention_preserves_token_window(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "policies": {
+                "ci": {
+                    "type": "tests",
+                    "cwd": str(tmp_path),
+                    "dedupe": {"mode": "token", "token_window": 3},
+                    "retention": {"admitted_runs": 1, "suppressed_runs": 1},
+                }
+            }
+        },
+    )
+
+    for token in ["one", "two", "three"]:
+        await runner.create_policy_run(
+            policy="ci",
+            dedupe_token=token,
+            label=token,
+            argv=[sys.executable, "-c", f"print('{token}')"],
+            script=None,
+            cwd=None,
+            env={},
+            requester_session_id="agent672",
+            timeout=None,
+        )
+
+    duplicate = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="one",
+        label="duplicate",
+        argv=[sys.executable, "-c", "print('duplicate')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+
+    admitted = runner.list_policy_runs(policy="ci")
+    assert len(admitted) == 3
+    assert duplicate.decision == "suppressed"
+    assert duplicate.suppression_reason == "dedupe_token"
+
+
+@pytest.mark.asyncio
+async def test_policy_status_by_id_enforces_policy_scope(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "policies": {
+                "ci": {"type": "tests", "cwd": str(tmp_path), "dedupe": {"mode": "none"}},
+                "other": {"type": "tests", "cwd": str(tmp_path), "dedupe": {"mode": "none"}},
+            }
+        },
+    )
+
+    run = await runner.create_policy_run(
+        policy="ci",
+        dedupe_token="one",
+        label="first",
+        argv=[sys.executable, "-c", "print('first')"],
+        script=None,
+        cwd=None,
+        env={},
+        requester_session_id="agent672",
+        timeout=None,
+    )
+
+    assert runner.get_policy_status(policy="ci", run_id=run.id).id == run.id
+    assert runner.get_policy_status(policy="other", run_id=run.id) is None
+
+
+@pytest.mark.asyncio
 async def test_policy_run_rejects_type_override_unless_enabled(mock_sm, tmp_path):
     runner = _runner(
         mock_sm,

@@ -381,9 +381,11 @@ class QueueRunner:
 
     def _policy_retention_config(self, policy_config: dict[str, Any]) -> tuple[int, int]:
         retention = policy_config.get("retention", {}) if isinstance(policy_config.get("retention", {}), dict) else {}
+        dedupe = policy_config.get("dedupe", {}) if isinstance(policy_config.get("dedupe", {}), dict) else {}
+        token_window = int(dedupe.get("token_window", 0) or 0)
         admitted = int(retention.get("admitted_runs", 200) or 200)
         suppressed = int(retention.get("suppressed_runs", 200) or 200)
-        return max(1, admitted), max(1, suppressed)
+        return max(1, admitted, token_window), max(1, suppressed)
 
     def _prune_policy_runs(self, policy: str, policy_config: dict[str, Any]) -> None:
         admitted_keep, suppressed_keep = self._policy_retention_config(policy_config)
@@ -762,7 +764,10 @@ class QueueRunner:
 
     def get_policy_status(self, *, policy: str, dedupe_token: Optional[str] = None, run_id: Optional[str] = None) -> Optional[PolicyRun]:
         if run_id:
-            return self.get_policy_run(run_id)
+            run = self.get_policy_run(run_id)
+            if run is None or run.policy != policy:
+                return None
+            return run
         if not dedupe_token:
             raise ValueError("dedupe_token or run_id is required")
         self._reconcile_policy_results()
