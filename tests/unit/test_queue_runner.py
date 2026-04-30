@@ -542,6 +542,39 @@ async def test_policy_run_prunes_by_configured_retention(mock_sm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_policy_run_fails_fast_when_queue_runner_disabled(mock_sm, tmp_path):
+    runner = _runner(
+        mock_sm,
+        tmp_path,
+        extra_config={
+            "enabled": False,
+            "policies": {
+                "ci": {
+                    "type": "tests",
+                    "cwd": str(tmp_path),
+                    "dedupe": {"mode": "token", "token_window": 3},
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="queue runner is disabled"):
+        await runner.create_policy_run(
+            policy="ci",
+            dedupe_token="same",
+            label="disabled",
+            argv=[sys.executable, "-c", "print('disabled')"],
+            script=None,
+            cwd=None,
+            env={},
+            requester_session_id="agent672",
+            timeout=None,
+        )
+
+    assert runner.list_policy_runs(policy="ci", include_suppressed=True) == []
+
+
+@pytest.mark.asyncio
 async def test_policy_run_create_job_failure_does_not_consume_gate(mock_sm, tmp_path):
     runner = _runner(
         mock_sm,

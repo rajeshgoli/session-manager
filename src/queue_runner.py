@@ -624,6 +624,8 @@ class QueueRunner:
         job_type: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> PolicyRun:
+        if not self.enabled:
+            raise ValueError("queue runner is disabled")
         policy_config = self._policy_from_config(policy)
         mode = self._policy_dedupe_mode(policy_config)
         dedupe_config = policy_config.get("dedupe", {}) if isinstance(policy_config.get("dedupe", {}), dict) else {}
