@@ -48,7 +48,7 @@ The missing piece is a focused discovery UI over stopped/restorable SM records.
 3. Do not add provider-level deletion or archive management.
 4. Do not live-probe every stopped tmux/provider runtime during list refresh.
 5. Do not replace `sm restore <identifier>`; this adds a discovery surface for humans.
-6. Do not make Codex app attachable. Headless providers can be restored, but the UI should report that no tmux attach is available.
+6. Do not make `codex-app` attachable. Tmux-backed `codex` and `codex-fork` sessions should restore and attach like Claude; headless `codex-app` sessions can be restored, but the UI should report that no tmux attach is available.
 
 ## User Experience
 
@@ -171,7 +171,7 @@ Do not call live provider commands or tmux probes to render readiness.
 - Parent is running while child is stopped: show parent context if available, but only stopped rows are selectable/restorable.
 - Parent is stopped while child is running: restore mode should show the stopped parent; running child visibility is optional and should not be selectable in v1 if included only as context.
 - Session lacks resume id: show it as non-restorable with `no-resume-id`; pressing Enter should show a clear error from the restore API.
-- `codex-app`: restore can be attempted through the existing restore API, but attach should be skipped with a headless message.
+- `codex` / `codex-fork`: restore and attach through the existing tmux-backed paths. `codex-app`: restore can be attempted through the existing restore API, but attach should be skipped with a headless message.
 - Session Manager unavailable: keep the existing watch flash behavior and retry on refresh interval.
 - Very large stopped-session history: client-side filtering is acceptable for v1 because `/sessions?include_stopped=true` already exists, but rendering should remain paginated by terminal viewport and avoid per-row live probes.
 
@@ -194,7 +194,7 @@ A separate `sm restore --interactive` alias can be added later if users want dis
 3. `/` filtering can find sessions by name, id, role, provider, repo/workdir, aliases, or parent context.
 4. `--top-level`, `Tab`, `C`, and `E` provide basic hierarchy collapse/expand controls.
 5. Pressing Enter restores the selected stopped session by id through the existing restore API.
-6. Tmux-backed restored sessions attach automatically and return to restore-browser mode after detach.
+6. Tmux-backed restored sessions, including Claude, codex, and codex-fork, attach automatically and return to restore-browser mode after detach.
 7. Headless restored sessions do not attempt tmux attach and show a clear message.
 8. Normal `sm watch` behavior is unchanged.
 9. Restore browsing does not run live tmux/provider probes on each refresh.
