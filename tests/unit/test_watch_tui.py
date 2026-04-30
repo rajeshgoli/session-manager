@@ -16,6 +16,7 @@ from src.cli.watch_tui import (
     _retire_confirmation_matches,
     _resolve_create_provider,
     _session_line,
+    build_restore_rows,
     build_watch_rows,
     can_attach_session,
     filter_sessions,
@@ -51,11 +52,19 @@ def _session(
     agent_status_at: str | None = None,
     agent_task_completed_at: str | None = None,
     pending_adoption_proposals: list[dict] | None = None,
+    friendly_name: str | None = None,
+    current_task: str | None = None,
+    aliases: list[str] | None = None,
+    stopped_at: str | None = None,
+    completed_at: str | None = None,
+    tmux_session: str | None = None,
+    provider_resume_id: str | None = None,
+    codex_thread_id: str | None = None,
 ):
     return {
         "id": session_id,
         "name": name,
-        "friendly_name": None,
+        "friendly_name": friendly_name,
         "working_dir": working_dir,
         "parent_session_id": parent_session_id,
         "role": role,
@@ -63,6 +72,11 @@ def _session(
         "activity_state": activity_state,
         "status": status,
         "last_activity": "2026-02-21T23:00:00",
+        "stopped_at": stopped_at,
+        "completed_at": completed_at,
+        "tmux_session": tmux_session or f"{provider}-{session_id}",
+        "provider_resume_id": provider_resume_id,
+        "codex_thread_id": codex_thread_id,
         "last_tool_name": last_tool_name,
         "last_tool_call": last_tool_call,
         "last_action_summary": last_action_summary,
@@ -73,6 +87,8 @@ def _session(
         "agent_status_at": agent_status_at,
         "agent_task_completed_at": agent_task_completed_at,
         "pending_adoption_proposals": pending_adoption_proposals or [],
+        "current_task": current_task,
+        "aliases": aliases or [],
     }
 
 
@@ -704,3 +720,79 @@ def test_detail_worker_does_not_block_request_path():
     assert snapshot.loading is False
     assert any("Read" in line for line in snapshot.action_lines)
     assert any("one" in line for line in snapshot.tail_lines)
+
+def test_filter_sessions_matches_restore_search_fields():
+    sessions = [
+        _session(
+            "parent1",
+            "em-parent",
+            "/tmp/repo-a",
+            provider="claude",
+            status="running",
+        ),
+        _session(
+            "child1",
+            "child",
+            "/tmp/repo-b",
+            parent_session_id="parent1",
+            provider="codex-fork",
+            status="stopped",
+            current_task="audit replay",
+            aliases=["reviewer-alias"],
+        ),
+    ]
+
+    assert [s["id"] for s in filter_sessions(sessions, text_filter="codex-fork")] == ["child1"]
+    assert [s["id"] for s in filter_sessions(sessions, text_filter="audit replay")] == ["child1"]
+    assert [s["id"] for s in filter_sessions(sessions, text_filter="reviewer-alias")] == ["child1"]
+    assert [s["id"] for s in filter_sessions(sessions, text_filter="em-parent")] == ["parent1", "child1"]
+
+
+def test_build_restore_rows_only_stopped_with_restore_columns():
+    sessions = [
+        _session("run1", "running", "/tmp/repo", status="running"),
+        _session(
+            "stop1",
+            "stopped-agent",
+            "/tmp/repo",
+            status="stopped",
+            provider="codex",
+            stopped_at="2026-02-21T22:00:00",
+        ),
+    ]
+
+    rows, selectable, repo_count = build_restore_rows(
+        [s for s in sessions if s["status"] == "stopped"],
+        all_sessions=sessions,
+    )
+
+    assert repo_count == 1
+    assert selectable == ["stop1"]
+    session_row = next(row for row in rows if row.kind == "session")
+    assert session_row.columns["ID"] == "stop1"
+    assert session_row.columns["Provider"] == "codex"
+    assert session_row.columns["Repo"] == "repo/"
+    assert session_row.columns["Retired"] != "-"
+    assert session_row.columns["Restore"] == "ready"
+
+
+def test_build_restore_rows_top_level_collapses_children_until_expanded():
+    sessions = [
+        _session("p1", "parent", "/tmp/repo", status="stopped"),
+        _session("c1", "child", "/tmp/repo", status="stopped", parent_session_id="p1"),
+    ]
+
+    rows, selectable, _ = build_restore_rows(sessions, top_level_only=True)
+    assert selectable == ["p1"]
+    assert all(row.session_id != "c1" for row in rows)
+
+    rows, selectable, _ = build_restore_rows(sessions, expanded_session_ids={"p1"}, top_level_only=True)
+    assert selectable == ["p1", "c1"]
+    child_row = next(row for row in rows if row.session_id == "c1")
+    assert child_row.columns["Session"].startswith("   `-child")
+
+
+def test_can_attach_session_supports_tmux_backed_codex_only():
+    assert can_attach_session(_session("c1", "codex", "/tmp", provider="codex"))
+    assert can_attach_session(_session("f1", "fork", "/tmp", provider="codex-fork"))
+    assert not can_attach_session(_session("a1", "app", "/tmp", provider="codex-app"))

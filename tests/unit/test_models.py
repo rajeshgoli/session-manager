@@ -48,6 +48,7 @@ class TestSession:
             completion_message="Task completed",
             spawned_at=datetime(2024, 1, 15, 10, 0, 0),
             completed_at=datetime(2024, 1, 15, 12, 0, 0),
+            stopped_at=datetime(2024, 1, 15, 12, 5, 0),
             tokens_used=5000,
             tools_used={"Read": 10, "Write": 5},
             last_tool_call=datetime(2024, 1, 15, 11, 30, 0),
@@ -86,6 +87,7 @@ class TestSession:
         assert restored.completion_message == original.completion_message
         assert restored.spawned_at == original.spawned_at
         assert restored.completed_at == original.completed_at
+        assert restored.stopped_at == original.stopped_at
         assert restored.tokens_used == original.tokens_used
         assert restored.tools_used == original.tools_used
         assert restored.last_tool_call == original.last_tool_call
@@ -117,6 +119,7 @@ class TestSession:
         assert session.tools_used == {}
         assert session.touched_repos == set()
         assert session.worktrees == []
+        assert session.stopped_at is None
         assert session.role is None
 
     def test_tmux_session_auto_generated(self):

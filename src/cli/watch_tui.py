@@ -57,6 +57,39 @@ _DYNAMIC_COLUMN_CAPS = {
     "Age": 6,
 }
 
+_RESTORE_COLUMN_SPECS = [
+    ("Session", 16, 4, "left"),
+    ("ID", 8, 0, "left"),
+    ("Parent", 18, 2, "left"),
+    ("Role", 8, 1, "left"),
+    ("Provider", 10, 1, "left"),
+    ("Repo", 12, 2, "left"),
+    ("Last Active", 11, 1, "left"),
+    ("Retired", 8, 1, "left"),
+    ("Restore", 10, 1, "left"),
+]
+_RESTORE_COLUMN_FLOORS = {
+    "Session": 8,
+    "ID": 4,
+    "Parent": 8,
+    "Role": 4,
+    "Provider": 6,
+    "Repo": 6,
+    "Last Active": 5,
+    "Retired": 5,
+    "Restore": 5,
+}
+_RESTORE_DYNAMIC_COLUMN_CAPS = {
+    "ID": 8,
+    "Parent": 36,
+    "Role": 16,
+    "Provider": 10,
+    "Repo": 28,
+    "Last Active": 12,
+    "Retired": 12,
+    "Restore": 12,
+}
+
 
 @dataclass
 class WatchRow:
@@ -476,11 +509,22 @@ def filter_sessions(
             continue
 
         if text_filter_norm:
+            parent = sessions_by_id.get(session.get("parent_session_id"))
+            aliases = session.get("aliases") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
             haystack = " ".join(
                 [
                     _session_name(session),
                     session.get("id", ""),
                     session.get("role", "") or "",
+                    session.get("provider", "") or "",
+                    session.get("status", "") or "",
+                    session.get("working_dir", "") or "",
+                    session.get("current_task", "") or "",
+                    _session_name(parent) if parent else "",
+                    session.get("parent_session_id", "") or "",
+                    " ".join(str(alias) for alias in aliases),
                 ]
             ).lower()
             if text_filter_norm not in haystack:
@@ -743,6 +787,110 @@ def build_watch_rows(
     return rows, selectable, len(groups)
 
 
+
+def _restore_status(session: dict) -> str:
+    provider = session.get("provider", "claude")
+    if provider == "codex-app":
+        return "headless"
+    return "ready" if session.get("tmux_session") else "no-tmux"
+
+
+def _restore_retired_age(session: dict) -> str:
+    return _age_from_iso(session.get("stopped_at") or session.get("completed_at") or session.get("last_activity"))
+
+
+def build_restore_rows(
+    stopped_sessions: list[dict],
+    all_sessions: Optional[list[dict]] = None,
+    expanded_session_ids: Optional[set[str]] = None,
+    top_level_only: bool = False,
+) -> tuple[list[WatchRow], list[str], int]:
+    """Build grouped restore-browser rows for stopped sessions."""
+    rows: list[WatchRow] = []
+    selectable: list[str] = []
+    expanded = expanded_session_ids or set()
+    stopped_by_id = {session["id"]: session for session in stopped_sessions if session.get("id")}
+    sessions_by_id = {
+        session["id"]: session
+        for session in (all_sessions or stopped_sessions)
+        if session.get("id")
+    }
+    groups: dict[str, list[dict]] = {}
+    roots_by_repo: dict[str, list[dict]] = {}
+    children_by_parent: dict[str, list[dict]] = {}
+
+    for session in stopped_sessions:
+        if session.get("status") != "stopped":
+            continue
+        session_id = session.get("id")
+        if not session_id:
+            continue
+        key = _repo_key(session.get("working_dir", ""))
+        groups.setdefault(key, []).append(session)
+        parent_id = session.get("parent_session_id")
+        if parent_id and parent_id in stopped_by_id:
+            children_by_parent.setdefault(parent_id, []).append(session)
+        else:
+            roots_by_repo.setdefault(key, []).append(session)
+
+    sort_key = lambda s: (_session_name(s).lower(), s.get("id", ""))
+    for root_list in roots_by_repo.values():
+        root_list.sort(key=sort_key)
+    for child_list in children_by_parent.values():
+        child_list.sort(key=sort_key)
+
+    def _tree_prefix(ancestors_last: list[bool], is_last: bool) -> str:
+        connector = "`-" if is_last else "|-"
+        prefix_parts = []
+        for ancestor_is_last in ancestors_last:
+            prefix_parts.append("   " if ancestor_is_last else "|  ")
+        return "".join(prefix_parts) + connector
+
+    def render_session(session: dict, ancestors_last: list[bool], is_last: bool):
+        tree_prefix = _tree_prefix(ancestors_last, is_last)
+        session_id = session.get("id")
+        repo_label = _repo_label(session.get("working_dir") or "")
+        columns = {
+            "Session": f"{tree_prefix}{_session_name(session)}",
+            "ID": session_id or "",
+            "Parent": _parent_label(session, sessions_by_id),
+            "Role": session.get("role") or "-",
+            "Provider": session.get("provider", "claude"),
+            "Repo": repo_label,
+            "Last Active": _age_from_iso(session.get("last_activity")),
+            "Retired": _restore_retired_age(session),
+            "Restore": _restore_status(session),
+        }
+        rows.append(
+            WatchRow(
+                kind="session",
+                session_id=session_id,
+                activity_state="idle",
+                columns=columns,
+            )
+        )
+        if session_id:
+            selectable.append(session_id)
+
+        if top_level_only and session_id not in expanded:
+            return
+        children = children_by_parent.get(session_id or "", [])
+        for idx, child in enumerate(children):
+            render_session(child, ancestors_last + [is_last], idx == len(children) - 1)
+
+    for repo_key in sorted(groups.keys()):
+        top_level_roots = roots_by_repo.get(repo_key, [])
+        if not top_level_roots:
+            continue
+        repo_header = _repo_label(repo_key) if repo_key != "unknown" else "unknown/"
+        if repo_key not in ("unknown",):
+            repo_header = f"{repo_header} ({repo_key})"
+        rows.append(WatchRow(kind="repo", text=repo_header))
+        for idx, root in enumerate(top_level_roots):
+            render_session(root, [], idx == len(top_level_roots) - 1)
+
+    return rows, selectable, len(groups)
+
 def _truncate(text: str, width: int, align: str = "left") -> str:
     if width <= 0:
         return ""
@@ -761,18 +909,24 @@ def _content_len(text: str) -> int:
     return len(ANSI_RE.sub("", text or ""))
 
 
-def _compute_static_column_widths(content_width: int) -> dict[str, int]:
+def _compute_static_column_widths(
+    content_width: int,
+    column_specs: Optional[list[tuple[str, int, int, str]]] = None,
+    column_floors: Optional[dict[str, int]] = None,
+) -> dict[str, int]:
+    specs = column_specs or _COLUMN_SPECS
+    floors = column_floors or _COLUMN_FLOORS
     if content_width <= 10:
-        return {name: 1 for name, _, _, _ in _COLUMN_SPECS}
+        return {name: 1 for name, _, _, _ in specs}
 
-    min_widths = {name: minimum for name, minimum, _, _ in _COLUMN_SPECS}
+    min_widths = {name: minimum for name, minimum, _, _ in specs}
     widths = dict(min_widths)
-    sep_total = len(_COLUMN_SEP) * (len(_COLUMN_SPECS) - 1)
+    sep_total = len(_COLUMN_SEP) * (len(specs) - 1)
     min_total = sum(min_widths.values()) + sep_total
 
     if content_width >= min_total:
         extra = content_width - min_total
-        weighted = [entry for entry in _COLUMN_SPECS if entry[2] > 0]
+        weighted = [entry for entry in specs if entry[2] > 0]
         total_weight = sum(weight for _, _, weight, _ in weighted) or 1
         for name, _, weight, _ in weighted:
             add = (extra * weight) // total_weight
@@ -788,11 +942,11 @@ def _compute_static_column_widths(content_width: int) -> dict[str, int]:
         return widths
 
     deficit = min_total - content_width
-    shrink_order = ["Last", "Session", "Parent", "Activity", "Role", "Provider", "Status", "Age"]
+    shrink_order = [name for name, _, _, _ in reversed(specs)]
     while deficit > 0:
         changed = False
         for name in shrink_order:
-            if widths[name] > _COLUMN_FLOORS[name] and deficit > 0:
+            if widths[name] > floors.get(name, 1) and deficit > 0:
                 widths[name] -= 1
                 deficit -= 1
                 changed = True
@@ -802,41 +956,51 @@ def _compute_static_column_widths(content_width: int) -> dict[str, int]:
     return widths
 
 
-def _compute_column_widths(content_width: int, rows: Optional[list[WatchRow]] = None) -> dict[str, int]:
+def _compute_column_widths(
+    content_width: int,
+    rows: Optional[list[WatchRow]] = None,
+    column_specs: Optional[list[tuple[str, int, int, str]]] = None,
+    column_floors: Optional[dict[str, int]] = None,
+    dynamic_caps: Optional[dict[str, int]] = None,
+) -> dict[str, int]:
+    specs = column_specs or _COLUMN_SPECS
+    floors = column_floors or _COLUMN_FLOORS
+    caps = dynamic_caps or _DYNAMIC_COLUMN_CAPS
     if not rows:
-        return _compute_static_column_widths(content_width)
+        return _compute_static_column_widths(content_width, specs, floors)
     if content_width <= 10:
-        return {name: 1 for name, _, _, _ in _COLUMN_SPECS}
+        return {name: 1 for name, _, _, _ in specs}
 
     session_rows = [row for row in rows if row.kind == "session"]
     if not session_rows:
-        return _compute_static_column_widths(content_width)
+        return _compute_static_column_widths(content_width, specs, floors)
 
     widths: dict[str, int] = {}
-    for name, _, _, _ in _COLUMN_SPECS:
+    for name, _, _, _ in specs:
         if name == "ID":
-            widths[name] = _DYNAMIC_COLUMN_CAPS["ID"]
+            widths[name] = caps.get("ID", 8)
             continue
         desired = len(name)
         for row in session_rows:
             desired = max(desired, _content_len(row.columns.get(name, "")))
-        cap = _DYNAMIC_COLUMN_CAPS.get(name)
+        cap = caps.get(name)
         if cap is not None:
             desired = min(desired, max(len(name), cap))
         widths[name] = max(1, desired)
 
-    sep_total = len(_COLUMN_SEP) * (len(_COLUMN_SPECS) - 1)
+    sep_total = len(_COLUMN_SEP) * (len(specs) - 1)
     used = sum(widths.values()) + sep_total
     if used <= content_width:
-        widths["Session"] += content_width - used
+        if "Session" in widths:
+            widths["Session"] += content_width - used
         return widths
 
     deficit = used - content_width
-    shrink_order = ["Last", "Parent", "Role", "Activity", "Provider", "Status", "Session", "Age", "ID"]
+    shrink_order = [name for name, _, _, _ in reversed(specs)]
     while deficit > 0:
         changed = False
         for name in shrink_order:
-            if widths[name] > _COLUMN_FLOORS[name] and deficit > 0:
+            if widths[name] > floors.get(name, 1) and deficit > 0:
                 widths[name] -= 1
                 deficit -= 1
                 changed = True
@@ -846,19 +1010,25 @@ def _compute_column_widths(content_width: int, rows: Optional[list[WatchRow]] = 
     return widths
 
 
-def _header_line(widths: dict[str, int]) -> str:
+def _header_line(
+    widths: dict[str, int],
+    column_specs: Optional[list[tuple[str, int, int, str]]] = None,
+) -> str:
     parts = []
-    for name, _, _, align in _COLUMN_SPECS:
+    for name, _, _, align in (column_specs or _COLUMN_SPECS):
         parts.append(_truncate(name, widths[name], align=align))
     return _COLUMN_SEP.join(parts)
 
 
-def _session_line(row: WatchRow, widths: dict[str, int]) -> str:
+def _session_line(
+    row: WatchRow,
+    widths: dict[str, int],
+    column_specs: Optional[list[tuple[str, int, int, str]]] = None,
+) -> str:
     parts = []
-    for name, _, _, align in _COLUMN_SPECS:
+    for name, _, _, align in (column_specs or _COLUMN_SPECS):
         parts.append(_truncate(row.columns.get(name, ""), widths[name], align=align))
     return _COLUMN_SEP.join(parts)
-
 
 def _prompt_input(stdscr, prompt: str) -> str:
     height, width = stdscr.getmaxyx()
@@ -1057,18 +1227,22 @@ def _render(
     filter_text: Optional[str],
     flash_message: Optional[str],
     palette: dict[str, int],
+    restore_mode: bool = False,
 ):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
-    title = f"sm watch  {total_sessions} agents - {repo_count} repos"
+    title = f"sm watch{' --restore' if restore_mode else ''}  {total_sessions} agents - {repo_count} repos"
     if filter_text:
         title += f" - filter: {filter_text}"
     stdscr.addnstr(0, 0, title, _render_columns(width, 0), curses.A_BOLD | palette["header"])
 
     content_width = max(1, _render_columns(width, 2))
-    widths = _compute_column_widths(content_width, rows)
-    stdscr.addnstr(1, 2, _header_line(widths), _render_columns(width, 2), curses.A_BOLD | palette["header"])
+    column_specs = _RESTORE_COLUMN_SPECS if restore_mode else _COLUMN_SPECS
+    column_floors = _RESTORE_COLUMN_FLOORS if restore_mode else _COLUMN_FLOORS
+    dynamic_caps = _RESTORE_DYNAMIC_COLUMN_CAPS if restore_mode else _DYNAMIC_COLUMN_CAPS
+    widths = _compute_column_widths(content_width, rows, column_specs, column_floors, dynamic_caps)
+    stdscr.addnstr(1, 2, _header_line(widths, column_specs), _render_columns(width, 2), curses.A_BOLD | palette["header"])
 
     max_rows = max(0, height - _RESERVED_SCREEN_ROWS)
     display_rows = rows[scroll_offset: scroll_offset + max_rows]
@@ -1085,7 +1259,7 @@ def _render(
             attr = base_attr
             if is_selected:
                 attr = base_attr | curses.A_REVERSE | curses.A_BOLD
-            stdscr.addnstr(y, 0, f"{marker} {_session_line(row, widths)}", _render_columns(width, 0), attr)
+            stdscr.addnstr(y, 0, f"{marker} {_session_line(row, widths, column_specs)}", _render_columns(width, 0), attr)
         elif row.kind == "repo":
             stdscr.addnstr(y, 2, row.text, _render_columns(width, 2), curses.A_BOLD | palette["repo"])
         elif row.kind == "repo_ref":
@@ -1106,7 +1280,10 @@ def _render(
             _flash_attr(flash_message, palette),
         )
 
-    footer = "j/k: move  +: create  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
+    if restore_mode:
+        footer = "j/k: move  Enter: restore+attach  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
+    else:
+        footer = "j/k: move  +: create  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
     stdscr.refresh()
 
@@ -1116,6 +1293,8 @@ def run_watch_tui(
     repo_filter: Optional[str] = None,
     role_filter: Optional[str] = None,
     interval: float = 2.0,
+    restore_mode: bool = False,
+    top_level: bool = False,
 ) -> int:
     """Run the sm watch curses UI."""
 
@@ -1130,7 +1309,7 @@ def run_watch_tui(
             rollout_flags and rollout_flags.get("enable_observability_projection", True)
         )
 
-        detail_worker = DetailFetchWorker(client=client, codex_projection_enabled=codex_projection_enabled)
+        detail_worker = None if restore_mode else DetailFetchWorker(client=client, codex_projection_enabled=codex_projection_enabled)
 
         try:
             selected_session_id: Optional[str] = None
@@ -1152,40 +1331,52 @@ def run_watch_tui(
             while True:
                 now = time.monotonic()
                 if now >= next_refresh:
-                    listed = client.list_sessions()
+                    listed = client.list_sessions(include_stopped=restore_mode)
                     if listed is None:
                         flash_message = "Session manager unavailable"
                         flash_until = now + 2.5
                     else:
-                        latest_sessions = filter_sessions(
+                        filtered = filter_sessions(
                             listed,
                             repo_filter=repo_filter,
                             role_filter=role_filter,
                             text_filter=text_filter,
                         )
-                        latest_by_id = {s.get("id", ""): s for s in latest_sessions if s.get("id")}
-                        total_sessions = len(latest_sessions)
-                        detail_cache = {
-                            sid: detail_worker.get(sid)
-                            for sid in expanded_session_ids
-                            if sid in latest_by_id
-                        }
-                        rows, selectable, repo_count = build_watch_rows(
-                            latest_sessions,
-                            spinner_index=spinner_index,
-                            expanded_session_ids=expanded_session_ids,
-                            detail_cache=detail_cache,
-                            codex_projection_enabled=codex_projection_enabled,
-                        )
-                        spinner_index += 1
+                        if restore_mode:
+                            latest_sessions = [s for s in filtered if s.get("status") == "stopped"]
+                            latest_by_id = {s.get("id", ""): s for s in latest_sessions if s.get("id")}
+                            total_sessions = len(latest_sessions)
+                            rows, selectable, repo_count = build_restore_rows(
+                                latest_sessions,
+                                all_sessions=listed,
+                                expanded_session_ids=expanded_session_ids,
+                                top_level_only=top_level,
+                            )
+                        else:
+                            latest_sessions = filtered
+                            latest_by_id = {s.get("id", ""): s for s in latest_sessions if s.get("id")}
+                            total_sessions = len(latest_sessions)
+                            detail_cache = {
+                                sid: detail_worker.get(sid)
+                                for sid in expanded_session_ids
+                                if sid in latest_by_id
+                            } if detail_worker else {}
+                            rows, selectable, repo_count = build_watch_rows(
+                                latest_sessions,
+                                spinner_index=spinner_index,
+                                expanded_session_ids=expanded_session_ids,
+                                detail_cache=detail_cache,
+                                codex_projection_enabled=codex_projection_enabled,
+                            )
+                            spinner_index += 1
+                            # Prune stale expanded IDs and enqueue refresh for active details.
+                            expanded_session_ids.intersection_update(set(selectable))
+                            for sid in expanded_session_ids:
+                                session = latest_by_id.get(sid)
+                                if session and detail_worker:
+                                    detail_worker.request(session)
                         if selected_session_id not in selectable:
                             selected_session_id = selectable[0] if selectable else None
-                        # Prune stale expanded IDs and enqueue refresh for active details.
-                        expanded_session_ids.intersection_update(set(selectable))
-                        for sid in expanded_session_ids:
-                            session = latest_by_id.get(sid)
-                            if session:
-                                detail_worker.request(session)
 
                     next_refresh = now + max(0.2, interval)
 
@@ -1221,6 +1412,7 @@ def run_watch_tui(
                     filter_text=text_filter,
                     flash_message=flash_message,
                     palette=palette,
+                    restore_mode=restore_mode,
                 )
 
                 key = stdscr.getch()
@@ -1247,10 +1439,11 @@ def run_watch_tui(
                     continue
 
                 if key in (ord("r"),):
-                    for sid in expanded_session_ids:
-                        session = latest_by_id.get(sid)
-                        if session:
-                            detail_worker.request(session)
+                    if detail_worker:
+                        for sid in expanded_session_ids:
+                            session = latest_by_id.get(sid)
+                            if session:
+                                detail_worker.request(session)
                     next_refresh = 0.0
                     continue
 
@@ -1271,9 +1464,24 @@ def run_watch_tui(
                         expanded_session_ids.remove(selected_session_id)
                     else:
                         expanded_session_ids.add(selected_session_id)
-                        if selected:
+                        if selected and detail_worker:
                             detail_worker.request(selected)
                     next_refresh = 0.0
+                    continue
+
+                if restore_mode and key in (ord("C"),):
+                    expanded_session_ids.clear()
+                    next_refresh = 0.0
+                    continue
+
+                if restore_mode and key in (ord("E"),):
+                    expanded_session_ids.update(selectable)
+                    next_refresh = 0.0
+                    continue
+
+                if restore_mode and key in (ord("s"), ord("+"), ord("K"), ord("n"), ord("A"), ord("X")):
+                    flash_message = "Not available in restore mode"
+                    flash_until = time.monotonic() + 2.0
                     continue
 
                 if key in (ord("s"),):
@@ -1447,6 +1655,24 @@ def run_watch_tui(
                         flash_message = "No session selected"
                         flash_until = time.monotonic() + 2.0
                         continue
+                    if restore_mode:
+                        result = client.restore_session_result(selected_session_id)
+                        if result.get("unavailable"):
+                            flash_message = "Session manager unavailable"
+                        elif result.get("ok"):
+                            restored = result.get("data") or selected
+                            selected_session_id = restored.get("id") or selected_session_id
+                            tmux_session = restored.get("tmux_session")
+                            if can_attach_session(restored) and tmux_session:
+                                _attach_tmux(stdscr, tmux_session)
+                                flash_message = f"Restored {selected_session_id}"
+                            else:
+                                flash_message = f"Restored {selected_session_id} (headless)"
+                        else:
+                            flash_message = str(result.get("detail") or result.get("error") or "Failed to restore session")
+                        flash_until = time.monotonic() + 2.5
+                        next_refresh = 0.0
+                        continue
                     if not can_attach_session(selected):
                         flash_message = "no terminal (use s to send)"
                         flash_until = time.monotonic() + 2.5
@@ -1459,7 +1685,8 @@ def run_watch_tui(
                     _attach_tmux(stdscr, tmux_session)
                     next_refresh = 0.0
         finally:
-            detail_worker.stop()
+            if detail_worker:
+                detail_worker.stop()
 
     curses.wrapper(_loop)
     return 0

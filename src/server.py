@@ -509,6 +509,8 @@ class SessionResponse(BaseModel):
     status: str
     created_at: str
     last_activity: str
+    completed_at: Optional[str] = None
+    stopped_at: Optional[str] = None
     tmux_session: str
     provider: Optional[str] = "claude"
     friendly_name: Optional[str] = None
@@ -1836,6 +1838,8 @@ def create_app(
             status=session.status.value,
             created_at=session.created_at.isoformat(),
             last_activity=session.last_activity.isoformat(),
+            completed_at=session.completed_at.isoformat() if session.completed_at else None,
+            stopped_at=session.stopped_at.isoformat() if session.stopped_at else None,
             tmux_session=session.tmux_session,
             provider=provider,
             friendly_name=_effective_session_name(

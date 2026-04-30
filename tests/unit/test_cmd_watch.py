@@ -28,6 +28,8 @@ def test_cmd_watch_delegates_to_watch_tui():
         repo_filter="/tmp/repo",
         role_filter="engineer",
         interval=2.5,
+        restore_mode=False,
+        top_level=False,
     )
 
 
@@ -49,3 +51,19 @@ def test_main_watch_rejects_managed_session_before_dispatch():
 
     assert exc_info.value.code == 1
     mock_cmd_watch.assert_not_called()
+
+def test_cmd_watch_delegates_restore_mode_to_watch_tui():
+    client = MagicMock()
+    with patch.dict(os.environ, {"CLAUDE_SESSION_MANAGER_ID": ""}, clear=False):
+        with patch("src.cli.watch_tui.run_watch_tui", return_value=0) as mock_run:
+            rc = cmd_watch(client, repo=None, role=None, interval=1.0, restore_mode=True, top_level=True)
+
+    assert rc == 0
+    mock_run.assert_called_once_with(
+        client=client,
+        repo_filter=None,
+        role_filter=None,
+        interval=1.0,
+        restore_mode=True,
+        top_level=True,
+    )
