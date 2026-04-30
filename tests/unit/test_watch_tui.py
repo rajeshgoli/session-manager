@@ -792,6 +792,45 @@ def test_build_restore_rows_top_level_collapses_children_until_expanded():
     assert child_row.columns["Session"].startswith("   `-child")
 
 
+
+
+def test_build_restore_rows_sorts_by_retired_descending_by_default():
+    sessions = [
+        _session("old", "old", "/tmp/repo", status="stopped", stopped_at="2026-02-21T20:00:00"),
+        _session("new", "new", "/tmp/repo", status="stopped", stopped_at="2026-02-21T22:00:00"),
+    ]
+
+    _, selectable, _ = build_restore_rows(sessions)
+
+    assert selectable == ["new", "old"]
+
+
+def test_build_restore_rows_sorts_by_last_active_or_name():
+    sessions = [
+        _session("beta", "beta", "/tmp/repo", status="stopped", last_action_at=None),
+        _session("alpha", "alpha", "/tmp/repo", status="stopped", last_action_at=None),
+    ]
+    sessions[0]["last_activity"] = "2026-02-21T21:00:00"
+    sessions[1]["last_activity"] = "2026-02-21T22:00:00"
+
+    _, selectable, _ = build_restore_rows(sessions, sort_mode="last-active")
+    assert selectable == ["alpha", "beta"]
+
+    _, selectable, _ = build_restore_rows(sessions, sort_mode="name")
+    assert selectable == ["alpha", "beta"]
+
+
+def test_build_restore_rows_collapsed_session_hides_children_when_default_expanded():
+    sessions = [
+        _session("p1", "parent", "/tmp/repo", status="stopped"),
+        _session("c1", "child", "/tmp/repo", status="stopped", parent_session_id="p1"),
+    ]
+
+    rows, selectable, _ = build_restore_rows(sessions, collapsed_session_ids={"p1"})
+
+    assert selectable == ["p1"]
+    assert all(row.session_id != "c1" for row in rows)
+
 def test_can_attach_session_supports_tmux_backed_codex_only():
     assert can_attach_session(_session("c1", "codex", "/tmp", provider="codex"))
     assert can_attach_session(_session("f1", "fork", "/tmp", provider="codex-fork"))
