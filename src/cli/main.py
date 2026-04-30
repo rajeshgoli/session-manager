@@ -298,6 +298,30 @@ def main():
     queue_cancel_parser = queue_subparsers.add_parser("cancel", help="Cancel one queue runner job")
     queue_cancel_parser.add_argument("job_id", help="Queue job ID")
 
+    queue_ci_run_parser = queue_subparsers.add_parser("ci-run", help="Submit a configured policy-controlled queue run")
+    queue_ci_run_parser.add_argument("--policy", required=True, help="Configured queue policy name")
+    queue_ci_run_parser.add_argument("--dedupe-token", help="Bounded dedupe token, such as a commit SHA")
+    queue_ci_run_parser.add_argument("--label", help="Human-readable run label")
+    queue_ci_run_parser.add_argument("--cwd", help="Working directory override")
+    queue_ci_run_parser.add_argument("--timeout", help="Timeout duration override, e.g. 90s, 10m, 2h")
+    queue_ci_run_parser.add_argument("--type", dest="job_type", choices=["tests", "perf", "background"], help="Queue workload type override")
+    queue_ci_run_parser.add_argument("--env", dest="env_pairs", action="append", default=[], help="Environment override KEY=VALUE")
+    queue_ci_run_parser.add_argument("--metadata", dest="metadata_pairs", action="append", default=[], help="Metadata KEY=VALUE")
+    queue_ci_run_parser.add_argument("--script-file", help="Script file to run, or - for stdin")
+    queue_ci_run_parser.add_argument("queue_argv", nargs=argparse.REMAINDER, help="Command argv after --")
+
+    queue_ci_status_parser = queue_subparsers.add_parser("ci-status", help="Show one configured policy-controlled queue run")
+    queue_ci_status_parser.add_argument("--policy", required=True, help="Configured queue policy name")
+    queue_ci_status_parser.add_argument("--dedupe-token", help="Look up the latest admitted run by token")
+    queue_ci_status_parser.add_argument("--id", dest="run_id", help="Look up a specific queue policy run ID")
+    queue_ci_status_parser.add_argument("--json", action="store_true", help="Output JSON")
+
+    queue_ci_history_parser = queue_subparsers.add_parser("ci-history", help="List configured policy-controlled queue runs")
+    queue_ci_history_parser.add_argument("--policy", required=True, help="Configured queue policy name")
+    queue_ci_history_parser.add_argument("--limit", type=int, default=50, help="Maximum runs to show")
+    queue_ci_history_parser.add_argument("--include-suppressed", action="store_true", help="Include suppressed run attempts")
+    queue_ci_history_parser.add_argument("--json", action="store_true", help="Output JSON")
+
     # sm request-codex-review <pr>|list|status|cancel
     request_codex_review_parser = subparsers.add_parser(
         "request-codex-review",
@@ -934,7 +958,38 @@ def main():
             sys.exit(commands.cmd_queue_status(client, args.job_id, json_output=args.json))
         if args.queue_command == "cancel":
             sys.exit(commands.cmd_queue_cancel(client, args.job_id))
-        print("Error: queue subcommand required (run, list, status, cancel)", file=sys.stderr)
+        if args.queue_command == "ci-run":
+            sys.exit(commands.cmd_queue_ci_run(
+                client,
+                current_session_id=session_id,
+                policy=args.policy,
+                dedupe_token=args.dedupe_token,
+                label=args.label,
+                cwd=args.cwd,
+                timeout=args.timeout,
+                job_type=args.job_type,
+                env_pairs=args.env_pairs,
+                metadata_pairs=args.metadata_pairs,
+                command=args.queue_argv,
+                script_file=args.script_file,
+            ))
+        if args.queue_command == "ci-status":
+            sys.exit(commands.cmd_queue_ci_status(
+                client,
+                policy=args.policy,
+                dedupe_token=args.dedupe_token,
+                run_id=args.run_id,
+                json_output=args.json,
+            ))
+        if args.queue_command == "ci-history":
+            sys.exit(commands.cmd_queue_ci_history(
+                client,
+                policy=args.policy,
+                limit=args.limit,
+                include_suppressed=args.include_suppressed,
+                json_output=args.json,
+            ))
+        print("Error: queue subcommand required (run, list, status, cancel, ci-run, ci-status, ci-history)", file=sys.stderr)
         sys.exit(2)
     elif args.command == "request-codex-review":
         action = args.action_or_pr
