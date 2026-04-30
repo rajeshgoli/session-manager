@@ -609,6 +609,12 @@ def main():
         action="store_true",
         help="In --restore mode, start with only top-level stopped sessions expanded on demand",
     )
+    watch_parser.add_argument(
+        "--sort",
+        choices=("retired", "last-active", "name"),
+        default="retired",
+        help="In --restore mode, initial sort order (default: retired)",
+    )
 
     # sm tail <session> [-n N] [--raw] [--db-path PATH]
     tail_parser = subparsers.add_parser(
@@ -1128,6 +1134,7 @@ def main():
             interval=args.interval,
             restore_mode=args.restore,
             top_level=args.top_level,
+            restore_sort=args.sort,
         ))
     elif args.command == "tail":
         sys.exit(commands.cmd_tail(

@@ -803,12 +803,15 @@ def build_restore_rows(
     stopped_sessions: list[dict],
     all_sessions: Optional[list[dict]] = None,
     expanded_session_ids: Optional[set[str]] = None,
+    collapsed_session_ids: Optional[set[str]] = None,
     top_level_only: bool = False,
+    sort_mode: str = "retired",
 ) -> tuple[list[WatchRow], list[str], int]:
     """Build grouped restore-browser rows for stopped sessions."""
     rows: list[WatchRow] = []
     selectable: list[str] = []
     expanded = expanded_session_ids or set()
+    collapsed = collapsed_session_ids or set()
     stopped_by_id = {session["id"]: session for session in stopped_sessions if session.get("id")}
     sessions_by_id = {
         session["id"]: session
@@ -833,11 +836,27 @@ def build_restore_rows(
         else:
             roots_by_repo.setdefault(key, []).append(session)
 
-    sort_key = lambda s: (_session_name(s).lower(), s.get("id", ""))
+    def _timestamp_sort_value(ts: Optional[str]) -> float:
+        parsed = _parse_iso(ts)
+        if not parsed:
+            return float("-inf")
+        try:
+            return parsed.timestamp()
+        except Exception:
+            return float("-inf")
+
+    def restore_sort_key(session: dict):
+        name_key = (_session_name(session).lower(), session.get("id", ""))
+        if sort_mode == "last-active":
+            return (-_timestamp_sort_value(session.get("last_activity")), *name_key)
+        if sort_mode == "retired":
+            return (-_timestamp_sort_value(session.get("stopped_at") or session.get("completed_at") or session.get("last_activity")), *name_key)
+        return name_key
+
     for root_list in roots_by_repo.values():
-        root_list.sort(key=sort_key)
+        root_list.sort(key=restore_sort_key)
     for child_list in children_by_parent.values():
-        child_list.sort(key=sort_key)
+        child_list.sort(key=restore_sort_key)
 
     def _tree_prefix(ancestors_last: list[bool], is_last: bool) -> str:
         connector = "`-" if is_last else "|-"
@@ -872,7 +891,7 @@ def build_restore_rows(
         if session_id:
             selectable.append(session_id)
 
-        if top_level_only and session_id not in expanded:
+        if (top_level_only and session_id not in expanded) or session_id in collapsed:
             return
         children = children_by_parent.get(session_id or "", [])
         for idx, child in enumerate(children):
@@ -1228,6 +1247,7 @@ def _render(
     flash_message: Optional[str],
     palette: dict[str, int],
     restore_mode: bool = False,
+    restore_sort: str = "retired",
 ):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
@@ -1281,7 +1301,7 @@ def _render(
         )
 
     if restore_mode:
-        footer = "j/k: move  Enter: restore+attach  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
+        footer = f"j/k: move  Enter: restore+attach  o: sort={restore_sort}  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
     else:
         footer = "j/k: move  +: create  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
@@ -1295,6 +1315,7 @@ def run_watch_tui(
     interval: float = 2.0,
     restore_mode: bool = False,
     top_level: bool = False,
+    restore_sort: str = "retired",
 ) -> int:
     """Run the sm watch curses UI."""
 
@@ -1321,6 +1342,9 @@ def run_watch_tui(
             latest_sessions: list[dict] = []
             latest_by_id: dict[str, dict] = {}
             expanded_session_ids: set[str] = set()
+            collapsed_session_ids: set[str] = set()
+            restore_tree_collapsed = top_level
+            restore_sort_mode = restore_sort
             repo_count = 0
             total_sessions = 0
             spinner_index = 0
@@ -1350,7 +1374,9 @@ def run_watch_tui(
                                 latest_sessions,
                                 all_sessions=listed,
                                 expanded_session_ids=expanded_session_ids,
-                                top_level_only=top_level,
+                                collapsed_session_ids=collapsed_session_ids,
+                                top_level_only=restore_tree_collapsed,
+                                sort_mode=restore_sort_mode,
                             )
                         else:
                             latest_sessions = filtered
@@ -1413,6 +1439,7 @@ def run_watch_tui(
                     flash_message=flash_message,
                     palette=palette,
                     restore_mode=restore_mode,
+                    restore_sort=restore_sort_mode,
                 )
 
                 key = stdscr.getch()
@@ -1460,6 +1487,19 @@ def run_watch_tui(
                 if key == 9:  # Tab
                     if not selected_session_id:
                         continue
+                    if restore_mode:
+                        if restore_tree_collapsed:
+                            if selected_session_id in expanded_session_ids:
+                                expanded_session_ids.remove(selected_session_id)
+                            else:
+                                expanded_session_ids.add(selected_session_id)
+                        else:
+                            if selected_session_id in collapsed_session_ids:
+                                collapsed_session_ids.remove(selected_session_id)
+                            else:
+                                collapsed_session_ids.add(selected_session_id)
+                        next_refresh = 0.0
+                        continue
                     if selected_session_id in expanded_session_ids:
                         expanded_session_ids.remove(selected_session_id)
                     else:
@@ -1470,12 +1510,23 @@ def run_watch_tui(
                     continue
 
                 if restore_mode and key in (ord("C"),):
+                    restore_tree_collapsed = True
                     expanded_session_ids.clear()
+                    collapsed_session_ids.clear()
                     next_refresh = 0.0
                     continue
 
                 if restore_mode and key in (ord("E"),):
-                    expanded_session_ids.update(selectable)
+                    restore_tree_collapsed = False
+                    expanded_session_ids.clear()
+                    collapsed_session_ids.clear()
+                    next_refresh = 0.0
+                    continue
+
+                if restore_mode and key in (ord("o"),):
+                    order = ["retired", "last-active", "name"]
+                    current_idx = order.index(restore_sort_mode) if restore_sort_mode in order else 0
+                    restore_sort_mode = order[(current_idx + 1) % len(order)]
                     next_refresh = 0.0
                     continue
 
