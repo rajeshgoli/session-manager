@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from src.cli.watch_tui import (
     DetailFetchWorker,
@@ -830,6 +831,27 @@ def test_build_restore_rows_collapsed_session_hides_children_when_default_expand
 
     assert selectable == ["p1"]
     assert all(row.session_id != "c1" for row in rows)
+
+
+
+def test_build_restore_rows_collapsed_repo_hides_sessions_but_keeps_header():
+    sessions = [
+        _session("a1", "agent-a", "/tmp/repo-a", status="stopped"),
+        _session("b1", "agent-b", "/tmp/repo-b", status="stopped"),
+    ]
+
+    rows, selectable, repo_count = build_restore_rows(
+        sessions,
+        collapsed_repo_keys={str(Path("/tmp/repo-a").resolve())},
+        sort_mode="name",
+    )
+
+    assert repo_count == 2
+    assert selectable == ["b1"]
+    repo_rows = [row for row in rows if row.kind == "repo"]
+    assert any(row.text.startswith("[+] repo-a/") and "1 hidden" in row.text for row in repo_rows)
+    assert any(row.session_id == "b1" for row in rows)
+    assert all(row.session_id != "a1" for row in rows)
 
 def test_can_attach_session_supports_tmux_backed_codex_only():
     assert can_attach_session(_session("c1", "codex", "/tmp", provider="codex"))

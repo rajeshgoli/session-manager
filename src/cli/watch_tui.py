@@ -98,6 +98,7 @@ class WatchRow:
     kind: str  # repo, session, status, detail, repo_ref
     text: str = ""
     session_id: Optional[str] = None
+    repo_key: Optional[str] = None
     activity_state: str = "idle"
     columns: dict[str, str] = field(default_factory=dict)
 
@@ -804,6 +805,7 @@ def build_restore_rows(
     all_sessions: Optional[list[dict]] = None,
     expanded_session_ids: Optional[set[str]] = None,
     collapsed_session_ids: Optional[set[str]] = None,
+    collapsed_repo_keys: Optional[set[str]] = None,
     top_level_only: bool = False,
     sort_mode: str = "retired",
 ) -> tuple[list[WatchRow], list[str], int]:
@@ -812,6 +814,7 @@ def build_restore_rows(
     selectable: list[str] = []
     expanded = expanded_session_ids or set()
     collapsed = collapsed_session_ids or set()
+    collapsed_repos = collapsed_repo_keys or set()
     stopped_by_id = {session["id"]: session for session in stopped_sessions if session.get("id")}
     sessions_by_id = {
         session["id"]: session
@@ -884,6 +887,7 @@ def build_restore_rows(
             WatchRow(
                 kind="session",
                 session_id=session_id,
+                repo_key=_repo_key(session.get("working_dir", "")),
                 activity_state="idle",
                 columns=columns,
             )
@@ -904,7 +908,17 @@ def build_restore_rows(
         repo_header = _repo_label(repo_key) if repo_key != "unknown" else "unknown/"
         if repo_key not in ("unknown",):
             repo_header = f"{repo_header} ({repo_key})"
-        rows.append(WatchRow(kind="repo", text=repo_header))
+        if repo_key in collapsed_repos:
+            rows.append(
+                WatchRow(
+                    kind="repo",
+                    text=f"[+] {repo_header} ({len(groups.get(repo_key, []))} hidden)",
+                    repo_key=repo_key,
+                )
+            )
+            continue
+
+        rows.append(WatchRow(kind="repo", text=repo_header, repo_key=repo_key))
         for idx, root in enumerate(top_level_roots):
             render_session(root, [], idx == len(top_level_roots) - 1)
 
@@ -1301,7 +1315,7 @@ def _render(
         )
 
     if restore_mode:
-        footer = f"j/k: move  Enter: restore+attach  o: sort={restore_sort}  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
+        footer = f"j/k: move  Enter: restore+attach  o: sort={restore_sort}  R: hide repo  U: show repos  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
     else:
         footer = "j/k: move  +: create  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
@@ -1343,6 +1357,7 @@ def run_watch_tui(
             latest_by_id: dict[str, dict] = {}
             expanded_session_ids: set[str] = set()
             collapsed_session_ids: set[str] = set()
+            collapsed_repo_keys: set[str] = set()
             restore_tree_collapsed = top_level
             restore_sort_mode = restore_sort
             repo_count = 0
@@ -1375,6 +1390,7 @@ def run_watch_tui(
                                 all_sessions=listed,
                                 expanded_session_ids=expanded_session_ids,
                                 collapsed_session_ids=collapsed_session_ids,
+                                collapsed_repo_keys=collapsed_repo_keys,
                                 top_level_only=restore_tree_collapsed,
                                 sort_mode=restore_sort_mode,
                             )
@@ -1527,6 +1543,18 @@ def run_watch_tui(
                     order = ["retired", "last-active", "name"]
                     current_idx = order.index(restore_sort_mode) if restore_sort_mode in order else 0
                     restore_sort_mode = order[(current_idx + 1) % len(order)]
+                    next_refresh = 0.0
+                    continue
+
+                if restore_mode and key in (ord("R"),):
+                    if selected:
+                        collapsed_repo_keys.add(_repo_key(selected.get("working_dir", "")))
+                        selected_session_id = None
+                        next_refresh = 0.0
+                    continue
+
+                if restore_mode and key in (ord("U"),):
+                    collapsed_repo_keys.clear()
                     next_refresh = 0.0
                     continue
 
