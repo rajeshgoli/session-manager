@@ -1251,8 +1251,10 @@ class SessionManager:
                 session.status = SessionStatus.IDLE
             elif state in ("shutdown", "error"):
                 session.status = SessionStatus.STOPPED
+                session.stopped_at = now
             else:
                 session.status = SessionStatus.RUNNING
+                session.stopped_at = None
             session.last_activity = now
 
             if self.message_queue_manager:
@@ -4997,11 +4999,13 @@ class SessionManager:
         self.codex_last_delta_at.pop(session_id, None)
         self.codex_wait_states.pop(session_id, None)
 
+        now = datetime.now()
         session.status = SessionStatus.STOPPED
         session.completion_status = CompletionStatus.KILLED
         session.completion_message = reason
         session.error_message = reason
-        session.last_activity = datetime.now()
+        session.last_activity = now
+        session.stopped_at = now
         with contextlib.suppress(Exception):
             self.codex_event_store.append_event(
                 session_id=session_id,
@@ -5469,10 +5473,12 @@ class SessionManager:
                     cause_event_type="session_killed",
                 )
             self.tmux.kill_session(session.tmux_session)
+        now = datetime.now()
         session.status = SessionStatus.STOPPED
         session.completion_status = CompletionStatus.KILLED
         session.completion_message = "Terminated via sm kill"
-        session.completed_at = datetime.now()
+        session.completed_at = now
+        session.stopped_at = now
         self.unregister_session_roles(session_id, persist=False)
         self._save_state()
 
@@ -5582,6 +5588,7 @@ class SessionManager:
         session.completion_message = None
         session.completed_at = None
         session.agent_task_completed_at = None
+        session.stopped_at = None
         session.status = SessionStatus.IDLE if session.provider == "codex-app" else SessionStatus.RUNNING
         session.last_activity = datetime.now()
         if session.provider == "codex-fork":

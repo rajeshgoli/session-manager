@@ -599,6 +599,16 @@ def main():
         default=2.0,
         help="Refresh interval seconds (default: 2.0)",
     )
+    watch_parser.add_argument(
+        "--restore",
+        action="store_true",
+        help="Browse restorable stopped sessions and restore the selected row",
+    )
+    watch_parser.add_argument(
+        "--top-level",
+        action="store_true",
+        help="In --restore mode, start with only top-level stopped sessions expanded on demand",
+    )
 
     # sm tail <session> [-n N] [--raw] [--db-path PATH]
     tail_parser = subparsers.add_parser(
@@ -1116,6 +1126,8 @@ def main():
             repo=args.repo,
             role=args.role,
             interval=args.interval,
+            restore_mode=args.restore,
+            top_level=args.top_level,
         ))
     elif args.command == "tail":
         sys.exit(commands.cmd_tail(

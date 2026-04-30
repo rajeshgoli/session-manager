@@ -328,6 +328,7 @@ class Session:
     completion_message: Optional[str] = None  # Message when completed
     spawned_at: Optional[datetime] = None  # When this session was spawned
     completed_at: Optional[datetime] = None  # When this session completed
+    stopped_at: Optional[datetime] = None  # When this session was explicitly retired/stopped
     tokens_used: int = 0  # Approximate token count
     tools_used: dict[str, int] = field(default_factory=dict)  # {"Read": 5, "Write": 3}
     last_tool_call: Optional[datetime] = None  # Last tool usage timestamp
@@ -417,6 +418,7 @@ class Session:
             "completion_message": self.completion_message,
             "spawned_at": self.spawned_at.isoformat() if self.spawned_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
             "tokens_used": self.tokens_used,
             "tools_used": self.tools_used,
             "last_tool_call": self.last_tool_call.isoformat() if self.last_tool_call else None,
@@ -508,6 +510,7 @@ class Session:
             completion_message=data.get("completion_message"),
             spawned_at=datetime.fromisoformat(data["spawned_at"]) if data.get("spawned_at") else None,
             completed_at=datetime.fromisoformat(data["completed_at"]) if data.get("completed_at") else None,
+            stopped_at=datetime.fromisoformat(data["stopped_at"]) if data.get("stopped_at") else None,
             tokens_used=data.get("tokens_used", 0),
             tools_used=data.get("tools_used", {}),
             last_tool_call=datetime.fromisoformat(data["last_tool_call"]) if data.get("last_tool_call") else None,

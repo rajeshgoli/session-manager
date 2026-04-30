@@ -3173,6 +3173,8 @@ def cmd_watch(
     repo: Optional[str] = None,
     role: Optional[str] = None,
     interval: float = 2.0,
+    restore_mode: bool = False,
+    top_level: bool = False,
 ) -> int:
     """Launch interactive watch dashboard."""
     if os.environ.get("CLAUDE_SESSION_MANAGER_ID"):
@@ -3194,6 +3196,8 @@ def cmd_watch(
         repo_filter=repo,
         role_filter=role,
         interval=interval,
+        restore_mode=restore_mode,
+        top_level=top_level,
     )
 
 
