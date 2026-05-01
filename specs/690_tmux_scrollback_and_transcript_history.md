@@ -74,6 +74,13 @@ Claude and Codex are interactive TUIs. They redraw prompt regions, status footer
 
 Increasing tmux history depth does not remove this class of artifact. It only preserves more of the same screen-buffer history. A clean history/search feature must read provider transcripts, not tmux pane history.
 
+Native terminal scrollback feels better for two separate reasons:
+
+- The terminal emulator is usually configured with a much larger or effectively unlimited scrollback buffer, while the managed tmux panes observed here are capped at `2000` history lines.
+- There is no intermediate tmux screen buffer/copy-mode layer. When Claude/Codex run directly, the terminal emulator records the provider's terminal output at the outer terminal boundary. When Claude/Codex run inside tmux, the provider writes to tmux, tmux stores a bounded per-pane screen history, and the outer terminal only sees tmux's current client viewport. Tmux copy-mode is therefore exposing tmux's saved screen states, including TUI redraws.
+
+Provider TUIs can still emit repaint artifacts in any terminal. Native terminal scrollback is just a better nearby visual history; it is still not the right source for semantic transcript search.
+
 ### Problem 2: scrollback wall
 
 Root cause: Session Manager does not configure a larger tmux history limit.
@@ -85,7 +92,7 @@ Native terminal scrollback is usually much larger or effectively unbounded by us
 ## Goals
 
 1. Make future SM-managed tmux sessions retain substantially more screen scrollback by default.
-2. Apply the configured tmux history limit to live managed tmux sessions on server startup so existing active agents benefit from that point forward.
+2. Correctly apply the configured tmux history limit before the provider pane/window is created.
 3. Provide a clean, provider-transcript-backed CLI for tailing and searching long session history.
 4. Support Claude, Codex, and codex-fork histories in the first implementation.
 5. Keep tmux as the runtime control and attach plane for existing SM workflows.
@@ -123,23 +130,31 @@ Implementation requirements:
 
 - Add `TmuxController.history_limit`.
 - Validate it as a positive integer; fall back to `100000` when absent or invalid.
-- Immediately after `tmux new-session -d ...`, run:
+- Do not set `history-limit` after creating the provider pane and assume it resized that pane. tmux's `history-limit` applies only to new windows; existing window histories retain the limit they had at creation time.
+- Create SM sessions using a bootstrap-window sequence:
 
 ```bash
+tmux new-session -d -s <session_name> -c <working_dir> -n __sm_bootstrap
 tmux set-option -t <session_name> history-limit <history_limit>
+tmux new-window -d -t <session_name> -n main -c <working_dir>
+tmux kill-window -t <session_name>:__sm_bootstrap
+tmux select-window -t <session_name>:main
 ```
+
+The provider must be launched only in the new `main` window created after the session option is set.
 
 - Apply this in both tmux creation paths:
   - `create_session()`
   - `create_session_with_command()`
-- Add a `TmuxController.apply_history_limit(session_name)` helper so startup can update live managed panes.
-- On Session Manager startup after state load, iterate live sessions with a `tmux_session` and call `apply_history_limit()` when the tmux session exists.
+- Add `TmuxController.get_history_limit(session_name)` so attach/status paths can report when an existing pane is still below the configured target.
 - Do not set global tmux options. Session Manager should not silently change user-owned tmux sessions outside SM.
 
 Existing live sessions:
 
-- Applying the option to an existing pane cannot recover lines already dropped under the previous limit.
-- It does allow the pane to retain more future history after the server restart or helper call.
+- Existing live panes cannot be resized in place. A startup-time `set-option` can affect only future windows in that tmux session, not the current provider pane.
+- Do not automatically recreate or restore active sessions just to raise scrollback; that would be a separate, disruptive migration workflow.
+- The implementation should surface the current pane limit in `sm status`, `sm me`, or attach hints so users can see that a pre-fix pane is still capped.
+- Stopped/restored sessions and newly spawned sessions should get the larger limit because they create a new provider pane.
 
 ### 2. Provider transcript resolver
 
@@ -258,16 +273,16 @@ These endpoints should:
 Add one small user-facing hint when attaching to a managed tmux session whose current history limit is below the configured SM limit:
 
 ```text
-[sm info] This pane has tmux history-limit 2000; configured SM limit is 100000. Future history will expand after Session Manager applies the setting.
+[sm info] This pane was created with tmux history-limit 2000; configured SM limit is 100000. Existing tmux panes cannot be resized in place. New and restored sessions will use the configured limit.
 ```
 
 Do not print this on every attach once the pane is already configured.
 
 ## Implementation plan
 
-1. Add `tmux.history_limit` config loading and `TmuxController.apply_history_limit()`.
-2. Apply the limit during tmux session creation before provider launch.
-3. Apply the limit to live managed tmux sessions during Session Manager startup.
+1. Add `tmux.history_limit` config loading and `TmuxController.get_history_limit()`.
+2. Change tmux creation to use the bootstrap-window sequence so the provider window is created after the per-session `history-limit` is set.
+3. Add attach/status visibility for live panes whose current `history_limit` is below the configured target.
 4. Add `src/transcript_history.py` with source resolution and streaming parser primitives.
 5. Add server endpoints for source, tail, and search.
 6. Add `sm history` CLI commands using the server endpoints.
@@ -287,8 +302,8 @@ Do not print this on every attach once the pane is already configured.
 
 ## Acceptance criteria
 
-1. New SM-managed Claude, Codex, and codex-fork tmux sessions are created with the configured `history-limit`.
-2. Existing live managed tmux sessions have their `history-limit` raised on Session Manager startup when their tmux session still exists.
+1. New SM-managed Claude, Codex, and codex-fork tmux provider panes are created with the configured `history-limit`.
+2. Tests prove setting `history-limit` after the initial `new-session` window is insufficient, and the implementation uses a provider window created after the option is set.
 3. Session Manager does not change global tmux options or user-owned tmux sessions outside SM.
 4. `sm history path 3348-owner` prints the provider transcript path for the session when available.
 5. `sm history search 3348-owner "..." --role user --last` finds old user prompts even when tmux scrollback no longer contains them.
