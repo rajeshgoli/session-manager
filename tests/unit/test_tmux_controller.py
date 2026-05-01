@@ -10,12 +10,13 @@ def test_set_status_bar_passes_timeout_to_tmux(monkeypatch):
     controller = TmuxController()
     monkeypatch.setattr(controller, "session_exists", lambda _: True)
     run_tmux = MagicMock(return_value=MagicMock(returncode=0))
-    monkeypatch.setattr(controller, "_run_tmux", run_tmux)
+    monkeypatch.setattr(controller, "_run_tmux_for_session", run_tmux)
 
     ok = controller.set_status_bar("claude-test123", "friendly", timeout_seconds=1.0)
 
     assert ok is True
     run_tmux.assert_called_once_with(
+        "claude-test123",
         "set-option",
         "-t",
         "claude-test123",
@@ -32,11 +33,55 @@ def test_set_status_bar_returns_false_on_timeout(monkeypatch):
     def _raise_timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired(cmd=["tmux", "set-option"], timeout=1.0)
 
-    monkeypatch.setattr(controller, "_run_tmux", _raise_timeout)
+    monkeypatch.setattr(controller, "_run_tmux_for_session", _raise_timeout)
 
     ok = controller.set_status_bar("claude-test123", "friendly", timeout_seconds=1.0)
 
     assert ok is False
+
+
+def test_create_session_with_command_bootstraps_history_before_provider_window(tmp_path, monkeypatch):
+    controller = TmuxController(
+        log_dir=str(tmp_path),
+        config={
+            "tmux": {
+                "socket_name": "session-manager-test",
+                "native_scrollback": True,
+                "history_limit": 12345,
+            },
+            "timeouts": {"tmux": {"shell_export_settle_seconds": 0}},
+        },
+    )
+    calls = []
+
+    def _fake_run_tmux(*args, **kwargs):
+        calls.append(args)
+        if args[:3] == ("show-options", "-gqv", "terminal-overrides"):
+            return MagicMock(returncode=0, stdout="")
+        return MagicMock(returncode=0, stdout="")
+
+    monkeypatch.setattr(controller, "session_exists", lambda _: False)
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    ok = controller.create_session_with_command(
+        "claude-test123",
+        str(tmp_path),
+        str(tmp_path / "claude-test123.log"),
+        command="sh",
+        args=["-lc", "sleep 1"],
+    )
+
+    assert ok is True
+    assert calls[:7] == [
+        ("new-session", "-d", "-s", "claude-test123", "-c", str(tmp_path), "-n", "__sm_bootstrap"),
+        ("show-options", "-gqv", "terminal-overrides"),
+        ("set-option", "-as", "terminal-overrides", ",*:smcup@:rmcup@"),
+        ("set-option", "-t", "claude-test123", "history-limit", "12345"),
+        ("new-window", "-d", "-t", "claude-test123", "-n", "main", "-c", str(tmp_path)),
+        ("kill-window", "-t", "claude-test123:__sm_bootstrap"),
+        ("select-window", "-t", "claude-test123:main"),
+    ]
 
 
 def test_codex_rename_prompt_detection():

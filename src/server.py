@@ -2280,6 +2280,9 @@ def create_app(
             tmux_session = str(descriptor.get("tmux_session") or "").strip()
         if not tmux_session:
             tmux_session = str(getattr(session, "tmux_session", "") or "").strip()
+        tmux_socket_name = ""
+        if descriptor:
+            tmux_socket_name = str(descriptor.get("tmux_socket_name") or "").strip()
 
         if not descriptor:
             return {
@@ -2321,15 +2324,22 @@ def create_app(
             "PATH=/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/bin:/bin:$PATH; "
             "export PATH; "
             "if command -v tmux >/dev/null 2>&1; then "
-            "exec tmux attach-session -d -t \"$SM_TMUX_SESSION\"; "
+            "if [ -n \"${SM_TMUX_SOCKET:-}\" ]; then "
+            "exec tmux -L \"$SM_TMUX_SOCKET\" attach-session -d -t \"$SM_TMUX_SESSION\"; "
+            "else exec tmux attach-session -d -t \"$SM_TMUX_SESSION\"; fi; "
             "elif [ -x /opt/homebrew/bin/tmux ]; then "
-            "exec /opt/homebrew/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; "
+            "if [ -n \"${SM_TMUX_SOCKET:-}\" ]; then "
+            "exec /opt/homebrew/bin/tmux -L \"$SM_TMUX_SOCKET\" attach-session -d -t \"$SM_TMUX_SESSION\"; "
+            "else exec /opt/homebrew/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; fi; "
             "elif [ -x /usr/local/bin/tmux ]; then "
-            "exec /usr/local/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; "
+            "if [ -n \"${SM_TMUX_SOCKET:-}\" ]; then "
+            "exec /usr/local/bin/tmux -L \"$SM_TMUX_SOCKET\" attach-session -d -t \"$SM_TMUX_SESSION\"; "
+            "else exec /usr/local/bin/tmux attach-session -d -t \"$SM_TMUX_SESSION\"; fi; "
             "else echo \"tmux not found on remote host\" >&2; exit 127; fi"
         )
         remote_command = (
             f"SM_TMUX_SESSION={shlex.quote(tmux_session)} "
+            f"SM_TMUX_SOCKET={shlex.quote(tmux_socket_name)} "
             f"sh -lc {shlex.quote(remote_attach_script)}"
         )
         ssh_args.extend([
@@ -2360,7 +2370,7 @@ def create_app(
             "exit \"$attach_status\""
         )
 
-        return {
+        metadata = {
             "supported": True,
             "transport": "termux-ssh-tmux",
             "ssh_host": public_ssh_host,
@@ -2371,6 +2381,9 @@ def create_app(
             "runtime_mode": descriptor.get("runtime_mode"),
             "termux_package": "com.termux",
         }
+        if tmux_socket_name:
+            metadata["tmux_socket_name"] = tmux_socket_name
+        return metadata
 
     def _mobile_primary_action(termux_attach: dict[str, Any], descriptor: Optional[dict[str, Any]]) -> dict[str, Any]:
         if termux_attach.get("supported"):

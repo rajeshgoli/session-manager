@@ -26,6 +26,22 @@ worktree_cleanup:
   # Send "[sm info] Uncommitted changes in worktree(s)" notices after turns
   notify_dirty: true
 
+# tmux runtime configuration for managed Claude/Codex terminal sessions
+tmux:
+  # Optional SM-owned tmux socket. When set, new managed sessions use this
+  # server instead of the user's default tmux server, allowing SM-specific
+  # terminal behavior without mutating unrelated tmux sessions.
+  socket_name: "session-manager"
+
+  # When socket_name is set, prevent tmux from taking over the caller
+  # terminal's alternate screen so live attached output can enter native
+  # terminal scrollback.
+  native_scrollback: true
+
+  # Retained tmux pane history for new provider windows. tmux applies this
+  # only to windows created after the option is set.
+  history_limit: 100000
+
 # Timeout and delay configuration (all values in seconds unless specified)
 timeouts:
   # Tmux session creation and interaction timeouts

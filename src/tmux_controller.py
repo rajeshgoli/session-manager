@@ -21,6 +21,18 @@ class TmuxController:
         self.config = config or {}
         self.last_error_message: Optional[str] = None
 
+        tmux_config = self.config.get("tmux", {}) if isinstance(self.config, dict) else {}
+        raw_socket_name = str(tmux_config.get("socket_name", "") or "").strip()
+        self.socket_name: Optional[str] = raw_socket_name or None
+        self.native_scrollback = self._coerce_bool(
+            tmux_config.get("native_scrollback"),
+            default=bool(self.socket_name),
+        )
+        self.history_limit = self._coerce_positive_int(
+            tmux_config.get("history_limit"),
+            default=100000,
+        )
+
         # Load timeout configuration with fallbacks
         timeouts = self.config.get("timeouts", {})
         tmux_timeouts = timeouts.get("tmux", {})
@@ -37,6 +49,92 @@ class TmuxController:
         self.submit_verify_seconds = tmux_timeouts.get("submit_verify_seconds", 0.6)
         self.submit_retry_seconds = tmux_timeouts.get("submit_retry_seconds", 0.6)
         self.shell_fd_limit = int(tmux_timeouts.get("shell_fd_limit", 65536))
+
+    @staticmethod
+    def _coerce_bool(value: object, default: bool = False) -> bool:
+        """Parse bool config values with common string/int forms."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _coerce_positive_int(value: object, default: int) -> int:
+        """Parse a positive integer config value."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    @staticmethod
+    def _normalize_session_target(session_name: str) -> str:
+        """Return the tmux session portion of a target that may include window/pane suffixes."""
+        return str(session_name or "").split(":", 1)[0].split(".", 1)[0]
+
+    def tmux_cmd(self, *args: str, socket_name: Optional[str] = "__primary__") -> list[str]:
+        """Build one tmux command using the configured SM socket unless overridden."""
+        effective_socket = self.socket_name if socket_name == "__primary__" else socket_name
+        cmd = ["tmux"]
+        if effective_socket:
+            cmd.extend(["-L", effective_socket])
+        cmd.extend(args)
+        return cmd
+
+    def tmux_cmd_for_session(self, session_name: str, *args: str) -> list[str]:
+        """Build a tmux command for an existing target, falling back for legacy sessions."""
+        return self.tmux_cmd(*args, socket_name=self._resolve_socket_for_session(session_name))
+
+    def _session_exists_on_socket(self, session_name: str, socket_name: Optional[str]) -> bool:
+        target = self._normalize_session_target(session_name)
+        if not target:
+            return False
+        result = subprocess.run(
+            self.tmux_cmd("has-session", "-t", target, socket_name=socket_name),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def _resolve_socket_for_session(self, session_name: str) -> Optional[str]:
+        """Resolve which tmux server owns a session, supporting legacy default-server panes."""
+        target = self._normalize_session_target(session_name)
+        if not target:
+            return self.socket_name
+        if self.socket_name and self._session_exists_on_socket(target, self.socket_name):
+            return self.socket_name
+        if self.socket_name and self._session_exists_on_socket(target, None):
+            return None
+        return self.socket_name
+
+    def _ensure_server_options(self) -> None:
+        """Apply SM-owned tmux server options that are safe only on the configured socket."""
+        if not self.socket_name or not self.native_scrollback:
+            return
+        current = self._run_tmux(
+            "show-options",
+            "-gqv",
+            "terminal-overrides",
+            check=False,
+        )
+        if "smcup@:rmcup@" in (current.stdout or ""):
+            return
+        self._run_tmux(
+            "set-option",
+            "-as",
+            "terminal-overrides",
+            ",*:smcup@:rmcup@",
+        )
 
     def _resolve_launch_command(
         self,
@@ -72,9 +170,28 @@ class TmuxController:
         *args: str,
         check: bool = True,
         timeout: Optional[float] = None,
+        socket_name: Optional[str] = "__primary__",
     ) -> subprocess.CompletedProcess:
         """Run a tmux command."""
-        cmd = ["tmux"] + list(args)
+        cmd = self.tmux_cmd(*args, socket_name=socket_name)
+        logger.debug(f"Running tmux command: {' '.join(cmd)}")
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=check,
+            timeout=timeout,
+        )
+
+    def _run_tmux_for_session(
+        self,
+        session_name: str,
+        *args: str,
+        check: bool = True,
+        timeout: Optional[float] = None,
+    ) -> subprocess.CompletedProcess:
+        """Run a tmux command against an existing target, with legacy fallback."""
+        cmd = self.tmux_cmd_for_session(session_name, *args)
         logger.debug(f"Running tmux command: {' '.join(cmd)}")
         return subprocess.run(
             cmd,
@@ -125,7 +242,8 @@ class TmuxController:
     def _get_pane_in_mode(self, session_name: str) -> Optional[int]:
         """Return tmux pane_in_mode (1 copy-mode, 0 normal) for active pane."""
         try:
-            result = self._run_tmux(
+            result = self._run_tmux_for_session(
+                session_name,
                 "display-message", "-p", "-t", session_name, "#{pane_in_mode}",
                 check=False,
             )
@@ -139,7 +257,8 @@ class TmuxController:
     def get_pane_title(self, session_name: str) -> Optional[str]:
         """Return the active pane title for one tmux session."""
         try:
-            result = self._run_tmux(
+            result = self._run_tmux_for_session(
+                session_name,
                 "display-message", "-p", "-t", session_name, "#{pane_title}",
                 check=False,
             )
@@ -230,7 +349,7 @@ class TmuxController:
         if before != 1:
             return before, before
         try:
-            self._run_tmux("send-keys", "-t", session_name, "-X", "cancel", check=False)
+            self._run_tmux_for_session(session_name, "send-keys", "-t", session_name, "-X", "cancel", check=False)
         except Exception:
             # Non-fatal: we still attempt delivery.
             pass
@@ -241,7 +360,7 @@ class TmuxController:
         """Best-effort clear of partially typed input after a failed send."""
         try:
             subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "C-u"],
+                self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "C-u"),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -256,7 +375,7 @@ class TmuxController:
         """Async variant of pane mode query."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "display-message", "-p", "-t", session_name, "#{pane_in_mode}",
+                *self.tmux_cmd_for_session(session_name, "display-message", "-p", "-t", session_name, "#{pane_in_mode}"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -277,7 +396,7 @@ class TmuxController:
             return before, before
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session_name, "-X", "cancel",
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "-X", "cancel"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -292,7 +411,7 @@ class TmuxController:
         """Best-effort clear of partially typed input after a failed send."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session_name, "C-u",
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "C-u"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -306,7 +425,7 @@ class TmuxController:
         """Capture the full active tmux pane asynchronously."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "capture-pane", "-p", "-J", "-S", "-200", "-t", session_name,
+                *self.tmux_cmd_for_session(session_name, "capture-pane", "-p", "-J", "-S", "-200", "-t", session_name),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -462,7 +581,7 @@ class TmuxController:
             return False
 
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", session_name, "Enter",
+            *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -505,7 +624,7 @@ class TmuxController:
             return False
 
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", session_name, "Escape",
+            *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Escape"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -524,8 +643,29 @@ class TmuxController:
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a tmux session exists."""
-        result = self._run_tmux("has-session", "-t", session_name, check=False)
-        return result.returncode == 0
+        if self._session_exists_on_socket(session_name, self.socket_name):
+            return True
+        if self.socket_name and self._session_exists_on_socket(session_name, None):
+            return True
+        return False
+
+    def get_history_limit(self, session_name: str) -> Optional[int]:
+        """Return the active pane history limit for a tmux session."""
+        try:
+            result = self._run_tmux_for_session(
+                session_name,
+                "display-message",
+                "-p",
+                "-t", session_name,
+                "#{history_limit}",
+                check=False,
+            )
+            if result.returncode != 0:
+                return None
+            raw = (result.stdout or "").strip()
+            return int(raw) if raw.isdigit() else None
+        except Exception:
+            return None
 
     def set_status_bar(
         self,
@@ -551,7 +691,8 @@ class TmuxController:
 
         try:
             # Set status-left to show friendly name
-            self._run_tmux(
+            self._run_tmux_for_session(
+                session_name,
                 "set-option",
                 "-t", session_name,
                 "status-left",
@@ -619,13 +760,19 @@ class TmuxController:
         log_path.touch()
 
         try:
-            # Create new detached tmux session
+            # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
                 "-d",
                 "-s", session_name,
                 "-c", str(working_path),
+                "-n", "__sm_bootstrap",
             )
+            self._ensure_server_options()
+            self._run_tmux("set-option", "-t", session_name, "history-limit", str(self.history_limit))
+            self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
+            self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
+            self._run_tmux("select-window", "-t", f"{session_name}:main")
             self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file
@@ -712,13 +859,19 @@ class TmuxController:
         log_path.touch()
 
         try:
-            # Create new detached tmux session
+            # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
                 "-d",
                 "-s", session_name,
                 "-c", str(working_path),
+                "-n", "__sm_bootstrap",
             )
+            self._ensure_server_options()
+            self._run_tmux("set-option", "-t", session_name, "history-limit", str(self.history_limit))
+            self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
+            self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
+            self._run_tmux("select-window", "-t", f"{session_name}:main")
             self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file
@@ -806,7 +959,7 @@ class TmuxController:
             # Use subprocess with list arguments to prevent shell injection
             for chunk in chunks:
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "-l", "--", chunk],
+                    self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "-l", "--", chunk),
                     check=True,
                     capture_output=True,
                     text=True,
@@ -815,7 +968,7 @@ class TmuxController:
                 text_injected = True
             time.sleep(settle_delay)
             subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -879,7 +1032,7 @@ class TmuxController:
 
             for chunk in chunks:
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, '-l', '--', chunk,
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "-l", "--", chunk),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -901,7 +1054,7 @@ class TmuxController:
 
             # Send Enter as a separate keystroke
             proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -959,7 +1112,7 @@ class TmuxController:
         """
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session_name, key,
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, key),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1060,7 +1213,7 @@ class TmuxController:
             return True  # Already gone
 
         try:
-            self._run_tmux("kill-session", "-t", session_name)
+            self._run_tmux_for_session(session_name, "kill-session", "-t", session_name)
             logger.info(f"Killed session {session_name}")
             return True
 
@@ -1070,10 +1223,23 @@ class TmuxController:
 
     def list_sessions(self) -> list[str]:
         """List all tmux sessions."""
+        sessions: set[str] = set()
         result = self._run_tmux("list-sessions", "-F", "#{session_name}", check=False)
         if result.returncode != 0:
-            return []
-        return [s.strip() for s in result.stdout.strip().split("\n") if s.strip()]
+            result = None
+        if result is not None:
+            sessions.update(s.strip() for s in result.stdout.strip().split("\n") if s.strip())
+        if self.socket_name:
+            legacy = self._run_tmux(
+                "list-sessions",
+                "-F",
+                "#{session_name}",
+                check=False,
+                socket_name=None,
+            )
+            if legacy.returncode == 0:
+                sessions.update(s.strip() for s in legacy.stdout.strip().split("\n") if s.strip())
+        return sorted(sessions)
 
     def capture_pane(self, session_name: str, lines: int = 50) -> Optional[str]:
         """
@@ -1090,7 +1256,8 @@ class TmuxController:
             return None
 
         try:
-            result = self._run_tmux(
+            result = self._run_tmux_for_session(
+                session_name,
                 "capture-pane",
                 "-t", session_name,
                 "-p",  # Print to stdout
@@ -1140,14 +1307,14 @@ class TmuxController:
                 # Custom mode: send /review <text> directly, bypasses menu
                 review_text = f"/review {custom_prompt}"
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, '--', review_text,
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "--", review_text),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
                 await asyncio.sleep(self.send_keys_settle_seconds)
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1157,7 +1324,7 @@ class TmuxController:
 
             # All other modes: send /review + Enter, then navigate menu
             proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, '--', '/review',
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "--", "/review"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1165,7 +1332,7 @@ class TmuxController:
             await asyncio.sleep(self.send_keys_settle_seconds)
 
             proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1177,7 +1344,7 @@ class TmuxController:
             if mode == "branch":
                 # 1st menu item — just press Enter
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1190,7 +1357,7 @@ class TmuxController:
                 if branch_position and branch_position > 0:
                     for _ in range(branch_position):
                         proc = await asyncio.create_subprocess_exec(
-                            'tmux', 'send-keys', '-t', session_name, 'Down',
+                            *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Down"),
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                         )
@@ -1199,7 +1366,7 @@ class TmuxController:
                 # Confirm branch selection
                 await asyncio.sleep(self.send_keys_settle_seconds)
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1209,14 +1376,14 @@ class TmuxController:
             elif mode == "uncommitted":
                 # 2nd menu item — Down then Enter
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, 'Down',
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Down"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
                 await asyncio.sleep(self.send_keys_settle_seconds)
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1231,14 +1398,14 @@ class TmuxController:
                 # 3rd menu item — Down Down then Enter
                 for _ in range(2):
                     proc = await asyncio.create_subprocess_exec(
-                        'tmux', 'send-keys', '-t', session_name, 'Down',
+                        *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Down"),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
                     await asyncio.wait_for(proc.wait(), timeout=self.send_keys_timeout_seconds)
                 await asyncio.sleep(self.send_keys_settle_seconds)
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1249,7 +1416,7 @@ class TmuxController:
 
                 # Select the first commit (most recent)
                 proc = await asyncio.create_subprocess_exec(
-                    'tmux', 'send-keys', '-t', session_name, 'Enter',
+                    *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -1285,7 +1452,7 @@ class TmuxController:
         try:
             # Press Enter to open steer input field
             proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1294,7 +1461,7 @@ class TmuxController:
 
             # Send the steer text
             proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, '--', text,
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "--", text),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1303,7 +1470,7 @@ class TmuxController:
 
             # Press Enter to submit
             proc = await asyncio.create_subprocess_exec(
-                'tmux', 'send-keys', '-t', session_name, 'Enter',
+                *self.tmux_cmd_for_session(session_name, "send-keys", "-t", session_name, "Enter"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1338,13 +1505,10 @@ class TmuxController:
             return False
 
         # AppleScript to open new Terminal window and attach to tmux session
-        # Escape session_name for AppleScript (prevent injection)
-        import shlex
-        escaped_session = shlex.quote(session_name)
         script = f'''
         tell application "Terminal"
             activate
-            do script "tmux attach-session -t {escaped_session}"
+            do script "{' '.join(shlex.quote(part) for part in self.tmux_cmd_for_session(session_name, 'attach-session', '-t', session_name))}"
         end tell
         '''
 

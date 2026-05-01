@@ -157,7 +157,7 @@ class SessionManager:
             mq_timeouts.get("input_delivery_wait_seconds", 1.0)
         )
 
-        self.tmux = TmuxController(log_dir=log_dir)
+        self.tmux = TmuxController(log_dir=log_dir, config=self.config)
         self.sessions: dict[str, Session] = {}
         self._event_handlers: list[Callable[[NotificationEvent], Awaitable[None]]] = []
         self.codex_sessions: dict[str, CodexAppServerSession] = {}
@@ -407,6 +407,27 @@ class SessionManager:
         self._load_state()
         if self.sync_codex_native_titles_from_index(persist=False):
             self._save_state()
+
+    def _tmux_socket_name(self) -> Optional[str]:
+        """Return configured tmux socket name, treating partial mocks as legacy default-server."""
+        socket_name = getattr(self.tmux, "socket_name", None)
+        return socket_name if isinstance(socket_name, str) and socket_name else None
+
+    def _tmux_history_limit(self) -> Optional[int]:
+        """Return configured tmux history limit when available."""
+        history_limit = getattr(self.tmux, "history_limit", None)
+        return history_limit if isinstance(history_limit, int) else None
+
+    def _tmux_session_history_limit(self, tmux_session: str) -> Optional[int]:
+        """Return a session's current tmux history limit when the controller can provide it."""
+        getter = getattr(self.tmux, "get_history_limit", None)
+        if not callable(getter):
+            return None
+        try:
+            history_limit = getter(tmux_session)
+        except Exception:
+            return None
+        return history_limit if isinstance(history_limit, int) else None
 
     def _migrate_legacy_state_file_if_needed(self) -> None:
         """Copy a pre-durable temp-backed session registry into the configured path once."""
@@ -2320,6 +2341,7 @@ class SessionManager:
                 else:
                     logger.error(f"Failed to create tmux session for {session.name}")
                 return None
+            session.tmux_socket_name = self._tmux_socket_name()
         elif provider == "codex-app":
             try:
                 codex_session = CodexAppServerSession(
@@ -4154,6 +4176,7 @@ class SessionManager:
 
         session.error_message = None
         session.status = SessionStatus.RUNNING
+        session.tmux_socket_name = self._tmux_socket_name()
         session.last_activity = datetime.now()
         if session.provider == "codex-fork":
             self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
@@ -5203,6 +5226,9 @@ class SessionManager:
                 "attach_supported": True,
                 "attach_transport": "tmux",
                 "tmux_session": session.tmux_session,
+                "tmux_socket_name": session.tmux_socket_name,
+                "tmux_history_limit": self._tmux_session_history_limit(session.tmux_session),
+                "tmux_configured_history_limit": self._tmux_history_limit(),
                 "runtime_mode": "detached_runtime",
                 "runtime_id": f"codex-fork:{session.id}",
                 "runtime_owner": self.codex_fork_runtime_owner.get(session.id),
@@ -5227,6 +5253,9 @@ class SessionManager:
             "attach_supported": True,
             "attach_transport": "tmux",
             "tmux_session": session.tmux_session,
+            "tmux_socket_name": session.tmux_socket_name,
+            "tmux_history_limit": self._tmux_session_history_limit(session.tmux_session),
+            "tmux_configured_history_limit": self._tmux_history_limit(),
             "runtime_mode": "tmux",
         }
 
@@ -5350,7 +5379,7 @@ class SessionManager:
             # If session is completed, wake it up first
             if session.completion_status == CompletionStatus.COMPLETED:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, "Enter",
+                    *self.tmux.tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -5359,7 +5388,7 @@ class SessionManager:
 
             # Interrupt any ongoing stream
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_session, "Escape",
+                *self.tmux.tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "Escape"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -5368,7 +5397,7 @@ class SessionManager:
 
             # Send clear command
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_session, clear_command,
+                *self.tmux.tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, clear_command),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -5376,7 +5405,7 @@ class SessionManager:
             await asyncio.sleep(1.0)
 
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_session, "Enter",
+                *self.tmux.tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "Enter"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -5386,14 +5415,14 @@ class SessionManager:
             # Send new prompt if provided
             if new_prompt:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, new_prompt,
+                    *self.tmux.tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, new_prompt),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await proc.communicate()
                 await asyncio.sleep(1.0)
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, "Enter",
+                    *self.tmux.tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -5535,6 +5564,7 @@ class SessionManager:
                     session.error_message = tmux_error
                     self._save_state()
                 return False, session, tmux_error or "Failed to restore Claude session runtime"
+            session.tmux_socket_name = self._tmux_socket_name()
         elif session.provider in ("codex", "codex-fork"):
             if not resume_id:
                 return False, session, "No Codex resume id is available for this session"
@@ -5566,6 +5596,7 @@ class SessionManager:
                     session.error_message = tmux_error
                     self._save_state()
                 return False, session, tmux_error or "Failed to restore Codex session runtime"
+            session.tmux_socket_name = self._tmux_socket_name()
         elif session.provider == "codex-app":
             thread_id = session.codex_thread_id or resume_id
             if not thread_id:
@@ -6106,14 +6137,14 @@ class SessionManager:
                 # Harness survived the crash — use /exit for a clean shutdown
                 logger.debug(f"Sending /exit to session {session.id} (graceful)")
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session, "Escape",
+                    *self.tmux.tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, "Escape"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=5)
                 await asyncio.sleep(0.3)
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session, "/exit", "Enter",
+                    *self.tmux.tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, "/exit", "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -6124,7 +6155,7 @@ class SessionManager:
                 logger.debug(f"Sending C-c twice to session {session.id}")
                 for _ in range(2):
                     proc = await asyncio.create_subprocess_exec(
-                        "tmux", "send-keys", "-t", session.tmux_session, "C-c",
+                        *self.tmux.tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, "C-c"),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -6138,7 +6169,7 @@ class SessionManager:
             #    Claude prints: "To resume this conversation, run:\n  claude --resume <uuid>"
             resume_uuid = None
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "capture-pane", "-p", "-t", session.tmux_session, "-S", "-200",
+                *self.tmux.tmux_cmd_for_session(session.tmux_session, "capture-pane", "-p", "-t", session.tmux_session, "-S", "-200"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -6169,7 +6200,7 @@ class SessionManager:
             if not graceful:
                 logger.debug(f"Sending stty sane to session {session.id}")
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session, "stty sane", "Enter",
+                    *self.tmux.tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, "stty sane", "Enter"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -6179,8 +6210,11 @@ class SessionManager:
             # 6. Unset CLAUDECODE to prevent nested-session detection
             #    (Claude Code exports this; it persists in the shell after the process dies)
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session.tmux_session,
-                "unset CLAUDECODE", "Enter",
+                *self.tmux.tmux_cmd_for_session(
+                    session.tmux_session,
+                    "send-keys", "-t", session.tmux_session,
+                    "unset CLAUDECODE", "Enter",
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -6191,8 +6225,11 @@ class SessionManager:
             shell_fd_limit = int(tmux_timeouts.get("shell_fd_limit", 65536))
             if shell_fd_limit > 0:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session,
-                    f"ulimit -n {shell_fd_limit}", "Enter",
+                    *self.tmux.tmux_cmd_for_session(
+                        session.tmux_session,
+                        "send-keys", "-t", session.tmux_session,
+                        f"ulimit -n {shell_fd_limit}", "Enter",
+                    ),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -6216,8 +6253,11 @@ class SessionManager:
 
             for color_cmd in color_cmds:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", session.tmux_session,
-                    color_cmd, "Enter",
+                    *self.tmux.tmux_cmd_for_session(
+                        session.tmux_session,
+                        "send-keys", "-t", session.tmux_session,
+                        color_cmd, "Enter",
+                    ),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -6237,7 +6277,7 @@ class SessionManager:
 
             logger.debug(f"Sending resume command to session {session.id}: {resume_cmd}")
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", session.tmux_session, resume_cmd, "Enter",
+                *self.tmux.tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, resume_cmd, "Enter"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
