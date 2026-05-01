@@ -187,9 +187,12 @@ async def test_deliver_direct_marks_missing_tmux_runtime_stopped(tmp_path):
             "pane_dead": False,
         }
     )
+    manager.output_monitor = MagicMock()
+    manager.output_monitor.cleanup_session = AsyncMock()
 
     success = await manager._deliver_direct(session, "hello codex")
 
     assert success is False
     assert session.status == SessionStatus.STOPPED
     assert session.error_message == "Tmux session codex-codex697 disappeared before delivery"
+    manager.output_monitor.cleanup_session.assert_awaited_once_with(session, preserve_record=True)

@@ -261,5 +261,5 @@ async def test_deliver_direct_returns_failure_when_fallback_disabled(tmp_path):
     success = await manager._deliver_direct(session, "no fallback")
     assert success is False
     manager.tmux.send_input_async.assert_not_called()
-    assert session.error_message is not None
-    assert session.error_message.startswith("codex_fork_control_degraded:")
+    assert session.status == SessionStatus.STOPPED
+    assert session.error_message == "Tmux session codex-fork-cfctl3 disappeared before delivery"

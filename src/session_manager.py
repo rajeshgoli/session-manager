@@ -4438,7 +4438,7 @@ class SessionManager:
             return f"Tmux session {tmux_name} exited before delivery ({suffix})"
         return f"Tmux session {tmux_name} disappeared before delivery"
 
-    def _mark_tmux_runtime_missing_if_absent(self, session: Session) -> bool:
+    async def _mark_tmux_runtime_missing_if_absent(self, session: Session) -> bool:
         """Mark a tmux-backed session stopped when delivery proves the runtime is gone."""
         if session.provider == "codex-app" or not session.tmux_session:
             return False
@@ -4458,7 +4458,15 @@ class SessionManager:
             session.error_message,
             diagnostics,
         )
-        self._save_state()
+        cleanup_session = (
+            getattr(self.output_monitor, "cleanup_session", None)
+            if self.output_monitor
+            else None
+        )
+        if callable(cleanup_session):
+            await cleanup_session(session, preserve_record=True)
+        else:
+            self._save_state()
         return True
 
     async def _deliver_direct(self, session: Session, text: str, model: Optional[str] = None) -> bool:
@@ -4497,7 +4505,7 @@ class SessionManager:
             logger.warning("Codex-fork control send failed for %s: %s", session.id, reason)
             self._set_codex_fork_control_degraded(session, reason)
             if not self.codex_fork_control_tmux_fallback_enabled:
-                self._mark_tmux_runtime_missing_if_absent(session)
+                await self._mark_tmux_runtime_missing_if_absent(session)
                 return False
 
             logger.warning("Falling back to tmux input path for codex-fork session %s", session.id)
@@ -4509,7 +4517,7 @@ class SessionManager:
             if fallback_success and self.message_queue_manager:
                 self.message_queue_manager.mark_session_active(session.id)
             elif not fallback_success:
-                self._mark_tmux_runtime_missing_if_absent(session)
+                await self._mark_tmux_runtime_missing_if_absent(session)
             return fallback_success
 
         success = await self.tmux.send_input_async(
@@ -4521,7 +4529,7 @@ class SessionManager:
         if success and self.message_queue_manager:
             self.message_queue_manager.mark_session_active(session.id)
         elif not success:
-            self._mark_tmux_runtime_missing_if_absent(session)
+            await self._mark_tmux_runtime_missing_if_absent(session)
         return success
 
     async def _interrupt_codex(self, session: Session) -> bool:
