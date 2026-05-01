@@ -93,7 +93,7 @@ Native terminal scrollback is usually much larger or effectively unbounded by us
 
 1. Make future SM-managed tmux sessions retain substantially more screen scrollback by default.
 2. Correctly apply the configured tmux history limit before the provider pane/window is created.
-3. Provide a clean, provider-transcript-backed CLI for tailing and searching long session history.
+3. Provide a clean, friendly, provider-transcript-backed inspection UI for browsing and searching long session history.
 4. Support Claude, Codex, and codex-fork histories in the first implementation.
 5. Keep tmux as the runtime control and attach plane for existing SM workflows.
 6. Keep raw `pipe-pane` logs as diagnostics, not as the primary human transcript source.
@@ -106,6 +106,7 @@ Native terminal scrollback is usually much larger or effectively unbounded by us
 4. Do not modify Claude or Codex provider behavior.
 5. Do not expose hidden reasoning, encrypted payloads, or provider-internal metadata that is not already visible as normal conversation content.
 6. Do not backfill screen lines already discarded by tmux. Raising `history-limit` only preserves future screen history.
+7. Do not make the user parse raw JSONL, ANSI logs, or low-level command output for the primary history workflow.
 
 ## Proposed solution
 
@@ -223,11 +224,48 @@ Search semantics:
 - `--last` should return only the newest matching entry.
 - `--before N` and `--after N` should provide local transcript context around matches.
 
-### 4. CLI
+### 4. Interactive inspect UI
+
+Add a first-class terminal UI:
+
+```bash
+sm inspect <session>
+```
+
+This should be the primary user-facing answer to "I want to inspect turns" and "when was the last time I said X?" It should feel like a clean conversation browser, not a log parser.
+
+Recommended layout:
+
+- Header: session friendly name, id, provider, repo/workdir, transcript source, transcript freshness.
+- Left/top turn list: timestamp, role, compact one-line preview.
+- Main pane: full selected turn text with wrapping.
+- Footer: active filter/search text, key hints, source path/line for the selected turn.
+
+Required interactions:
+
+- Up/Down or `j`/`k`: move between turns.
+- PageUp/PageDown: move by viewport.
+- `/`: search across visible transcript entries.
+- `n` / `N`: next/previous match.
+- `r`: filter by role (`all`, `user`, `assistant`, `tools`, `system`).
+- `t`: toggle tool entries.
+- `s`: show source metadata for the selected entry.
+- `q` / Esc: quit.
+
+The first implementation can be curses/textual-style and does not need mouse support. It should preserve the existing SM terminal ergonomics: bounded rendering, no live provider probes per keypress, and clear error states when no transcript source exists.
+
+`sm inspect` should use the same transcript resolver/parser as the non-interactive commands. It should not shell out to `jq`, `less`, or provider-native transcript viewers.
+
+This does not make tmux unnecessary. Tmux remains the live runtime and attach surface. `sm inspect` is the clean historical review surface.
+
+### 5. Supporting CLI
+
+Add non-interactive commands for scripting and quick lookup:
 
 Add a new command group:
 
 ```bash
+sm inspect <session>
 sm history path <session>
 sm history tail <session> [--entries 100] [--role user|assistant|all] [--include-tools] [--include-system]
 sm history search <session> <query> [--role user|assistant|all] [--last] [--before N] [--after N] [--include-tools] [--include-system]
@@ -249,9 +287,9 @@ Output shape:
   source: /Users/.../d7b6fbd0-b6aa-474e-8e6b-4d7806beca36.jsonl:3
 ```
 
-This directly solves the "when was the last time I said X?" use case without relying on tmux scrollback still containing that text.
+The non-interactive commands support automation and quick terminal lookup. The primary human workflow should be `sm inspect <session>`.
 
-### 5. API
+### 6. API
 
 Add read-only server endpoints so future UI surfaces can reuse the same parser:
 
@@ -268,7 +306,7 @@ These endpoints should:
 - Stream/scan transcripts without loading whole files into memory.
 - Return a clear `404` or typed error when no transcript source exists.
 
-### 6. Status and attach affordances
+### 7. Status and attach affordances
 
 Add one small user-facing hint when attaching to a managed tmux session whose current history limit is below the configured SM limit:
 
@@ -285,10 +323,11 @@ Do not print this on every attach once the pane is already configured.
 3. Add attach/status visibility for live panes whose current `history_limit` is below the configured target.
 4. Add `src/transcript_history.py` with source resolution and streaming parser primitives.
 5. Add server endpoints for source, tail, and search.
-6. Add `sm history` CLI commands using the server endpoints.
-7. Broaden `Session.transcript_path` comments and docs from "Claude transcript" to "provider transcript" where needed.
-8. Store discovered Codex/codex-fork transcript paths when resolution succeeds, without making path discovery a hard requirement for session operation.
-9. Add tests for tmux history configuration, startup application, transcript source resolution, Claude parsing, Codex parsing, CLI output, and bounded API responses.
+6. Add `sm inspect <session>` as the primary interactive turn browser.
+7. Add `sm history` non-interactive commands using the same resolver/parser.
+8. Broaden `Session.transcript_path` comments and docs from "Claude transcript" to "provider transcript" where needed.
+9. Store discovered Codex/codex-fork transcript paths when resolution succeeds, without making path discovery a hard requirement for session operation.
+10. Add tests for tmux history configuration, bootstrap-window ordering, transcript source resolution, Claude parsing, Codex parsing, inspect UI row state, CLI output, and bounded API responses.
 
 ## Edge cases
 
@@ -305,13 +344,14 @@ Do not print this on every attach once the pane is already configured.
 1. New SM-managed Claude, Codex, and codex-fork tmux provider panes are created with the configured `history-limit`.
 2. Tests prove setting `history-limit` after the initial `new-session` window is insufficient, and the implementation uses a provider window created after the option is set.
 3. Session Manager does not change global tmux options or user-owned tmux sessions outside SM.
-4. `sm history path 3348-owner` prints the provider transcript path for the session when available.
-5. `sm history search 3348-owner "..." --role user --last` finds old user prompts even when tmux scrollback no longer contains them.
-6. `sm history tail <session>` returns clean provider transcript entries, not raw ANSI pane bytes.
-7. Claude transcript parsing excludes tool results from default user-message searches.
-8. Codex/codex-fork transcript resolution works through provider session JSONL paths and codex-fork event streams.
-9. API and CLI outputs are bounded and stream large transcript files without loading them whole.
-10. Tests cover the new tmux config path, live-session application, parser normalization, resolver fallback behavior, and CLI/API error handling.
+4. `sm inspect 3348-owner` opens a clean interactive turn browser with role filtering and search.
+5. `sm history path 3348-owner` prints the provider transcript path for the session when available.
+6. `sm history search 3348-owner "..." --role user --last` finds old user prompts even when tmux scrollback no longer contains them.
+7. `sm history tail <session>` returns clean provider transcript entries, not raw ANSI pane bytes.
+8. Claude transcript parsing excludes tool results from default user-message searches.
+9. Codex/codex-fork transcript resolution works through provider session JSONL paths and codex-fork event streams.
+10. API, inspect UI, and CLI outputs are bounded and stream large transcript files without loading them whole.
+11. Tests cover the new tmux config path, bootstrap-window ordering, inspect UI row state, parser normalization, resolver fallback behavior, and CLI/API error handling.
 
 ## Recommended design decision
 
@@ -326,4 +366,4 @@ This matches the actual data sources Session Manager already has and avoids over
 
 ## Ticket classification
 
-Single implementation ticket. One agent can implement the tmux history-limit change and the first `sm history` transcript search/tail path without splitting this into an epic, as long as v1 stays limited to Claude, Codex, and codex-fork transcript sources.
+Single implementation ticket. One agent can implement the tmux history-limit change, the first `sm inspect` turn browser, and the supporting `sm history` search/tail path without splitting this into an epic, as long as v1 stays limited to Claude, Codex, and codex-fork transcript sources.
