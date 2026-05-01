@@ -3058,7 +3058,7 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
                 )
                 if contains_release is not None:
                     info["fork_contains_latest_upstream_release"] = contains_release == 0
-                    if contains_release != 0 and _codex_fork_pin_satisfies_latest_release(
+                    if contains_release == 1 and _codex_fork_pin_satisfies_latest_release(
                         runtime_payload=runtime_payload,
                         release_tag=release_tag,
                         release_version=info.get("latest_upstream_release_version"),
@@ -3066,8 +3066,13 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
                         fork_head_full=fork_head_full,
                     ):
                         info["latest_upstream_release_satisfied_by_pin"] = True
-                    elif contains_release != 0:
+                    elif contains_release == 1:
                         sync_reasons.append(f"fork does not yet contain upstream release {release_tag}")
+                    elif contains_release != 0:
+                        sync_reasons.append(
+                            f"could not verify fork contains upstream release {release_tag} "
+                            f"(git merge-base exited {contains_release})"
+                        )
         if binary_mtime_dt and release_tag:
             release_published_dt = _parse_iso_datetime(release_published_at)
             if release_published_dt is not None:
