@@ -2978,8 +2978,7 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
     if binary_path.exists():
         binary_mtime_dt = datetime.fromtimestamp(binary_path.stat().st_mtime, tz=timezone.utc)
         info["binary_mtime"] = binary_mtime_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
-        binary_version_output = _run_text_command([str(binary_path), "--version"])
-        binary_version = _parse_codex_version(binary_version_output)
+        binary_version = _probe_codex_binary_version(binary_path)
         if binary_version:
             info["binary_version"] = binary_version
     else:
@@ -3094,6 +3093,23 @@ def _parse_codex_version(value: Optional[str]) -> Optional[str]:
         return None
     match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)", value)
     return match.group(1) if match else None
+
+
+def _probe_codex_binary_version(binary_path: Path, timeout_seconds: float = 2.0) -> Optional[str]:
+    """Return `codex --version` semver without letting diagnostics hang."""
+    try:
+        result = subprocess.run(
+            [str(binary_path), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_codex_version(result.stdout)
 
 
 def _codex_fork_pin_satisfies_latest_release(

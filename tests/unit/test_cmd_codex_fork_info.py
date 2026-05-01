@@ -197,8 +197,6 @@ def test_collect_codex_fork_maintenance_info_accepts_squashed_pinned_release(mon
     fork_head = "abc1234567890defabc1234567890defabc12345"
 
     def _fake_run_text(args):
-        if args == [str(binary_path), "--version"]:
-            return "codex-cli 0.128.0"
         cmd = " ".join(args)
         if "rev-parse --abbrev-ref HEAD" in cmd:
             return "main"
@@ -228,6 +226,7 @@ def test_collect_codex_fork_maintenance_info_accepts_squashed_pinned_release(mon
 
     monkeypatch.setattr(commands, "_run_text_command", _fake_run_text)
     monkeypatch.setattr(commands, "_run_command", _fake_run)
+    monkeypatch.setattr(commands, "_probe_codex_binary_version", lambda path: "0.128.0")
 
     info = commands._collect_codex_fork_maintenance_info(
         {
@@ -257,8 +256,6 @@ def test_collect_codex_fork_maintenance_info_keeps_merge_base_errors_visible(mon
     fork_head = "abc1234567890defabc1234567890defabc12345"
 
     def _fake_run_text(args):
-        if args == [str(binary_path), "--version"]:
-            return "codex-cli 0.128.0"
         cmd = " ".join(args)
         if "rev-parse --abbrev-ref HEAD" in cmd:
             return "main"
@@ -288,6 +285,7 @@ def test_collect_codex_fork_maintenance_info_keeps_merge_base_errors_visible(mon
 
     monkeypatch.setattr(commands, "_run_text_command", _fake_run_text)
     monkeypatch.setattr(commands, "_run_command", _fake_run)
+    monkeypatch.setattr(commands, "_probe_codex_binary_version", lambda path: "0.128.0")
 
     info = commands._collect_codex_fork_maintenance_info(
         {
@@ -303,3 +301,15 @@ def test_collect_codex_fork_maintenance_info_keeps_merge_base_errors_visible(mon
     assert info["sync_reasons"] == [
         "could not verify fork contains upstream release rust-v0.128.0 (git merge-base exited 128)"
     ]
+
+
+def test_probe_codex_binary_version_times_out(monkeypatch, tmp_path):
+    binary_path = tmp_path / "codex"
+    binary_path.write_text("binary")
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise commands.subprocess.TimeoutExpired(cmd=[str(binary_path), "--version"], timeout=2.0)
+
+    monkeypatch.setattr(commands.subprocess, "run", _raise_timeout)
+
+    assert commands._probe_codex_binary_version(binary_path) is None
