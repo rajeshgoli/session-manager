@@ -4,12 +4,19 @@ Issue: #690
 
 ## Summary
 
-Session Manager should improve the long-running Claude/Codex terminal experience in two layers:
+Session Manager should improve the long-running Claude/Codex terminal experience in three layers:
 
-1. Make SM-managed tmux panes retain far more scrollback by default, with a configurable per-session `history-limit`.
-2. Add a clean `sm history` surface backed by provider-native structured transcripts for search and review use cases such as "when was the last time I said X?"
+1. Make attached SM sessions use the caller's native terminal scrollback where tmux can safely support it.
+2. Make SM-managed tmux panes retain far more scrollback by default, with a configurable per-session `history-limit`.
+3. Add a clean `sm inspect` surface backed by provider-native structured transcripts for review/search use cases such as "when was the last time I said X?"
 
-The important design point is that tmux pane history and provider conversation history are not the same product. Tmux history is a screen buffer. It can be made deeper, but it cannot reliably become a clean transcript while Claude/Codex render interactive TUIs with prompt, footer, and status redraws.
+The important design point is that there are three different histories:
+
+- Native terminal scrollback: best UX when the terminal is attached while output is produced.
+- tmux pane history: bounded screen-buffer history retained by tmux, including TUI redraw artifacts.
+- Provider transcript history: structured conversation data, best for clean turn inspection/search.
+
+Native-terminal parity is a valid target for live attached sessions. It is not a complete answer for detached periods because no caller terminal exists to receive bytes while the session is detached.
 
 ## Observed behavior
 
@@ -21,6 +28,7 @@ Live probe on May 1, 2026 against `3348-owner`:
 - pane size: `51x142`
 - tmux pane history at probe time: `hist=1623/2000`
 - global tmux setting: `history-limit 2000`
+- attached tmux clients: none at the time of the probe
 
 Capturing the full available pane history:
 
@@ -89,14 +97,73 @@ The current `TmuxController.create_session_with_command()` path creates a detach
 
 Native terminal scrollback is usually much larger or effectively unbounded by user preference. The managed tmux panes therefore lose inspectable screen history much sooner.
 
+### Native scrollback spike
+
+The spike tested tmux 3.6a with isolated tmux servers/sockets so the user's default tmux server was not modified.
+
+Relevant tmux docs:
+
+- `history-limit` applies only to new windows; existing window histories are not resized.
+- `alternate-screen` controls whether programs inside a pane may use `smcup`/`rmcup`.
+- The tmux FAQ says tmux makes no attempt to keep terminal scrollback consistent and that disabling alternate-screen use can still be incomplete.
+
+Probe results:
+
+1. Default attached tmux emits outer-terminal alternate-screen enter/exit sequences:
+
+```text
+default alt_1049h=1 alt_1049l=1
+normal  alt_1049h=0 alt_1049l=0
+```
+
+The `normal` case used:
+
+```tmux
+set -as terminal-overrides ',*:smcup@:rmcup@'
+```
+
+2. If an outer terminal is attached before output starts, no-alternate-screen tmux can populate the outer terminal's scrollback. Using an outer tmux pane as a stand-in terminal emulator:
+
+```text
+default outer history: hist=0/2000, first/mid lines missing, only current bottom viewport visible
+normal  outer history: hist=338/2000, first/mid/last lines all visible
+```
+
+This means a native-scrollback attach mode is worth pursuing for live attached sessions.
+
+3. If output is produced while the SM tmux session is detached, attaching later cannot populate the caller terminal's old scrollback. Even in no-alternate-screen mode, attach only painted the current bottom viewport:
+
+```text
+default first_line_seen=0 mid_line_seen=0 last_line_seen=2
+normal  first_line_seen=0 mid_line_seen=0 last_line_seen=2
+```
+
+4. Programmatically sweeping tmux copy-mode from `history-top` through the retained pane history did not preload the outer terminal's scrollback. It only changed the current viewport:
+
+```text
+after_attach      outer hist=0, first=0, mid=0, last=1
+after_history_top outer hist=0, first=1, mid=0, last=0
+after_sweep       outer hist=0, first=0, mid=0, last=1
+```
+
+5. `clear-history` really drops tmux's saved history. `refresh-client`/`refresh-from-pane` do not cause the provider process to replay old output:
+
+```text
+before_clear hist=117/2000 first=1 last=1
+after_clear  hist=0/2000   first=0 last=1
+```
+
+Conclusion: the best tmux-side UX is a native-scrollback attach mode for output produced while attached, plus much deeper tmux history for detached retention. It is not possible to force tmux to drop history and rebuild old output from the app through terminal scrolling alone.
+
 ## Goals
 
-1. Make future SM-managed tmux sessions retain substantially more screen scrollback by default.
-2. Correctly apply the configured tmux history limit before the provider pane/window is created.
-3. Provide a clean, friendly, provider-transcript-backed inspection UI for browsing and searching long session history.
-4. Support Claude, Codex, and codex-fork histories in the first implementation.
-5. Keep tmux as the runtime control and attach plane for existing SM workflows.
-6. Keep raw `pipe-pane` logs as diagnostics, not as the primary human transcript source.
+1. Make live attached SM sessions use native terminal scrollback when tmux can safely support it.
+2. Make future SM-managed tmux sessions retain substantially more screen scrollback by default.
+3. Correctly apply the configured tmux history limit before the provider pane/window is created.
+4. Provide a clean, friendly, provider-transcript-backed inspection UI for browsing and searching long session history.
+5. Support Claude, Codex, and codex-fork histories in the first implementation.
+6. Keep tmux as the runtime control and attach plane for existing SM workflows.
+7. Keep raw `pipe-pane` logs as diagnostics, not as the primary human transcript source.
 
 ## Non-goals
 
@@ -107,14 +174,59 @@ Native terminal scrollback is usually much larger or effectively unbounded by us
 5. Do not expose hidden reasoning, encrypted payloads, or provider-internal metadata that is not already visible as normal conversation content.
 6. Do not backfill screen lines already discarded by tmux. Raising `history-limit` only preserves future screen history.
 7. Do not make the user parse raw JSONL, ANSI logs, or low-level command output for the primary history workflow.
+8. Do not claim exact native-terminal parity for output produced while no caller terminal was attached.
 
 ## Proposed solution
+
+### 0. Native scrollback attach mode
+
+Add a native-scrollback attach path and make it the preferred live terminal experience when enabled.
+
+Required behavior:
+
+- Configure SM-owned tmux clients so tmux does not enter the caller terminal's alternate screen:
+
+```tmux
+set -as terminal-overrides ',*:smcup@:rmcup@'
+```
+
+- Do this only for an SM-owned tmux server/socket. `terminal-overrides` is a server option; Session Manager must not mutate the user's default tmux server or unrelated tmux sessions.
+- Add tmux config:
+
+```yaml
+tmux:
+  socket_name: session-manager
+  native_scrollback: true
+  history_limit: 100000
+```
+
+- Route all SM tmux commands through the configured socket, for example:
+
+```bash
+tmux -L session-manager ...
+```
+
+- `sm attach`, `sm new`, `sm codex-2`, and `sm watch` attach flows must use the same socket/config as session creation.
+- Keep a compatibility path for existing sessions already created on the default tmux server. They can attach normally, but should not silently change the default server's `terminal-overrides`.
+
+Expected result:
+
+- When the user is attached before output is produced, the caller terminal's own scrollback should accumulate the live session output, matching native terminal behavior much more closely than default tmux attach.
+- When the session is detached while output is produced, the caller terminal cannot receive that past output. Reattach can only draw the current tmux viewport unless SM explicitly prints a prefill before attaching.
+
+Optional follow-up after the core mode works:
+
+- Add `sm attach --prefill-scrollback <session>` to print a bounded pre-attach history block into the caller terminal before attaching in native-scrollback mode.
+- The prefill source should be explicit:
+  - `--prefill-source tmux` prints retained tmux pane history and preserves visual context, including artifacts.
+  - `--prefill-source transcript` prints clean provider turns and intentionally does not claim to be exact terminal output.
+- This is not a substitute for real native scrollback from detached periods. It is a reattach convenience for cases where the user wants old material in the terminal scrollback above the live pane.
 
 ### Rejected direct fix: periodic tmux scroll sweep
 
 Do not try to keep tmux "native-terminal-like" by periodically scrolling detached or idle attached panes to the top and back down.
 
-This was tested against a disposable tmux pane. `copy-mode` plus `history-top` changed only tmux's copy-mode cursor:
+This was tested against disposable tmux panes, including an outer tmux pane acting as the caller terminal. `copy-mode` plus `history-top` changed only tmux's copy-mode cursor/current viewport:
 
 ```bash
 tmux copy-mode -t sm-scroll-sync-probe
@@ -122,7 +234,7 @@ tmux send-keys -t sm-scroll-sync-probe -X history-top
 tmux display-message -p -t sm-scroll-sync-probe 'hist=#{history_size}/#{history_limit} mode=#{pane_in_mode}'
 ```
 
-The pane entered copy-mode, but `history_size/history_limit` did not increase and no previously discarded lines reappeared. This matches the tmux model: copy-mode scrolls through the pane history tmux has already retained; it does not cause the child process to replay output, and it does not populate an outer terminal emulator's scrollback.
+The pane entered copy-mode, but `history_size/history_limit` did not increase and no previously discarded lines reappeared. In the outer-terminal simulation, sweeping through copy-mode also left the outer terminal's history at `hist=0/2000`. This matches the tmux model: copy-mode scrolls through the pane history tmux has already retained; it does not cause the child process to replay output, and it does not populate an outer terminal emulator's scrollback.
 
 This approach also has bad operational properties:
 
@@ -131,14 +243,16 @@ This approach also has bad operational properties:
 - Leaving a pane in copy-mode can block normal input delivery until Session Manager exits copy-mode; the existing send path already has defensive copy-mode cancellation because this happens in practice.
 - TUI redraw artifacts are already in tmux's saved screen history. Scrolling over them cannot turn that screen history into semantic turns.
 
-The direct fix remains: set a larger history limit before the provider pane is created. The clean-history fix remains: use provider transcripts for inspection/search.
+The live UX fix is native-scrollback attach mode. The retained-screen-history fix is setting a larger history limit before the provider pane is created. The clean-history fix is provider transcript inspection/search.
 
 ### 1. Configurable tmux history limit
 
-Add a top-level tmux config section:
+Extend the top-level tmux config section:
 
 ```yaml
 tmux:
+  socket_name: session-manager
+  native_scrollback: true
   history_limit: 100000
 ```
 
@@ -171,7 +285,7 @@ The provider must be launched only in the new `main` window created after the se
   - `create_session()`
   - `create_session_with_command()`
 - Add `TmuxController.get_history_limit(session_name)` so attach/status paths can report when an existing pane is still below the configured target.
-- Do not set global tmux options. Session Manager should not silently change user-owned tmux sessions outside SM.
+- Do not set global tmux options on the user's default tmux server. Server-wide options are acceptable only inside the configured SM-owned tmux server/socket.
 
 Existing live sessions:
 
@@ -341,16 +455,21 @@ Do not print this on every attach once the pane is already configured.
 
 ## Implementation plan
 
-1. Add `tmux.history_limit` config loading and `TmuxController.get_history_limit()`.
-2. Change tmux creation to use the bootstrap-window sequence so the provider window is created after the per-session `history-limit` is set.
-3. Add attach/status visibility for live panes whose current `history_limit` is below the configured target.
-4. Add `src/transcript_history.py` with source resolution and streaming parser primitives.
-5. Add server endpoints for source, tail, and search.
-6. Add `sm inspect <session>` as the primary interactive turn browser.
-7. Add `sm history` non-interactive commands using the same resolver/parser.
-8. Broaden `Session.transcript_path` comments and docs from "Claude transcript" to "provider transcript" where needed.
-9. Store discovered Codex/codex-fork transcript paths when resolution succeeds, without making path discovery a hard requirement for session operation.
-10. Add tests for tmux history configuration, bootstrap-window ordering, transcript source resolution, Claude parsing, Codex parsing, inspect UI row state, CLI output, and bounded API responses.
+1. Add `tmux.socket_name`, `tmux.native_scrollback`, and `tmux.history_limit` config loading.
+2. Add a tmux command wrapper so `TmuxController` can route all managed tmux operations through the configured SM socket.
+3. Initialize the SM-owned tmux server/socket with no-alternate-screen terminal overrides when `native_scrollback` is enabled.
+4. Update `sm attach`, `sm new`, `sm codex-2`, and `sm watch` attach flows to use the same configured tmux socket as session creation.
+5. Preserve a compatibility attach path for existing live sessions created on the default tmux server.
+6. Add `TmuxController.get_history_limit()`.
+7. Change tmux creation to use the bootstrap-window sequence so the provider window is created after the per-session `history-limit` is set.
+8. Add attach/status visibility for live panes whose current `history_limit` is below the configured target.
+9. Add `src/transcript_history.py` with source resolution and streaming parser primitives.
+10. Add server endpoints for source, tail, and search.
+11. Add `sm inspect <session>` as the primary interactive turn browser.
+12. Add `sm history` non-interactive commands using the same resolver/parser.
+13. Broaden `Session.transcript_path` comments and docs from "Claude transcript" to "provider transcript" where needed.
+14. Store discovered Codex/codex-fork transcript paths when resolution succeeds, without making path discovery a hard requirement for session operation.
+15. Add tests for native-scrollback attach behavior, tmux socket routing, tmux history configuration, bootstrap-window ordering, transcript source resolution, Claude parsing, Codex parsing, inspect UI row state, CLI output, and bounded API responses.
 
 ## Edge cases
 
@@ -360,33 +479,46 @@ Do not print this on every attach once the pane is already configured.
 - Query matches tool output but the user requested `--role user`: do not return tool-result entries unless `--include-tools` is set.
 - Session is active and transcript is being appended: tolerate partial last lines by skipping only the incomplete line.
 - Existing tmux panes already lost old history: the higher limit only affects future retained screen history.
+- Existing tmux panes created on the default tmux server: attach through the compatibility path and show that they are not using the new native-scrollback mode.
+- Native-scrollback mode while nested inside another tmux: keep the same no-alternate-screen behavior; the outer tmux can then accumulate scrollback for output produced while attached.
+- Detached output before attach: do not imply it was written to the caller terminal. Use tmux history, optional prefill, or `sm inspect`.
 - Very large transcripts: scan line by line and cap rendered snippets.
 
 ## Acceptance criteria
 
-1. New SM-managed Claude, Codex, and codex-fork tmux provider panes are created with the configured `history-limit`.
-2. Tests prove setting `history-limit` after the initial `new-session` window is insufficient, and the implementation uses a provider window created after the option is set.
-3. Session Manager does not change global tmux options or user-owned tmux sessions outside SM.
-4. `sm inspect 3348-owner` opens a clean interactive turn browser with role filtering and search.
-5. `sm history path 3348-owner` prints the provider transcript path for the session when available.
-6. `sm history search 3348-owner "..." --role user --last` finds old user prompts even when tmux scrollback no longer contains them.
-7. `sm history tail <session>` returns clean provider transcript entries, not raw ANSI pane bytes.
-8. Claude transcript parsing excludes tool results from default user-message searches.
-9. Codex/codex-fork transcript resolution works through provider session JSONL paths and codex-fork event streams.
-10. API, inspect UI, and CLI outputs are bounded and stream large transcript files without loading them whole.
-11. Tests cover the new tmux config path, bootstrap-window ordering, inspect UI row state, parser normalization, resolver fallback behavior, and CLI/API error handling.
+1. New SM-managed Claude, Codex, and codex-fork tmux sessions are created on the configured SM tmux socket.
+2. With `tmux.native_scrollback: true`, attached-from-start sessions do not send outer-terminal `1049` alternate-screen enter/exit sequences, and an integration probe sees first/mid/last live output lines in the outer terminal scrollback.
+3. Output produced while no client is attached is not claimed to be present in the caller terminal's native scrollback after later attach.
+4. New SM-managed Claude, Codex, and codex-fork tmux provider panes are created with the configured `history-limit`.
+5. Tests prove setting `history-limit` after the initial `new-session` window is insufficient, and the implementation uses a provider window created after the option is set.
+6. Session Manager does not change global tmux options or user-owned tmux sessions outside the configured SM tmux socket.
+7. Existing default-server sessions remain attachable through a compatibility path.
+8. `sm inspect 3348-owner` opens a clean interactive turn browser with role filtering and search.
+9. `sm history path 3348-owner` prints the provider transcript path for the session when available.
+10. `sm history search 3348-owner "..." --role user --last` finds old user prompts even when tmux scrollback no longer contains them.
+11. `sm history tail <session>` returns clean provider transcript entries, not raw ANSI pane bytes.
+12. Claude transcript parsing excludes tool results from default user-message searches.
+13. Codex/codex-fork transcript resolution works through provider session JSONL paths and codex-fork event streams.
+14. API, inspect UI, and CLI outputs are bounded and stream large transcript files without loading them whole.
+15. Tests cover native-scrollback attach behavior, tmux socket routing, the new tmux config path, bootstrap-window ordering, inspect UI row state, parser normalization, resolver fallback behavior, and CLI/API error handling.
 
 ## Recommended design decision
 
-Do not try to make tmux copy-mode be the clean long-term transcript.
+Pursue native terminal scrollback for the live attached path. Do not try to make tmux copy-mode be the clean long-term transcript.
 
 The practical split is:
 
-- tmux scrollback: deeper, useful for nearby visual context and manual terminal review.
+- native terminal scrollback: best live UX when attached before output is produced.
+- tmux scrollback: deeper, useful for detached retention, nearby visual context, and manual terminal review.
 - provider transcript history: clean, searchable, timestamped, and durable enough for long-running agent workflows.
 
 This matches the actual data sources Session Manager already has and avoids overfitting to provider TUI repaint behavior.
 
+## Research sources
+
+- tmux FAQ: <https://github.com/tmux/tmux/wiki/FAQ>
+- tmux manual: <https://man.openbsd.org/tmux.1>
+
 ## Ticket classification
 
-Single implementation ticket. One agent can implement the tmux history-limit change, the first `sm inspect` turn browser, and the supporting `sm history` search/tail path without splitting this into an epic, as long as v1 stays limited to Claude, Codex, and codex-fork transcript sources.
+Single implementation ticket with a strict order: native-scrollback attach mode and tmux socket routing first, larger tmux history second, provider transcript inspection third. One agent can implement the first `sm inspect` turn browser and the supporting `sm history` search/tail path without splitting this into an epic, as long as v1 stays limited to Claude, Codex, and codex-fork transcript sources.
