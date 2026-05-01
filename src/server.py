@@ -512,6 +512,7 @@ class SessionResponse(BaseModel):
     completed_at: Optional[str] = None
     stopped_at: Optional[str] = None
     tmux_session: str
+    tmux_socket_name: Optional[str] = None
     provider: Optional[str] = "claude"
     friendly_name: Optional[str] = None
     telegram_chat_id: Optional[int] = None
@@ -1841,6 +1842,7 @@ def create_app(
             completed_at=session.completed_at.isoformat() if session.completed_at else None,
             stopped_at=session.stopped_at.isoformat() if session.stopped_at else None,
             tmux_session=session.tmux_session,
+            tmux_socket_name=session.tmux_socket_name,
             provider=provider,
             friendly_name=_effective_session_name(
                 session,
@@ -5684,6 +5686,8 @@ Provide ONLY the summary, no preamble or questions."""
                     "last_activity": s.last_activity.isoformat(),
                     "spawned_at": s.spawned_at.isoformat() if s.spawned_at else None,
                     "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                    "tmux_session": s.tmux_session,
+                    "tmux_socket_name": s.tmux_socket_name,
                     # sm remind: self-reported status (#188)
                     "agent_status_text": s.agent_status_text,
                     "agent_status_at": s.agent_status_at.isoformat() if s.agent_status_at else None,

@@ -131,6 +131,7 @@ class TestSessionEndpoints:
         assert len(data["sessions"]) == 1
         assert data["sessions"][0]["id"] == "test123"
         assert data["sessions"][0]["friendly_name"] == "Test Session"
+        assert data["sessions"][0]["tmux_socket_name"] is None
         assert data["sessions"][0]["activity_state"] == "working"
         assert data["sessions"][0]["agent_status_text"] == "running tests"
         assert data["sessions"][0]["agent_status_at"] == "2024-01-15T11:05:00"

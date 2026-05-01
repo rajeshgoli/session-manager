@@ -30,6 +30,8 @@ def test_children_endpoint_includes_activity_state(tmp_path):
         provider="codex-fork",
         parent_session_id=parent.id,
         status=SessionStatus.IDLE,
+        tmux_session="codex-fork-child001",
+        tmux_socket_name="session-manager-test",
     )
     manager.sessions[parent.id] = parent
     manager.sessions[child.id] = child
@@ -48,6 +50,8 @@ def test_children_endpoint_includes_activity_state(tmp_path):
     assert payload[0]["id"] == child.id
     assert payload[0]["status"] == "idle"
     assert payload[0]["activity_state"] == "working"
+    assert payload[0]["tmux_session"] == "codex-fork-child001"
+    assert payload[0]["tmux_socket_name"] == "session-manager-test"
 
 
 def test_children_endpoint_hides_terminated_by_default(tmp_path):
