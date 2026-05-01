@@ -183,6 +183,26 @@ class TmuxController:
                 "on",
                 check=False,
             )
+            pane_id = (
+                self._run_tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    session_name,
+                    "#{pane_id}",
+                    check=False,
+                ).stdout
+                or ""
+            ).strip()
+            if pane_id:
+                self._run_tmux(
+                    "set-option",
+                    "-t",
+                    session_name,
+                    "@sm_main_pane_id",
+                    pane_id,
+                    check=False,
+                )
         except Exception:
             # Exit diagnostics are best-effort. Spawn should not fail if tmux
             # lacks this option or the pane disappeared during setup.
@@ -236,12 +256,26 @@ class TmuxController:
         if not exists:
             return diagnostics
 
+        main_pane_id = (
+            self._run_tmux(
+                "show-options",
+                "-qv",
+                "-t",
+                target,
+                "@sm_main_pane_id",
+                check=False,
+                socket_name=socket_name,
+            ).stdout
+            or ""
+        ).strip() or None
+        diagnostics["main_pane_id"] = main_pane_id
+
         result = self._run_tmux(
             "list-panes",
             "-t",
             target,
             "-F",
-            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_current_command}\t#{pane_pid}\t#{pane_tty}",
+            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_current_command}\t#{pane_pid}\t#{pane_tty}\t#{pane_active}\t#{pane_title}",
             check=False,
             socket_name=socket_name,
         )
@@ -252,7 +286,7 @@ class TmuxController:
         panes: list[dict[str, object]] = []
         for line in (result.stdout or "").splitlines():
             parts = line.split("\t")
-            parts += [""] * (7 - len(parts))
+            parts += [""] * (9 - len(parts))
             pane = {
                 "pane_id": parts[0],
                 "pane_dead": parts[1] == "1",
@@ -261,16 +295,35 @@ class TmuxController:
                 "pane_current_command": parts[4] or None,
                 "pane_pid": parts[5] or None,
                 "pane_tty": parts[6] or None,
+                "pane_active": parts[7] == "1",
+                "pane_title": parts[8] or None,
             }
             panes.append(pane)
 
         diagnostics["panes"] = panes
-        dead_pane = next((pane for pane in panes if pane.get("pane_dead")), None)
+        dead_panes = [pane for pane in panes if pane.get("pane_dead")]
+        diagnostics["dead_panes"] = dead_panes
+        if main_pane_id:
+            dead_pane = next(
+                (
+                    pane
+                    for pane in dead_panes
+                    if pane.get("pane_id") == main_pane_id
+                ),
+                None,
+            )
+        else:
+            live_panes = [pane for pane in panes if not pane.get("pane_dead")]
+            dead_pane = dead_panes[0] if dead_panes and not live_panes else None
         if dead_pane:
             diagnostics["pane_dead"] = True
             diagnostics.update(dead_pane)
         elif panes:
-            diagnostics.update(panes[0])
+            main_pane = next(
+                (pane for pane in panes if pane.get("pane_id") == main_pane_id),
+                None,
+            )
+            diagnostics.update(main_pane or panes[0])
         return diagnostics
 
     def _resolve_launch_command(

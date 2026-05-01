@@ -130,7 +130,10 @@ async def test_provider_native_rename_skips_when_native_title_already_matches(tm
     queued = await manager.queue_provider_native_rename(session, "maintainer")
 
     assert queued is True
-    manager.message_queue_manager.cancel_queued_messages_for_target.assert_not_called()
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_called_once_with(
+        session.id,
+        "native_rename",
+    )
     manager.message_queue_manager.queue_message.assert_not_called()
 
 

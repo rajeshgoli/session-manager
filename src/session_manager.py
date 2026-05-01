@@ -3478,6 +3478,11 @@ class SessionManager:
             return False
         if not self._is_safe_provider_native_rename_name(friendly_name):
             return False
+        if self.message_queue_manager:
+            self.message_queue_manager.cancel_queued_messages_for_target(
+                session.id,
+                "native_rename",
+            )
         if (session.native_title or "").strip() == friendly_name:
             logger.debug(
                 "Skipping provider-native rename for %s; native title is already %r",
@@ -3490,10 +3495,6 @@ class SessionManager:
         if not self.message_queue_manager:
             return await self._deliver_provider_native_rename(session, friendly_name)
 
-        self.message_queue_manager.cancel_queued_messages_for_target(
-            session.id,
-            "native_rename",
-        )
         self.message_queue_manager.queue_message(
             target_session_id=session.id,
             text=rename_command,

@@ -146,6 +146,8 @@ def test_create_session_with_command_enables_exit_diagnostics(tmp_path, monkeypa
 
     def _fake_run_tmux(*args, **kwargs):
         calls.append(args)
+        if args[:3] == ("display-message", "-p", "-t"):
+            return MagicMock(returncode=0, stdout="%main\n")
         return MagicMock(returncode=0, stdout="")
 
     monkeypatch.setattr(controller, "session_exists", lambda _: False)
@@ -168,6 +170,13 @@ def test_create_session_with_command_enables_exit_diagnostics(tmp_path, monkeypa
         "remain-on-exit",
         "on",
     ) in calls
+    assert (
+        "set-option",
+        "-t",
+        "claude-exitdiag",
+        "@sm_main_pane_id",
+        "%main",
+    ) in calls
 
 
 def test_get_session_exit_diagnostics_reports_dead_pane(monkeypatch):
@@ -181,6 +190,8 @@ def test_get_session_exit_diagnostics_reports_dead_pane(monkeypatch):
     def _fake_run_tmux(*args, **kwargs):
         if args[:2] == ("list-sessions", "-F"):
             return MagicMock(returncode=0, stdout="codex-fork-dead\n")
+        if args[:3] == ("show-options", "-qv", "-t"):
+            return MagicMock(returncode=0, stdout="")
         if args[:2] == ("list-panes", "-t"):
             return MagicMock(
                 returncode=0,
@@ -198,6 +209,71 @@ def test_get_session_exit_diagnostics_reports_dead_pane(monkeypatch):
     assert diagnostics["pane_dead_signal"] == "0"
     assert diagnostics["pane_current_command"] == "codex"
     assert diagnostics["socket_name"] == "session-manager-test"
+
+
+def test_get_session_exit_diagnostics_ignores_dead_auxiliary_pane(monkeypatch):
+    controller = TmuxController(config={"tmux": {"socket_name": "session-manager-test"}})
+    monkeypatch.setattr(
+        controller,
+        "_session_exists_on_socket",
+        lambda session_name, socket_name: socket_name == "session-manager-test",
+    )
+
+    def _fake_run_tmux(*args, **kwargs):
+        if args[:2] == ("list-sessions", "-F"):
+            return MagicMock(returncode=0, stdout="claude-live\n")
+        if args[:3] == ("show-options", "-qv", "-t"):
+            return MagicMock(returncode=0, stdout="%main\n")
+        if args[:2] == ("list-panes", "-t"):
+            return MagicMock(
+                returncode=0,
+                stdout=(
+                    "%main\t0\t\t\tclaude\t111\t/dev/ttys001\t1\tclaude-live\n"
+                    "%aux\t1\t0\t\tzsh\t222\t/dev/ttys002\t0\taux-shell\n"
+                ),
+            )
+        return MagicMock(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+
+    diagnostics = controller.get_session_exit_diagnostics("claude-live")
+
+    assert diagnostics["exists"] is True
+    assert diagnostics["pane_dead"] is False
+    assert diagnostics["pane_id"] == "%main"
+    assert diagnostics["dead_panes"][0]["pane_id"] == "%aux"
+
+
+def test_get_session_exit_diagnostics_reports_dead_main_pane(monkeypatch):
+    controller = TmuxController(config={"tmux": {"socket_name": "session-manager-test"}})
+    monkeypatch.setattr(
+        controller,
+        "_session_exists_on_socket",
+        lambda session_name, socket_name: socket_name == "session-manager-test",
+    )
+
+    def _fake_run_tmux(*args, **kwargs):
+        if args[:2] == ("list-sessions", "-F"):
+            return MagicMock(returncode=0, stdout="claude-dead-main\n")
+        if args[:3] == ("show-options", "-qv", "-t"):
+            return MagicMock(returncode=0, stdout="%main\n")
+        if args[:2] == ("list-panes", "-t"):
+            return MagicMock(
+                returncode=0,
+                stdout=(
+                    "%main\t1\t9\t\tclaude\t111\t/dev/ttys001\t0\tclaude-dead-main\n"
+                    "%aux\t0\t\t\tzsh\t222\t/dev/ttys002\t1\taux-shell\n"
+                ),
+            )
+        return MagicMock(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+
+    diagnostics = controller.get_session_exit_diagnostics("claude-dead-main")
+
+    assert diagnostics["pane_dead"] is True
+    assert diagnostics["pane_id"] == "%main"
+    assert diagnostics["pane_dead_status"] == "9"
 
 
 def test_get_session_exit_diagnostics_snapshots_missing_session(monkeypatch):
