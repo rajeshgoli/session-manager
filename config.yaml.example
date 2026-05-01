@@ -204,6 +204,9 @@ codex_rollout:
 
 # Codex fork runtime metadata + pinning contract
 codex_fork:
+  # SM appends `-c check_for_update_on_startup=false` to codex-fork launches
+  # because SM owns fork update cadence and interactive Codex update prompts
+  # block managed agents.
   # Pinned release channel + immutable commit/tag ref consumed by operators.
   artifact_release: "v0.1.0-sm"
   artifact_ref: "8f00aa11b22cc33dd44ee55ff66778899aabbccd"

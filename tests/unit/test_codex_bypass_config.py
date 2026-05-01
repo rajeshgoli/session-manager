@@ -26,6 +26,23 @@ class TestCodexBypassConfig:
             sm = SessionManager(log_dir=tmpdir, state_file=f"{tmpdir}/state.json", config=config)
             assert "--dangerously-bypass-approvals-and-sandbox" in sm.codex_cli_args
 
+    def test_codex_fork_disables_interactive_startup_update_prompt(self):
+        """SM-managed codex-fork sessions must not block on Codex's update popup."""
+        config = {
+            "codex": {
+                "command": "codex",
+                "args": ["--dangerously-bypass-approvals-and-sandbox"],
+                "app_server_args": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sm = SessionManager(log_dir=tmpdir, state_file=f"{tmpdir}/state.json", config=config)
+            assert sm.codex_fork_args == [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                "check_for_update_on_startup=false",
+            ]
+
     def test_app_server_args_empty_prevents_leak(self):
         """Verify app_server_args: [] prevents bypass flag from leaking to codex app-server."""
         config = {

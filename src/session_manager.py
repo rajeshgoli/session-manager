@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOG_DIR = "/tmp/claude-sessions"
 DEFAULT_SESSION_STATE_FILE = "~/.local/share/claude-sessions/sessions.json"
 LEGACY_TMP_SESSION_STATE_FILE = "/tmp/claude-sessions/sessions.json"
+CODEX_FORK_DISABLE_STARTUP_UPDATE_ARGS = ["-c", "check_for_update_on_startup=false"]
 
 DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
@@ -266,7 +267,9 @@ class SessionManager:
         ).expanduser()
         codex_fork_config = self.config.get("codex_fork", codex_config)
         self.codex_fork_command = codex_fork_config.get("command", self.codex_cli_command)
-        self.codex_fork_args = codex_fork_config.get("args", self.codex_cli_args)
+        self.codex_fork_args = self._with_codex_fork_managed_args(
+            codex_fork_config.get("args", self.codex_cli_args)
+        )
         self.codex_fork_default_model = codex_fork_config.get("default_model", self.codex_default_model)
         self.codex_fork_event_schema_version = int(codex_fork_config.get("event_schema_version", 2))
         raw_artifact_ref = codex_fork_config.get("artifact_ref", "local-unpinned")
@@ -1077,6 +1080,14 @@ class SessionManager:
         if shutil.which(raw_command) is None:
             return None, f"Launch command not found on PATH: {raw_command}"
         return raw_command, None
+
+    @staticmethod
+    def _with_codex_fork_managed_args(args: list[str]) -> list[str]:
+        """Return codex-fork args with SM-owned startup-update prompts disabled."""
+        managed_args = [str(arg) for arg in (args or [])]
+        if not any("check_for_update_on_startup=false" in arg.replace(" ", "") for arg in managed_args):
+            managed_args.extend(CODEX_FORK_DISABLE_STARTUP_UPDATE_ARGS)
+        return managed_args
 
     def _build_codex_fork_launch_spec(
         self,
