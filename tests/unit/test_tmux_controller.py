@@ -61,6 +61,7 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
         return MagicMock(returncode=0, stdout="")
 
     monkeypatch.setattr(controller, "session_exists", lambda _: False)
+    monkeypatch.setattr(controller, "_session_exists_on_socket", lambda *_: False)
     monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
     monkeypatch.setattr("time.sleep", lambda _: None)
 
@@ -73,7 +74,18 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
     )
 
     assert ok is True
-    assert calls[:7] == [
+    assert calls[:8] == [
+        (
+            "new-session",
+            "-d",
+            "-s",
+            TmuxController.SERVER_ANCHOR_SESSION,
+            "-n",
+            "anchor",
+            "-c",
+            str(tmp_path),
+            "sleep 315360000",
+        ),
         ("new-session", "-d", "-s", "claude-test123", "-c", str(tmp_path), "-n", "__sm_bootstrap"),
         ("show-options", "-gqv", "terminal-overrides"),
         ("set-option", "-as", "terminal-overrides", ",*:smcup@:rmcup@"),
@@ -82,6 +94,47 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
         ("kill-window", "-t", "claude-test123:__sm_bootstrap"),
         ("select-window", "-t", "claude-test123:main"),
     ]
+
+
+def test_create_session_with_command_uses_existing_server_anchor(tmp_path, monkeypatch):
+    controller = TmuxController(
+        log_dir=str(tmp_path),
+        config={
+            "tmux": {
+                "socket_name": "session-manager-test",
+                "history_limit": 12345,
+            },
+            "timeouts": {"tmux": {"shell_export_settle_seconds": 0}},
+        },
+    )
+    calls = []
+
+    def _fake_run_tmux(*args, **kwargs):
+        calls.append(args)
+        return MagicMock(returncode=0, stdout="")
+
+    monkeypatch.setattr(controller, "session_exists", lambda _: False)
+    monkeypatch.setattr(
+        controller,
+        "_session_exists_on_socket",
+        lambda session_name, socket_name: session_name == TmuxController.SERVER_ANCHOR_SESSION,
+    )
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    ok = controller.create_session_with_command(
+        "claude-testanchor",
+        str(tmp_path),
+        str(tmp_path / "claude-testanchor.log"),
+        command="sh",
+        args=["-lc", "sleep 1"],
+    )
+
+    assert ok is True
+    assert not any(
+        call[:4] == ("new-session", "-d", "-s", TmuxController.SERVER_ANCHOR_SESSION)
+        for call in calls
+    )
 
 
 def test_create_session_with_command_enables_exit_diagnostics(tmp_path, monkeypatch):

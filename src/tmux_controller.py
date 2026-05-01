@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 class TmuxController:
     """Controls tmux sessions for Claude Code."""
 
+    SERVER_ANCHOR_SESSION = "__sm_server_anchor"
+
     def __init__(self, log_dir: str = "/tmp/claude-sessions", config: Optional[dict] = None):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +138,40 @@ class TmuxController:
             ",*:smcup@:rmcup@",
         )
 
+    def _ensure_server_anchor(self) -> None:
+        """Start the configured tmux server under a neutral SM-owned session.
+
+        tmux server processes keep the argv from the command that first created
+        the server. If the first command is an agent session, `ps` can later
+        make the server itself look like an orphaned agent runtime after that
+        session is retired. Keep a neutral anchor so process-grep cleanup cannot
+        accidentally kill every managed session on the socket.
+        """
+        if not self.socket_name:
+            return
+        if self._session_exists_on_socket(self.SERVER_ANCHOR_SESSION, self.socket_name):
+            return
+        result = self._run_tmux(
+            "new-session",
+            "-d",
+            "-s",
+            self.SERVER_ANCHOR_SESSION,
+            "-n",
+            "anchor",
+            "-c",
+            str(self.log_dir),
+            "sleep 315360000",
+            check=False,
+        )
+        if result.returncode == 0:
+            logger.info(
+                "Created tmux server anchor %s on socket %s",
+                self.SERVER_ANCHOR_SESSION,
+                self.socket_name,
+            )
+        elif "duplicate session" not in (result.stderr or "").lower():
+            logger.warning("Could not create tmux server anchor: %s", result.stderr)
+
     def _enable_exit_diagnostics(self, session_name: str) -> None:
         """Keep dead panes around long enough for the monitor to read exit status."""
         try:
@@ -163,7 +199,11 @@ class TmuxController:
         )
         if result.returncode != 0:
             return []
-        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        return [
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip() and line.strip() != self.SERVER_ANCHOR_SESSION
+        ]
 
     def get_session_exit_diagnostics(self, session_name: str) -> dict[str, object]:
         """Collect tmux lifecycle diagnostics for a managed session.
@@ -857,6 +897,7 @@ class TmuxController:
         log_path.touch()
 
         try:
+            self._ensure_server_anchor()
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
@@ -957,6 +998,7 @@ class TmuxController:
         log_path.touch()
 
         try:
+            self._ensure_server_anchor()
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
@@ -1327,7 +1369,11 @@ class TmuxController:
         if result.returncode != 0:
             result = None
         if result is not None:
-            sessions.update(s.strip() for s in result.stdout.strip().split("\n") if s.strip())
+            sessions.update(
+                s.strip()
+                for s in result.stdout.strip().split("\n")
+                if s.strip() and s.strip() != self.SERVER_ANCHOR_SESSION
+            )
         if self.socket_name:
             legacy = self._run_tmux(
                 "list-sessions",
@@ -1337,7 +1383,11 @@ class TmuxController:
                 socket_name=None,
             )
             if legacy.returncode == 0:
-                sessions.update(s.strip() for s in legacy.stdout.strip().split("\n") if s.strip())
+                sessions.update(
+                    s.strip()
+                    for s in legacy.stdout.strip().split("\n")
+                    if s.strip() and s.strip() != self.SERVER_ANCHOR_SESSION
+                )
         return sorted(sessions)
 
     def capture_pane(self, session_name: str, lines: int = 50) -> Optional[str]:
