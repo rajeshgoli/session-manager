@@ -2882,6 +2882,9 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
         binary_mtime = maintenance.get("binary_mtime")
         if binary_mtime:
             print(f"- binary_mtime: {binary_mtime}")
+        binary_version = maintenance.get("binary_version")
+        if binary_version:
+            print(f"- binary_version: {binary_version}")
         head_commit_committed_at = maintenance.get("head_commit_committed_at")
         if head_commit_committed_at:
             print(f"- head_commit_committed_at: {head_commit_committed_at}")
@@ -2907,6 +2910,8 @@ def cmd_codex_fork_info(client: SessionManagerClient, json_output: bool = False)
                 f"- fork_contains_latest_upstream_release: "
                 f"{maintenance.get('fork_contains_latest_upstream_release')}"
             )
+        if maintenance.get("latest_upstream_release_satisfied_by_pin"):
+            print("- latest_upstream_release_satisfied_by_pin: True")
         release_build_script = maintenance.get("release_build_script")
         if release_build_script:
             print(f"- release_build_script: {release_build_script}")
@@ -2973,6 +2978,9 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
     if binary_path.exists():
         binary_mtime_dt = datetime.fromtimestamp(binary_path.stat().st_mtime, tz=timezone.utc)
         info["binary_mtime"] = binary_mtime_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+        binary_version = _probe_codex_binary_version(binary_path)
+        if binary_version:
+            info["binary_version"] = binary_version
     else:
         build_reasons.append("local codex binary is missing")
     if release_build_script.exists():
@@ -2984,6 +2992,7 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
     if branch:
         info["branch"] = branch
 
+    fork_head_full = _run_text_command(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
     fork_head = _run_text_command(["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"])
     if fork_head:
         info["fork_head"] = fork_head
@@ -3032,6 +3041,9 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
         release_published_at = str(release_payload.get("publishedAt") or "").strip()
         if release_tag:
             info["latest_upstream_release_tag"] = release_tag
+            release_version = _parse_codex_version(release_tag)
+            if release_version:
+                info["latest_upstream_release_version"] = release_version
         if release_published_at:
             info["latest_upstream_release_published_at"] = release_published_at
         if fetch_rc == 0 and release_tag:
@@ -3045,8 +3057,21 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
                 )
                 if contains_release is not None:
                     info["fork_contains_latest_upstream_release"] = contains_release == 0
-                    if contains_release != 0:
+                    if contains_release == 1 and _codex_fork_pin_satisfies_latest_release(
+                        runtime_payload=runtime_payload,
+                        release_tag=release_tag,
+                        release_version=info.get("latest_upstream_release_version"),
+                        binary_version=info.get("binary_version"),
+                        fork_head_full=fork_head_full,
+                    ):
+                        info["latest_upstream_release_satisfied_by_pin"] = True
+                    elif contains_release == 1:
                         sync_reasons.append(f"fork does not yet contain upstream release {release_tag}")
+                    elif contains_release != 0:
+                        sync_reasons.append(
+                            f"could not verify fork contains upstream release {release_tag} "
+                            f"(git merge-base exited {contains_release})"
+                        )
         if binary_mtime_dt and release_tag:
             release_published_dt = _parse_iso_datetime(release_published_at)
             if release_published_dt is not None:
@@ -3060,6 +3085,57 @@ def _collect_codex_fork_maintenance_info(runtime_payload: dict) -> dict[str, obj
     info["sync_recommended"] = bool(sync_reasons)
     info["sync_reasons"] = sync_reasons
     return info
+
+
+def _parse_codex_version(value: Optional[str]) -> Optional[str]:
+    """Extract a Codex semver from a tag or `codex --version` output."""
+    if not value:
+        return None
+    match = re.search(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)", value)
+    return match.group(1) if match else None
+
+
+def _probe_codex_binary_version(binary_path: Path, timeout_seconds: float = 2.0) -> Optional[str]:
+    """Return `codex --version` semver without letting diagnostics hang."""
+    try:
+        result = subprocess.run(
+            [str(binary_path), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_codex_version(result.stdout)
+
+
+def _codex_fork_pin_satisfies_latest_release(
+    *,
+    runtime_payload: dict,
+    release_tag: str,
+    release_version: object,
+    binary_version: object,
+    fork_head_full: Optional[str],
+) -> bool:
+    """Return True when an explicit runtime pin represents a squashed release sync."""
+    release_version_str = str(release_version or "").strip()
+    binary_version_str = str(binary_version or "").strip()
+    if not release_version_str or binary_version_str != release_version_str:
+        return False
+
+    artifact_release = str(runtime_payload.get("artifact_release") or "")
+    if release_tag not in artifact_release and release_version_str not in artifact_release:
+        return False
+
+    artifact_ref = str(runtime_payload.get("artifact_ref") or "").strip().lower()
+    fork_head = str(fork_head_full or "").strip().lower()
+    if not artifact_ref or not fork_head:
+        return False
+
+    return fork_head.startswith(artifact_ref) or artifact_ref.startswith(fork_head)
 
 
 def _find_git_repo_root(path: Path) -> Optional[Path]:

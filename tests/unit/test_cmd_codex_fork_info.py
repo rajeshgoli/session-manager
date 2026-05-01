@@ -183,3 +183,133 @@ def test_collect_codex_fork_maintenance_info_tracks_latest_release(monkeypatch, 
     assert info["fork_contains_latest_upstream_release"] is False
     assert info["sync_recommended"] is True
     assert info["sync_reasons"] == ["fork does not yet contain upstream release rust-v0.120.0"]
+
+
+def test_collect_codex_fork_maintenance_info_accepts_squashed_pinned_release(monkeypatch, tmp_path):
+    repo_root = tmp_path / "codex-fork"
+    repo_root.mkdir()
+    (repo_root / ".git").write_text("")
+    binary_path = repo_root / "bin" / "codex-merged"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_text("binary")
+    timestamp = 1_777_659_600
+    os.utime(binary_path, (timestamp, timestamp))
+    fork_head = "abc1234567890defabc1234567890defabc12345"
+
+    def _fake_run_text(args):
+        cmd = " ".join(args)
+        if "rev-parse --abbrev-ref HEAD" in cmd:
+            return "main"
+        if args[-2:] == ["rev-parse", "HEAD"]:
+            return fork_head
+        if "rev-parse --short HEAD" in cmd:
+            return fork_head[:10]
+        if "log -1 --format=%cI HEAD" in cmd:
+            return "2026-05-01T18:00:00+00:00"
+        if "rev-parse --short upstream/main" in cmd:
+            return "upstream123"
+        if "rev-list --left-right --count HEAD...upstream/main" in cmd:
+            return "19\t318"
+        if "gh release view" in cmd:
+            return '{"tagName":"rust-v0.128.0","publishedAt":"2026-04-30T16:40:28Z"}'
+        if "rev-list -n 1 refs/tags/rust-v0.128.0" in cmd:
+            return "releasecommit"
+        return None
+
+    def _fake_run(args):
+        cmd = " ".join(args)
+        if "fetch upstream main --tags --quiet" in cmd:
+            return 0
+        if "merge-base --is-ancestor releasecommit HEAD" in cmd:
+            return 1
+        return 0
+
+    monkeypatch.setattr(commands, "_run_text_command", _fake_run_text)
+    monkeypatch.setattr(commands, "_run_command", _fake_run)
+    monkeypatch.setattr(commands, "_probe_codex_binary_version", lambda path: "0.128.0")
+
+    info = commands._collect_codex_fork_maintenance_info(
+        {
+            "command": str(binary_path),
+            "artifact_release": "local-0.128.0-pr14-merged",
+            "artifact_ref": fork_head,
+        }
+    )
+
+    assert info["binary_version"] == "0.128.0"
+    assert info["latest_upstream_release_version"] == "0.128.0"
+    assert info["fork_contains_latest_upstream_release"] is False
+    assert info["latest_upstream_release_satisfied_by_pin"] is True
+    assert info["sync_recommended"] is False
+    assert info["sync_reasons"] == []
+
+
+def test_collect_codex_fork_maintenance_info_keeps_merge_base_errors_visible(monkeypatch, tmp_path):
+    repo_root = tmp_path / "codex-fork"
+    repo_root.mkdir()
+    (repo_root / ".git").write_text("")
+    binary_path = repo_root / "bin" / "codex-merged"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_text("binary")
+    timestamp = 1_777_659_600
+    os.utime(binary_path, (timestamp, timestamp))
+    fork_head = "abc1234567890defabc1234567890defabc12345"
+
+    def _fake_run_text(args):
+        cmd = " ".join(args)
+        if "rev-parse --abbrev-ref HEAD" in cmd:
+            return "main"
+        if args[-2:] == ["rev-parse", "HEAD"]:
+            return fork_head
+        if "rev-parse --short HEAD" in cmd:
+            return fork_head[:10]
+        if "log -1 --format=%cI HEAD" in cmd:
+            return "2026-05-01T18:00:00+00:00"
+        if "rev-parse --short upstream/main" in cmd:
+            return "upstream123"
+        if "rev-list --left-right --count HEAD...upstream/main" in cmd:
+            return "19\t318"
+        if "gh release view" in cmd:
+            return '{"tagName":"rust-v0.128.0","publishedAt":"2026-04-30T16:40:28Z"}'
+        if "rev-list -n 1 refs/tags/rust-v0.128.0" in cmd:
+            return "releasecommit"
+        return None
+
+    def _fake_run(args):
+        cmd = " ".join(args)
+        if "fetch upstream main --tags --quiet" in cmd:
+            return 0
+        if "merge-base --is-ancestor releasecommit HEAD" in cmd:
+            return 128
+        return 0
+
+    monkeypatch.setattr(commands, "_run_text_command", _fake_run_text)
+    monkeypatch.setattr(commands, "_run_command", _fake_run)
+    monkeypatch.setattr(commands, "_probe_codex_binary_version", lambda path: "0.128.0")
+
+    info = commands._collect_codex_fork_maintenance_info(
+        {
+            "command": str(binary_path),
+            "artifact_release": "local-0.128.0-pr14-merged",
+            "artifact_ref": fork_head,
+        }
+    )
+
+    assert info["fork_contains_latest_upstream_release"] is False
+    assert "latest_upstream_release_satisfied_by_pin" not in info
+    assert info["sync_recommended"] is True
+    assert info["sync_reasons"] == [
+        "could not verify fork contains upstream release rust-v0.128.0 (git merge-base exited 128)"
+    ]
+
+
+def test_probe_codex_binary_version_times_out(monkeypatch, tmp_path):
+    binary_path = tmp_path / "codex"
+    binary_path.write_text("binary")
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise commands.subprocess.TimeoutExpired(cmd=[str(binary_path), "--version"], timeout=2.0)
+
+    monkeypatch.setattr(commands.subprocess, "run", _raise_timeout)
+
+    assert commands._probe_codex_binary_version(binary_path) is None
