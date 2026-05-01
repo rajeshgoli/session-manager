@@ -1161,15 +1161,25 @@ def _create_watch_session(
     tmux_session = (descriptor or {}).get("tmux_session") or session.get("tmux_session")
     if not tmux_session:
         return session, None, "Created session has no tmux target"
+    if descriptor and descriptor.get("tmux_socket_name"):
+        session["tmux_socket_name"] = descriptor.get("tmux_socket_name")
 
     return session, tmux_session, None
 
 
-def _attach_tmux(stdscr, tmux_session: str):
+def _tmux_attach_command(tmux_session: str, tmux_socket_name: str | None = None) -> list[str]:
+    cmd = ["tmux"]
+    if tmux_socket_name:
+        cmd.extend(["-L", tmux_socket_name])
+    cmd.extend(["attach-session", "-t", tmux_session])
+    return cmd
+
+
+def _attach_tmux(stdscr, tmux_session: str, tmux_socket_name: str | None = None):
     curses.def_prog_mode()
     curses.endwin()
     try:
-        subprocess.run(["tmux", "attach-session", "-t", tmux_session], check=False)
+        subprocess.run(_tmux_attach_command(tmux_session, tmux_socket_name), check=False)
     finally:
         curses.reset_prog_mode()
         curses.curs_set(0)
@@ -1634,7 +1644,7 @@ def run_watch_tui(
 
                     selected_session_id = session.get("id") or selected_session_id
                     next_refresh = 0.0
-                    _attach_tmux(stdscr, tmux_session)
+                    _attach_tmux(stdscr, tmux_session, session.get("tmux_socket_name"))
                     flash_message = f"Created {selected_session_id}"
                     flash_until = time.monotonic() + 2.5
                     next_refresh = 0.0
@@ -1743,7 +1753,7 @@ def run_watch_tui(
                             selected_session_id = restored.get("id") or selected_session_id
                             tmux_session = restored.get("tmux_session")
                             if can_attach_session(restored) and tmux_session:
-                                _attach_tmux(stdscr, tmux_session)
+                                _attach_tmux(stdscr, tmux_session, restored.get("tmux_socket_name"))
                                 flash_message = f"Restored {selected_session_id}"
                             else:
                                 flash_message = f"Restored {selected_session_id} (headless)"
@@ -1761,7 +1771,7 @@ def run_watch_tui(
                         flash_message = "Selected session has no tmux target"
                         flash_until = time.monotonic() + 2.5
                         continue
-                    _attach_tmux(stdscr, tmux_session)
+                    _attach_tmux(stdscr, tmux_session, selected.get("tmux_socket_name"))
                     next_refresh = 0.0
         finally:
             if detail_worker:

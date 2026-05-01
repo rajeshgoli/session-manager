@@ -29,6 +29,9 @@ class TestTmuxControllerConfig:
             assert controller.claude_init_no_prompt_seconds == 1
             assert controller.send_keys_timeout_seconds == 5
             assert controller.send_keys_settle_seconds == 0.3
+            assert controller.socket_name is None
+            assert controller.native_scrollback is False
+            assert controller.history_limit == 100000
 
     def test_config_values_loaded(self):
         """Verify config values override defaults."""
@@ -52,6 +55,29 @@ class TestTmuxControllerConfig:
             assert controller.claude_init_no_prompt_seconds == 2
             assert controller.send_keys_timeout_seconds == 10
             assert controller.send_keys_settle_seconds == 0.5
+
+    def test_tmux_config_values_loaded(self):
+        """Verify tmux socket/native-scrollback/history values load from config."""
+        config = {
+            "tmux": {
+                "socket_name": "session-manager-test",
+                "native_scrollback": True,
+                "history_limit": 12345,
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = TmuxController(log_dir=temp_dir, config=config)
+
+            assert controller.socket_name == "session-manager-test"
+            assert controller.native_scrollback is True
+            assert controller.history_limit == 12345
+            assert controller.tmux_cmd("list-sessions") == [
+                "tmux",
+                "-L",
+                "session-manager-test",
+                "list-sessions",
+            ]
 
     def test_partial_config_uses_defaults(self):
         """Verify missing config values fall back to defaults."""

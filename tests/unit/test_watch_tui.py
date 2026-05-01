@@ -17,6 +17,7 @@ from src.cli.watch_tui import (
     _retire_confirmation_matches,
     _resolve_create_provider,
     _session_line,
+    _tmux_attach_command,
     build_restore_rows,
     build_watch_rows,
     can_attach_session,
@@ -31,6 +32,18 @@ def test_retire_confirmation_requires_same_session_before_expiry():
     assert not _retire_confirmation_matches(confirmation, "agent-b", 12.0)
     assert not _retire_confirmation_matches(confirmation, "agent-a", 16.0)
     assert not _retire_confirmation_matches(None, "agent-a", 12.0)
+
+
+def test_tmux_attach_command_includes_socket_when_available():
+    assert _tmux_attach_command("claude-test") == ["tmux", "attach-session", "-t", "claude-test"]
+    assert _tmux_attach_command("claude-test", "session-manager-test") == [
+        "tmux",
+        "-L",
+        "session-manager-test",
+        "attach-session",
+        "-t",
+        "claude-test",
+    ]
 
 
 def _session(

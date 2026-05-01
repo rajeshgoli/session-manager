@@ -32,6 +32,55 @@ from ..codex_provider_policy import (
 _SEND_KEYS_SETTLE_SECONDS = 0.3
 
 
+def _tmux_command(args: list[str], tmux_socket_name: Optional[str] = None) -> list[str]:
+    """Build a tmux command, using an SM-owned socket when provided."""
+    cmd = ["tmux"]
+    if tmux_socket_name:
+        cmd.extend(["-L", tmux_socket_name])
+    cmd.extend(args)
+    return cmd
+
+
+def _tmux_socket_from_descriptor(descriptor: Optional[dict]) -> Optional[str]:
+    """Return the tmux socket name from an attach descriptor when present."""
+    if not isinstance(descriptor, dict):
+        return None
+    socket_name = str(descriptor.get("tmux_socket_name") or "").strip()
+    return socket_name or None
+
+
+def _attach_tmux_session(tmux_session: str, descriptor: Optional[dict] = None) -> int:
+    """Attach the current terminal to a tmux session."""
+    tmux_socket_name = _tmux_socket_from_descriptor(descriptor)
+    try:
+        subprocess.run(
+            _tmux_command(["attach", "-t", tmux_session], tmux_socket_name),
+            check=True,
+        )
+        return 0
+    except subprocess.CalledProcessError:
+        print(f"Error: Failed to attach to tmux session {tmux_session}", file=sys.stderr)
+        return 1
+    except FileNotFoundError:
+        print("Error: tmux not found. Is tmux installed?", file=sys.stderr)
+        return 1
+
+
+def _capture_tmux_pane(tmux_session: str, lines: int, descriptor: Optional[dict] = None) -> Optional[str]:
+    """Capture recent output from a tmux pane using descriptor socket metadata."""
+    tmux_socket_name = _tmux_socket_from_descriptor(descriptor)
+    try:
+        result = subprocess.run(
+            _tmux_command(["capture-pane", "-t", tmux_session, "-p", "-S", f"-{lines}"], tmux_socket_name),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
 def _get_codex_app_policy_for_cli(client: SessionManagerClient) -> dict:
     """Get codex-app migration policy from rollout flags (or local defaults)."""
     rollout_flags = client.get_rollout_flags() or {}
@@ -2126,7 +2175,10 @@ def _query_last_tool(session_id: str, db_path: str) -> Optional[dict]:
     }
 
 
-def _get_tmux_session_activity(tmux_session_name: str) -> Optional[int]:
+def _get_tmux_session_activity(
+    tmux_session_name: str,
+    tmux_socket_name: Optional[str] = None,
+) -> Optional[int]:
     """
     Returns Unix epoch of last tmux session activity via:
       tmux display-message -p -t <name> '#{session_activity}'
@@ -2134,7 +2186,10 @@ def _get_tmux_session_activity(tmux_session_name: str) -> Optional[int]:
     """
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", tmux_session_name, "#{session_activity}"],
+            _tmux_command(
+                ["display-message", "-p", "-t", tmux_session_name, "#{session_activity}"],
+                tmux_socket_name,
+            ),
             capture_output=True,
             text=True,
             timeout=3,
@@ -2280,15 +2335,15 @@ def cmd_children(
                                     last_tool_str = f"{tool_name} ({_format_thinking_duration(delta_s)} ago)"
 
                 elif provider == "codex":
-                    tmux_name = f"codex-{child_id}"
-                    epoch = _get_tmux_session_activity(tmux_name)
+                    tmux_name = child.get("tmux_session") or f"codex-{child_id}"
+                    epoch = _get_tmux_session_activity(tmux_name, child.get("tmux_socket_name"))
                     if epoch is not None:
                         delta_s = max(0, int(time.time() - epoch))
                         thinking_str = _format_thinking_duration(delta_s)
                     last_tool_str = "n/a (no hooks)"
                 elif provider == "codex-fork":
-                    tmux_name = f"codex-fork-{child_id}"
-                    epoch = _get_tmux_session_activity(tmux_name)
+                    tmux_name = child.get("tmux_session") or f"codex-fork-{child_id}"
+                    epoch = _get_tmux_session_activity(tmux_name, child.get("tmux_socket_name"))
                     if epoch is not None:
                         delta_s = max(0, int(time.time() - epoch))
                         thinking_str = _format_thinking_duration(delta_s)
@@ -2455,7 +2510,6 @@ def cmd_new(
         2: Session manager unavailable
     """
     import os
-    import subprocess
     import time
     from pathlib import Path
 
@@ -2518,16 +2572,8 @@ def cmd_new(
     # Wait briefly for Claude to initialize
     time.sleep(1)
 
-    # Attach to tmux session (blocks until detach)
-    try:
-        subprocess.run(["tmux", "attach", "-t", tmux_session], check=True)
-        return 0
-    except subprocess.CalledProcessError:
-        print(f"Error: Failed to attach to tmux session {tmux_session}", file=sys.stderr)
-        return 1
-    except FileNotFoundError:
-        print("Error: tmux not found. Is tmux installed?", file=sys.stderr)
-        return 1
+    descriptor = client.get_attach_descriptor(session_id) if session_id else None
+    return _attach_tmux_session(tmux_session, descriptor)
 
 
 def cmd_codex_2(
@@ -2605,8 +2651,6 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
         1: No sessions available or invalid selection
         2: Session manager unavailable
     """
-    import subprocess
-
     def _attach_with_descriptor(session: dict) -> int:
         session_id = session.get("id")
         descriptor = client.get_attach_descriptor(session_id) if session_id else None
@@ -2628,15 +2672,7 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
             print("Error: Session has no tmux session", file=sys.stderr)
             return 1
 
-        try:
-            subprocess.run(["tmux", "attach", "-t", tmux_session], check=True)
-            return 0
-        except subprocess.CalledProcessError:
-            print(f"Error: Failed to attach to tmux session {tmux_session}", file=sys.stderr)
-            return 1
-        except FileNotFoundError:
-            print("Error: tmux not found. Is tmux installed?", file=sys.stderr)
-            return 1
+        return _attach_tmux_session(tmux_session, descriptor)
 
     # Case 1: Direct attach with identifier
     if identifier:
@@ -2725,8 +2761,6 @@ def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int
         1: Session not found or no tmux session
         2: Session manager unavailable
     """
-    from ..tmux_controller import TmuxController
-
     # Resolve identifier to session ID and get session details
     session_id, session = resolve_session_id(client, identifier)
     if session_id is None:
@@ -2754,9 +2788,8 @@ def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int
         print(f"Error: Session has no tmux session", file=sys.stderr)
         return 1
 
-    # Capture pane output
-    tmux_controller = TmuxController()
-    output = tmux_controller.capture_pane(tmux_session, lines=lines)
+    descriptor = client.get_attach_descriptor(session_id)
+    output = _capture_tmux_pane(tmux_session, lines=lines, descriptor=descriptor)
 
     if output is None:
         print(f"Error: Failed to capture output from {tmux_session}", file=sys.stderr)
@@ -3273,9 +3306,8 @@ def cmd_tail(
             print("Error: Session has no tmux session", file=sys.stderr)
             return 1
 
-        from ..tmux_controller import TmuxController
-        tmux = TmuxController()
-        output = tmux.capture_pane(tmux_session, lines=n)
+        descriptor = client.get_attach_descriptor(session_id)
+        output = _capture_tmux_pane(tmux_session, lines=n, descriptor=descriptor)
         if output is None:
             print(f"Error: Failed to capture output from {tmux_session}", file=sys.stderr)
             return 1
@@ -4367,7 +4399,10 @@ def cmd_review(
 
 
 def _wait_for_claude_prompt(
-    tmux_session: str, timeout: float = 3.0, poll_interval: float = 0.1
+    tmux_session: str,
+    timeout: float = 3.0,
+    poll_interval: float = 0.1,
+    tmux_socket_name: Optional[str] = None,
 ) -> bool:
     """Poll capture-pane until Claude Code shows bare '>' prompt, or timeout.
 
@@ -4381,7 +4416,7 @@ def _wait_for_claude_prompt(
     while time.monotonic() < deadline:
         try:
             result = subprocess.run(
-                ["tmux", "capture-pane", "-p", "-t", tmux_session],
+                _tmux_command(["capture-pane", "-p", "-t", tmux_session], tmux_socket_name),
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -4475,6 +4510,8 @@ def cmd_clear(
     if not tmux_session:
         print(f"Error: Session {target_session_id} has no tmux session", file=sys.stderr)
         return 1
+    descriptor = client.get_attach_descriptor(target_session_id)
+    tmux_socket_name = _tmux_socket_from_descriptor(descriptor) or session.get("tmux_socket_name")
 
     clear_command = "/new" if provider in ("codex", "codex-fork") else "/clear"
 
@@ -4503,56 +4540,56 @@ def cmd_clear(
         if completion_status == "completed":
             # Wake up the session by sending Enter
             subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+                _tmux_command(["send-keys", "-t", tmux_session, "Enter"], tmux_socket_name),
                 check=True,
                 capture_output=True,
                 text=True,
             )
             # Wait for Claude to show prompt after wake-up (#175)
-            _wait_for_claude_prompt(tmux_session)
+            _wait_for_claude_prompt(tmux_session, tmux_socket_name=tmux_socket_name)
 
         # First, send ESC to interrupt any ongoing stream
         subprocess.run(
-            ["tmux", "send-keys", "-t", tmux_session, "Escape"],
+            _tmux_command(["send-keys", "-t", tmux_session, "Escape"], tmux_socket_name),
             check=True,
             capture_output=True,
             text=True,
         )
 
         # Wait for Claude to show idle prompt before sending payload (#175)
-        _wait_for_claude_prompt(tmux_session)
+        _wait_for_claude_prompt(tmux_session, tmux_socket_name=tmux_socket_name)
 
         # Send clear command, then Enter as a separate call after a settle delay (#178).
         # Sending text+"\r" atomically fails because Claude Code (Node.js TUI in raw
         # mode) treats the rapid burst as pasted text, in which \r is literal, not submit.
         subprocess.run(
-            ["tmux", "send-keys", "-t", tmux_session, "--", clear_command],
+            _tmux_command(["send-keys", "-t", tmux_session, "--", clear_command], tmux_socket_name),
             check=True,
             capture_output=True,
             text=True,
         )
         time.sleep(_SEND_KEYS_SETTLE_SECONDS)  # Allow paste mode to end before Enter arrives
         subprocess.run(
-            ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+            _tmux_command(["send-keys", "-t", tmux_session, "Enter"], tmux_socket_name),
             check=True,
             capture_output=True,
             text=True,
         )
 
         # Wait for clear to finish and prompt to reappear (#175)
-        _wait_for_claude_prompt(tmux_session, timeout=5.0)
+        _wait_for_claude_prompt(tmux_session, timeout=5.0, tmux_socket_name=tmux_socket_name)
 
         # Send new prompt if provided
         if new_prompt:
             subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_session, "--", new_prompt],
+                _tmux_command(["send-keys", "-t", tmux_session, "--", new_prompt], tmux_socket_name),
                 check=True,
                 capture_output=True,
                 text=True,
             )
             time.sleep(_SEND_KEYS_SETTLE_SECONDS)  # Allow paste mode to end before Enter arrives
             subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_session, "Enter"],
+                _tmux_command(["send-keys", "-t", tmux_session, "Enter"], tmux_socket_name),
                 check=True,
                 capture_output=True,
                 text=True,

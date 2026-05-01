@@ -148,6 +148,16 @@ class MessageQueueManager:
         # Initialize database
         self._init_db()
 
+    def _tmux_cmd_for_session(self, tmux_session: str, *args: str) -> list[str]:
+        """Build a tmux command, using SessionManager's socket-aware controller when available."""
+        tmux = getattr(self.session_manager, "tmux", None)
+        builder = getattr(tmux, "tmux_cmd_for_session", None)
+        if callable(builder):
+            cmd = builder(tmux_session, *args)
+            if isinstance(cmd, (list, tuple)):
+                return list(cmd)
+        return ["tmux", *args]
+
     def _init_db(self):
         """Initialize SQLite database schema with persistent connection."""
         # Create persistent connection with thread-safety enabled
@@ -2217,7 +2227,7 @@ class MessageQueueManager:
         """
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "capture-pane", "-p", "-t", tmux_session,
+                *self._tmux_cmd_for_session(tmux_session, "capture-pane", "-p", "-t", tmux_session),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -2249,7 +2259,7 @@ class MessageQueueManager:
         """Clear the current input line using Ctrl+U (async, non-blocking)."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_session, "C-u",
+                *self._tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "C-u"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -2264,7 +2274,7 @@ class MessageQueueManager:
         try:
             # Use list-based subprocess with "--" to handle text starting with "-"
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "send-keys", "-t", tmux_session, "--", text,
+                *self._tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "--", text),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -2613,7 +2623,7 @@ class MessageQueueManager:
                     logger.info(f"Session {session_id} is completed, sending Enter to wake up")
                     # Send Enter to wake up the completed session
                     proc = await asyncio.create_subprocess_exec(
-                        "tmux", "send-keys", "-t", session.tmux_session, "Enter",
+                        *self._tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, "Enter"),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -2635,7 +2645,7 @@ class MessageQueueManager:
                     await self._wait_for_claude_prompt_async(session.tmux_session)
 
                     proc = await asyncio.create_subprocess_exec(
-                        "tmux", "send-keys", "-t", session.tmux_session, "Escape",
+                        *self._tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, "Escape"),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -2643,7 +2653,7 @@ class MessageQueueManager:
                 else:
                     # Non-Claude tmux providers retain the existing interrupt behavior.
                     proc = await asyncio.create_subprocess_exec(
-                        "tmux", "send-keys", "-t", session.tmux_session, "Escape",
+                        *self._tmux_cmd_for_session(session.tmux_session, "send-keys", "-t", session.tmux_session, "Escape"),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -4148,7 +4158,7 @@ class MessageQueueManager:
         while asyncio.get_event_loop().time() < deadline:
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "capture-pane", "-p", "-t", tmux_session,
+                    *self._tmux_cmd_for_session(tmux_session, "capture-pane", "-p", "-t", tmux_session),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -4229,7 +4239,7 @@ class MessageQueueManager:
 
                 # 2. Send Escape to ensure idle
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, "Escape",
+                    *self._tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "Escape"),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
@@ -4240,13 +4250,13 @@ class MessageQueueManager:
                 # 4. Send /clear (with settle delay before Enter)
                 clear_command = "/new" if session.provider in ("codex", "codex-fork") else "/clear"
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, "--", clear_command,
+                    *self._tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "--", clear_command),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
                 await asyncio.sleep(0.3)  # Settle delay: allow paste mode to end before Enter
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, "Enter",
+                    *self._tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "Enter"),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
@@ -4259,13 +4269,13 @@ class MessageQueueManager:
                 # 6. Send handoff prompt (with settle delay before Enter)
                 handoff_prompt = f"Read {file_path} and continue from where you left off."
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, "--", handoff_prompt,
+                    *self._tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "--", handoff_prompt),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
                 await asyncio.sleep(0.3)  # Settle delay
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", tmux_session, "Enter",
+                    *self._tmux_cmd_for_session(tmux_session, "send-keys", "-t", tmux_session, "Enter"),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=self.subprocess_timeout)
@@ -4290,7 +4300,7 @@ class MessageQueueManager:
         """Check if CLI is showing the input prompt (idle). Works for both Claude Code and Codex CLI."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tmux", "capture-pane", "-p", "-t", tmux_session,
+                *self._tmux_cmd_for_session(tmux_session, "capture-pane", "-p", "-t", tmux_session),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

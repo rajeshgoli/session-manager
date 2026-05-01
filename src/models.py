@@ -294,6 +294,7 @@ class Session:
     name: str = ""  # Internal identifier (auto-generated: claude-{id})
     working_dir: str = ""
     tmux_session: str = ""
+    tmux_socket_name: Optional[str] = None  # tmux -L socket for managed sessions; None means default server
     provider: str = "claude"  # "claude", "codex"/"codex-fork" (tmux), or "codex-app" (app-server)
     log_file: str = ""
     status: SessionStatus = SessionStatus.RUNNING
@@ -385,6 +386,7 @@ class Session:
             "name": self.name,
             "working_dir": self.working_dir,
             "tmux_session": self.tmux_session,
+            "tmux_socket_name": self.tmux_socket_name,
             "provider": self.provider,
             "log_file": self.log_file,
             "status": self.status.value,
@@ -477,6 +479,7 @@ class Session:
             name=data["name"],
             working_dir=data["working_dir"],
             tmux_session=data["tmux_session"],
+            tmux_socket_name=data.get("tmux_socket_name"),
             provider=data.get("provider", "claude"),
             log_file=data["log_file"],
             status=SessionStatus(mapped_status),

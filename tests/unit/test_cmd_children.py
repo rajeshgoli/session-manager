@@ -180,6 +180,27 @@ class TestGetTmuxSessionActivity:
             timeout=3,
         )
 
+    def test_uses_tmux_socket_when_available(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="1771480032\n", returncode=0)
+            result = _get_tmux_session_activity("codex-abc123", "session-manager-test")
+        assert result == 1771480032
+        mock_run.assert_called_once_with(
+            [
+                "tmux",
+                "-L",
+                "session-manager-test",
+                "display-message",
+                "-p",
+                "-t",
+                "codex-abc123",
+                "#{session_activity}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+
     def test_returns_none_on_empty_output(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="", returncode=1)
@@ -276,6 +297,19 @@ class TestCmdChildrenOutput:
         assert "last tool: n/a (no hooks)" in out
         assert "thinking" in out
         assert " | codex | " in out
+
+    def test_running_codex_session_activity_uses_recorded_tmux_socket(self, tmp_path, capsys):
+        child = _child(child_id="bbb00000002", provider="codex", status="running")
+        child["tmux_session"] = "custom-codex-target"
+        child["tmux_socket_name"] = "session-manager-test"
+        client = _make_client([child])
+
+        epoch = int(time.time()) - 120
+        with patch("src.cli.commands._get_tmux_session_activity", return_value=epoch) as mock_activity:
+            rc = cmd_children(client, "parent1", db_path=str(tmp_path / "tool_usage.db"))
+
+        assert rc == 0
+        mock_activity.assert_called_once_with("custom-codex-target", "session-manager-test")
 
     def test_codex_fork_prefers_activity_state_over_raw_status(self, tmp_path, capsys):
         child = _child(

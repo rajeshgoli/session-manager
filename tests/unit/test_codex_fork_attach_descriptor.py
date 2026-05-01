@@ -78,3 +78,30 @@ def test_stopped_codex_fork_attach_descriptor_is_not_attachable(tmp_path):
     assert descriptor is not None
     assert descriptor["attach_supported"] is False
     assert descriptor["runtime_mode"] == "stopped"
+
+
+def test_attach_descriptor_includes_tmux_socket_and_history_limit(tmp_path, monkeypatch):
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+        config={"tmux": {"socket_name": "session-manager-test", "history_limit": 12345}},
+    )
+    monkeypatch.setattr(manager.tmux, "get_history_limit", lambda _: 12345)
+    session = Session(
+        id="claude1001",
+        name="claude-claude1001",
+        provider="claude",
+        working_dir=str(tmp_path),
+        tmux_session="claude-claude1001",
+        tmux_socket_name="session-manager-test",
+        log_file=str(tmp_path / "logs" / "claude-claude1001.log"),
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    descriptor = manager.get_attach_descriptor(session.id)
+
+    assert descriptor is not None
+    assert descriptor["tmux_socket_name"] == "session-manager-test"
+    assert descriptor["tmux_history_limit"] == 12345
+    assert descriptor["tmux_configured_history_limit"] == 12345
