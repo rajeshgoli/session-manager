@@ -1167,6 +1167,34 @@ def _create_watch_session(
     return session, tmux_session, None
 
 
+def _resolve_tmux_attach_target(
+    client,
+    session: dict,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve tmux target/socket from the attach descriptor when available."""
+    session_id = session.get("id")
+    descriptor = None
+    descriptor_getter = getattr(client, "get_attach_descriptor", None)
+    if session_id and callable(descriptor_getter):
+        descriptor = descriptor_getter(session_id)
+
+    if descriptor and not descriptor.get("attach_supported", True):
+        message = descriptor.get("message") or "Attach not supported for this session"
+        return None, None, message
+
+    tmux_session = (descriptor or {}).get("tmux_session") or session.get("tmux_session")
+    if not tmux_session:
+        return None, None, "Selected session has no tmux target"
+
+    tmux_socket_name = (descriptor or {}).get("tmux_socket_name") or session.get("tmux_socket_name")
+    if descriptor:
+        session["tmux_session"] = tmux_session
+        if tmux_socket_name:
+            session["tmux_socket_name"] = tmux_socket_name
+
+    return tmux_session, tmux_socket_name, None
+
+
 def _tmux_attach_command(tmux_session: str, tmux_socket_name: str | None = None) -> list[str]:
     cmd = ["tmux"]
     if tmux_socket_name:
@@ -1751,12 +1779,18 @@ def run_watch_tui(
                         elif result.get("ok"):
                             restored = result.get("data") or selected
                             selected_session_id = restored.get("id") or selected_session_id
-                            tmux_session = restored.get("tmux_session")
+                            if can_attach_session(restored):
+                                tmux_session, tmux_socket_name, attach_error = _resolve_tmux_attach_target(
+                                    client,
+                                    restored,
+                                )
+                            else:
+                                tmux_session, tmux_socket_name, attach_error = None, None, None
                             if can_attach_session(restored) and tmux_session:
-                                _attach_tmux(stdscr, tmux_session, restored.get("tmux_socket_name"))
+                                _attach_tmux(stdscr, tmux_session, tmux_socket_name)
                                 flash_message = f"Restored {selected_session_id}"
                             else:
-                                flash_message = f"Restored {selected_session_id} (headless)"
+                                flash_message = attach_error or f"Restored {selected_session_id} (headless)"
                         else:
                             flash_message = str(result.get("detail") or result.get("error") or "Failed to restore session")
                         flash_until = time.monotonic() + 2.5
@@ -1766,12 +1800,12 @@ def run_watch_tui(
                         flash_message = "no terminal (use s to send)"
                         flash_until = time.monotonic() + 2.5
                         continue
-                    tmux_session = selected.get("tmux_session")
-                    if not tmux_session:
-                        flash_message = "Selected session has no tmux target"
+                    tmux_session, tmux_socket_name, attach_error = _resolve_tmux_attach_target(client, selected)
+                    if attach_error:
+                        flash_message = attach_error
                         flash_until = time.monotonic() + 2.5
                         continue
-                    _attach_tmux(stdscr, tmux_session, selected.get("tmux_socket_name"))
+                    _attach_tmux(stdscr, tmux_session, tmux_socket_name)
                     next_refresh = 0.0
         finally:
             if detail_worker:

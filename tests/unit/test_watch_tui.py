@@ -16,6 +16,7 @@ from src.cli.watch_tui import (
     _render_columns,
     _retire_confirmation_matches,
     _resolve_create_provider,
+    _resolve_tmux_attach_target,
     _session_line,
     _tmux_attach_command,
     build_restore_rows,
@@ -44,6 +45,51 @@ def test_tmux_attach_command_includes_socket_when_available():
         "-t",
         "claude-test",
     ]
+
+
+def test_resolve_tmux_attach_target_hydrates_descriptor_socket():
+    calls = []
+
+    client = type(
+        "_Client",
+        (),
+        {
+            "get_attach_descriptor": staticmethod(
+                lambda session_id: calls.append(session_id)
+                or {
+                    "attach_supported": True,
+                    "tmux_session": "descriptor-target",
+                    "tmux_socket_name": "session-manager-test",
+                }
+            ),
+        },
+    )()
+    session = {"id": "agent123", "provider": "codex-fork", "tmux_session": "stale-target"}
+
+    tmux_session, tmux_socket_name, error = _resolve_tmux_attach_target(client, session)
+
+    assert error is None
+    assert tmux_session == "descriptor-target"
+    assert tmux_socket_name == "session-manager-test"
+    assert session["tmux_session"] == "descriptor-target"
+    assert session["tmux_socket_name"] == "session-manager-test"
+    assert calls == ["agent123"]
+
+
+def test_resolve_tmux_attach_target_falls_back_to_session_without_descriptor():
+    client = type("_Client", (), {"get_attach_descriptor": staticmethod(lambda session_id: None)})()
+    session = {
+        "id": "agent123",
+        "provider": "claude",
+        "tmux_session": "session-target",
+        "tmux_socket_name": "session-manager-test",
+    }
+
+    tmux_session, tmux_socket_name, error = _resolve_tmux_attach_target(client, session)
+
+    assert error is None
+    assert tmux_session == "session-target"
+    assert tmux_socket_name == "session-manager-test"
 
 
 def _session(

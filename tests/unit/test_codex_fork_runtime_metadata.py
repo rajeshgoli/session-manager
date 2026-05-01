@@ -21,7 +21,7 @@ def test_codex_fork_runtime_metadata_uses_config_pin(tmp_path):
 
     metadata = manager.get_codex_fork_runtime_info()
     assert metadata["command"] == "codex-fork-bin"
-    assert metadata["args"] == ["--fast"]
+    assert metadata["args"] == ["--fast", "-c", "check_for_update_on_startup=false"]
     assert metadata["event_schema_version"] == 7
     assert metadata["artifact_release"] == "v1.2.3-sm"
     assert metadata["artifact_ref"] == "f00dbabe1234"
