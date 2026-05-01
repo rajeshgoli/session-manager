@@ -2003,6 +2003,37 @@ class TestDirectDelivery244:
         assert [msg.id for msg in remaining] == ["after244a"]
 
     @pytest.mark.asyncio
+    async def test_failed_native_rename_is_dropped(self, mock_session_manager, temp_db_path):
+        """Provider-native rename sync is best-effort and must not retry forever."""
+        mq = self._make_mq(mock_session_manager, temp_db_path)
+
+        session = MagicMock()
+        session.id = "target244renamefail"
+        session.provider = "codex-fork"
+        session.tmux_session = "codex-fork-target244renamefail"
+        session.status = SessionStatus.IDLE
+        session.last_activity = datetime.now()
+        mock_session_manager.get_session = MagicMock(return_value=session)
+        mock_session_manager._deliver_direct = AsyncMock(return_value=True)
+        mock_session_manager.extract_provider_native_rename_name = MagicMock(return_value="fresh-name")
+        mock_session_manager._deliver_provider_native_rename = AsyncMock(return_value=False)
+
+        self._insert_pending_message_with_category(
+            mq,
+            "target244renamefail",
+            msg_id="rename244fail",
+            text="/rename fresh-name",
+            message_category="native_rename",
+        )
+        mq._get_pending_user_input_async = AsyncMock(return_value=None)
+
+        await mq._try_deliver_messages("target244renamefail")
+
+        mock_session_manager._deliver_provider_native_rename.assert_awaited_once_with(session, "fresh-name")
+        mock_session_manager._deliver_direct.assert_not_awaited()
+        assert mq.get_pending_messages("target244renamefail") == []
+
+    @pytest.mark.asyncio
     async def test_native_rename_is_not_concatenated_after_regular_message(self, mock_session_manager, temp_db_path):
         """Regular sequential text must not absorb a later native rename."""
         mq = self._make_mq(mock_session_manager, temp_db_path)

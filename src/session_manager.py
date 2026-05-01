@@ -3478,6 +3478,13 @@ class SessionManager:
             return False
         if not self._is_safe_provider_native_rename_name(friendly_name):
             return False
+        if (session.native_title or "").strip() == friendly_name:
+            logger.debug(
+                "Skipping provider-native rename for %s; native title is already %r",
+                session.id,
+                friendly_name,
+            )
+            return True
 
         rename_command = f"/rename {friendly_name}"
         if not self.message_queue_manager:
@@ -4413,6 +4420,47 @@ class SessionManager:
         )
         self._save_state()
 
+    def _format_tmux_runtime_missing_message(
+        self,
+        session: Session,
+        diagnostics: Optional[dict[str, object]] = None,
+    ) -> str:
+        tmux_name = session.tmux_session or session.name or session.id
+        if diagnostics and diagnostics.get("pane_dead"):
+            status = diagnostics.get("pane_dead_status")
+            command = diagnostics.get("pane_current_command")
+            details = []
+            if status is not None:
+                details.append(f"exit_status={status}")
+            if command:
+                details.append(f"command={command}")
+            suffix = "; ".join(details) if details else "dead pane detected"
+            return f"Tmux session {tmux_name} exited before delivery ({suffix})"
+        return f"Tmux session {tmux_name} disappeared before delivery"
+
+    def _mark_tmux_runtime_missing_if_absent(self, session: Session) -> bool:
+        """Mark a tmux-backed session stopped when delivery proves the runtime is gone."""
+        if session.provider == "codex-app" or not session.tmux_session:
+            return False
+        if self.tmux.session_exists(session.tmux_session):
+            return False
+
+        diagnostics = None
+        get_exit_diagnostics = getattr(self.tmux, "get_session_exit_diagnostics", None)
+        if callable(get_exit_diagnostics):
+            diagnostics = get_exit_diagnostics(session.tmux_session)
+
+        session.status = SessionStatus.STOPPED
+        session.error_message = self._format_tmux_runtime_missing_message(session, diagnostics)
+        logger.warning(
+            "Marked session %s stopped after missing tmux runtime during delivery: %s; diagnostics=%s",
+            session.id,
+            session.error_message,
+            diagnostics,
+        )
+        self._save_state()
+        return True
+
     async def _deliver_direct(self, session: Session, text: str, model: Optional[str] = None) -> bool:
         """Deliver a message directly to a session (no queue)."""
         if session.provider == "codex-app":
@@ -4449,6 +4497,7 @@ class SessionManager:
             logger.warning("Codex-fork control send failed for %s: %s", session.id, reason)
             self._set_codex_fork_control_degraded(session, reason)
             if not self.codex_fork_control_tmux_fallback_enabled:
+                self._mark_tmux_runtime_missing_if_absent(session)
                 return False
 
             logger.warning("Falling back to tmux input path for codex-fork session %s", session.id)
@@ -4459,6 +4508,8 @@ class SessionManager:
             )
             if fallback_success and self.message_queue_manager:
                 self.message_queue_manager.mark_session_active(session.id)
+            elif not fallback_success:
+                self._mark_tmux_runtime_missing_if_absent(session)
             return fallback_success
 
         success = await self.tmux.send_input_async(
@@ -4469,6 +4520,8 @@ class SessionManager:
         )
         if success and self.message_queue_manager:
             self.message_queue_manager.mark_session_active(session.id)
+        elif not success:
+            self._mark_tmux_runtime_missing_if_absent(session)
         return success
 
     async def _interrupt_codex(self, session: Session) -> bool:

@@ -111,6 +111,29 @@ def test_codex_native_title_does_not_override_newer_explicit_sm_name(tmp_path):
     assert manager.get_effective_session_name(session) == "sm-reviewer"
 
 
+@pytest.mark.asyncio
+async def test_provider_native_rename_skips_when_native_title_already_matches(tmp_path):
+    manager = _manager(tmp_path)
+    manager.message_queue_manager = MagicMock()
+    session = Session(
+        id="cfskip",
+        name="codex-fork-cfskip",
+        working_dir="/tmp",
+        provider="codex-fork",
+        tmux_session="codex-fork-cfskip",
+        friendly_name="maintainer",
+        native_title="maintainer",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+
+    queued = await manager.queue_provider_native_rename(session, "maintainer")
+
+    assert queued is True
+    manager.message_queue_manager.cancel_queued_messages_for_target.assert_not_called()
+    manager.message_queue_manager.queue_message.assert_not_called()
+
+
 def test_codex_thread_name_event_ignores_unknown_thread_id(tmp_path):
     manager = _manager(tmp_path)
     session = Session(

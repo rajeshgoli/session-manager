@@ -136,6 +136,103 @@ class TmuxController:
             ",*:smcup@:rmcup@",
         )
 
+    def _enable_exit_diagnostics(self, session_name: str) -> None:
+        """Keep dead panes around long enough for the monitor to read exit status."""
+        try:
+            self._run_tmux(
+                "set-window-option",
+                "-t",
+                f"{session_name}:main",
+                "remain-on-exit",
+                "on",
+                check=False,
+            )
+        except Exception:
+            # Exit diagnostics are best-effort. Spawn should not fail if tmux
+            # lacks this option or the pane disappeared during setup.
+            logger.debug("Could not enable remain-on-exit for %s", session_name, exc_info=True)
+
+    def _list_sessions_on_socket(self, socket_name: Optional[str]) -> list[str]:
+        """Return tmux session names on one socket without using fallback resolution."""
+        result = self._run_tmux(
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+            check=False,
+            socket_name=socket_name,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+    def get_session_exit_diagnostics(self, session_name: str) -> dict[str, object]:
+        """Collect tmux lifecycle diagnostics for a managed session.
+
+        If the session still exists with a dead pane, this captures the provider
+        exit status. If tmux has already removed it, this returns socket-level
+        snapshots so logs can distinguish a missing SM socket session from a
+        legacy/default-socket mismatch.
+        """
+        target = self._normalize_session_target(session_name)
+        socket_name = self._resolve_socket_for_session(target)
+        exists = self._session_exists_on_socket(target, socket_name)
+        if not exists and self.socket_name:
+            legacy_exists = self._session_exists_on_socket(target, None)
+            if legacy_exists:
+                socket_name = None
+                exists = True
+
+        diagnostics: dict[str, object] = {
+            "session_name": target,
+            "socket_name": socket_name,
+            "configured_socket_name": self.socket_name,
+            "exists": exists,
+            "pane_dead": False,
+            "panes": [],
+            "sessions_on_configured_socket": self._list_sessions_on_socket(self.socket_name),
+            "sessions_on_default_socket": self._list_sessions_on_socket(None),
+        }
+
+        if not exists:
+            return diagnostics
+
+        result = self._run_tmux(
+            "list-panes",
+            "-t",
+            target,
+            "-F",
+            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_current_command}\t#{pane_pid}\t#{pane_tty}",
+            check=False,
+            socket_name=socket_name,
+        )
+        if result.returncode != 0:
+            diagnostics["pane_error"] = (result.stderr or "").strip()
+            return diagnostics
+
+        panes: list[dict[str, object]] = []
+        for line in (result.stdout or "").splitlines():
+            parts = line.split("\t")
+            parts += [""] * (7 - len(parts))
+            pane = {
+                "pane_id": parts[0],
+                "pane_dead": parts[1] == "1",
+                "pane_dead_status": parts[2] or None,
+                "pane_dead_signal": parts[3] or None,
+                "pane_current_command": parts[4] or None,
+                "pane_pid": parts[5] or None,
+                "pane_tty": parts[6] or None,
+            }
+            panes.append(pane)
+
+        diagnostics["panes"] = panes
+        dead_pane = next((pane for pane in panes if pane.get("pane_dead")), None)
+        if dead_pane:
+            diagnostics["pane_dead"] = True
+            diagnostics.update(dead_pane)
+        elif panes:
+            diagnostics.update(panes[0])
+        return diagnostics
+
     def _resolve_launch_command(
         self,
         command: str,
@@ -773,6 +870,7 @@ class TmuxController:
             self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
             self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
             self._run_tmux("select-window", "-t", f"{session_name}:main")
+            self._enable_exit_diagnostics(session_name)
             self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file
@@ -872,6 +970,7 @@ class TmuxController:
             self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
             self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
             self._run_tmux("select-window", "-t", f"{session_name}:main")
+            self._enable_exit_diagnostics(session_name)
             self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file

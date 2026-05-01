@@ -84,6 +84,91 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
     ]
 
 
+def test_create_session_with_command_enables_exit_diagnostics(tmp_path, monkeypatch):
+    controller = TmuxController(
+        log_dir=str(tmp_path),
+        config={"timeouts": {"tmux": {"shell_export_settle_seconds": 0}}},
+    )
+    calls = []
+
+    def _fake_run_tmux(*args, **kwargs):
+        calls.append(args)
+        return MagicMock(returncode=0, stdout="")
+
+    monkeypatch.setattr(controller, "session_exists", lambda _: False)
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    ok = controller.create_session_with_command(
+        "claude-exitdiag",
+        str(tmp_path),
+        str(tmp_path / "claude-exitdiag.log"),
+        command="sh",
+        args=["-lc", "sleep 1"],
+    )
+
+    assert ok is True
+    assert (
+        "set-window-option",
+        "-t",
+        "claude-exitdiag:main",
+        "remain-on-exit",
+        "on",
+    ) in calls
+
+
+def test_get_session_exit_diagnostics_reports_dead_pane(monkeypatch):
+    controller = TmuxController(config={"tmux": {"socket_name": "session-manager-test"}})
+    monkeypatch.setattr(
+        controller,
+        "_session_exists_on_socket",
+        lambda session_name, socket_name: socket_name == "session-manager-test",
+    )
+
+    def _fake_run_tmux(*args, **kwargs):
+        if args[:2] == ("list-sessions", "-F"):
+            return MagicMock(returncode=0, stdout="codex-fork-dead\n")
+        if args[:2] == ("list-panes", "-t"):
+            return MagicMock(
+                returncode=0,
+                stdout="%1\t1\t2\t0\tcodex\t12345\t/dev/ttys001\n",
+            )
+        return MagicMock(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+
+    diagnostics = controller.get_session_exit_diagnostics("codex-fork-dead")
+
+    assert diagnostics["exists"] is True
+    assert diagnostics["pane_dead"] is True
+    assert diagnostics["pane_dead_status"] == "2"
+    assert diagnostics["pane_dead_signal"] == "0"
+    assert diagnostics["pane_current_command"] == "codex"
+    assert diagnostics["socket_name"] == "session-manager-test"
+
+
+def test_get_session_exit_diagnostics_snapshots_missing_session(monkeypatch):
+    controller = TmuxController(config={"tmux": {"socket_name": "session-manager-test"}})
+    monkeypatch.setattr(controller, "_session_exists_on_socket", lambda *_: False)
+
+    def _fake_run_tmux(*args, **kwargs):
+        socket_name = kwargs.get("socket_name")
+        if socket_name == "session-manager-test":
+            return MagicMock(returncode=0, stdout="other-managed\n")
+        if socket_name is None:
+            return MagicMock(returncode=0, stdout="legacy-session\n")
+        return MagicMock(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+
+    diagnostics = controller.get_session_exit_diagnostics("missing-session")
+
+    assert diagnostics["exists"] is False
+    assert diagnostics["pane_dead"] is False
+    assert diagnostics["sessions_on_configured_socket"] == ["other-managed"]
+    assert diagnostics["sessions_on_default_socket"] == ["legacy-session"]
+
+
 def test_codex_rename_prompt_detection():
     controller = TmuxController()
 
