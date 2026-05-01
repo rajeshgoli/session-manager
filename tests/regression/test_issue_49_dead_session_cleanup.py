@@ -122,6 +122,60 @@ async def test_monitor_detects_tmux_death(output_monitor, mock_session, mock_ses
 
 
 @pytest.mark.asyncio
+async def test_monitor_records_tmux_exit_diagnostics(output_monitor, mock_session, mock_session_manager):
+    """Dead panes are cleaned up with persisted tmux exit diagnostics."""
+    mock_session_manager.sessions[mock_session.id] = mock_session
+    mock_session_manager.tmux.get_session_exit_diagnostics = Mock(
+        return_value={
+            "session_name": "claude-test-123",
+            "socket_name": "session-manager",
+            "exists": True,
+            "pane_dead": True,
+            "pane_dead_status": "2",
+            "pane_dead_signal": "0",
+            "pane_current_command": "claude",
+            "pane_pid": "12345",
+        }
+    )
+    mock_session_manager.tmux.kill_session = Mock(return_value=True)
+
+    await output_monitor._handle_session_died(
+        mock_session,
+        mock_session_manager.tmux.get_session_exit_diagnostics.return_value,
+    )
+
+    assert mock_session.status == SessionStatus.STOPPED
+    assert mock_session.id in mock_session_manager.sessions
+    assert mock_session.error_message == (
+        "Tmux session claude-test-123 exited unexpectedly "
+        "(exit_status=2; signal=0; command=claude; socket=session-manager)"
+    )
+    mock_session_manager.tmux.kill_session.assert_called_once_with("claude-test-123")
+    mock_session_manager._save_state_async.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_monitor_records_missing_tmux_snapshot(output_monitor, mock_session, mock_session_manager):
+    """Missing sessions preserve socket snapshots for postmortem debugging."""
+    diagnostics = {
+        "session_name": "claude-test-123",
+        "socket_name": "session-manager",
+        "exists": False,
+        "pane_dead": False,
+        "sessions_on_configured_socket": ["other-managed"],
+        "sessions_on_default_socket": ["legacy-session"],
+    }
+
+    await output_monitor._handle_session_died(mock_session, diagnostics)
+
+    assert mock_session.error_message == (
+        "Tmux session claude-test-123 disappeared unexpectedly "
+        "(socket=session-manager; configured_socket_sessions=1; default_socket_sessions=1)"
+    )
+    mock_session_manager.tmux.kill_session.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_session_full_workflow(output_monitor, mock_session, mock_session_manager):
     """Test that cleanup_session performs all cleanup steps."""
     # Add session to manager

@@ -2540,6 +2540,17 @@ class MessageQueueManager:
                 self.session_manager._save_state()
                 if getattr(session, "provider", "claude") == "codex":
                     self._schedule_codex_idle_reconcile(session_id)
+            elif len(batch) == 1 and batch[0].message_category == "native_rename":
+                # Provider-native renames are display-sync hints, not user
+                # messages. If the provider control path is unavailable, do
+                # not retry slash-command fallbacks into an active prompt
+                # indefinitely.
+                self._mark_delivered(batch[0].id)
+                logger.warning(
+                    "Dropping failed provider-native rename message %s for %s",
+                    batch[0].id,
+                    session_id,
+                )
             else:
                 logger.error(f"Failed to deliver messages to {session_id}")
 

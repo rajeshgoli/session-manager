@@ -164,3 +164,35 @@ async def test_deliver_direct_enables_codex_submit_verification(tmp_path):
         verify_claude_submit=False,
         verify_codex_submit=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_deliver_direct_marks_missing_tmux_runtime_stopped(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="codex697",
+        name="codex-codex697",
+        working_dir=str(tmp_path),
+        tmux_session="codex-codex697",
+        provider="codex",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    manager.tmux.send_input_async = AsyncMock(return_value=False)
+    manager.tmux.session_exists = MagicMock(return_value=False)
+    manager.tmux.get_session_exit_diagnostics = MagicMock(
+        return_value={
+            "session_name": "codex-codex697",
+            "exists": False,
+            "pane_dead": False,
+        }
+    )
+    manager.output_monitor = MagicMock()
+    manager.output_monitor.cleanup_session = AsyncMock()
+
+    success = await manager._deliver_direct(session, "hello codex")
+
+    assert success is False
+    assert session.status == SessionStatus.STOPPED
+    assert session.error_message == "Tmux session codex-codex697 disappeared before delivery"
+    manager.output_monitor.cleanup_session.assert_awaited_once_with(session, preserve_record=True)

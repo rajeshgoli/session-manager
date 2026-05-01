@@ -257,14 +257,38 @@ class OutputMonitor:
                 # Every ~30 polls (~30 seconds with default 1s interval), verify tmux still exists
                 if check_counter % 30 == 0:
                     session_exists = True
+                    exit_diagnostics = None
                     if self._session_manager:
                         session_exists = await asyncio.to_thread(
                             self._session_manager.tmux.session_exists,
                             session.tmux_session,
                         )
+                        tmux_controller = self._session_manager.tmux
+                        get_exit_diagnostics = getattr(
+                            tmux_controller,
+                            "get_session_exit_diagnostics",
+                            None,
+                        )
+                        has_real_diagnostics = callable(get_exit_diagnostics) and (
+                            "get_session_exit_diagnostics" in vars(tmux_controller)
+                            or getattr(type(tmux_controller), "get_session_exit_diagnostics", None)
+                            is not None
+                        )
+                        if has_real_diagnostics:
+                            exit_diagnostics = await asyncio.to_thread(
+                                get_exit_diagnostics,
+                                session.tmux_session,
+                            )
+                            if exit_diagnostics.get("pane_dead"):
+                                logger.info(
+                                    "Tmux session %s has a dead pane, cleaning up",
+                                    session.tmux_session,
+                                )
+                                await self._handle_session_died(session, exit_diagnostics)
+                                break
                     if not session_exists:
                         logger.info(f"Tmux session {session.tmux_session} no longer exists, cleaning up")
-                        await self._handle_session_died(session)
+                        await self._handle_session_died(session, exit_diagnostics)
                         break
 
                 last_pos = self._file_positions.get(session.id, 0)
@@ -819,11 +843,59 @@ class OutputMonitor:
 
         return True
 
-    async def _handle_session_died(self, session: Session):
+    def _format_session_exit_diagnostic(self, session: Session, diagnostics: Optional[dict[str, object]]) -> str:
+        """Create a compact persisted reason for unexpected tmux/provider exits."""
+        tmux_name = session.tmux_session or session.name or session.id
+        if not diagnostics:
+            return f"Tmux session {tmux_name} disappeared unexpectedly; no diagnostics available"
+
+        socket_name = diagnostics.get("socket_name")
+        if diagnostics.get("pane_dead"):
+            status = diagnostics.get("pane_dead_status")
+            signal = diagnostics.get("pane_dead_signal")
+            command = diagnostics.get("pane_current_command")
+            details = []
+            if status is not None:
+                details.append(f"exit_status={status}")
+            if signal is not None:
+                details.append(f"signal={signal}")
+            if command:
+                details.append(f"command={command}")
+            if socket_name:
+                details.append(f"socket={socket_name}")
+            suffix = "; ".join(details) if details else "dead pane detected"
+            return f"Tmux session {tmux_name} exited unexpectedly ({suffix})"
+
+        configured = diagnostics.get("sessions_on_configured_socket") or []
+        default = diagnostics.get("sessions_on_default_socket") or []
+        configured_count = len(configured) if isinstance(configured, list) else 0
+        default_count = len(default) if isinstance(default, list) else 0
+        socket_part = f"socket={socket_name}" if socket_name else "socket=default"
+        return (
+            f"Tmux session {tmux_name} disappeared unexpectedly "
+            f"({socket_part}; configured_socket_sessions={configured_count}; "
+            f"default_socket_sessions={default_count})"
+        )
+
+    async def _handle_session_died(
+        self,
+        session: Session,
+        diagnostics: Optional[dict[str, object]] = None,
+    ):
         """
         Handle tmux session death - called when monitor detects tmux no longer exists.
         """
-        logger.info(f"Tmux session {session.tmux_session} died, performing cleanup")
+        session.error_message = self._format_session_exit_diagnostic(session, diagnostics)
+        logger.warning(
+            "Tmux session %s died, performing cleanup: %s; diagnostics=%s",
+            session.tmux_session,
+            session.error_message,
+            diagnostics,
+        )
+        if diagnostics and diagnostics.get("pane_dead") and self._session_manager:
+            kill_session = getattr(self._session_manager.tmux, "kill_session", None)
+            if callable(kill_session):
+                await asyncio.to_thread(kill_session, session.tmux_session)
         # Preserve the stopped record so dead sessions remain restorable and
         # can produce useful diagnostics instead of disappearing from state.
         await self.cleanup_session(session, preserve_record=True)

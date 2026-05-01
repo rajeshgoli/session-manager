@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 class TmuxController:
     """Controls tmux sessions for Claude Code."""
 
+    SERVER_ANCHOR_SESSION = "__sm_server_anchor"
+
     def __init__(self, log_dir: str = "/tmp/claude-sessions", config: Optional[dict] = None):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +137,194 @@ class TmuxController:
             "terminal-overrides",
             ",*:smcup@:rmcup@",
         )
+
+    def _ensure_server_anchor(self) -> None:
+        """Start the configured tmux server under a neutral SM-owned session.
+
+        tmux server processes keep the argv from the command that first created
+        the server. If the first command is an agent session, `ps` can later
+        make the server itself look like an orphaned agent runtime after that
+        session is retired. Keep a neutral anchor so process-grep cleanup cannot
+        accidentally kill every managed session on the socket.
+        """
+        if not self.socket_name:
+            return
+        if self._session_exists_on_socket(self.SERVER_ANCHOR_SESSION, self.socket_name):
+            return
+        result = self._run_tmux(
+            "new-session",
+            "-d",
+            "-s",
+            self.SERVER_ANCHOR_SESSION,
+            "-n",
+            "anchor",
+            "-c",
+            str(self.log_dir),
+            "sleep 315360000",
+            check=False,
+        )
+        if result.returncode == 0:
+            logger.info(
+                "Created tmux server anchor %s on socket %s",
+                self.SERVER_ANCHOR_SESSION,
+                self.socket_name,
+            )
+        elif "duplicate session" not in (result.stderr or "").lower():
+            logger.warning("Could not create tmux server anchor: %s", result.stderr)
+
+    def _enable_exit_diagnostics(self, session_name: str) -> None:
+        """Keep dead panes around long enough for the monitor to read exit status."""
+        try:
+            self._run_tmux(
+                "set-window-option",
+                "-t",
+                f"{session_name}:main",
+                "remain-on-exit",
+                "on",
+                check=False,
+            )
+            pane_id = (
+                self._run_tmux(
+                    "display-message",
+                    "-p",
+                    "-t",
+                    session_name,
+                    "#{pane_id}",
+                    check=False,
+                ).stdout
+                or ""
+            ).strip()
+            if pane_id:
+                self._run_tmux(
+                    "set-option",
+                    "-t",
+                    session_name,
+                    "@sm_main_pane_id",
+                    pane_id,
+                    check=False,
+                )
+        except Exception:
+            # Exit diagnostics are best-effort. Spawn should not fail if tmux
+            # lacks this option or the pane disappeared during setup.
+            logger.debug("Could not enable remain-on-exit for %s", session_name, exc_info=True)
+
+    def _list_sessions_on_socket(self, socket_name: Optional[str]) -> list[str]:
+        """Return tmux session names on one socket without using fallback resolution."""
+        result = self._run_tmux(
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+            check=False,
+            socket_name=socket_name,
+        )
+        if result.returncode != 0:
+            return []
+        return [
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip() and line.strip() != self.SERVER_ANCHOR_SESSION
+        ]
+
+    def get_session_exit_diagnostics(self, session_name: str) -> dict[str, object]:
+        """Collect tmux lifecycle diagnostics for a managed session.
+
+        If the session still exists with a dead pane, this captures the provider
+        exit status. If tmux has already removed it, this returns socket-level
+        snapshots so logs can distinguish a missing SM socket session from a
+        legacy/default-socket mismatch.
+        """
+        target = self._normalize_session_target(session_name)
+        socket_name = self._resolve_socket_for_session(target)
+        exists = self._session_exists_on_socket(target, socket_name)
+        if not exists and self.socket_name:
+            legacy_exists = self._session_exists_on_socket(target, None)
+            if legacy_exists:
+                socket_name = None
+                exists = True
+
+        diagnostics: dict[str, object] = {
+            "session_name": target,
+            "socket_name": socket_name,
+            "configured_socket_name": self.socket_name,
+            "exists": exists,
+            "pane_dead": False,
+            "panes": [],
+            "sessions_on_configured_socket": self._list_sessions_on_socket(self.socket_name),
+            "sessions_on_default_socket": self._list_sessions_on_socket(None),
+        }
+
+        if not exists:
+            return diagnostics
+
+        main_pane_id = (
+            self._run_tmux(
+                "show-options",
+                "-qv",
+                "-t",
+                target,
+                "@sm_main_pane_id",
+                check=False,
+                socket_name=socket_name,
+            ).stdout
+            or ""
+        ).strip() or None
+        diagnostics["main_pane_id"] = main_pane_id
+
+        result = self._run_tmux(
+            "list-panes",
+            "-t",
+            target,
+            "-F",
+            "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_current_command}\t#{pane_pid}\t#{pane_tty}\t#{pane_active}\t#{pane_title}",
+            check=False,
+            socket_name=socket_name,
+        )
+        if result.returncode != 0:
+            diagnostics["pane_error"] = (result.stderr or "").strip()
+            return diagnostics
+
+        panes: list[dict[str, object]] = []
+        for line in (result.stdout or "").splitlines():
+            parts = line.split("\t")
+            parts += [""] * (9 - len(parts))
+            pane = {
+                "pane_id": parts[0],
+                "pane_dead": parts[1] == "1",
+                "pane_dead_status": parts[2] or None,
+                "pane_dead_signal": parts[3] or None,
+                "pane_current_command": parts[4] or None,
+                "pane_pid": parts[5] or None,
+                "pane_tty": parts[6] or None,
+                "pane_active": parts[7] == "1",
+                "pane_title": parts[8] or None,
+            }
+            panes.append(pane)
+
+        diagnostics["panes"] = panes
+        dead_panes = [pane for pane in panes if pane.get("pane_dead")]
+        diagnostics["dead_panes"] = dead_panes
+        if main_pane_id:
+            dead_pane = next(
+                (
+                    pane
+                    for pane in dead_panes
+                    if pane.get("pane_id") == main_pane_id
+                ),
+                None,
+            )
+        else:
+            live_panes = [pane for pane in panes if not pane.get("pane_dead")]
+            dead_pane = dead_panes[0] if dead_panes and not live_panes else None
+        if dead_pane:
+            diagnostics["pane_dead"] = True
+            diagnostics.update(dead_pane)
+        elif panes:
+            main_pane = next(
+                (pane for pane in panes if pane.get("pane_id") == main_pane_id),
+                None,
+            )
+            diagnostics.update(main_pane or panes[0])
+        return diagnostics
 
     def _resolve_launch_command(
         self,
@@ -760,6 +950,7 @@ class TmuxController:
         log_path.touch()
 
         try:
+            self._ensure_server_anchor()
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
@@ -773,6 +964,7 @@ class TmuxController:
             self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
             self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
             self._run_tmux("select-window", "-t", f"{session_name}:main")
+            self._enable_exit_diagnostics(session_name)
             self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file
@@ -859,6 +1051,7 @@ class TmuxController:
         log_path.touch()
 
         try:
+            self._ensure_server_anchor()
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
@@ -872,6 +1065,7 @@ class TmuxController:
             self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
             self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
             self._run_tmux("select-window", "-t", f"{session_name}:main")
+            self._enable_exit_diagnostics(session_name)
             self._initialize_pane_title(session_name)
 
             # Set up pipe-pane to capture output to log file
@@ -1228,7 +1422,11 @@ class TmuxController:
         if result.returncode != 0:
             result = None
         if result is not None:
-            sessions.update(s.strip() for s in result.stdout.strip().split("\n") if s.strip())
+            sessions.update(
+                s.strip()
+                for s in result.stdout.strip().split("\n")
+                if s.strip() and s.strip() != self.SERVER_ANCHOR_SESSION
+            )
         if self.socket_name:
             legacy = self._run_tmux(
                 "list-sessions",
@@ -1238,7 +1436,11 @@ class TmuxController:
                 socket_name=None,
             )
             if legacy.returncode == 0:
-                sessions.update(s.strip() for s in legacy.stdout.strip().split("\n") if s.strip())
+                sessions.update(
+                    s.strip()
+                    for s in legacy.stdout.strip().split("\n")
+                    if s.strip() and s.strip() != self.SERVER_ANCHOR_SESSION
+                )
         return sorted(sessions)
 
     def capture_pane(self, session_name: str, lines: int = 50) -> Optional[str]:
