@@ -110,6 +110,29 @@ Native terminal scrollback is usually much larger or effectively unbounded by us
 
 ## Proposed solution
 
+### Rejected direct fix: periodic tmux scroll sweep
+
+Do not try to keep tmux "native-terminal-like" by periodically scrolling detached or idle attached panes to the top and back down.
+
+This was tested against a disposable tmux pane. `copy-mode` plus `history-top` changed only tmux's copy-mode cursor:
+
+```bash
+tmux copy-mode -t sm-scroll-sync-probe
+tmux send-keys -t sm-scroll-sync-probe -X history-top
+tmux display-message -p -t sm-scroll-sync-probe 'hist=#{history_size}/#{history_limit} mode=#{pane_in_mode}'
+```
+
+The pane entered copy-mode, but `history_size/history_limit` did not increase and no previously discarded lines reappeared. This matches the tmux model: copy-mode scrolls through the pane history tmux has already retained; it does not cause the child process to replay output, and it does not populate an outer terminal emulator's scrollback.
+
+This approach also has bad operational properties:
+
+- Detached sessions have no attached terminal emulator to keep in sync. Tmux is the terminal emulator for the provider process, so tmux's own history limit is the retention boundary.
+- Attached sessions would see their viewport moved by Session Manager, which is surprising and can interfere with a human reading or typing.
+- Leaving a pane in copy-mode can block normal input delivery until Session Manager exits copy-mode; the existing send path already has defensive copy-mode cancellation because this happens in practice.
+- TUI redraw artifacts are already in tmux's saved screen history. Scrolling over them cannot turn that screen history into semantic turns.
+
+The direct fix remains: set a larger history limit before the provider pane is created. The clean-history fix remains: use provider transcripts for inspection/search.
+
 ### 1. Configurable tmux history limit
 
 Add a top-level tmux config section:
