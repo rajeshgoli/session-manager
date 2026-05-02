@@ -160,6 +160,10 @@ def test_client_sessions_include_termux_attach_metadata():
     assert "Attach transport failed (255); retrying once..." in ssh_command
     assert "run_attach() {" in ssh_command
     assert "stty sane" in ssh_command
+    assert "sm-attach-$$-${RANDOM:-0}.log" in ssh_command
+    assert "websocket: bad handshake" in ssh_command
+    assert "Cloudflare Access SSH auth failed; refreshing login for ssh.sm.rajeshgo.li..." in ssh_command
+    assert "cloudflared access login https://ssh.sm.rajeshgo.li" in ssh_command
     assert "attach_pid=$!" not in ssh_command
     assert "fg %1 >/dev/null 2>&1 || wait \"$attach_pid\"" not in ssh_command
     assert "kill \"$attach_pid\"" not in ssh_command
