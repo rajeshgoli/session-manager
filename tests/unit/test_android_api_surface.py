@@ -209,6 +209,37 @@ def test_client_sessions_fall_back_to_lan_ssh_on_cloudflare_bad_handshake():
     assert "cloudflared access login" not in ssh_command
 
 
+def test_client_sessions_fall_back_to_ipv6_lan_ssh_on_cloudflare_bad_handshake():
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_android_config(),
+    )
+    app.state.infra_supervisor = MagicMock()
+    app.state.infra_supervisor.get_check.side_effect = lambda name: {
+        "status": "ok",
+        "message": "android attach sshd is listening",
+        "details": {
+            "attach_ready": True,
+            "listeners": ["127.0.0.1:22220", "[fe80::1420:ef0f:9f96:cd24]:22220"],
+        },
+    } if name == "android_sshd" else {
+        "status": "ok",
+        "message": "android attach cloudflared tunnel is running",
+        "details": {"attach_ready": True},
+    }
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    ssh_command = response.json()["sessions"][0]["termux_attach"]["ssh_command"]
+    assert "Cloudflare Tunnel SSH transport failed; trying LAN SSH fallback fe80::1420:ef0f:9f96:cd24:22220..." in ssh_command
+    assert "ssh -o StrictHostKeyChecking=accept-new -p 22220 -tt" in ssh_command
+    assert "rajesh@[fe80::1420:ef0f:9f96:cd24]" in ssh_command
+    assert "cloudflared access login" not in ssh_command
+
+
 def test_client_sessions_generate_valid_non_cloudflare_attach_command():
     session = _session()
     config = _android_config()

@@ -2279,13 +2279,16 @@ def create_app(
             listener_text = str(listener or "").strip()
             if not listener_text:
                 continue
-            host, separator, port_text = listener_text.rpartition(":")
+            if listener_text.startswith("[") and "]:" in listener_text:
+                host_part, port_text = listener_text.rsplit("]:", 1)
+                host = host_part[1:]
+                separator = ":"
+            else:
+                host, separator, port_text = listener_text.rpartition(":")
             if not separator or not host or not port_text:
                 continue
             host = host.strip("[]")
             if host in {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::", "*"}:
-                continue
-            if ":" in host:
                 continue
             try:
                 port = int(port_text)
@@ -2378,6 +2381,7 @@ def create_app(
         lan_ssh_command = ""
         if lan_ssh_target:
             lan_host, lan_port = lan_ssh_target
+            lan_ssh_host = f"[{lan_host}]" if ":" in lan_host else lan_host
             lan_ssh_args = [
                 "ssh",
                 "-o",
@@ -2385,7 +2389,7 @@ def create_app(
                 "-p",
                 str(lan_port),
                 "-tt",
-                f"{ssh_username}@{lan_host}",
+                f"{ssh_username}@{lan_ssh_host}",
                 remote_command,
             ]
             lan_ssh_command = shlex.join(lan_ssh_args)
