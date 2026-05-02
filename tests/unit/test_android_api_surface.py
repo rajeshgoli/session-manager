@@ -164,6 +164,7 @@ def test_client_sessions_include_termux_attach_metadata():
     assert "websocket: bad handshake" in ssh_command
     assert "Cloudflare Access SSH auth failed; refreshing login for ssh.sm.rajeshgo.li..." in ssh_command
     assert "cloudflared access login https://ssh.sm.rajeshgo.li" in ssh_command
+    assert "if [ \"$attach_status\" -ne 0 ]; then show_attach_error; fi; attach_cleanup" in ssh_command
     assert "attach_pid=$!" not in ssh_command
     assert "fg %1 >/dev/null 2>&1 || wait \"$attach_pid\"" not in ssh_command
     assert "kill \"$attach_pid\"" not in ssh_command

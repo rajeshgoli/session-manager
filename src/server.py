@@ -2402,8 +2402,8 @@ def create_app(
             "printf 'Attach transport failed (255); retrying once...\\r\\n' >/dev/tty 2>/dev/null || true; "
             "run_attach; "
             "attach_status=$?; "
-            "if [ \"$attach_status\" -ne 0 ]; then show_attach_error; fi; "
             "fi; "
+            "if [ \"$attach_status\" -ne 0 ]; then show_attach_error; fi; "
             "attach_cleanup; "
             "exit \"$attach_status\""
         )
