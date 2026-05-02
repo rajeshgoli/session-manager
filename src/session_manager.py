@@ -5197,12 +5197,13 @@ class SessionManager:
 
     def _compute_codex_fork_activity(self, session: Session) -> str:
         """Compute activity state for codex-fork sessions from reducer state."""
+        if session.status == SessionStatus.STOPPED:
+            return ActivityState.STOPPED.value
+        if session.status == SessionStatus.IDLE:
+            return ActivityState.IDLE.value
+
         lifecycle = self.codex_fork_lifecycle.get(session.id)
         if not lifecycle:
-            if session.status == SessionStatus.STOPPED:
-                return ActivityState.STOPPED.value
-            if session.status == SessionStatus.IDLE:
-                return ActivityState.IDLE.value
             return ActivityState.THINKING.value
 
         state_name = lifecycle.get("state")
