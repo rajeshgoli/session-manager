@@ -2350,7 +2350,7 @@ def create_app(
             remote_command,
         ])
         ssh_command = shlex.join(ssh_args)
-        cloudflared_reauth_script = ""
+        cloudflared_reauth_script = ":; "
         if "cloudflared" in ssh_proxy_command:
             cloudflared_login_url = f"https://{public_ssh_host}"
             cloudflared_reauth_script = (
