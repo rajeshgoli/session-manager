@@ -160,6 +160,11 @@ def test_client_sessions_include_termux_attach_metadata():
     assert "Attach transport failed (255); retrying once..." in ssh_command
     assert "run_attach() {" in ssh_command
     assert "stty sane" in ssh_command
+    assert "sm-attach-$$-${RANDOM:-0}.log" in ssh_command
+    assert "websocket: bad handshake" in ssh_command
+    assert "Cloudflare Access SSH auth failed; refreshing login for ssh.sm.rajeshgo.li..." in ssh_command
+    assert "cloudflared access login https://ssh.sm.rajeshgo.li" in ssh_command
+    assert "if [ \"$attach_status\" -ne 0 ]; then show_attach_error; fi; attach_cleanup" in ssh_command
     assert "attach_pid=$!" not in ssh_command
     assert "fg %1 >/dev/null 2>&1 || wait \"$attach_pid\"" not in ssh_command
     assert "kill \"$attach_pid\"" not in ssh_command
@@ -172,6 +177,25 @@ def test_client_sessions_include_termux_attach_metadata():
         "type": "termux_attach",
         "label": "Attach in Termux",
     }
+
+
+def test_client_sessions_generate_valid_non_cloudflare_attach_command():
+    session = _session()
+    config = _android_config()
+    config["external_access"]["ssh_proxy_command"] = "nc %h 22"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    ssh_command = response.json()["sessions"][0]["termux_attach"]["ssh_command"]
+    assert "ProxyCommand=nc %h 22" in ssh_command
+    assert "maybe_refresh_cloudflared() { :; }" in ssh_command
+    assert "cloudflared access login" not in ssh_command
 
 
 def test_client_session_reports_details_when_external_attach_not_configured():
