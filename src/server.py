@@ -2272,6 +2272,30 @@ def create_app(
             return None
         return getter(session.id)
 
+    def _termux_lan_ssh_target() -> Optional[tuple[str, int]]:
+        infra_status = _infra_check("android_sshd")
+        details = (infra_status or {}).get("details") or {}
+        for listener in details.get("listeners") or []:
+            listener_text = str(listener or "").strip()
+            if not listener_text:
+                continue
+            host, separator, port_text = listener_text.rpartition(":")
+            if not separator or not host or not port_text:
+                continue
+            host = host.strip("[]")
+            if host in {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::", "*"}:
+                continue
+            if ":" in host:
+                continue
+            try:
+                port = int(port_text)
+            except ValueError:
+                continue
+            if port <= 0:
+                continue
+            return host, port
+        return None
+
     def _termux_attach_metadata(session: Session, descriptor: Optional[dict[str, Any]]) -> dict[str, Any]:
         external_access = _external_access_config()
         public_ssh_host = str(external_access.get("public_ssh_host") or "").strip()
@@ -2350,21 +2374,47 @@ def create_app(
             remote_command,
         ])
         ssh_command = shlex.join(ssh_args)
-        cloudflared_reauth_script = ":; "
+        lan_ssh_target = _termux_lan_ssh_target()
+        lan_ssh_command = ""
+        if lan_ssh_target:
+            lan_host, lan_port = lan_ssh_target
+            lan_ssh_args = [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-p",
+                str(lan_port),
+                "-tt",
+                f"{ssh_username}@{lan_host}",
+                remote_command,
+            ]
+            lan_ssh_command = shlex.join(lan_ssh_args)
+        cloudflared_recovery_script = ":; return 1; "
         if "cloudflared" in ssh_proxy_command:
-            cloudflared_login_url = f"https://{public_ssh_host}"
-            cloudflared_reauth_script = (
+            bad_handshake_pattern = "websocket: bad handshake|Connection closed by UNKNOWN port 65535"
+            if lan_ssh_command and lan_ssh_target:
+                lan_host, lan_port = lan_ssh_target
+                cloudflared_recovery_script = (
+                    f"if grep -Eqi '{bad_handshake_pattern}' \"$attach_log\" 2>/dev/null; then "
+                    f"printf 'Cloudflare Tunnel SSH transport failed; trying LAN SSH fallback {lan_host}:{lan_port}...\\r\\n' "
+                    ">/dev/tty 2>/dev/null || true; "
+                    "attach_cleanup; "
+                    "attach_log=\"${TMPDIR:-/tmp}/sm-attach-$$-${RANDOM:-0}.lan.log\"; "
+                    ": >\"$attach_log\" 2>/dev/null || attach_log=\"/tmp/sm-attach-$$.lan.log\"; "
+                    f"{lan_ssh_command} 2>\"$attach_log\"; "
+                    "attach_status=\"$?\"; "
+                    "return 0; "
+                    "fi; "
+                    "return 1; "
+                )
+            else:
+                cloudflared_recovery_script = (
                 "if grep -Eqi 'websocket: bad handshake|Connection closed by UNKNOWN port 65535' "
                 "\"$attach_log\" 2>/dev/null; then "
-                "if command -v cloudflared >/dev/null 2>&1; then "
-                f"printf 'Cloudflare Access SSH auth failed; refreshing login for {public_ssh_host}...\\r\\n' "
-                ">/dev/tty 2>/dev/null || true; "
-                f"cloudflared access login {shlex.quote(cloudflared_login_url)} >/dev/tty 2>&1 || true; "
-                "else "
-                "printf 'cloudflared is unavailable in Termux; cannot refresh Cloudflare Access login.\\r\\n' "
+                    "printf 'Cloudflare Tunnel SSH transport failed and no LAN SSH fallback is configured.\\r\\n' "
                 ">/dev/tty 2>/dev/null || true; "
                 "fi; "
-                "fi; "
+                    "return 1; "
             )
 
         local_attach_script = (
@@ -2383,25 +2433,25 @@ def create_app(
             f"{ssh_command} 2>\"$attach_log\"; "
             "return \"$?\"; "
             "}; "
-            "maybe_refresh_cloudflared() { "
-            f"{cloudflared_reauth_script}"
+            "maybe_recover_cloudflared() { "
+            f"{cloudflared_recovery_script}"
             "}; "
             "trap 'attach_cleanup; exit 130' INT TERM; "
             f"printf 'Connecting to {tmux_session}...\\r\\n' >/dev/tty 2>/dev/null || true; "
             "run_attach; "
             "attach_status=$?; "
             "if [ \"$attach_status\" -eq 255 ]; then "
-            "maybe_refresh_cloudflared; "
-            "if ! grep -Eqi 'websocket: bad handshake|Connection closed by UNKNOWN port 65535' "
-            "\"$attach_log\" 2>/dev/null; then "
+            "if maybe_recover_cloudflared; then "
+            ":; "
+            "else "
             "show_attach_error; "
-            "fi; "
             "attach_cleanup; "
             "attach_log=\"${TMPDIR:-/tmp}/sm-attach-$$-${RANDOM:-0}.retry.log\"; "
             ": >\"$attach_log\" 2>/dev/null || attach_log=\"/tmp/sm-attach-$$.retry.log\"; "
             "printf 'Attach transport failed (255); retrying once...\\r\\n' >/dev/tty 2>/dev/null || true; "
             "run_attach; "
             "attach_status=$?; "
+            "fi; "
             "fi; "
             "if [ \"$attach_status\" -ne 0 ]; then show_attach_error; fi; "
             "attach_cleanup; "
