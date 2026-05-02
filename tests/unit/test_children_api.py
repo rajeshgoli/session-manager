@@ -29,7 +29,7 @@ def test_children_endpoint_includes_activity_state(tmp_path):
         working_dir=str(tmp_path),
         provider="codex-fork",
         parent_session_id=parent.id,
-        status=SessionStatus.IDLE,
+        status=SessionStatus.RUNNING,
         tmux_session="codex-fork-child001",
         tmux_socket_name="session-manager-test",
     )
@@ -48,7 +48,7 @@ def test_children_endpoint_includes_activity_state(tmp_path):
     payload = response.json()["children"]
     assert len(payload) == 1
     assert payload[0]["id"] == child.id
-    assert payload[0]["status"] == "idle"
+    assert payload[0]["status"] == "running"
     assert payload[0]["activity_state"] == "working"
     assert payload[0]["tmux_session"] == "codex-fork-child001"
     assert payload[0]["tmux_socket_name"] == "session-manager-test"

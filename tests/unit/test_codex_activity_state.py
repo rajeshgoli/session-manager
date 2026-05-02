@@ -719,6 +719,44 @@ def test_codex_fork_turn_diff_reasserts_running_after_restart_without_turn_start
     assert manager.get_activity_state(session.id) == "working"
 
 
+def test_codex_fork_idle_status_overrides_stale_running_lifecycle():
+    manager = _make_manager()
+    session = Session(
+        id="cf-stale-idle",
+        name="codex-fork-cf-stale-idle",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.codex_fork_lifecycle[session.id] = {
+        "state": "running",
+        "cause_event_type": "turn_diff",
+        "updated_at": datetime.now().isoformat(),
+    }
+
+    assert manager.get_activity_state(session.id) == "idle"
+
+
+def test_codex_fork_stopped_status_overrides_stale_running_lifecycle():
+    manager = _make_manager()
+    session = Session(
+        id="cf-stale-stopped",
+        name="codex-fork-cf-stale-stopped",
+        working_dir="/tmp",
+        provider="codex-fork",
+        status=SessionStatus.STOPPED,
+    )
+    manager.sessions[session.id] = session
+    manager.codex_fork_lifecycle[session.id] = {
+        "state": "running",
+        "cause_event_type": "turn_diff",
+        "updated_at": datetime.now().isoformat(),
+    }
+
+    assert manager.get_activity_state(session.id) == "stopped"
+
+
 def test_codex_fork_idle_reducer_does_not_capture_pane_on_read_path():
     manager = _make_manager()
     session = Session(
