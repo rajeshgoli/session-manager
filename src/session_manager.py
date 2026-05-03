@@ -18,6 +18,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Callable, Awaitable, Any
 
+import yaml
+
+from .human_recipients import HumanRecipientConfigError, HumanRecipientRegistry
 from .models import (
     AgentRegistration,
     ActivityState,
@@ -51,6 +54,7 @@ DEFAULT_LOG_DIR = "/tmp/claude-sessions"
 DEFAULT_SESSION_STATE_FILE = "~/.local/share/claude-sessions/sessions.json"
 LEGACY_TMP_SESSION_STATE_FILE = "/tmp/claude-sessions/sessions.json"
 CODEX_FORK_DISABLE_STARTUP_UPDATE_ARGS = ["-c", "check_for_update_on_startup=false"]
+DEFAULT_EMAIL_BRIDGE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "email_send.yaml"
 
 DEFAULT_MAINTAINER_BOOTSTRAP_PROMPT = textwrap.dedent(
     """
@@ -3026,6 +3030,9 @@ class SessionManager:
         normalized_role = self.normalize_agent_role(role)
         if not normalized_role:
             raise ValueError("Role cannot be empty")
+        reserved_error = self.validate_reserved_human_name(normalized_role)
+        if reserved_error:
+            raise ValueError(reserved_error)
 
         session = self.sessions.get(session_id)
         if not session:
@@ -3919,6 +3926,48 @@ class SessionManager:
         if normalized_name in reserved_aliases and normalized_name != primary_alias:
             return f'Name "{friendly_name}" is reserved for registry identity "{normalized_name}"'
 
+        human_error = self.validate_reserved_human_name(friendly_name)
+        if human_error:
+            return human_error
+
+        return None
+
+    def _load_human_recipient_config(self) -> dict[str, Any]:
+        """Load human recipient config from config.yaml and the email bridge config."""
+        merged: dict[str, Any] = {}
+        if isinstance(self.config.get("humans"), dict):
+            merged["humans"] = self.config["humans"]
+
+        bridge_config = (self.config.get("email") or {}).get("bridge_config")
+        bridge_path = Path(str(bridge_config or DEFAULT_EMAIL_BRIDGE_CONFIG_PATH)).expanduser()
+        if bridge_path.exists():
+            try:
+                bridge_data = yaml.safe_load(bridge_path.read_text(encoding="utf-8")) or {}
+            except Exception as exc:
+                logger.warning("Failed to load human recipient config from %s: %s", bridge_path, exc)
+                bridge_data = {}
+            if isinstance(bridge_data, dict) and isinstance(bridge_data.get("humans"), dict):
+                merged["humans"] = bridge_data["humans"]
+        return merged
+
+    def human_recipient_registry(self) -> HumanRecipientRegistry:
+        """Return the configured human recipient registry."""
+        return HumanRecipientRegistry.from_config(self._load_human_recipient_config())
+
+    def human_reserved_names(self) -> set[str]:
+        """Return every configured human recipient canonical name and alias."""
+        try:
+            return self.human_recipient_registry().reserved_names()
+        except HumanRecipientConfigError:
+            raise
+
+    def validate_reserved_human_name(self, name: str) -> Optional[str]:
+        """Return an error when a name is reserved for a configured human recipient."""
+        normalized_name = self.normalize_agent_role(name)
+        if not normalized_name:
+            return None
+        if normalized_name in self.human_reserved_names():
+            return f'Name "{name}" is reserved for configured human recipient "{normalized_name}"'
         return None
 
     def list_sessions(self, include_stopped: bool = False) -> list[Session]:

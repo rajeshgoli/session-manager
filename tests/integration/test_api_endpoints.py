@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from src.server import create_app
+from src.email_handler import RegisteredEmailUser
+from src.human_recipients import HumanChannel, HumanRecipient
 from src.models import Session, SessionStatus, Subagent, SubagentStatus, DeliveryResult
 
 
@@ -56,11 +58,35 @@ def mock_email_handler():
     mock.bridge_session_id_header.return_value = "x-email-session-id"
     mock.normalize_explicit_session_id.side_effect = lambda value: value.strip().lower() if value else None
     mock.send_agent_email = AsyncMock(return_value={"to": [], "cc": [], "subject": "test"})
+    mock.lookup_human.return_value = None
+    mock.lookup_user.return_value = None
     mock.is_authorized_sender.return_value = True
     mock.extract_routed_session_id.return_value = None
     mock.extract_subject_from_raw_email.return_value = None
     mock.extract_reply_message_body.side_effect = lambda value: value
     return mock
+
+
+def _human_recipient() -> HumanRecipient:
+    return HumanRecipient(
+        name="rajesh",
+        display_name="Human operator",
+        aliases=("rajesh", "rajeshgoli", "user"),
+        default_channel="telegram",
+        channels={
+            "telegram": HumanChannel(
+                name="telegram",
+                enabled=True,
+                delivery="sender_session_topic",
+            ),
+            "email": HumanChannel(
+                name="email",
+                enabled=True,
+                address="private@example.com",
+                use="fallback_only",
+            ),
+        },
+    )
 
 
 @pytest.fixture
@@ -313,6 +339,228 @@ class TestSessionEndpoints:
             text="[sm] user requests status, please update now using sm status",
             delivery_mode="important",
         )
+
+
+class TestHumanRecipientEndpoints:
+    """Tests for human-recipient lookup and delivery."""
+
+    def test_lookup_human_alias(self, test_client, mock_email_handler):
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+
+        response = test_client.get("/humans/rajeshgoli")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["recipient"] == "rajesh"
+        assert data["aliases"] == ["rajesh", "rajeshgoli", "user"]
+        assert data["default_channel"] == "telegram"
+        assert data["available_channels"] == ["telegram", "email"]
+        assert data["telegram_delivery"] == "sender_session_topic"
+        assert data["email_use"] == "fallback_only"
+
+    def test_forced_telegram_posts_to_sender_topic(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+    ):
+        sample_session.telegram_chat_id = 12345
+        sample_session.telegram_thread_id = 67890
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+        mock_session_manager.get_session.return_value = sample_session
+        notifier = MagicMock()
+        notifier.send_human_message_to_session_topic = AsyncMock(return_value=(True, None))
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=notifier,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/humans/user/telegram",
+            json={"requester_session_id": "test123", "text": "hello human"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["channel"] == "telegram"
+        assert response.json()["thread"] == "sender session topic"
+        notifier.send_human_message_to_session_topic.assert_awaited_once_with(
+            session=sample_session,
+            recipient_name="rajesh",
+            message="hello human",
+        )
+
+    def test_send_input_batch_defaults_human_to_telegram(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+    ):
+        sender_session = Session(
+            id="sender123",
+            name="sender-session",
+            working_dir="/tmp/sender",
+            tmux_session="claude-sender123",
+            log_file="/tmp/sender.log",
+            status=SessionStatus.RUNNING,
+            telegram_chat_id=12345,
+            telegram_thread_id=67890,
+        )
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+        mock_session_manager.get_session.side_effect = lambda session_id: {
+            "sender123": sender_session,
+        }.get(session_id)
+        notifier = MagicMock()
+        notifier.send_human_message_to_session_topic = AsyncMock(return_value=(True, None))
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=notifier,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/sessions/input-batch",
+            json={
+                "recipients": ["user"],
+                "text": "default route",
+                "sender_session_id": "sender123",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["results"][0]["delivery_kind"] == "human_telegram"
+        assert data["results"][0]["target_name"] == "rajesh"
+        notifier.send_human_message_to_session_topic.assert_awaited_once_with(
+            session=sender_session,
+            recipient_name="rajesh",
+            message="default route",
+        )
+
+    def test_explicit_human_email_redacts_address(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_email_handler,
+        sample_session,
+    ):
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+        mock_email_handler.lookup_user.return_value = RegisteredEmailUser(
+            username="rajesh",
+            email="private@example.com",
+            display_name="Human operator",
+            aliases=("rajesh", "user"),
+        )
+        mock_session_manager.get_session.return_value = sample_session
+        mock_email_handler.send_agent_email = AsyncMock(
+            return_value={
+                "to": [{"username": "rajesh", "email": "private@example.com"}],
+                "cc": [],
+                "subject": "Fallback",
+            }
+        )
+
+        response = test_client.post(
+            "/humans/user/email",
+            json={"requester_session_id": "test123", "text": "email fallback", "subject": "Fallback"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["recipient"] == "rajesh"
+        assert data["channel"] == "email"
+        assert "private@example.com" not in json.dumps(data)
+
+    def test_human_telegram_missing_sender_topic_fails_clearly(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+        sample_session,
+    ):
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+        mock_session_manager.get_session.return_value = sample_session
+        notifier = MagicMock()
+        notifier.send_human_message_to_session_topic = AsyncMock(
+            return_value=(False, "Sender session has no SM-managed Telegram topic")
+        )
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=notifier,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/humans/user/telegram",
+            json={"requester_session_id": "test123", "text": "hello"},
+        )
+
+        assert response.status_code == 409
+        assert "SM-managed Telegram topic" in response.json()["detail"]
+
+    def test_human_telegram_missing_config_fails_clearly(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_email_handler,
+        sample_session,
+    ):
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+        mock_session_manager.get_session.return_value = sample_session
+
+        response = test_client.post(
+            "/humans/user/telegram",
+            json={"requester_session_id": "test123", "text": "hello"},
+        )
+
+        assert response.status_code == 503
+        assert "Telegram delivery is not configured" in response.json()["detail"]
+
+    def test_spawn_rejects_reserved_human_alias(
+        self,
+        test_client,
+        mock_session_manager,
+        sample_session,
+    ):
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.validate_reserved_human_name.return_value = (
+            'Name "user" is reserved for configured human recipient "user"'
+        )
+
+        response = test_client.post(
+            "/sessions/spawn",
+            json={"parent_session_id": "test123", "prompt": "hello", "name": "user"},
+        )
+
+        assert response.status_code == 400
+        assert "reserved for configured human recipient" in response.json()["detail"]
+
+    def test_name_rejects_reserved_human_alias(
+        self,
+        test_client,
+        mock_session_manager,
+        sample_session,
+    ):
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.validate_friendly_name_update.return_value = (
+            'Name "user" is reserved for configured human recipient "user"'
+        )
+
+        response = test_client.patch("/sessions/test123", json={"friendly_name": "user"})
+
+        assert response.status_code == 400
+        assert "reserved for configured human recipient" in response.json()["detail"]
 
 
 class TestEmailBridgeEndpoints:

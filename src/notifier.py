@@ -224,6 +224,48 @@ class Notifier:
 
         return msg_id is not None
 
+    async def send_human_message_to_session_topic(
+        self,
+        *,
+        session: Session,
+        recipient_name: str,
+        message: str,
+    ) -> tuple[bool, Optional[str]]:
+        """Post an agent-to-human message into the sender session's Telegram topic."""
+        if not self.telegram:
+            return False, "Telegram is not configured"
+        if not session.telegram_chat_id:
+            return False, "Sender session has no Telegram chat configured"
+
+        if not session.telegram_thread_id:
+            session_manager = getattr(self, "session_manager", None)
+            ensure_topic = getattr(session_manager, "_ensure_telegram_topic", None) if session_manager else None
+            if callable(ensure_topic) and getattr(session, "status", None) != SessionStatus.STOPPED:
+                try:
+                    await ensure_topic(session)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to ensure Telegram topic for human recipient send from %s: %s",
+                        session.id,
+                        exc,
+                    )
+            if not session.telegram_thread_id:
+                return False, "Sender session has no SM-managed Telegram topic"
+
+        body = str(message or "").strip()
+        if not body:
+            return False, "Message body is required"
+        recipient = str(recipient_name or "human").strip() or "human"
+        payload = f"To {recipient}:\n{body}"
+
+        msg_id = await self.telegram.send_notification(
+            chat_id=session.telegram_chat_id,
+            message=payload,
+            session_id=session.id,
+            message_thread_id=session.telegram_thread_id,
+        )
+        return (msg_id is not None), None if msg_id is not None else "Telegram send failed"
+
     async def _notify_email(self, event: NotificationEvent, message: str) -> bool:
         """Send notification via Email."""
         if not self.email:

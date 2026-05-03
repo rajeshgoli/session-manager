@@ -595,14 +595,25 @@ def cmd_unregister(client: SessionManagerClient, session_id: Optional[str], role
 
 def cmd_lookup(client: SessionManagerClient, role: str) -> int:
     """
-    Resolve a durable registry role or live session identifier to a session ID.
-
-    Prints only the session ID on stdout so it can be used in command substitution.
+    Resolve a human recipient, durable registry role, or live session identifier.
     """
     normalized_role = (role or "").strip()
     if not normalized_role:
         print("Error: role is required", file=sys.stderr)
         return 1
+
+    human_result = _lookup_human_result(client, normalized_role)
+    if human_result is not None:
+        if human_result.get("unavailable"):
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        if human_result.get("ok"):
+            _print_human_lookup(human_result.get("data") or {})
+            return 0
+        if human_result.get("status_code") not in (None, 404):
+            detail = human_result.get("detail") or "Human recipient lookup failed"
+            print(f"Error: {detail}", file=sys.stderr)
+            return 1
 
     result = client.lookup_role(normalized_role)
     if result.get("unavailable"):
@@ -635,6 +646,32 @@ def cmd_lookup(client: SessionManagerClient, role: str) -> int:
         return 1
     print(session_id)
     return 0
+
+
+def _lookup_human_result(client: SessionManagerClient, identifier: str) -> Optional[dict]:
+    """Return a human lookup result when the client supports the endpoint."""
+    lookup = getattr(client, "lookup_human", None)
+    if not callable(lookup):
+        return None
+    result = lookup(identifier)
+    return result if isinstance(result, dict) else None
+
+
+def _print_human_lookup(payload: dict) -> None:
+    """Print human-recipient lookup details for operator-facing discovery."""
+    recipient = payload.get("recipient") or "<unknown>"
+    aliases = [alias for alias in payload.get("aliases") or [] if alias != recipient]
+    print(f"Human recipient: {recipient}")
+    if aliases:
+        print(f"Aliases: {', '.join(aliases)}")
+    print(f"Default delivery: {payload.get('default_channel') or 'unknown'}")
+    channels = payload.get("available_channels") or []
+    if channels:
+        print(f"Available delivery: {', '.join(channels)}")
+    if "telegram" in channels:
+        print("Telegram delivery posts into the sending agent's SM-managed Telegram thread.")
+    if "email" in channels:
+        print("Email is available as fallback/explicit only; use email sparingly.")
 
 
 def _lookup_ambiguous_match_error(identifier: str, matches: list[dict]) -> str:
@@ -1526,12 +1563,33 @@ def cmd_send(
         )
     identifier = identifiers[0]
 
-    # Resolve identifier to session ID and get session details
-    session_id, session, resolve_unavailable = resolve_session_id_with_status(
-        client,
-        identifier,
-        timeout=SEND_API_TIMEOUT,
-    )
+    # Exact session IDs stay first. Human aliases come before friendly-name and
+    # role fallback because configured human aliases are reserved identifiers.
+    try:
+        exact_session = client.get_session(identifier, timeout=SEND_API_TIMEOUT)
+    except TypeError:
+        exact_session = client.get_session(identifier)
+    if exact_session:
+        session_id, session, resolve_unavailable = identifier, exact_session, False
+    else:
+        human_send_rc = _try_send_human_telegram(
+            client,
+            identifier,
+            text,
+            sender_session_id=sender_session_id,
+            delivery_mode=delivery_mode,
+            notify_after_seconds=effective_notify_after,
+            track_seconds=track_seconds,
+        )
+        if human_send_rc is not None:
+            return human_send_rc
+
+        # Resolve identifier to session ID and get session details
+        session_id, session, resolve_unavailable = resolve_session_id_with_status(
+            client,
+            identifier,
+            timeout=SEND_API_TIMEOUT,
+        )
     if resolve_unavailable:
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
@@ -1581,7 +1639,7 @@ def cmd_send(
                 payload = email_result.get("data") or {}
                 recipients = payload.get("to") or []
                 recipient_summary = ", ".join(
-                    f"{item.get('username')} <{item.get('email')}>"
+                    str(item.get("username") or identifier)
                     for item in recipients
                     if isinstance(item, dict)
                 ) or identifier
@@ -1649,6 +1707,63 @@ def cmd_send(
     return 0
 
 
+def _try_send_human_telegram(
+    client: SessionManagerClient,
+    identifier: str,
+    text: str,
+    *,
+    sender_session_id: Optional[str],
+    delivery_mode: str,
+    notify_after_seconds: Optional[int],
+    track_seconds: Optional[int],
+) -> Optional[int]:
+    """Send to a configured human recipient, returning None when not a human."""
+    human_result = _lookup_human_result(client, identifier)
+    if human_result is None:
+        return None
+    if human_result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not human_result.get("ok"):
+        if human_result.get("status_code") in (None, 404):
+            return None
+        detail = human_result.get("detail") or "Human recipient lookup failed"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    if not sender_session_id:
+        print("Error: human Telegram delivery requires a managed sender session", file=sys.stderr)
+        return 2
+    if delivery_mode != "sequential" or notify_after_seconds or track_seconds is not None:
+        print(
+            "Error: human Telegram delivery only supports plain sequential sends without --wait/--track/--urgent",
+            file=sys.stderr,
+        )
+        return 1
+
+    sender = getattr(client, "send_human_telegram_result", None)
+    if not callable(sender):
+        return None
+    result = sender(
+        requester_session_id=sender_session_id,
+        recipient=identifier,
+        text=text,
+    )
+    if not isinstance(result, dict):
+        print("Error: Failed to send Telegram message", file=sys.stderr)
+        return 1
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        print(f"Error: {result.get('detail') or 'Failed to send Telegram message'}", file=sys.stderr)
+        return 1
+
+    payload = result.get("data") or {}
+    print(f"Telegram sent to {payload.get('recipient') or identifier}")
+    print(f"Thread: {payload.get('thread') or 'sender session topic'}")
+    return 0
+
+
 def _cmd_send_batch(
     client: SessionManagerClient,
     identifiers: list[str],
@@ -1705,6 +1820,11 @@ def _cmd_send_batch(
             print(f"Email sent to {recipient_summary}")
             continue
 
+        if item.get("delivery_kind") == "human_telegram" and status == "delivered":
+            print(f"Telegram sent to {item.get('target_name') or item.get('identifier')}")
+            print("Thread: sender session topic")
+            continue
+
         if status in {"delivered", "queued"}:
             had_session_success = True
             target_name = item.get("target_name") or item.get("session_id") or item.get("identifier")
@@ -1739,10 +1859,7 @@ def _cmd_send_batch(
 def _email_result_summary(item: dict) -> str:
     """Format one batch email result for CLI output."""
     username = item.get("email_username")
-    email = item.get("email_address")
-    if username and email:
-        return f"{username} <{email}>"
-    return email or item.get("identifier") or "<unknown>"
+    return username or item.get("identifier") or "<unknown>"
 
 
 def _send_option_labels(
@@ -1831,7 +1948,7 @@ def cmd_email(
     *,
     sender_session_id: Optional[str],
     recipients_raw: str,
-    subject: str,
+    subject: Optional[str] = None,
     body: Optional[str] = None,
     text_file: Optional[str] = None,
     html_file: Optional[str] = None,
@@ -1847,9 +1964,6 @@ def cmd_email(
     if not recipients:
         print("Error: at least one recipient is required", file=sys.stderr)
         return 1
-    if not str(subject or "").strip():
-        print("Error: --subject is required", file=sys.stderr)
-        return 1
 
     try:
         body_text, body_html, body_markdown = _load_email_body(
@@ -1859,6 +1973,42 @@ def cmd_email(
         )
     except (OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if len(recipients) == 1 and not cc and body_text is not None and body_html is None:
+        human_result = _lookup_human_result(client, recipients[0])
+        if human_result is not None:
+            if human_result.get("unavailable"):
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+                return 2
+            if human_result.get("ok"):
+                sender = getattr(client, "send_human_email_result", None)
+                if callable(sender):
+                    result = sender(
+                        requester_session_id=sender_session_id,
+                        recipient=recipients[0],
+                        text=body_text,
+                        subject=subject,
+                        body_markdown=body_markdown,
+                        auto_subject=not bool(str(subject or "").strip()),
+                    )
+                    if result.get("unavailable"):
+                        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+                        return 2
+                    if not result.get("ok"):
+                        print(f"Error: {result.get('detail') or 'Failed to send email'}", file=sys.stderr)
+                        return 1
+                    payload = result.get("data") or {}
+                    print(f"Email sent to {payload.get('recipient') or recipients[0]}")
+                    if payload.get("subject"):
+                        print(f"  Subject: {payload['subject']}")
+                    return 0
+            elif human_result.get("status_code") not in (None, 404):
+                print(f"Error: {human_result.get('detail') or 'Human recipient lookup failed'}", file=sys.stderr)
+                return 1
+
+    if not str(subject or "").strip():
+        print("Error: --subject is required for non-human registered email", file=sys.stderr)
         return 1
 
     result = client.send_email_result(
@@ -1880,13 +2030,45 @@ def cmd_email(
     payload = result.get("data") or {}
     to_entries = payload.get("to") or []
     to_summary = ", ".join(
-        f"{entry.get('username')} <{entry.get('email')}>"
+        str(entry.get("username") or "recipient")
         for entry in to_entries
         if isinstance(entry, dict)
     ) or ", ".join(recipients)
     print(f"Email sent to {to_summary}")
     if payload.get("subject"):
         print(f"  Subject: {payload['subject']}")
+    return 0
+
+
+def cmd_telegram(
+    client: SessionManagerClient,
+    *,
+    sender_session_id: Optional[str],
+    recipient: str,
+    text: str,
+) -> int:
+    """Send a configured human recipient message through Telegram."""
+    if not sender_session_id:
+        print("Error: sm telegram requires a managed session (CLAUDE_SESSION_MANAGER_ID not set)", file=sys.stderr)
+        return 2
+    sender = getattr(client, "send_human_telegram_result", None)
+    if not callable(sender):
+        print("Error: Telegram human delivery is not available", file=sys.stderr)
+        return 1
+    result = sender(
+        requester_session_id=sender_session_id,
+        recipient=recipient,
+        text=text,
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        print(f"Error: {result.get('detail') or 'Failed to send Telegram message'}", file=sys.stderr)
+        return 1
+    payload = result.get("data") or {}
+    print(f"Telegram sent to {payload.get('recipient') or recipient}")
+    print(f"Thread: {payload.get('thread') or 'sender session topic'}")
     return 0
 
 

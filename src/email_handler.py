@@ -16,6 +16,8 @@ from typing import Any, Optional
 import httpx
 import yaml
 
+from .human_recipients import HumanRecipient, HumanRecipientConfigError, HumanRecipientRegistry
+
 logger = logging.getLogger(__name__)
 
 # Path to existing email automation
@@ -177,6 +179,13 @@ class EmailHandler:
 
     def lookup_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
         """Resolve one registered user by username or alias."""
+        configured_user = self._lookup_configured_user(identifier)
+        if configured_user is not None:
+            return configured_user
+        return self._lookup_human_email_user(identifier)
+
+    def _lookup_configured_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
+        """Resolve one legacy registered email user by username or alias."""
         needle = str(identifier or "").strip().lower()
         if not needle:
             return None
@@ -192,6 +201,45 @@ class EmailHandler:
             if needle in resolved.aliases:
                 return resolved
         return None
+
+    def human_registry(self) -> HumanRecipientRegistry:
+        """Return the configured human recipient registry."""
+        return HumanRecipientRegistry.from_config(self._load_bridge_config())
+
+    def lookup_human(self, identifier: str) -> Optional[HumanRecipient]:
+        """Resolve one configured human recipient by canonical name or alias."""
+        return self.human_registry().lookup(identifier)
+
+    def human_reserved_names(self) -> set[str]:
+        """Return every configured human canonical name and alias."""
+        return self.human_registry().reserved_names()
+
+    def _lookup_human_email_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
+        """Resolve an email-enabled human recipient into the email send model."""
+        try:
+            human = self.lookup_human(identifier)
+        except HumanRecipientConfigError:
+            raise
+        if human is None:
+            return None
+        channel = human.channel("email")
+        if channel is None:
+            return None
+
+        email_address = channel.resolved_address()
+        if not email_address:
+            canonical_user = self._lookup_configured_user(human.name)
+            if canonical_user is not None:
+                email_address = canonical_user.email
+        if not email_address:
+            return None
+
+        return RegisteredEmailUser(
+            username=human.name,
+            email=email_address,
+            display_name=human.display_name,
+            aliases=human.aliases,
+        )
 
     def resolve_users(self, identifiers: list[str]) -> list[RegisteredEmailUser]:
         """Resolve a list of usernames/aliases into distinct registered users."""

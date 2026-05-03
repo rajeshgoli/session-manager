@@ -1,21 +1,37 @@
 resend:
   api_key: "re_PLACEHOLDER"
-  domain: "sm.rajeshgo.li"
+  domain: "sm.example.com"
   # Optional stable mailbox address for friendly-name outbound mail and routed replies.
-  reply_address: "reply@sm.rajeshgo.li"
+  reply_address: "reply@sm.example.com"
   # Legacy fallback when Email Routing receives replies on a different domain.
-  # reply_domain: "rajeshgo.li"
+  # reply_domain: "example.com"
+
+humans:
+  operator:
+    display_name: "Human operator"
+    aliases:
+      - "user"
+      - "owner"
+    default_channel: "telegram"
+    channels:
+      telegram:
+        enabled: true
+        delivery: "sender_session_topic"
+      email:
+        enabled: true
+        address_env: "SM_OPERATOR_EMAIL"
+        use: "fallback_only"
 
 users:
-  rajesh:
-    email: "rajeshgoli@gmail.com"
-    name: "Rajesh"
+  operator:
+    email: "operator@example.com"
+    name: "Human operator"
     aliases:
       - "owner"
 
 email_bridge:
   authorized_senders:
-    - "rajeshgoli@gmail.com"
+    - "operator@example.com"
   # Optional shared secret header enforced on inbound worker delivery.
   # worker_secret: "set-a-random-secret"
   # worker_secret_header: "x-email-worker-secret"
