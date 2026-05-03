@@ -2095,16 +2095,24 @@ def create_app(
             host = str(_google_auth_config(app.state.config).get("public_host") or "").strip()
         return host or None
 
+    def _mobile_terminal_require_tls() -> bool:
+        return _mobile_terminal_config().get("require_tls", True) is not False
+
     def _mobile_terminal_ws_url() -> Optional[str]:
         config_block = _mobile_terminal_config()
         configured = str(config_block.get("ws_url") or "").strip()
         if configured:
+            if _mobile_terminal_require_tls() and not configured.lower().startswith("wss://"):
+                return None
             return configured
         host = _mobile_terminal_public_http_host()
         if not host:
             return None
         scheme = "wss"
-        if host.startswith("localhost") or host.startswith("127.0.0.1") or host.startswith("testserver"):
+        if (
+            not _mobile_terminal_require_tls()
+            and (host.startswith("localhost") or host.startswith("127.0.0.1") or host.startswith("testserver"))
+        ):
             scheme = "ws"
         return f"{scheme}://{host}/client/terminal"
 
@@ -4542,6 +4550,19 @@ def create_app(
                     if not (10 <= rows <= 120 and 20 <= cols <= 300):
                         await websocket.send_json({"type": "error", "message": "ignored invalid resize"})
                     else:
+                        result = await _mobile_terminal_tmux_run(
+                            ticket,
+                            "resize-window",
+                            "-t",
+                            ticket.tmux_session,
+                            "-x",
+                            str(cols),
+                            "-y",
+                            str(rows),
+                        )
+                        if result.returncode != 0:
+                            await websocket.send_json({"type": "error", "message": "failed to resize terminal"})
+                            continue
                         await websocket.send_json({"type": "status", "state": "resized", "rows": rows, "cols": cols})
                 elif frame_type == "ping":
                     await websocket.send_json({"type": "status", "state": "pong"})

@@ -289,6 +289,50 @@ def test_client_sessions_prefer_mobile_terminal_when_enabled():
     }
 
 
+def test_mobile_terminal_require_tls_rejects_configured_plaintext_ws_url():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["require_tls"] = True
+    config["mobile_terminal"]["ws_url"] = "ws://localhost:8420/client/terminal"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]
+    assert payload["mobile_terminal"]["supported"] is False
+    assert payload["mobile_terminal"]["reason"] == "mobile terminal public HTTPS host is not configured"
+    assert payload["primary_action"] == {
+        "type": "termux_attach",
+        "label": "Attach in Termux",
+    }
+
+
+def test_mobile_terminal_can_allow_plaintext_ws_when_tls_not_required():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["require_tls"] = False
+    config["mobile_terminal"]["ws_url"] = "ws://localhost:8420/client/terminal"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]
+    assert payload["mobile_terminal"]["supported"] is True
+    assert payload["mobile_terminal"]["ws_url"] == "ws://localhost:8420/client/terminal"
+
+
 def test_client_sessions_hide_mobile_terminal_action_for_unregistered_actor():
     private_key = ec.generate_private_key(ec.SECP256R1())
     session = _session()
@@ -387,10 +431,15 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
     assert ticket_response.status_code == 200
     ticket = ticket_response.json()
 
+    commands = []
+
     def fake_run(args, capture_output, text, check, timeout):
+        commands.append(args)
         if "capture-pane" in args:
             return subprocess.CompletedProcess(args, 0, stdout="live pane output", stderr="")
         if "send-keys" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if "resize-window" in args:
             return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected tmux command")
 
@@ -416,7 +465,10 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
         assert output == {"type": "output", "mode": "snapshot", "data": "live pane output"}
         websocket.send_json({"type": "input", "data": "hello"})
         websocket.send_json({"type": "key", "key": "enter"})
+        websocket.send_json({"type": "resize", "rows": 32, "cols": 120})
+        assert websocket.receive_json() == {"type": "status", "state": "resized", "rows": 32, "cols": 120}
         websocket.send_json({"type": "detach"})
+    assert any("resize-window" in command for command in commands)
 
 
 def test_mobile_terminal_websocket_enforces_active_attach_limit_at_consume_time():
