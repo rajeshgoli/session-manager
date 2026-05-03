@@ -538,6 +538,44 @@ async def test_message_queue_records_email_inbound_boundary(tmp_path):
     assert active_turn.source == "email"
 
 
+def test_api_input_records_default_inbound_boundary(tmp_path):
+    transcript = tmp_path / "api-input.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    session.status = SessionStatus.IDLE
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+    manager.message_queue_manager = mq
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    app = create_app(
+        session_manager=manager,
+        notifier=MagicMock(),
+        output_monitor=MagicMock(),
+        response_relay_ledger=ledger,
+        config={},
+    )
+    client = TestClient(app)
+
+    response = client.post(f"/sessions/{session.id}/input", json={"text": "api user turn"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "delivered"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.source == "api"
+    assert active_turn.transcript_offset == transcript.stat().st_size
+
+
 @pytest.mark.asyncio
 async def test_bypass_queue_telegram_permission_response_records_boundary(tmp_path):
     transcript = tmp_path / "permission-response.jsonl"

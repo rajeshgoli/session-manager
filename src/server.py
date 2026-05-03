@@ -1645,6 +1645,9 @@ def create_app(
             and request.parent_session_id is None
         )
 
+    def _response_relay_source_for_send_request(request: SendInputRequest) -> str:
+        return "sm-send" if request.from_sm_send else "api"
+
     def _resolve_live_send_target(identifier: str) -> Optional[Session]:
         if not app.state.session_manager:
             return None
@@ -1747,6 +1750,7 @@ def create_app(
             remind_hard_threshold=request.remind_hard_threshold,
             remind_cancel_on_reply_session_id=request.remind_cancel_on_reply_session_id,
             parent_session_id=request.parent_session_id,
+            response_relay_source=_response_relay_source_for_send_request(request),
         )
 
         if result == DeliveryResult.FAILED:
