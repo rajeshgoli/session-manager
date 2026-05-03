@@ -1975,37 +1975,59 @@ def cmd_email(
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    if len(recipients) == 1 and not cc and body_text is not None and body_html is None:
-        human_result = _lookup_human_result(client, recipients[0])
-        if human_result is not None:
-            if human_result.get("unavailable"):
+    human_targets: dict[str, dict] = {}
+    for target in recipients + cc:
+        human_result = _lookup_human_result(client, target)
+        if human_result is None:
+            continue
+        if human_result.get("unavailable"):
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        if human_result.get("ok"):
+            human_targets[target] = human_result
+            continue
+        if human_result.get("status_code") not in (None, 404):
+            print(f"Error: {human_result.get('detail') or 'Human recipient lookup failed'}", file=sys.stderr)
+            return 1
+
+    if human_targets:
+        if len(recipients) != 1 or cc:
+            print(
+                "Error: sm email to human recipients supports exactly one recipient and no --cc",
+                file=sys.stderr,
+            )
+            return 1
+        if body_text is None or body_html is not None:
+            print(
+                "Error: sm email to human recipients supports plain text or markdown bodies only",
+                file=sys.stderr,
+            )
+            return 1
+
+        sender = getattr(client, "send_human_email_result", None)
+        if callable(sender):
+            result = sender(
+                requester_session_id=sender_session_id,
+                recipient=recipients[0],
+                text=body_text,
+                subject=subject,
+                body_markdown=body_markdown,
+                auto_subject=not bool(str(subject or "").strip()),
+            )
+            if result.get("unavailable"):
                 print(UNAVAILABLE_MESSAGE, file=sys.stderr)
                 return 2
-            if human_result.get("ok"):
-                sender = getattr(client, "send_human_email_result", None)
-                if callable(sender):
-                    result = sender(
-                        requester_session_id=sender_session_id,
-                        recipient=recipients[0],
-                        text=body_text,
-                        subject=subject,
-                        body_markdown=body_markdown,
-                        auto_subject=not bool(str(subject or "").strip()),
-                    )
-                    if result.get("unavailable"):
-                        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
-                        return 2
-                    if not result.get("ok"):
-                        print(f"Error: {result.get('detail') or 'Failed to send email'}", file=sys.stderr)
-                        return 1
-                    payload = result.get("data") or {}
-                    print(f"Email sent to {payload.get('recipient') or recipients[0]}")
-                    if payload.get("subject"):
-                        print(f"  Subject: {payload['subject']}")
-                    return 0
-            elif human_result.get("status_code") not in (None, 404):
-                print(f"Error: {human_result.get('detail') or 'Human recipient lookup failed'}", file=sys.stderr)
+            if not result.get("ok"):
+                print(f"Error: {result.get('detail') or 'Failed to send email'}", file=sys.stderr)
                 return 1
+            payload = result.get("data") or {}
+            print(f"Email sent to {payload.get('recipient') or recipients[0]}")
+            if payload.get("subject"):
+                print(f"  Subject: {payload['subject']}")
+            return 0
+
+        print("Error: Human email delivery is not supported by this Session Manager server", file=sys.stderr)
+        return 1
 
     if not str(subject or "").strip():
         print("Error: --subject is required for non-human registered email", file=sys.stderr)

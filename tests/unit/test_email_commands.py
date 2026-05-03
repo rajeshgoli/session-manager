@@ -169,6 +169,58 @@ def test_cmd_email_human_uses_explicit_email_endpoint_and_redacts_address(capsys
     assert "private@example.com" not in output
 
 
+def test_cmd_email_human_with_cc_rejects_before_registered_email(capsys):
+    client = Mock()
+    client.lookup_human.side_effect = lambda identifier: (
+        {
+            "ok": True,
+            "unavailable": False,
+            "data": _human_lookup_payload(),
+        }
+        if identifier == "rajeshgoli"
+        else {"ok": False, "unavailable": False, "status_code": 404}
+    )
+
+    rc = cmd_email(
+        client,
+        sender_session_id="sender123",
+        recipients_raw="rajeshgoli",
+        subject="Fallback",
+        body="explicit fallback",
+        cc_raw="architect",
+    )
+
+    assert rc == 1
+    client.send_human_email_result.assert_not_called()
+    client.send_email_result.assert_not_called()
+    assert "supports exactly one recipient and no --cc" in capsys.readouterr().err
+
+
+def test_cmd_email_human_html_rejects_before_registered_email(tmp_path, capsys):
+    html_path = tmp_path / "body.html"
+    html_path.write_text("<p>explicit fallback</p>", encoding="utf-8")
+
+    client = Mock()
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": _human_lookup_payload(),
+    }
+
+    rc = cmd_email(
+        client,
+        sender_session_id="sender123",
+        recipients_raw="rajeshgoli",
+        subject="Fallback",
+        html_file=str(html_path),
+    )
+
+    assert rc == 1
+    client.send_human_email_result.assert_not_called()
+    client.send_email_result.assert_not_called()
+    assert "supports plain text or markdown bodies only" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("delivery_mode", "expected_snippet"),
     [
