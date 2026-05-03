@@ -4085,6 +4085,7 @@ class SessionManager:
         remind_hard_threshold: Optional[int] = None,
         remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        response_relay_source: Optional[str] = None,
     ) -> DeliveryResult:
         """
         Send input to a session with optional sender metadata and delivery mode.
@@ -4103,6 +4104,7 @@ class SessionManager:
             remind_soft_threshold: Seconds after delivery before soft remind fires (#188)
             remind_hard_threshold: Seconds after delivery before hard remind fires (#188)
             remind_cancel_on_reply_session_id: Cancel remind when target replies to this session (#406)
+            response_relay_source: Explicit user/operator source for turn-bound response relay
 
         Returns:
             DeliveryResult indicating whether message was DELIVERED, QUEUED, or FAILED
@@ -4183,6 +4185,12 @@ class SessionManager:
                 sender_state.last_outgoing_sm_send_target = session_id
                 sender_state.last_outgoing_sm_send_at = datetime.now()
 
+        response_relay_kwargs = (
+            {"response_relay_source": response_relay_source}
+            if response_relay_source
+            else {}
+        )
+
         # Handle steer delivery mode — direct Enter-based injection, bypasses queue
         if delivery_mode == "steer":
             if session.provider not in ("codex", "codex-fork"):
@@ -4216,6 +4224,7 @@ class SessionManager:
                     remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
+                    **response_relay_kwargs,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
@@ -4248,6 +4257,7 @@ class SessionManager:
                     remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
+                    **response_relay_kwargs,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 _record_outgoing_sm_send_target()
@@ -4276,6 +4286,7 @@ class SessionManager:
                     remind_hard_threshold=remind_hard_threshold,
                     remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
+                    **response_relay_kwargs,
                 )
                 _record_outgoing_sm_send_target()
                 _clear_completed_state()

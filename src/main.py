@@ -406,6 +406,7 @@ class SessionManagerApp:
                 user_input.text,
                 bypass_queue=user_input.is_permission_response,
                 delivery_mode=getattr(user_input, 'delivery_mode', 'sequential'),
+                response_relay_source=user_input.source.value,
             )
             if result != DeliveryResult.FAILED:
                 self.output_monitor.update_activity(user_input.session_id)

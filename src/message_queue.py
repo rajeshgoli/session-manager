@@ -190,7 +190,8 @@ class MessageQueueManager:
                 remind_hard_threshold INTEGER,
                 remind_cancel_on_reply_session_id TEXT,
                 parent_session_id TEXT,
-                message_category TEXT DEFAULT NULL
+                message_category TEXT DEFAULT NULL,
+                response_relay_source TEXT DEFAULT NULL
             )
         """)
         cursor.execute("""
@@ -235,6 +236,9 @@ class MessageQueueManager:
         if "message_category" not in columns:
             cursor.execute("ALTER TABLE message_queue ADD COLUMN message_category TEXT DEFAULT NULL")
             logger.info("Migrated message_queue: added message_category column")
+        if "response_relay_source" not in columns:
+            cursor.execute("ALTER TABLE message_queue ADD COLUMN response_relay_source TEXT DEFAULT NULL")
+            logger.info("Migrated message_queue: added response_relay_source column")
         cursor.execute("PRAGMA table_info(scheduled_reminders)")
         reminder_columns = [col[1] for col in cursor.fetchall()]
         if "recurring_interval_seconds" not in reminder_columns:
@@ -1923,6 +1927,7 @@ class MessageQueueManager:
         remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
         message_category: Optional[str] = None,
+        response_relay_source: Optional[str] = None,
         trigger_delivery: bool = True,
     ) -> QueuedMessage:
         """
@@ -1944,6 +1949,7 @@ class MessageQueueManager:
             remind_cancel_on_reply_session_id: Cancel remind when the target replies to this session (#406)
             parent_session_id: EM session to wake periodically after delivery (#225-C)
             message_category: Optional category tag, e.g. 'context_monitor', for scoped cancellation (#241)
+            response_relay_source: Optional source tag for turn-bound response relay, e.g. 'telegram'
             trigger_delivery: If True, queue_message schedules immediate delivery based on mode.
 
         Returns:
@@ -1966,6 +1972,7 @@ class MessageQueueManager:
             remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
             parent_session_id=parent_session_id,
             message_category=message_category,
+            response_relay_source=response_relay_source or ("sm-send" if from_sm_send else None),
         )
 
         # Persist to database
@@ -1974,8 +1981,8 @@ class MessageQueueManager:
             (id, target_session_id, sender_session_id, sender_name, text,
              delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery, notify_after_seconds,
              notify_on_stop, remind_soft_threshold, remind_hard_threshold,
-             remind_cancel_on_reply_session_id, parent_session_id, message_category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             remind_cancel_on_reply_session_id, parent_session_id, message_category, response_relay_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             msg.id,
             msg.target_session_id,
@@ -1994,6 +2001,7 @@ class MessageQueueManager:
             msg.remind_cancel_on_reply_session_id,
             msg.parent_session_id,
             msg.message_category,
+            msg.response_relay_source,
         ))
 
         queue_len = self.get_queue_length(target_session_id)
@@ -2082,7 +2090,8 @@ class MessageQueueManager:
                    delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery,
                    notify_after_seconds, notify_on_stop, delivered_at,
                    remind_soft_threshold, remind_hard_threshold,
-                   remind_cancel_on_reply_session_id, parent_session_id, message_category
+                   remind_cancel_on_reply_session_id, parent_session_id, message_category,
+                   response_relay_source
             FROM message_queue
             WHERE target_session_id = ? AND delivered_at IS NULL
             ORDER BY queued_at ASC
@@ -2109,6 +2118,7 @@ class MessageQueueManager:
                 remind_cancel_on_reply_session_id=row[15],
                 parent_session_id=row[16],
                 message_category=row[17],
+                response_relay_source=row[18],
             )
             # Skip expired messages
             if msg.timeout_at and datetime.now() > msg.timeout_at:
@@ -2133,9 +2143,10 @@ class MessageQueueManager:
         """Record a delivered user/operator message as the active response relay turn."""
         if msg.message_category is not None:
             return
-        # Internal prompts are often uncategorized; only explicit sm send turns
-        # should move the automatic Telegram response boundary.
-        if not msg.from_sm_send:
+        # Internal prompts are often uncategorized; only explicit inbound turn
+        # sources should move the automatic Telegram response boundary.
+        source = msg.response_relay_source or ("sm-send" if msg.from_sm_send else None)
+        if not source:
             return
         ledger = getattr(self, "response_relay_ledger", None)
         if ledger is None:
@@ -2150,7 +2161,7 @@ class MessageQueueManager:
             ledger.record_inbound_turn(
                 session_id=msg.target_session_id,
                 inbound_id=msg.id,
-                source="sm-send",
+                source=source,
                 provider=provider,
                 delivered_at=delivered_at,
                 transcript_path=transcript_path,

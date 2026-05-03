@@ -340,6 +340,7 @@ async def test_message_queue_records_inbound_boundary_only_after_delivery(tmp_pa
     assert active_turn is not None
     assert active_turn.inbound_id == msg.id
     assert active_turn.transcript_offset == transcript.stat().st_size
+    assert active_turn.source == "sm-send"
     delivered_rows = mq._execute_query(
         "SELECT delivered_at FROM message_queue WHERE id = ?",
         (msg.id,),
@@ -385,3 +386,37 @@ async def test_message_queue_ignores_internal_uncategorized_prompts(tmp_path):
     assert active_turn is not None
     assert active_turn.inbound_id == user_msg.id
     assert active_turn.source == "sm-send"
+
+
+@pytest.mark.asyncio
+async def test_message_queue_records_telegram_inbound_boundary(tmp_path):
+    transcript = tmp_path / "telegram.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    session = _session(transcript)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+
+    msg = mq.queue_message(
+        session.id,
+        "telegram user turn",
+        response_relay_source="telegram",
+        trigger_delivery=False,
+    )
+
+    pending = mq.get_pending_messages(session.id)
+    assert pending[0].response_relay_source == "telegram"
+
+    await mq._try_deliver_messages(session.id)
+
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == msg.id
+    assert active_turn.source == "telegram"
