@@ -315,7 +315,7 @@ End-state user flow:
 3. The user taps `Attach`.
 4. The app performs OAuth/session checks and registered device-key proof in the background.
 5. The app opens an in-app terminal view for that agent's existing tmux session.
-6. The terminal behaves like desktop `sm attach`: the user sees the live pane, can type, and can detach/back out.
+6. The terminal behaves like desktop `sm attach`: the user sees the live pane, can type, can send required control keys, can copy/paste, and can detach/back out.
 7. On detach or back navigation, the app returns to the prior SM watch/details screen.
 
 The normal end-state UX does not require Termux or another terminal app. Termux appears only during rollout as a temporary fallback action.
@@ -341,6 +341,25 @@ Renderer requirements:
 3. Keep the ticket secret and device-key material out of URLs, logs, screenshots, persistent settings, and crash reports.
 4. Expose no generic browser navigation or external web content in the terminal surface.
 5. Return to watch/details when the attach ends.
+6. Provide mobile-accessible controls for keys that the default Android keyboard cannot reliably emit.
+
+### Mobile Control Keys
+
+The in-app terminal must provide Termux-like control parity for the agent operations the user depends on. The default Android keyboard is not enough because it may not expose ESC, Ctrl, or tmux prefix sequences.
+
+Minimum required controls:
+
+| UI control | Wire behavior |
+| --- | --- |
+| `Esc` | Send ESC (`\x1b`) to the terminal. Used to interrupt/stop agent UI states. |
+| `Detach` | Send tmux detach for the attached session, equivalent to `Ctrl-b d`, or call a server-side detach action that has the same effect. |
+| `Ctrl` modifier | Allow at least `Ctrl-b` and common control chords needed by tmux/agent UIs. |
+| `Paste` | Paste clipboard text safely into the terminal input stream. |
+| `Copy` | Copy selected terminal text without sending unintended input. |
+
+The app may implement these as a terminal accessory row, floating controls, or a command palette. The exact UI is an implementation detail; the requirement is that a mobile user can detach, send ESC, and copy/paste without installing Termux or switching keyboards.
+
+The `Detach` control may translate to raw `Ctrl-b d` over the terminal stream, but a server-side detach frame is acceptable and may be safer if it can detach only the current bridge without sending extra input to the agent.
 
 Implementation action required:
 
@@ -442,6 +461,10 @@ Android tests:
 7. After cutover, Termux attach is not shown as a normal attach action.
 8. Owner-only app disable control blocks new mobile terminal attaches.
 9. Native renderer viability is documented in the implementation PR; if WebView is used, the PR documents the native blocker and WebView containment controls.
+10. Terminal UI exposes mobile-accessible `Esc`, `Detach`, `Ctrl` modifier/chords, copy, and paste controls.
+11. `Esc` sends ESC to the attached terminal.
+12. `Detach` detaches from tmux and returns to watch/details without killing the agent.
+13. Copy/paste works without leaking ticket secrets or sending unintended control input.
 
 Manual verification:
 
@@ -452,6 +475,7 @@ Manual verification:
 5. Existing desktop `sm attach` still works.
 6. During rollout only, Termux fallback still works where Cloudflare/LAN SSH works.
 7. After cutover, the SM app exposes only the HTTPS/device-key attach path for mobile attach.
+8. On Android, the user can stop/interrupt with `Esc`, detach with the detach control or `Ctrl-b d` equivalent, and copy/paste without Termux.
 
 ## Rollout
 
