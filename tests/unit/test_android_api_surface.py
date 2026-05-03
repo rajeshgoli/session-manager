@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from src.models import Session, SessionStatus
-from src.server import create_app
+from src.server import _issue_device_access_token, create_app
 
 
 def _android_config() -> dict:
@@ -215,16 +215,22 @@ def _mobile_terminal_config(private_key) -> dict:
     return config
 
 
-def _sign_mobile_ticket_headers(private_key, session_id: str) -> dict[str, str]:
+def _sign_mobile_ticket_headers(
+    private_key,
+    session_id: str,
+    *,
+    actor_email: str = "local_bypass",
+    path: str | None = None,
+) -> dict[str, str]:
     timestamp = str(time.time())
     nonce = "nonce-1"
     message = "\n".join(
         [
             "SM-MOBILE-TERMINAL-TICKET-V1",
             "POST",
-            f"/client/sessions/{session_id}/attach-ticket",
+            path or f"/client/sessions/{session_id}/attach-ticket",
             session_id,
-            "local_bypass",
+            actor_email,
             "test-device",
             timestamp,
             nonce,
@@ -281,6 +287,60 @@ def test_client_sessions_prefer_mobile_terminal_when_enabled():
         "type": "mobile_terminal",
         "label": "Attach",
     }
+
+
+def test_client_sessions_hide_mobile_terminal_action_for_unregistered_actor():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    token = _issue_device_access_token(config, email="other@example.com", name="Other")["access_token"]
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.get(
+        "/client/sessions",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]
+    assert payload["mobile_terminal"]["supported"] is False
+    assert payload["mobile_terminal"]["reason"] == "mobile terminal user is not configured"
+    assert payload["primary_action"] == {
+        "type": "termux_attach",
+        "label": "Attach in Termux",
+    }
+
+
+def test_mobile_terminal_user_matching_does_not_accept_email_local_part():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["allowed_users"] = {
+        "rajesh": config["mobile_terminal"]["allowed_users"]["local_bypass"],
+    }
+    actor_email = "rajesh@example.invalid"
+    token = _issue_device_access_token(config, email=actor_email, name="Rajesh")["access_token"]
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers={
+            "Authorization": f"Bearer {token}",
+            **_sign_mobile_ticket_headers(private_key, session.id, actor_email=actor_email),
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "mobile terminal user is not configured"
 
 
 def test_mobile_attach_ticket_requires_registered_device_signature():
@@ -357,6 +417,51 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
         websocket.send_json({"type": "input", "data": "hello"})
         websocket.send_json({"type": "key", "key": "enter"})
         websocket.send_json({"type": "detach"})
+
+
+def test_mobile_terminal_websocket_enforces_active_attach_limit_at_consume_time():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    ticket_response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+    assert ticket_response.status_code == 200
+    ticket = ticket_response.json()
+    app.state.mobile_terminal_active_attaches["busy"] = {
+        "user_id": "local_bypass",
+        "session_id": "other-session",
+        "provider": "claude",
+        "device_key_id": "test-device",
+        "started_at": time.time(),
+    }
+
+    with client.websocket_connect("/client/terminal") as websocket:
+        websocket.send_json(
+            {
+                "type": "auth",
+                "ticket_id": ticket["ticket_id"],
+                "ticket_secret": ticket["ticket_secret"],
+                "device_key_id": "test-device",
+                "nonce": "ws-nonce-1",
+                "signature": _sign_mobile_ws_auth(
+                    private_key,
+                    ticket_id=ticket["ticket_id"],
+                    session_id=session.id,
+                ),
+            }
+        )
+        assert websocket.receive_json() == {
+            "type": "error",
+            "message": "Too many active mobile attaches for user",
+        }
 
 
 def test_client_sessions_fall_back_to_lan_ssh_on_cloudflare_bad_handshake():

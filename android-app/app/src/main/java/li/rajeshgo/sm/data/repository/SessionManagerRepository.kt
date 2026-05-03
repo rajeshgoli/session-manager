@@ -31,6 +31,7 @@ import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.HttpException
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import java.net.URI
 
 open class SessionManagerRequestException(message: String, cause: Throwable? = null) : IllegalStateException(message, cause)
 class SessionManagerAuthException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
@@ -217,6 +218,13 @@ class SessionManagerRepository {
                 signature = proof.signature,
             )
         }.mapFailure(::classifyWriteFailure)
+    }
+
+    fun mobileAttachTicketPath(baseUrl: String, sessionId: String): String {
+        val prefix = runCatching {
+            URI(baseUrl.trim()).rawPath.orEmpty().trimEnd('/')
+        }.getOrDefault("")
+        return "$prefix/client/sessions/$sessionId/attach-ticket"
     }
 
     fun openMobileTerminalSocket(

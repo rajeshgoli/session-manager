@@ -2113,7 +2113,8 @@ def create_app(
         if not isinstance(allowed_users, dict):
             return None
         normalized_email = str(actor_email or "").strip().lower()
-        email_local = normalized_email.split("@", 1)[0]
+        if not normalized_email:
+            return None
         for user_id, raw_user_config in allowed_users.items():
             user_config = raw_user_config if isinstance(raw_user_config, dict) else {}
             candidates = {
@@ -2124,9 +2125,22 @@ def create_app(
             if isinstance(aliases, list):
                 candidates.update(str(alias or "").strip().lower() for alias in aliases)
             candidates.discard("")
-            if normalized_email in candidates or email_local in candidates:
+            if normalized_email in candidates:
                 return str(user_id), user_config
         return None
+
+    def _mobile_terminal_user_has_registered_device(user_config: dict[str, Any]) -> bool:
+        keys = user_config.get("registered_device_keys") or []
+        if not isinstance(keys, list):
+            return False
+        for raw_key in keys:
+            if not isinstance(raw_key, dict):
+                continue
+            if raw_key.get("enabled", True) is False:
+                continue
+            if str(raw_key.get("id") or "").strip() and str(raw_key.get("public_key") or "").strip():
+                return True
+        return False
 
     def _mobile_terminal_device_config(
         user_id: str,
@@ -2271,7 +2285,12 @@ def create_app(
         if tmux_socket_name and not MOBILE_TERMINAL_SOCKET_NAME_PATTERN.fullmatch(tmux_socket_name):
             raise HTTPException(status_code=403, detail="Unsafe tmux socket target")
 
-    def _mobile_terminal_metadata(session: Session, descriptor: Optional[dict[str, Any]]) -> dict[str, Any]:
+    def _mobile_terminal_metadata(
+        session: Session,
+        descriptor: Optional[dict[str, Any]],
+        *,
+        actor_email: Optional[str] = None,
+    ) -> dict[str, Any]:
         if not _mobile_terminal_enabled():
             return {
                 "supported": False,
@@ -2284,6 +2303,32 @@ def create_app(
                 "supported": False,
                 "transport": "sm-https-tmux",
                 "reason": "mobile terminal public HTTPS host is not configured",
+            }
+        if actor_email is None:
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": "authenticated mobile terminal user is required",
+            }
+        user_match = _mobile_terminal_visible_user(actor_email)
+        if user_match is None:
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": "mobile terminal user is not configured",
+            }
+        _user_id, user_config = user_match
+        if user_config.get("interactive_shell_access") is not True:
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": "interactive shell access is not enabled",
+            }
+        if not _mobile_terminal_user_has_registered_device(user_config):
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": "registered mobile device key is required",
             }
         if not descriptor:
             return {
@@ -2806,13 +2851,14 @@ def create_app(
         session: Session,
         *,
         sync_display_name: bool = True,
+        actor_email: Optional[str] = None,
     ) -> dict[str, Any]:
         base = _response_dict(
             _session_to_response(session, sync_display_name=sync_display_name)
         )
         descriptor = _attach_descriptor(session)
         termux_attach = _termux_attach_metadata(session, descriptor)
-        mobile_terminal = _mobile_terminal_metadata(session, descriptor)
+        mobile_terminal = _mobile_terminal_metadata(session, descriptor, actor_email=actor_email)
         base["attach_descriptor"] = descriptor
         base["termux_attach"] = termux_attach
         base["mobile_terminal"] = mobile_terminal
@@ -4028,15 +4074,16 @@ def create_app(
         }
 
     @app.get("/client/sessions")
-    async def list_client_sessions():
+    async def list_client_sessions(request: Request):
         """List sessions with mobile-friendly attach metadata."""
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
+        actor_email = _request_actor_email(request)
         sessions = app.state.session_manager.list_sessions()
         return {
             "sessions": [
-                _mobile_session_payload(session, sync_display_name=False)
+                _mobile_session_payload(session, sync_display_name=False, actor_email=actor_email)
                 for session in sessions
             ]
         }
@@ -4166,7 +4213,7 @@ def create_app(
         if session.status == SessionStatus.STOPPED:
             _audit_mobile_terminal("ticket_denied", user_id=actor_email, session_id=session.id, reason="session_stopped")
             raise HTTPException(status_code=409, detail="Session is not running")
-        metadata = _mobile_terminal_metadata(session, descriptor)
+        metadata = _mobile_terminal_metadata(session, descriptor, actor_email=actor_email)
         if not metadata.get("supported"):
             _audit_mobile_terminal(
                 "ticket_denied",
@@ -4235,7 +4282,7 @@ def create_app(
             descriptor,
             actor_email,
         )
-        metadata = _mobile_terminal_metadata(session, descriptor)
+        metadata = _mobile_terminal_metadata(session, descriptor, actor_email=actor_email)
         tmux_session = str(metadata.get("tmux_session") or "").strip()
         tmux_socket_name = str(metadata.get("tmux_socket_name") or "").strip() or None
         _validate_mobile_terminal_tmux_target(tmux_session, tmux_socket_name)
@@ -4297,7 +4344,7 @@ def create_app(
             expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
         )
 
-    async def _consume_mobile_terminal_ticket(auth_frame: dict[str, Any]) -> MobileTerminalTicket:
+    async def _consume_mobile_terminal_ticket(auth_frame: dict[str, Any]) -> tuple[MobileTerminalTicket, str]:
         ticket_id = str(auth_frame.get("ticket_id") or "").strip()
         ticket_secret = str(auth_frame.get("ticket_secret") or "").strip()
         device_key_id = str(auth_frame.get("device_key_id") or "").strip()
@@ -4353,11 +4400,19 @@ def create_app(
             if not session or session.status == SessionStatus.STOPPED:
                 raise HTTPException(status_code=409, detail="Session is no longer attachable")
             descriptor = _attach_descriptor(session)
-            metadata = _mobile_terminal_metadata(session, descriptor)
+            metadata = _mobile_terminal_metadata(session, descriptor, actor_email=ticket.actor_email)
             if not metadata.get("supported"):
                 raise HTTPException(status_code=403, detail=metadata.get("reason") or "Session is no longer attachable")
             ticket.consumed_at = time.time()
             app.state.mobile_terminal_tickets.pop(ticket_id, None)
+            attach_id = secrets.token_urlsafe(16)
+            app.state.mobile_terminal_active_attaches[attach_id] = {
+                "user_id": ticket.user_id,
+                "session_id": ticket.session_id,
+                "provider": ticket.provider,
+                "device_key_id": ticket.device_key_id,
+                "started_at": time.time(),
+            }
             _audit_mobile_terminal(
                 "ticket_consumed",
                 user_id=ticket.user_id,
@@ -4365,7 +4420,7 @@ def create_app(
                 provider=ticket.provider,
                 device_key_id=ticket.device_key_id,
             )
-            return ticket
+            return ticket, attach_id
 
     def _mobile_terminal_tmux_cmd(ticket: MobileTerminalTicket, *args: str) -> list[str]:
         cmd = ["tmux"]
@@ -4548,11 +4603,12 @@ def create_app(
             return
 
         auth_timeout = _mobile_terminal_int("auth_frame_timeout_seconds", 3, minimum=1, maximum=30)
+        attach_id: Optional[str] = None
         try:
             auth_frame = await asyncio.wait_for(websocket.receive_json(), timeout=auth_timeout)
             if not isinstance(auth_frame, dict) or auth_frame.get("type") != "auth":
                 raise HTTPException(status_code=401, detail="First terminal frame must be auth")
-            ticket = await _consume_mobile_terminal_ticket(auth_frame)
+            ticket, attach_id = await _consume_mobile_terminal_ticket(auth_frame)
             _validate_mobile_terminal_tmux_target(ticket.tmux_session, ticket.tmux_socket_name)
         except asyncio.TimeoutError:
             _audit_mobile_terminal("auth_failed", reason="timeout")
@@ -4572,15 +4628,6 @@ def create_app(
             await websocket.close(code=1008)
             return
 
-        attach_id = secrets.token_urlsafe(16)
-        async with app.state.mobile_terminal_lock:
-            app.state.mobile_terminal_active_attaches[attach_id] = {
-                "user_id": ticket.user_id,
-                "session_id": ticket.session_id,
-                "provider": ticket.provider,
-                "device_key_id": ticket.device_key_id,
-                "started_at": time.time(),
-            }
         _audit_mobile_terminal(
             "attach_started",
             user_id=ticket.user_id,
@@ -4591,8 +4638,10 @@ def create_app(
         try:
             await _run_mobile_terminal_bridge(websocket, ticket, attach_id)
         except WebSocketDisconnect:
-            app.state.mobile_terminal_active_attaches.pop(attach_id, None)
+            pass
         finally:
+            if attach_id is not None:
+                app.state.mobile_terminal_active_attaches.pop(attach_id, None)
             if websocket.client_state.name != "DISCONNECTED":
                 try:
                     await websocket.close()
@@ -4655,7 +4704,7 @@ def create_app(
         return _session_to_response(session, sync_display_name=False)
 
     @app.get("/client/sessions/{session_id}")
-    async def get_client_session(session_id: str):
+    async def get_client_session(session_id: str, request: Request):
         """Get one session with mobile-friendly attach metadata."""
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
@@ -4665,7 +4714,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found")
 
         await _ensure_session_display_identity_synced(session)
-        return _mobile_session_payload(session)
+        return _mobile_session_payload(session, actor_email=_request_actor_email(request))
 
     @app.get("/sessions/{session_id}/codex-events")
     async def get_codex_events(

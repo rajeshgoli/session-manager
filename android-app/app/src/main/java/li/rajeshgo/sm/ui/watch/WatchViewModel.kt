@@ -73,6 +73,12 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    override fun onCleared() {
+        terminalSocket?.close(1000, "viewmodel cleared")
+        terminalSocket = null
+        super.onCleared()
+    }
+
     fun refresh(initial: Boolean = false) {
         if (refreshJob?.isActive == true) {
             return
@@ -232,7 +238,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 onComplete(Result.failure(IllegalStateException("Sign in to attach")))
                 return@launch
             }
-            val path = "/client/sessions/${session.id}/attach-ticket"
+            val path = sessionRepository.mobileAttachTicketPath(serverUrl, session.id)
             _uiState.value = _uiState.value.copy(
                 terminal = TerminalUiState(
                     sessionId = session.id,
