@@ -345,3 +345,43 @@ async def test_message_queue_records_inbound_boundary_only_after_delivery(tmp_pa
         (msg.id,),
     )
     assert delivered_rows[0][0].endswith("+00:00")
+
+
+@pytest.mark.asyncio
+async def test_message_queue_ignores_internal_uncategorized_prompts(tmp_path):
+    transcript = tmp_path / "internal-prompt.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    session = _session(transcript)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+
+    user_msg = mq.queue_message(
+        session.id,
+        "real user turn",
+        from_sm_send=True,
+        trigger_delivery=False,
+    )
+    await mq._try_deliver_messages(session.id)
+    assert ledger.get_latest_active_turn(session.id).inbound_id == user_msg.id
+
+    internal_msg = mq.queue_message(
+        session.id,
+        "[sm info] Uncommitted changes in worktree(s):\n- /tmp/worktree",
+        delivery_mode="important",
+        trigger_delivery=False,
+    )
+    await mq._try_deliver_messages(session.id, important_only=True)
+
+    assert mq.was_message_delivered(internal_msg.id)
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == user_msg.id
+    assert active_turn.source == "sm-send"

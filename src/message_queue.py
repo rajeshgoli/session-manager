@@ -2133,6 +2133,10 @@ class MessageQueueManager:
         """Record a delivered user/operator message as the active response relay turn."""
         if msg.message_category is not None:
             return
+        # Internal prompts are often uncategorized; only explicit sm send turns
+        # should move the automatic Telegram response boundary.
+        if not msg.from_sm_send:
+            return
         ledger = getattr(self, "response_relay_ledger", None)
         if ledger is None:
             return
@@ -2140,14 +2144,13 @@ class MessageQueueManager:
         if not session:
             return
         provider = getattr(session, "provider", None) or "claude"
-        source = "sm-send" if msg.from_sm_send else "sm-input"
         transcript_path = getattr(session, "transcript_path", None)
         transcript_offset = ledger.capture_transcript_offset(transcript_path)
         try:
             ledger.record_inbound_turn(
                 session_id=msg.target_session_id,
                 inbound_id=msg.id,
-                source=source,
+                source="sm-send",
                 provider=provider,
                 delivered_at=delivered_at,
                 transcript_path=transcript_path,
