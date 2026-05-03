@@ -516,6 +516,55 @@ def test_mobile_terminal_websocket_enforces_active_attach_limit_at_consume_time(
         }
 
 
+def test_mobile_terminal_disable_requires_owner_authorization():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    response = client.post("/client/mobile-terminal/disable")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "User is not allowed to disable mobile terminal attach"
+    assert app.state.mobile_terminal_runtime_disabled is False
+
+
+def test_mobile_terminal_disable_owner_terminates_active_attaches():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["allowed_users"]["local_bypass"]["mobile_terminal_owner"] = True
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+    stop_event = MagicMock()
+    app.state.mobile_terminal_active_attaches["active-1"] = {
+        "user_id": "local_bypass",
+        "session_id": session.id,
+        "provider": session.provider,
+        "device_key_id": "test-device",
+        "started_at": time.time(),
+        "stop_event": stop_event,
+    }
+
+    response = client.post("/client/mobile-terminal/disable")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "disabled": True,
+        "active_attaches_terminated": 1,
+    }
+    assert app.state.mobile_terminal_runtime_disabled is True
+    assert app.state.mobile_terminal_active_attaches == {}
+    stop_event.set.assert_called_once_with()
+
+
 def test_client_sessions_fall_back_to_lan_ssh_on_cloudflare_bad_handshake():
     session = _session()
     app = create_app(

@@ -171,6 +171,8 @@ mobile_terminal:
     you:
       email: "you@example.com"
       interactive_shell_access: true
+      # Required for the global emergency disable endpoint.
+      mobile_terminal_owner: true
       registered_device_keys:
         - id: "replace-with-app-device-key-id"
           label: "Your Android device"

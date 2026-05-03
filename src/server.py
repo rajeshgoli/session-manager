@@ -596,6 +596,7 @@ class MobileTerminalDisableResponse(BaseModel):
     """Response for emergency mobile terminal disable controls."""
     ok: bool = True
     disabled: bool
+    active_attaches_terminated: int = 0
 
 
 @dataclass
@@ -2149,6 +2150,13 @@ def create_app(
             if str(raw_key.get("id") or "").strip() and str(raw_key.get("public_key") or "").strip():
                 return True
         return False
+
+    def _mobile_terminal_user_can_disable(user_config: dict[str, Any]) -> bool:
+        return (
+            user_config.get("mobile_terminal_owner") is True
+            or user_config.get("can_disable_mobile_terminal") is True
+            or user_config.get("owner") is True
+        )
 
     def _mobile_terminal_device_config(
         user_id: str,
@@ -4454,6 +4462,10 @@ def create_app(
         poll_interval = min(max(poll_interval, 0.2), 2.0)
         stop_event = asyncio.Event()
         counters = {"input_bytes": 0, "output_bytes": 0}
+        active = getattr(app.state, "mobile_terminal_active_attaches", {})
+        if attach_id in active:
+            active[attach_id]["stop_event"] = stop_event
+            active[attach_id]["websocket"] = websocket
 
         async def send_status(state: str, **extra: Any) -> None:
             await websocket.send_json({"type": "status", "state": state, **extra})
@@ -4676,11 +4688,50 @@ def create_app(
         if actor_email is None:
             raise HTTPException(status_code=401, detail="Authentication required")
         user_match = _mobile_terminal_visible_user(actor_email)
-        if user_match is None or user_match[1].get("interactive_shell_access") is not True:
+        if (
+            user_match is None
+            or user_match[1].get("interactive_shell_access") is not True
+            or not _mobile_terminal_user_can_disable(user_match[1])
+        ):
             raise HTTPException(status_code=403, detail="User is not allowed to disable mobile terminal attach")
-        app.state.mobile_terminal_runtime_disabled = True
-        _audit_mobile_terminal("runtime_disabled", user_id=user_match[0])
-        return MobileTerminalDisableResponse(disabled=True)
+        sockets_to_close: list[WebSocket] = []
+        async with app.state.mobile_terminal_lock:
+            app.state.mobile_terminal_runtime_disabled = True
+            app.state.mobile_terminal_tickets.clear()
+            active_records = list(app.state.mobile_terminal_active_attaches.values())
+            app.state.mobile_terminal_active_attaches.clear()
+
+        for active in active_records:
+            stop_event = active.get("stop_event")
+            if hasattr(stop_event, "set"):
+                stop_event.set()
+            websocket = active.get("websocket")
+            if isinstance(websocket, WebSocket):
+                sockets_to_close.append(websocket)
+
+        for websocket in sockets_to_close:
+            try:
+                await websocket.send_json({
+                    "type": "exit",
+                    "code": 1008,
+                    "reason": "mobile_terminal_disabled",
+                })
+            except Exception:
+                pass
+            try:
+                await websocket.close(code=1008)
+            except Exception:
+                pass
+
+        _audit_mobile_terminal(
+            "runtime_disabled",
+            user_id=user_match[0],
+            active_attaches_terminated=len(active_records),
+        )
+        return MobileTerminalDisableResponse(
+            disabled=True,
+            active_attaches_terminated=len(active_records),
+        )
 
     @app.get("/sessions/{session_id}/attach-descriptor")
     async def get_attach_descriptor(session_id: str):
