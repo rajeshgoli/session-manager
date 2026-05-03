@@ -643,6 +643,51 @@ def test_mobile_terminal_disable_owner_terminates_active_attaches():
     stop_event.set.assert_called_once_with()
 
 
+def test_mobile_terminal_bridge_aborts_if_disable_cleared_attach_before_start():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    class ClearOnSetDict(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            self.clear()
+
+    app.state.mobile_terminal_active_attaches = ClearOnSetDict()
+    ticket_response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+    assert ticket_response.status_code == 200
+    ticket = ticket_response.json()
+
+    with client.websocket_connect("/client/terminal") as websocket:
+        websocket.send_json(
+            {
+                "type": "auth",
+                "ticket_id": ticket["ticket_id"],
+                "ticket_secret": ticket["ticket_secret"],
+                "device_key_id": "test-device",
+                "nonce": "ws-nonce-1",
+                "signature": _sign_mobile_ws_auth(
+                    private_key,
+                    ticket_id=ticket["ticket_id"],
+                    session_id=session.id,
+                ),
+            }
+        )
+        assert websocket.receive_json() == {
+            "type": "exit",
+            "code": 1008,
+            "reason": "mobile_terminal_disabled",
+        }
+
+
 def test_client_sessions_fall_back_to_lan_ssh_on_cloudflare_bad_handshake():
     session = _session()
     app = create_app(

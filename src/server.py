@@ -4528,9 +4528,16 @@ def create_app(
         stop_event = asyncio.Event()
         counters = {"input_bytes": 0, "output_bytes": 0}
         active = getattr(app.state, "mobile_terminal_active_attaches", {})
-        if attach_id in active:
-            active[attach_id]["stop_event"] = stop_event
-            active[attach_id]["websocket"] = websocket
+        if attach_id not in active or not _mobile_terminal_enabled():
+            await websocket.send_json({
+                "type": "exit",
+                "code": 1008,
+                "reason": "mobile_terminal_disabled",
+            })
+            await websocket.close(code=1008)
+            return
+        active[attach_id]["stop_event"] = stop_event
+        active[attach_id]["websocket"] = websocket
 
         async def send_status(state: str, **extra: Any) -> None:
             await websocket.send_json({"type": "status", "state": state, **extra})
