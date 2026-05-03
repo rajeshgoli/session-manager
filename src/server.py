@@ -4245,14 +4245,23 @@ def create_app(
         async with app.state.mobile_terminal_lock:
             _mobile_terminal_cleanup_expired_tickets(now)
             active = list(app.state.mobile_terminal_active_attaches.values())
+            pending = list(app.state.mobile_terminal_tickets.values())
             max_global = _mobile_terminal_int("max_concurrent_attaches_global", 4, minimum=1, maximum=64)
             max_user = _mobile_terminal_int("max_concurrent_attaches_per_user", 1, minimum=1, maximum=16)
             max_session = _mobile_terminal_int("max_concurrent_attaches_per_session", 1, minimum=1, maximum=16)
-            if len(active) >= max_global:
+            if len(active) + len(pending) >= max_global:
                 raise HTTPException(status_code=429, detail="Too many active mobile attaches")
-            if sum(1 for item in active if item.get("user_id") == user_id) >= max_user:
+            if (
+                sum(1 for item in active if item.get("user_id") == user_id)
+                + sum(1 for item in pending if item.user_id == user_id)
+                >= max_user
+            ):
                 raise HTTPException(status_code=429, detail="Too many active mobile attaches for user")
-            if sum(1 for item in active if item.get("session_id") == session.id) >= max_session:
+            if (
+                sum(1 for item in active if item.get("session_id") == session.id)
+                + sum(1 for item in pending if item.session_id == session.id)
+                >= max_session
+            ):
                 raise HTTPException(status_code=429, detail="Session already has an active mobile attach")
 
             ticket_id = f"att_{secrets.token_urlsafe(18)}"
@@ -4309,6 +4318,16 @@ def create_app(
             if ticket.expires_at <= time.time() or ticket.consumed_at is not None:
                 app.state.mobile_terminal_tickets.pop(ticket_id, None)
                 raise HTTPException(status_code=401, detail="Attach ticket is expired or consumed")
+            active = list(app.state.mobile_terminal_active_attaches.values())
+            max_global = _mobile_terminal_int("max_concurrent_attaches_global", 4, minimum=1, maximum=64)
+            max_user = _mobile_terminal_int("max_concurrent_attaches_per_user", 1, minimum=1, maximum=16)
+            max_session = _mobile_terminal_int("max_concurrent_attaches_per_session", 1, minimum=1, maximum=16)
+            if len(active) >= max_global:
+                raise HTTPException(status_code=429, detail="Too many active mobile attaches")
+            if sum(1 for item in active if item.get("user_id") == ticket.user_id) >= max_user:
+                raise HTTPException(status_code=429, detail="Too many active mobile attaches for user")
+            if sum(1 for item in active if item.get("session_id") == ticket.session_id) >= max_session:
+                raise HTTPException(status_code=429, detail="Session already has an active mobile attach")
 
             user_match = _mobile_terminal_visible_user(ticket.actor_email)
             if user_match is None or user_match[0] != ticket.user_id:
