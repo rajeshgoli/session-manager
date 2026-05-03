@@ -1,5 +1,6 @@
-from unittest.mock import MagicMock
 import re
+from pathlib import Path
+from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
@@ -22,6 +23,24 @@ def _auth_config() -> dict:
             }
         }
     }
+
+
+def _auth_config_with_watch_dist(watch_dist: Path) -> dict:
+    config = _auth_config()
+    config["watch_frontend"] = {"dist_path": str(watch_dist)}
+    return config
+
+
+def _write_watch_dist_fixture(tmp_path: Path) -> Path:
+    watch_dist = tmp_path / "sm-watch-dist"
+    assets_dir = watch_dist / "assets"
+    assets_dir.mkdir(parents=True)
+    (watch_dist / "index.html").write_text(
+        '<!doctype html><script type="module" src="/watch/assets/app.abc123.js"></script>',
+        encoding="utf-8",
+    )
+    (assets_dir / "app.abc123.js").write_text("console.log('watch fixture');", encoding="utf-8")
+    return watch_dist
 
 
 def _misconfigured_auth_config() -> dict:
@@ -160,8 +179,14 @@ def test_local_loopback_bypasses_google_auth():
     assert root_response.json() == {"status": "ok", "service": "session-manager"}
 
 
-def test_watch_html_is_not_cached_but_hashed_assets_remain_static():
-    client = TestClient(create_app(session_manager=_session_manager(), config=_auth_config()))
+def test_watch_html_is_not_cached_but_hashed_assets_remain_static(tmp_path):
+    watch_dist = _write_watch_dist_fixture(tmp_path)
+    client = TestClient(
+        create_app(
+            session_manager=_session_manager(),
+            config=_auth_config_with_watch_dist(watch_dist),
+        )
+    )
 
     html_response = client.get("/watch/")
 

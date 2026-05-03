@@ -189,6 +189,11 @@ def _google_auth_config(config: Optional[dict]) -> dict:
     return ((config or {}).get("auth") or {}).get("google") or {}
 
 
+def _watch_frontend_config(config: Optional[dict]) -> dict:
+    """Return normalized watch frontend config block."""
+    return ((config or {}).get("watch_frontend") or {})
+
+
 def _google_auth_requested(config: Optional[dict]) -> bool:
     """Whether operators requested Google auth enforcement."""
     return bool(_google_auth_config(config).get("enabled"))
@@ -3315,7 +3320,12 @@ def create_app(
     def _configure_watch_frontend() -> None:
         """Serve the mobile dashboard if static assets exist in web/sm-watch/dist."""
         project_root = Path(__file__).resolve().parents[1]
-        watch_dist = project_root / "web" / "sm-watch" / "dist"
+        configured_dist = _watch_frontend_config(app.state.config).get("dist_path")
+        watch_dist = (
+            Path(str(configured_dist)).expanduser()
+            if configured_dist
+            else project_root / "web" / "sm-watch" / "dist"
+        )
 
         if not watch_dist.is_dir():
             detail = (
