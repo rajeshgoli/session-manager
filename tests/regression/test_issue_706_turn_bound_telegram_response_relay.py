@@ -223,6 +223,28 @@ def test_deferred_transcript_lag_waits_for_post_boundary_output(tmp_path):
     assert notifier.notify.await_args.args[0].context == "response after transcript lag"
 
 
+def test_unresolved_session_manager_id_uses_legacy_transcript_match(tmp_path):
+    transcript = tmp_path / "fallback.jsonl"
+    transcript.write_text(_assistant_line("fallback matched answer", uuid="fallback-answer"))
+    session = _session(transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": "stale-missing-session",
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "fallback matched answer"
+
+
 def test_long_chunk_group_is_deduped_as_one_output(tmp_path):
     transcript = tmp_path / "long.jsonl"
     transcript.write_text(_assistant_line("old", uuid="old"))
@@ -318,3 +340,8 @@ async def test_message_queue_records_inbound_boundary_only_after_delivery(tmp_pa
     assert active_turn is not None
     assert active_turn.inbound_id == msg.id
     assert active_turn.transcript_offset == transcript.stat().st_size
+    delivered_rows = mq._execute_query(
+        "SELECT delivered_at FROM message_queue WHERE id = ?",
+        (msg.id,),
+    )
+    assert delivered_rows[0][0].endswith("+00:00")

@@ -6329,7 +6329,7 @@ Provide ONLY the summary, no preamble or questions."""
 
         target_session = app.state.session_manager.get_session(session_id)
         if not target_session:
-            return True
+            return False
         if not target_session.telegram_chat_id:
             return True
 

@@ -2123,7 +2123,7 @@ class MessageQueueManager:
 
     def _mark_delivered(self, message_id: str) -> datetime:
         """Mark a message as delivered in the database."""
-        delivered_at = datetime.now()
+        delivered_at = datetime.now(timezone.utc)
         self._execute("""
             UPDATE message_queue SET delivered_at = ? WHERE id = ?
         """, (delivered_at.isoformat(), message_id))
