@@ -420,17 +420,25 @@ class ResponseRelayLedger:
             self._conn.commit()
 
 
-def _extract_visible_assistant_text(entry: dict) -> str:
+def _extract_visible_message_text(entry: dict) -> str:
     message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
-    content = message.get("content", [])
+    content = message.get("content", entry.get("content", []))
+    if isinstance(content, str):
+        return content.strip()
     texts: list[str] = []
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
                 text = item.get("text")
                 if isinstance(text, str):
                     texts.append(text)
     return "\n".join(texts).strip()
+
+
+def _extract_visible_assistant_text(entry: dict) -> str:
+    return _extract_visible_message_text(entry)
 
 
 def _assistant_message_id(entry: dict, line_start_offset: int, text: str) -> str:
@@ -444,6 +452,44 @@ def _assistant_message_id(entry: dict, line_start_offset: int, text: str) -> str
         if value:
             return str(value)
     return f"transcript:{line_start_offset}:{_hash_text(text)[:16]}"
+
+
+def find_claude_inbound_turn_boundary_offset(
+    transcript_path: str,
+    turn: InboundTurn,
+) -> Optional[int]:
+    """Find the byte offset immediately after the matching inbound user line."""
+    if not turn.text_hash:
+        return None
+
+    path = Path(transcript_path).expanduser()
+    if not path.exists():
+        return None
+
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        logger.warning("Could not read Claude transcript for inbound boundary %s: %s", transcript_path, exc)
+        return None
+
+    offset = 0
+    matched_offset: Optional[int] = None
+    for raw_line in data.splitlines(keepends=True):
+        offset += len(raw_line)
+        if not raw_line.strip():
+            continue
+        try:
+            entry = json.loads(raw_line.decode("utf-8").strip())
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.debug("Skipping malformed Claude transcript line for inbound boundary: %s", exc)
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "user":
+            continue
+        text = _extract_visible_message_text(entry)
+        if text and _hash_text(text) == turn.text_hash:
+            matched_offset = offset
+
+    return matched_offset
 
 
 def collect_claude_assistant_outputs_after_turn(

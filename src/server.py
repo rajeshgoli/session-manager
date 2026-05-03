@@ -1,6 +1,7 @@
 """FastAPI server for hooks and API endpoints."""
 
 import asyncio
+from dataclasses import replace
 import inspect
 import json
 import logging
@@ -61,6 +62,7 @@ from .mobile_analytics import MobileAnalyticsBuilder
 from .response_relay import (
     ResponseRelayLedger,
     collect_claude_assistant_outputs_after_turn,
+    find_claude_inbound_turn_boundary_offset,
 )
 
 logger = logging.getLogger(__name__)
@@ -6343,8 +6345,25 @@ Provide ONLY the summary, no preamble or questions."""
             return True
 
         effective_transcript_path = active_turn.transcript_path or transcript_path
-        if transcript_path and not active_turn.transcript_path:
-            ledger.update_inbound_boundary(active_turn.inbound_id, transcript_path=transcript_path)
+        boundary_offset = active_turn.transcript_offset
+        if effective_transcript_path and boundary_offset is None:
+            boundary_offset = find_claude_inbound_turn_boundary_offset(
+                effective_transcript_path,
+                active_turn,
+            )
+        should_update_path = bool(transcript_path and not active_turn.transcript_path)
+        should_update_offset = boundary_offset is not None and active_turn.transcript_offset is None
+        if should_update_path or should_update_offset:
+            ledger.update_inbound_boundary(
+                active_turn.inbound_id,
+                transcript_path=transcript_path if should_update_path else None,
+                transcript_offset=boundary_offset if should_update_offset else None,
+            )
+            active_turn = replace(
+                active_turn,
+                transcript_path=active_turn.transcript_path or transcript_path,
+                transcript_offset=boundary_offset,
+            )
         if not effective_transcript_path:
             app.state.pending_stop_notifications.add(session_id)
             logger.info(

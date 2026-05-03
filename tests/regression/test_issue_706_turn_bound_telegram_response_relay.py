@@ -32,6 +32,21 @@ def _assistant_line(text: str, *, timestamp: str | None = None, uuid: str | None
     return json.dumps(entry) + "\n"
 
 
+def _user_line(text: str, *, timestamp: str | None = None, uuid: str | None = None) -> str:
+    entry = {
+        "type": "user",
+        "message": {
+            "id": uuid or f"user-{abs(hash(text))}",
+            "content": [{"type": "text", "text": text}],
+        },
+    }
+    if timestamp:
+        entry["timestamp"] = timestamp
+    if uuid:
+        entry["uuid"] = uuid
+    return json.dumps(entry) + "\n"
+
+
 def _record_inbound(
     ledger: ResponseRelayLedger,
     session: Session,
@@ -222,6 +237,43 @@ def test_deferred_transcript_lag_waits_for_post_boundary_output(tmp_path):
     assert response.status_code == 200
     notifier.notify.assert_awaited_once()
     assert notifier.notify.await_args.args[0].context == "response after transcript lag"
+
+
+def test_missing_transcript_path_binds_offset_from_inbound_user_line(tmp_path):
+    transcript = tmp_path / "late-boundary.jsonl"
+    user_text = "the first input before transcript discovery"
+    prefix = _assistant_line("old answer before the turn", uuid="old") + _user_line(user_text, uuid="user-current")
+    transcript.write_text(prefix + _assistant_line("current answer without timestamp", uuid="answer-current"))
+    session = _session(transcript)
+    session.transcript_path = None
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    ledger.record_inbound_turn(
+        session_id=session.id,
+        inbound_id="inbound-late-boundary",
+        source="telegram",
+        provider=session.provider,
+        delivered_at=datetime(2026, 5, 2, 22, 24, 19, tzinfo=timezone.utc),
+        text=user_text,
+    )
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "current answer without timestamp"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.transcript_path == str(transcript)
+    assert active_turn.transcript_offset == len(prefix.encode("utf-8"))
 
 
 def test_unresolved_session_manager_id_uses_legacy_transcript_match(tmp_path):
