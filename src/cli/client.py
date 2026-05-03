@@ -188,6 +188,13 @@ class SessionManagerClient:
             return data.get("registrations", [])
         return None
 
+    def list_humans(self) -> Optional[list]:
+        """List configured human recipients."""
+        data, success, _ = self._request("GET", "/humans")
+        if success and data:
+            return data.get("humans", [])
+        return None
+
     def lookup_role(self, role: str) -> dict:
         """Resolve one registry role."""
         role_path = urllib.parse.quote(role, safe="")

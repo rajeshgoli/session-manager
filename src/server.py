@@ -1491,6 +1491,18 @@ def create_app(
             email_use=email_channel.use if email_channel else None,
         )
 
+    def _list_human_recipients() -> list[HumanRecipient]:
+        handler = getattr(app.state, "email_handler", None)
+        registry_getter = getattr(handler, "human_registry", None) if handler is not None else None
+        if not callable(registry_getter):
+            return []
+        try:
+            registry = registry_getter()
+            lister = getattr(registry, "list_recipients", None)
+            return list(lister()) if callable(lister) else []
+        except HumanRecipientConfigError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     async def _send_human_telegram(identifier: str, request: HumanDeliveryRequest) -> dict[str, Any]:
         human = _lookup_human_or_404(identifier)
         channel = human.channel("telegram")
@@ -6194,6 +6206,16 @@ Provide ONLY the summary, no preamble or questions."""
             success = True
 
         return {"status": "sent" if success else "failed"}
+
+    @app.get("/humans")
+    async def list_human_recipients():
+        """List configured human recipients without exposing addresses or secrets."""
+        return {
+            "humans": [
+                _response_dict(_human_to_response(human))
+                for human in _list_human_recipients()
+            ]
+        }
 
     @app.get("/humans/{identifier}", response_model=HumanRecipientResponse)
     async def lookup_human_recipient(identifier: str):

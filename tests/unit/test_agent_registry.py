@@ -66,6 +66,82 @@ def test_registering_maintainer_updates_compat_field(tmp_path):
     assert manager.get_maintainer_session().id == session.id
 
 
+def test_load_state_recovers_missing_maintainer_registration_from_live_last_holder(tmp_path):
+    session = _session("maint123", tmp_path)
+    session.friendly_name = "maintainer"
+    state_path = tmp_path / "sessions.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "sessions": [session.to_dict()],
+                "maintainer_session_id": None,
+                "agent_registrations": [],
+                "agent_role_last_session_ids": {"maintainer": session.id},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("src.session_manager.TmuxController") as tmux_cls:
+        tmux_cls.return_value.session_exists.return_value = True
+        manager = SessionManager(
+            log_dir=str(tmp_path / "logs"),
+            state_file=str(state_path),
+            config={},
+        )
+
+    registration = manager.lookup_agent_registration("maintainer")
+    assert registration is not None
+    assert registration.session_id == session.id
+    assert manager.maintainer_session_id == session.id
+
+    state_data = json.loads(state_path.read_text())
+    assert state_data["agent_registrations"][0]["role"] == "maintainer"
+    assert state_data["agent_registrations"][0]["session_id"] == session.id
+
+
+def test_load_state_recovers_missing_maintainer_registration_for_restorable_holder(tmp_path):
+    session = _session("maint123", tmp_path)
+    session.friendly_name = "maintainer"
+    session.status = SessionStatus.STOPPED
+    session.provider = "codex-fork"
+    session.provider_resume_id = "resume-maint123"
+    state_path = tmp_path / "sessions.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "sessions": [session.to_dict()],
+                "maintainer_session_id": None,
+                "agent_registrations": [],
+                "agent_role_last_session_ids": {"maintainer": session.id},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(state_path),
+        config={},
+    )
+
+    registration = manager.lookup_agent_registration("maintainer")
+    assert registration is not None
+    assert registration.session_id == session.id
+
+
+def test_explicit_unregister_clears_last_role_hint(tmp_path):
+    manager = _manager(tmp_path)
+    session = _session("role1234", tmp_path)
+    manager.sessions[session.id] = session
+    manager.register_agent_role(session.id, "reviewer")
+
+    assert manager.unregister_agent_role(session.id, "reviewer") is True
+
+    state_data = json.loads((tmp_path / "sessions.json").read_text())
+    assert "reviewer" not in state_data["agent_role_last_session_ids"]
+
+
 def test_lookup_prunes_stopped_registration(tmp_path):
     manager = _manager(tmp_path)
     session = _session("stop1234", tmp_path)
@@ -276,11 +352,67 @@ def test_cmd_register_lookup_unregister_and_roster(capsys):
     assert cmd_unregister(client, "sess1234", "reviewer") == 0
     assert "Unregistered: reviewer" in capsys.readouterr().out
 
+    client.list_humans.return_value = []
     assert cmd_roster(client) == 0
     roster_output = capsys.readouterr().out
+    assert "Agents" in roster_output
     assert "Role" in roster_output
     assert "reviewer" in roster_output
     assert "sess1234" in roster_output
+
+
+def test_cmd_roster_lists_reachable_humans(capsys):
+    client = Mock()
+    client.list_registry.return_value = []
+    client.list_humans.return_value = [
+        {
+            "recipient": "rajesh",
+            "display_name": "Human operator",
+            "aliases": ["rajesh", "rajeshgoli", "user"],
+            "default_channel": "telegram",
+            "available_channels": ["telegram", "email"],
+        }
+    ]
+
+    assert cmd_roster(client) == 0
+
+    output = capsys.readouterr().out
+    assert "Humans" in output
+    assert "rajesh" in output
+    assert "Human operator" in output
+    assert "rajeshgoli,user" in output
+    assert "telegram,email" in output
+
+
+def test_cmd_roster_lists_roles_and_humans(capsys):
+    client = Mock()
+    client.list_registry.return_value = [
+        {
+            "role": "maintainer",
+            "session_id": "9b134c6e",
+            "friendly_name": "maintainer",
+            "provider": "codex-fork",
+            "activity_state": "working",
+        }
+    ]
+    client.list_humans.return_value = [
+        {
+            "recipient": "rajesh",
+            "display_name": "Human operator",
+            "aliases": ["rajesh", "user"],
+            "default_channel": "telegram",
+            "available_channels": ["telegram", "email"],
+        }
+    ]
+
+    assert cmd_roster(client) == 0
+
+    output = capsys.readouterr().out
+    assert "Agents" in output
+    assert "maintainer" in output
+    assert "9b134c6e" in output
+    assert "Humans" in output
+    assert "rajesh" in output
 
 
 def test_cmd_lookup_human_alias_prints_delivery_guidance(capsys):

@@ -76,6 +76,15 @@ def test_lookup_human_uses_humans_endpoint():
     req.assert_called_once_with("GET", "/humans/user")
 
 
+def test_list_humans_uses_humans_endpoint():
+    client = _make_client()
+    payload = {"humans": [{"recipient": "rajesh"}]}
+    with patch.object(client, "_request", return_value=(payload, True, False)) as req:
+        result = client.list_humans()
+    assert result == payload["humans"]
+    req.assert_called_once_with("GET", "/humans")
+
+
 def test_send_human_telegram_result_uses_humans_endpoint():
     client = _make_client()
     payload = {"status": "sent", "recipient": "rajesh"}

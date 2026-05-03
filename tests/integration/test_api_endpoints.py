@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from src.server import create_app
 from src.email_handler import RegisteredEmailUser
-from src.human_recipients import HumanChannel, HumanRecipient
+from src.human_recipients import HumanChannel, HumanRecipient, HumanRecipientRegistry
 from src.models import Session, SessionStatus, Subagent, SubagentStatus, DeliveryResult
 
 
@@ -359,6 +359,28 @@ class TestHumanRecipientEndpoints:
         assert data["available_channels"] == ["telegram", "email"]
         assert data["telegram_delivery"] == "sender_session_topic"
         assert data["email_use"] == "fallback_only"
+
+    def test_list_humans_redacts_addresses(self, test_client, mock_email_handler):
+        mock_email_handler.human_registry.return_value = HumanRecipientRegistry(
+            {"rajesh": _human_recipient()}
+        )
+
+        response = test_client.get("/humans")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["humans"] == [
+            {
+                "recipient": "rajesh",
+                "display_name": "Human operator",
+                "aliases": ["rajesh", "rajeshgoli", "user"],
+                "default_channel": "telegram",
+                "available_channels": ["telegram", "email"],
+                "telegram_delivery": "sender_session_topic",
+                "email_use": "fallback_only",
+            }
+        ]
+        assert "private@example.com" not in response.text
 
     def test_forced_telegram_posts_to_sender_topic(
         self,
