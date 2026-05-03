@@ -19,9 +19,10 @@ sm send user "message"
 
 sm telegram rajesh "message"
 sm tg rajesh "message"
+sm email rajesh "message"
 ```
 
-`sm send` should use the configured default human channel. For this deployment, Telegram should be the normal default and email should be an explicit or fallback channel. `sm telegram` and its short alias `sm tg` should force Telegram delivery and fail clearly if Telegram is not available for that human recipient.
+`sm send <human> ...` should use the normal human channel: Telegram into the sender agent's SM-managed topic. `sm telegram` and its short alias `sm tg` should force the same Telegram path. `sm email` should be the explicit sparse fallback for email.
 
 ## Problem
 
@@ -52,7 +53,7 @@ Agents cannot infer the right behavior from `sm lookup`, and the working path is
 1. Do not expose a shell or attach capability through the human recipient path.
 2. Do not create arbitrary public inbound messaging. This is an outbound operator notification surface for trusted local SM agents.
 3. Do not require agents to know Telegram chat ids or email addresses.
-4. Do not remove existing email fallback behavior; make it discoverable, explicit, and lower-precedence than Telegram.
+4. Do not remove existing email fallback behavior; make it discoverable and explicit through `sm email`.
 5. Do not solve automatic agent-response relay correctness here; that is covered by #705 and #706.
 
 ## Recipient Model
@@ -143,7 +144,7 @@ Email-only human route; use sparingly.
 
 ### `sm send`
 
-`sm send` should accept human aliases after live-session/role resolution:
+`sm send` should accept human aliases and deliver through the normal human channel, which is Telegram into the sender session's SM-managed topic:
 
 ```bash
 sm send rajesh "message"
@@ -167,8 +168,8 @@ Email sent to rajesh
 If the default channel is unavailable, the command may either fail clearly or fall back according to config. The recommended default is:
 
 - use configured `default_channel`;
-- if unavailable and `fallback_channels` is configured, try those in order;
-- otherwise fail with a clear error.
+- for this deployment, `default_channel` should be `telegram`;
+- if Telegram is unavailable, fail clearly by default;
 - do not fall back from Telegram to email unless config explicitly allows fallback and command output states that email was used.
 
 ### `sm telegram`
@@ -191,15 +192,32 @@ Semantics:
 
 This command gives agents an unambiguous way to contact the user when instructed: "Use `sm telegram rajesh ...` for this conversation." `sm tg` is an ergonomic alias for the same command.
 
+### `sm email`
+
+Add an explicit email command:
+
+```bash
+sm email rajesh "message"
+```
+
+Semantics:
+
+- Resolve only human recipients, not live sessions.
+- Force email channel.
+- Fail if the recipient has no enabled email channel.
+- Print a concise success/failure message without exposing the private address unless local config explicitly allows it.
+
+This command keeps email available for rare cases where the user asks for it, while making `sm send rajesh ...` mean the clean Telegram-in-agent-thread path.
+
 ## Safety And Abuse Controls
 
 Human-recipient delivery should be intentionally lightweight but not silent:
 
 - `sm lookup` explains that Telegram is normal for human contact and email should be sparse/explicit.
-- `sm send`/`sm telegram` should include channel-specific audit telemetry.
+- `sm send`/`sm telegram`/`sm email` should include channel-specific audit telemetry.
 - Rate limits should protect against accidental notification loops, with an override path only if one already exists for urgent SM messages.
 - Telegram message content should go to the sender agent's SM-managed Telegram thread by default.
-- Email should be used sparingly: explicit email command/channel or configured fallback only.
+- Email should be used sparingly: explicit `sm email` or configured fallback only.
 - Config secrets such as chat ids and email credentials must not be printed.
 - The command should be available only to local SM clients with the same trust boundary as existing `sm send`; do not expose this as unauthenticated HTTP.
 
@@ -211,16 +229,18 @@ Human-recipient delivery should be intentionally lightweight but not silent:
 4. Update `sm send` recipient resolution to support human aliases after exact session-id lookup.
 5. Add `sm telegram <human> <message>` and `sm tg <human> <message>` as forced-Telegram delivery commands.
 6. Wire Telegram delivery through the existing bot/notifier channel into the sender session's SM-managed Telegram topic.
-7. Preserve existing email send behavior, but make it fallback/explicit rather than the normal human channel when Telegram is available.
-8. Add tests for alias lookup, reserved-name rejection, forced Telegram delivery to sender topic, email fallback, missing Telegram topic/config, missing Telegram config, and secret redaction.
-9. Update `sm -h` / command help so agents can discover the human contact path.
+7. Add `sm email <human> <message>` as the explicit email delivery command.
+8. Preserve existing email send behavior behind the explicit command and optional configured fallback, not as the normal `sm send <human>` route.
+9. Add tests for alias lookup, reserved-name rejection, default `sm send` Telegram delivery to sender topic, forced Telegram delivery to sender topic, explicit email delivery, missing Telegram topic/config, missing Telegram config, and secret redaction.
+10. Update `sm -h` / command help so agents can discover the human contact path.
 
 ## Acceptance Criteria
 
 1. `sm lookup rajesh`, `sm lookup rajeshgoli`, and `sm lookup user` resolve to the configured human recipient and explain that Telegram is the normal channel while email is sparse/explicit.
-2. `sm send rajesh ...`, `sm send rajeshgoli ...`, and `sm send user ...` all route through the configured human default channel.
+2. `sm send rajesh ...`, `sm send rajeshgoli ...`, and `sm send user ...` all route through Telegram into the sender session's SM-managed Telegram topic by default.
 3. `sm telegram rajesh ...` and `sm tg rajesh ...` send via Telegram into the sender session's SM-managed Telegram topic, or fail clearly when that topic/channel is unavailable.
 4. `sm spawn --name user ...`, `sm name <id> user`, and `sm register user` are rejected when `user` is a configured human alias.
-5. Email delivery is still available where configured, but command/help text positions it as sparse fallback or explicit delivery, not the normal agent-to-user path.
-6. Config secrets and private addresses are not printed in command output, committed example config, or routine logs.
-7. Help text documents the human-recipient path clearly enough that an agent can use it when instructed.
+5. `sm email rajesh ...` sends via email when configured and fails clearly otherwise.
+6. Email delivery is still available where configured, but command/help text positions it as sparse fallback or explicit delivery, not the normal agent-to-user path.
+7. Config secrets and private addresses are not printed in command output, committed example config, or routine logs.
+8. Help text documents the human-recipient path clearly enough that an agent can use it when instructed.
