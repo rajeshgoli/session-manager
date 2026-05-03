@@ -54,6 +54,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private val deviceKeyManager = DeviceKeyManager()
     private var refreshJob: Job? = null
     private var terminalSocket: WebSocket? = null
+    private var terminalAttachToken: String? = null
 
     private val _uiState = MutableStateFlow(WatchUiState())
     val uiState: StateFlow<WatchUiState> = _uiState
@@ -74,6 +75,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        terminalAttachToken = null
         terminalSocket?.close(1000, "viewmodel cleared")
         terminalSocket = null
         super.onCleared()
@@ -238,6 +240,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 onComplete(Result.failure(IllegalStateException("Sign in to attach")))
                 return@launch
             }
+            val attachToken = UUID.randomUUID().toString()
+            terminalAttachToken = attachToken
             val path = sessionRepository.mobileAttachTicketPath(serverUrl, session.id)
             _uiState.value = _uiState.value.copy(
                 terminal = TerminalUiState(
@@ -254,15 +258,13 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     actorEmail = actorEmail,
                 )
             }.getOrElse { error ->
-                _uiState.value = _uiState.value.copy(terminal = null)
+                clearTerminalIfCurrent(attachToken)
                 onComplete(Result.failure(error))
                 return@launch
             }
             val ticketResult = sessionRepository.createMobileAttachTicket(serverUrl, accessToken, session.id, proof)
             ticketResult.onFailure { error ->
-                _uiState.value = _uiState.value.copy(
-                    terminal = _uiState.value.terminal?.copy(status = "failed", error = error.message)
-                )
+                updateTerminalIfCurrent(attachToken) { it.copy(status = "failed", error = error.message) }
                 onComplete(Result.failure(error))
                 return@launch
             }
@@ -277,9 +279,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     nonce = wsNonce,
                 )
             }.getOrElse { error ->
-                _uiState.value = _uiState.value.copy(
-                    terminal = _uiState.value.terminal?.copy(status = "failed", error = error.message)
-                )
+                updateTerminalIfCurrent(attachToken) { it.copy(status = "failed", error = error.message) }
                 onComplete(Result.failure(error))
                 return@launch
             }
@@ -295,19 +295,16 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                         .put("signature", wsSignature)
                     webSocket.send(frame.toString())
                     viewModelScope.launch {
-                        _uiState.value = _uiState.value.copy(
-                            terminal = _uiState.value.terminal?.copy(status = "authenticating", error = null)
-                        )
+                        updateTerminalIfCurrent(attachToken) { it.copy(status = "authenticating", error = null) }
                     }
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     val payload = runCatching { JSONObject(text) }.getOrNull() ?: return
                     viewModelScope.launch {
-                        val current = _uiState.value.terminal ?: return@launch
                         when (payload.optString("type")) {
-                            "output" -> _uiState.value = _uiState.value.copy(
-                                terminal = current.copy(
+                            "output" -> updateTerminalIfCurrent(attachToken) { current ->
+                                current.copy(
                                     status = "attached",
                                     output = if (payload.optString("mode") == "snapshot") {
                                         payload.optString("data")
@@ -316,33 +313,29 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                     },
                                     error = null,
                                 )
-                            )
-                            "status" -> _uiState.value = _uiState.value.copy(
-                                terminal = current.copy(status = payload.optString("state", current.status))
-                            )
-                            "error" -> _uiState.value = _uiState.value.copy(
-                                terminal = current.copy(error = payload.optString("message", "Terminal error"))
-                            )
-                            "exit" -> _uiState.value = _uiState.value.copy(
-                                terminal = current.copy(status = "detached")
-                            )
+                            }
+                            "status" -> updateTerminalIfCurrent(attachToken) {
+                                it.copy(status = payload.optString("state", it.status))
+                            }
+                            "error" -> updateTerminalIfCurrent(attachToken) {
+                                it.copy(error = payload.optString("message", "Terminal error"))
+                            }
+                            "exit" -> updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
                         }
                     }
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     viewModelScope.launch {
-                        _uiState.value = _uiState.value.copy(
-                            terminal = _uiState.value.terminal?.copy(status = "failed", error = t.message ?: "Terminal socket failed")
-                        )
+                        updateTerminalIfCurrent(attachToken) {
+                            it.copy(status = "failed", error = t.message ?: "Terminal socket failed")
+                        }
                     }
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     viewModelScope.launch {
-                        _uiState.value = _uiState.value.copy(
-                            terminal = _uiState.value.terminal?.copy(status = "detached")
-                        )
+                        updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
                     }
                 }
             })
@@ -373,11 +366,31 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun detachTerminal() {
+        terminalAttachToken = null
         terminalSocket?.send(JSONObject().put("type", "detach").toString())
         terminalSocket?.close(1000, "detach")
         terminalSocket = null
         _uiState.value = _uiState.value.copy(terminal = null)
         refresh()
+    }
+
+    private fun updateTerminalIfCurrent(
+        attachToken: String,
+        transform: (TerminalUiState) -> TerminalUiState,
+    ) {
+        if (terminalAttachToken != attachToken) {
+            return
+        }
+        val current = _uiState.value.terminal ?: return
+        _uiState.value = _uiState.value.copy(terminal = transform(current))
+    }
+
+    private fun clearTerminalIfCurrent(attachToken: String) {
+        if (terminalAttachToken != attachToken) {
+            return
+        }
+        terminalAttachToken = null
+        _uiState.value = _uiState.value.copy(terminal = null)
     }
 
     fun requestStatus(onComplete: (Result<String>) -> Unit) {
