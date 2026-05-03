@@ -2050,17 +2050,7 @@ class SessionManager:
             context=text,
             urgent=False,
         )
-        try:
-            accepted = await notifier.notify(event_obj, session)
-        except Exception as exc:
-            logger.warning(
-                "Failed to relay Codex assistant message for %s turn %s item %s: %s",
-                session_id,
-                normalized_turn_id,
-                normalized_item_id,
-                exc,
-            )
-            return False
+        accepted = await notifier.notify(event_obj, session)
         if not accepted:
             return False
 
@@ -2106,6 +2096,26 @@ class SessionManager:
             )
             self._codex_assistant_message_deltas.pop(key, None)
 
+    def _discard_codex_assistant_deltas_for_turn(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> None:
+        """Drop buffered delta fallback for a turn when completed text is available."""
+        normalized_turn_id = self._codex_payload_id(turn_id)
+        if not normalized_turn_id:
+            return
+        normalized_thread_id = self._normalize_codex_thread_id(thread_id)
+        for key in list(self._codex_assistant_message_deltas.keys()):
+            key_session_id, key_thread_id, key_turn_id, _ = key
+            if key_session_id != session_id or key_turn_id != normalized_turn_id:
+                continue
+            if normalized_thread_id and key_thread_id and key_thread_id != normalized_thread_id:
+                continue
+            self._codex_assistant_message_deltas.pop(key, None)
+
     async def _handle_codex_fork_assistant_relay_event(
         self,
         session_id: str,
@@ -2114,72 +2124,77 @@ class SessionManager:
         """Consume codex-fork assistant events and relay completed visible output."""
         if not isinstance(event, dict):
             return
-        try:
-            raw_event_type = event.get("event_type") or event.get("type")
-            normalized = self._normalize_codex_fork_event_type(raw_event_type)
-            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            thread_id = self._codex_fork_thread_id_for_event(event, payload)
+        raw_event_type = event.get("event_type") or event.get("type")
+        normalized = self._normalize_codex_fork_event_type(raw_event_type)
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        thread_id = self._codex_fork_thread_id_for_event(event, payload)
 
-            if normalized in {"item/agent_message/delta", "agent_message_content_delta"}:
-                turn_id = self._codex_payload_id(
-                    payload.get("turnId") or payload.get("turn_id") or event.get("turn_id")
-                )
-                message_item_id = self._codex_payload_id(
-                    payload.get("itemId") or payload.get("item_id") or payload.get("message_item_id")
-                )
-                self._accumulate_codex_assistant_delta(
+        if normalized in {"item/agent_message/delta", "agent_message_content_delta"}:
+            turn_id = self._codex_payload_id(
+                payload.get("turnId") or payload.get("turn_id") or event.get("turn_id")
+            )
+            message_item_id = self._codex_payload_id(
+                payload.get("itemId") or payload.get("item_id") or payload.get("message_item_id")
+            )
+            self._accumulate_codex_assistant_delta(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                message_item_id=message_item_id,
+                delta=payload.get("delta"),
+            )
+            return
+
+        if normalized in {"item_completed", "item/completed"}:
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+            if item.get("type") != "agentMessage":
+                return
+            turn_id = self._codex_payload_id(
+                payload.get("turnId") or payload.get("turn_id") or event.get("turn_id")
+            )
+            message_item_id = self._codex_payload_id(
+                item.get("id")
+                or payload.get("itemId")
+                or payload.get("item_id")
+                or payload.get("message_item_id")
+            )
+            key = None
+            if turn_id and message_item_id:
+                key = self._codex_assistant_delta_key(
                     session_id=session_id,
                     thread_id=thread_id,
                     turn_id=turn_id,
                     message_item_id=message_item_id,
-                    delta=payload.get("delta"),
                 )
-                return
+            completed_text = self._codex_payload_text(item.get("text"))
+            if not completed_text and key:
+                completed_text = "".join(self._codex_assistant_message_deltas.get(key, []))
+            await self._relay_codex_assistant_message(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                message_item_id=message_item_id,
+                text=completed_text,
+            )
+            if key:
+                self._codex_assistant_message_deltas.pop(key, None)
+            return
 
-            if normalized in {"item_completed", "item/completed"}:
-                item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
-                if item.get("type") != "agentMessage":
-                    return
-                turn_id = self._codex_payload_id(
-                    payload.get("turnId") or payload.get("turn_id") or event.get("turn_id")
-                )
-                message_item_id = self._codex_payload_id(
-                    item.get("id")
-                    or payload.get("itemId")
-                    or payload.get("item_id")
-                    or payload.get("message_item_id")
-                )
-                key = None
-                if turn_id and message_item_id:
-                    key = self._codex_assistant_delta_key(
-                        session_id=session_id,
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        message_item_id=message_item_id,
-                    )
-                completed_text = self._codex_payload_text(item.get("text"))
-                if not completed_text and key:
-                    completed_text = "".join(self._codex_assistant_message_deltas.get(key, []))
-                await self._relay_codex_assistant_message(
-                    session_id=session_id,
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    message_item_id=message_item_id,
-                    text=completed_text,
-                )
-                if key:
-                    self._codex_assistant_message_deltas.pop(key, None)
-                return
-
-            if normalized == "turn_complete":
-                turn_id = self._codex_payload_id(payload.get("turn_id") or event.get("turn_id"))
-                await self._relay_codex_assistant_deltas_for_turn(
+        if normalized == "turn_complete":
+            turn_id = self._codex_payload_id(payload.get("turn_id") or event.get("turn_id"))
+            last_message = payload.get("last_agent_message")
+            if isinstance(last_message, str) and last_message.strip():
+                self._discard_codex_assistant_deltas_for_turn(
                     session_id=session_id,
                     thread_id=thread_id,
                     turn_id=turn_id,
                 )
-        except Exception as exc:
-            logger.warning("Skipping malformed codex-fork assistant relay event for %s: %s", session_id, exc)
+                return
+            await self._relay_codex_assistant_deltas_for_turn(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
 
     def ingest_codex_fork_event(self, session_id: str, event: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Ingest one codex-fork bridge event record."""

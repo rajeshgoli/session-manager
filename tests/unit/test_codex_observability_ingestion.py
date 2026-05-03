@@ -420,6 +420,52 @@ async def test_codex_fork_assistant_relay_suppresses_empty_output(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_codex_fork_turn_complete_full_output_beats_delta_fallback(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "session_id": "thread-full",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-full",
+                "turnId": "turn-full",
+                "itemId": "msg-full",
+                "delta": "partial suffix only",
+            },
+        },
+    )
+    turn_complete = {
+        "schema_version": 2,
+        "event_type": "turn_complete",
+        "session_id": "thread-full",
+        "seq": 2,
+        "session_epoch": 1,
+        "payload": {
+            "turn_id": "turn-full",
+            "last_agent_message": "canonical full answer",
+        },
+    }
+
+    await _ingest_and_relay(manager, session.id, turn_complete)
+    await manager._handle_codex_fork_turn_complete(
+        session_id=session.id,
+        last_message="canonical full answer",
+        event=turn_complete,
+    )
+
+    manager.notifier.notify.assert_awaited_once()
+    event = manager.notifier.notify.await_args.args[0]
+    assert event.context == "canonical full answer"
+    assert manager._codex_assistant_message_deltas == {}
+
+
+@pytest.mark.asyncio
 async def test_codex_fork_assistant_relay_tolerates_malformed_events(tmp_path):
     manager, session = _codex_fork_relay_manager(tmp_path)
 
@@ -469,6 +515,46 @@ async def test_codex_fork_monitor_surfaces_ingestion_failures(tmp_path):
         manager,
         "ingest_codex_fork_event",
         side_effect=sqlite3.OperationalError("forced persistence failure"),
+    ):
+        await asyncio.wait_for(manager._monitor_codex_fork_event_stream(session.id), timeout=1.0)
+
+    assert manager.codex_fork_lifecycle[session.id]["state"] == "error"
+    assert (
+        manager.codex_fork_lifecycle[session.id]["cause_event_type"]
+        == "event_stream_monitor_error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_monitor_surfaces_assistant_relay_failures(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+    stream_path = manager._codex_fork_event_stream_path(session)
+    stream_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "event_type": "item_completed",
+                "session_id": "thread-relay-failure",
+                "seq": 1,
+                "session_epoch": 1,
+                "payload": {
+                    "threadId": "thread-relay-failure",
+                    "turnId": "turn-relay-failure",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-relay-failure",
+                        "text": "should not be swallowed",
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+
+    with patch.object(
+        manager.codex_event_store,
+        "has_assistant_message_relayed",
+        side_effect=sqlite3.OperationalError("forced relay ledger failure"),
     ):
         await asyncio.wait_for(manager._monitor_codex_fork_event_stream(session.id), timeout=1.0)
 
