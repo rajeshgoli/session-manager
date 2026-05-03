@@ -2466,27 +2466,20 @@ class SessionManager:
                             if not isinstance(event, dict):
                                 logger.debug("Skipping malformed codex-fork event line for %s", session_id)
                                 continue
-                            try:
-                                self.ingest_codex_fork_event(session_id, event)
-                                await self._handle_codex_fork_assistant_relay_event(session_id, event)
-                                normalized = self._normalize_codex_fork_event_type(
-                                    event.get("event_type") or event.get("type")
-                                )
-                                if normalized == "turn_complete":
-                                    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                                    last_message = payload.get("last_agent_message")
-                                    if isinstance(last_message, str) and last_message.strip():
-                                        await self._handle_codex_fork_turn_complete(
-                                            session_id=session_id,
-                                            last_message=last_message,
-                                            event=event,
-                                        )
-                            except Exception as exc:
-                                logger.warning(
-                                    "Skipping malformed codex-fork event for %s: %s",
-                                    session_id,
-                                    exc,
-                                )
+                            self.ingest_codex_fork_event(session_id, event)
+                            await self._handle_codex_fork_assistant_relay_event(session_id, event)
+                            normalized = self._normalize_codex_fork_event_type(
+                                event.get("event_type") or event.get("type")
+                            )
+                            if normalized == "turn_complete":
+                                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                                last_message = payload.get("last_agent_message")
+                                if isinstance(last_message, str) and last_message.strip():
+                                    await self._handle_codex_fork_turn_complete(
+                                        session_id=session_id,
+                                        last_message=last_message,
+                                        event=event,
+                                    )
 
                 await asyncio.sleep(self.codex_fork_event_poll_interval_seconds)
         except asyncio.CancelledError:

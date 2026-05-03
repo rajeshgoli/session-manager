@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -444,3 +445,35 @@ async def test_codex_fork_assistant_relay_tolerates_malformed_events(tmp_path):
     )
 
     manager.notifier.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_monitor_surfaces_ingestion_failures(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+    stream_path = manager._codex_fork_event_stream_path(session)
+    stream_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "event_type": "turn_started",
+                "session_id": "thread-failure",
+                "seq": 1,
+                "session_epoch": 1,
+                "payload": {"turn_id": "turn-failure"},
+            }
+        )
+        + "\n"
+    )
+
+    with patch.object(
+        manager,
+        "ingest_codex_fork_event",
+        side_effect=sqlite3.OperationalError("forced persistence failure"),
+    ):
+        await asyncio.wait_for(manager._monitor_codex_fork_event_stream(session.id), timeout=1.0)
+
+    assert manager.codex_fork_lifecycle[session.id]["state"] == "error"
+    assert (
+        manager.codex_fork_lifecycle[session.id]["cause_event_type"]
+        == "event_stream_monitor_error"
+    )
