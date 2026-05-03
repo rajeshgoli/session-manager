@@ -2,6 +2,7 @@ package li.rajeshgo.sm.ui.settings
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -62,7 +63,7 @@ fun SettingsScreen(
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            text = "Native Android watch client for sm.rajeshgo.li with direct Termux attach.",
+            text = "Native Android watch client for sm.rajeshgo.li with in-app HTTPS terminal attach.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -118,6 +119,64 @@ fun SettingsScreen(
                 color = Cyan,
                 fontFamily = FontFamily.Monospace,
             )
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = PanelElevated),
+            border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "Mobile HTTPS attach",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "Register this public key under mobile_terminal.allowed_users in Session Manager config to enable in-app terminal attach.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "Device key id",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = state.mobileDeviceKeyId.ifBlank { "unavailable" },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (state.mobileDeviceKeyId.isBlank()) Rose else Cyan,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = state.mobileDevicePublicKey.ifBlank { state.mobileDeviceKeyError ?: "No key generated yet" },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (state.mobileDeviceKeyError == null) MaterialTheme.colorScheme.onSurfaceVariant else Rose,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = viewModel::loadMobileDeviceKey) {
+                        Text("Refresh key")
+                    }
+                    Button(
+                        onClick = {
+                            val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                            val text = "id: ${state.mobileDeviceKeyId}\npublic_key: |\n" +
+                                state.mobileDevicePublicKey.lines().joinToString("\n") { "  $it" }
+                            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm mobile attach key", text))
+                        },
+                        enabled = state.mobileDeviceKeyId.isNotBlank() && state.mobileDevicePublicKey.isNotBlank(),
+                    ) {
+                        Text("Copy config")
+                    }
+                }
+            }
         }
 
         Spacer(Modifier.height(24.dp))
@@ -251,7 +310,7 @@ fun SettingsScreen(
 
         Spacer(Modifier.height(24.dp))
         Text(
-            text = "Attach note: install Termux, allow external apps, complete Cloudflare Access login there, and add your SSH public key once. Password auth is unsupported.",
+            text = "Attach note: HTTPS in-app attach is primary when mobile_terminal is enabled server-side. Termux remains a temporary fallback for sessions without mobile terminal support.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

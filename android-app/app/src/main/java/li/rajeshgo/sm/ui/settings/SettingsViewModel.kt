@@ -13,6 +13,7 @@ import li.rajeshgo.sm.data.repository.AppUpdateRepository
 import li.rajeshgo.sm.data.repository.AvailableAppUpdate
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
+import li.rajeshgo.sm.data.security.DeviceKeyManager
 
 data class SettingsUiState(
     val serverUrl: String = "",
@@ -22,6 +23,9 @@ data class SettingsUiState(
     val loading: Boolean = false,
     val bootstrap: ClientBootstrapResponse? = null,
     val availableUpdate: AvailableAppUpdate? = null,
+    val mobileDeviceKeyId: String = "",
+    val mobileDevicePublicKey: String = "",
+    val mobileDeviceKeyError: String? = null,
     val updateInstalling: Boolean = false,
     val updateError: String? = null,
     val error: String? = null,
@@ -31,6 +35,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val settingsRepository = SettingsRepository(application)
     private val sessionRepository = SessionManagerRepository()
     private val appUpdateRepository = AppUpdateRepository(application, settingsRepository)
+    private val deviceKeyManager = DeviceKeyManager()
 
     private val _uiState = MutableStateFlow(SettingsUiState())
     val uiState: StateFlow<SettingsUiState> = _uiState
@@ -43,6 +48,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 userName = settingsRepository.userName.first(),
                 isLoggedIn = settingsRepository.isLoggedIn.first(),
             )
+            loadMobileDeviceKey()
             refreshBootstrap()
             refreshUpdate()
         }
@@ -68,6 +74,22 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             }.onFailure { error ->
                 _uiState.value = _uiState.value.copy(error = error.message ?: "Failed to load bootstrap")
             }
+        }
+    }
+
+    fun loadMobileDeviceKey() {
+        runCatching {
+            deviceKeyManager.deviceKeyId() to deviceKeyManager.publicKeyPem()
+        }.onSuccess { (keyId, publicKey) ->
+            _uiState.value = _uiState.value.copy(
+                mobileDeviceKeyId = keyId,
+                mobileDevicePublicKey = publicKey,
+                mobileDeviceKeyError = null,
+            )
+        }.onFailure { error ->
+            _uiState.value = _uiState.value.copy(
+                mobileDeviceKeyError = error.message ?: "Failed to load mobile attach device key",
+            )
         }
     }
 

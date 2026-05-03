@@ -8,6 +8,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import java.util.UUID
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
@@ -16,6 +21,16 @@ import li.rajeshgo.sm.data.repository.SessionManagerBackendUnavailableException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SessionManagerTransientException
 import li.rajeshgo.sm.data.repository.SettingsRepository
+import li.rajeshgo.sm.data.security.DeviceKeyManager
+
+data class TerminalUiState(
+    val sessionId: String,
+    val title: String,
+    val status: String = "connecting",
+    val output: String = "",
+    val inputDraft: String = "",
+    val error: String? = null,
+)
 
 data class WatchUiState(
     val serverUrl: String = "",
@@ -28,6 +43,7 @@ data class WatchUiState(
     val refreshing: Boolean = false,
     val requestingStatus: Boolean = false,
     val ensuringMaintainer: Boolean = false,
+    val terminal: TerminalUiState? = null,
     val lastSync: String? = null,
     val error: String? = null,
 )
@@ -35,7 +51,10 @@ data class WatchUiState(
 class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
     private val sessionRepository = SessionManagerRepository()
+    private val deviceKeyManager = DeviceKeyManager()
     private var refreshJob: Job? = null
+    private var terminalSocket: WebSocket? = null
+    private var terminalAttachToken: String? = null
 
     private val _uiState = MutableStateFlow(WatchUiState())
     val uiState: StateFlow<WatchUiState> = _uiState
@@ -53,6 +72,13 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = _uiState.value.copy(serverUrl = serverUrl, userEmail = userEmail, bootstrap = bootstrap)
             refresh(initial = true)
         }
+    }
+
+    override fun onCleared() {
+        terminalAttachToken = null
+        terminalSocket?.close(1000, "viewmodel cleared")
+        terminalSocket = null
+        super.onCleared()
     }
 
     fun refresh(initial: Boolean = false) {
@@ -203,6 +229,172 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             }
             onComplete(result)
         }
+    }
+
+    fun openMobileTerminal(session: ClientSession, onComplete: (Result<String>) -> Unit) {
+        viewModelScope.launch {
+            val serverUrl = settingsRepository.serverUrl.first()
+            val accessToken = settingsRepository.accessToken.first()
+            val actorEmail = settingsRepository.userEmail.first()
+            if (serverUrl.isBlank() || accessToken.isBlank() || actorEmail.isBlank()) {
+                onComplete(Result.failure(IllegalStateException("Sign in to attach")))
+                return@launch
+            }
+            val attachToken = UUID.randomUUID().toString()
+            terminalAttachToken = attachToken
+            val path = sessionRepository.mobileAttachTicketPath(
+                baseUrl = serverUrl,
+                sessionId = session.id,
+                advertisedEndpoint = session.mobileTerminal?.ticketEndpoint,
+            )
+            _uiState.value = _uiState.value.copy(
+                terminal = TerminalUiState(
+                    sessionId = session.id,
+                    title = sessionDisplayName(session),
+                    status = "requesting ticket",
+                )
+            )
+            val proof = runCatching {
+                deviceKeyManager.signTicketRequest(
+                    method = "POST",
+                    path = path,
+                    sessionId = session.id,
+                    actorEmail = actorEmail,
+                )
+            }.getOrElse { error ->
+                clearTerminalIfCurrent(attachToken)
+                onComplete(Result.failure(error))
+                return@launch
+            }
+            val ticketResult = sessionRepository.createMobileAttachTicket(serverUrl, accessToken, session.id, proof)
+            ticketResult.onFailure { error ->
+                updateTerminalIfCurrent(attachToken) { it.copy(status = "failed", error = error.message) }
+                onComplete(Result.failure(error))
+                return@launch
+            }
+            val ticket = ticketResult.getOrThrow()
+            val wsNonce = UUID.randomUUID().toString()
+            val wsSignature = runCatching {
+                deviceKeyManager.signWebSocketAuth(
+                    ticketId = ticket.ticketId,
+                    sessionId = session.id,
+                    actorEmail = actorEmail,
+                    deviceKeyId = ticket.deviceKeyId,
+                    nonce = wsNonce,
+                )
+            }.getOrElse { error ->
+                updateTerminalIfCurrent(attachToken) { it.copy(status = "failed", error = error.message) }
+                onComplete(Result.failure(error))
+                return@launch
+            }
+            terminalSocket?.close(1000, "new attach")
+            terminalSocket = sessionRepository.openMobileTerminalSocket(ticket, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    val frame = JSONObject()
+                        .put("type", "auth")
+                        .put("ticket_id", ticket.ticketId)
+                        .put("ticket_secret", ticket.ticketSecret)
+                        .put("device_key_id", ticket.deviceKeyId)
+                        .put("nonce", wsNonce)
+                        .put("signature", wsSignature)
+                    webSocket.send(frame.toString())
+                    viewModelScope.launch {
+                        updateTerminalIfCurrent(attachToken) { it.copy(status = "authenticating", error = null) }
+                    }
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val payload = runCatching { JSONObject(text) }.getOrNull() ?: return
+                    viewModelScope.launch {
+                        when (payload.optString("type")) {
+                            "output" -> updateTerminalIfCurrent(attachToken) { current ->
+                                current.copy(
+                                    status = "attached",
+                                    output = if (payload.optString("mode") == "snapshot") {
+                                        payload.optString("data")
+                                    } else {
+                                        current.output + payload.optString("data")
+                                    },
+                                    error = null,
+                                )
+                            }
+                            "status" -> updateTerminalIfCurrent(attachToken) {
+                                it.copy(status = payload.optString("state", it.status))
+                            }
+                            "error" -> updateTerminalIfCurrent(attachToken) {
+                                it.copy(error = payload.optString("message", "Terminal error"))
+                            }
+                            "exit" -> updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
+                        }
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    viewModelScope.launch {
+                        updateTerminalIfCurrent(attachToken) {
+                            it.copy(status = "failed", error = t.message ?: "Terminal socket failed")
+                        }
+                    }
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    viewModelScope.launch {
+                        updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
+                    }
+                }
+            })
+            onComplete(Result.success("Opening terminal for ${sessionDisplayName(session)}"))
+        }
+    }
+
+    fun updateTerminalInput(value: String) {
+        _uiState.value = _uiState.value.copy(
+            terminal = _uiState.value.terminal?.copy(inputDraft = value)
+        )
+    }
+
+    fun sendTerminalInput(sendEnter: Boolean = false) {
+        val terminal = _uiState.value.terminal ?: return
+        val text = terminal.inputDraft
+        if (text.isNotEmpty()) {
+            terminalSocket?.send(JSONObject().put("type", "input").put("data", text).toString())
+        }
+        if (sendEnter) {
+            terminalSocket?.send(JSONObject().put("type", "key").put("key", "enter").toString())
+        }
+        _uiState.value = _uiState.value.copy(terminal = terminal.copy(inputDraft = ""))
+    }
+
+    fun sendTerminalKey(key: String) {
+        terminalSocket?.send(JSONObject().put("type", "key").put("key", key).toString())
+    }
+
+    fun detachTerminal() {
+        terminalAttachToken = null
+        terminalSocket?.send(JSONObject().put("type", "detach").toString())
+        terminalSocket?.close(1000, "detach")
+        terminalSocket = null
+        _uiState.value = _uiState.value.copy(terminal = null)
+        refresh()
+    }
+
+    private fun updateTerminalIfCurrent(
+        attachToken: String,
+        transform: (TerminalUiState) -> TerminalUiState,
+    ) {
+        if (terminalAttachToken != attachToken) {
+            return
+        }
+        val current = _uiState.value.terminal ?: return
+        _uiState.value = _uiState.value.copy(terminal = transform(current))
+    }
+
+    private fun clearTerminalIfCurrent(attachToken: String) {
+        if (terminalAttachToken != attachToken) {
+            return
+        }
+        terminalAttachToken = null
+        _uiState.value = _uiState.value.copy(terminal = null)
     }
 
     fun requestStatus(onComplete: (Result<String>) -> Unit) {

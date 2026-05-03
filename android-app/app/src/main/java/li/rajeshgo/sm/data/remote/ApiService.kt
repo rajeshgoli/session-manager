@@ -12,12 +12,15 @@ import li.rajeshgo.sm.data.model.EnsureMaintainerRequest
 import li.rajeshgo.sm.data.model.EnsureMaintainerResponse
 import li.rajeshgo.sm.data.model.KillSessionRequest
 import li.rajeshgo.sm.data.model.KillSessionResponse
+import li.rajeshgo.sm.data.model.MobileAttachTicketRequest
+import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
 import li.rajeshgo.sm.data.model.OutputResponse
 import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionListResponse
 import li.rajeshgo.sm.data.model.ToolCallsResponse
 import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
@@ -43,6 +46,16 @@ interface ApiService {
 
     @GET("client/sessions/{session_id}")
     suspend fun getClientSession(@Path("session_id") sessionId: String): ClientSession
+
+    @POST("client/sessions/{session_id}/attach-ticket")
+    suspend fun createMobileAttachTicket(
+        @Path("session_id") sessionId: String,
+        @Header("X-SM-Device-Key-Id") deviceKeyId: String,
+        @Header("X-SM-Device-Timestamp") timestamp: String,
+        @Header("X-SM-Device-Nonce") nonce: String,
+        @Header("X-SM-Device-Signature") signature: String,
+        @Body request: MobileAttachTicketRequest = MobileAttachTicketRequest(),
+    ): MobileAttachTicketResponse
 
     @POST("client/request-status")
     suspend fun requestStatus(): RequestStatusResponse

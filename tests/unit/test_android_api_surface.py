@@ -1,9 +1,14 @@
 from unittest.mock import MagicMock
+import base64
+import subprocess
+import time
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from src.models import Session, SessionStatus
-from src.server import create_app
+from src.server import _issue_device_access_token, create_app
 
 
 def _android_config() -> dict:
@@ -106,6 +111,8 @@ def test_client_bootstrap_reports_termux_attach_defaults():
             "public_ssh_host": "ssh.sm.rajeshgo.li",
             "ssh_username": "rajesh",
             "termux_attach_supported": True,
+            "mobile_terminal_supported": False,
+            "mobile_terminal_ws_url": None,
         },
         "session_open_defaults": {
             "preferred_action": "termux_attach",
@@ -177,6 +184,508 @@ def test_client_sessions_include_termux_attach_metadata():
         "type": "termux_attach",
         "label": "Attach in Termux",
     }
+
+
+def _mobile_terminal_config(private_key) -> dict:
+    config = _android_config()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    config["mobile_terminal"] = {
+        "enabled": True,
+        "allowed_users": {
+            "local_bypass": {
+                "interactive_shell_access": True,
+                "registered_device_keys": [
+                    {
+                        "id": "test-device",
+                        "public_key": public_key,
+                        "enabled": True,
+                    }
+                ],
+            }
+        },
+        "ticket_ttl_seconds": 30,
+        "auth_frame_timeout_seconds": 3,
+        "max_concurrent_attaches_per_user": 1,
+        "max_concurrent_attaches_per_session": 1,
+        "max_concurrent_attaches_global": 4,
+    }
+    return config
+
+
+def _sign_mobile_ticket_headers(
+    private_key,
+    session_id: str,
+    *,
+    actor_email: str = "local_bypass",
+    path: str | None = None,
+    timestamp: str | None = None,
+) -> dict[str, str]:
+    timestamp = timestamp or str(time.time())
+    nonce = "nonce-1"
+    message = "\n".join(
+        [
+            "SM-MOBILE-TERMINAL-TICKET-V1",
+            "POST",
+            path or f"/client/sessions/{session_id}/attach-ticket",
+            session_id,
+            actor_email,
+            "test-device",
+            timestamp,
+            nonce,
+        ]
+    )
+    signature = private_key.sign(message.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
+    return {
+        "X-SM-Device-Key-Id": "test-device",
+        "X-SM-Device-Timestamp": timestamp,
+        "X-SM-Device-Nonce": nonce,
+        "X-SM-Device-Signature": base64.b64encode(signature).decode("ascii"),
+    }
+
+
+def _sign_mobile_ws_auth(private_key, *, ticket_id: str, session_id: str, nonce: str = "ws-nonce-1") -> str:
+    message = "\n".join(
+        [
+            "SM-MOBILE-TERMINAL-WS-V1",
+            ticket_id,
+            session_id,
+            "local_bypass",
+            "test-device",
+            nonce,
+        ]
+    )
+    signature = private_key.sign(message.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
+    return base64.b64encode(signature).decode("ascii")
+
+
+def test_client_sessions_prefer_mobile_terminal_when_enabled():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]
+    assert payload["mobile_terminal"] == {
+        "supported": True,
+        "transport": "sm-https-tmux",
+        "ticket_endpoint": "/client/sessions/fork1001/attach-ticket",
+        "ws_url": "wss://sm.rajeshgo.li/client/terminal",
+        "tmux_session": "codex-fork-fork1001",
+        "tmux_socket_name": None,
+        "runtime_mode": "detached_runtime",
+        "requires_device_key": True,
+    }
+    assert payload["primary_action"] == {
+        "type": "mobile_terminal",
+        "label": "Attach",
+    }
+
+
+def test_mobile_terminal_require_tls_rejects_configured_plaintext_ws_url():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["require_tls"] = True
+    config["mobile_terminal"]["ws_url"] = "ws://localhost:8420/client/terminal"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]
+    assert payload["mobile_terminal"]["supported"] is False
+    assert payload["mobile_terminal"]["reason"] == "mobile terminal public HTTPS host is not configured"
+    assert payload["primary_action"] == {
+        "type": "termux_attach",
+        "label": "Attach in Termux",
+    }
+
+
+def test_mobile_terminal_can_allow_plaintext_ws_when_tls_not_required():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["require_tls"] = False
+    config["mobile_terminal"]["ws_url"] = "ws://localhost:8420/client/terminal"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]
+    assert payload["mobile_terminal"]["supported"] is True
+    assert payload["mobile_terminal"]["ws_url"] == "ws://localhost:8420/client/terminal"
+
+
+def test_mobile_terminal_metadata_preserves_configured_public_path_prefix():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["external_access"]["public_http_path_prefix"] = "/sm"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]["mobile_terminal"]
+    assert payload["ticket_endpoint"] == "/sm/client/sessions/fork1001/attach-ticket"
+    assert payload["ws_url"] == "wss://sm.rajeshgo.li/sm/client/terminal"
+
+
+def test_mobile_attach_ticket_signature_uses_advertised_public_path_prefix():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["external_access"]["public_http_path_prefix"] = "/sm"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+    advertised_path = client.get("/client/sessions").json()["sessions"][0]["mobile_terminal"]["ticket_endpoint"]
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id, path=advertised_path),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ticket_id"].startswith("att_")
+
+
+def test_mobile_terminal_metadata_preserves_request_root_path_prefix():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app, root_path="/sm")
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]["mobile_terminal"]
+    assert payload["ticket_endpoint"] == "/sm/client/sessions/fork1001/attach-ticket"
+    assert payload["ws_url"] == "wss://sm.rajeshgo.li/sm/client/terminal"
+
+
+def test_client_sessions_hide_mobile_terminal_action_for_unregistered_actor():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    token = _issue_device_access_token(config, email="other@example.com", name="Other")["access_token"]
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.get(
+        "/client/sessions",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]
+    assert payload["mobile_terminal"]["supported"] is False
+    assert payload["mobile_terminal"]["reason"] == "mobile terminal user is not configured"
+    assert payload["primary_action"] == {
+        "type": "termux_attach",
+        "label": "Attach in Termux",
+    }
+
+
+def test_mobile_terminal_user_matching_does_not_accept_email_local_part():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["allowed_users"] = {
+        "rajesh": config["mobile_terminal"]["allowed_users"]["local_bypass"],
+    }
+    actor_email = "rajesh@example.invalid"
+    token = _issue_device_access_token(config, email=actor_email, name="Rajesh")["access_token"]
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers={
+            "Authorization": f"Bearer {token}",
+            **_sign_mobile_ticket_headers(private_key, session.id, actor_email=actor_email),
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "mobile terminal user is not configured"
+
+
+def test_mobile_attach_ticket_requires_registered_device_signature():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    missing = client.post(f"/client/sessions/{session.id}/attach-ticket", json={})
+    assert missing.status_code == 401
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ticket_id"].startswith("att_")
+    assert len(payload["ticket_secret"]) >= 40
+    assert payload["device_key_id"] == "test-device"
+    assert payload["ws_url"] == "wss://sm.rajeshgo.li/client/terminal"
+    assert payload["ticket_secret"] not in payload["ws_url"]
+
+
+def test_mobile_attach_ticket_rejects_non_finite_device_timestamp():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id, timestamp="NaN"),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid device timestamp"
+
+
+def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch):
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    ticket_response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+    assert ticket_response.status_code == 200
+    ticket = ticket_response.json()
+
+    commands = []
+
+    def fake_run(args, capture_output, text, check, timeout):
+        commands.append(args)
+        if "capture-pane" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="live pane output", stderr="")
+        if "send-keys" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if "resize-window" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected tmux command")
+
+    monkeypatch.setattr("src.server.subprocess.run", fake_run)
+
+    with client.websocket_connect("/client/terminal") as websocket:
+        websocket.send_json(
+            {
+                "type": "auth",
+                "ticket_id": ticket["ticket_id"],
+                "ticket_secret": ticket["ticket_secret"],
+                "device_key_id": "test-device",
+                "nonce": "ws-nonce-1",
+                "signature": _sign_mobile_ws_auth(
+                    private_key,
+                    ticket_id=ticket["ticket_id"],
+                    session_id=session.id,
+                ),
+            }
+        )
+        assert websocket.receive_json() == {"type": "status", "state": "attached", "session_id": session.id}
+        output = websocket.receive_json()
+        assert output == {"type": "output", "mode": "snapshot", "data": "live pane output"}
+        websocket.send_json({"type": "input", "data": "hello"})
+        websocket.send_json({"type": "key", "key": "enter"})
+        websocket.send_json({"type": "resize", "rows": 32, "cols": 120})
+        assert websocket.receive_json() == {"type": "status", "state": "resized", "rows": 32, "cols": 120}
+        websocket.send_json({"type": "detach"})
+    assert any("resize-window" in command for command in commands)
+
+
+def test_mobile_terminal_websocket_enforces_active_attach_limit_at_consume_time():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    ticket_response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+    assert ticket_response.status_code == 200
+    ticket = ticket_response.json()
+    app.state.mobile_terminal_active_attaches["busy"] = {
+        "user_id": "local_bypass",
+        "session_id": "other-session",
+        "provider": "claude",
+        "device_key_id": "test-device",
+        "started_at": time.time(),
+    }
+
+    with client.websocket_connect("/client/terminal") as websocket:
+        websocket.send_json(
+            {
+                "type": "auth",
+                "ticket_id": ticket["ticket_id"],
+                "ticket_secret": ticket["ticket_secret"],
+                "device_key_id": "test-device",
+                "nonce": "ws-nonce-1",
+                "signature": _sign_mobile_ws_auth(
+                    private_key,
+                    ticket_id=ticket["ticket_id"],
+                    session_id=session.id,
+                ),
+            }
+        )
+        assert websocket.receive_json() == {
+            "type": "error",
+            "message": "Too many active mobile attaches for user",
+        }
+
+
+def test_mobile_terminal_disable_requires_owner_authorization():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    response = client.post("/client/mobile-terminal/disable")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "User is not allowed to disable mobile terminal attach"
+    assert app.state.mobile_terminal_runtime_disabled is False
+
+
+def test_mobile_terminal_disable_owner_terminates_active_attaches():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["mobile_terminal"]["allowed_users"]["local_bypass"]["mobile_terminal_owner"] = True
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+    stop_event = MagicMock()
+    app.state.mobile_terminal_active_attaches["active-1"] = {
+        "user_id": "local_bypass",
+        "session_id": session.id,
+        "provider": session.provider,
+        "device_key_id": "test-device",
+        "started_at": time.time(),
+        "stop_event": stop_event,
+    }
+
+    response = client.post("/client/mobile-terminal/disable")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "disabled": True,
+        "active_attaches_terminated": 1,
+    }
+    assert app.state.mobile_terminal_runtime_disabled is True
+    assert app.state.mobile_terminal_active_attaches == {}
+    stop_event.set.assert_called_once_with()
+
+
+def test_mobile_terminal_bridge_aborts_if_disable_cleared_attach_before_start():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    class ClearOnSetDict(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            self.clear()
+
+    app.state.mobile_terminal_active_attaches = ClearOnSetDict()
+    ticket_response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+    assert ticket_response.status_code == 200
+    ticket = ticket_response.json()
+
+    with client.websocket_connect("/client/terminal") as websocket:
+        websocket.send_json(
+            {
+                "type": "auth",
+                "ticket_id": ticket["ticket_id"],
+                "ticket_secret": ticket["ticket_secret"],
+                "device_key_id": "test-device",
+                "nonce": "ws-nonce-1",
+                "signature": _sign_mobile_ws_auth(
+                    private_key,
+                    ticket_id=ticket["ticket_id"],
+                    session_id=session.id,
+                ),
+            }
+        )
+        assert websocket.receive_json() == {
+            "type": "exit",
+            "code": 1008,
+            "reason": "mobile_terminal_disabled",
+        }
 
 
 def test_client_sessions_fall_back_to_lan_ssh_on_cloudflare_bad_handshake():

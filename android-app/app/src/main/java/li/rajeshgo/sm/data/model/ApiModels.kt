@@ -51,6 +51,10 @@ data class ExternalAccess(
     val sshUsername: String? = null,
     @SerialName("termux_attach_supported")
     val termuxAttachSupported: Boolean = false,
+    @SerialName("mobile_terminal_supported")
+    val mobileTerminalSupported: Boolean = false,
+    @SerialName("mobile_terminal_ws_url")
+    val mobileTerminalWsUrl: String? = null,
 )
 
 @Serializable
@@ -172,6 +176,8 @@ data class ClientSession(
     val attachDescriptor: AttachDescriptor? = null,
     @SerialName("termux_attach")
     val termuxAttach: TermuxAttachMetadata? = null,
+    @SerialName("mobile_terminal")
+    val mobileTerminal: MobileTerminalMetadata? = null,
     @SerialName("primary_action")
     val primaryAction: PrimaryAction? = null,
 )
@@ -217,6 +223,44 @@ data class TermuxAttachMetadata(
     val runtimeMode: String? = null,
     @SerialName("termux_package")
     val termuxPackage: String? = null,
+)
+
+@Serializable
+data class MobileTerminalMetadata(
+    val supported: Boolean = false,
+    val reason: String? = null,
+    val transport: String? = null,
+    @SerialName("ticket_endpoint")
+    val ticketEndpoint: String? = null,
+    @SerialName("ws_url")
+    val wsUrl: String? = null,
+    @SerialName("tmux_session")
+    val tmuxSession: String? = null,
+    @SerialName("tmux_socket_name")
+    val tmuxSocketName: String? = null,
+    @SerialName("runtime_mode")
+    val runtimeMode: String? = null,
+    @SerialName("requires_device_key")
+    val requiresDeviceKey: Boolean = true,
+)
+
+@Serializable
+data class MobileAttachTicketRequest(
+    val mode: String = "terminal",
+)
+
+@Serializable
+data class MobileAttachTicketResponse(
+    @SerialName("ticket_id")
+    val ticketId: String,
+    @SerialName("ticket_secret")
+    val ticketSecret: String,
+    @SerialName("device_key_id")
+    val deviceKeyId: String,
+    @SerialName("ws_url")
+    val wsUrl: String,
+    @SerialName("expires_at")
+    val expiresAt: String,
 )
 
 @Serializable
