@@ -597,6 +597,20 @@ private fun HeaderBar(
                                 )
                             },
                         )
+                        DropdownMenuItem(
+                            text = { Text("Settings") },
+                            onClick = {
+                                menuExpanded = false
+                                onOpenSettings()
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    Icons.Rounded.Settings,
+                                    contentDescription = null,
+                                    tint = TextSecondary,
+                                )
+                            },
+                        )
                     }
                 }
                 SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
