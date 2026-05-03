@@ -617,6 +617,71 @@ def test_api_input_records_default_inbound_boundary(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_session_create_initial_prompt_records_relay_boundary(tmp_path):
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    manager.tmux = MagicMock()
+    manager.tmux.create_session_with_command.return_value = True
+    manager._get_git_remote_url_async = AsyncMock(return_value=None)
+    manager._ensure_telegram_topic = AsyncMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.message_queue_manager = SimpleNamespace(response_relay_ledger=ledger)
+
+    session = await manager._create_session_common(
+        working_dir=str(tmp_path),
+        parent_session_id="parent-session",
+        spawn_prompt="first spawned turn",
+        initial_prompt="first spawned turn",
+        provider="claude",
+    )
+
+    assert session is not None
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == f"initial:{session.id}"
+    assert active_turn.source == "spawn"
+    assert active_turn.provider == "claude"
+    assert active_turn.text_hash is not None
+
+
+def test_stop_hook_backfills_spawn_prompt_boundary_for_first_turn(tmp_path):
+    prompt = "first spawned turn"
+    transcript = tmp_path / "spawn-first-turn.jsonl"
+    transcript.write_text(
+        _user_line(prompt, uuid="spawn-user")
+        + _assistant_line("spawn first answer", uuid="spawn-answer")
+    )
+    session = _session(transcript)
+    session.spawn_prompt = prompt
+    session.spawned_at = datetime(2026, 5, 2, 22, 24, 18)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    app, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    assert ledger.get_latest_active_turn(session.id) is None
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "spawn first answer"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == f"initial:{session.id}"
+    assert active_turn.source == "spawn"
+    assert active_turn.transcript_offset is not None
+    assert active_turn.transcript_offset < transcript.stat().st_size
+
+
+@pytest.mark.asyncio
 async def test_bypass_queue_telegram_permission_response_records_boundary(tmp_path):
     transcript = tmp_path / "permission-response.jsonl"
     transcript.write_text(_assistant_line("existing old output", uuid="old"))

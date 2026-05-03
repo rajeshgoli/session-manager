@@ -6342,11 +6342,37 @@ Provide ONLY the summary, no preamble or questions."""
 
         active_turn = ledger.get_latest_active_turn(session_id)
         if not active_turn:
-            logger.info(
-                "Suppressing Claude response relay for %s: no active inbound turn boundary",
-                session_id,
-            )
-            return True
+            spawn_prompt = getattr(target_session, "spawn_prompt", None)
+            if isinstance(spawn_prompt, str) and spawn_prompt.strip():
+                try:
+                    active_turn = ledger.record_inbound_turn(
+                        session_id=session_id,
+                        inbound_id=f"initial:{session_id}",
+                        source="spawn",
+                        provider="claude",
+                        delivered_at=target_session.spawned_at or target_session.created_at,
+                        transcript_path=transcript_path or target_session.transcript_path,
+                        transcript_offset=None,
+                        text=spawn_prompt,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to backfill spawn response relay boundary for %s: %s",
+                        session_id,
+                        exc,
+                    )
+                    active_turn = None
+            if active_turn:
+                logger.info(
+                    "Backfilled Claude response relay boundary for spawned session %s",
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "Suppressing Claude response relay for %s: no active inbound turn boundary",
+                    session_id,
+                )
+                return True
 
         hook_replaces_stored_transcript = bool(
             transcript_path

@@ -2678,6 +2678,14 @@ class SessionManager:
         self._sync_session_resume_id(session)
         self._save_state()
 
+        if provider == "claude" and initial_prompt:
+            self._record_initial_response_relay_inbound(
+                session=session,
+                text=initial_prompt,
+                source="spawn" if spawn_prompt else "initial",
+                delivered_at=session.spawned_at or session.created_at,
+            )
+
         if provider == "codex-fork":
             self.codex_fork_runtime_owner[session.id] = parent_session_id or session.id
             self._set_codex_fork_lifecycle_state(
@@ -4068,6 +4076,38 @@ class SessionManager:
                     revive_deleted=True,
                 )
             self._save_state()
+
+    def _record_initial_response_relay_inbound(
+        self,
+        *,
+        session: Session,
+        text: str,
+        source: str,
+        delivered_at: datetime,
+    ) -> None:
+        """Record a Claude prompt injected at session launch as the first relay turn."""
+        if not text.strip() or not self.message_queue_manager:
+            return
+        ledger = getattr(self.message_queue_manager, "response_relay_ledger", None)
+        if ledger is None:
+            return
+        try:
+            ledger.record_inbound_turn(
+                session_id=session.id,
+                inbound_id=f"initial:{session.id}",
+                source=source,
+                provider="claude",
+                delivered_at=delivered_at,
+                transcript_path=getattr(session, "transcript_path", None),
+                transcript_offset=None,
+                text=text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record initial response relay inbound turn for %s: %s",
+                session.id,
+                exc,
+            )
 
     def _record_direct_response_relay_inbound(
         self,
