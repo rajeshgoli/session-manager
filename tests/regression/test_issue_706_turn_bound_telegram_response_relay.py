@@ -14,6 +14,7 @@ from src.message_queue import MessageQueueManager
 from src.models import Session, SessionStatus
 from src.response_relay import ResponseRelayLedger
 from src.server import create_app
+from src.session_manager import SessionManager
 
 
 def _assistant_line(text: str, *, timestamp: str | None = None, uuid: str | None = None) -> str:
@@ -420,3 +421,33 @@ async def test_message_queue_records_telegram_inbound_boundary(tmp_path):
     assert active_turn is not None
     assert active_turn.inbound_id == msg.id
     assert active_turn.source == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_bypass_queue_telegram_permission_response_records_boundary(tmp_path):
+    transcript = tmp_path / "permission-response.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.message_queue_manager = SimpleNamespace(response_relay_ledger=ledger)
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+
+    result = await manager.send_input(
+        session.id,
+        "yes, allow the command",
+        bypass_queue=True,
+        response_relay_source="telegram",
+    )
+
+    assert result.value == "delivered"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id.startswith(f"direct:{session.id}:")
+    assert active_turn.source == "telegram"
+    assert active_turn.transcript_offset == transcript.stat().st_size

@@ -4069,6 +4069,40 @@ class SessionManager:
                 )
             self._save_state()
 
+    def _record_direct_response_relay_inbound(
+        self,
+        *,
+        session: Session,
+        text: str,
+        source: Optional[str],
+        delivered_at: datetime,
+    ) -> None:
+        """Record a direct user/operator input turn that bypassed the message queue."""
+        if not source or not self.message_queue_manager:
+            return
+        ledger = getattr(self.message_queue_manager, "response_relay_ledger", None)
+        if ledger is None:
+            return
+        transcript_path = getattr(session, "transcript_path", None)
+        transcript_offset = ledger.capture_transcript_offset(transcript_path)
+        try:
+            ledger.record_inbound_turn(
+                session_id=session.id,
+                inbound_id=f"direct:{session.id}:{uuid.uuid4().hex}",
+                source=source,
+                provider=getattr(session, "provider", None) or "claude",
+                delivered_at=delivered_at,
+                transcript_path=transcript_path,
+                transcript_offset=transcript_offset,
+                text=text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record direct response relay inbound turn for %s: %s",
+                session.id,
+                exc,
+            )
+
     async def send_input(
         self,
         session_id: str,
@@ -4135,7 +4169,14 @@ class SessionManager:
             logger.info(f"Bypassing queue for direct send to {session_id}: {text}")
             success = await self._deliver_direct(session, text)
             if success:
-                session.last_activity = datetime.now()
+                delivered_at = datetime.now(timezone.utc)
+                session.last_activity = delivered_at
+                self._record_direct_response_relay_inbound(
+                    session=session,
+                    text=text,
+                    source=response_relay_source,
+                    delivered_at=delivered_at,
+                )
                 _clear_completed_state()
             return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
