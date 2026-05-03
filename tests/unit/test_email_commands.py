@@ -79,6 +79,7 @@ def test_cmd_send_human_alias_defaults_to_telegram(capsys):
     client = Mock()
     client.session_id = "sender123"
     client.get_session.return_value = None
+    client.list_sessions.return_value = []
     client.lookup_human.return_value = {
         "ok": True,
         "unavailable": False,
@@ -103,6 +104,63 @@ def test_cmd_send_human_alias_defaults_to_telegram(capsys):
     output = capsys.readouterr().out
     assert "Telegram sent to rajesh" in output
     assert "Thread: sender session topic" in output
+
+
+@pytest.mark.parametrize(
+    "session_identity",
+    [
+        {"friendly_name": "user"},
+        {"friendly_name": "historical-user", "aliases": ["user"]},
+    ],
+)
+def test_cmd_send_prefers_live_session_identity_over_human_alias(
+    session_identity: dict,
+    capsys,
+):
+    client = Mock()
+    client.session_id = "sender123"
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {
+            "id": "live-user",
+            "status": "idle",
+            "provider": "claude",
+            **session_identity,
+        }
+    ]
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": _human_lookup_payload(),
+    }
+    client.send_input.return_value = (True, False)
+
+    rc = cmd_send(client, "user", "message for existing session")
+
+    assert rc == 0
+    client.lookup_human.assert_not_called()
+    client.send_human_telegram_result.assert_not_called()
+    client.ensure_role.assert_not_called()
+    client.send_email_result.assert_not_called()
+    client.send_input.assert_called_once_with(
+        "live-user",
+        "message for existing session",
+        sender_session_id="sender123",
+        delivery_mode="sequential",
+        from_sm_send=True,
+        timeout_seconds=None,
+        notify_on_delivery=False,
+        notify_after_seconds=None,
+        notify_on_stop=True,
+        remind_soft_threshold=None,
+        remind_hard_threshold=None,
+        remind_cancel_on_reply_session_id=None,
+        parent_session_id=None,
+        timeout=SEND_API_TIMEOUT,
+    )
+    output = capsys.readouterr().out
+    expected_name = session_identity["friendly_name"]
+    assert f"Input sent to {expected_name} (live-user)" in output
 
 
 def test_cmd_telegram_forces_human_telegram(capsys):

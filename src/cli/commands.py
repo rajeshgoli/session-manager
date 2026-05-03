@@ -1563,37 +1563,34 @@ def cmd_send(
         )
     identifier = identifiers[0]
 
-    # Exact session IDs stay first. Human aliases come before friendly-name and
-    # role fallback because configured human aliases are reserved identifiers.
-    try:
-        exact_session = client.get_session(identifier, timeout=SEND_API_TIMEOUT)
-    except TypeError:
-        exact_session = client.get_session(identifier)
-    if exact_session:
-        session_id, session, resolve_unavailable = identifier, exact_session, False
-    else:
+    # Resolve live session IDs, aliases, and friendly names before human aliases
+    # so legacy sessions created before alias reservation cannot be rerouted.
+    session_id, session, resolve_unavailable = resolve_session_id_with_status(
+        client,
+        identifier,
+        timeout=SEND_API_TIMEOUT,
+    )
+    if resolve_unavailable:
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if session_id is None:
         human_send_rc = _try_send_human_telegram(
             client,
             identifier,
             text,
             sender_session_id=sender_session_id,
             delivery_mode=delivery_mode,
+            timeout_seconds=timeout_seconds,
+            notify_on_delivery=notify_on_delivery,
             notify_after_seconds=effective_notify_after,
+            remind_soft_threshold=remind_soft_threshold,
+            remind_hard_threshold=remind_hard_threshold,
+            parent_session_id=parent_session_id,
             track_seconds=track_seconds,
         )
         if human_send_rc is not None:
             return human_send_rc
 
-        # Resolve identifier to session ID and get session details
-        session_id, session, resolve_unavailable = resolve_session_id_with_status(
-            client,
-            identifier,
-            timeout=SEND_API_TIMEOUT,
-        )
-    if resolve_unavailable:
-        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
-        return 2
-    if session_id is None:
         ensure_result = client.ensure_role(identifier, requester_session_id=sender_session_id)
         if ensure_result.get("unavailable"):
             print(UNAVAILABLE_MESSAGE, file=sys.stderr)
@@ -1714,7 +1711,12 @@ def _try_send_human_telegram(
     *,
     sender_session_id: Optional[str],
     delivery_mode: str,
+    timeout_seconds: Optional[int],
+    notify_on_delivery: bool,
     notify_after_seconds: Optional[int],
+    remind_soft_threshold: Optional[int],
+    remind_hard_threshold: Optional[int],
+    parent_session_id: Optional[str],
     track_seconds: Optional[int],
 ) -> Optional[int]:
     """Send to a configured human recipient, returning None when not a human."""
@@ -1733,9 +1735,18 @@ def _try_send_human_telegram(
     if not sender_session_id:
         print("Error: human Telegram delivery requires a managed sender session", file=sys.stderr)
         return 2
-    if delivery_mode != "sequential" or notify_after_seconds or track_seconds is not None:
+    if (
+        delivery_mode != "sequential"
+        or timeout_seconds is not None
+        or notify_on_delivery
+        or notify_after_seconds is not None
+        or remind_soft_threshold is not None
+        or remind_hard_threshold is not None
+        or parent_session_id is not None
+        or track_seconds is not None
+    ):
         print(
-            "Error: human Telegram delivery only supports plain sequential sends without --wait/--track/--urgent",
+            "Error: human Telegram delivery only supports plain sequential sends without delivery modifiers",
             file=sys.stderr,
         )
         return 1
