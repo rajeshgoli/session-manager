@@ -12,7 +12,7 @@ The recommended v1 shape is:
 2. The app proves possession of a registered device key, preserving the second authentication factor that SSH keys provide today.
 3. The app opens an authenticated terminal stream over the existing HTTPS origin, `sm.rajeshgo.li`.
 4. Session Manager bridges that stream to the selected tmux-backed session only.
-5. The existing Termux SSH path remains available as a supported operator fallback, but is no longer the primary off-LAN attach path.
+5. The existing Termux SSH path remains available only as a temporary rollout fallback, then is removed from the app attach surface after the HTTPS path is verified.
 
 Security is the primary design constraint. This feature exposes an interactive shell path to the machine. It must be implemented as a narrowly authorized, audited, session-scoped terminal bridge, not as a general remote command API.
 
@@ -35,6 +35,10 @@ PR #702 added a direct LAN SSH fallback. That helps only when the phone can reac
 
 The app already talks to Session Manager over HTTPS for watch, status, and session detail. Attach should use that same authenticated HTTPS path instead of requiring a second Cloudflare SSH stack inside Termux.
 
+This is not because Termux itself is bad. Termux is a capable terminal, and SSH key auth is a strong security model. The problem is operational shape: mobile attach currently depends on a separate Termux app, a separate Cloudflare SSH/websocket path, separate login/cache state, separate SSH configuration, and a second canonical remote-shell ingress path that Session Manager cannot fully audit, rate-limit, revoke, or health-check. Keeping both paths permanently means one will eventually drift, rust, and become either unreliable or a security liability.
+
+The desired end state is one canonical hardened mobile attach path owned by SM: app OAuth plus registered device-key proof plus SM session authorization plus audited tmux bridging. Termux can remain during rollout as a rollback/fallback path, but should be removed from the app once the HTTPS path is verified.
+
 ## Goals
 
 1. Make Android app attach work off-LAN through the existing Session Manager HTTPS origin.
@@ -43,8 +47,9 @@ The app already talks to Session Manager over HTTPS for watch, status, and sessi
 4. Use short-lived, single-use attach tickets so durable app credentials are not embedded in WebSocket URLs or terminal pages.
 5. Audit terminal attach lifecycle events without logging sensitive terminal content by default.
 6. Preserve existing desktop `sm attach` behavior.
-7. Keep Termux SSH as a supported fallback/copy-command path for operators.
+7. Keep Termux SSH only as a temporary rollout fallback/copy-command path.
 8. Preserve the current two-layer security model: authenticated app access plus a registered device key that proves the client is an approved device.
+9. Decommission the Termux attach action after the HTTPS path ships and passes off-LAN verification.
 
 ## Non-Goals
 
@@ -55,6 +60,7 @@ The app already talks to Session Manager over HTTPS for watch, status, and sessi
 5. Do not stream raw terminal input/output into normal application logs.
 6. Do not support headless `codex-app` terminal attach in v1.
 7. Do not replace tmux as the runtime/control plane for Claude, Codex, and codex-fork sessions.
+8. Do not keep Termux SSH as a second long-term canonical mobile attach path after cutover.
 
 ## Threat Model
 
@@ -210,6 +216,23 @@ Do not rely on browser cookies alone for WebSocket authorization. This prevents 
 4. Missing `Origin` is acceptable for native OkHttp clients, but those clients still need a valid attach ticket.
 5. Failed auth attempts are rate-limited by IP, user id when known, device key id when present, and global counters.
 
+### Emergency Disable And Revocation
+
+The emergency-control surface should match the threat model:
+
+1. Lost or retired device: disable the registered device key from the local SM CLI/config path. This prevents new tickets and rejects unconsumed tickets for that key even if app login state remains valid.
+2. Abuse detected while the operator is away from the Mac: expose an authenticated SM app/API control to disable mobile terminal attach globally or revoke the current device key.
+3. Suspected server-side bug or active exploit: provide a config-level kill switch that disables ticket minting and WebSocket auth before any tmux bridge can start.
+
+Recommended controls:
+
+```bash
+sm mobile-terminal disable
+sm mobile-terminal device disable rajesh pixel-8-pro
+```
+
+The Android app should also expose an owner-only "Disable mobile terminal attach" action backed by the same API. All disable/revoke actions must audit who invoked them, which device/user was affected, and whether active bridges were terminated.
+
 ### tmux Bridge Safety
 
 The bridge must never construct a shell command from client input.
@@ -300,13 +323,13 @@ The Android implementation can use a native terminal component or a local WebVie
 3. JavaScript interfaces must expose only the minimal terminal bridge API.
 4. External web content must not be able to access attach tickets.
 
-Termux attach remains available as a supported secondary action such as "Open in Termux" or "Copy SSH fallback command". This spec is not a Termux removal or deprecation plan; it changes the default off-LAN app attach path because the Termux Cloudflare SSH stack has been the unreliable component.
+Termux attach remains available only as a rollout fallback such as "Open in Termux" or "Copy SSH fallback command" until the HTTPS path is verified. After cutover, remove the Termux attach action from the app and stop advertising Termux attach metadata. The goal is one canonical hardened mobile attach path, not two remote-shell paths with different auth, audit, and health behavior.
 
 V1 should allow only one active mobile attach per user and one active mobile attach per session. To attach somewhere else, the app should detach the current terminal first, then mint a new ticket for the next session. This matches the mobile ergonomic model and avoids surprising simultaneous shell views.
 
 ## Server API Changes
 
-Add bootstrap capability metadata:
+During rollout, add bootstrap capability metadata:
 
 ```json
 {
@@ -332,7 +355,7 @@ Add session action metadata:
 }
 ```
 
-When the feature is disabled or the user lacks shell access, `mobile_terminal.supported` should be false with a concise reason, and Termux fallback metadata can remain as-is.
+When the feature is disabled or the user lacks shell access, `mobile_terminal.supported` should be false with a concise reason. `termux_attach_supported` is transitional metadata only; remove it from the app-facing attach surface after the HTTPS cutover is complete.
 
 ## Implementation Plan
 
@@ -345,8 +368,10 @@ When the feature is disabled or the user lacks shell access, `mobile_terminal.su
 7. Add lifecycle cleanup so bridge processes are killed on disconnect, timeout, server shutdown, or session disappearance.
 8. Add client payload metadata so Android can prefer mobile terminal attach when supported.
 9. Add Android terminal attach UI using existing app auth to mint tickets and Android Keystore/device-key signing.
-10. Keep existing Termux SSH attach as supported fallback.
-11. Rebuild and publish the Android APK artifact when the app change lands.
+10. Keep existing Termux SSH attach as a rollout fallback only.
+11. Add mobile-terminal disable and device-key revocation controls for CLI and app/API paths.
+12. Rebuild and publish the Android APK artifact when the app change lands.
+13. After HTTPS attach passes off-LAN verification, remove the Termux attach app action and stop advertising Termux attach metadata.
 
 ## Test Plan
 
@@ -369,7 +394,9 @@ Server tests:
 15. Malicious tmux names fail validation.
 16. Disconnect kills the bridge subprocess.
 17. Second simultaneous mobile attach by the same user/session is rejected or requires prior detach according to config.
-18. Audit events are written for success, deny, auth failure, device-key failure, and abnormal exit.
+18. Disabled global mobile-terminal config rejects ticket mint and WebSocket auth.
+19. Disabled device key rejects ticket mint and unconsumed tickets bound to that key.
+20. Audit events are written for success, deny, auth failure, device-key failure, disable/revoke, and abnormal exit.
 
 Android tests:
 
@@ -379,6 +406,8 @@ Android tests:
 4. Ticket secret is not included in URLs or persisted settings.
 5. Terminal view returns to watch/details after disconnect.
 6. Starting a second attach first detaches or blocks the current mobile attach.
+7. After cutover, Termux attach is not shown as a normal attach action.
+8. Owner-only app disable control blocks new mobile terminal attaches.
 
 Manual verification:
 
@@ -387,21 +416,22 @@ Manual verification:
 3. Non-allowed account cannot mint a ticket.
 4. OAuth-authenticated app without a registered device key cannot attach.
 5. Existing desktop `sm attach` still works.
-6. Termux fallback still works where Cloudflare/LAN SSH works.
+6. During rollout only, Termux fallback still works where Cloudflare/LAN SSH works.
+7. After cutover, the SM app exposes only the HTTPS/device-key attach path for mobile attach.
 
 ## Rollout
 
 1. Ship server feature disabled by default.
 2. Enable only for the configured owner account after tests pass.
 3. Verify off-LAN attach from Android.
-4. Keep Termux SSH fallback visible and supported during the initial rollout.
+4. Keep Termux SSH fallback visible only during the initial rollout.
 5. Add dashboard/watch health text distinguishing HTTPS terminal attach from Termux attach.
 6. After confidence, make HTTPS terminal attach the default app action.
+7. Remove Termux attach from the app and public attach metadata after cutover so the old path does not rust into a latent vulnerability.
 
 ## Open Decisions For PR Review
 
 1. Terminal renderer: native Android terminal component vs bundled local WebView renderer.
-2. Whether operator emergency disable should be config-only or also exposed as a CLI/API switch.
 
 ## Ticket Classification
 
