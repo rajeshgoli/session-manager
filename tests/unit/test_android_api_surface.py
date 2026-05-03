@@ -221,8 +221,9 @@ def _sign_mobile_ticket_headers(
     *,
     actor_email: str = "local_bypass",
     path: str | None = None,
+    timestamp: str | None = None,
 ) -> dict[str, str]:
-    timestamp = str(time.time())
+    timestamp = timestamp or str(time.time())
     nonce = "nonce-1"
     message = "\n".join(
         [
@@ -333,6 +334,42 @@ def test_mobile_terminal_can_allow_plaintext_ws_when_tls_not_required():
     assert payload["mobile_terminal"]["ws_url"] == "ws://localhost:8420/client/terminal"
 
 
+def test_mobile_terminal_metadata_preserves_configured_public_path_prefix():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["external_access"]["public_http_path_prefix"] = "/sm"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]["mobile_terminal"]
+    assert payload["ticket_endpoint"] == "/sm/client/sessions/fork1001/attach-ticket"
+    assert payload["ws_url"] == "wss://sm.rajeshgo.li/sm/client/terminal"
+
+
+def test_mobile_terminal_metadata_preserves_request_root_path_prefix():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app, root_path="/sm")
+
+    response = client.get("/client/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()["sessions"][0]["mobile_terminal"]
+    assert payload["ticket_endpoint"] == "/sm/client/sessions/fork1001/attach-ticket"
+    assert payload["ws_url"] == "wss://sm.rajeshgo.li/sm/client/terminal"
+
+
 def test_client_sessions_hide_mobile_terminal_action_for_unregistered_actor():
     private_key = ec.generate_private_key(ec.SECP256R1())
     session = _session()
@@ -412,6 +449,25 @@ def test_mobile_attach_ticket_requires_registered_device_signature():
     assert payload["device_key_id"] == "test-device"
     assert payload["ws_url"] == "wss://sm.rajeshgo.li/client/terminal"
     assert payload["ticket_secret"] not in payload["ws_url"]
+
+
+def test_mobile_attach_ticket_rejects_non_finite_device_timestamp():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id, timestamp="NaN"),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid device timestamp"
 
 
 def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch):
