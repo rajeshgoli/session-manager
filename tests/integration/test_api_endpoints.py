@@ -447,6 +447,57 @@ class TestHumanRecipientEndpoints:
             message="default route",
         )
 
+    def test_send_input_batch_allows_default_notify_on_stop_for_human_telegram(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+    ):
+        sender_session = Session(
+            id="sender123",
+            name="sender-session",
+            working_dir="/tmp/sender",
+            tmux_session="claude-sender123",
+            log_file="/tmp/sender.log",
+            status=SessionStatus.RUNNING,
+            telegram_chat_id=12345,
+            telegram_thread_id=67890,
+        )
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+        mock_session_manager.get_session.side_effect = lambda session_id: {
+            "sender123": sender_session,
+        }.get(session_id)
+        notifier = MagicMock()
+        notifier.send_human_message_to_session_topic = AsyncMock(return_value=(True, None))
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=notifier,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/sessions/input-batch",
+            json={
+                "recipients": ["user"],
+                "text": "default cli route",
+                "sender_session_id": "sender123",
+                "notify_on_stop": True,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["results"][0]["delivery_kind"] == "human_telegram"
+        notifier.send_human_message_to_session_topic.assert_awaited_once_with(
+            session=sender_session,
+            recipient_name="rajesh",
+            message="default cli route",
+        )
+
     def test_send_input_batch_rejects_urgent_human_telegram(
         self,
         mock_session_manager,

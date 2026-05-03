@@ -1575,7 +1575,6 @@ def create_app(
             and request.timeout_seconds is None
             and request.notify_on_delivery is False
             and request.notify_after_seconds is None
-            and request.notify_on_stop is False
             and request.remind_soft_threshold is None
             and request.remind_hard_threshold is None
             and request.remind_cancel_on_reply_session_id is None
