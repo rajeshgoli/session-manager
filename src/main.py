@@ -291,6 +291,7 @@ class SessionManagerApp:
                 "~/.local/share/claude-sessions/response_relay.db",
             )
         )
+        self.session_manager.response_relay_ledger = self.response_relay_ledger
 
         # Wire up output monitor callbacks
         self.output_monitor.set_event_callback(self._handle_monitor_event)

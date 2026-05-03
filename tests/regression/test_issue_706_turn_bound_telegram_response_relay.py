@@ -710,3 +710,65 @@ async def test_bypass_queue_telegram_permission_response_records_boundary(tmp_pa
     assert active_turn.inbound_id.startswith(f"direct:{session.id}:")
     assert active_turn.source == "telegram"
     assert active_turn.transcript_offset == transcript.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_without_queue_records_boundary(tmp_path):
+    transcript = tmp_path / "direct-no-queue.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.response_relay_ledger = ledger
+    manager.message_queue_manager = None
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+
+    result = await manager.send_input(
+        session.id,
+        "direct api user turn",
+        response_relay_source="api",
+    )
+
+    assert result.value == "delivered"
+    manager._deliver_direct.assert_awaited_once_with(session, "direct api user turn")
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id.startswith(f"direct:{session.id}:")
+    assert active_turn.source == "api"
+    assert active_turn.transcript_offset == transcript.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_mode_fallthrough_records_sm_send_boundary(tmp_path):
+    transcript = tmp_path / "direct-fallthrough.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.message_queue_manager = SimpleNamespace(response_relay_ledger=ledger)
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+
+    result = await manager.send_input(
+        session.id,
+        "fallthrough user turn",
+        delivery_mode="custom-direct",
+        from_sm_send=True,
+    )
+
+    assert result.value == "delivered"
+    manager._deliver_direct.assert_awaited_once_with(session, "fallthrough user turn")
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id.startswith(f"direct:{session.id}:")
+    assert active_turn.source == "sm-send"
+    assert active_turn.transcript_offset == transcript.stat().st_size

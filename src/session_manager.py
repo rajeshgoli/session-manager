@@ -390,6 +390,7 @@ class SessionManager:
 
         # Message queue manager (set by main app)
         self.message_queue_manager = None
+        self.response_relay_ledger = None
         queue_runner_config = dict(self.config)
         if "queue_runner" not in queue_runner_config and self.state_file != self.default_state_file:
             queue_runner_config["queue_runner"] = {
@@ -4077,6 +4078,12 @@ class SessionManager:
                 )
             self._save_state()
 
+    def _get_response_relay_ledger(self):
+        ledger = None
+        if self.message_queue_manager:
+            ledger = getattr(self.message_queue_manager, "response_relay_ledger", None)
+        return ledger or getattr(self, "response_relay_ledger", None)
+
     def _record_initial_response_relay_inbound(
         self,
         *,
@@ -4086,9 +4093,9 @@ class SessionManager:
         delivered_at: datetime,
     ) -> None:
         """Record a Claude prompt injected at session launch as the first relay turn."""
-        if not text.strip() or not self.message_queue_manager:
+        if not text.strip():
             return
-        ledger = getattr(self.message_queue_manager, "response_relay_ledger", None)
+        ledger = self._get_response_relay_ledger()
         if ledger is None:
             return
         try:
@@ -4118,9 +4125,9 @@ class SessionManager:
         delivered_at: datetime,
     ) -> None:
         """Record a direct user/operator input turn that bypassed the message queue."""
-        if not source or not self.message_queue_manager:
+        if not source or not text.strip():
             return
-        ledger = getattr(self.message_queue_manager, "response_relay_ledger", None)
+        ledger = self._get_response_relay_ledger()
         if ledger is None:
             return
         transcript_path = getattr(session, "transcript_path", None)
@@ -4376,8 +4383,15 @@ class SessionManager:
         # Fallback: send immediately (no queue manager or unknown mode)
         success = await self._deliver_direct(session, formatted_text)
         if success:
+            delivered_at = datetime.now(timezone.utc)
             session.last_activity = datetime.now()
             session.status = SessionStatus.RUNNING
+            self._record_direct_response_relay_inbound(
+                session=session,
+                text=formatted_text,
+                source=response_relay_source or ("sm-send" if from_sm_send else None),
+                delivered_at=delivered_at,
+            )
             _clear_completed_state()
             self._save_state()
 
