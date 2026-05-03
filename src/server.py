@@ -1357,7 +1357,8 @@ def create_app(
     if notifier is not None:
         setattr(notifier, "session_manager", session_manager)
     if session_manager is not None:
-        setattr(session_manager, "response_relay_ledger", response_relay_ledger)
+        if response_relay_ledger is not None:
+            setattr(session_manager, "response_relay_ledger", response_relay_ledger)
         queue_mgr = getattr(session_manager, "message_queue_manager", None)
         if queue_mgr is not None and response_relay_ledger is not None:
             setattr(queue_mgr, "response_relay_ledger", response_relay_ledger)
