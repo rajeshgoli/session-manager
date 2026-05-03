@@ -1892,7 +1892,7 @@ class SessionManager:
         if not last_message:
             return
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        turn_id = self._codex_payload_id(payload.get("turn_id") or event.get("turn_id"))
+        turn_id = self._codex_fork_turn_id_for_event(event, payload)
         thread_id = self._codex_fork_thread_id_for_event(event, payload)
         if turn_id and self.codex_event_store.has_assistant_turn_relayed(
             session_id=session_id,
@@ -1984,6 +1984,19 @@ class SessionManager:
             if thread_id:
                 return thread_id
         return None
+
+    def _codex_fork_turn_id_for_event(
+        self,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> Optional[str]:
+        """Return the best available Codex turn id from old or provider-native keys."""
+        return self._codex_payload_id(
+            payload.get("turnId")
+            or payload.get("turn_id")
+            or event.get("turnId")
+            or event.get("turn_id")
+        )
 
     def _accumulate_codex_assistant_delta(
         self,
@@ -2130,9 +2143,7 @@ class SessionManager:
         thread_id = self._codex_fork_thread_id_for_event(event, payload)
 
         if normalized in {"item/agent_message/delta", "agent_message_content_delta"}:
-            turn_id = self._codex_payload_id(
-                payload.get("turnId") or payload.get("turn_id") or event.get("turn_id")
-            )
+            turn_id = self._codex_fork_turn_id_for_event(event, payload)
             message_item_id = self._codex_payload_id(
                 payload.get("itemId") or payload.get("item_id") or payload.get("message_item_id")
             )
@@ -2149,9 +2160,7 @@ class SessionManager:
             item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
             if item.get("type") != "agentMessage":
                 return
-            turn_id = self._codex_payload_id(
-                payload.get("turnId") or payload.get("turn_id") or event.get("turn_id")
-            )
+            turn_id = self._codex_fork_turn_id_for_event(event, payload)
             message_item_id = self._codex_payload_id(
                 item.get("id")
                 or payload.get("itemId")
@@ -2181,7 +2190,7 @@ class SessionManager:
             return
 
         if normalized == "turn_complete":
-            turn_id = self._codex_payload_id(payload.get("turn_id") or event.get("turn_id"))
+            turn_id = self._codex_fork_turn_id_for_event(event, payload)
             last_message = payload.get("last_agent_message")
             if isinstance(last_message, str) and last_message.strip():
                 self._discard_codex_assistant_deltas_for_turn(
@@ -2237,7 +2246,7 @@ class SessionManager:
             self._safe_log_codex_turn_event(
                 session_id=session_id,
                 thread_id=str(event.get("session_id")) if event.get("session_id") else None,
-                turn_id=payload.get("turn_id") or event.get("turn_id"),
+                turn_id=self._codex_fork_turn_id_for_event(event, payload),
                 event_type=normalized,
                 status="completed" if normalized == "turn_complete" else None,
                 output_preview=payload_preview[:400] if payload_preview else None,
@@ -2252,7 +2261,7 @@ class SessionManager:
             if event_thread_id and not self._normalize_codex_thread_id(payload_for_store.get("thread_id")):
                 payload_for_reducer = {**payload_for_store, "session_id": event_thread_id}
 
-        turn_id = payload_for_store.get("turn_id") or event.get("turn_id")
+        turn_id = self._codex_fork_turn_id_for_event(event, payload_for_store)
         self.codex_event_store.append_event(
             session_id=session_id,
             event_type=f"codex_fork_{normalized}",

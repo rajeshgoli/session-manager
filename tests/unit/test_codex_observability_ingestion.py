@@ -447,7 +447,7 @@ async def test_codex_fork_turn_complete_full_output_beats_delta_fallback(tmp_pat
         "seq": 2,
         "session_epoch": 1,
         "payload": {
-            "turn_id": "turn-full",
+            "turnId": "turn-full",
             "last_agent_message": "canonical full answer",
         },
     }
@@ -463,6 +463,59 @@ async def test_codex_fork_turn_complete_full_output_beats_delta_fallback(tmp_pat
     event = manager.notifier.notify.await_args.args[0]
     assert event.context == "canonical full answer"
     assert manager._codex_assistant_message_deltas == {}
+    assert manager.codex_event_store.has_assistant_turn_relayed(
+        session_id=session.id,
+        thread_id="thread-full",
+        turn_id="turn-full",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_turn_complete_camel_case_turn_id_flushes_delta_fallback(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "session_id": "thread-camel",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-camel",
+                "turnId": "turn-camel",
+                "itemId": "msg-camel",
+                "delta": "fallback from camel turn id",
+            },
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "turn_complete",
+            "session_id": "thread-camel",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {
+                "turnId": "turn-camel",
+                "last_agent_message": None,
+            },
+        },
+    )
+
+    manager.notifier.notify.assert_awaited_once()
+    event = manager.notifier.notify.await_args.args[0]
+    assert event.context == "fallback from camel turn id"
+    assert manager.codex_event_store.has_assistant_message_relayed(
+        session_id=session.id,
+        thread_id="thread-camel",
+        turn_id="turn-camel",
+        message_item_id="msg-camel",
+    )
 
 
 @pytest.mark.asyncio
