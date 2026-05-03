@@ -1983,6 +1983,7 @@ def create_app(
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
+            response_relay_source="email",
         )
         if result == DeliveryResult.FAILED:
             raise HTTPException(status_code=500, detail="Failed to deliver inbound email to session")

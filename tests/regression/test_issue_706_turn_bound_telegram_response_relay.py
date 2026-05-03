@@ -424,6 +424,37 @@ async def test_message_queue_records_telegram_inbound_boundary(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_message_queue_records_email_inbound_boundary(tmp_path):
+    transcript = tmp_path / "email.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    session = _session(transcript)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+
+    msg = mq.queue_message(
+        session.id,
+        "{sm email from user@example.com}\nemail user turn",
+        response_relay_source="email",
+        trigger_delivery=False,
+    )
+
+    await mq._try_deliver_messages(session.id)
+
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == msg.id
+    assert active_turn.source == "email"
+
+
+@pytest.mark.asyncio
 async def test_bypass_queue_telegram_permission_response_records_boundary(tmp_path):
     transcript = tmp_path / "permission-response.jsonl"
     transcript.write_text(_assistant_line("existing old output", uuid="old"))
@@ -446,6 +477,7 @@ async def test_bypass_queue_telegram_permission_response_records_boundary(tmp_pa
     )
 
     assert result.value == "delivered"
+    assert session.last_activity.tzinfo is None
     active_turn = ledger.get_latest_active_turn(session.id)
     assert active_turn is not None
     assert active_turn.inbound_id.startswith(f"direct:{session.id}:")

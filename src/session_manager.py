@@ -4170,7 +4170,7 @@ class SessionManager:
             success = await self._deliver_direct(session, text)
             if success:
                 delivered_at = datetime.now(timezone.utc)
-                session.last_activity = delivered_at
+                session.last_activity = datetime.now()
                 self._record_direct_response_relay_inbound(
                     session=session,
                     text=text,
