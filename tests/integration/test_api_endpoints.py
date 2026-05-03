@@ -453,12 +453,25 @@ class TestHumanRecipientEndpoints:
         sample_session,
     ):
         mock_email_handler.lookup_human.return_value = _human_recipient()
-        mock_email_handler.lookup_user.return_value = RegisteredEmailUser(
-            username="rajesh",
-            email="private@example.com",
-            display_name="Human operator",
-            aliases=("rajesh", "user"),
-        )
+
+        def lookup_user(identifier: str):
+            if identifier == "user":
+                return RegisteredEmailUser(
+                    username="other-user",
+                    email="wrong@example.com",
+                    display_name="Wrong recipient",
+                    aliases=("user",),
+                )
+            if identifier == "rajesh":
+                return RegisteredEmailUser(
+                    username="rajesh",
+                    email="private@example.com",
+                    display_name="Human operator",
+                    aliases=("rajesh", "user"),
+                )
+            return None
+
+        mock_email_handler.lookup_user.side_effect = lookup_user
         mock_session_manager.get_session.return_value = sample_session
         mock_email_handler.send_agent_email = AsyncMock(
             return_value={
@@ -478,6 +491,10 @@ class TestHumanRecipientEndpoints:
         assert data["recipient"] == "rajesh"
         assert data["channel"] == "email"
         assert "private@example.com" not in json.dumps(data)
+        assert "wrong@example.com" not in json.dumps(data)
+        mock_email_handler.lookup_user.assert_called_once_with("rajesh")
+        mock_email_handler.send_agent_email.assert_awaited_once()
+        assert mock_email_handler.send_agent_email.await_args.kwargs["to_identifiers"] == ["rajesh"]
 
     def test_human_telegram_missing_sender_topic_fails_clearly(
         self,

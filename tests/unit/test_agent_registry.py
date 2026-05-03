@@ -341,6 +341,56 @@ humans:
     )
 
 
+def test_human_reserved_names_merge_main_and_bridge_config(tmp_path):
+    bridge_config = tmp_path / "email_send.yaml"
+    bridge_config.write_text(
+        """
+humans:
+  rajesh:
+    aliases: [bridge-user]
+    default_channel: telegram
+    channels:
+      email:
+        enabled: true
+        use: fallback_only
+""",
+        encoding="utf-8",
+    )
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+        config={
+            "humans": {
+                "rajesh": {
+                    "aliases": ["main-user"],
+                    "default_channel": "telegram",
+                    "channels": {
+                        "telegram": {
+                            "enabled": True,
+                            "delivery": "sender_session_topic",
+                        },
+                    },
+                },
+                "operator": {
+                    "aliases": ["main-operator"],
+                    "default_channel": "telegram",
+                    "channels": {
+                        "telegram": {
+                            "enabled": True,
+                            "delivery": "sender_session_topic",
+                        },
+                    },
+                },
+            },
+            "email": {"bridge_config": str(bridge_config)},
+        },
+    )
+
+    reserved_names = manager.human_reserved_names()
+
+    assert {"rajesh", "main-user", "bridge-user", "operator", "main-operator"}.issubset(reserved_names)
+
+
 def test_cmd_lookup_falls_back_to_exact_session_name(capsys):
     client = Mock()
     client.lookup_role.return_value = {

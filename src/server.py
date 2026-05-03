@@ -1485,7 +1485,7 @@ def create_app(
         handler = _email_handler_or_503()
         lookup_user = getattr(handler, "lookup_user", None)
         try:
-            resolved_email_user = lookup_user(identifier) if callable(lookup_user) else None
+            resolved_email_user = lookup_user(human.name) if callable(lookup_user) else None
         except HumanRecipientConfigError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if resolved_email_user is None:
@@ -1494,7 +1494,7 @@ def create_app(
         email_payload = await _send_registered_email(
             SendEmailRequest(
                 requester_session_id=request.requester_session_id,
-                recipients=[identifier],
+                recipients=[human.name],
                 subject=request.subject,
                 body_text=request.text,
                 body_markdown=request.body_markdown,

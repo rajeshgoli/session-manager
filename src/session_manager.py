@@ -3934,9 +3934,9 @@ class SessionManager:
 
     def _load_human_recipient_config(self) -> dict[str, Any]:
         """Load human recipient config from config.yaml and the email bridge config."""
-        merged: dict[str, Any] = {}
+        humans: dict[str, Any] = {}
         if isinstance(self.config.get("humans"), dict):
-            merged["humans"] = self.config["humans"]
+            self._merge_human_recipient_entries(humans, self.config["humans"])
 
         bridge_config = (self.config.get("email") or {}).get("bridge_config")
         bridge_path = Path(str(bridge_config or DEFAULT_EMAIL_BRIDGE_CONFIG_PATH)).expanduser()
@@ -3947,8 +3947,64 @@ class SessionManager:
                 logger.warning("Failed to load human recipient config from %s: %s", bridge_path, exc)
                 bridge_data = {}
             if isinstance(bridge_data, dict) and isinstance(bridge_data.get("humans"), dict):
-                merged["humans"] = bridge_data["humans"]
+                self._merge_human_recipient_entries(humans, bridge_data["humans"])
+
+        merged: dict[str, Any] = {}
+        if humans:
+            merged["humans"] = humans
         return merged
+
+    @staticmethod
+    def _merge_human_recipient_entries(target: dict[str, Any], source: dict[str, Any]) -> None:
+        """Merge human recipient entries while preserving aliases from earlier sources."""
+        for raw_name, raw_spec in source.items():
+            name = str(raw_name or "").strip().lower()
+            if not name or not isinstance(raw_spec, dict):
+                continue
+
+            incoming = dict(raw_spec)
+            existing = target.get(name)
+            if not isinstance(existing, dict):
+                target[name] = incoming
+                continue
+
+            aliases = SessionManager._merged_human_aliases(existing.get("aliases"), incoming.get("aliases"))
+            channels = SessionManager._merged_human_channels(existing.get("channels"), incoming.get("channels"))
+
+            merged_spec = dict(existing)
+            merged_spec.update(incoming)
+            if aliases:
+                merged_spec["aliases"] = aliases
+            if channels:
+                merged_spec["channels"] = channels
+            target[name] = merged_spec
+
+    @staticmethod
+    def _merged_human_aliases(*alias_values: Any) -> list[str]:
+        aliases: list[str] = []
+        seen: set[str] = set()
+        for value in alias_values:
+            if isinstance(value, str):
+                values = [value]
+            elif isinstance(value, list):
+                values = value
+            else:
+                values = []
+            for alias in values:
+                normalized = str(alias or "").strip().lower()
+                if normalized and normalized not in seen:
+                    aliases.append(normalized)
+                    seen.add(normalized)
+        return aliases
+
+    @staticmethod
+    def _merged_human_channels(existing: Any, incoming: Any) -> dict[str, Any]:
+        channels: dict[str, Any] = {}
+        if isinstance(existing, dict):
+            channels.update(existing)
+        if isinstance(incoming, dict):
+            channels.update(incoming)
+        return channels
 
     def human_recipient_registry(self) -> HumanRecipientRegistry:
         """Return the configured human recipient registry."""
