@@ -9,9 +9,10 @@ Add a secure, SM-owned mobile attach transport that works off-LAN without relyin
 The recommended v1 shape is:
 
 1. The Android app asks Session Manager for a short-lived attach ticket for one existing session.
-2. The app opens an authenticated terminal stream over the existing HTTPS origin, `sm.rajeshgo.li`.
-3. Session Manager bridges that stream to the selected tmux-backed session only.
-4. The existing Termux SSH path remains available as an operator fallback, but is no longer the primary mobile attach path.
+2. The app proves possession of a registered device key, preserving the second authentication factor that SSH keys provide today.
+3. The app opens an authenticated terminal stream over the existing HTTPS origin, `sm.rajeshgo.li`.
+4. Session Manager bridges that stream to the selected tmux-backed session only.
+5. The existing Termux SSH path remains available as a supported operator fallback, but is no longer the primary off-LAN attach path.
 
 Security is the primary design constraint. This feature exposes an interactive shell path to the machine. It must be implemented as a narrowly authorized, audited, session-scoped terminal bridge, not as a general remote command API.
 
@@ -42,7 +43,8 @@ The app already talks to Session Manager over HTTPS for watch, status, and sessi
 4. Use short-lived, single-use attach tickets so durable app credentials are not embedded in WebSocket URLs or terminal pages.
 5. Audit terminal attach lifecycle events without logging sensitive terminal content by default.
 6. Preserve existing desktop `sm attach` behavior.
-7. Keep Termux SSH as an optional fallback/copy-command path for operators.
+7. Keep Termux SSH as a supported fallback/copy-command path for operators.
+8. Preserve the current two-layer security model: authenticated app access plus a registered device key that proves the client is an approved device.
 
 ## Non-Goals
 
@@ -61,11 +63,12 @@ The design must assume these threats are realistic:
 1. An unauthenticated internet client finds the public SM hostname and tries to open terminal WebSockets.
 2. An authenticated but non-authorized account attempts to mint an attach ticket.
 3. A valid attach ticket leaks through browser history, proxy logs, crash reports, app logs, or screenshots.
-4. A client tampers with session ids, tmux session names, socket names, resize values, or terminal frames.
-5. A malicious webpage tries to trigger attach through cookies or browser ambient credentials.
-6. A stale Android app or compromised network path replays an old attach ticket.
-7. A terminal bridge process outlives the mobile connection and leaves a shell attached.
-8. High-volume failed connection attempts create a denial-of-service path on the SM event loop.
+4. A valid app login token leaks without the approved device private key.
+5. A client tampers with session ids, tmux session names, socket names, resize values, or terminal frames.
+6. A malicious webpage tries to trigger attach through cookies or browser ambient credentials.
+7. A stale Android app or compromised network path replays an old attach ticket.
+8. A terminal bridge process outlives the mobile connection and leaves a shell attached.
+9. High-volume failed connection attempts create a denial-of-service path on the SM event loop.
 
 ## Security Requirements
 
@@ -79,6 +82,7 @@ Attach is allowed only when all checks pass:
 4. The session attach descriptor reports `attach_supported=true`.
 5. The session is tmux-backed and has a server-derived tmux target.
 6. The session is currently running or attachable according to cached SM state.
+7. The caller proves possession of a registered device key for that human user.
 
 Agents, email senders, Telegram senders, anonymous clients, and browser sessions without the explicit shell-access grant must not be able to mint attach tickets.
 
@@ -88,16 +92,39 @@ Recommended config shape:
 mobile_terminal:
   enabled: false
   allowed_users:
-    - rajesh
+    rajesh:
+      interactive_shell_access: true
+      registered_device_keys:
+        - id: pixel-8-pro
+          public_key: "ssh-ed25519 AAAA..."
+          label: "Rajesh Pixel"
+          enabled: true
   ticket_ttl_seconds: 30
   auth_frame_timeout_seconds: 3
-  max_attach_seconds: 14400
-  max_concurrent_attaches_per_user: 2
-  max_concurrent_attaches_global: 8
+  max_attach_seconds: 3600
+  max_concurrent_attaches_per_user: 1
+  max_concurrent_attaches_per_session: 1
+  max_concurrent_attaches_global: 4
   require_tls: true
 ```
 
 Default should be disabled unless the deployment config explicitly enables it.
+
+### Registered Device Key
+
+The HTTPS attach path should replicate the current SSH model's second layer of protection. OAuth/app authentication proves the user account. A registered device key proves the request comes from an approved device, similar to the existing presigned SSH key requirement.
+
+Recommended v1 behavior:
+
+1. Each allowed human user has one or more configured device public keys.
+2. The Android app stores the private key in Android Keystore when generated on-device, or imports a dedicated attach key through an operator-controlled setup flow.
+3. The attach-ticket request includes a device key id, timestamp, nonce, and signature over the HTTP method, path, session id, user id, timestamp, and nonce.
+4. The server verifies the signature against the configured public key before minting a ticket.
+5. The ticket is bound to the verified device key id.
+6. The WebSocket auth frame includes a second signature over the ticket id, session id, and a server/client nonce so a leaked ticket alone cannot open a shell.
+7. Revoking a device key immediately prevents new tickets and rejects unconsumed tickets bound to that key.
+
+The exact key format can be SSH `ed25519` public keys or another standard asymmetric format supported cleanly by the Android app and Python server. The security requirement is proof-of-possession of a configured device private key, not a bearer-only token.
 
 ### Attach Tickets
 
@@ -109,12 +136,24 @@ Endpoint:
 POST /client/sessions/{session_id}/attach-ticket
 ```
 
+Request authentication includes normal app auth plus device-key proof, for example:
+
+```http
+X-SM-Device-Key-Id: pixel-8-pro
+X-SM-Device-Timestamp: 2026-05-03T00:00:00Z
+X-SM-Device-Nonce: ...
+X-SM-Device-Signature: ...
+```
+
+The signature covers the method, path, target session id, authenticated user id, timestamp, and nonce.
+
 Response:
 
 ```json
 {
   "ticket_id": "att_...",
   "ticket_secret": "...",
+  "device_key_id": "pixel-8-pro",
   "ws_url": "wss://sm.rajeshgo.li/client/terminal",
   "expires_at": "2026-05-03T00:00:00Z"
 }
@@ -126,7 +165,7 @@ Ticket rules:
 2. Store only a keyed hash of the secret server-side.
 3. TTL defaults to 30 seconds.
 4. Tickets are single-use and are consumed atomically.
-5. A ticket is bound to user id, session id, provider, tmux session, tmux socket, client id, and creation time.
+5. A ticket is bound to user id, registered device key id, session id, provider, tmux session, tmux socket, client id, and creation time.
 6. Expired, consumed, revoked, or mismatched tickets fail closed.
 7. Cleanup expired tickets in bounded background maintenance, not on the hot path.
 
@@ -146,16 +185,20 @@ The server accepts the socket only into a pending-auth state. The client must se
 {
   "type": "auth",
   "ticket_id": "att_...",
-  "ticket_secret": "..."
+  "ticket_secret": "...",
+  "device_key_id": "pixel-8-pro",
+  "nonce": "...",
+  "signature": "..."
 }
 ```
 
 The server then:
 
 1. Validates and atomically consumes the ticket.
-2. Re-runs authorization checks against current session state.
-3. Starts the tmux bridge only after validation succeeds.
-4. Closes the socket immediately on invalid auth, timeout, replay, or authorization failure.
+2. Verifies the registered device-key signature and checks it matches the ticket-bound key id.
+3. Re-runs authorization checks against current session state.
+4. Starts the tmux bridge only after validation succeeds.
+5. Closes the socket immediately on invalid auth, timeout, replay, or authorization failure.
 
 Do not rely on browser cookies alone for WebSocket authorization. This prevents cross-site WebSocket abuse from ambient browser credentials.
 
@@ -165,7 +208,7 @@ Do not rely on browser cookies alone for WebSocket authorization. This prevents 
 2. Plain `ws://` is allowed only for localhost development when explicitly configured.
 3. The server should validate `Origin` when present against configured app/web origins.
 4. Missing `Origin` is acceptable for native OkHttp clients, but those clients still need a valid attach ticket.
-5. Failed auth attempts are rate-limited by IP, user id when known, and global counters.
+5. Failed auth attempts are rate-limited by IP, user id when known, device key id when present, and global counters.
 
 ### tmux Bridge Safety
 
@@ -200,10 +243,11 @@ Audit fields:
 2. User id.
 3. Session id.
 4. Provider.
-5. Remote address or coarse client fingerprint.
-6. Result and reason.
-7. Duration.
-8. Input/output byte counts.
+5. Registered device key id.
+6. Remote address or coarse client fingerprint.
+7. Result and reason.
+8. Duration.
+9. Input/output byte counts.
 
 Do not log raw terminal input or output by default. If a future debug mode captures content, it must be opt-in, time-bounded, visibly marked, and disabled in normal operation.
 
@@ -239,14 +283,15 @@ Input and resize validation:
 
 ## Android UX
 
-The app should make HTTPS terminal attach the primary action when the server advertises support:
+The app should make HTTPS terminal attach the primary action when the server advertises support. This terminal surface should live inside the SM Android app, behind the same app OAuth/auth boundary as watch/details. Do not expose a public browser terminal page as the normal v1 entry point.
 
 1. User taps a tmux-backed session in watch/details.
-2. App calls `POST /client/sessions/{id}/attach-ticket`.
-3. App opens the terminal view and connects to `ws_url`.
-4. App sends the auth frame.
-5. App renders output and forwards keyboard/resize input.
-6. When the terminal disconnects, the app returns to the prior watch/details state.
+2. App signs the attach-ticket request with the registered device key.
+3. App calls `POST /client/sessions/{id}/attach-ticket`.
+4. App opens the terminal view and connects to `ws_url`.
+5. App sends the auth frame, including a fresh device-key signature.
+6. App renders output and forwards keyboard/resize input.
+7. When the terminal disconnects, the app returns to the prior watch/details state.
 
 The Android implementation can use a native terminal component or a local WebView terminal renderer. If WebView is used:
 
@@ -255,7 +300,9 @@ The Android implementation can use a native terminal component or a local WebVie
 3. JavaScript interfaces must expose only the minimal terminal bridge API.
 4. External web content must not be able to access attach tickets.
 
-Termux attach remains available as a secondary action such as "Open in Termux" or "Copy SSH fallback command".
+Termux attach remains available as a supported secondary action such as "Open in Termux" or "Copy SSH fallback command". This spec is not a Termux removal or deprecation plan; it changes the default off-LAN app attach path because the Termux Cloudflare SSH stack has been the unreliable component.
+
+V1 should allow only one active mobile attach per user and one active mobile attach per session. To attach somewhere else, the app should detach the current terminal first, then mint a new ticket for the next session. This matches the mobile ergonomic model and avoids surprising simultaneous shell views.
 
 ## Server API Changes
 
@@ -291,14 +338,15 @@ When the feature is disabled or the user lacks shell access, `mobile_terminal.su
 
 1. Add configuration parsing for `mobile_terminal`, default disabled.
 2. Add an attach-ticket store with hashed secrets, atomic consume, TTL cleanup, and audit hooks.
-3. Add `POST /client/sessions/{session_id}/attach-ticket` with strict authorization.
-4. Add `GET /client/terminal` WebSocket pending-auth flow.
-5. Add a tmux bridge abstraction that uses server-derived attach descriptors and argv-only subprocess execution.
-6. Add lifecycle cleanup so bridge processes are killed on disconnect, timeout, server shutdown, or session disappearance.
-7. Add client payload metadata so Android can prefer mobile terminal attach when supported.
-8. Add Android terminal attach UI using existing app auth to mint tickets.
-9. Keep existing Termux SSH attach as fallback.
-10. Rebuild and publish the Android APK artifact when the app change lands.
+3. Add registered device-key config and signature verification for ticket minting.
+4. Add `POST /client/sessions/{session_id}/attach-ticket` with strict authorization.
+5. Add `GET /client/terminal` WebSocket pending-auth flow with ticket and device-key proof validation.
+6. Add a tmux bridge abstraction that uses server-derived attach descriptors and argv-only subprocess execution.
+7. Add lifecycle cleanup so bridge processes are killed on disconnect, timeout, server shutdown, or session disappearance.
+8. Add client payload metadata so Android can prefer mobile terminal attach when supported.
+9. Add Android terminal attach UI using existing app auth to mint tickets and Android Keystore/device-key signing.
+10. Keep existing Termux SSH attach as supported fallback.
+11. Rebuild and publish the Android APK artifact when the app change lands.
 
 ## Test Plan
 
@@ -307,49 +355,53 @@ Server tests:
 1. Ticket mint denied when feature disabled.
 2. Ticket mint denied for unauthenticated users.
 3. Ticket mint denied for authenticated users without `interactive_shell_access`.
-4. Ticket mint denied for non-attachable/headless sessions.
-5. Ticket mint succeeds for an authorized user and tmux-backed session.
-6. Ticket secret is not stored raw.
-7. Expired ticket fails.
-8. Replayed ticket fails.
-9. Ticket for session A cannot attach to session B.
-10. WebSocket closes if auth frame is missing, late, malformed, or invalid.
-11. Bridge subprocess is not started until auth succeeds.
-12. Bridge subprocess receives argv-only tmux command with server-derived target.
-13. Malicious tmux names fail validation.
-14. Disconnect kills the bridge subprocess.
-15. Audit events are written for success, deny, auth failure, and abnormal exit.
+4. Ticket mint denied when the registered device-key signature is missing, invalid, stale, or revoked.
+5. Ticket mint denied for non-attachable/headless sessions.
+6. Ticket mint succeeds for an authorized user, registered device key, and tmux-backed session.
+7. Ticket secret is not stored raw.
+8. Expired ticket fails.
+9. Replayed ticket fails.
+10. Ticket for session A cannot attach to session B.
+11. Ticket minted for device key A cannot be consumed by device key B.
+12. WebSocket closes if auth frame is missing, late, malformed, unsigned, or invalid.
+13. Bridge subprocess is not started until auth and device-key proof both succeed.
+14. Bridge subprocess receives argv-only tmux command with server-derived target.
+15. Malicious tmux names fail validation.
+16. Disconnect kills the bridge subprocess.
+17. Second simultaneous mobile attach by the same user/session is rejected or requires prior detach according to config.
+18. Audit events are written for success, deny, auth failure, device-key failure, and abnormal exit.
 
 Android tests:
 
 1. App shows HTTPS terminal attach when `mobile_terminal.supported=true`.
 2. App falls back to details/Termux when unsupported.
-3. Ticket secret is not included in URLs or persisted settings.
-4. Terminal view returns to watch/details after disconnect.
+3. App signs ticket mint and WebSocket auth with the configured device key.
+4. Ticket secret is not included in URLs or persisted settings.
+5. Terminal view returns to watch/details after disconnect.
+6. Starting a second attach first detaches or blocks the current mobile attach.
 
 Manual verification:
 
 1. Off-LAN Android attach works through `sm.rajeshgo.li`.
 2. Invalid/expired ticket cannot attach.
 3. Non-allowed account cannot mint a ticket.
-4. Existing desktop `sm attach` still works.
-5. Termux fallback still works where Cloudflare/LAN SSH works.
+4. OAuth-authenticated app without a registered device key cannot attach.
+5. Existing desktop `sm attach` still works.
+6. Termux fallback still works where Cloudflare/LAN SSH works.
 
 ## Rollout
 
 1. Ship server feature disabled by default.
 2. Enable only for the configured owner account after tests pass.
 3. Verify off-LAN attach from Android.
-4. Keep Termux SSH fallback visible during the initial rollout.
+4. Keep Termux SSH fallback visible and supported during the initial rollout.
 5. Add dashboard/watch health text distinguishing HTTPS terminal attach from Termux attach.
 6. After confidence, make HTTPS terminal attach the default app action.
 
 ## Open Decisions For PR Review
 
 1. Terminal renderer: native Android terminal component vs bundled local WebView renderer.
-2. Maximum attach duration default.
-3. Whether concurrent attaches to the same session should be allowed or limited to one mobile attach at a time.
-4. Whether operator emergency disable should be config-only or also exposed as a CLI/API switch.
+2. Whether operator emergency disable should be config-only or also exposed as a CLI/API switch.
 
 ## Ticket Classification
 
