@@ -1,6 +1,7 @@
 """FastAPI server for hooks and API endpoints."""
 
 import asyncio
+from dataclasses import replace
 import inspect
 import json
 import logging
@@ -58,6 +59,11 @@ from .cli.dispatch import get_auto_remind_config
 from .bug_report_store import BugReportStore
 from .human_recipients import HumanRecipient, HumanRecipientConfigError
 from .mobile_analytics import MobileAnalyticsBuilder
+from .response_relay import (
+    ResponseRelayLedger,
+    collect_claude_assistant_outputs_after_turn,
+    find_claude_inbound_turn_boundary_offset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1293,6 +1299,7 @@ def create_app(
     config: Optional[dict] = None,
     lifespan=None,
     email_handler=None,
+    response_relay_ledger: Optional[ResponseRelayLedger] = None,
 ) -> FastAPI:
     """
     Create the FastAPI application.
@@ -1305,6 +1312,7 @@ def create_app(
         config: Configuration dictionary
         lifespan: Optional ASGI lifespan context manager
         email_handler: EmailHandler instance
+        response_relay_ledger: Durable turn-bound response relay ledger
 
     Returns:
         Configured FastAPI app
@@ -1341,12 +1349,19 @@ def create_app(
     app.state.output_monitor = output_monitor
     app.state.child_monitor = child_monitor
     app.state.email_handler = email_handler
+    app.state.response_relay_ledger = response_relay_ledger
     app.state.bug_report_store = None
     app.state.infra_supervisor = None
     app.state.last_claude_output = {}  # Store last output per session from hooks
     app.state.pending_stop_notifications = set()  # Sessions where Stop hook had empty transcript
     if notifier is not None:
         setattr(notifier, "session_manager", session_manager)
+    if session_manager is not None:
+        if response_relay_ledger is not None:
+            setattr(session_manager, "response_relay_ledger", response_relay_ledger)
+        queue_mgr = getattr(session_manager, "message_queue_manager", None)
+        if queue_mgr is not None and response_relay_ledger is not None:
+            setattr(queue_mgr, "response_relay_ledger", response_relay_ledger)
 
     attach_infra_cache = {"expires_at": 0.0, "issue": None}
     app.state.mobile_terminal_tickets: dict[str, MobileTerminalTicket] = {}
@@ -1644,6 +1659,9 @@ def create_app(
             and request.parent_session_id is None
         )
 
+    def _response_relay_source_for_send_request(request: SendInputRequest) -> str:
+        return "sm-send" if request.from_sm_send else "api"
+
     def _resolve_live_send_target(identifier: str) -> Optional[Session]:
         if not app.state.session_manager:
             return None
@@ -1746,6 +1764,7 @@ def create_app(
             remind_hard_threshold=request.remind_hard_threshold,
             remind_cancel_on_reply_session_id=request.remind_cancel_on_reply_session_id,
             parent_session_id=request.parent_session_id,
+            response_relay_source=_response_relay_source_for_send_request(request),
         )
 
         if result == DeliveryResult.FAILED:
@@ -1984,6 +2003,7 @@ def create_app(
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
+            response_relay_source="email",
         )
         if result == DeliveryResult.FAILED:
             raise HTTPException(status_code=500, detail="Failed to deliver inbound email to session")
@@ -6262,6 +6282,255 @@ Provide ONLY the summary, no preamble or questions."""
             methods=["POST"],
         )
 
+    def _resolve_claude_hook_session(
+        session_manager_id: Optional[str],
+        transcript_path: Optional[str],
+        claude_session_id: Optional[str],
+    ) -> Optional[Session]:
+        """Resolve a Claude hook to its managed session without transcript probing."""
+        if not app.state.session_manager:
+            return None
+        if session_manager_id:
+            target_session = app.state.session_manager.get_session(session_manager_id)
+            if target_session:
+                logger.info(f"Matched hook to session {session_manager_id} via environment variable")
+                return target_session
+        if transcript_path:
+            for session in app.state.session_manager.list_sessions():
+                if session.transcript_path == transcript_path:
+                    logger.info(f"Matched hook to session {session.id} via existing transcript path")
+                    return session
+        if claude_session_id:
+            target_session = app.state.session_manager.get_session(claude_session_id)
+            if target_session:
+                logger.info(f"Matched hook to session {claude_session_id} via claude_session_id")
+                return target_session
+        return None
+
+    async def _emit_review_complete_if_needed(target_session: Session, last_message: str) -> None:
+        """Preserve existing Claude review-complete side effects after response relay."""
+        if not target_session.review_config:
+            return
+        try:
+            from .review_parser import parse_tui_output, parse_github_review
+
+            review_config = target_session.review_config
+            review_result = None
+            if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
+                from .github_reviews import fetch_latest_codex_review
+
+                codex_review = await asyncio.to_thread(
+                    fetch_latest_codex_review,
+                    review_config.pr_repo,
+                    review_config.pr_number,
+                )
+                if codex_review:
+                    review_result = await asyncio.to_thread(
+                        parse_github_review,
+                        review_config.pr_repo,
+                        review_config.pr_number,
+                        codex_review,
+                    )
+            else:
+                review_result = parse_tui_output(last_message)
+
+            if review_result and review_result.findings:
+                review_event = NotificationEvent(
+                    session_id=target_session.id,
+                    event_type="review_complete",
+                    message="Review complete",
+                    context="",
+                    urgent=False,
+                )
+                review_event.review_result = review_result
+                await app.state.notifier.notify(review_event, target_session)
+        except Exception as e:
+            logger.warning(f"Failed to emit review_complete notification: {e}")
+
+    async def _relay_claude_response_for_turn(
+        *,
+        session_id: str,
+        transcript_path: Optional[str],
+        hook_event: str,
+    ) -> bool:
+        """Relay a Claude response only when it belongs to the active inbound turn."""
+        ledger = getattr(app.state, "response_relay_ledger", None)
+        if ledger is None or not app.state.notifier or not app.state.session_manager:
+            return False
+
+        target_session = app.state.session_manager.get_session(session_id)
+        if not target_session:
+            return False
+        if not target_session.telegram_chat_id:
+            return True
+
+        active_turn = ledger.get_latest_active_turn(session_id)
+        if not active_turn:
+            spawn_prompt = getattr(target_session, "spawn_prompt", None)
+            if isinstance(spawn_prompt, str) and spawn_prompt.strip():
+                try:
+                    active_turn = ledger.record_inbound_turn(
+                        session_id=session_id,
+                        inbound_id=f"initial:{session_id}",
+                        source="spawn",
+                        provider="claude",
+                        delivered_at=target_session.spawned_at or target_session.created_at,
+                        transcript_path=transcript_path or target_session.transcript_path,
+                        transcript_offset=None,
+                        text=spawn_prompt,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to backfill spawn response relay boundary for %s: %s",
+                        session_id,
+                        exc,
+                    )
+                    active_turn = None
+            if active_turn:
+                logger.info(
+                    "Backfilled Claude response relay boundary for spawned session %s",
+                    session_id,
+                )
+            else:
+                logger.info(
+                    "Suppressing Claude response relay for %s: no active inbound turn boundary",
+                    session_id,
+                )
+                return True
+
+        hook_replaces_stored_transcript = bool(
+            transcript_path
+            and active_turn.transcript_path
+            and transcript_path != active_turn.transcript_path
+        )
+        effective_transcript_path = (
+            transcript_path
+            if hook_replaces_stored_transcript
+            else active_turn.transcript_path or transcript_path
+        )
+        boundary_offset = None if hook_replaces_stored_transcript else active_turn.transcript_offset
+        if effective_transcript_path and boundary_offset is None:
+            boundary_offset = find_claude_inbound_turn_boundary_offset(
+                effective_transcript_path,
+                active_turn,
+            )
+        should_update_path = bool(transcript_path and not active_turn.transcript_path)
+        should_update_offset = boundary_offset is not None and active_turn.transcript_offset is None
+        if hook_replaces_stored_transcript:
+            ledger.replace_inbound_transcript_boundary(
+                active_turn.inbound_id,
+                transcript_path=transcript_path,
+                transcript_offset=boundary_offset,
+            )
+            active_turn = replace(
+                active_turn,
+                transcript_path=transcript_path,
+                transcript_offset=boundary_offset,
+            )
+        elif should_update_path or should_update_offset:
+            ledger.update_inbound_boundary(
+                active_turn.inbound_id,
+                transcript_path=transcript_path if should_update_path else None,
+                transcript_offset=boundary_offset if should_update_offset else None,
+            )
+            active_turn = replace(
+                active_turn,
+                transcript_path=active_turn.transcript_path or transcript_path,
+                transcript_offset=boundary_offset,
+            )
+        if not effective_transcript_path:
+            app.state.pending_stop_notifications.add(session_id)
+            logger.info(
+                "Deferring Claude response relay for %s: no transcript path for inbound %s",
+                session_id,
+                active_turn.inbound_id,
+            )
+            return True
+
+        outputs = collect_claude_assistant_outputs_after_turn(effective_transcript_path, active_turn)
+        if hook_event == "Stop":
+            retry_delay = EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS if not outputs else TRANSCRIPT_RETRY_DELAY_SECONDS
+            await asyncio.sleep(retry_delay)
+            retry_outputs = collect_claude_assistant_outputs_after_turn(effective_transcript_path, active_turn)
+            if retry_outputs:
+                outputs = retry_outputs
+
+        if not outputs:
+            app.state.pending_stop_notifications.add(session_id)
+            logger.info(
+                "Deferring Claude response relay for %s inbound %s: no post-boundary assistant output",
+                session_id,
+                active_turn.inbound_id,
+            )
+            return True
+
+        candidate = outputs[-1]
+        claimed = ledger.claim_assistant_output(
+            session_id=session_id,
+            inbound_id=active_turn.inbound_id,
+            provider="claude",
+            assistant_message_id=candidate.assistant_message_id,
+            text=candidate.text,
+            completed_at=candidate.completed_at,
+            provider_turn_id=active_turn.provider_turn_id,
+        )
+        if not claimed:
+            app.state.pending_stop_notifications.discard(session_id)
+            logger.info(
+                "Skipping duplicate Claude response relay for %s inbound %s message %s",
+                session_id,
+                active_turn.inbound_id,
+                candidate.assistant_message_id,
+            )
+            return True
+
+        app.state.last_claude_output["latest"] = candidate.text
+        app.state.last_claude_output[session_id] = candidate.text
+        app.state.pending_stop_notifications.discard(session_id)
+
+        event = NotificationEvent(
+            session_id=target_session.id,
+            event_type="response",
+            message="Claude responded",
+            context=candidate.text,
+            urgent=False,
+        )
+        if app.state.output_monitor:
+            app.state.output_monitor.mark_response_sent(target_session.id)
+
+        async def _notify_response_event():
+            try:
+                accepted = await app.state.notifier.notify(event, target_session)
+            except Exception as exc:
+                accepted = False
+                logger.warning(
+                    "Failed to send turn-bound Claude response notification for %s: %s",
+                    target_session.id,
+                    exc,
+                )
+
+            if accepted:
+                ledger.mark_assistant_output_relayed(
+                    session_id=session_id,
+                    inbound_id=active_turn.inbound_id,
+                    provider="claude",
+                    assistant_message_id=candidate.assistant_message_id,
+                    telegram_thread_id=target_session.telegram_thread_id,
+                )
+                target_session.last_activity = datetime.now()
+                await _save_session_manager_state(app.state.session_manager)
+            else:
+                ledger.release_assistant_output_claim(
+                    session_id=session_id,
+                    inbound_id=active_turn.inbound_id,
+                    provider="claude",
+                    assistant_message_id=candidate.assistant_message_id,
+                )
+            await _emit_review_complete_if_needed(target_session, candidate.text)
+
+        asyncio.create_task(_notify_response_event())
+        return True
+
     @app.post("/hooks/claude")
     async def claude_hook(request: Request):
         """
@@ -6549,7 +6818,15 @@ Provide ONLY the summary, no preamble or questions."""
                     elif prompt_state_changed:
                         await _save_session_manager_state(app.state.session_manager)
 
-        if hook_event == "Stop" and not last_message and session_manager_id:
+        relay_handled = False
+        if hook_event == "Stop" and session_manager_id:
+            relay_handled = await _relay_claude_response_for_turn(
+                session_id=session_manager_id,
+                transcript_path=transcript_path,
+                hook_event=hook_event,
+            )
+
+        if hook_event == "Stop" and not last_message and session_manager_id and not relay_handled:
             # Transcript was empty/whitespace-only at Stop time (race condition:
             # file not flushed yet). Track this so we can send a deferred
             # notification when the idle_prompt Notification hook arrives with
@@ -6557,40 +6834,16 @@ Provide ONLY the summary, no preamble or questions."""
             app.state.pending_stop_notifications.add(session_manager_id)
             logger.info(f"Stop hook for {session_manager_id} had empty transcript, deferring notification")
 
-        if hook_event == "Stop" and last_message:
+        if hook_event == "Stop" and last_message and not relay_handled:
             # Send immediate notification to Telegram
             app.state.pending_stop_notifications.discard(session_manager_id)
             if app.state.notifier and app.state.session_manager:
                 # Try to find the session this hook belongs to
-                target_session = None
-
-                # First try: match by session_manager_id (set when session manager launches Claude)
-                # This is the most reliable - set via CLAUDE_SESSION_MANAGER_ID env var
-                if session_manager_id:
-                    target_session = app.state.session_manager.get_session(session_manager_id)
-                    if target_session:
-                        logger.info(f"Matched hook to session {session_manager_id} via environment variable")
-
-                # If we have a reliable match, don't try other methods
-                if target_session:
-                    pass  # Use this session
-                else:
-                    # Second try: match by transcript path - but only if it hasn't been set yet
-                    # (to avoid matching wrong session if transcript paths get reused)
-                    if transcript_path:
-                        sessions = app.state.session_manager.list_sessions()
-                        for session in sessions:
-                            # Only match if session has this transcript path already recorded
-                            if session.transcript_path == transcript_path:
-                                target_session = session
-                                logger.info(f"Matched hook to session {session.id} via existing transcript path")
-                                break
-
-                    # Third try: match by claude_session_id (if provided)
-                    if not target_session and claude_session_id:
-                        target_session = app.state.session_manager.get_session(claude_session_id)
-                        if target_session:
-                            logger.info(f"Matched hook to session {claude_session_id} via claude_session_id")
+                target_session = _resolve_claude_hook_session(
+                    session_manager_id,
+                    transcript_path,
+                    claude_session_id,
+                )
 
                 # If we found a matching session, send the notification
                 if target_session and target_session.telegram_chat_id:
@@ -6626,44 +6879,7 @@ Provide ONLY the summary, no preamble or questions."""
 
                     asyncio.create_task(_notify_response_event())
 
-                    # If session has a review_config, emit review_complete notification
-                    if target_session.review_config:
-                        try:
-                            from .review_parser import parse_tui_output, parse_github_review
-                            review_config = target_session.review_config
-
-                            review_result = None
-                            if review_config.mode == "pr" and review_config.pr_repo and review_config.pr_number:
-                                # PR mode: fetch from GitHub (async)
-                                from .github_reviews import fetch_latest_codex_review
-                                codex_review = await asyncio.to_thread(
-                                    fetch_latest_codex_review,
-                                    review_config.pr_repo,
-                                    review_config.pr_number,
-                                )
-                                if codex_review:
-                                    review_result = await asyncio.to_thread(
-                                        parse_github_review,
-                                        review_config.pr_repo,
-                                        review_config.pr_number,
-                                        codex_review,
-                                    )
-                            else:
-                                # TUI mode: parse from last message
-                                review_result = parse_tui_output(last_message)
-
-                            if review_result and review_result.findings:
-                                review_event = NotificationEvent(
-                                    session_id=target_session.id,
-                                    event_type="review_complete",
-                                    message="Review complete",
-                                    context="",
-                                    urgent=False,
-                                )
-                                review_event.review_result = review_result
-                                await app.state.notifier.notify(review_event, target_session)
-                        except Exception as e:
-                            logger.warning(f"Failed to emit review_complete notification: {e}")
+                    await _emit_review_complete_if_needed(target_session, last_message)
                 else:
                     # Couldn't find matching session
                     logger.warning(
@@ -6682,6 +6898,16 @@ Provide ONLY the summary, no preamble or questions."""
             # preceding Stop hook had an empty transcript (race condition).
             if notification_type == "idle_prompt":
                 sid = session_manager_id
+                relay_handled = False
+                if sid:
+                    relay_handled = await _relay_claude_response_for_turn(
+                        session_id=sid,
+                        transcript_path=transcript_path,
+                        hook_event=hook_event,
+                    )
+                if relay_handled:
+                    return {"status": "received", "hook_event": hook_event}
+
                 if sid and sid in app.state.pending_stop_notifications and last_message:
                     app.state.pending_stop_notifications.discard(sid)
                     logger.info(f"Sending deferred response notification for {sid} (idle_prompt had content)")

@@ -275,6 +275,7 @@ class TestQueuedMessage:
             notify_on_delivery=True,
             notify_after_seconds=60,
             delivered_at=None,
+            response_relay_source="telegram",
         )
 
         as_dict = original.to_dict()
@@ -289,6 +290,7 @@ class TestQueuedMessage:
         assert as_dict["notify_on_delivery"] is True
         assert as_dict["notify_after_seconds"] == 60
         assert as_dict["delivered_at"] is None
+        assert as_dict["response_relay_source"] == "telegram"
 
     def test_queued_message_defaults(self):
         """QueuedMessage has correct defaults."""
@@ -306,6 +308,7 @@ class TestQueuedMessage:
         assert msg.notify_on_delivery is False
         assert msg.notify_after_seconds is None
         assert msg.delivered_at is None
+        assert msg.response_relay_source is None
 
     def test_is_expired_not_implemented(self):
         """Expiration is handled by MessageQueueManager, not model."""

@@ -390,6 +390,7 @@ class SessionManager:
 
         # Message queue manager (set by main app)
         self.message_queue_manager = None
+        self.response_relay_ledger = None
         queue_runner_config = dict(self.config)
         if "queue_runner" not in queue_runner_config and self.state_file != self.default_state_file:
             queue_runner_config["queue_runner"] = {
@@ -2679,6 +2680,14 @@ class SessionManager:
         self._sync_session_resume_id(session)
         self._save_state()
 
+        if provider == "claude" and initial_prompt:
+            self._record_initial_response_relay_inbound(
+                session=session,
+                text=initial_prompt,
+                source="spawn" if spawn_prompt else "initial",
+                delivered_at=session.spawned_at or session.created_at,
+            )
+
         if provider == "codex-fork":
             self.codex_fork_runtime_owner[session.id] = parent_session_id or session.id
             self._set_codex_fork_lifecycle_state(
@@ -4118,6 +4127,78 @@ class SessionManager:
                 )
             self._save_state()
 
+    def _get_response_relay_ledger(self):
+        ledger = None
+        if self.message_queue_manager:
+            ledger = getattr(self.message_queue_manager, "response_relay_ledger", None)
+        return ledger or getattr(self, "response_relay_ledger", None)
+
+    def _record_initial_response_relay_inbound(
+        self,
+        *,
+        session: Session,
+        text: str,
+        source: str,
+        delivered_at: datetime,
+    ) -> None:
+        """Record a Claude prompt injected at session launch as the first relay turn."""
+        if not text.strip():
+            return
+        ledger = self._get_response_relay_ledger()
+        if ledger is None:
+            return
+        try:
+            ledger.record_inbound_turn(
+                session_id=session.id,
+                inbound_id=f"initial:{session.id}",
+                source=source,
+                provider="claude",
+                delivered_at=delivered_at,
+                transcript_path=getattr(session, "transcript_path", None),
+                transcript_offset=None,
+                text=text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record initial response relay inbound turn for %s: %s",
+                session.id,
+                exc,
+            )
+
+    def _record_direct_response_relay_inbound(
+        self,
+        *,
+        session: Session,
+        text: str,
+        source: Optional[str],
+        delivered_at: datetime,
+    ) -> None:
+        """Record a direct user/operator input turn that bypassed the message queue."""
+        if not source or not text.strip():
+            return
+        ledger = self._get_response_relay_ledger()
+        if ledger is None:
+            return
+        transcript_path = getattr(session, "transcript_path", None)
+        transcript_offset = ledger.capture_transcript_offset(transcript_path)
+        try:
+            ledger.record_inbound_turn(
+                session_id=session.id,
+                inbound_id=f"direct:{session.id}:{uuid.uuid4().hex}",
+                source=source,
+                provider=getattr(session, "provider", None) or "claude",
+                delivered_at=delivered_at,
+                transcript_path=transcript_path,
+                transcript_offset=transcript_offset,
+                text=text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record direct response relay inbound turn for %s: %s",
+                session.id,
+                exc,
+            )
+
     async def send_input(
         self,
         session_id: str,
@@ -4134,6 +4215,7 @@ class SessionManager:
         remind_hard_threshold: Optional[int] = None,
         remind_cancel_on_reply_session_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        response_relay_source: Optional[str] = None,
     ) -> DeliveryResult:
         """
         Send input to a session with optional sender metadata and delivery mode.
@@ -4152,6 +4234,7 @@ class SessionManager:
             remind_soft_threshold: Seconds after delivery before soft remind fires (#188)
             remind_hard_threshold: Seconds after delivery before hard remind fires (#188)
             remind_cancel_on_reply_session_id: Cancel remind when target replies to this session (#406)
+            response_relay_source: Explicit user/operator source for turn-bound response relay
 
         Returns:
             DeliveryResult indicating whether message was DELIVERED, QUEUED, or FAILED
@@ -4182,7 +4265,14 @@ class SessionManager:
             logger.info(f"Bypassing queue for direct send to {session_id}: {text}")
             success = await self._deliver_direct(session, text)
             if success:
+                delivered_at = datetime.now(timezone.utc)
                 session.last_activity = datetime.now()
+                self._record_direct_response_relay_inbound(
+                    session=session,
+                    text=text,
+                    source=response_relay_source,
+                    delivered_at=delivered_at,
+                )
                 _clear_completed_state()
             return DeliveryResult.DELIVERED if success else DeliveryResult.FAILED
 
@@ -4232,6 +4322,12 @@ class SessionManager:
                 sender_state.last_outgoing_sm_send_target = session_id
                 sender_state.last_outgoing_sm_send_at = datetime.now()
 
+        response_relay_kwargs = (
+            {"response_relay_source": response_relay_source}
+            if response_relay_source
+            else {}
+        )
+
         # Handle steer delivery mode — direct Enter-based injection, bypasses queue
         if delivery_mode == "steer":
             if session.provider not in ("codex", "codex-fork"):
@@ -4265,6 +4361,7 @@ class SessionManager:
                     remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
+                    **response_relay_kwargs,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 # Placed after queue_message to ensure message was persisted first.
@@ -4297,6 +4394,7 @@ class SessionManager:
                     remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
                     trigger_delivery=False,
+                    **response_relay_kwargs,
                 )
                 # Record outgoing sm send for deferred stop notification suppression (#182)
                 _record_outgoing_sm_send_target()
@@ -4325,6 +4423,7 @@ class SessionManager:
                     remind_hard_threshold=remind_hard_threshold,
                     remind_cancel_on_reply_session_id=remind_cancel_on_reply_session_id,
                     parent_session_id=parent_session_id,
+                    **response_relay_kwargs,
                 )
                 _record_outgoing_sm_send_target()
                 _clear_completed_state()
@@ -4333,8 +4432,15 @@ class SessionManager:
         # Fallback: send immediately (no queue manager or unknown mode)
         success = await self._deliver_direct(session, formatted_text)
         if success:
+            delivered_at = datetime.now(timezone.utc)
             session.last_activity = datetime.now()
             session.status = SessionStatus.RUNNING
+            self._record_direct_response_relay_inbound(
+                session=session,
+                text=formatted_text,
+                source=response_relay_source or ("sm-send" if from_sm_send else None),
+                delivered_at=delivered_at,
+            )
             _clear_completed_state()
             self._save_state()
 

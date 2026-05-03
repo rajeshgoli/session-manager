@@ -818,6 +818,7 @@ class TestEmailBridgeEndpoints:
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
+            response_relay_source="email",
         )
         mock_output_monitor.start_monitoring.assert_awaited_once_with(restored)
         mock_email_handler.extract_reply_message_body.assert_called_once_with("please continue")
@@ -914,6 +915,7 @@ class TestEmailBridgeEndpoints:
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
+            response_relay_source="email",
         )
 
     def test_inbound_email_ignores_explicit_session_header_without_worker_secret(
@@ -1011,6 +1013,7 @@ class TestEmailBridgeEndpoints:
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
+            response_relay_source="email",
         )
         mock_email_handler.extract_routed_session_id.assert_called_once_with(body)
 
@@ -1070,6 +1073,7 @@ class TestEmailBridgeEndpoints:
             sender_session_id=None,
             delivery_mode="sequential",
             from_sm_send=False,
+            response_relay_source="email",
         )
 
     def test_get_session_not_found(self, test_client, mock_session_manager):
@@ -1404,6 +1408,8 @@ class TestEmailBridgeEndpoints:
         data = response.json()
         assert data["status"] == "delivered"
         assert data["session_id"] == "test123"
+        mock_session_manager.send_input.assert_awaited_once()
+        assert mock_session_manager.send_input.await_args.kwargs["response_relay_source"] == "api"
 
     def test_send_input_codex_app_with_pending_structured_request_returns_409(self, test_client, mock_session_manager):
         """POST /sessions/{id}/input is blocked for codex-app when structured requests are pending."""

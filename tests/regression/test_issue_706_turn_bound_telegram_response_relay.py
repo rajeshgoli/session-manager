@@ -1,0 +1,774 @@
+"""Regression tests for sm#706 turn-bound Telegram response relay."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from src.message_queue import MessageQueueManager
+from src.models import ReviewConfig, Session, SessionStatus
+from src.response_relay import ResponseRelayLedger
+from src.server import create_app
+from src.session_manager import SessionManager
+
+
+def _assistant_line(text: str, *, timestamp: str | None = None, uuid: str | None = None) -> str:
+    entry = {
+        "type": "assistant",
+        "message": {
+            "id": uuid or f"msg-{abs(hash(text))}",
+            "content": [{"type": "text", "text": text}],
+        },
+    }
+    if timestamp:
+        entry["timestamp"] = timestamp
+    if uuid:
+        entry["uuid"] = uuid
+    return json.dumps(entry) + "\n"
+
+
+def _user_line(text: str, *, timestamp: str | None = None, uuid: str | None = None) -> str:
+    entry = {
+        "type": "user",
+        "message": {
+            "id": uuid or f"user-{abs(hash(text))}",
+            "content": [{"type": "text", "text": text}],
+        },
+    }
+    if timestamp:
+        entry["timestamp"] = timestamp
+    if uuid:
+        entry["uuid"] = uuid
+    return json.dumps(entry) + "\n"
+
+
+def _record_inbound(
+    ledger: ResponseRelayLedger,
+    session: Session,
+    inbound_id: str,
+    transcript_path,
+    *,
+    source: str = "sm-send",
+) -> None:
+    ledger.record_inbound_turn(
+        session_id=session.id,
+        inbound_id=inbound_id,
+        source=source,
+        provider=session.provider,
+        delivered_at=datetime(2026, 5, 2, 22, 24, 19, tzinfo=timezone.utc),
+        transcript_path=str(transcript_path),
+        transcript_offset=transcript_path.stat().st_size,
+        text="This is way too complex of an explanation",
+    )
+
+
+def _make_app(tmp_path, session: Session, ledger: ResponseRelayLedger):
+    manager = MagicMock()
+    manager.get_session.side_effect = lambda sid: session if sid == session.id else None
+    manager.list_sessions.return_value = [session]
+    manager._sync_session_resume_id = MagicMock()
+    manager._save_state = MagicMock()
+    manager.update_session_status = MagicMock()
+    queue = MagicMock()
+    queue.delivery_states = {session.id: SimpleNamespace(is_idle=True)}
+    queue.mark_session_idle = MagicMock()
+    queue._restore_user_input_after_response = AsyncMock()
+    manager.message_queue_manager = queue
+
+    notifier = MagicMock()
+    notifier.notify = AsyncMock(return_value=True)
+    output_monitor = MagicMock()
+    app = create_app(
+        session_manager=manager,
+        notifier=notifier,
+        output_monitor=output_monitor,
+        response_relay_ledger=ledger,
+        config={},
+    )
+    return app, TestClient(app), notifier, output_monitor
+
+
+def _session(transcript_path) -> Session:
+    return Session(
+        id="3401-consultant",
+        name="claude-3401-consultant",
+        working_dir="/tmp",
+        tmux_session="claude-3401-consultant",
+        log_file="/tmp/3401.log",
+        status=SessionStatus.RUNNING,
+        telegram_chat_id=123,
+        telegram_thread_id=456,
+        transcript_path=str(transcript_path),
+        provider="claude",
+    )
+
+
+def test_3401_timeline_suppresses_d13_then_relays_current_turn(tmp_path):
+    transcript = tmp_path / "3401-consultant.jsonl"
+    transcript.write_text(
+        _assistant_line(
+            "D13 previous assistant response",
+            timestamp="2026-05-02T22:23:00Z",
+            uuid="old-d13",
+        )
+    )
+    session = _session(transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _record_inbound(ledger, session, "inbound-3401", transcript)
+    app, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_not_awaited()
+    assert session.id in app.state.pending_stop_notifications
+
+    transcript.write_text(
+        transcript.read_text()
+        + _assistant_line(
+            "You're right - the correct current-turn answer",
+            timestamp="2026-05-02T22:26:27Z",
+            uuid="current-answer",
+        )
+    )
+
+    response = client.post(
+        "/hooks/claude",
+        json={
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "session_manager_id": session.id,
+            "transcript_path": str(transcript),
+        },
+    )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    event = notifier.notify.await_args.args[0]
+    assert event.context.startswith("You're right")
+    assert "D13" not in event.context
+    assert session.id not in app.state.pending_stop_notifications
+
+
+def test_restart_dedupe_suppresses_replayed_hook(tmp_path):
+    transcript = tmp_path / "restart.jsonl"
+    transcript.write_text(_assistant_line("old answer", uuid="old"))
+    session = _session(transcript)
+    ledger_path = tmp_path / "relay.db"
+    ledger = ResponseRelayLedger(str(ledger_path))
+    _record_inbound(ledger, session, "inbound-restart", transcript)
+    transcript.write_text(transcript.read_text() + _assistant_line("fresh answer", uuid="fresh"))
+
+    app, client, notifier, _ = _make_app(tmp_path, session, ledger)
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+
+    restarted_ledger = ResponseRelayLedger(str(ledger_path))
+    _, restarted_client, restarted_notifier, _ = _make_app(tmp_path, session, restarted_ledger)
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = restarted_client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    restarted_notifier.notify.assert_not_awaited()
+
+
+def test_deferred_transcript_lag_waits_for_post_boundary_output(tmp_path):
+    transcript = tmp_path / "lag.jsonl"
+    transcript.write_text("")
+    session = _session(transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _record_inbound(ledger, session, "inbound-lag", transcript)
+    app, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_not_awaited()
+    assert session.id in app.state.pending_stop_notifications
+
+    transcript.write_text(_assistant_line("response after transcript lag", uuid="lag-answer"))
+    response = client.post(
+        "/hooks/claude",
+        json={
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "session_manager_id": session.id,
+            "transcript_path": str(transcript),
+        },
+    )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "response after transcript lag"
+
+
+def test_missing_transcript_path_binds_offset_from_inbound_user_line(tmp_path):
+    transcript = tmp_path / "late-boundary.jsonl"
+    user_text = "the first input before transcript discovery"
+    prefix = _assistant_line("old answer before the turn", uuid="old") + _user_line(user_text, uuid="user-current")
+    transcript.write_text(prefix + _assistant_line("current answer without timestamp", uuid="answer-current"))
+    session = _session(transcript)
+    session.transcript_path = None
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    ledger.record_inbound_turn(
+        session_id=session.id,
+        inbound_id="inbound-late-boundary",
+        source="telegram",
+        provider=session.provider,
+        delivered_at=datetime(2026, 5, 2, 22, 24, 19, tzinfo=timezone.utc),
+        text=user_text,
+    )
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "current answer without timestamp"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.transcript_path == str(transcript)
+    assert active_turn.transcript_offset == len(prefix.encode("utf-8"))
+
+
+def test_hook_transcript_path_replaces_stale_turn_path(tmp_path):
+    stale_transcript = tmp_path / "stale-transcript.jsonl"
+    stale_transcript.write_text(_assistant_line("old stale file answer", uuid="old-stale"))
+    current_transcript = tmp_path / "current-transcript.jsonl"
+    user_text = "input after transcript rotation"
+    prefix = _assistant_line("older current file answer", uuid="old-current") + _user_line(user_text, uuid="user-rotated")
+    current_transcript.write_text(prefix + _assistant_line("answer in rotated transcript", uuid="answer-rotated"))
+    session = _session(stale_transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    ledger.record_inbound_turn(
+        session_id=session.id,
+        inbound_id="inbound-stale-path",
+        source="telegram",
+        provider=session.provider,
+        delivered_at=datetime(2026, 5, 2, 22, 24, 19, tzinfo=timezone.utc),
+        transcript_path=str(stale_transcript),
+        transcript_offset=stale_transcript.stat().st_size,
+        text=user_text,
+    )
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(current_transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "answer in rotated transcript"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.transcript_path == str(current_transcript)
+    assert active_turn.transcript_offset == len(prefix.encode("utf-8"))
+
+
+def test_unresolved_session_manager_id_uses_legacy_transcript_match(tmp_path):
+    transcript = tmp_path / "fallback.jsonl"
+    transcript.write_text(_assistant_line("fallback matched answer", uuid="fallback-answer"))
+    session = _session(transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": "stale-missing-session",
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "fallback matched answer"
+
+
+def test_long_chunk_group_is_deduped_as_one_output(tmp_path):
+    transcript = tmp_path / "long.jsonl"
+    transcript.write_text(_assistant_line("old", uuid="old"))
+    session = _session(transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _record_inbound(ledger, session, "inbound-long", transcript)
+    long_answer = "chunk-group " + ("x" * 9000)
+    transcript.write_text(transcript.read_text() + _assistant_line(long_answer, uuid="long-answer"))
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        for _ in range(3):
+            response = client.post(
+                "/hooks/claude",
+                json={
+                    "hook_event_name": "Stop",
+                    "session_manager_id": session.id,
+                    "transcript_path": str(transcript),
+                },
+            )
+            assert response.status_code == 200
+
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == long_answer
+
+
+def test_review_complete_emits_when_response_notify_is_rejected(tmp_path):
+    transcript = tmp_path / "review-complete.jsonl"
+    transcript.write_text(_assistant_line("old", uuid="old"))
+    session = _session(transcript)
+    session.review_config = ReviewConfig(mode="branch", base_branch="main")
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _record_inbound(ledger, session, "inbound-review", transcript)
+    review_text = "[P2] Keep review completion\nReview findings remain available."
+    transcript.write_text(transcript.read_text() + _assistant_line(review_text, uuid="review-answer"))
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+    notifier.notify.side_effect = [False, True]
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    assert notifier.notify.await_count == 2
+    response_event = notifier.notify.await_args_list[0].args[0]
+    review_event = notifier.notify.await_args_list[1].args[0]
+    assert response_event.event_type == "response"
+    assert review_event.event_type == "review_complete"
+    assert review_event.review_result is not None
+    assert review_event.review_result.findings[0].title == "Keep review completion"
+
+
+def test_newer_inbound_supersedes_late_output_for_previous_turn(tmp_path):
+    transcript = tmp_path / "multi-turn.jsonl"
+    transcript.write_text(_assistant_line("old", uuid="old"))
+    session = _session(transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _record_inbound(ledger, session, "turn-1", transcript)
+    transcript.write_text(transcript.read_text() + _assistant_line("late turn one answer", uuid="turn-1-answer"))
+    _record_inbound(ledger, session, "turn-2", transcript)
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_not_awaited()
+
+    transcript.write_text(transcript.read_text() + _assistant_line("turn two answer", uuid="turn-2-answer"))
+    response = client.post(
+        "/hooks/claude",
+        json={
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "session_manager_id": session.id,
+            "transcript_path": str(transcript),
+        },
+    )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "turn two answer"
+
+
+@pytest.mark.asyncio
+async def test_message_queue_records_inbound_boundary_only_after_delivery(tmp_path):
+    transcript = tmp_path / "delivery.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    session = _session(transcript)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+
+    msg = mq.queue_message(
+        session.id,
+        "new user turn",
+        from_sm_send=True,
+        trigger_delivery=False,
+    )
+    assert ledger.get_latest_active_turn(session.id) is None
+
+    await mq._try_deliver_messages(session.id)
+
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == msg.id
+    assert active_turn.transcript_offset == transcript.stat().st_size
+    assert active_turn.source == "sm-send"
+    delivered_rows = mq._execute_query(
+        "SELECT delivered_at FROM message_queue WHERE id = ?",
+        (msg.id,),
+    )
+    assert delivered_rows[0][0].endswith("+00:00")
+
+
+@pytest.mark.asyncio
+async def test_message_queue_ignores_internal_uncategorized_prompts(tmp_path):
+    transcript = tmp_path / "internal-prompt.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    session = _session(transcript)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+
+    user_msg = mq.queue_message(
+        session.id,
+        "real user turn",
+        from_sm_send=True,
+        trigger_delivery=False,
+    )
+    await mq._try_deliver_messages(session.id)
+    assert ledger.get_latest_active_turn(session.id).inbound_id == user_msg.id
+
+    internal_msg = mq.queue_message(
+        session.id,
+        "[sm info] Uncommitted changes in worktree(s):\n- /tmp/worktree",
+        delivery_mode="important",
+        trigger_delivery=False,
+    )
+    await mq._try_deliver_messages(session.id, important_only=True)
+
+    assert mq.was_message_delivered(internal_msg.id)
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == user_msg.id
+    assert active_turn.source == "sm-send"
+
+
+@pytest.mark.asyncio
+async def test_message_queue_records_telegram_inbound_boundary(tmp_path):
+    transcript = tmp_path / "telegram.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    session = _session(transcript)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+
+    msg = mq.queue_message(
+        session.id,
+        "telegram user turn",
+        response_relay_source="telegram",
+        trigger_delivery=False,
+    )
+
+    pending = mq.get_pending_messages(session.id)
+    assert pending[0].response_relay_source == "telegram"
+
+    await mq._try_deliver_messages(session.id)
+
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == msg.id
+    assert active_turn.source == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_message_queue_records_email_inbound_boundary(tmp_path):
+    transcript = tmp_path / "email.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    session = _session(transcript)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+
+    msg = mq.queue_message(
+        session.id,
+        "{sm email from user@example.com}\nemail user turn",
+        response_relay_source="email",
+        trigger_delivery=False,
+    )
+
+    await mq._try_deliver_messages(session.id)
+
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == msg.id
+    assert active_turn.source == "email"
+
+
+def test_api_input_records_default_inbound_boundary(tmp_path):
+    transcript = tmp_path / "api-input.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    session.status = SessionStatus.IDLE
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    mq = MessageQueueManager(
+        manager,
+        db_path=str(tmp_path / "message_queue.db"),
+        response_relay_ledger=ledger,
+    )
+    manager.message_queue_manager = mq
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+    app = create_app(
+        session_manager=manager,
+        notifier=MagicMock(),
+        output_monitor=MagicMock(),
+        response_relay_ledger=ledger,
+        config={},
+    )
+    client = TestClient(app)
+
+    response = client.post(f"/sessions/{session.id}/input", json={"text": "api user turn"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "delivered"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.source == "api"
+    assert active_turn.transcript_offset == transcript.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_session_create_initial_prompt_records_relay_boundary(tmp_path):
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    manager.tmux = MagicMock()
+    manager.tmux.create_session_with_command.return_value = True
+    manager._get_git_remote_url_async = AsyncMock(return_value=None)
+    manager._ensure_telegram_topic = AsyncMock()
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.message_queue_manager = SimpleNamespace(response_relay_ledger=ledger)
+
+    session = await manager._create_session_common(
+        working_dir=str(tmp_path),
+        parent_session_id="parent-session",
+        spawn_prompt="first spawned turn",
+        initial_prompt="first spawned turn",
+        provider="claude",
+    )
+
+    assert session is not None
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == f"initial:{session.id}"
+    assert active_turn.source == "spawn"
+    assert active_turn.provider == "claude"
+    assert active_turn.text_hash is not None
+
+
+def test_stop_hook_backfills_spawn_prompt_boundary_for_first_turn(tmp_path):
+    prompt = "first spawned turn"
+    transcript = tmp_path / "spawn-first-turn.jsonl"
+    transcript.write_text(
+        _user_line(prompt, uuid="spawn-user")
+        + _assistant_line("spawn first answer", uuid="spawn-answer")
+    )
+    session = _session(transcript)
+    session.spawn_prompt = prompt
+    session.spawned_at = datetime(2026, 5, 2, 22, 24, 18)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    app, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    assert ledger.get_latest_active_turn(session.id) is None
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "spawn first answer"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id == f"initial:{session.id}"
+    assert active_turn.source == "spawn"
+    assert active_turn.transcript_offset is not None
+    assert active_turn.transcript_offset < transcript.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_bypass_queue_telegram_permission_response_records_boundary(tmp_path):
+    transcript = tmp_path / "permission-response.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.message_queue_manager = SimpleNamespace(response_relay_ledger=ledger)
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+
+    result = await manager.send_input(
+        session.id,
+        "yes, allow the command",
+        bypass_queue=True,
+        response_relay_source="telegram",
+    )
+
+    assert result.value == "delivered"
+    assert session.last_activity.tzinfo is None
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id.startswith(f"direct:{session.id}:")
+    assert active_turn.source == "telegram"
+    assert active_turn.transcript_offset == transcript.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_without_queue_records_boundary(tmp_path):
+    transcript = tmp_path / "direct-no-queue.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.response_relay_ledger = ledger
+    manager.message_queue_manager = None
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+
+    result = await manager.send_input(
+        session.id,
+        "direct api user turn",
+        response_relay_source="api",
+    )
+
+    assert result.value == "delivered"
+    manager._deliver_direct.assert_awaited_once_with(session, "direct api user turn")
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id.startswith(f"direct:{session.id}:")
+    assert active_turn.source == "api"
+    assert active_turn.transcript_offset == transcript.stat().st_size
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_mode_fallthrough_records_sm_send_boundary(tmp_path):
+    transcript = tmp_path / "direct-fallthrough.jsonl"
+    transcript.write_text(_assistant_line("existing old output", uuid="old"))
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+    )
+    session = _session(transcript)
+    manager.sessions[session.id] = session
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    manager.message_queue_manager = SimpleNamespace(response_relay_ledger=ledger)
+    manager._deliver_direct = AsyncMock(return_value=True)
+    manager._save_state = MagicMock()
+
+    result = await manager.send_input(
+        session.id,
+        "fallthrough user turn",
+        delivery_mode="custom-direct",
+        from_sm_send=True,
+    )
+
+    assert result.value == "delivered"
+    manager._deliver_direct.assert_awaited_once_with(session, "fallthrough user turn")
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.inbound_id.startswith(f"direct:{session.id}:")
+    assert active_turn.source == "sm-send"
+    assert active_turn.transcript_offset == transcript.stat().st_size
