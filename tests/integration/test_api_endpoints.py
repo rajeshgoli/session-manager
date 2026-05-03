@@ -58,7 +58,9 @@ def mock_email_handler():
     mock.bridge_session_id_header.return_value = "x-email-session-id"
     mock.normalize_explicit_session_id.side_effect = lambda value: value.strip().lower() if value else None
     mock.send_agent_email = AsyncMock(return_value={"to": [], "cc": [], "subject": "test"})
+    mock.send_agent_email_to_resolved_users = AsyncMock(return_value={"to": [], "cc": [], "subject": "test"})
     mock.lookup_human.return_value = None
+    mock.lookup_human_email_user.return_value = None
     mock.lookup_user.return_value = None
     mock.is_authorized_sender.return_value = True
     mock.extract_routed_session_id.return_value = None
@@ -445,6 +447,55 @@ class TestHumanRecipientEndpoints:
             message="default route",
         )
 
+    def test_send_input_batch_rejects_urgent_human_telegram(
+        self,
+        mock_session_manager,
+        mock_output_monitor,
+        mock_email_handler,
+    ):
+        sender_session = Session(
+            id="sender123",
+            name="sender-session",
+            working_dir="/tmp/sender",
+            tmux_session="claude-sender123",
+            log_file="/tmp/sender.log",
+            status=SessionStatus.RUNNING,
+            telegram_chat_id=12345,
+            telegram_thread_id=67890,
+        )
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+        mock_session_manager.get_session.side_effect = lambda session_id: {
+            "sender123": sender_session,
+        }.get(session_id)
+        notifier = MagicMock()
+        notifier.send_human_message_to_session_topic = AsyncMock(return_value=(True, None))
+        app = create_app(
+            session_manager=mock_session_manager,
+            notifier=notifier,
+            output_monitor=mock_output_monitor,
+            email_handler=mock_email_handler,
+            config={},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/sessions/input-batch",
+            json={
+                "recipients": ["user"],
+                "text": "urgent route",
+                "sender_session_id": "sender123",
+                "delivery_mode": "urgent",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is False
+        assert data["results"][0]["status"] == "failed"
+        assert data["results"][0]["delivery_kind"] == "none"
+        assert "human Telegram delivery only supports plain sequential sends" in data["results"][0]["detail"]
+        notifier.send_human_message_to_session_topic.assert_not_awaited()
+
     def test_explicit_human_email_redacts_address(
         self,
         test_client,
@@ -471,9 +522,9 @@ class TestHumanRecipientEndpoints:
                 )
             return None
 
-        mock_email_handler.lookup_user.side_effect = lookup_user
+        mock_email_handler.lookup_human_email_user.side_effect = lookup_user
         mock_session_manager.get_session.return_value = sample_session
-        mock_email_handler.send_agent_email = AsyncMock(
+        mock_email_handler.send_agent_email_to_resolved_users = AsyncMock(
             return_value={
                 "to": [{"username": "rajesh", "email": "private@example.com"}],
                 "cc": [],
@@ -492,9 +543,33 @@ class TestHumanRecipientEndpoints:
         assert data["channel"] == "email"
         assert "private@example.com" not in json.dumps(data)
         assert "wrong@example.com" not in json.dumps(data)
-        mock_email_handler.lookup_user.assert_called_once_with("rajesh")
-        mock_email_handler.send_agent_email.assert_awaited_once()
-        assert mock_email_handler.send_agent_email.await_args.kwargs["to_identifiers"] == ["rajesh"]
+        mock_email_handler.lookup_human_email_user.assert_called_once_with("rajesh")
+        mock_email_handler.send_agent_email_to_resolved_users.assert_awaited_once()
+        assert mock_email_handler.send_agent_email_to_resolved_users.await_args.kwargs["to_users"][0].username == "rajesh"
+
+    def test_generic_email_rejects_human_alias(
+        self,
+        test_client,
+        mock_session_manager,
+        mock_email_handler,
+        sample_session,
+    ):
+        mock_session_manager.get_session.return_value = sample_session
+        mock_email_handler.lookup_human.return_value = _human_recipient()
+
+        response = test_client.post(
+            "/email/send",
+            json={
+                "requester_session_id": "test123",
+                "recipients": ["user"],
+                "subject": "Wrong path",
+                "body_html": "<p>Hello</p>",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "generic email routing is not allowed" in response.json()["detail"]
+        mock_email_handler.send_agent_email.assert_not_awaited()
 
     def test_human_telegram_missing_sender_topic_fails_clearly(
         self,

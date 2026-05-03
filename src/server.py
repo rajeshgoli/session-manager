@@ -1483,7 +1483,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=f'Human recipient "{human.name}" has no enabled email channel')
 
         handler = _email_handler_or_503()
-        lookup_user = getattr(handler, "lookup_user", None)
+        lookup_user = getattr(handler, "lookup_human_email_user", None)
         try:
             resolved_email_user = lookup_user(human.name) if callable(lookup_user) else None
         except HumanRecipientConfigError as exc:
@@ -1491,16 +1491,37 @@ def create_app(
         if resolved_email_user is None:
             raise HTTPException(status_code=400, detail=f'Human recipient "{human.name}" has no resolved email address')
 
-        email_payload = await _send_registered_email(
-            SendEmailRequest(
-                requester_session_id=request.requester_session_id,
-                recipients=[human.name],
+        if not getattr(handler, "bridge_is_available", lambda: False)():
+            raise HTTPException(status_code=503, detail="Email bridge is unavailable")
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        if not request.requester_session_id:
+            raise HTTPException(status_code=400, detail="Managed sender session is required for email delivery")
+
+        sender_session = app.state.session_manager.get_session(request.requester_session_id)
+        if not sender_session:
+            raise HTTPException(status_code=404, detail="Sender session not found")
+
+        sender = getattr(handler, "send_agent_email_to_resolved_users", None)
+        if not callable(sender):
+            raise HTTPException(status_code=503, detail="Explicit human email delivery is not configured")
+        try:
+            email_payload = await sender(
+                sender_session_id=sender_session.id,
+                sender_name=_effective_session_name(sender_session),
+                sender_provider=getattr(sender_session, "provider", "claude"),
+                to_users=[resolved_email_user],
+                cc_users=[],
                 subject=request.subject,
                 body_text=request.text,
+                body_html=None,
                 body_markdown=request.body_markdown,
                 auto_subject=request.auto_subject,
             )
-        )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
             "status": "sent",
             "recipient": human.name,
@@ -1546,6 +1567,19 @@ def create_app(
             and request.remind_soft_threshold is None
             and request.remind_hard_threshold is None
             and request.remind_cancel_on_reply_session_id is None
+        )
+
+    def _send_request_supports_human_telegram(request: SendInputRequest) -> bool:
+        return (
+            request.delivery_mode == "sequential"
+            and request.timeout_seconds is None
+            and request.notify_on_delivery is False
+            and request.notify_after_seconds is None
+            and request.notify_on_stop is False
+            and request.remind_soft_threshold is None
+            and request.remind_hard_threshold is None
+            and request.remind_cancel_on_reply_session_id is None
+            and request.parent_session_id is None
         )
 
     def _resolve_live_send_target(identifier: str) -> Optional[Session]:
@@ -1597,6 +1631,17 @@ def create_app(
         cc = _normalize_identifier_list(request.cc)
         if not recipients:
             raise HTTPException(status_code=400, detail="At least one email recipient is required")
+
+        for identifier in recipients + cc:
+            human = _lookup_human_optional(identifier)
+            if human is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f'Human recipient "{human.name}" must use explicit human email delivery; '
+                        "generic email routing is not allowed"
+                    ),
+                )
 
         try:
             return await handler.send_agent_email(
@@ -1671,6 +1716,14 @@ def create_app(
         if session is None:
             human = _lookup_human_optional(identifier)
             if human is not None:
+                if not _send_request_supports_human_telegram(request):
+                    return SendInputBatchResult(
+                        identifier=identifier,
+                        status="failed",
+                        delivery_kind="none",
+                        target_name=human.name,
+                        detail="human Telegram delivery only supports plain sequential sends without --wait/--track/--urgent",
+                    )
                 try:
                     payload = await _send_human_telegram(
                         identifier,
@@ -4617,6 +4670,11 @@ def create_app(
         session = app.state.session_manager.get_session(session_id)
         if not session:
             if _lookup_human_optional(session_id) is not None:
+                if not _send_request_supports_human_telegram(request):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="human Telegram delivery only supports plain sequential sends without --wait/--track/--urgent",
+                    )
                 return await _send_human_telegram(
                     session_id,
                     HumanDeliveryRequest(

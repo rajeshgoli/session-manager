@@ -179,10 +179,7 @@ class EmailHandler:
 
     def lookup_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
         """Resolve one registered user by username or alias."""
-        configured_user = self._lookup_configured_user(identifier)
-        if configured_user is not None:
-            return configured_user
-        return self._lookup_human_email_user(identifier)
+        return self._lookup_configured_user(identifier)
 
     def _lookup_configured_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
         """Resolve one legacy registered email user by username or alias."""
@@ -213,6 +210,10 @@ class EmailHandler:
     def human_reserved_names(self) -> set[str]:
         """Return every configured human canonical name and alias."""
         return self.human_registry().reserved_names()
+
+    def lookup_human_email_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
+        """Resolve an email-enabled human recipient for explicit human email delivery."""
+        return self._lookup_human_email_user(identifier)
 
     def _lookup_human_email_user(self, identifier: str) -> Optional[RegisteredEmailUser]:
         """Resolve an email-enabled human recipient into the email send model."""
@@ -580,6 +581,36 @@ class EmailHandler:
         auto_subject: bool = False,
     ) -> dict[str, Any]:
         """Send a reply-routable email from one managed session to registered user(s)."""
+        to_users = self.resolve_users(to_identifiers)
+        cc_users = self.resolve_users(cc_identifiers or []) if cc_identifiers else []
+        return await self.send_agent_email_to_resolved_users(
+            sender_session_id=sender_session_id,
+            sender_name=sender_name,
+            sender_provider=sender_provider,
+            to_users=to_users,
+            cc_users=cc_users,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            body_markdown=body_markdown,
+            auto_subject=auto_subject,
+        )
+
+    async def send_agent_email_to_resolved_users(
+        self,
+        *,
+        sender_session_id: str,
+        sender_name: str,
+        sender_provider: str,
+        to_users: list[RegisteredEmailUser],
+        cc_users: Optional[list[RegisteredEmailUser]] = None,
+        subject: Optional[str] = None,
+        body_text: Optional[str] = None,
+        body_html: Optional[str] = None,
+        body_markdown: bool = False,
+        auto_subject: bool = False,
+    ) -> dict[str, Any]:
+        """Send a reply-routable email to pre-resolved users."""
         if not self.bridge_is_available():
             raise RuntimeError(f"Email bridge config is unavailable at {self.bridge_config}")
 
@@ -593,8 +624,9 @@ class EmailHandler:
         if not text_payload and not html_payload:
             raise ValueError("Email body is required")
 
-        to_users = self.resolve_users(to_identifiers)
-        cc_users = self.resolve_users(cc_identifiers or []) if cc_identifiers else []
+        cc_users = cc_users or []
+        if not to_users:
+            raise LookupError("No registered email users were provided")
 
         if body_markdown and text_payload and not html_payload:
             html_payload = self.render_markdown_to_html(text_payload)

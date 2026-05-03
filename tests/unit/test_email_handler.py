@@ -78,7 +78,7 @@ def test_lookup_human_alias_and_email_channel_via_legacy_user(tmp_path):
     handler = EmailHandler(bridge_config=str(config_path))
 
     human = handler.lookup_human("user")
-    email_user = handler.lookup_user("rajeshgoli")
+    email_user = handler.lookup_human_email_user("rajeshgoli")
 
     assert human is not None
     assert human.name == "rajesh"
@@ -86,6 +86,30 @@ def test_lookup_human_alias_and_email_channel_via_legacy_user(tmp_path):
     assert email_user is not None
     assert email_user.username == "rajesh"
     assert email_user.email == "rajesh@example.com"
+    assert handler.lookup_user("rajeshgoli") is None
+
+
+def test_generic_resolve_users_does_not_accept_human_alias(tmp_path):
+    config_path = tmp_path / "email_send.yaml"
+    _write_bridge_config(config_path)
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "\n"
+            "humans:\n"
+            "  rajesh:\n"
+            "    display_name: Human operator\n"
+            "    aliases: [rajeshgoli, user]\n"
+            "    default_channel: telegram\n"
+            "    channels:\n"
+            "      email:\n"
+            "        enabled: true\n"
+            "        address: private@example.com\n"
+            "        use: fallback_only\n"
+        )
+    handler = EmailHandler(bridge_config=str(config_path))
+
+    with pytest.raises(LookupError, match="rajeshgoli"):
+        handler.resolve_users(["rajeshgoli"])
 
 
 @pytest.mark.asyncio
