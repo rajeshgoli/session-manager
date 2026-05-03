@@ -308,6 +308,20 @@ Input and resize validation:
 
 The app should make HTTPS terminal attach the primary action when the server advertises support. This terminal surface should live inside the SM Android app, behind the same app OAuth/auth boundary as watch/details. Do not expose a public browser terminal page as the normal v1 entry point.
 
+End-state user flow:
+
+1. The user opens the SM Android app.
+2. The user navigates from watch or session details to an existing tmux-backed agent session.
+3. The user taps `Attach`.
+4. The app performs OAuth/session checks and registered device-key proof in the background.
+5. The app opens an in-app terminal view for that agent's existing tmux session.
+6. The terminal behaves like desktop `sm attach`: the user sees the live pane, can type, and can detach/back out.
+7. On detach or back navigation, the app returns to the prior SM watch/details screen.
+
+The normal end-state UX does not require Termux or another terminal app. Termux appears only during rollout as a temporary fallback action.
+
+Attach sequence:
+
 1. User taps a tmux-backed session in watch/details.
 2. App signs the attach-ticket request with the registered device key.
 3. App calls `POST /client/sessions/{id}/attach-ticket`.
@@ -316,7 +330,26 @@ The app should make HTTPS terminal attach the primary action when the server adv
 6. App renders output and forwards keyboard/resize input.
 7. When the terminal disconnects, the app returns to the prior watch/details state.
 
-The Android implementation can use a native terminal component or a local WebView terminal renderer. If WebView is used:
+### Android Terminal Renderer
+
+Use a native Android terminal component unless the implementer proves it cannot meet the core requirements within reasonable scope. The native path is preferred because it keeps the terminal inside the app process, avoids a JavaScript bridge for shell input/output, and reduces the risk of exposing attach tickets to web content.
+
+Renderer requirements:
+
+1. Render ANSI terminal output correctly enough for Claude/Codex tmux sessions.
+2. Support keyboard input, paste, resize, scrollback, and detach/back navigation.
+3. Keep the ticket secret and device-key material out of URLs, logs, screenshots, persistent settings, and crash reports.
+4. Expose no generic browser navigation or external web content in the terminal surface.
+5. Return to watch/details when the attach ends.
+
+Implementation action required:
+
+1. First evaluate a native Android terminal component against the renderer requirements.
+2. If native is viable, use it for v1.
+3. If native is not viable, document the specific blocker in the implementation PR and use a bundled local WebView renderer as the fallback.
+4. Do not choose WebView solely for convenience if native is viable.
+
+If WebView is used:
 
 1. Terminal assets must be bundled in the app or served from SM with integrity/version control.
 2. The ticket secret must be passed to the terminal renderer without writing it to logs, URLs, or persistent storage.
@@ -408,6 +441,7 @@ Android tests:
 6. Starting a second attach first detaches or blocks the current mobile attach.
 7. After cutover, Termux attach is not shown as a normal attach action.
 8. Owner-only app disable control blocks new mobile terminal attaches.
+9. Native renderer viability is documented in the implementation PR; if WebView is used, the PR documents the native blocker and WebView containment controls.
 
 Manual verification:
 
@@ -429,9 +463,11 @@ Manual verification:
 6. After confidence, make HTTPS terminal attach the default app action.
 7. Remove Termux attach from the app and public attach metadata after cutover so the old path does not rust into a latent vulnerability.
 
-## Open Decisions For PR Review
+## Resolved Design Decisions
 
-1. Terminal renderer: native Android terminal component vs bundled local WebView renderer.
+1. End-state mobile attach happens inside the SM Android app; the user does not normally use Termux or another terminal app.
+2. Native Android terminal rendering is preferred for v1. WebView is a fallback only if the implementation PR documents a concrete native blocker and keeps assets local/contained.
+3. Termux is transitional rollout fallback only and is removed from the app attach surface after HTTPS/device-key attach passes verification.
 
 ## Ticket Classification
 
