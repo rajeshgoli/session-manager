@@ -162,6 +162,31 @@ external_access:
   ssh_username: "your-ssh-user"
   ssh_proxy_command: "cloudflared access ssh --hostname %h"
 
+# Optional Android in-app HTTPS terminal attach. Disabled by default because it
+# exposes an interactive shell path; enable only for explicitly registered users
+# and app-generated device public keys.
+mobile_terminal:
+  enabled: false
+  allowed_users:
+    you:
+      email: "you@example.com"
+      interactive_shell_access: true
+      registered_device_keys:
+        - id: "replace-with-app-device-key-id"
+          label: "Your Android device"
+          public_key: |
+            -----BEGIN PUBLIC KEY-----
+            REPLACE_WITH_APP_SETTINGS_PUBLIC_KEY
+            -----END PUBLIC KEY-----
+          enabled: true
+  ticket_ttl_seconds: 30
+  auth_frame_timeout_seconds: 3
+  max_attach_seconds: 3600
+  max_concurrent_attaches_per_user: 1
+  max_concurrent_attaches_per_session: 1
+  max_concurrent_attaches_global: 4
+  require_tls: true
+
 auth:
   google:
     enabled: false

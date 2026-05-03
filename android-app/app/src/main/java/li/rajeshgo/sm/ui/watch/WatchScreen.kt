@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +37,7 @@ import androidx.compose.material.icons.rounded.UnfoldLess
 import androidx.compose.material.icons.rounded.UnfoldMore
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -46,6 +48,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -120,6 +123,22 @@ fun WatchScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     var isResumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+    val openAttach: (ClientSession) -> Unit = { session ->
+        if (session.mobileTerminal?.supported == true) {
+            viewModel.openMobileTerminal(session) { result ->
+                toast = result.exceptionOrNull()?.message ?: result.getOrNull()
+            }
+        } else {
+            val attach = session.termuxAttach
+            if (attach == null) {
+                toast = "Attach metadata unavailable"
+            } else {
+                launchTermuxAttach(context, attach)
+                    .onSuccess { toast = "Opening Termux for ${sessionDisplayName(session)}" }
+                    .onFailure { error -> toast = error.message ?: "Attach failed" }
+            }
+        }
     }
 
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
@@ -229,16 +248,7 @@ fun WatchScreen(
                             expandedSessionIds = state.expandedSessionIds,
                             detailsById = state.detailsBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
-                            onOpenAttach = { session ->
-                                val attach = session.termuxAttach
-                                if (attach == null) {
-                                    toast = "Attach metadata unavailable"
-                                } else {
-                                    launchTermuxAttach(context, attach)
-                                        .onSuccess { toast = "Opening Termux for ${sessionDisplayName(session)}" }
-                                        .onFailure { error -> toast = error.message ?: "Attach failed" }
-                                }
-                            },
+                            onOpenAttach = openAttach,
                             onCopyAttach = { session ->
                                 val command = session.termuxAttach?.let(::termuxAttachCommand)
                                 if (command == null) {
@@ -284,16 +294,7 @@ fun WatchScreen(
                             expandedSessionIds = state.expandedSessionIds,
                             detailsById = state.detailsBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
-                            onOpenAttach = { session ->
-                                val attach = session.termuxAttach
-                                if (attach == null) {
-                                    toast = "Attach metadata unavailable"
-                                } else {
-                                    launchTermuxAttach(context, attach)
-                                        .onSuccess { toast = "Opening Termux for ${sessionDisplayName(session)}" }
-                                        .onFailure { error -> toast = error.message ?: "Attach failed" }
-                                }
-                            },
+                            onOpenAttach = openAttach,
                             onCopyAttach = { session ->
                                 val command = session.termuxAttach?.let(::termuxAttachCommand)
                                 if (command == null) {
@@ -365,6 +366,129 @@ fun WatchScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface,
                     )
+                }
+            }
+        }
+
+        state.terminal?.let { terminal ->
+            MobileTerminalOverlay(
+                terminal = terminal,
+                onInputChange = viewModel::updateTerminalInput,
+                onSend = { viewModel.sendTerminalInput(sendEnter = true) },
+                onEsc = { viewModel.sendTerminalKey("esc") },
+                onCtrlC = { viewModel.sendTerminalKey("ctrl-c") },
+                onEnter = { viewModel.sendTerminalKey("enter") },
+                onDetach = viewModel::detachTerminal,
+                onCopy = {
+                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", terminal.output))
+                    toast = "Terminal output copied"
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun MobileTerminalOverlay(
+    terminal: TerminalUiState,
+    onInputChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onEsc: () -> Unit,
+    onCtrlC: () -> Unit,
+    onEnter: () -> Unit,
+    onDetach: () -> Unit,
+    onCopy: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = Panel,
+                border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = terminal.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = terminal.status,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (terminal.error == null) Cyan else Rose,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                    OutlinedButton(onClick = onDetach) {
+                        Text("Detach")
+                    }
+                }
+            }
+
+            terminal.error?.let { error ->
+                Text(
+                    text = error,
+                    color = Rose,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            Surface(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                color = Color.Black,
+                border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
+            ) {
+                Text(
+                    text = terminal.output.ifBlank { "Waiting for terminal output..." },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(12.dp),
+                    color = Color(0xFFE7F6F2),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onEsc) { Text("Esc") }
+                OutlinedButton(onClick = onCtrlC) { Text("Ctrl-C") }
+                OutlinedButton(onClick = onEnter) { Text("Enter") }
+                OutlinedButton(onClick = onCopy) { Text("Copy") }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = terminal.inputDraft,
+                    onValueChange = onInputChange,
+                    modifier = Modifier.weight(1f),
+                    label = { Text("Input") },
+                    singleLine = false,
+                    maxLines = 4,
+                )
+                Button(onClick = onSend) {
+                    Text("Send")
                 }
             }
         }
@@ -639,7 +763,7 @@ private fun SessionRow(
     onOpenTelegram: () -> Unit,
     onKill: () -> Unit,
 ) {
-    val attachSupported = session.termuxAttach?.supported == true
+    val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
     Surface(
         modifier = Modifier.padding(start = (depth * 14).dp),
         shape = RoundedCornerShape(22.dp),
@@ -756,7 +880,9 @@ private fun SessionRow(
                         }
                         ActionPill(label = "Kill", icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
                     }
-                    if (session.termuxAttach?.supported == false) {
+                    if (session.mobileTerminal?.supported == false && session.termuxAttach?.supported != true) {
+                        StatusChip(label = session.mobileTerminal.reason ?: "mobile attach unavailable", tint = TextMuted)
+                    } else if (session.termuxAttach?.supported == false && session.mobileTerminal?.supported != true) {
                         StatusChip(label = session.termuxAttach.reason ?: "attach unavailable", tint = TextMuted)
                     }
                 }

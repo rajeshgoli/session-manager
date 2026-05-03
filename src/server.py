@@ -15,15 +15,19 @@ import base64
 import hashlib
 import hmac
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
 from urllib.parse import urlencode, urlparse
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token as google_id_token
-from fastapi import FastAPI, HTTPException, Body, Request, Query, Response
+from fastapi import FastAPI, HTTPException, Body, Request, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -71,6 +75,9 @@ BUG_REPORT_MAX_TEXT_CHARS = 4000
 BUG_REPORT_MAX_CLIENT_STATE_CHARS = 100_000
 BUG_REPORT_MAX_SERVER_STATE_CHARS = 200_000
 DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS = 1.0
+MOBILE_TERMINAL_INPUT_MAX_CHARS = 8192
+MOBILE_TERMINAL_TMUX_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:@-]+$")
+MOBILE_TERMINAL_SOCKET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
 DEFAULT_BUG_REPORTS_DB = Path(__file__).resolve().parents[1] / "data" / "bug_reports.db"
 DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
@@ -574,6 +581,37 @@ class DeviceGoogleAuthResponse(BaseModel):
     expires_at: str
     email: str
     name: Optional[str] = None
+
+
+class MobileAttachTicketResponse(BaseModel):
+    """Short-lived, single-use mobile terminal attach ticket."""
+    ticket_id: str
+    ticket_secret: str
+    device_key_id: str
+    ws_url: str
+    expires_at: str
+
+
+class MobileTerminalDisableResponse(BaseModel):
+    """Response for emergency mobile terminal disable controls."""
+    ok: bool = True
+    disabled: bool
+
+
+@dataclass
+class MobileTerminalTicket:
+    ticket_id: str
+    secret_hash: str
+    user_id: str
+    actor_email: str
+    session_id: str
+    provider: str
+    tmux_session: str
+    tmux_socket_name: Optional[str]
+    device_key_id: str
+    created_at: float
+    expires_at: float
+    consumed_at: Optional[float] = None
 
 
 class AppArtifactMetadataResponse(BaseModel):
@@ -1283,6 +1321,12 @@ def create_app(
         setattr(notifier, "session_manager", session_manager)
 
     attach_infra_cache = {"expires_at": 0.0, "issue": None}
+    app.state.mobile_terminal_tickets: dict[str, MobileTerminalTicket] = {}
+    app.state.mobile_terminal_active_attaches: dict[str, dict[str, Any]] = {}
+    app.state.mobile_terminal_lock = asyncio.Lock()
+    app.state.mobile_terminal_secret = secrets.token_bytes(32)
+    app.state.mobile_terminal_runtime_disabled = False
+    app.state.mobile_terminal_revoked_keys: set[tuple[str, str]] = set()
 
     # Wire _app back-reference so _execute_handoff can clear server-side caches (#196)
     if session_manager:
@@ -2025,6 +2069,255 @@ def create_app(
     def _external_access_config() -> dict:
         return (app.state.config or {}).get("external_access") or {}
 
+    def _mobile_terminal_config() -> dict[str, Any]:
+        raw = (app.state.config or {}).get("mobile_terminal") or {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _mobile_terminal_enabled() -> bool:
+        return bool(_mobile_terminal_config().get("enabled")) and not bool(
+            getattr(app.state, "mobile_terminal_runtime_disabled", False)
+        )
+
+    def _mobile_terminal_int(name: str, default: int, minimum: int = 1, maximum: Optional[int] = None) -> int:
+        try:
+            value = int(_mobile_terminal_config().get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _mobile_terminal_public_http_host() -> Optional[str]:
+        external_access = _external_access_config()
+        host = str(external_access.get("public_http_host") or "").strip()
+        if not host:
+            host = str(_google_auth_config(app.state.config).get("public_host") or "").strip()
+        return host or None
+
+    def _mobile_terminal_ws_url() -> Optional[str]:
+        config_block = _mobile_terminal_config()
+        configured = str(config_block.get("ws_url") or "").strip()
+        if configured:
+            return configured
+        host = _mobile_terminal_public_http_host()
+        if not host:
+            return None
+        scheme = "wss"
+        if host.startswith("localhost") or host.startswith("127.0.0.1") or host.startswith("testserver"):
+            scheme = "ws"
+        return f"{scheme}://{host}/client/terminal"
+
+    def _mobile_terminal_visible_user(actor_email: str) -> Optional[tuple[str, dict[str, Any]]]:
+        allowed_users = _mobile_terminal_config().get("allowed_users") or {}
+        if not isinstance(allowed_users, dict):
+            return None
+        normalized_email = str(actor_email or "").strip().lower()
+        email_local = normalized_email.split("@", 1)[0]
+        for user_id, raw_user_config in allowed_users.items():
+            user_config = raw_user_config if isinstance(raw_user_config, dict) else {}
+            candidates = {
+                str(user_id or "").strip().lower(),
+                str(user_config.get("email") or "").strip().lower(),
+            }
+            aliases = user_config.get("aliases") or []
+            if isinstance(aliases, list):
+                candidates.update(str(alias or "").strip().lower() for alias in aliases)
+            candidates.discard("")
+            if normalized_email in candidates or email_local in candidates:
+                return str(user_id), user_config
+        return None
+
+    def _mobile_terminal_device_config(
+        user_id: str,
+        user_config: dict[str, Any],
+        device_key_id: str,
+    ) -> Optional[dict[str, Any]]:
+        if (user_id, device_key_id) in getattr(app.state, "mobile_terminal_revoked_keys", set()):
+            return None
+        keys = user_config.get("registered_device_keys") or []
+        if not isinstance(keys, list):
+            return None
+        for raw_key in keys:
+            if not isinstance(raw_key, dict):
+                continue
+            if str(raw_key.get("id") or "").strip() != device_key_id:
+                continue
+            if raw_key.get("enabled", True) is False:
+                return None
+            public_key = str(raw_key.get("public_key") or "").strip()
+            if not public_key:
+                return None
+            return raw_key
+        return None
+
+    def _mobile_terminal_signature_bytes(value: str) -> bytes:
+        text = str(value or "").strip()
+        if not text:
+            raise HTTPException(status_code=401, detail="Missing device signature")
+        try:
+            return base64.b64decode(text, validate=True)
+        except Exception:
+            try:
+                return _urlsafe_b64decode(text)
+            except Exception as exc:
+                raise HTTPException(status_code=401, detail="Invalid device signature encoding") from exc
+
+    def _load_mobile_terminal_public_key(public_key_text: str):
+        encoded = public_key_text.strip().encode("utf-8")
+        if public_key_text.strip().startswith("ssh-"):
+            return serialization.load_ssh_public_key(encoded)
+        return serialization.load_pem_public_key(encoded)
+
+    def _verify_mobile_terminal_signature(
+        *,
+        public_key_text: str,
+        signature_text: str,
+        message: str,
+    ) -> None:
+        try:
+            public_key = _load_mobile_terminal_public_key(public_key_text)
+            signature = _mobile_terminal_signature_bytes(signature_text)
+            payload = message.encode("utf-8")
+            if isinstance(public_key, ed25519.Ed25519PublicKey):
+                public_key.verify(signature, payload)
+                return
+            if isinstance(public_key, ec.EllipticCurvePublicKey):
+                public_key.verify(signature, payload, ec.ECDSA(hashes.SHA256()))
+                return
+            if isinstance(public_key, rsa.RSAPublicKey):
+                public_key.verify(signature, payload, padding.PKCS1v15(), hashes.SHA256())
+                return
+        except InvalidSignature as exc:
+            raise HTTPException(status_code=401, detail="Invalid device signature") from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=401, detail="Invalid device public key") from exc
+        raise HTTPException(status_code=401, detail="Unsupported device public key type")
+
+    def _mobile_terminal_ticket_message(
+        *,
+        method: str,
+        path: str,
+        session_id: str,
+        actor_email: str,
+        device_key_id: str,
+        timestamp: str,
+        nonce: str,
+    ) -> str:
+        return "\n".join(
+            [
+                "SM-MOBILE-TERMINAL-TICKET-V1",
+                method.upper(),
+                path,
+                session_id,
+                actor_email.lower(),
+                device_key_id,
+                timestamp,
+                nonce,
+            ]
+        )
+
+    def _mobile_terminal_ws_message(
+        *,
+        ticket_id: str,
+        session_id: str,
+        actor_email: str,
+        device_key_id: str,
+        nonce: str,
+    ) -> str:
+        return "\n".join(
+            [
+                "SM-MOBILE-TERMINAL-WS-V1",
+                ticket_id,
+                session_id,
+                actor_email.lower(),
+                device_key_id,
+                nonce,
+            ]
+        )
+
+    def _validate_mobile_terminal_timestamp(timestamp_text: str) -> None:
+        try:
+            timestamp = float(timestamp_text)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=401, detail="Invalid device timestamp") from exc
+        max_skew = _mobile_terminal_int("device_signature_max_skew_seconds", 60, minimum=5, maximum=600)
+        if abs(time.time() - timestamp) > max_skew:
+            raise HTTPException(status_code=401, detail="Expired device signature")
+
+    def _hash_mobile_terminal_ticket_secret(secret: str) -> str:
+        return hmac.new(
+            app.state.mobile_terminal_secret,
+            secret.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _audit_mobile_terminal(event: str, **fields: Any) -> None:
+        safe_fields = {key: value for key, value in fields.items() if value is not None}
+        logger.info("mobile_terminal.%s %s", event, json.dumps(safe_fields, sort_keys=True, default=str))
+
+    def _mobile_terminal_cleanup_expired_tickets(now: Optional[float] = None) -> None:
+        current = now or time.time()
+        tickets = getattr(app.state, "mobile_terminal_tickets", {})
+        for ticket_id, ticket in list(tickets.items()):
+            if ticket.expires_at <= current or ticket.consumed_at is not None:
+                tickets.pop(ticket_id, None)
+
+    def _validate_mobile_terminal_tmux_target(tmux_session: str, tmux_socket_name: Optional[str]) -> None:
+        if not tmux_session or not MOBILE_TERMINAL_TMUX_NAME_PATTERN.fullmatch(tmux_session):
+            raise HTTPException(status_code=403, detail="Unsafe tmux session target")
+        if tmux_socket_name and not MOBILE_TERMINAL_SOCKET_NAME_PATTERN.fullmatch(tmux_socket_name):
+            raise HTTPException(status_code=403, detail="Unsafe tmux socket target")
+
+    def _mobile_terminal_metadata(session: Session, descriptor: Optional[dict[str, Any]]) -> dict[str, Any]:
+        if not _mobile_terminal_enabled():
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": "mobile terminal attach is disabled",
+            }
+        ws_url = _mobile_terminal_ws_url()
+        if not ws_url:
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": "mobile terminal public HTTPS host is not configured",
+            }
+        if not descriptor:
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": "attach descriptor unavailable",
+            }
+        if not descriptor.get("attach_supported", True):
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": descriptor.get("message") or "attach not supported",
+            }
+        tmux_session = str(descriptor.get("tmux_session") or getattr(session, "tmux_session", "") or "").strip()
+        tmux_socket_name = str(descriptor.get("tmux_socket_name") or "").strip() or None
+        try:
+            _validate_mobile_terminal_tmux_target(tmux_session, tmux_socket_name)
+        except HTTPException as exc:
+            return {
+                "supported": False,
+                "transport": "sm-https-tmux",
+                "reason": str(exc.detail),
+            }
+        return {
+            "supported": True,
+            "transport": "sm-https-tmux",
+            "ticket_endpoint": f"/client/sessions/{session.id}/attach-ticket",
+            "ws_url": ws_url,
+            "tmux_session": tmux_session,
+            "tmux_socket_name": tmux_socket_name,
+            "runtime_mode": descriptor.get("runtime_mode"),
+            "requires_device_key": True,
+        }
+
     def _app_artifacts_root() -> Path:
         configured = ((app.state.config or {}).get("paths") or {}).get("app_artifacts_dir")
         if configured:
@@ -2117,6 +2410,10 @@ def create_app(
         ssh_username = str(external_access.get("ssh_username") or "").strip()
         google_server_client_id = str(google_auth.get("client_id") or "").strip()
         termux_supported = bool(public_ssh_host and ssh_username and not _termux_attach_infra_issue())
+        mobile_terminal_supported = bool(_mobile_terminal_enabled() and _mobile_terminal_ws_url())
+        preferred_action = "mobile_terminal" if mobile_terminal_supported else (
+            "termux_attach" if termux_supported else "details"
+        )
         return _response_dict(
             ClientBootstrapResponse(
                 auth={
@@ -2133,9 +2430,11 @@ def create_app(
                     "public_ssh_host": public_ssh_host or None,
                     "ssh_username": ssh_username or None,
                     "termux_attach_supported": termux_supported,
+                    "mobile_terminal_supported": mobile_terminal_supported,
+                    "mobile_terminal_ws_url": _mobile_terminal_ws_url() if mobile_terminal_supported else None,
                 },
                 session_open_defaults={
-                    "preferred_action": "termux_attach" if termux_supported else "details",
+                    "preferred_action": preferred_action,
                     "termux_package": "com.termux",
                 },
             )
@@ -2477,7 +2776,16 @@ def create_app(
             metadata["tmux_socket_name"] = tmux_socket_name
         return metadata
 
-    def _mobile_primary_action(termux_attach: dict[str, Any], descriptor: Optional[dict[str, Any]]) -> dict[str, Any]:
+    def _mobile_primary_action(
+        mobile_terminal: dict[str, Any],
+        termux_attach: dict[str, Any],
+        descriptor: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if mobile_terminal.get("supported"):
+            return {
+                "type": "mobile_terminal",
+                "label": "Attach",
+            }
         if termux_attach.get("supported"):
             return {
                 "type": "termux_attach",
@@ -2504,9 +2812,11 @@ def create_app(
         )
         descriptor = _attach_descriptor(session)
         termux_attach = _termux_attach_metadata(session, descriptor)
+        mobile_terminal = _mobile_terminal_metadata(session, descriptor)
         base["attach_descriptor"] = descriptor
         base["termux_attach"] = termux_attach
-        base["primary_action"] = _mobile_primary_action(termux_attach, descriptor)
+        base["mobile_terminal"] = mobile_terminal
+        base["primary_action"] = _mobile_primary_action(mobile_terminal, termux_attach, descriptor)
         return base
 
     async def _sync_session_display_identity(
@@ -3843,6 +4153,445 @@ def create_app(
             bug_id=created["id"],
             maintainer_notified=maintainer_notified,
         )
+
+    def _mobile_terminal_authorize_ticket_request(
+        request: Request,
+        session: Session,
+        descriptor: Optional[dict[str, Any]],
+        actor_email: str,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        if not _mobile_terminal_enabled():
+            _audit_mobile_terminal("ticket_denied", user_id=actor_email, session_id=session.id, reason="disabled")
+            raise HTTPException(status_code=403, detail="Mobile terminal attach is disabled")
+        if session.status == SessionStatus.STOPPED:
+            _audit_mobile_terminal("ticket_denied", user_id=actor_email, session_id=session.id, reason="session_stopped")
+            raise HTTPException(status_code=409, detail="Session is not running")
+        metadata = _mobile_terminal_metadata(session, descriptor)
+        if not metadata.get("supported"):
+            _audit_mobile_terminal(
+                "ticket_denied",
+                user_id=actor_email,
+                session_id=session.id,
+                reason=metadata.get("reason") or "not_supported",
+            )
+            raise HTTPException(status_code=403, detail=metadata.get("reason") or "Attach not supported")
+        user_match = _mobile_terminal_visible_user(actor_email)
+        if user_match is None:
+            _audit_mobile_terminal("ticket_denied", user_id=actor_email, session_id=session.id, reason="user_not_allowed")
+            raise HTTPException(status_code=403, detail="User is not allowed to attach")
+        user_id, user_config = user_match
+        if user_config.get("interactive_shell_access") is not True:
+            _audit_mobile_terminal("ticket_denied", user_id=user_id, session_id=session.id, reason="shell_access_disabled")
+            raise HTTPException(status_code=403, detail="Interactive shell access is not enabled for this user")
+
+        device_key_id = str(request.headers.get("x-sm-device-key-id") or "").strip()
+        timestamp = str(request.headers.get("x-sm-device-timestamp") or "").strip()
+        nonce = str(request.headers.get("x-sm-device-nonce") or "").strip()
+        signature = str(request.headers.get("x-sm-device-signature") or "").strip()
+        if not device_key_id or not timestamp or not nonce or not signature:
+            raise HTTPException(status_code=401, detail="Device key proof is required")
+        _validate_mobile_terminal_timestamp(timestamp)
+        device_config = _mobile_terminal_device_config(user_id, user_config, device_key_id)
+        if device_config is None:
+            _audit_mobile_terminal(
+                "ticket_denied",
+                user_id=user_id,
+                session_id=session.id,
+                device_key_id=device_key_id,
+                reason="device_not_allowed",
+            )
+            raise HTTPException(status_code=401, detail="Device key is not registered")
+        message = _mobile_terminal_ticket_message(
+            method=request.method,
+            path=request.url.path,
+            session_id=session.id,
+            actor_email=actor_email,
+            device_key_id=device_key_id,
+            timestamp=timestamp,
+            nonce=nonce,
+        )
+        _verify_mobile_terminal_signature(
+            public_key_text=str(device_config.get("public_key") or ""),
+            signature_text=signature,
+            message=message,
+        )
+        return user_id, user_config, device_config
+
+    @app.post("/client/sessions/{session_id}/attach-ticket", response_model=MobileAttachTicketResponse)
+    async def create_mobile_attach_ticket(session_id: str, request: Request):
+        """Mint a short-lived, single-use mobile terminal attach ticket."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        actor_email = _request_actor_email(request)
+        if actor_email is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        session = _resolve_session_or_registry_role(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        descriptor = _attach_descriptor(session)
+        user_id, _user_config, device_config = _mobile_terminal_authorize_ticket_request(
+            request,
+            session,
+            descriptor,
+            actor_email,
+        )
+        metadata = _mobile_terminal_metadata(session, descriptor)
+        tmux_session = str(metadata.get("tmux_session") or "").strip()
+        tmux_socket_name = str(metadata.get("tmux_socket_name") or "").strip() or None
+        _validate_mobile_terminal_tmux_target(tmux_session, tmux_socket_name)
+
+        now = time.time()
+        ttl_seconds = _mobile_terminal_int("ticket_ttl_seconds", 30, minimum=5, maximum=300)
+        async with app.state.mobile_terminal_lock:
+            _mobile_terminal_cleanup_expired_tickets(now)
+            active = list(app.state.mobile_terminal_active_attaches.values())
+            max_global = _mobile_terminal_int("max_concurrent_attaches_global", 4, minimum=1, maximum=64)
+            max_user = _mobile_terminal_int("max_concurrent_attaches_per_user", 1, minimum=1, maximum=16)
+            max_session = _mobile_terminal_int("max_concurrent_attaches_per_session", 1, minimum=1, maximum=16)
+            if len(active) >= max_global:
+                raise HTTPException(status_code=429, detail="Too many active mobile attaches")
+            if sum(1 for item in active if item.get("user_id") == user_id) >= max_user:
+                raise HTTPException(status_code=429, detail="Too many active mobile attaches for user")
+            if sum(1 for item in active if item.get("session_id") == session.id) >= max_session:
+                raise HTTPException(status_code=429, detail="Session already has an active mobile attach")
+
+            ticket_id = f"att_{secrets.token_urlsafe(18)}"
+            ticket_secret = secrets.token_urlsafe(40)
+            expires_at = now + ttl_seconds
+            app.state.mobile_terminal_tickets[ticket_id] = MobileTerminalTicket(
+                ticket_id=ticket_id,
+                secret_hash=_hash_mobile_terminal_ticket_secret(ticket_secret),
+                user_id=user_id,
+                actor_email=actor_email,
+                session_id=session.id,
+                provider=str(session.provider or "claude"),
+                tmux_session=tmux_session,
+                tmux_socket_name=tmux_socket_name,
+                device_key_id=str(device_config.get("id") or ""),
+                created_at=now,
+                expires_at=expires_at,
+            )
+
+        _audit_mobile_terminal(
+            "ticket_minted",
+            user_id=user_id,
+            session_id=session.id,
+            provider=session.provider,
+            device_key_id=device_config.get("id"),
+            remote_addr=request.client.host if request.client else None,
+        )
+        return MobileAttachTicketResponse(
+            ticket_id=ticket_id,
+            ticket_secret=ticket_secret,
+            device_key_id=str(device_config.get("id") or ""),
+            ws_url=metadata["ws_url"],
+            expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+        )
+
+    async def _consume_mobile_terminal_ticket(auth_frame: dict[str, Any]) -> MobileTerminalTicket:
+        ticket_id = str(auth_frame.get("ticket_id") or "").strip()
+        ticket_secret = str(auth_frame.get("ticket_secret") or "").strip()
+        device_key_id = str(auth_frame.get("device_key_id") or "").strip()
+        nonce = str(auth_frame.get("nonce") or "").strip()
+        signature = str(auth_frame.get("signature") or "").strip()
+        if not ticket_id or not ticket_secret or not device_key_id or not nonce or not signature:
+            raise HTTPException(status_code=401, detail="Invalid terminal auth frame")
+
+        async with app.state.mobile_terminal_lock:
+            _mobile_terminal_cleanup_expired_tickets()
+            ticket = app.state.mobile_terminal_tickets.get(ticket_id)
+            if ticket is None:
+                raise HTTPException(status_code=401, detail="Attach ticket is invalid or expired")
+            if ticket.device_key_id != device_key_id:
+                raise HTTPException(status_code=401, detail="Attach ticket device mismatch")
+            if not hmac.compare_digest(ticket.secret_hash, _hash_mobile_terminal_ticket_secret(ticket_secret)):
+                raise HTTPException(status_code=401, detail="Attach ticket secret mismatch")
+            if ticket.expires_at <= time.time() or ticket.consumed_at is not None:
+                app.state.mobile_terminal_tickets.pop(ticket_id, None)
+                raise HTTPException(status_code=401, detail="Attach ticket is expired or consumed")
+
+            user_match = _mobile_terminal_visible_user(ticket.actor_email)
+            if user_match is None or user_match[0] != ticket.user_id:
+                raise HTTPException(status_code=403, detail="User is no longer allowed to attach")
+            _user_id, user_config = user_match
+            device_config = _mobile_terminal_device_config(ticket.user_id, user_config, device_key_id)
+            if device_config is None:
+                raise HTTPException(status_code=401, detail="Device key is no longer registered")
+            message = _mobile_terminal_ws_message(
+                ticket_id=ticket.ticket_id,
+                session_id=ticket.session_id,
+                actor_email=ticket.actor_email,
+                device_key_id=device_key_id,
+                nonce=nonce,
+            )
+            _verify_mobile_terminal_signature(
+                public_key_text=str(device_config.get("public_key") or ""),
+                signature_text=signature,
+                message=message,
+            )
+
+            session = app.state.session_manager.get_session(ticket.session_id)
+            if not session or session.status == SessionStatus.STOPPED:
+                raise HTTPException(status_code=409, detail="Session is no longer attachable")
+            descriptor = _attach_descriptor(session)
+            metadata = _mobile_terminal_metadata(session, descriptor)
+            if not metadata.get("supported"):
+                raise HTTPException(status_code=403, detail=metadata.get("reason") or "Session is no longer attachable")
+            ticket.consumed_at = time.time()
+            app.state.mobile_terminal_tickets.pop(ticket_id, None)
+            _audit_mobile_terminal(
+                "ticket_consumed",
+                user_id=ticket.user_id,
+                session_id=ticket.session_id,
+                provider=ticket.provider,
+                device_key_id=ticket.device_key_id,
+            )
+            return ticket
+
+    def _mobile_terminal_tmux_cmd(ticket: MobileTerminalTicket, *args: str) -> list[str]:
+        cmd = ["tmux"]
+        if ticket.tmux_socket_name:
+            cmd.extend(["-L", ticket.tmux_socket_name])
+        cmd.extend(args)
+        return cmd
+
+    async def _mobile_terminal_tmux_run(ticket: MobileTerminalTicket, *args: str) -> subprocess.CompletedProcess[str]:
+        return await asyncio.to_thread(
+            subprocess.run,
+            _mobile_terminal_tmux_cmd(ticket, *args),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+
+    async def _run_mobile_terminal_bridge(websocket: WebSocket, ticket: MobileTerminalTicket, attach_id: str) -> None:
+        """Bridge authenticated WebSocket frames to one server-derived tmux target."""
+        max_attach_seconds = _mobile_terminal_int("max_attach_seconds", 3600, minimum=30, maximum=24 * 3600)
+        poll_interval = float(_mobile_terminal_config().get("capture_poll_seconds", 0.5) or 0.5)
+        poll_interval = min(max(poll_interval, 0.2), 2.0)
+        stop_event = asyncio.Event()
+        counters = {"input_bytes": 0, "output_bytes": 0}
+
+        async def send_status(state: str, **extra: Any) -> None:
+            await websocket.send_json({"type": "status", "state": state, **extra})
+
+        async def capture_loop() -> None:
+            last_output: Optional[str] = None
+            while not stop_event.is_set():
+                result = await _mobile_terminal_tmux_run(
+                    ticket,
+                    "capture-pane",
+                    "-p",
+                    "-e",
+                    "-J",
+                    "-t",
+                    ticket.tmux_session,
+                )
+                if result.returncode != 0:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "tmux session is no longer attachable",
+                    })
+                    stop_event.set()
+                    return
+                output = result.stdout or ""
+                if output != last_output:
+                    counters["output_bytes"] += len(output.encode("utf-8", errors="ignore"))
+                    await websocket.send_json({
+                        "type": "output",
+                        "mode": "snapshot",
+                        "data": output,
+                    })
+                    last_output = output
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
+                except asyncio.TimeoutError:
+                    pass
+
+        async def receive_loop() -> None:
+            while not stop_event.is_set():
+                frame = await websocket.receive_json()
+                frame_type = str(frame.get("type") or "").strip().lower()
+                if frame_type == "input":
+                    data = str(frame.get("data") or "")
+                    if len(data) > MOBILE_TERMINAL_INPUT_MAX_CHARS:
+                        await websocket.send_json({"type": "error", "message": "input frame too large"})
+                        stop_event.set()
+                        return
+                    if data:
+                        counters["input_bytes"] += len(data.encode("utf-8", errors="ignore"))
+                        result = await _mobile_terminal_tmux_run(
+                            ticket,
+                            "send-keys",
+                            "-t",
+                            ticket.tmux_session,
+                            "-l",
+                            data,
+                        )
+                        if result.returncode != 0:
+                            await websocket.send_json({"type": "error", "message": "failed to deliver terminal input"})
+                            stop_event.set()
+                            return
+                elif frame_type == "key":
+                    key = str(frame.get("key") or "").strip().lower()
+                    key_map = {
+                        "enter": "Enter",
+                        "esc": "Escape",
+                        "escape": "Escape",
+                        "tab": "Tab",
+                        "backspace": "BSpace",
+                        "ctrl-c": "C-c",
+                        "ctrl-d": "C-d",
+                        "ctrl-z": "C-z",
+                        "ctrl-b": "C-b",
+                    }
+                    tmux_key = key_map.get(key)
+                    if not tmux_key:
+                        await websocket.send_json({"type": "error", "message": f"unsupported key: {key}"})
+                        continue
+                    counters["input_bytes"] += 1
+                    result = await _mobile_terminal_tmux_run(
+                        ticket,
+                        "send-keys",
+                        "-t",
+                        ticket.tmux_session,
+                        tmux_key,
+                    )
+                    if result.returncode != 0:
+                        await websocket.send_json({"type": "error", "message": "failed to deliver terminal key"})
+                        stop_event.set()
+                        return
+                elif frame_type == "resize":
+                    rows = int(frame.get("rows") or 0)
+                    cols = int(frame.get("cols") or 0)
+                    if not (10 <= rows <= 120 and 20 <= cols <= 300):
+                        await websocket.send_json({"type": "error", "message": "ignored invalid resize"})
+                    else:
+                        await websocket.send_json({"type": "status", "state": "resized", "rows": rows, "cols": cols})
+                elif frame_type == "ping":
+                    await websocket.send_json({"type": "status", "state": "pong"})
+                elif frame_type == "detach":
+                    stop_event.set()
+                    return
+                else:
+                    await websocket.send_json({"type": "error", "message": "unsupported terminal frame"})
+
+        await send_status("attached", session_id=ticket.session_id)
+        capture_task = asyncio.create_task(capture_loop())
+        receive_task = asyncio.create_task(receive_loop())
+        timeout_task = asyncio.create_task(asyncio.sleep(max_attach_seconds))
+        try:
+            done, pending = await asyncio.wait(
+                {capture_task, receive_task, timeout_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if timeout_task in done and not stop_event.is_set():
+                await websocket.send_json({"type": "exit", "code": 124, "reason": "max_attach_seconds"})
+            stop_event.set()
+            for task in pending:
+                task.cancel()
+        finally:
+            stop_event.set()
+            for task in (capture_task, receive_task, timeout_task):
+                if not task.done():
+                    task.cancel()
+            active = getattr(app.state, "mobile_terminal_active_attaches", {})
+            active.pop(attach_id, None)
+            _audit_mobile_terminal(
+                "attach_ended",
+                user_id=ticket.user_id,
+                session_id=ticket.session_id,
+                provider=ticket.provider,
+                device_key_id=ticket.device_key_id,
+                duration_seconds=round(time.time() - ticket.created_at, 3),
+                input_bytes=counters["input_bytes"],
+                output_bytes=counters["output_bytes"],
+            )
+
+    @app.websocket("/client/terminal")
+    async def mobile_terminal_websocket(websocket: WebSocket):
+        """Authenticated mobile terminal stream over the public HTTPS origin."""
+        await websocket.accept()
+        if not _mobile_terminal_enabled():
+            await websocket.send_json({"type": "error", "message": "mobile terminal attach is disabled"})
+            await websocket.close(code=1008)
+            return
+        origin = websocket.headers.get("origin")
+        allowed_origins = set(str(item).rstrip("/") for item in (_mobile_terminal_config().get("allowed_origins") or []))
+        public_host = _mobile_terminal_public_http_host()
+        if public_host:
+            allowed_origins.add(f"https://{public_host}")
+        if origin and allowed_origins and origin.rstrip("/") not in allowed_origins:
+            _audit_mobile_terminal("auth_failed", reason="invalid_origin", origin=origin)
+            await websocket.send_json({"type": "error", "message": "invalid origin"})
+            await websocket.close(code=1008)
+            return
+
+        auth_timeout = _mobile_terminal_int("auth_frame_timeout_seconds", 3, minimum=1, maximum=30)
+        try:
+            auth_frame = await asyncio.wait_for(websocket.receive_json(), timeout=auth_timeout)
+            if not isinstance(auth_frame, dict) or auth_frame.get("type") != "auth":
+                raise HTTPException(status_code=401, detail="First terminal frame must be auth")
+            ticket = await _consume_mobile_terminal_ticket(auth_frame)
+            _validate_mobile_terminal_tmux_target(ticket.tmux_session, ticket.tmux_socket_name)
+        except asyncio.TimeoutError:
+            _audit_mobile_terminal("auth_failed", reason="timeout")
+            await websocket.send_json({"type": "error", "message": "terminal auth timed out"})
+            await websocket.close(code=1008)
+            return
+        except HTTPException as exc:
+            _audit_mobile_terminal("auth_failed", reason=exc.detail)
+            await websocket.send_json({"type": "error", "message": str(exc.detail)})
+            await websocket.close(code=1008)
+            return
+        except WebSocketDisconnect:
+            return
+        except Exception as exc:
+            _audit_mobile_terminal("auth_failed", reason=type(exc).__name__)
+            await websocket.send_json({"type": "error", "message": "terminal auth failed"})
+            await websocket.close(code=1008)
+            return
+
+        attach_id = secrets.token_urlsafe(16)
+        async with app.state.mobile_terminal_lock:
+            app.state.mobile_terminal_active_attaches[attach_id] = {
+                "user_id": ticket.user_id,
+                "session_id": ticket.session_id,
+                "provider": ticket.provider,
+                "device_key_id": ticket.device_key_id,
+                "started_at": time.time(),
+            }
+        _audit_mobile_terminal(
+            "attach_started",
+            user_id=ticket.user_id,
+            session_id=ticket.session_id,
+            provider=ticket.provider,
+            device_key_id=ticket.device_key_id,
+        )
+        try:
+            await _run_mobile_terminal_bridge(websocket, ticket, attach_id)
+        except WebSocketDisconnect:
+            app.state.mobile_terminal_active_attaches.pop(attach_id, None)
+        finally:
+            if websocket.client_state.name != "DISCONNECTED":
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+
+    @app.post("/client/mobile-terminal/disable", response_model=MobileTerminalDisableResponse)
+    async def disable_mobile_terminal(request: Request):
+        """Emergency runtime kill switch for mobile terminal attach."""
+        actor_email = _request_actor_email(request)
+        if actor_email is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_match = _mobile_terminal_visible_user(actor_email)
+        if user_match is None or user_match[1].get("interactive_shell_access") is not True:
+            raise HTTPException(status_code=403, detail="User is not allowed to disable mobile terminal attach")
+        app.state.mobile_terminal_runtime_disabled = True
+        _audit_mobile_terminal("runtime_disabled", user_id=user_match[0])
+        return MobileTerminalDisableResponse(disabled=True)
 
     @app.get("/sessions/{session_id}/attach-descriptor")
     async def get_attach_descriptor(session_id: str):
