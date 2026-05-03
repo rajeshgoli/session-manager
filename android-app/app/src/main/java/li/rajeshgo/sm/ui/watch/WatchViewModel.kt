@@ -288,7 +288,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             terminalSocket?.close(1000, "new attach")
-            terminalSocket = sessionRepository.openMobileTerminalSocket(ticket, object : WebSocketListener() {
+            terminalSocket = sessionRepository.openMobileTerminalSocket(ticket, accessToken, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     val frame = JSONObject()
                         .put("type", "auth")

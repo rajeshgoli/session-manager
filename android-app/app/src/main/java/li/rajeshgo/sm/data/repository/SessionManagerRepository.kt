@@ -246,12 +246,19 @@ class SessionManagerRepository {
 
     fun openMobileTerminalSocket(
         ticket: MobileAttachTicketResponse,
+        accessToken: String,
         listener: WebSocketListener,
     ): WebSocket {
-        val request = Request.Builder()
-            .url(ticket.wsUrl)
-            .build()
-        return httpClient().newWebSocket(request, listener)
+        return httpClient().newWebSocket(mobileTerminalSocketRequest(ticket, accessToken), listener)
+    }
+
+    fun mobileTerminalSocketRequest(ticket: MobileAttachTicketResponse, accessToken: String): Request {
+        val builder = Request.Builder().url(ticket.wsUrl)
+        val token = accessToken.trim()
+        if (token.isNotBlank()) {
+            builder.header("Authorization", "Bearer $token")
+        }
+        return builder.build()
     }
 
     suspend fun requestStatus(baseUrl: String, token: String): Result<RequestStatusResponse> = withContext(Dispatchers.IO) {
