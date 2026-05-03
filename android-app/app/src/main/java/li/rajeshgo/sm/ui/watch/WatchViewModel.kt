@@ -242,7 +242,11 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             }
             val attachToken = UUID.randomUUID().toString()
             terminalAttachToken = attachToken
-            val path = sessionRepository.mobileAttachTicketPath(serverUrl, session.id)
+            val path = sessionRepository.mobileAttachTicketPath(
+                baseUrl = serverUrl,
+                sessionId = session.id,
+                advertisedEndpoint = session.mobileTerminal?.ticketEndpoint,
+            )
             _uiState.value = _uiState.value.copy(
                 terminal = TerminalUiState(
                     sessionId = session.id,

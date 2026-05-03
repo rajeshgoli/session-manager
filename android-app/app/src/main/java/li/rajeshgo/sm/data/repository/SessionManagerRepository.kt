@@ -220,11 +220,28 @@ class SessionManagerRepository {
         }.mapFailure(::classifyWriteFailure)
     }
 
-    fun mobileAttachTicketPath(baseUrl: String, sessionId: String): String {
+    fun mobileAttachTicketPath(
+        baseUrl: String,
+        sessionId: String,
+        advertisedEndpoint: String? = null,
+    ): String {
+        val advertised = advertisedEndpoint.orEmpty().trim()
+        if (advertised.isNotEmpty()) {
+            val path = runCatching { URI(advertised).rawPath.orEmpty() }.getOrDefault("")
+            return normalizePath(path.ifBlank { advertised.substringBefore('?').substringBefore('#') })
+        }
         val prefix = runCatching {
             URI(baseUrl.trim()).rawPath.orEmpty().trimEnd('/')
         }.getOrDefault("")
         return "$prefix/client/sessions/$sessionId/attach-ticket"
+    }
+
+    private fun normalizePath(path: String): String {
+        val trimmed = path.trim()
+        if (trimmed.isEmpty() || trimmed == "/") {
+            return "/"
+        }
+        return if (trimmed.startsWith("/")) trimmed else "/$trimmed"
     }
 
     fun openMobileTerminalSocket(

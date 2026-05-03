@@ -2150,6 +2150,10 @@ def create_app(
         prefix = _mobile_terminal_public_http_path_prefix(path_prefix)
         return f"{scheme}://{host}{prefix}/client/terminal"
 
+    def _mobile_terminal_attach_ticket_path(session_id: str, path_prefix: Optional[str] = None) -> str:
+        prefix = _mobile_terminal_public_http_path_prefix(path_prefix)
+        return f"{prefix}/client/sessions/{session_id}/attach-ticket"
+
     def _mobile_terminal_visible_user(actor_email: str) -> Optional[tuple[str, dict[str, Any]]]:
         allowed_users = _mobile_terminal_config().get("allowed_users") or {}
         if not isinstance(allowed_users, dict):
@@ -2407,10 +2411,7 @@ def create_app(
         return {
             "supported": True,
             "transport": "sm-https-tmux",
-            "ticket_endpoint": (
-                f"{_mobile_terminal_public_http_path_prefix(path_prefix)}"
-                f"/client/sessions/{session.id}/attach-ticket"
-            ),
+            "ticket_endpoint": _mobile_terminal_attach_ticket_path(session.id, path_prefix),
             "ws_url": ws_url,
             "tmux_session": tmux_session,
             "tmux_socket_name": tmux_socket_name,
@@ -4323,7 +4324,7 @@ def create_app(
             raise HTTPException(status_code=401, detail="Device key is not registered")
         message = _mobile_terminal_ticket_message(
             method=request.method,
-            path=request.url.path,
+            path=_mobile_terminal_attach_ticket_path(session.id, path_prefix),
             session_id=session.id,
             actor_email=actor_email,
             device_key_id=device_key_id,

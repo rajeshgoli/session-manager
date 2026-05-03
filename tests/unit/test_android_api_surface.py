@@ -353,6 +353,28 @@ def test_mobile_terminal_metadata_preserves_configured_public_path_prefix():
     assert payload["ws_url"] == "wss://sm.rajeshgo.li/sm/client/terminal"
 
 
+def test_mobile_attach_ticket_signature_uses_advertised_public_path_prefix():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    config["external_access"]["public_http_path_prefix"] = "/sm"
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app)
+    advertised_path = client.get("/client/sessions").json()["sessions"][0]["mobile_terminal"]["ticket_endpoint"]
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id, path=advertised_path),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ticket_id"].startswith("att_")
+
+
 def test_mobile_terminal_metadata_preserves_request_root_path_prefix():
     private_key = ec.generate_private_key(ec.SECP256R1())
     session = _session()

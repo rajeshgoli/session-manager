@@ -23,4 +23,32 @@ class SessionManagerRepositoryTest {
             repository.mobileAttachTicketPath("https://example.com", "abc123"),
         )
     }
+
+    @Test
+    fun mobileAttachTicketPathPrefersAdvertisedTicketEndpoint() {
+        val repository = SessionManagerRepository()
+
+        assertEquals(
+            "/proxy/client/sessions/abc123/attach-ticket",
+            repository.mobileAttachTicketPath(
+                "https://example.com/sm/",
+                "abc123",
+                "/proxy/client/sessions/abc123/attach-ticket",
+            ),
+        )
+    }
+
+    @Test
+    fun mobileAttachTicketPathExtractsPathFromAbsoluteAdvertisedTicketEndpoint() {
+        val repository = SessionManagerRepository()
+
+        assertEquals(
+            "/proxy/client/sessions/abc123/attach-ticket",
+            repository.mobileAttachTicketPath(
+                "https://example.com/sm/",
+                "abc123",
+                "https://api.example.com/proxy/client/sessions/abc123/attach-ticket",
+            ),
+        )
+    }
 }
