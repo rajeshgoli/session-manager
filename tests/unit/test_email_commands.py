@@ -361,6 +361,58 @@ def test_cmd_send_uses_extended_timeout_for_resolution_and_delivery(capsys):
     assert "Input sent to worker (live123)" in capsys.readouterr().out
 
 
+def test_cmd_send_rejects_redundant_friendly_name_plus_sm_id(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+    target_session = {
+        "id": "69c4f382",
+        "friendly_name": "em-proximity-3324",
+        "status": "idle",
+        "provider": "claude",
+    }
+
+    def get_session(session_id, timeout=None):
+        if session_id == "69c4f382":
+            return target_session
+        return None
+
+    client.get_session.side_effect = get_session
+    client.list_sessions.return_value = [target_session]
+
+    rc = cmd_send(client, "em-proximity-3324", "69c4f382")
+
+    assert rc == 1
+    client.send_input.assert_not_called()
+    captured = capsys.readouterr()
+    assert "message text '69c4f382' is the sm-id for em-proximity-3324" in captured.err
+    assert "pass either the friendly name or the sm-id, not both" in captured.err
+
+
+def test_cmd_send_allows_unknown_id_shaped_message(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+
+    def get_session(session_id, timeout=None):
+        if session_id == "live123":
+            return {
+                "id": "live123",
+                "friendly_name": "worker",
+                "status": "running",
+                "provider": "claude",
+            }
+        return None
+
+    client.get_session.side_effect = get_session
+    client.send_input.return_value = (True, False)
+
+    rc = cmd_send(client, "live123", "deadbeef")
+
+    assert rc == 0
+    client.send_input.assert_called_once()
+    assert client.send_input.call_args.args[:2] == ("live123", "deadbeef")
+    assert "Input sent to worker (live123)" in capsys.readouterr().out
+
+
 def test_cmd_send_multiple_recipients_uses_batch_endpoint(capsys):
     client = Mock()
     client.session_id = "sender123"
