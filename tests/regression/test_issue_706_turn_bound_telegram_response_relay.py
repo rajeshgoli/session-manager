@@ -276,6 +276,46 @@ def test_missing_transcript_path_binds_offset_from_inbound_user_line(tmp_path):
     assert active_turn.transcript_offset == len(prefix.encode("utf-8"))
 
 
+def test_hook_transcript_path_replaces_stale_turn_path(tmp_path):
+    stale_transcript = tmp_path / "stale-transcript.jsonl"
+    stale_transcript.write_text(_assistant_line("old stale file answer", uuid="old-stale"))
+    current_transcript = tmp_path / "current-transcript.jsonl"
+    user_text = "input after transcript rotation"
+    prefix = _assistant_line("older current file answer", uuid="old-current") + _user_line(user_text, uuid="user-rotated")
+    current_transcript.write_text(prefix + _assistant_line("answer in rotated transcript", uuid="answer-rotated"))
+    session = _session(stale_transcript)
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    ledger.record_inbound_turn(
+        session_id=session.id,
+        inbound_id="inbound-stale-path",
+        source="telegram",
+        provider=session.provider,
+        delivered_at=datetime(2026, 5, 2, 22, 24, 19, tzinfo=timezone.utc),
+        transcript_path=str(stale_transcript),
+        transcript_offset=stale_transcript.stat().st_size,
+        text=user_text,
+    )
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(current_transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    notifier.notify.assert_awaited_once()
+    assert notifier.notify.await_args.args[0].context == "answer in rotated transcript"
+    active_turn = ledger.get_latest_active_turn(session.id)
+    assert active_turn is not None
+    assert active_turn.transcript_path == str(current_transcript)
+    assert active_turn.transcript_offset == len(prefix.encode("utf-8"))
+
+
 def test_unresolved_session_manager_id_uses_legacy_transcript_match(tmp_path):
     transcript = tmp_path / "fallback.jsonl"
     transcript.write_text(_assistant_line("fallback matched answer", uuid="fallback-answer"))

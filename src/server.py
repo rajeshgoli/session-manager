@@ -6348,8 +6348,17 @@ Provide ONLY the summary, no preamble or questions."""
             )
             return True
 
-        effective_transcript_path = active_turn.transcript_path or transcript_path
-        boundary_offset = active_turn.transcript_offset
+        hook_replaces_stored_transcript = bool(
+            transcript_path
+            and active_turn.transcript_path
+            and transcript_path != active_turn.transcript_path
+        )
+        effective_transcript_path = (
+            transcript_path
+            if hook_replaces_stored_transcript
+            else active_turn.transcript_path or transcript_path
+        )
+        boundary_offset = None if hook_replaces_stored_transcript else active_turn.transcript_offset
         if effective_transcript_path and boundary_offset is None:
             boundary_offset = find_claude_inbound_turn_boundary_offset(
                 effective_transcript_path,
@@ -6357,7 +6366,18 @@ Provide ONLY the summary, no preamble or questions."""
             )
         should_update_path = bool(transcript_path and not active_turn.transcript_path)
         should_update_offset = boundary_offset is not None and active_turn.transcript_offset is None
-        if should_update_path or should_update_offset:
+        if hook_replaces_stored_transcript:
+            ledger.replace_inbound_transcript_boundary(
+                active_turn.inbound_id,
+                transcript_path=transcript_path,
+                transcript_offset=boundary_offset,
+            )
+            active_turn = replace(
+                active_turn,
+                transcript_path=transcript_path,
+                transcript_offset=boundary_offset,
+            )
+        elif should_update_path or should_update_offset:
             ledger.update_inbound_boundary(
                 active_turn.inbound_id,
                 transcript_path=transcript_path if should_update_path else None,

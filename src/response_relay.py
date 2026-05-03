@@ -250,6 +250,28 @@ class ResponseRelayLedger:
             )
             self._conn.commit()
 
+    def replace_inbound_transcript_boundary(
+        self,
+        inbound_id: str,
+        *,
+        transcript_path: str,
+        transcript_offset: Optional[int] = None,
+    ) -> None:
+        """Replace transcript boundary metadata when a session moves to a new transcript."""
+        now = _utc_now().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE inbound_turns
+                SET transcript_path = ?,
+                    transcript_offset = ?,
+                    updated_at = ?
+                WHERE inbound_id = ?
+                """,
+                (transcript_path, transcript_offset, now, inbound_id),
+            )
+            self._conn.commit()
+
     def get_latest_active_turn(self, session_id: str) -> Optional[InboundTurn]:
         with self._lock:
             cursor = self._conn.cursor()
