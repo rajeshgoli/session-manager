@@ -732,6 +732,19 @@ def _lookup_live_session_fallback(
     return None, False, None
 
 
+def _print_roster_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> None:
+    widths = [
+        max(len(header), *(len(row[idx]) for row in rows))
+        for idx, header in enumerate(headers)
+    ]
+    header_line = "  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers))
+    divider = "  ".join("-" * widths[idx] for idx in range(len(headers)))
+    print(header_line)
+    print(divider)
+    for row in rows:
+        print("  ".join(value.ljust(widths[idx]) for idx, value in enumerate(row)))
+
+
 def cmd_roster(client: SessionManagerClient) -> int:
     """
     List all live durable registry roles.
@@ -745,32 +758,57 @@ def cmd_roster(client: SessionManagerClient) -> int:
     if registrations is None:
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
-    if not registrations:
-        print("No registered roles.")
+
+    human_lister = getattr(client, "list_humans", None)
+    humans_raw = human_lister() if callable(human_lister) else []
+    if humans_raw is None:
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    humans = humans_raw if isinstance(humans_raw, list) else []
+
+    if not registrations and not humans:
+        print("No registered roles or humans.")
         return 0
 
-    headers = ("Role", "Session ID", "Name", "Provider", "State")
-    rows = [
-        (
-            str(entry.get("role") or ""),
-            str(entry.get("session_id") or ""),
-            str(entry.get("friendly_name") or ""),
-            str(entry.get("provider") or ""),
-            str(entry.get("activity_state") or entry.get("status") or ""),
-        )
-        for entry in registrations
-    ]
-    widths = [
-        max(len(header), *(len(row[idx]) for row in rows))
-        for idx, header in enumerate(headers)
-    ]
+    if registrations:
+        print("Agents")
+        headers = ("Role", "Session ID", "Name", "Provider", "State")
+        rows = [
+            (
+                str(entry.get("role") or ""),
+                str(entry.get("session_id") or ""),
+                str(entry.get("friendly_name") or ""),
+                str(entry.get("provider") or ""),
+                str(entry.get("activity_state") or entry.get("status") or ""),
+            )
+            for entry in registrations
+        ]
+        _print_roster_table(headers, rows)
 
-    header_line = "  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers))
-    divider = "  ".join("-" * widths[idx] for idx in range(len(headers)))
-    print(header_line)
-    print(divider)
-    for row in rows:
-        print("  ".join(value.ljust(widths[idx]) for idx, value in enumerate(row)))
+    if humans:
+        if registrations:
+            print()
+        print("Humans")
+        headers = ("Name", "Display", "Aliases", "Default", "Channels")
+        rows = []
+        for entry in humans:
+            recipient = str(entry.get("recipient") or "")
+            aliases = [
+                str(alias)
+                for alias in (entry.get("aliases") or [])
+                if str(alias) and str(alias) != recipient
+            ]
+            channels = [str(channel) for channel in (entry.get("available_channels") or []) if str(channel)]
+            rows.append(
+                (
+                    recipient,
+                    str(entry.get("display_name") or ""),
+                    ",".join(aliases),
+                    str(entry.get("default_channel") or ""),
+                    ",".join(channels),
+                )
+            )
+        _print_roster_table(headers, rows)
     return 0
 
 

@@ -910,8 +910,9 @@ class SessionManager:
         for proposal_data in data.get("adoption_proposals", []):
             proposal = AdoptionProposal.from_dict(proposal_data)
             self.adoption_proposals[proposal.id] = proposal
+        registry_recovered = self._recover_missing_maintainer_registration()
         registry_changed = self._prune_agent_registrations(persist=False)
-        if retired_codex_app_sessions or registry_changed:
+        if retired_codex_app_sessions or registry_recovered or registry_changed:
             self._save_state()
 
     def _rewrite_state_raw(self, sessions_data: list[dict], extra_state: Optional[dict] = None) -> bool:
@@ -2979,14 +2980,62 @@ class SessionManager:
         self.maintainer_session_id = registration.session_id if registration else None
 
     def _get_live_registered_session(self, session_id: str) -> Optional[Session]:
-        """Return the owning session when it is still live for registry purposes."""
+        """Return the owning session when it is still usable for registry purposes."""
         session = self.sessions.get(session_id)
-        if not session or session.status == SessionStatus.STOPPED:
+        if not session or not self._session_is_restorable_for_registry(session):
             return None
         return session
 
+    @staticmethod
+    def _session_is_restorable_for_registry(session: Session) -> bool:
+        """Return whether a stopped session still has enough provider state to restore."""
+        if session.status != SessionStatus.STOPPED:
+            return True
+        if session.provider == "claude":
+            return bool(session.provider_resume_id or session.transcript_path)
+        if session.provider == "codex-app":
+            return bool(session.codex_thread_id or session.provider_resume_id)
+        if session.provider in {"codex", "codex-fork"}:
+            return bool(session.provider_resume_id)
+        return bool(session.provider_resume_id)
+
+    def _recover_missing_maintainer_registration(self) -> bool:
+        """Recover a missing maintainer role when persisted history still points to it."""
+        registration_map = self._get_agent_registration_map()
+        if "maintainer" in registration_map:
+            return False
+
+        candidates = [
+            self.maintainer_session_id,
+            self.agent_role_last_session_ids.get("maintainer"),
+        ]
+        for session_id in candidates:
+            if not session_id:
+                continue
+            session = self.sessions.get(session_id)
+            if not session or not self._session_is_restorable_for_registry(session):
+                continue
+            session_identity = {
+                str(session.friendly_name or "").strip().lower(),
+                str(getattr(session, "role", "") or "").strip().lower(),
+                str(getattr(session, "auto_bootstrapped_role", "") or "").strip().lower(),
+            }
+            if "maintainer" not in session_identity:
+                continue
+
+            registration_map["maintainer"] = AgentRegistration(
+                role="maintainer",
+                session_id=session_id,
+            )
+            self.agent_role_last_session_ids["maintainer"] = session_id
+            self._synchronize_maintainer_alias()
+            logger.info("Recovered missing maintainer registry entry for session %s", session_id)
+            return True
+
+        return False
+
     def _prune_agent_registrations(self, persist: bool = True) -> bool:
-        """Drop registrations whose owning sessions no longer exist or are no longer live."""
+        """Drop registrations whose owning sessions no longer exist or are no longer restorable."""
         registration_map = self._get_agent_registration_map()
         removed = False
         for role, registration in list(registration_map.items()):
@@ -3084,8 +3133,8 @@ class SessionManager:
         registration = registration_map.get(normalized_role)
         if not registration or registration.session_id != session_id:
             return False
-        self.agent_role_last_session_ids[normalized_role] = registration.session_id
         registration_map.pop(normalized_role, None)
+        self.agent_role_last_session_ids.pop(normalized_role, None)
         self._synchronize_maintainer_alias()
         self._save_state()
         return True

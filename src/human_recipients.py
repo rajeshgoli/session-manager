@@ -150,7 +150,10 @@ class HumanRecipientRegistry:
             return None
         return self._recipients.get(matches[0])
 
+    def list_recipients(self) -> tuple[HumanRecipient, ...]:
+        """Return all configured human recipients in stable display order."""
+        return tuple(self._recipients[name] for name in sorted(self._recipients))
+
     def reserved_names(self) -> set[str]:
         """Return every canonical name and alias reserved by humans."""
         return set(self._alias_map)
-
