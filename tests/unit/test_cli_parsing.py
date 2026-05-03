@@ -7,7 +7,7 @@ import os
 from unittest.mock import MagicMock, patch
 from io import StringIO
 
-from src.cli.main import main, _normalize_optional_track_args
+from src.cli.main import main, _build_send_parser, _normalize_optional_track_args, _parse_send_args
 from src.cli.commands import (
     parse_duration,
     resolve_session_id,
@@ -283,6 +283,47 @@ class TestSendCommand:
         assert args.track is None
         assert args.session_id == "target123"
         assert args.text == "--track=420"
+
+    def test_send_options_may_follow_message(self):
+        """sm send target text --urgent is accepted and documented behavior."""
+        args = _parse_send_args(["target123", "Test", "--urgent"])
+
+        assert args.session_id == "target123"
+        assert args.text == "Test"
+        assert args.urgent is True
+
+    def test_send_options_may_appear_between_recipient_and_message(self):
+        """sm send target --urgent text remains a valid call shape."""
+        args = _parse_send_args(["target123", "--urgent", "Test"])
+
+        assert args.session_id == "target123"
+        assert args.text == "Test"
+        assert args.urgent is True
+
+    def test_send_extra_positionals_get_send_specific_error(self, capsys):
+        """Extra recipient-like tokens fail under sm send usage, not global usage."""
+        with pytest.raises(SystemExit) as exc_info:
+            _parse_send_args(["em-proximity-3324", "69c4f382", "--urgent", "hello"])
+
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "usage: sm send" in captured.err
+        assert "unexpected extra positional argument(s): hello" in captured.err
+        assert "pass either the friendly name or the sm-id, not both" in captured.err
+
+    def test_send_help_documents_flag_position_and_one_recipient(self, capsys):
+        """sm send -h documents option placement and the one-recipient rule."""
+        parser = _build_send_parser()
+
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(["-h"])
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        help_text = " ".join(captured.out.split())
+        assert "Flag placement:" in captured.out
+        assert "before the recipient, between the recipient and message, or after the message" in help_text
+        assert "use either the friendly name or the sm-id, not both" in help_text
 
 
 class TestEmailCommand:

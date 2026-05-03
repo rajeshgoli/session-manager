@@ -30,6 +30,7 @@ from ..codex_provider_policy import (
 # Claude Code (Node.js TUI in raw mode) treats a rapid character burst as pasted
 # text; Enter must arrive as a separate event after the paste mode ends.
 _SEND_KEYS_SETTLE_SECONDS = 0.3
+_SM_ID_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 
 
 def _tmux_command(args: list[str], tmux_socket_name: Optional[str] = None) -> list[str]:
@@ -1646,6 +1647,11 @@ def cmd_send(
             print(f"Error: {detail_message}", file=sys.stderr)
             return 1
 
+    redundant_address_error = _redundant_send_address_error(client, identifier, session_id, text)
+    if redundant_address_error:
+        print(redundant_address_error, file=sys.stderr)
+        return 1
+
     # Self-sends are commonly used as delayed wakeups; do not advertise or request
     # stop-notify because it would wake the same agent on its next stop hook.
     effective_notify_on_stop = notify_on_stop and sender_session_id != session_id
@@ -1702,6 +1708,36 @@ def cmd_send(
         print(f"  Options: {', '.join(extras)}")
 
     return 0
+
+
+def _redundant_send_address_error(
+    client: SessionManagerClient,
+    identifier: str,
+    session_id: str,
+    text: str,
+) -> Optional[str]:
+    """Return an error when the message is the same target's sm-id."""
+    token = str(text or "").strip()
+    if token != text or not _SM_ID_TOKEN_RE.fullmatch(token):
+        return None
+
+    try:
+        token_session = client.get_session(token, timeout=SEND_API_TIMEOUT)
+    except TypeError:
+        token_session = client.get_session(token)
+    if not token_session:
+        return None
+
+    token_session_id = token_session.get("id") or token
+    if token_session_id != session_id:
+        return None
+
+    name = token_session.get("friendly_name") or token_session.get("name") or identifier
+    return (
+        f"Error: message text '{token}' is the sm-id for {name} ({session_id}). "
+        "sm send accepts one recipient followed by one message; pass either the "
+        f"friendly name or the sm-id, not both. Example: sm send {identifier} \"<message>\""
+    )
 
 
 def _try_send_human_telegram(

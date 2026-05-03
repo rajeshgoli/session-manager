@@ -9,6 +9,15 @@ from .client import SessionManagerClient
 from . import commands
 
 
+SEND_HELP_EPILOG = (
+    "Flag placement: send options may appear before the recipient, between the "
+    "recipient and message, or after the message. The message is exactly one "
+    "shell argument. Pass one recipient only; "
+    "if you copied '<friendly-name> [<sm-id>]' from list output, use either the "
+    "friendly name or the sm-id, not both."
+)
+
+
 def _looks_like_int_token(token: str) -> bool:
     """Return True when one argv token can be parsed as an integer."""
     try:
@@ -60,6 +69,77 @@ def _normalize_optional_track_args(argv: list[str]) -> list[str]:
     return normalized
 
 
+def _add_send_arguments(send_parser: argparse.ArgumentParser) -> None:
+    """Register arguments shared by the top-level and send-specific parsers."""
+    send_parser.add_argument("session_id", help="Target session ID, friendly name, human alias, or comma-delimited list")
+    send_parser.add_argument("text", help="Text to send")
+    send_parser.add_argument("--sequential", action="store_true", help="Wait for idle before sending (default)")
+    send_parser.add_argument("--important", action="store_true", help="Inject immediately, queue behind current work")
+    send_parser.add_argument("--urgent", action="store_true", help="Interrupt immediately")
+    send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
+    send_parser.add_argument("--steer", action="store_true", help="Inject via Enter-based mid-turn steering (for Codex reviews)")
+    send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
+    send_parser.add_argument(
+        "--track",
+        action="store_const",
+        const=300,
+        default=None,
+        help="Track the recipient with periodic remind until it replies (default: 300s; explicit seconds also supported)",
+    )
+    send_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS", help=argparse.SUPPRESS)
+
+
+def _build_send_parser() -> argparse.ArgumentParser:
+    """Build the standalone parser used for `sm send` execution and tests."""
+    parser = argparse.ArgumentParser(
+        prog="sm send",
+        description="Send input to a session or Telegram to a human recipient",
+        epilog=SEND_HELP_EPILOG,
+    )
+    _add_send_arguments(parser)
+    return parser
+
+
+def _parse_send_args(argv: list[str]) -> argparse.Namespace:
+    """Parse `sm send` args with send-specific errors for extra positionals."""
+    parser = _build_send_parser()
+    normalized = _normalize_optional_track_args(["send", *argv])[1:]
+    args, extras = parser.parse_known_args(normalized)
+    if extras:
+        optionish = [token for token in extras if token.startswith("-")]
+        if optionish:
+            parser.error(f"unrecognized arguments: {' '.join(extras)}")
+        parser.error(
+            "unexpected extra positional argument(s): "
+            f"{' '.join(extras)}. sm send accepts exactly one recipient "
+            "followed by one message; pass either the friendly name or the sm-id, not both."
+        )
+    return args
+
+
+def _handle_send(argv: list[str]) -> int:
+    """Handle `sm send` with subcommand-specific parsing and dispatch."""
+    args = _parse_send_args(argv)
+    delivery_mode = "sequential"
+    if args.urgent:
+        delivery_mode = "urgent"
+    elif args.important:
+        delivery_mode = "important"
+    elif args.steer:
+        delivery_mode = "steer"
+
+    client = SessionManagerClient()
+    return commands.cmd_send(
+        client,
+        args.session_id,
+        args.text,
+        delivery_mode,
+        wait_seconds=getattr(args, "wait", None),
+        notify_on_stop=not getattr(args, "no_notify_on_stop", False),
+        track_seconds=getattr(args, "track", None),
+    )
+
+
 def _handle_dispatch(session_id: Optional[str]) -> int:
     """Handle 'sm dispatch' with two-phase argument parsing.
 
@@ -98,6 +178,8 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "dispatch":
         session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
         sys.exit(_handle_dispatch(session_id))
+    if len(sys.argv) >= 2 and sys.argv[1] == "send":
+        sys.exit(_handle_send(sys.argv[2:]))
 
     parser = argparse.ArgumentParser(
         prog="sm",
@@ -178,23 +260,13 @@ def main():
     subagents_parser.add_argument("session_id", help="Session ID")
 
     # sm send <session-id|human> "<text>"
-    send_parser = subparsers.add_parser("send", help="Send input to a session or Telegram to a human recipient")
-    send_parser.add_argument("session_id", help="Target session ID, friendly name, human alias, or comma-delimited list")
-    send_parser.add_argument("text", help="Text to send")
-    send_parser.add_argument("--sequential", action="store_true", help="Wait for idle before sending (default)")
-    send_parser.add_argument("--important", action="store_true", help="Inject immediately, queue behind current work")
-    send_parser.add_argument("--urgent", action="store_true", help="Interrupt immediately")
-    send_parser.add_argument("--wait", type=int, metavar="SECONDS", help="Notify sender N seconds after delivery if recipient is idle")
-    send_parser.add_argument("--steer", action="store_true", help="Inject via Enter-based mid-turn steering (for Codex reviews)")
-    send_parser.add_argument("--no-notify-on-stop", action="store_true", help="Don't notify sender when receiver's Stop hook fires")
-    send_parser.add_argument(
-        "--track",
-        action="store_const",
-        const=300,
-        default=None,
-        help="Track the recipient with periodic remind until it replies (default: 300s; explicit seconds also supported)",
+    send_parser = subparsers.add_parser(
+        "send",
+        help="Send input to a session or Telegram to a human recipient",
+        description="Send input to a session or Telegram to a human recipient",
+        epilog=SEND_HELP_EPILOG,
     )
-    send_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS", help=argparse.SUPPRESS)
+    _add_send_arguments(send_parser)
 
     # sm telegram <human> "<text>" / sm tg <human> "<text>"
     telegram_parser = subparsers.add_parser(
