@@ -59,6 +59,7 @@ class MessageQueueManager:
         db_path: str = "~/.local/share/claude-sessions/message_queue.db",
         config: Optional[dict] = None,
         notifier=None,
+        response_relay_ledger=None,
     ):
         """
         Initialize message queue manager.
@@ -68,9 +69,11 @@ class MessageQueueManager:
             db_path: Path to SQLite database
             config: Optional config dict with sm_send settings
             notifier: Optional Notifier instance for Telegram mirroring
+            response_relay_ledger: Optional durable turn-bound response relay ledger
         """
         self.session_manager = session_manager
         self.notifier = notifier
+        self.response_relay_ledger = response_relay_ledger
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2118,11 +2121,46 @@ class MessageQueueManager:
         """Get the number of pending messages for a session."""
         return len(self.get_pending_messages(session_id))
 
-    def _mark_delivered(self, message_id: str):
+    def _mark_delivered(self, message_id: str) -> datetime:
         """Mark a message as delivered in the database."""
+        delivered_at = datetime.now()
         self._execute("""
             UPDATE message_queue SET delivered_at = ? WHERE id = ?
-        """, (datetime.now().isoformat(), message_id))
+        """, (delivered_at.isoformat(), message_id))
+        return delivered_at
+
+    def _record_response_relay_inbound(self, msg: QueuedMessage, delivered_at: datetime) -> None:
+        """Record a delivered user/operator message as the active response relay turn."""
+        if msg.message_category is not None:
+            return
+        ledger = getattr(self, "response_relay_ledger", None)
+        if ledger is None:
+            return
+        session = self.session_manager.get_session(msg.target_session_id)
+        if not session:
+            return
+        provider = getattr(session, "provider", None) or "claude"
+        source = "sm-send" if msg.from_sm_send else "sm-input"
+        transcript_path = getattr(session, "transcript_path", None)
+        transcript_offset = ledger.capture_transcript_offset(transcript_path)
+        try:
+            ledger.record_inbound_turn(
+                session_id=msg.target_session_id,
+                inbound_id=msg.id,
+                source=source,
+                provider=provider,
+                delivered_at=delivered_at,
+                transcript_path=transcript_path,
+                transcript_offset=transcript_offset,
+                text=msg.text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to record response relay inbound turn for %s message %s: %s",
+                msg.target_session_id,
+                msg.id,
+                exc,
+            )
 
     def _mark_expired(self, message_id: str):
         """Mark a message as expired (delete it)."""
@@ -2471,7 +2509,8 @@ class MessageQueueManager:
 
                 # Mark messages as delivered
                 for msg in batch:
-                    self._mark_delivered(msg.id)
+                    delivered_at = self._mark_delivered(msg.id)
+                    self._record_response_relay_inbound(msg, delivered_at)
                     logger.info(f"Delivered message {msg.id}")
 
                     if msg.sender_session_id and msg.message_category is None:
@@ -2574,7 +2613,8 @@ class MessageQueueManager:
             if provider == "codex-app":
                 success = await self.session_manager._deliver_urgent(session, msg.text)
                 if success:
-                    self._mark_delivered(msg.id)
+                    delivered_at = self._mark_delivered(msg.id)
+                    self._record_response_relay_inbound(msg, delivered_at)
                     state = self._get_or_create_state(session_id)
                     state.is_idle = False
                     if state.stop_notify_delay_seconds > 0:
@@ -2677,7 +2717,8 @@ class MessageQueueManager:
                 success = await self.session_manager._deliver_direct(session, msg.text)
 
                 if success:
-                    self._mark_delivered(msg.id)
+                    delivered_at = self._mark_delivered(msg.id)
+                    self._record_response_relay_inbound(msg, delivered_at)
                     state = self._get_or_create_state(session_id)
                     state.is_idle = False
                     if state.stop_notify_delay_seconds > 0:

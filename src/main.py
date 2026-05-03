@@ -25,6 +25,7 @@ from .notifier import Notifier
 from .server import create_app
 from .child_monitor import ChildMonitor
 from .message_queue import MessageQueueManager
+from .response_relay import ResponseRelayLedger
 from .tool_logger import ToolLogger
 from .cli.commands import validate_friendly_name
 from .infra_supervisor import InfrastructureSupervisor
@@ -283,6 +284,14 @@ class SessionManagerApp:
         # Set notifier reference in session manager for sm_send notifications
         self.session_manager.notifier = self.notifier
 
+        response_relay_config = config.get("response_relay", {})
+        self.response_relay_ledger = ResponseRelayLedger(
+            db_path=response_relay_config.get(
+                "db_path",
+                "~/.local/share/claude-sessions/response_relay.db",
+            )
+        )
+
         # Wire up output monitor callbacks
         self.output_monitor.set_event_callback(self._handle_monitor_event)
         self.output_monitor.set_status_callback(self._handle_status_change)
@@ -305,6 +314,7 @@ class SessionManagerApp:
             db_path=sm_send_config.get("db_path", "~/.local/share/claude-sessions/message_queue.db"),
             config=config,  # Pass full config for timeout settings
             notifier=self.notifier,  # Pass notifier for Telegram mirroring
+            response_relay_ledger=self.response_relay_ledger,
         )
         # Pass message queue to session manager
         self.session_manager.message_queue_manager = self.message_queue
@@ -333,6 +343,7 @@ class SessionManagerApp:
             output_monitor=self.output_monitor,
             child_monitor=self.child_monitor,
             email_handler=self.email_handler,
+            response_relay_ledger=self.response_relay_ledger,
             config=config,  # Pass config for server timeout settings
             lifespan=_lifespan,
         )
@@ -971,6 +982,8 @@ class SessionManagerApp:
         # Stop Telegram bot
         if self.telegram_bot:
             await self.telegram_bot.stop()
+
+        self.response_relay_ledger.close()
 
         # Stop Codex app-server sessions
         for codex_session in self.session_manager.codex_sessions.values():
