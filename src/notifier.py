@@ -76,6 +76,28 @@ class Notifier:
             or getattr(resolved_session, "id", None)
         )
 
+    def _get_provider_label(self, session: Optional[Session]) -> str:
+        """Return the human label for provider response notifications."""
+        resolved_session = session
+        session_manager = getattr(self, "session_manager", None)
+        if session_manager and not isinstance(session, Session):
+            session_id = getattr(session, "id", None)
+            getter = getattr(session_manager, "get_session", None)
+            if isinstance(session_id, str) and callable(getter):
+                live_session = getter(session_id)
+                if live_session is not None:
+                    resolved_session = live_session
+        provider = str(getattr(resolved_session, "provider", "") or "").strip().lower()
+        labels = {
+            "claude": "Claude",
+            "codex": "Codex",
+            "codex-fork": "Codex-fork",
+            "codex_fork": "Codex-fork",
+            "codex-app": "Codex-app",
+            "codex_app": "Codex-app",
+        }
+        return labels.get(provider, "Claude")
+
     async def notify(
         self,
         event: NotificationEvent,
@@ -230,11 +252,12 @@ class Notifier:
         if event.event_type == "response":
             # Escape for markdown
             session_id_escaped = session_id.replace('-', '\\-').replace('.', '\\.')
+            provider_label = self._get_provider_label(session).replace('-', '\\-').replace('.', '\\.')
             if friendly_name:
                 name_escaped = friendly_name.replace('-', '\\-').replace('.', '\\.')
-                lines.append(f"{name_escaped} \\[{session_id_escaped}\\] *Claude:*")
+                lines.append(f"{name_escaped} \\[{session_id_escaped}\\] *{provider_label}:*")
             else:
-                lines.append(f"\\[{session_id_escaped}\\] *Claude:*")
+                lines.append(f"\\[{session_id_escaped}\\] *{provider_label}:*")
 
             if event.context:
                 # Strip ANSI codes

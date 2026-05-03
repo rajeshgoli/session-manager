@@ -147,6 +147,53 @@ def test_notifier_response_message_prefers_registry_alias(tmp_path):
     assert message.startswith("maintainer \\[maint123\\] *Claude:*")
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected_label"),
+    [
+        ("claude", "Claude"),
+        ("codex", "Codex"),
+        ("codex-fork", "Codex\\-fork"),
+        ("codex-app", "Codex\\-app"),
+    ],
+)
+def test_notifier_response_message_uses_provider_label(tmp_path, provider, expected_label):
+    session = _session("reply01", tmp_path, provider=provider)
+    notifier = Notifier()
+    event = NotificationEvent(
+        session_id=session.id,
+        event_type="response",
+        message="",
+        context="done",
+        channel=NotificationChannel.TELEGRAM,
+    )
+
+    message = notifier._format_message(event, session)
+
+    expected_name = provider.replace("-", "\\-")
+    assert message.startswith(f"{expected_name}\\-reply01 \\[reply01\\] *{expected_label}:*")
+
+
+def test_notifier_response_message_resolves_provider_from_live_session(tmp_path):
+    manager = _manager(tmp_path)
+    session = _session("snap01", tmp_path, provider="codex")
+    manager.sessions[session.id] = session
+
+    notifier = Notifier()
+    notifier.session_manager = manager
+    snapshot = SimpleNamespace(id=session.id)
+    event = NotificationEvent(
+        session_id=session.id,
+        event_type="response",
+        message="",
+        context="done",
+        channel=NotificationChannel.TELEGRAM,
+    )
+
+    message = notifier._format_message(event, snapshot)
+
+    assert message.startswith("codex\\-snap01 \\[snap01\\] *Codex:*")
+
+
 def test_notifier_uses_live_session_identity_for_snapshot_routing_objects(tmp_path):
     manager = _manager(tmp_path)
     session = _session("maint123", tmp_path)

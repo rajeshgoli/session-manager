@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -82,6 +83,27 @@ class CodexEventStore:
             )
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_codex_session_events_event_type ON codex_session_events(event_type)"
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS codex_assistant_relays (
+                    session_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL DEFAULT '',
+                    turn_id TEXT NOT NULL,
+                    message_item_id TEXT NOT NULL,
+                    text_hash TEXT NOT NULL,
+                    relayed_at TEXT NOT NULL,
+                    telegram_thread_id INTEGER,
+                    text_preview TEXT,
+                    PRIMARY KEY (session_id, thread_id, turn_id, message_item_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_codex_assistant_relays_relayed_at
+                ON codex_assistant_relays(relayed_at)
+                """
             )
             conn.commit()
 
@@ -353,6 +375,123 @@ class CodexEventStore:
             if not ring:
                 return []
             return list(ring)[-limit:]
+
+    def has_assistant_message_relayed(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: str,
+        message_item_id: str,
+    ) -> bool:
+        """Return True if this assistant message identity was already relayed."""
+        thread_key = thread_id or ""
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            if thread_key:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM codex_assistant_relays
+                    WHERE session_id = ?
+                      AND thread_id = ?
+                      AND turn_id = ?
+                      AND message_item_id = ?
+                    LIMIT 1
+                    """,
+                    (session_id, thread_key, turn_id, message_item_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM codex_assistant_relays
+                    WHERE session_id = ?
+                      AND turn_id = ?
+                      AND message_item_id = ?
+                    LIMIT 1
+                    """,
+                    (session_id, turn_id, message_item_id),
+                )
+            return cursor.fetchone() is not None
+
+    def has_assistant_turn_relayed(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: str,
+    ) -> bool:
+        """Return True if any assistant message for this turn was already relayed."""
+        thread_key = thread_id or ""
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            if thread_key:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM codex_assistant_relays
+                    WHERE session_id = ?
+                      AND thread_id = ?
+                      AND turn_id = ?
+                    LIMIT 1
+                    """,
+                    (session_id, thread_key, turn_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM codex_assistant_relays
+                    WHERE session_id = ?
+                      AND turn_id = ?
+                    LIMIT 1
+                    """,
+                    (session_id, turn_id),
+                )
+            return cursor.fetchone() is not None
+
+    def mark_assistant_message_relayed(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: str,
+        message_item_id: str,
+        text: str,
+        telegram_thread_id: Optional[int],
+        relayed_at: Optional[datetime] = None,
+    ) -> bool:
+        """Persist a relay ledger row after notification delivery is accepted."""
+        thread_key = thread_id or ""
+        relay_ts = relayed_at.astimezone(timezone.utc) if relayed_at else datetime.now(timezone.utc)
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        text_preview = text[:400]
+
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO codex_assistant_relays
+                (session_id, thread_id, turn_id, message_item_id, text_hash, relayed_at, telegram_thread_id, text_preview)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    thread_key,
+                    turn_id,
+                    message_item_id,
+                    text_hash,
+                    relay_ts.isoformat(),
+                    telegram_thread_id,
+                    text_preview,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
     def _latest_seq_locked(self, cursor: sqlite3.Cursor, session_id: str) -> int:
         cursor.execute(

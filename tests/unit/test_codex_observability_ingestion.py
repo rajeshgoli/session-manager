@@ -13,6 +13,28 @@ from src.models import Session, SessionStatus
 from src.session_manager import SessionManager
 
 
+def _codex_fork_relay_manager(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkrelay1",
+        name="codex-fork-forkrelay1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+        telegram_chat_id=1234,
+        telegram_thread_id=5678,
+    )
+    manager.sessions[session.id] = session
+    manager.set_hook_output_store({})
+    manager.notifier = SimpleNamespace(notify=AsyncMock(return_value=True))
+    return manager, session
+
+
+async def _ingest_and_relay(manager: SessionManager, session_id: str, event: dict):
+    manager.ingest_codex_fork_event(session_id, event)
+    await manager._handle_codex_fork_assistant_relay_event(session_id, event)
+
+
 @pytest.mark.asyncio
 async def test_structured_request_and_response_logged(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
@@ -259,3 +281,166 @@ async def test_codex_fork_turn_complete_updates_last_message_and_notifies(tmp_pa
         session.id,
         completion_transition=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_completed_agent_message_relays_without_turn_last_message(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "session_id": "thread-relay",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-relay",
+                "turnId": "turn-relay",
+                "itemId": "msg-relay",
+                "delta": "delta fallback text",
+            },
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item_completed",
+            "session_id": "thread-relay",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-relay",
+                "turnId": "turn-relay",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "msg-relay",
+                    "text": "completed text wins",
+                },
+            },
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "turn_complete",
+            "session_id": "thread-relay",
+            "seq": 3,
+            "session_epoch": 1,
+            "payload": {
+                "turn_id": "turn-relay",
+                "last_agent_message": None,
+            },
+        },
+    )
+
+    manager.notifier.notify.assert_awaited_once()
+    event = manager.notifier.notify.await_args.args[0]
+    assert event.event_type == "response"
+    assert event.context == "completed text wins"
+    assert manager.hook_output_store[session.id] == "completed text wins"
+    assert manager.codex_event_store.has_assistant_message_relayed(
+        session_id=session.id,
+        thread_id="thread-relay",
+        turn_id="turn-relay",
+        message_item_id="msg-relay",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_assistant_relay_dedupes_after_restart(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+    event = {
+        "schema_version": 2,
+        "event_type": "item_completed",
+        "session_id": "thread-dedupe",
+        "seq": 1,
+        "session_epoch": 1,
+        "payload": {
+            "threadId": "thread-dedupe",
+            "turnId": "turn-dedupe",
+            "item": {
+                "type": "agentMessage",
+                "id": "msg-dedupe",
+                "text": "send me once",
+            },
+        },
+    }
+
+    await _ingest_and_relay(manager, session.id, event)
+    manager.notifier.notify.assert_awaited_once()
+
+    restarted, restarted_session = _codex_fork_relay_manager(tmp_path)
+    restarted_session.id = session.id
+    restarted.sessions = {session.id: restarted_session}
+    await _ingest_and_relay(restarted, session.id, event)
+
+    restarted.notifier.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_assistant_relay_suppresses_empty_output(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item_completed",
+            "session_id": "thread-empty",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-empty",
+                "turnId": "turn-empty",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "msg-empty",
+                    "text": "   ",
+                },
+            },
+        },
+    )
+
+    manager.notifier.notify.assert_not_awaited()
+    assert not manager.codex_event_store.has_assistant_message_relayed(
+        session_id=session.id,
+        thread_id="thread-empty",
+        turn_id="turn-empty",
+        message_item_id="msg-empty",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_assistant_relay_tolerates_malformed_events(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    manager.ingest_codex_fork_event(session.id, ["not", "a", "dict"])
+    await manager._handle_codex_fork_assistant_relay_event(session.id, ["not", "a", "dict"])
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item_completed",
+            "payload": {"item": "not-a-dict"},
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "payload": {"turnId": "turn-bad", "delta": {"not": "text"}},
+        },
+    )
+
+    manager.notifier.notify.assert_not_awaited()
