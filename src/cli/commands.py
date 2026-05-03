@@ -214,7 +214,7 @@ def resolve_session_id_with_status(
     except TypeError:
         session = client.get_session(identifier)
     if session:
-        return identifier, session, False
+        return session.get("id") or identifier, session, False
 
     # Not found by ID, try as friendly name
     try:

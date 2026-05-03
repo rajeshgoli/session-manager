@@ -727,6 +727,26 @@ class TestCmdSendRemindParams:
         assert call_kwargs["remind_soft_threshold"] is None
         assert call_kwargs["remind_hard_threshold"] is None
 
+    def test_registry_alias_send_uses_resolved_session_id(self, capsys):
+        """A server-resolved registry alias must post to the concrete session ID."""
+        from src.cli.commands import cmd_send
+        mock_client = self._make_client()
+        mock_client.get_session.return_value = {
+            "id": "9b134c6e",
+            "friendly_name": "maintainer",
+            "status": "idle",
+            "provider": "codex-fork",
+            "aliases": ["maintainer"],
+        }
+
+        rc = cmd_send(mock_client, "maintainer", "hello")
+
+        assert rc == 0
+        mock_client.send_input.assert_called_once()
+        assert mock_client.send_input.call_args.args[:2] == ("9b134c6e", "hello")
+        captured = capsys.readouterr()
+        assert "Input sent to maintainer (9b134c6e)" in captured.out
+
     def test_track_sets_reply_cancelled_thresholds(self):
         """--track maps to periodic remind thresholds and reply-cancel metadata."""
         from src.cli.commands import cmd_send
