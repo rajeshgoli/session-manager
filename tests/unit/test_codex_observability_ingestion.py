@@ -4,13 +4,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.models import Session, SessionStatus
 from src.session_manager import SessionManager
+
+
+def _codex_fork_relay_manager(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkrelay1",
+        name="codex-fork-forkrelay1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+        telegram_chat_id=1234,
+        telegram_thread_id=5678,
+    )
+    manager.sessions[session.id] = session
+    manager.set_hook_output_store({})
+    manager.notifier = SimpleNamespace(notify=AsyncMock(return_value=True))
+    return manager, session
+
+
+async def _ingest_and_relay(manager: SessionManager, session_id: str, event: dict):
+    manager.ingest_codex_fork_event(session_id, event)
+    await manager._handle_codex_fork_assistant_relay_event(session_id, event)
 
 
 @pytest.mark.asyncio
@@ -258,4 +281,338 @@ async def test_codex_fork_turn_complete_updates_last_message_and_notifies(tmp_pa
     manager.message_queue_manager.mark_session_idle.assert_called_once_with(
         session.id,
         completion_transition=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_completed_agent_message_relays_without_turn_last_message(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "session_id": "thread-relay",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-relay",
+                "turnId": "turn-relay",
+                "itemId": "msg-relay",
+                "delta": "delta fallback text",
+            },
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item_completed",
+            "session_id": "thread-relay",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-relay",
+                "turnId": "turn-relay",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "msg-relay",
+                    "text": "completed text wins",
+                },
+            },
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "turn_complete",
+            "session_id": "thread-relay",
+            "seq": 3,
+            "session_epoch": 1,
+            "payload": {
+                "turn_id": "turn-relay",
+                "last_agent_message": None,
+            },
+        },
+    )
+
+    manager.notifier.notify.assert_awaited_once()
+    event = manager.notifier.notify.await_args.args[0]
+    assert event.event_type == "response"
+    assert event.context == "completed text wins"
+    assert manager.hook_output_store[session.id] == "completed text wins"
+    assert manager.codex_event_store.has_assistant_message_relayed(
+        session_id=session.id,
+        thread_id="thread-relay",
+        turn_id="turn-relay",
+        message_item_id="msg-relay",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_assistant_relay_dedupes_after_restart(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+    event = {
+        "schema_version": 2,
+        "event_type": "item_completed",
+        "session_id": "thread-dedupe",
+        "seq": 1,
+        "session_epoch": 1,
+        "payload": {
+            "threadId": "thread-dedupe",
+            "turnId": "turn-dedupe",
+            "item": {
+                "type": "agentMessage",
+                "id": "msg-dedupe",
+                "text": "send me once",
+            },
+        },
+    }
+
+    await _ingest_and_relay(manager, session.id, event)
+    manager.notifier.notify.assert_awaited_once()
+
+    restarted, restarted_session = _codex_fork_relay_manager(tmp_path)
+    restarted_session.id = session.id
+    restarted.sessions = {session.id: restarted_session}
+    await _ingest_and_relay(restarted, session.id, event)
+
+    restarted.notifier.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_assistant_relay_suppresses_empty_output(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item_completed",
+            "session_id": "thread-empty",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-empty",
+                "turnId": "turn-empty",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "msg-empty",
+                    "text": "   ",
+                },
+            },
+        },
+    )
+
+    manager.notifier.notify.assert_not_awaited()
+    assert not manager.codex_event_store.has_assistant_message_relayed(
+        session_id=session.id,
+        thread_id="thread-empty",
+        turn_id="turn-empty",
+        message_item_id="msg-empty",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_turn_complete_full_output_beats_delta_fallback(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "session_id": "thread-full",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-full",
+                "turnId": "turn-full",
+                "itemId": "msg-full",
+                "delta": "partial suffix only",
+            },
+        },
+    )
+    turn_complete = {
+        "schema_version": 2,
+        "event_type": "turn_complete",
+        "session_id": "thread-full",
+        "seq": 2,
+        "session_epoch": 1,
+        "payload": {
+            "turnId": "turn-full",
+            "last_agent_message": "canonical full answer",
+        },
+    }
+
+    await _ingest_and_relay(manager, session.id, turn_complete)
+    await manager._handle_codex_fork_turn_complete(
+        session_id=session.id,
+        last_message="canonical full answer",
+        event=turn_complete,
+    )
+
+    manager.notifier.notify.assert_awaited_once()
+    event = manager.notifier.notify.await_args.args[0]
+    assert event.context == "canonical full answer"
+    assert manager._codex_assistant_message_deltas == {}
+    assert manager.codex_event_store.has_assistant_turn_relayed(
+        session_id=session.id,
+        thread_id="thread-full",
+        turn_id="turn-full",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_turn_complete_camel_case_turn_id_flushes_delta_fallback(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "session_id": "thread-camel",
+            "seq": 1,
+            "session_epoch": 1,
+            "payload": {
+                "threadId": "thread-camel",
+                "turnId": "turn-camel",
+                "itemId": "msg-camel",
+                "delta": "fallback from camel turn id",
+            },
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "turn_complete",
+            "session_id": "thread-camel",
+            "seq": 2,
+            "session_epoch": 1,
+            "payload": {
+                "turnId": "turn-camel",
+                "last_agent_message": None,
+            },
+        },
+    )
+
+    manager.notifier.notify.assert_awaited_once()
+    event = manager.notifier.notify.await_args.args[0]
+    assert event.context == "fallback from camel turn id"
+    assert manager.codex_event_store.has_assistant_message_relayed(
+        session_id=session.id,
+        thread_id="thread-camel",
+        turn_id="turn-camel",
+        message_item_id="msg-camel",
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_assistant_relay_tolerates_malformed_events(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+
+    manager.ingest_codex_fork_event(session.id, ["not", "a", "dict"])
+    await manager._handle_codex_fork_assistant_relay_event(session.id, ["not", "a", "dict"])
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item_completed",
+            "payload": {"item": "not-a-dict"},
+        },
+    )
+    await _ingest_and_relay(
+        manager,
+        session.id,
+        {
+            "schema_version": 2,
+            "event_type": "item/agentMessage/delta",
+            "payload": {"turnId": "turn-bad", "delta": {"not": "text"}},
+        },
+    )
+
+    manager.notifier.notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_monitor_surfaces_ingestion_failures(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+    stream_path = manager._codex_fork_event_stream_path(session)
+    stream_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "event_type": "turn_started",
+                "session_id": "thread-failure",
+                "seq": 1,
+                "session_epoch": 1,
+                "payload": {"turn_id": "turn-failure"},
+            }
+        )
+        + "\n"
+    )
+
+    with patch.object(
+        manager,
+        "ingest_codex_fork_event",
+        side_effect=sqlite3.OperationalError("forced persistence failure"),
+    ):
+        await asyncio.wait_for(manager._monitor_codex_fork_event_stream(session.id), timeout=1.0)
+
+    assert manager.codex_fork_lifecycle[session.id]["state"] == "error"
+    assert (
+        manager.codex_fork_lifecycle[session.id]["cause_event_type"]
+        == "event_stream_monitor_error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_monitor_surfaces_assistant_relay_failures(tmp_path):
+    manager, session = _codex_fork_relay_manager(tmp_path)
+    stream_path = manager._codex_fork_event_stream_path(session)
+    stream_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "event_type": "item_completed",
+                "session_id": "thread-relay-failure",
+                "seq": 1,
+                "session_epoch": 1,
+                "payload": {
+                    "threadId": "thread-relay-failure",
+                    "turnId": "turn-relay-failure",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-relay-failure",
+                        "text": "should not be swallowed",
+                    },
+                },
+            }
+        )
+        + "\n"
+    )
+
+    with patch.object(
+        manager.codex_event_store,
+        "has_assistant_message_relayed",
+        side_effect=sqlite3.OperationalError("forced relay ledger failure"),
+    ):
+        await asyncio.wait_for(manager._monitor_codex_fork_event_stream(session.id), timeout=1.0)
+
+    assert manager.codex_fork_lifecycle[session.id]["state"] == "error"
+    assert (
+        manager.codex_fork_lifecycle[session.id]["cause_event_type"]
+        == "event_stream_monitor_error"
     )

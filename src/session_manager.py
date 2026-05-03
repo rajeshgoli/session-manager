@@ -166,6 +166,7 @@ class SessionManager:
         self.codex_last_delta_at: dict[str, datetime] = {}
         self.codex_wait_states: dict[str, tuple[str, datetime]] = {}
         self._codex_item_started_at: dict[tuple[str, str], datetime] = {}
+        self._codex_assistant_message_deltas: dict[tuple[str, str, str, str], list[str]] = {}
         self.codex_working_delta_window_seconds = float(
             self.config.get("codex_events", {}).get("working_delta_window_seconds", 2.5)
         )
@@ -1890,6 +1891,15 @@ class SessionManager:
         """Persist and notify on codex-fork turn completion output."""
         if not last_message:
             return
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        turn_id = self._codex_fork_turn_id_for_event(event, payload)
+        thread_id = self._codex_fork_thread_id_for_event(event, payload)
+        if turn_id and self.codex_event_store.has_assistant_turn_relayed(
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        ):
+            return
 
         if self.hook_output_store is not None:
             self.hook_output_store["latest"] = last_message
@@ -1921,10 +1931,284 @@ class SessionManager:
             context=last_message,
             urgent=False,
         )
-        await self.notifier.notify(event_obj, session)
+        accepted = await self.notifier.notify(event_obj, session)
+        if accepted and turn_id:
+            self.codex_event_store.mark_assistant_message_relayed(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                message_item_id="__turn_complete_last_agent_message__",
+                text=last_message,
+                telegram_thread_id=session.telegram_thread_id,
+            )
+
+    @staticmethod
+    def _codex_payload_text(value: Any) -> str:
+        """Normalize provider text fields without treating non-strings as output."""
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _codex_payload_id(value: Any) -> Optional[str]:
+        """Normalize provider identity fields to non-empty strings."""
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _codex_assistant_delta_key(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: str,
+        message_item_id: str,
+    ) -> tuple[str, str, str, str]:
+        return (session_id, thread_id or "", turn_id, message_item_id)
+
+    def _codex_fork_thread_id_for_event(
+        self,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> Optional[str]:
+        """Return the best available Codex thread id from a codex-fork event."""
+        for value in (
+            payload.get("threadId"),
+            payload.get("thread_id"),
+            payload.get("thread"),
+            event.get("threadId"),
+            event.get("thread_id"),
+            event.get("session_id"),
+            payload.get("session_id"),
+        ):
+            thread_id = self._normalize_codex_thread_id(value)
+            if thread_id:
+                return thread_id
+        return None
+
+    def _codex_fork_turn_id_for_event(
+        self,
+        event: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> Optional[str]:
+        """Return the best available Codex turn id from old or provider-native keys."""
+        return self._codex_payload_id(
+            payload.get("turnId")
+            or payload.get("turn_id")
+            or event.get("turnId")
+            or event.get("turn_id")
+        )
+
+    def _accumulate_codex_assistant_delta(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+        message_item_id: Optional[str],
+        delta: Any,
+    ) -> None:
+        """Accumulate visible assistant deltas as a fallback for missing completed text."""
+        if not turn_id or not message_item_id or not isinstance(delta, str):
+            return
+        key = self._codex_assistant_delta_key(
+            session_id=session_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            message_item_id=message_item_id,
+        )
+        self._codex_assistant_message_deltas.setdefault(key, []).append(delta)
+
+    async def _relay_codex_assistant_message(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+        message_item_id: Optional[str],
+        text: str,
+    ) -> bool:
+        """Send one completed Codex assistant message through the existing notifier path."""
+        normalized_turn_id = self._codex_payload_id(turn_id)
+        normalized_item_id = self._codex_payload_id(message_item_id)
+        normalized_thread_id = self._normalize_codex_thread_id(thread_id)
+        if not normalized_turn_id or not normalized_item_id:
+            return False
+        if not text.strip():
+            return False
+
+        if self.hook_output_store is not None:
+            self.hook_output_store["latest"] = text
+            self.hook_output_store[session_id] = text
+
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+
+        if self.codex_event_store.has_assistant_message_relayed(
+            session_id=session_id,
+            thread_id=normalized_thread_id,
+            turn_id=normalized_turn_id,
+            message_item_id=normalized_item_id,
+        ):
+            return False
+
+        notifier = getattr(self, "notifier", None)
+        if not notifier or not session.telegram_chat_id:
+            return False
+
+        event_obj = NotificationEvent(
+            session_id=session.id,
+            event_type="response",
+            message="Codex responded",
+            context=text,
+            urgent=False,
+        )
+        accepted = await notifier.notify(event_obj, session)
+        if not accepted:
+            return False
+
+        self.codex_event_store.mark_assistant_message_relayed(
+            session_id=session_id,
+            thread_id=normalized_thread_id,
+            turn_id=normalized_turn_id,
+            message_item_id=normalized_item_id,
+            text=text,
+            telegram_thread_id=session.telegram_thread_id,
+        )
+        return True
+
+    async def _relay_codex_assistant_deltas_for_turn(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> None:
+        """Flush accumulated assistant deltas for a turn when no completed text arrived."""
+        normalized_turn_id = self._codex_payload_id(turn_id)
+        if not normalized_turn_id:
+            return
+        normalized_thread_id = self._normalize_codex_thread_id(thread_id)
+        matches: list[tuple[tuple[str, str, str, str], str]] = []
+        for key, parts in list(self._codex_assistant_message_deltas.items()):
+            key_session_id, key_thread_id, key_turn_id, _ = key
+            if key_session_id != session_id or key_turn_id != normalized_turn_id:
+                continue
+            if normalized_thread_id and key_thread_id and key_thread_id != normalized_thread_id:
+                continue
+            matches.append((key, "".join(parts)))
+
+        for key, text in matches:
+            _, key_thread_id, _, message_item_id = key
+            await self._relay_codex_assistant_message(
+                session_id=session_id,
+                thread_id=key_thread_id or normalized_thread_id,
+                turn_id=normalized_turn_id,
+                message_item_id=message_item_id,
+                text=text,
+            )
+            self._codex_assistant_message_deltas.pop(key, None)
+
+    def _discard_codex_assistant_deltas_for_turn(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str],
+        turn_id: Optional[str],
+    ) -> None:
+        """Drop buffered delta fallback for a turn when completed text is available."""
+        normalized_turn_id = self._codex_payload_id(turn_id)
+        if not normalized_turn_id:
+            return
+        normalized_thread_id = self._normalize_codex_thread_id(thread_id)
+        for key in list(self._codex_assistant_message_deltas.keys()):
+            key_session_id, key_thread_id, key_turn_id, _ = key
+            if key_session_id != session_id or key_turn_id != normalized_turn_id:
+                continue
+            if normalized_thread_id and key_thread_id and key_thread_id != normalized_thread_id:
+                continue
+            self._codex_assistant_message_deltas.pop(key, None)
+
+    async def _handle_codex_fork_assistant_relay_event(
+        self,
+        session_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        """Consume codex-fork assistant events and relay completed visible output."""
+        if not isinstance(event, dict):
+            return
+        raw_event_type = event.get("event_type") or event.get("type")
+        normalized = self._normalize_codex_fork_event_type(raw_event_type)
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        thread_id = self._codex_fork_thread_id_for_event(event, payload)
+
+        if normalized in {"item/agent_message/delta", "agent_message_content_delta"}:
+            turn_id = self._codex_fork_turn_id_for_event(event, payload)
+            message_item_id = self._codex_payload_id(
+                payload.get("itemId") or payload.get("item_id") or payload.get("message_item_id")
+            )
+            self._accumulate_codex_assistant_delta(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                message_item_id=message_item_id,
+                delta=payload.get("delta"),
+            )
+            return
+
+        if normalized in {"item_completed", "item/completed"}:
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+            if item.get("type") != "agentMessage":
+                return
+            turn_id = self._codex_fork_turn_id_for_event(event, payload)
+            message_item_id = self._codex_payload_id(
+                item.get("id")
+                or payload.get("itemId")
+                or payload.get("item_id")
+                or payload.get("message_item_id")
+            )
+            key = None
+            if turn_id and message_item_id:
+                key = self._codex_assistant_delta_key(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    message_item_id=message_item_id,
+                )
+            completed_text = self._codex_payload_text(item.get("text"))
+            if not completed_text and key:
+                completed_text = "".join(self._codex_assistant_message_deltas.get(key, []))
+            await self._relay_codex_assistant_message(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                message_item_id=message_item_id,
+                text=completed_text,
+            )
+            if key:
+                self._codex_assistant_message_deltas.pop(key, None)
+            return
+
+        if normalized == "turn_complete":
+            turn_id = self._codex_fork_turn_id_for_event(event, payload)
+            last_message = payload.get("last_agent_message")
+            if isinstance(last_message, str) and last_message.strip():
+                self._discard_codex_assistant_deltas_for_turn(
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
+                return
+            await self._relay_codex_assistant_deltas_for_turn(
+                session_id=session_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
 
     def ingest_codex_fork_event(self, session_id: str, event: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Ingest one codex-fork bridge event record."""
+        if not isinstance(event, dict):
+            return None
         event_type = event.get("event_type") or event.get("type")
         if not event_type:
             return None
@@ -1962,7 +2246,7 @@ class SessionManager:
             self._safe_log_codex_turn_event(
                 session_id=session_id,
                 thread_id=str(event.get("session_id")) if event.get("session_id") else None,
-                turn_id=payload.get("turn_id") or event.get("turn_id"),
+                turn_id=self._codex_fork_turn_id_for_event(event, payload),
                 event_type=normalized,
                 status="completed" if normalized == "turn_complete" else None,
                 output_preview=payload_preview[:400] if payload_preview else None,
@@ -1977,7 +2261,7 @@ class SessionManager:
             if event_thread_id and not self._normalize_codex_thread_id(payload_for_store.get("thread_id")):
                 payload_for_reducer = {**payload_for_store, "session_id": event_thread_id}
 
-        turn_id = payload_for_store.get("turn_id") or event.get("turn_id")
+        turn_id = self._codex_fork_turn_id_for_event(event, payload_for_store)
         self.codex_event_store.append_event(
             session_id=session_id,
             event_type=f"codex_fork_{normalized}",
@@ -2203,7 +2487,11 @@ class SessionManager:
                             except json.JSONDecodeError:
                                 logger.debug("Skipping non-JSON codex-fork event line for %s", session_id)
                                 continue
+                            if not isinstance(event, dict):
+                                logger.debug("Skipping malformed codex-fork event line for %s", session_id)
+                                continue
                             self.ingest_codex_fork_event(session_id, event)
+                            await self._handle_codex_fork_assistant_relay_event(session_id, event)
                             normalized = self._normalize_codex_fork_event_type(
                                 event.get("event_type") or event.get("type")
                             )
