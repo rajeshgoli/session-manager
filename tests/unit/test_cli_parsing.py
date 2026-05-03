@@ -969,6 +969,26 @@ class TestSessionResolution:
         assert unavailable is False
         mock_client.get_session.assert_called_with("abc123")
 
+    def test_resolve_with_status_returns_server_resolved_session_id(self):
+        """Registry/read aliases must not leak into later mutation endpoints."""
+        mock_client = MagicMock()
+        mock_client.get_session.return_value = {
+            "id": "9b134c6e",
+            "friendly_name": "maintainer",
+            "aliases": ["maintainer"],
+        }
+
+        session_id, session, unavailable = resolve_session_id_with_status(
+            mock_client,
+            "maintainer",
+            timeout=15.0,
+        )
+
+        assert session_id == "9b134c6e"
+        assert session["friendly_name"] == "maintainer"
+        assert unavailable is False
+        mock_client.list_sessions.assert_not_called()
+
     def test_resolve_with_status_preserves_include_stopped_for_legacy_list_sessions(self):
         """Legacy list_sessions fallbacks still honor include_stopped."""
         mock_client = MagicMock()
