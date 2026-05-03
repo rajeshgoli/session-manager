@@ -198,6 +198,16 @@ class SessionManagerClient:
         detail = data.get("detail") if isinstance(data, dict) else None
         return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
 
+    def lookup_human(self, identifier: str) -> dict:
+        """Resolve one configured human recipient."""
+        identifier_path = urllib.parse.quote(identifier, safe="")
+        data, status_code, unavailable = self._request_with_status("GET", f"/humans/{identifier_path}")
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
     def register_role(self, session_id: str, role: str) -> dict:
         """Register the current session for one registry role."""
         data, status_code, unavailable = self._request_with_status(
@@ -912,6 +922,63 @@ class SessionManagerClient:
             "data": data,
             "detail": detail,
         }
+
+    def send_human_telegram_result(
+        self,
+        *,
+        requester_session_id: Optional[str],
+        recipient: str,
+        text: str,
+    ) -> dict:
+        """Send a configured human recipient message through Telegram."""
+        recipient_path = urllib.parse.quote(recipient, safe="")
+        payload = {
+            "requester_session_id": requester_session_id,
+            "text": text,
+        }
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/humans/{recipient_path}/telegram",
+            payload,
+            timeout=15,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
+
+    def send_human_email_result(
+        self,
+        *,
+        requester_session_id: Optional[str],
+        recipient: str,
+        text: str,
+        subject: Optional[str] = None,
+        body_markdown: bool = False,
+        auto_subject: bool = True,
+    ) -> dict:
+        """Send explicit email fallback to a configured human recipient."""
+        recipient_path = urllib.parse.quote(recipient, safe="")
+        payload: dict[str, object] = {
+            "requester_session_id": requester_session_id,
+            "text": text,
+            "body_markdown": body_markdown,
+            "auto_subject": auto_subject,
+        }
+        if subject is not None:
+            payload["subject"] = subject
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/humans/{recipient_path}/email",
+            payload,
+            timeout=15,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
 
     def create_session_result(
         self,

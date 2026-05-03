@@ -177,10 +177,10 @@ def main():
     subagents_parser = subparsers.add_parser("subagents", help="List subagents spawned by a session")
     subagents_parser.add_argument("session_id", help="Session ID")
 
-    # sm send <session-id> "<text>"
-    send_parser = subparsers.add_parser("send", help="Send input to a session")
-    send_parser.add_argument("session_id", help="Target session ID, friendly name, alias, or comma-delimited list")
-    send_parser.add_argument("text", help="Text to send to the session")
+    # sm send <session-id|human> "<text>"
+    send_parser = subparsers.add_parser("send", help="Send input to a session or Telegram to a human recipient")
+    send_parser.add_argument("session_id", help="Target session ID, friendly name, human alias, or comma-delimited list")
+    send_parser.add_argument("text", help="Text to send")
     send_parser.add_argument("--sequential", action="store_true", help="Wait for idle before sending (default)")
     send_parser.add_argument("--important", action="store_true", help="Inject immediately, queue behind current work")
     send_parser.add_argument("--urgent", action="store_true", help="Interrupt immediately")
@@ -196,10 +196,20 @@ def main():
     )
     send_parser.add_argument("--track-seconds", dest="track", type=int, metavar="SECONDS", help=argparse.SUPPRESS)
 
-    # sm email <user[,user2]> --subject "..." [--body ... | --text file | --html file]
-    email_parser = subparsers.add_parser("email", help="Send a routed email to registered user(s)")
-    email_parser.add_argument("recipients", help="Registered user(s), comma-separated")
-    email_parser.add_argument("--subject", required=True, help="Email subject line")
+    # sm telegram <human> "<text>" / sm tg <human> "<text>"
+    telegram_parser = subparsers.add_parser(
+        "telegram",
+        aliases=["tg"],
+        help="Send a Telegram message to a configured human recipient",
+    )
+    telegram_parser.add_argument("recipient", help="Configured human recipient or alias")
+    telegram_parser.add_argument("text", help="Text to post into this session's Telegram topic")
+
+    # sm email <human> "<text>" OR sm email <user[,user2]> --subject "..." [--body ... | --text file | --html file]
+    email_parser = subparsers.add_parser("email", help="Send explicit email fallback to a human recipient or registered user")
+    email_parser.add_argument("recipients", help="Human/registered user(s), comma-separated")
+    email_parser.add_argument("message", nargs="?", help="Inline plain-text body")
+    email_parser.add_argument("--subject", help="Email subject line")
     email_parser.add_argument("--body", help="Inline plain-text body")
     email_parser.add_argument("--text", help="Text/Markdown file for the body")
     email_parser.add_argument("--html", help="HTML file for the body")
@@ -727,14 +737,14 @@ def main():
         help="Registry role to release",
     )
 
-    # sm lookup <role>
+    # sm lookup <role|human>
     lookup_parser = subparsers.add_parser(
         "lookup",
-        help="Resolve a durable agent registry role to its session ID",
+        help="Resolve a human recipient, durable registry role, or live session",
     )
     lookup_parser.add_argument(
         "role",
-        help="Registry role to resolve",
+        help="Human alias, registry role, or session name to resolve",
     )
 
     # sm roster
@@ -869,13 +879,26 @@ def main():
             wait_seconds=wait_seconds, notify_on_stop=notify_on_stop,
             track_seconds=getattr(args, "track", None),
         ))
+    elif args.command in ("telegram", "tg"):
+        sys.exit(commands.cmd_telegram(
+            client,
+            sender_session_id=session_id,
+            recipient=args.recipient,
+            text=args.text,
+        ))
     elif args.command == "email":
+        inline_body = getattr(args, "body", None)
+        if inline_body is not None and getattr(args, "message", None) is not None:
+            print("Error: use either positional message or --body, not both", file=sys.stderr)
+            sys.exit(1)
+        if inline_body is None:
+            inline_body = getattr(args, "message", None)
         sys.exit(commands.cmd_email(
             client,
             sender_session_id=session_id,
             recipients_raw=args.recipients,
             subject=args.subject,
-            body=getattr(args, "body", None),
+            body=inline_body,
             text_file=getattr(args, "text", None),
             html_file=getattr(args, "html", None),
             cc_raw=getattr(args, "cc", None),

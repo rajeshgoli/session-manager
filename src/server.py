@@ -51,6 +51,7 @@ from .models import (
 from .cli.commands import validate_friendly_name
 from .cli.dispatch import get_auto_remind_config
 from .bug_report_store import BugReportStore
+from .human_recipients import HumanRecipient, HumanRecipientConfigError
 from .mobile_analytics import MobileAnalyticsBuilder
 
 logger = logging.getLogger(__name__)
@@ -648,7 +649,7 @@ class SendInputBatchResult(BaseModel):
     """Per-recipient result returned by batch send."""
     identifier: str
     status: Literal["delivered", "queued", "emailed", "failed"]
-    delivery_kind: Literal["session", "email", "none"]
+    delivery_kind: Literal["session", "email", "human_telegram", "none"]
     session_id: Optional[str] = None
     target_name: Optional[str] = None
     provider: Optional[str] = None
@@ -896,6 +897,26 @@ class SendEmailRequest(BaseModel):
     body_html: Optional[str] = None
     body_markdown: bool = False
     auto_subject: bool = False
+
+
+class HumanRecipientResponse(BaseModel):
+    """Lookup response for one configured human recipient."""
+    recipient: str
+    display_name: str
+    aliases: list[str]
+    default_channel: str
+    available_channels: list[str]
+    telegram_delivery: Optional[str] = None
+    email_use: Optional[str] = None
+
+
+class HumanDeliveryRequest(BaseModel):
+    """Request to deliver a message to one human recipient."""
+    requester_session_id: Optional[str] = None
+    text: str
+    subject: Optional[str] = None
+    body_markdown: bool = False
+    auto_subject: bool = True
 
 
 class InboundEmailRequest(BaseModel):
@@ -1378,12 +1399,136 @@ def create_app(
         valid, error = validate_friendly_name(name)
         if not valid:
             raise HTTPException(status_code=400, detail=f"Invalid name: {error}")
+        validator = getattr(app.state.session_manager, "validate_reserved_human_name", None)
+        if callable(validator):
+            identity_error = validator(name)
+            if isinstance(identity_error, str) and identity_error:
+                raise HTTPException(status_code=400, detail=identity_error)
 
     def _email_handler_or_503():
         handler = getattr(app.state, "email_handler", None)
         if handler is None:
             raise HTTPException(status_code=503, detail="Email bridge not configured")
         return handler
+
+    def _lookup_human_optional(identifier: str) -> Optional[HumanRecipient]:
+        handler = getattr(app.state, "email_handler", None)
+        lookup = getattr(handler, "lookup_human", None) if handler is not None else None
+        if not callable(lookup):
+            return None
+        try:
+            return lookup(identifier)
+        except HumanRecipientConfigError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def _lookup_human_or_404(identifier: str) -> HumanRecipient:
+        human = _lookup_human_optional(identifier)
+        if human is None:
+            raise HTTPException(status_code=404, detail="Human recipient not configured")
+        return human
+
+    def _human_to_response(human: HumanRecipient) -> HumanRecipientResponse:
+        telegram_channel = human.channel("telegram")
+        email_channel = human.channel("email")
+        return HumanRecipientResponse(
+            recipient=human.name,
+            display_name=human.display_name,
+            aliases=list(human.aliases),
+            default_channel=human.default_channel,
+            available_channels=list(human.available_channels),
+            telegram_delivery=telegram_channel.delivery if telegram_channel else None,
+            email_use=email_channel.use if email_channel else None,
+        )
+
+    async def _send_human_telegram(identifier: str, request: HumanDeliveryRequest) -> dict[str, Any]:
+        human = _lookup_human_or_404(identifier)
+        channel = human.channel("telegram")
+        if channel is None:
+            raise HTTPException(status_code=400, detail=f'Human recipient "{human.name}" has no enabled Telegram channel')
+        if channel.delivery not in (None, "sender_session_topic"):
+            raise HTTPException(status_code=400, detail=f'Unsupported Telegram delivery "{channel.delivery}"')
+        if not request.requester_session_id:
+            raise HTTPException(status_code=400, detail="Managed sender session is required for Telegram delivery")
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        sender_session = app.state.session_manager.get_session(request.requester_session_id)
+        if not sender_session:
+            raise HTTPException(status_code=404, detail="Sender session not found")
+
+        notifier = getattr(app.state, "notifier", None)
+        sender = getattr(notifier, "send_human_message_to_session_topic", None) if notifier else None
+        if not callable(sender):
+            raise HTTPException(status_code=503, detail="Telegram delivery is not configured")
+        ok, detail = await sender(
+            session=sender_session,
+            recipient_name=human.name,
+            message=request.text,
+        )
+        if not ok:
+            status_code = 503 if detail == "Telegram is not configured" else 409
+            raise HTTPException(status_code=status_code, detail=detail or "Telegram delivery failed")
+        return {
+            "status": "sent",
+            "recipient": human.name,
+            "channel": "telegram",
+            "thread": "sender session topic",
+            "sender_session_id": sender_session.id,
+        }
+
+    async def _send_human_email(identifier: str, request: HumanDeliveryRequest) -> dict[str, Any]:
+        human = _lookup_human_or_404(identifier)
+        channel = human.channel("email")
+        if channel is None:
+            raise HTTPException(status_code=400, detail=f'Human recipient "{human.name}" has no enabled email channel')
+
+        handler = _email_handler_or_503()
+        lookup_user = getattr(handler, "lookup_human_email_user", None)
+        try:
+            resolved_email_user = lookup_user(human.name) if callable(lookup_user) else None
+        except HumanRecipientConfigError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if resolved_email_user is None:
+            raise HTTPException(status_code=400, detail=f'Human recipient "{human.name}" has no resolved email address')
+
+        if not getattr(handler, "bridge_is_available", lambda: False)():
+            raise HTTPException(status_code=503, detail="Email bridge is unavailable")
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        if not request.requester_session_id:
+            raise HTTPException(status_code=400, detail="Managed sender session is required for email delivery")
+
+        sender_session = app.state.session_manager.get_session(request.requester_session_id)
+        if not sender_session:
+            raise HTTPException(status_code=404, detail="Sender session not found")
+
+        sender = getattr(handler, "send_agent_email_to_resolved_users", None)
+        if not callable(sender):
+            raise HTTPException(status_code=503, detail="Explicit human email delivery is not configured")
+        try:
+            email_payload = await sender(
+                sender_session_id=sender_session.id,
+                sender_name=_effective_session_name(sender_session),
+                sender_provider=getattr(sender_session, "provider", "claude"),
+                to_users=[resolved_email_user],
+                cc_users=[],
+                subject=request.subject,
+                body_text=request.text,
+                body_html=None,
+                body_markdown=request.body_markdown,
+                auto_subject=request.auto_subject,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "sent",
+            "recipient": human.name,
+            "channel": "email",
+            "subject": email_payload.get("subject"),
+            "to": [{"username": human.name}],
+        }
 
     def _normalize_identifier_list(values: list[str]) -> list[str]:
         identifiers: list[str] = []
@@ -1424,12 +1569,25 @@ def create_app(
             and request.remind_cancel_on_reply_session_id is None
         )
 
+    def _send_request_supports_human_telegram(request: SendInputRequest) -> bool:
+        return (
+            request.delivery_mode == "sequential"
+            and request.timeout_seconds is None
+            and request.notify_on_delivery is False
+            and request.notify_after_seconds is None
+            and request.remind_soft_threshold is None
+            and request.remind_hard_threshold is None
+            and request.remind_cancel_on_reply_session_id is None
+            and request.parent_session_id is None
+        )
+
     def _resolve_live_send_target(identifier: str) -> Optional[Session]:
-        session = _resolve_session_or_registry_role(identifier)
-        if session is not None:
-            return session
         if not app.state.session_manager:
             return None
+
+        session = app.state.session_manager.get_session(identifier)
+        if session is not None:
+            return session
 
         lister = getattr(app.state.session_manager, "list_sessions", None)
         alias_getter = getattr(app.state.session_manager, "get_session_aliases", None)
@@ -1447,6 +1605,12 @@ def create_app(
         for candidate in sessions or []:
             if _effective_session_name(candidate, sync_native_title=False) == identifier:
                 return candidate
+
+        getter = getattr(app.state.session_manager, "lookup_agent_registration", None)
+        if callable(getter):
+            registration = getter(identifier)
+            if registration is not None:
+                return app.state.session_manager.get_session(registration.session_id)
         return None
 
     async def _send_registered_email(request: SendEmailRequest) -> dict[str, Any]:
@@ -1466,6 +1630,17 @@ def create_app(
         cc = _normalize_identifier_list(request.cc)
         if not recipients:
             raise HTTPException(status_code=400, detail="At least one email recipient is required")
+
+        for identifier in recipients + cc:
+            human = _lookup_human_optional(identifier)
+            if human is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f'Human recipient "{human.name}" must use explicit human email delivery; '
+                        "generic email routing is not allowed"
+                    ),
+                )
 
         try:
             return await handler.send_agent_email(
@@ -1534,8 +1709,46 @@ def create_app(
         request: SendInputBatchRequest,
     ) -> SendInputBatchResult:
         """Resolve and deliver one batch send target."""
-        session = _resolve_live_send_target(identifier)
+        session = app.state.session_manager.get_session(identifier) if app.state.session_manager else None
         bootstrapped = False
+
+        if session is None:
+            human = _lookup_human_optional(identifier)
+            if human is not None:
+                if not _send_request_supports_human_telegram(request):
+                    return SendInputBatchResult(
+                        identifier=identifier,
+                        status="failed",
+                        delivery_kind="none",
+                        target_name=human.name,
+                        detail="human Telegram delivery only supports plain sequential sends without --wait/--track/--urgent",
+                    )
+                try:
+                    payload = await _send_human_telegram(
+                        identifier,
+                        HumanDeliveryRequest(
+                            requester_session_id=request.sender_session_id,
+                            text=request.text,
+                        ),
+                    )
+                except HTTPException as exc:
+                    return SendInputBatchResult(
+                        identifier=identifier,
+                        status="failed",
+                        delivery_kind="none",
+                        target_name=human.name,
+                        detail=_detail_text(exc.detail),
+                    )
+                return SendInputBatchResult(
+                    identifier=identifier,
+                    status="delivered",
+                    delivery_kind="human_telegram",
+                    target_name=payload.get("recipient") or human.name,
+                    detail="Telegram sent to sender session topic",
+                )
+
+        if session is None:
+            session = _resolve_live_send_target(identifier)
 
         if session is None and app.state.session_manager:
             ensurer = getattr(app.state.session_manager, "ensure_role_session", None)
@@ -4455,6 +4668,19 @@ def create_app(
 
         session = app.state.session_manager.get_session(session_id)
         if not session:
+            if _lookup_human_optional(session_id) is not None:
+                if not _send_request_supports_human_telegram(request):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="human Telegram delivery only supports plain sequential sends without --wait/--track/--urgent",
+                    )
+                return await _send_human_telegram(
+                    session_id,
+                    HumanDeliveryRequest(
+                        requester_session_id=request.sender_session_id,
+                        text=request.text,
+                    ),
+                )
             raise HTTPException(status_code=404, detail="Session not found")
         return await _deliver_send_input_to_session(session, request)
 
@@ -4993,6 +5219,21 @@ Provide ONLY the summary, no preamble or questions."""
             success = True
 
         return {"status": "sent" if success else "failed"}
+
+    @app.get("/humans/{identifier}", response_model=HumanRecipientResponse)
+    async def lookup_human_recipient(identifier: str):
+        """Resolve one configured human recipient."""
+        return _human_to_response(_lookup_human_or_404(identifier))
+
+    @app.post("/humans/{identifier}/telegram")
+    async def send_human_telegram(identifier: str, request: HumanDeliveryRequest):
+        """Send a human recipient message through the sender session Telegram topic."""
+        return await _send_human_telegram(identifier, request)
+
+    @app.post("/humans/{identifier}/email")
+    async def send_human_email(identifier: str, request: HumanDeliveryRequest):
+        """Send an explicit email fallback to a configured human recipient."""
+        return await _send_human_email(identifier, request)
 
     @app.post("/email/send")
     async def send_registered_email(request: SendEmailRequest):

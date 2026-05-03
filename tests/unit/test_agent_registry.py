@@ -283,6 +283,114 @@ def test_cmd_register_lookup_unregister_and_roster(capsys):
     assert "sess1234" in roster_output
 
 
+def test_cmd_lookup_human_alias_prints_delivery_guidance(capsys):
+    client = Mock()
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "recipient": "rajesh",
+            "display_name": "Human operator",
+            "aliases": ["rajesh", "rajeshgoli", "user"],
+            "default_channel": "telegram",
+            "available_channels": ["telegram", "email"],
+            "telegram_delivery": "sender_session_topic",
+            "email_use": "fallback_only",
+        },
+    }
+
+    assert cmd_lookup(client, "user") == 0
+
+    output = capsys.readouterr().out
+    assert "Human recipient: rajesh" in output
+    assert "Aliases: rajeshgoli, user" in output
+    assert "Default delivery: telegram" in output
+    assert "Telegram delivery posts into the sending agent's SM-managed Telegram thread." in output
+    assert "Email is available as fallback/explicit only; use email sparingly." in output
+    client.lookup_role.assert_not_called()
+
+
+def test_human_aliases_are_reserved_for_register_and_name(tmp_path):
+    bridge_config = tmp_path / "email_send.yaml"
+    bridge_config.write_text(
+        """
+humans:
+  rajesh:
+    aliases: [rajeshgoli, user]
+    default_channel: telegram
+    channels:
+      telegram:
+        enabled: true
+        delivery: sender_session_topic
+""",
+        encoding="utf-8",
+    )
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+        config={"email": {"bridge_config": str(bridge_config)}},
+    )
+    session = _session("human001", tmp_path)
+    manager.sessions[session.id] = session
+
+    with pytest.raises(ValueError, match='Name "user" is reserved'):
+        manager.register_agent_role(session.id, "user")
+
+    assert manager.validate_friendly_name_update(session.id, "user") == (
+        'Name "user" is reserved for configured human recipient "user"'
+    )
+
+
+def test_human_reserved_names_merge_main_and_bridge_config(tmp_path):
+    bridge_config = tmp_path / "email_send.yaml"
+    bridge_config.write_text(
+        """
+humans:
+  rajesh:
+    aliases: [bridge-user]
+    default_channel: telegram
+    channels:
+      email:
+        enabled: true
+        use: fallback_only
+""",
+        encoding="utf-8",
+    )
+    manager = SessionManager(
+        log_dir=str(tmp_path / "logs"),
+        state_file=str(tmp_path / "sessions.json"),
+        config={
+            "humans": {
+                "rajesh": {
+                    "aliases": ["main-user"],
+                    "default_channel": "telegram",
+                    "channels": {
+                        "telegram": {
+                            "enabled": True,
+                            "delivery": "sender_session_topic",
+                        },
+                    },
+                },
+                "operator": {
+                    "aliases": ["main-operator"],
+                    "default_channel": "telegram",
+                    "channels": {
+                        "telegram": {
+                            "enabled": True,
+                            "delivery": "sender_session_topic",
+                        },
+                    },
+                },
+            },
+            "email": {"bridge_config": str(bridge_config)},
+        },
+    )
+
+    reserved_names = manager.human_reserved_names()
+
+    assert {"rajesh", "main-user", "bridge-user", "operator", "main-operator"}.issubset(reserved_names)
+
+
 def test_cmd_lookup_falls_back_to_exact_session_name(capsys):
     client = Mock()
     client.lookup_role.return_value = {

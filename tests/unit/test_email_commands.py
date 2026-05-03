@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from src.cli.client import SEND_API_TIMEOUT
-from src.cli.commands import cmd_email, cmd_send
+from src.cli.commands import cmd_email, cmd_send, cmd_telegram
 
 
 def test_cmd_send_falls_back_to_registered_user_email(capsys):
@@ -39,7 +39,9 @@ def test_cmd_send_falls_back_to_registered_user_email(capsys):
         body_text="Deployment done",
         auto_subject=True,
     )
-    assert "Email sent to rajesh <rajesh@example.com>" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Email sent to rajesh" in output
+    assert "rajesh@example.com" not in output
 
 
 def test_cmd_send_email_fallback_rejects_track(capsys):
@@ -59,6 +61,222 @@ def test_cmd_send_email_fallback_rejects_track(capsys):
     assert rc == 1
     client.send_email_result.assert_not_called()
     assert "email fallback only supports plain sequential sends" in capsys.readouterr().err
+
+
+def _human_lookup_payload() -> dict:
+    return {
+        "recipient": "rajesh",
+        "display_name": "Human operator",
+        "aliases": ["rajesh", "rajeshgoli", "user"],
+        "default_channel": "telegram",
+        "available_channels": ["telegram", "email"],
+        "telegram_delivery": "sender_session_topic",
+        "email_use": "fallback_only",
+    }
+
+
+def test_cmd_send_human_alias_defaults_to_telegram(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+    client.get_session.return_value = None
+    client.list_sessions.return_value = []
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": _human_lookup_payload(),
+    }
+    client.send_human_telegram_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {"recipient": "rajesh", "thread": "sender session topic"},
+    }
+
+    rc = cmd_send(client, "user", "status for the human")
+
+    assert rc == 0
+    client.send_human_telegram_result.assert_called_once_with(
+        requester_session_id="sender123",
+        recipient="user",
+        text="status for the human",
+    )
+    client.ensure_role.assert_not_called()
+    client.send_email_result.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Telegram sent to rajesh" in output
+    assert "Thread: sender session topic" in output
+
+
+@pytest.mark.parametrize(
+    "session_identity",
+    [
+        {"friendly_name": "user"},
+        {"friendly_name": "historical-user", "aliases": ["user"]},
+    ],
+)
+def test_cmd_send_prefers_live_session_identity_over_human_alias(
+    session_identity: dict,
+    capsys,
+):
+    client = Mock()
+    client.session_id = "sender123"
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {
+            "id": "live-user",
+            "status": "idle",
+            "provider": "claude",
+            **session_identity,
+        }
+    ]
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": _human_lookup_payload(),
+    }
+    client.send_input.return_value = (True, False)
+
+    rc = cmd_send(client, "user", "message for existing session")
+
+    assert rc == 0
+    client.lookup_human.assert_not_called()
+    client.send_human_telegram_result.assert_not_called()
+    client.ensure_role.assert_not_called()
+    client.send_email_result.assert_not_called()
+    client.send_input.assert_called_once_with(
+        "live-user",
+        "message for existing session",
+        sender_session_id="sender123",
+        delivery_mode="sequential",
+        from_sm_send=True,
+        timeout_seconds=None,
+        notify_on_delivery=False,
+        notify_after_seconds=None,
+        notify_on_stop=True,
+        remind_soft_threshold=None,
+        remind_hard_threshold=None,
+        remind_cancel_on_reply_session_id=None,
+        parent_session_id=None,
+        timeout=SEND_API_TIMEOUT,
+    )
+    output = capsys.readouterr().out
+    expected_name = session_identity["friendly_name"]
+    assert f"Input sent to {expected_name} (live-user)" in output
+
+
+def test_cmd_telegram_forces_human_telegram(capsys):
+    client = Mock()
+    client.send_human_telegram_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {"recipient": "rajesh", "thread": "sender session topic"},
+    }
+
+    rc = cmd_telegram(
+        client,
+        sender_session_id="sender123",
+        recipient="rajeshgoli",
+        text="forced telegram",
+    )
+
+    assert rc == 0
+    client.send_human_telegram_result.assert_called_once_with(
+        requester_session_id="sender123",
+        recipient="rajeshgoli",
+        text="forced telegram",
+    )
+    output = capsys.readouterr().out
+    assert "Telegram sent to rajesh" in output
+
+
+def test_cmd_email_human_uses_explicit_email_endpoint_and_redacts_address(capsys):
+    client = Mock()
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": _human_lookup_payload(),
+    }
+    client.send_human_email_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "recipient": "rajesh",
+            "subject": "Auto subject",
+            "to": [{"username": "rajesh", "email": "private@example.com"}],
+        },
+    }
+
+    rc = cmd_email(
+        client,
+        sender_session_id="sender123",
+        recipients_raw="rajeshgoli",
+        body="explicit fallback",
+    )
+
+    assert rc == 0
+    client.send_human_email_result.assert_called_once_with(
+        requester_session_id="sender123",
+        recipient="rajeshgoli",
+        text="explicit fallback",
+        subject=None,
+        body_markdown=False,
+        auto_subject=True,
+    )
+    client.send_email_result.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Email sent to rajesh" in output
+    assert "private@example.com" not in output
+
+
+def test_cmd_email_human_with_cc_rejects_before_registered_email(capsys):
+    client = Mock()
+    client.lookup_human.side_effect = lambda identifier: (
+        {
+            "ok": True,
+            "unavailable": False,
+            "data": _human_lookup_payload(),
+        }
+        if identifier == "rajeshgoli"
+        else {"ok": False, "unavailable": False, "status_code": 404}
+    )
+
+    rc = cmd_email(
+        client,
+        sender_session_id="sender123",
+        recipients_raw="rajeshgoli",
+        subject="Fallback",
+        body="explicit fallback",
+        cc_raw="architect",
+    )
+
+    assert rc == 1
+    client.send_human_email_result.assert_not_called()
+    client.send_email_result.assert_not_called()
+    assert "supports exactly one recipient and no --cc" in capsys.readouterr().err
+
+
+def test_cmd_email_human_html_rejects_before_registered_email(tmp_path, capsys):
+    html_path = tmp_path / "body.html"
+    html_path.write_text("<p>explicit fallback</p>", encoding="utf-8")
+
+    client = Mock()
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": _human_lookup_payload(),
+    }
+
+    rc = cmd_email(
+        client,
+        sender_session_id="sender123",
+        recipients_raw="rajeshgoli",
+        subject="Fallback",
+        html_file=str(html_path),
+    )
+
+    assert rc == 1
+    client.send_human_email_result.assert_not_called()
+    client.send_email_result.assert_not_called()
+    assert "supports plain text or markdown bodies only" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -192,7 +410,8 @@ def test_cmd_send_multiple_recipients_uses_batch_endpoint(capsys):
     )
     output = capsys.readouterr().out
     assert "Input sent to spec-owner-3004 (owner123)" in output
-    assert "Email sent to orchestrator <orch@example.com>" in output
+    assert "Email sent to orchestrator" in output
+    assert "orch@example.com" not in output
 
 
 def test_cmd_send_multiple_recipients_returns_nonzero_on_partial_failure(capsys):
@@ -261,7 +480,9 @@ def test_cmd_email_reads_markdown_file_and_calls_api(tmp_path, capsys):
     assert kwargs["subject"] == "Reading list"
     assert kwargs["body_text"] == body_path.read_text(encoding="utf-8")
     assert kwargs["body_markdown"] is True
-    assert "Email sent to rajesh <rajesh@example.com>" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Email sent to rajesh" in output
+    assert "rajesh@example.com" not in output
 
 
 def test_cmd_email_treats_stdin_as_markdown(capsys):
@@ -291,4 +512,6 @@ def test_cmd_email_treats_stdin_as_markdown(capsys):
     kwargs = client.send_email_result.call_args.kwargs
     assert kwargs["body_text"] == "# Heading\n\n## Subhead\n"
     assert kwargs["body_markdown"] is True
-    assert "Email sent to rajesh <rajesh@example.com>" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Email sent to rajesh" in output
+    assert "rajesh@example.com" not in output

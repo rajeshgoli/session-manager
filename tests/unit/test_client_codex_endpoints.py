@@ -66,6 +66,35 @@ def test_send_input_batch_result_uses_batch_endpoint():
     )
 
 
+def test_lookup_human_uses_humans_endpoint():
+    client = _make_client()
+    payload = {"recipient": "rajesh"}
+    with patch.object(client, "_request_with_status", return_value=(payload, 200, False)) as req:
+        result = client.lookup_human("user")
+    assert result["ok"] is True
+    assert result["data"] == payload
+    req.assert_called_once_with("GET", "/humans/user")
+
+
+def test_send_human_telegram_result_uses_humans_endpoint():
+    client = _make_client()
+    payload = {"status": "sent", "recipient": "rajesh"}
+    with patch.object(client, "_request_with_status", return_value=(payload, 200, False)) as req:
+        result = client.send_human_telegram_result(
+            requester_session_id="sender123",
+            recipient="user",
+            text="hello",
+        )
+    assert result["ok"] is True
+    assert result["data"] == payload
+    req.assert_called_once_with(
+        "POST",
+        "/humans/user/telegram",
+        {"requester_session_id": "sender123", "text": "hello"},
+        timeout=15,
+    )
+
+
 def test_update_friendly_name_uses_mutation_timeout():
     client = _make_client()
     with patch.object(client, "_request", return_value=({}, True, False)) as req:

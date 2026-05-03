@@ -49,11 +49,17 @@ class TestCliParsing:
         # sm email
         email_parser = subparsers.add_parser("email")
         email_parser.add_argument("recipients")
-        email_parser.add_argument("--subject", required=True)
+        email_parser.add_argument("message", nargs="?")
+        email_parser.add_argument("--subject")
         email_parser.add_argument("--body")
         email_parser.add_argument("--text")
         email_parser.add_argument("--html")
         email_parser.add_argument("--cc")
+
+        # sm telegram / tg
+        telegram_parser = subparsers.add_parser("telegram", aliases=["tg"])
+        telegram_parser.add_argument("recipient")
+        telegram_parser.add_argument("text")
 
         # sm spawn
         spawn_parser = subparsers.add_parser("spawn")
@@ -290,6 +296,7 @@ class TestEmailCommand:
 
         assert args.command == "email"
         assert args.recipients == "rajesh,architect"
+        assert args.message is None
         assert args.subject == "Spec ready"
         assert args.body == "See attached"
         assert args.text is None
@@ -303,6 +310,35 @@ class TestEmailCommand:
 
         assert args.text == "docs/summary.md"
         assert args.cc == "architect"
+
+    def test_email_command_parses_positional_message(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["email", "rajesh", "Use the fallback path"])
+
+        assert args.command == "email"
+        assert args.recipients == "rajesh"
+        assert args.message == "Use the fallback path"
+        assert args.subject is None
+
+
+class TestTelegramCommand:
+    """Tests for 'sm telegram' command parsing."""
+
+    def test_telegram_command_parses(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["telegram", "rajesh", "hello"])
+
+        assert args.command == "telegram"
+        assert args.recipient == "rajesh"
+        assert args.text == "hello"
+
+    def test_tg_alias_parses(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["tg", "user", "hello"])
+
+        assert args.command == "tg"
+        assert args.recipient == "user"
+        assert args.text == "hello"
 
 
 class TestSpawnCommand:
