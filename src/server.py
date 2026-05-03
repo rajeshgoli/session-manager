@@ -6426,7 +6426,6 @@ Provide ONLY the summary, no preamble or questions."""
                 )
                 target_session.last_activity = datetime.now()
                 await _save_session_manager_state(app.state.session_manager)
-                await _emit_review_complete_if_needed(target_session, candidate.text)
             else:
                 ledger.release_assistant_output_claim(
                     session_id=session_id,
@@ -6434,6 +6433,7 @@ Provide ONLY the summary, no preamble or questions."""
                     provider="claude",
                     assistant_message_id=candidate.assistant_message_id,
                 )
+            await _emit_review_complete_if_needed(target_session, candidate.text)
 
         asyncio.create_task(_notify_response_event())
         return True

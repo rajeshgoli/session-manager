@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.message_queue import MessageQueueManager
-from src.models import Session, SessionStatus
+from src.models import ReviewConfig, Session, SessionStatus
 from src.response_relay import ResponseRelayLedger
 from src.server import create_app
 from src.session_manager import SessionManager
@@ -270,6 +270,38 @@ def test_long_chunk_group_is_deduped_as_one_output(tmp_path):
 
     notifier.notify.assert_awaited_once()
     assert notifier.notify.await_args.args[0].context == long_answer
+
+
+def test_review_complete_emits_when_response_notify_is_rejected(tmp_path):
+    transcript = tmp_path / "review-complete.jsonl"
+    transcript.write_text(_assistant_line("old", uuid="old"))
+    session = _session(transcript)
+    session.review_config = ReviewConfig(mode="branch", base_branch="main")
+    ledger = ResponseRelayLedger(str(tmp_path / "relay.db"))
+    _record_inbound(ledger, session, "inbound-review", transcript)
+    review_text = "[P2] Keep review completion\nReview findings remain available."
+    transcript.write_text(transcript.read_text() + _assistant_line(review_text, uuid="review-answer"))
+    _, client, notifier, _ = _make_app(tmp_path, session, ledger)
+    notifier.notify.side_effect = [False, True]
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        response = client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": session.id,
+                "transcript_path": str(transcript),
+            },
+        )
+
+    assert response.status_code == 200
+    assert notifier.notify.await_count == 2
+    response_event = notifier.notify.await_args_list[0].args[0]
+    review_event = notifier.notify.await_args_list[1].args[0]
+    assert response_event.event_type == "response"
+    assert review_event.event_type == "review_complete"
+    assert review_event.review_result is not None
+    assert review_event.review_result.findings[0].title == "Keep review completion"
 
 
 def test_newer_inbound_supersedes_late_output_for_previous_turn(tmp_path):
