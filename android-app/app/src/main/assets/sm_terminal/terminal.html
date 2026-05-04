@@ -6,27 +6,71 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
   <link rel="stylesheet" href="vendor/xterm.css">
   <style>
-    html, body, #terminal {
+    html, body, #terminal-root, #terminal {
       background: #05080d;
       height: 100%;
       margin: 0;
+      min-height: 100vh;
       overflow: hidden;
       width: 100%;
     }
+    #terminal-root {
+      bottom: 0;
+      left: 0;
+      position: fixed;
+      right: 0;
+      top: 0;
+    }
+    #terminal {
+      bottom: 0;
+      left: 0;
+      position: absolute;
+      right: 0;
+      top: 0;
+    }
     .terminal {
+      box-sizing: border-box;
       height: 100%;
       padding: 8px;
     }
     .xterm .xterm-viewport {
       background-color: transparent;
     }
+    #terminal-status {
+      align-items: center;
+      background: #05080d;
+      bottom: 0;
+      color: #22d3ee;
+      display: flex;
+      font-family: monospace;
+      font-size: 12px;
+      justify-content: center;
+      left: 0;
+      padding: 12px;
+      position: absolute;
+      right: 0;
+      text-align: center;
+      top: 0;
+      z-index: 5;
+    }
+    #terminal-status.error {
+      color: #fb7185;
+    }
+    #terminal-status.hidden {
+      display: none;
+    }
   </style>
 </head>
 <body>
-  <div id="terminal"></div>
+  <div id="terminal-root">
+    <div id="terminal"></div>
+    <div id="terminal-status">Loading terminal renderer...</div>
+  </div>
   <script src="vendor/xterm.js"></script>
   <script src="vendor/addon-fit.js"></script>
   <script>
+    const terminalElement = document.getElementById("terminal");
+    const statusElement = document.getElementById("terminal-status");
     const fitAddon = new FitAddon.FitAddon();
     const term = new Terminal({
       allowProposedApi: false,
@@ -62,13 +106,41 @@
       }
     });
     term.loadAddon(fitAddon);
-    term.open(document.getElementById("terminal"));
 
     let ready = false;
+    let opened = false;
     let lastResize = "";
+    let pendingWrites = [];
+    let openAttempts = 0;
+    let openTimer = null;
+    let lastBackendStatus = "connecting";
 
     function bridge() {
       return window.TerminalBridge;
+    }
+
+    function bridgeCall(method, ...args) {
+      const target = bridge();
+      if (!target || typeof target[method] !== "function") {
+        return;
+      }
+      try {
+        target[method](...args);
+      } catch (_) {
+      }
+    }
+
+    function setRendererStatus(message, isError) {
+      statusElement.textContent = message;
+      statusElement.classList.toggle("error", Boolean(isError));
+      statusElement.classList.toggle("hidden", ready && !isError);
+      bridgeCall("status", message);
+    }
+
+    function reportError(message) {
+      ready = false;
+      setRendererStatus(message, true);
+      bridgeCall("error", message);
     }
 
     function reportResize() {
@@ -77,14 +149,14 @@
         return;
       }
       lastResize = key;
-      if (bridge()) {
-        bridge().resize(term.cols, term.rows);
-      }
+      bridgeCall("resize", term.cols, term.rows);
     }
 
     function reportReady() {
-      if (bridge()) {
-        bridge().ready(term.cols, term.rows);
+      if (!ready) {
+        ready = true;
+        setRendererStatus(`Terminal renderer ready ${term.cols}x${term.rows}`, false);
+        bridgeCall("ready", term.cols, term.rows);
       }
     }
 
@@ -92,43 +164,152 @@
       try {
         fitAddon.fit();
         reportResize();
-      } catch (_) {
+        if (term.cols > 0 && term.rows > 0) {
+          reportReady();
+          flushPendingWrites();
+          term.focus();
+        }
+      } catch (error) {
+        reportError(`Terminal fit failed: ${error && error.message ? error.message : error}`);
       }
     }
 
-    term.onData((data) => {
-      if (bridge()) {
-        bridge().input(data);
+    function viewportDimensions() {
+      const width = window.innerWidth
+        || document.documentElement.clientWidth
+        || document.body.clientWidth
+        || 0;
+      const height = window.innerHeight
+        || document.documentElement.clientHeight
+        || document.body.clientHeight
+        || 0;
+      return { width, height };
+    }
+
+    function applyViewportSize() {
+      const dimensions = viewportDimensions();
+      if (dimensions.width > 0) {
+        terminalElement.style.width = `${dimensions.width}px`;
       }
-    });
+      if (dimensions.height > 0) {
+        terminalElement.style.height = `${dimensions.height}px`;
+      }
+      return dimensions;
+    }
 
-    term.onResize(() => reportResize());
+    function hasLayout() {
+      const dimensions = applyViewportSize();
+      const rect = terminalElement.getBoundingClientRect();
+      const width = rect.width || dimensions.width;
+      const height = rect.height || dimensions.height;
+      return width >= 40 && height >= 40;
+    }
 
-    window.addEventListener("resize", fitAndReport);
+    function scheduleOpenRetry() {
+      if (openTimer !== null) {
+        return;
+      }
+      openTimer = window.setTimeout(() => {
+        openTimer = null;
+        ensureTerminalOpen();
+      }, 250);
+    }
 
-    window.smFocus = function() {
-      term.focus();
-    };
+    function ensureTerminalOpen() {
+      if (!hasLayout()) {
+        openAttempts += 1;
+        if (openAttempts === 1 || openAttempts % 4 === 0) {
+          setRendererStatus(`Waiting for terminal layout (${lastBackendStatus}, attempt ${openAttempts})`, false);
+        }
+        scheduleOpenRetry();
+        return;
+      }
+      try {
+        if (openTimer !== null) {
+          window.clearTimeout(openTimer);
+          openTimer = null;
+        }
+        if (!opened) {
+          term.open(terminalElement);
+          opened = true;
+        }
+        fitAndReport();
+      } catch (error) {
+        reportError(`Terminal open failed: ${error && error.message ? error.message : error}`);
+      }
+    }
 
-    window.smWriteBase64 = function(payload) {
+    function bytesFromBase64(payload) {
       const binary = atob(payload);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i += 1) {
         bytes[i] = binary.charCodeAt(i);
       }
-      term.write(bytes);
+      return bytes;
+    }
+
+    function writeFrame(frame) {
+      try {
+        const data = frame.encoding === "base64" ? bytesFromBase64(frame.payload) : frame.payload;
+        const byteCount = frame.encoding === "base64" ? data.length : frame.payload.length;
+        term.write(data, () => {
+          bridgeCall("written", String(frame.sequence), byteCount);
+        });
+      } catch (error) {
+        reportError(`Terminal write failed: ${error && error.message ? error.message : error}`);
+      }
+    }
+
+    function flushPendingWrites() {
+      if (!ready || pendingWrites.length === 0) {
+        return;
+      }
+      const writes = pendingWrites;
+      pendingWrites = [];
+      writes.forEach(writeFrame);
+    }
+
+    function queueOrWrite(frame) {
+      if (!ready) {
+        pendingWrites.push(frame);
+        setRendererStatus(`Queued ${pendingWrites.length} terminal frames while renderer initializes`, false);
+        ensureTerminalOpen();
+        return;
+      }
+      writeFrame(frame);
+    }
+
+    term.onData((data) => {
+      bridgeCall("input", data);
+    });
+
+    term.onResize(() => reportResize());
+
+    window.addEventListener("resize", () => {
+      applyViewportSize();
+      fitAndReport();
+    });
+
+    window.smFocus = function() {
+      if (ready) {
+        term.focus();
+      }
     };
 
-    window.smWriteText = function(text) {
-      term.write(text);
+    window.smWriteBase64 = function(sequence, payload) {
+      queueOrWrite({ sequence: Number(sequence) || 0, payload, encoding: "base64" });
+    };
+
+    window.smWriteText = function(sequence, text) {
+      queueOrWrite({ sequence: Number(sequence) || 0, payload: text, encoding: "text" });
     };
 
     window.smSetStatus = function(status) {
-      if (!ready) {
-        ready = true;
-        fitAndReport();
-        reportReady();
+      lastBackendStatus = status || lastBackendStatus;
+      if (!ready && !statusElement.classList.contains("error")) {
+        setRendererStatus(`Backend ${lastBackendStatus}; waiting for terminal renderer`, false);
       }
+      ensureTerminalOpen();
     };
 
     window.smCopySelection = function() {
@@ -144,17 +325,13 @@
         }
         text = lines.join("\n").trimEnd();
       }
-      if (bridge()) {
-        bridge().copy(text);
-      }
+      bridgeCall("copy", text);
     };
 
-    setTimeout(() => {
-      ready = true;
-      fitAndReport();
-      reportReady();
-      term.focus();
-    }, 80);
+    window.requestAnimationFrame(() => {
+      applyViewportSize();
+      ensureTerminalOpen();
+    });
   </script>
 </body>
 </html>
