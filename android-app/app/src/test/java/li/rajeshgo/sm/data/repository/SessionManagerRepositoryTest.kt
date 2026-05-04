@@ -88,6 +88,8 @@ class SessionManagerRepositoryTest {
         val repository = SessionManagerRepository()
 
         assertFalse(repository.isRetryableMobileTerminalSocketFailure(401, "Unauthorized"))
+        assertFalse(repository.isRetryableMobileTerminalSocketFailure(401, "Expected HTTP 101 response but was 401"))
+        assertFalse(repository.isRetryableMobileTerminalSocketFailure(403, "Expected HTTP 101 response but was 403"))
         assertFalse(repository.isRetryableMobileTerminalSocketFailure(null, "timeout"))
     }
 

@@ -262,8 +262,8 @@ class SessionManagerRepository {
     }
 
     fun isRetryableMobileTerminalSocketFailure(httpStatusCode: Int?, message: String?): Boolean {
-        if (httpStatusCode in setOf(404, 426, 502, 503, 504)) {
-            return true
+        if (httpStatusCode != null) {
+            return httpStatusCode in setOf(404, 426, 502, 503, 504)
         }
         return message.orEmpty().contains("Expected HTTP 101 response", ignoreCase = true)
     }
