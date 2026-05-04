@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 import base64
 import fcntl
 import os
+import subprocess
 import struct
 import termios
 import time
@@ -628,6 +629,86 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
         assert websocket.receive_json() == {"type": "status", "state": "resized", "rows": 3, "cols": 15}
         websocket.send_json({"type": "detach"})
     assert any("attach-session" in command for command in commands)
+
+
+def test_mobile_terminal_websocket_preloads_tmux_scrollback(monkeypatch):
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    ticket_response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+    assert ticket_response.status_code == 200
+    ticket = ticket_response.json()
+
+    def fake_run(args, capture_output, check):
+        assert "capture-pane" in args
+        assert "-E" in args
+        assert "-1" in args
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"older line\nold line\n", stderr=b"")
+
+    class FakePopen:
+        def __init__(self, args, stdin, stdout, stderr, close_fds, start_new_session, env):
+            self.returncode = None
+            self.output_fd = os.dup(stdout)
+            os.write(self.output_fd, b"live pane output")
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+            try:
+                os.close(self.output_fd)
+            except OSError:
+                pass
+
+        def wait(self, timeout=None):
+            self.terminate()
+            return 0
+
+        def kill(self):
+            self.terminate()
+
+    monkeypatch.setattr("src.server.subprocess.run", fake_run)
+    monkeypatch.setattr("src.server.subprocess.Popen", FakePopen)
+
+    with client.websocket_connect("/client/terminal") as websocket:
+        websocket.send_json(
+            {
+                "type": "auth",
+                "ticket_id": ticket["ticket_id"],
+                "ticket_secret": ticket["ticket_secret"],
+                "device_key_id": "test-device",
+                "nonce": "ws-nonce-1",
+                "signature": _sign_mobile_ws_auth(
+                    private_key,
+                    ticket_id=ticket["ticket_id"],
+                    session_id=session.id,
+                ),
+            }
+        )
+        websocket.send_json({"type": "resize", "rows": 7, "cols": 42})
+        history = websocket.receive_json()
+        assert history["type"] == "output"
+        assert history["mode"] == "history"
+        assert history["encoding"] == "base64"
+        assert base64.b64decode(history["data"]) == b"older line\r\nold line\r\n"
+        attached = websocket.receive_json()
+        assert attached["type"] == "status"
+        assert attached["state"] == "attached"
+        output = websocket.receive_json()
+        assert output["type"] == "output"
+        assert output["mode"] == "stream"
+        assert base64.b64decode(output["data"]) == b"live pane output"
+        websocket.send_json({"type": "detach"})
 
 
 def test_mobile_terminal_plain_http_terminal_route_reports_upgrade_required():

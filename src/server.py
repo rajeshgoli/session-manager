@@ -4990,6 +4990,59 @@ def create_app(
                 offset += written
             return True
 
+        def capture_initial_scrollback() -> bytes:
+            lines = _mobile_terminal_int("history_preload_lines", 4000, minimum=0, maximum=20000)
+            if lines <= 0:
+                return b""
+            try:
+                result = subprocess.run(
+                    _mobile_terminal_tmux_cmd(
+                        ticket,
+                        "capture-pane",
+                        "-e",
+                        "-p",
+                        "-S",
+                        f"-{lines}",
+                        "-E",
+                        "-1",
+                        "-t",
+                        ticket.tmux_session,
+                    ),
+                    capture_output=True,
+                    check=False,
+                )
+            except Exception:
+                logger.debug("failed to capture mobile terminal scrollback", exc_info=True)
+                return b""
+            if result.returncode != 0:
+                return b""
+            output = bytes(result.stdout or b"")
+            if not output.strip():
+                return b""
+            # capture-pane emits LF rows; replay them as CRLF so xterm scrollback
+            # lands at column 0 before the live tmux attach stream starts.
+            normalized = output.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+            return normalized if normalized.endswith(b"\r\n") else normalized + b"\r\n"
+
+        async def preload_scrollback() -> None:
+            chunk = await asyncio.to_thread(capture_initial_scrollback)
+            if not chunk or stop_event.is_set():
+                return
+            counters["output_bytes"] += len(chunk)
+            await websocket.send_json({
+                "type": "output",
+                "mode": "history",
+                "encoding": "base64",
+                "data": base64.b64encode(chunk).decode("ascii"),
+            })
+            _audit_mobile_terminal(
+                "history_preloaded",
+                user_id=ticket.user_id,
+                session_id=ticket.session_id,
+                provider=ticket.provider,
+                bytes=len(chunk),
+            )
+
         async def output_loop() -> None:
             assert master_fd is not None
             while not stop_event.is_set():
@@ -5054,6 +5107,10 @@ def create_app(
                     await websocket.send_json({"type": "error", "message": "unsupported terminal frame"})
 
         await wait_for_initial_resize()
+        if stop_event.is_set():
+            return
+
+        await preload_scrollback()
         if stop_event.is_set():
             return
 

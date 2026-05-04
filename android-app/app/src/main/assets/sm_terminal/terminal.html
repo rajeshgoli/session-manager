@@ -12,6 +12,7 @@
       margin: 0;
       min-height: 100vh;
       overflow: hidden;
+      overscroll-behavior: none;
       width: 100%;
     }
     #terminal-root {
@@ -26,6 +27,7 @@
       left: 0;
       position: absolute;
       right: 0;
+      touch-action: none;
       top: 0;
     }
     .terminal {
@@ -35,6 +37,9 @@
     }
     .xterm .xterm-viewport {
       background-color: transparent;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+      touch-action: none;
     }
     #terminal-status {
       align-items: center;
@@ -114,6 +119,9 @@
     let openAttempts = 0;
     let openTimer = null;
     let lastBackendStatus = "connecting";
+    let scrollHandlersInstalled = false;
+    let lastTouchY = null;
+    let touchScrollRemainder = 0;
 
     function bridge() {
       return window.TerminalBridge;
@@ -163,6 +171,7 @@
     function fitAndReport() {
       try {
         fitAddon.fit();
+        installScrollHandlers();
         reportResize();
         if (term.cols > 0 && term.rows > 0) {
           reportReady();
@@ -172,6 +181,72 @@
       } catch (error) {
         reportError(`Terminal fit failed: ${error && error.message ? error.message : error}`);
       }
+    }
+
+    function terminalViewport() {
+      return terminalElement.querySelector(".xterm-viewport") || terminalElement;
+    }
+
+    function terminalCellHeight() {
+      const viewport = terminalViewport();
+      const byRows = term.rows > 0 ? viewport.clientHeight / term.rows : 0;
+      return byRows > 0 ? byRows : 16;
+    }
+
+    function scrollTerminalByPixels(deltaPixels) {
+      if (!ready || !Number.isFinite(deltaPixels)) {
+        return false;
+      }
+      const cellHeight = terminalCellHeight();
+      const rawLines = (deltaPixels / cellHeight) + touchScrollRemainder;
+      const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines);
+      touchScrollRemainder = rawLines - lines;
+      if (lines === 0) {
+        return true;
+      }
+      term.scrollLines(lines);
+      return true;
+    }
+
+    function installScrollHandlers() {
+      if (scrollHandlersInstalled || !opened) {
+        return;
+      }
+      const target = terminalViewport();
+      target.addEventListener("wheel", (event) => {
+        if (scrollTerminalByPixels(event.deltaY)) {
+          event.preventDefault();
+        }
+      }, { passive: false });
+      target.addEventListener("touchstart", (event) => {
+        if (event.touches.length !== 1) {
+          lastTouchY = null;
+          return;
+        }
+        lastTouchY = event.touches[0].clientY;
+        touchScrollRemainder = 0;
+      }, { passive: false });
+      target.addEventListener("touchmove", (event) => {
+        if (event.touches.length !== 1 || lastTouchY === null) {
+          lastTouchY = null;
+          return;
+        }
+        const currentY = event.touches[0].clientY;
+        const deltaY = lastTouchY - currentY;
+        lastTouchY = currentY;
+        if (scrollTerminalByPixels(deltaY)) {
+          event.preventDefault();
+        }
+      }, { passive: false });
+      target.addEventListener("touchend", () => {
+        lastTouchY = null;
+        touchScrollRemainder = 0;
+      }, { passive: true });
+      target.addEventListener("touchcancel", () => {
+        lastTouchY = null;
+        touchScrollRemainder = 0;
+      }, { passive: true });
+      scrollHandlersInstalled = true;
     }
 
     function viewportDimensions() {
