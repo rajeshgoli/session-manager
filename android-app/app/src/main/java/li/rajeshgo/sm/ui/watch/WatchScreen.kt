@@ -391,6 +391,10 @@ fun WatchScreen(
                 onEnter = { viewModel.sendTerminalKey("enter") },
                 onTerminalInput = viewModel::sendTerminalData,
                 onTerminalResize = viewModel::resizeTerminal,
+                onRendererStatus = viewModel::markTerminalRendererStatus,
+                onRendererReady = viewModel::markTerminalRendererReady,
+                onRendererError = viewModel::markTerminalRendererError,
+                onRendererWritten = viewModel::markTerminalRendererWritten,
                 onDetach = viewModel::detachTerminal,
                 onCopy = { selectedText ->
                     val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
@@ -413,6 +417,10 @@ private fun MobileTerminalOverlay(
     onEnter: () -> Unit,
     onTerminalInput: (String) -> Unit,
     onTerminalResize: (cols: Int, rows: Int) -> Unit,
+    onRendererStatus: (String) -> Unit,
+    onRendererReady: (cols: Int, rows: Int) -> Unit,
+    onRendererError: (String) -> Unit,
+    onRendererWritten: (sequence: Long, bytes: Int) -> Unit,
     onDetach: () -> Unit,
     onCopy: (String) -> Unit,
 ) {
@@ -452,6 +460,14 @@ private fun MobileTerminalOverlay(
                             color = if (terminal.error == null) Cyan else Rose,
                             fontFamily = FontFamily.Monospace,
                         )
+                        Text(
+                            text = terminalDiagnostics(terminal),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (terminal.rendererError == null) TextMuted else Rose,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                     OutlinedButton(onClick = onDetach) {
                         Text("Detach")
@@ -478,6 +494,10 @@ private fun MobileTerminalOverlay(
                     copyRequest = copyRequest,
                     onInput = onTerminalInput,
                     onResize = onTerminalResize,
+                    onRendererStatus = onRendererStatus,
+                    onRendererReady = onRendererReady,
+                    onRendererError = onRendererError,
+                    onRendererWritten = onRendererWritten,
                     onCopyText = onCopy,
                 )
             }
@@ -518,6 +538,10 @@ private fun TerminalWebView(
     copyRequest: Long,
     onInput: (String) -> Unit,
     onResize: (cols: Int, rows: Int) -> Unit,
+    onRendererStatus: (String) -> Unit,
+    onRendererReady: (cols: Int, rows: Int) -> Unit,
+    onRendererError: (String) -> Unit,
+    onRendererWritten: (sequence: Long, bytes: Int) -> Unit,
     onCopyText: (String) -> Unit,
 ) {
     var deliveredSequence by remember { mutableStateOf(0L) }
@@ -563,10 +587,13 @@ private fun TerminalWebView(
                         onInput = onInput,
                         onResize = onResize,
                         onCopyText = onCopyText,
+                        onStatus = onRendererStatus,
                         onReady = { cols, rows ->
                             terminalReady = true
-                            onResize(cols, rows)
+                            onRendererReady(cols, rows)
                         },
+                        onError = onRendererError,
+                        onWritten = onRendererWritten,
                     ),
                     "TerminalBridge",
                 )
@@ -581,9 +608,9 @@ private fun TerminalWebView(
                     .filter { it.sequence > deliveredSequence }
                     .forEach { frame ->
                         if (frame.encoding == "base64") {
-                            webView.evaluateJavascript("window.smWriteBase64(${jsString(frame.data)});", null)
+                            webView.evaluateJavascript("window.smWriteBase64(${frame.sequence}, ${jsString(frame.data)});", null)
                         } else {
-                            webView.evaluateJavascript("window.smWriteText(${jsString(frame.data)});", null)
+                            webView.evaluateJavascript("window.smWriteText(${frame.sequence}, ${jsString(frame.data)});", null)
                         }
                         deliveredSequence = frame.sequence
                     }
@@ -597,6 +624,27 @@ private fun TerminalWebView(
             }
         },
     )
+}
+
+private fun terminalDiagnostics(terminal: TerminalUiState): String {
+    val frameSummary = "${terminal.outputFrameCount} frames/${formatDiagnosticBytes(terminal.outputByteCount)}"
+    val ackSummary = if (terminal.rendererLastAckSequence > 0) {
+        "ack ${terminal.rendererLastAckSequence}/${terminal.outputSequence}"
+    } else {
+        "ack -/${terminal.outputSequence}"
+    }
+    val rendererMessage = terminal.rendererError ?: terminal.rendererStatus
+    return "$rendererMessage • $frameSummary • $ackSummary"
+}
+
+private fun formatDiagnosticBytes(bytes: Long): String {
+    if (bytes < 1024) {
+        return "${bytes}B"
+    }
+    if (bytes < 1024 * 1024) {
+        return "${bytes / 1024}KiB"
+    }
+    return "${bytes / (1024 * 1024)}MiB"
 }
 
 private const val TERMINAL_ASSET_HOST = "sm-terminal.local"
@@ -650,7 +698,10 @@ private class TerminalJavascriptBridge(
     private val onInput: (String) -> Unit,
     private val onResize: (cols: Int, rows: Int) -> Unit,
     private val onCopyText: (String) -> Unit,
+    private val onStatus: (String) -> Unit,
     private val onReady: (cols: Int, rows: Int) -> Unit,
+    private val onError: (String) -> Unit,
+    private val onWritten: (sequence: Long, bytes: Int) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -670,8 +721,24 @@ private class TerminalJavascriptBridge(
     }
 
     @JavascriptInterface
+    fun status(message: String) {
+        mainHandler.post { onStatus(message) }
+    }
+
+    @JavascriptInterface
     fun ready(cols: Int, rows: Int) {
         mainHandler.post { onReady(cols, rows) }
+    }
+
+    @JavascriptInterface
+    fun error(message: String) {
+        mainHandler.post { onError(message) }
+    }
+
+    @JavascriptInterface
+    fun written(sequence: String, bytes: Int) {
+        val parsedSequence = sequence.toLongOrNull() ?: 0L
+        mainHandler.post { onWritten(parsedSequence, bytes) }
     }
 }
 

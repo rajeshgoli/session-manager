@@ -27,6 +27,11 @@ data class TerminalUiState(
     val sessionId: String,
     val title: String,
     val status: String = "connecting",
+    val rendererStatus: String = "renderer loading",
+    val rendererLastAckSequence: Long = 0L,
+    val rendererError: String? = null,
+    val outputFrameCount: Int = 0,
+    val outputByteCount: Long = 0L,
     val outputFrames: List<TerminalOutputFrame> = emptyList(),
     val outputSequence: Long = 0L,
     val copyBuffer: String = "",
@@ -320,6 +325,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                 val encoding = payload.optString("encoding", "text")
                                 val mode = payload.optString("mode")
                                 val sequence = current.outputSequence + 1
+                                val byteCount = terminalOutputByteCount(data, encoding)
                                 current.copy(
                                     status = "attached",
                                     outputFrames = (
@@ -330,6 +336,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                         )
                                     ).takeLast(500),
                                     outputSequence = sequence,
+                                    outputFrameCount = current.outputFrameCount + 1,
+                                    outputByteCount = current.outputByteCount + byteCount,
                                     copyBuffer = if (encoding == "base64") {
                                         current.copyBuffer
                                     } else if (mode == "snapshot") {
@@ -372,6 +380,43 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     fun updateTerminalInput(value: String) {
         _uiState.value = _uiState.value.copy(
             terminal = _uiState.value.terminal?.copy(inputDraft = value)
+        )
+    }
+
+    fun markTerminalRendererStatus(message: String) {
+        _uiState.value = _uiState.value.copy(
+            terminal = _uiState.value.terminal?.copy(rendererStatus = message)
+        )
+    }
+
+    fun markTerminalRendererReady(cols: Int, rows: Int) {
+        resizeTerminal(cols, rows)
+        _uiState.value = _uiState.value.copy(
+            terminal = _uiState.value.terminal?.copy(
+                rendererStatus = "renderer ready ${cols}x${rows}",
+                rendererError = null,
+            )
+        )
+    }
+
+    fun markTerminalRendererError(message: String) {
+        _uiState.value = _uiState.value.copy(
+            terminal = _uiState.value.terminal?.copy(
+                rendererStatus = "renderer error",
+                rendererError = message,
+            )
+        )
+    }
+
+    fun markTerminalRendererWritten(sequence: Long, bytes: Int) {
+        _uiState.value = _uiState.value.copy(
+            terminal = _uiState.value.terminal?.let { terminal ->
+                terminal.copy(
+                    rendererStatus = "renderer wrote frame $sequence (${bytes}B)",
+                    rendererLastAckSequence = maxOf(terminal.rendererLastAckSequence, sequence),
+                    rendererError = null,
+                )
+            }
         )
     }
 
@@ -439,6 +484,15 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         }
         terminalAttachToken = null
         _uiState.value = _uiState.value.copy(terminal = null)
+    }
+
+    private fun terminalOutputByteCount(data: String, encoding: String): Long {
+        return if (encoding == "base64") {
+            val padding = data.takeLastWhile { it == '=' }.length
+            ((data.length * 3) / 4 - padding).coerceAtLeast(0).toLong()
+        } else {
+            data.length.toLong()
+        }
     }
 
     fun requestStatus(onComplete: (Result<String>) -> Unit) {
