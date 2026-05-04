@@ -27,9 +27,17 @@ data class TerminalUiState(
     val sessionId: String,
     val title: String,
     val status: String = "connecting",
-    val output: String = "",
+    val outputFrames: List<TerminalOutputFrame> = emptyList(),
+    val outputSequence: Long = 0L,
+    val copyBuffer: String = "",
     val inputDraft: String = "",
     val error: String? = null,
+)
+
+data class TerminalOutputFrame(
+    val sequence: Long,
+    val data: String,
+    val encoding: String = "text",
 )
 
 data class WatchUiState(
@@ -308,12 +316,26 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     viewModelScope.launch {
                         when (payload.optString("type")) {
                             "output" -> updateTerminalIfCurrent(attachToken) { current ->
+                                val data = payload.optString("data")
+                                val encoding = payload.optString("encoding", "text")
+                                val mode = payload.optString("mode")
+                                val sequence = current.outputSequence + 1
                                 current.copy(
                                     status = "attached",
-                                    output = if (payload.optString("mode") == "snapshot") {
-                                        payload.optString("data")
+                                    outputFrames = (
+                                        current.outputFrames + TerminalOutputFrame(
+                                            sequence = sequence,
+                                            data = data,
+                                            encoding = encoding,
+                                        )
+                                    ).takeLast(500),
+                                    outputSequence = sequence,
+                                    copyBuffer = if (encoding == "base64") {
+                                        current.copyBuffer
+                                    } else if (mode == "snapshot") {
+                                        data
                                     } else {
-                                        current.output + payload.optString("data")
+                                        (current.copyBuffer + data).takeLast(200_000)
                                     },
                                     error = null,
                                 )
@@ -357,16 +379,38 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         val terminal = _uiState.value.terminal ?: return
         val text = terminal.inputDraft
         if (text.isNotEmpty()) {
-            terminalSocket?.send(JSONObject().put("type", "input").put("data", text).toString())
+            sendTerminalData(text)
         }
         if (sendEnter) {
-            terminalSocket?.send(JSONObject().put("type", "key").put("key", "enter").toString())
+            sendTerminalKey("enter")
         }
-        _uiState.value = _uiState.value.copy(terminal = terminal.copy(inputDraft = ""))
+        _uiState.value = _uiState.value.copy(
+            terminal = _uiState.value.terminal?.copy(inputDraft = "")
+        )
+    }
+
+    fun sendTerminalData(data: String) {
+        if (data.isEmpty()) {
+            return
+        }
+        terminalSocket?.send(JSONObject().put("type", "input").put("data", data).toString())
     }
 
     fun sendTerminalKey(key: String) {
         terminalSocket?.send(JSONObject().put("type", "key").put("key", key).toString())
+    }
+
+    fun resizeTerminal(cols: Int, rows: Int) {
+        if (cols !in 20..300 || rows !in 10..120) {
+            return
+        }
+        terminalSocket?.send(
+            JSONObject()
+                .put("type", "resize")
+                .put("cols", cols)
+                .put("rows", rows)
+                .toString()
+        )
     }
 
     fun detachTerminal() {

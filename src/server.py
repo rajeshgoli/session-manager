@@ -1,14 +1,17 @@
 """FastAPI server for hooks and API endpoints."""
 
 import asyncio
+import fcntl
 from dataclasses import replace
 import inspect
 import json
 import logging
 import math
 import os
+import pty
 import secrets
 import shutil
+import select
 import subprocess
 import tempfile
 import time
@@ -17,6 +20,8 @@ import base64
 import hashlib
 import hmac
 import re
+import struct
+import termios
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +91,8 @@ DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS = 1.0
 MOBILE_TERMINAL_INPUT_MAX_CHARS = 8192
 MOBILE_TERMINAL_TMUX_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:@-]+$")
 MOBILE_TERMINAL_SOCKET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+MOBILE_TERMINAL_DEFAULT_ROWS = 24
+MOBILE_TERMINAL_DEFAULT_COLS = 80
 DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
 DEFAULT_BUG_REPORTS_DB = Path(__file__).resolve().parents[1] / "data" / "bug_reports.db"
 DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
@@ -93,6 +100,26 @@ DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
 
 def _is_valid_app_artifact_name(app_name: str) -> bool:
     return bool(APP_ARTIFACT_NAME_PATTERN.fullmatch(app_name))
+
+
+def _mobile_terminal_key_bytes(key: str) -> Optional[bytes]:
+    normalized = str(key or "").strip().lower()
+    key_map = {
+        "enter": b"\r",
+        "esc": b"\x1b",
+        "escape": b"\x1b",
+        "tab": b"\t",
+        "backspace": b"\x7f",
+        "ctrl-c": b"\x03",
+        "ctrl-d": b"\x04",
+        "ctrl-z": b"\x1a",
+        "ctrl-b": b"\x02",
+    }
+    return key_map.get(normalized)
+
+
+def _mobile_terminal_set_pty_size(fd: int, rows: int, cols: int) -> None:
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
 async def _decode_json_request(
@@ -4772,21 +4799,9 @@ def create_app(
         cmd.extend(args)
         return cmd
 
-    async def _mobile_terminal_tmux_run(ticket: MobileTerminalTicket, *args: str) -> subprocess.CompletedProcess[str]:
-        return await asyncio.to_thread(
-            subprocess.run,
-            _mobile_terminal_tmux_cmd(ticket, *args),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=3,
-        )
-
     async def _run_mobile_terminal_bridge(websocket: WebSocket, ticket: MobileTerminalTicket, attach_id: str) -> None:
-        """Bridge authenticated WebSocket frames to one server-derived tmux target."""
+        """Bridge authenticated WebSocket frames to a real tmux attach PTY."""
         max_attach_seconds = _mobile_terminal_int("max_attach_seconds", 3600, minimum=30, maximum=24 * 3600)
-        poll_interval = float(_mobile_terminal_config().get("capture_poll_seconds", 0.5) or 0.5)
-        poll_interval = min(max(poll_interval, 0.2), 2.0)
         stop_event = asyncio.Event()
         counters = {"input_bytes": 0, "output_bytes": 0}
         active = getattr(app.state, "mobile_terminal_active_attaches", {})
@@ -4801,43 +4816,114 @@ def create_app(
         active[attach_id]["stop_event"] = stop_event
         active[attach_id]["websocket"] = websocket
 
+        master_fd: Optional[int] = None
+        attach_proc: Optional[subprocess.Popen[Any]] = None
+        current_rows = MOBILE_TERMINAL_DEFAULT_ROWS
+        current_cols = MOBILE_TERMINAL_DEFAULT_COLS
+
         async def send_status(state: str, **extra: Any) -> None:
             await websocket.send_json({"type": "status", "state": state, **extra})
 
-        async def capture_loop() -> None:
-            last_output: Optional[str] = None
-            while not stop_event.is_set():
-                result = await _mobile_terminal_tmux_run(
-                    ticket,
-                    "capture-pane",
-                    "-p",
-                    "-e",
-                    "-J",
-                    "-t",
-                    ticket.tmux_session,
+        def start_attach_client() -> tuple[int, subprocess.Popen[Any]]:
+            fd_master, fd_slave = pty.openpty()
+            try:
+                _mobile_terminal_set_pty_size(fd_slave, current_rows, current_cols)
+                child_env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"TMUX", "TMUX_PANE"}
+                }
+                child_env["TERM"] = "xterm-256color"
+                proc = subprocess.Popen(
+                    _mobile_terminal_tmux_cmd(
+                        ticket,
+                        "attach-session",
+                        "-t",
+                        ticket.tmux_session,
+                    ),
+                    stdin=fd_slave,
+                    stdout=fd_slave,
+                    stderr=fd_slave,
+                    close_fds=True,
+                    start_new_session=True,
+                    env=child_env,
                 )
-                if result.returncode != 0:
+            except Exception:
+                os.close(fd_master)
+                os.close(fd_slave)
+                raise
+            finally:
+                try:
+                    os.close(fd_slave)
+                except OSError:
+                    pass
+            flags = fcntl.fcntl(fd_master, fcntl.F_GETFL)
+            fcntl.fcntl(fd_master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            return fd_master, proc
+
+        def read_pty_chunk(fd: int) -> Optional[bytes]:
+            try:
+                readable, _, _ = select.select([fd], [], [], 0.2)
+                if not readable:
+                    return b""
+                data = os.read(fd, 8192)
+            except BlockingIOError:
+                return b""
+            except OSError:
+                return None
+            return data if data else None
+
+        def write_pty_all(fd: int, data: bytes) -> bool:
+            deadline = time.monotonic() + 5
+            offset = 0
+            view = memoryview(data)
+            while offset < len(data):
+                if time.monotonic() > deadline:
+                    return False
+                try:
+                    _, writable, _ = select.select([], [fd], [], 0.2)
+                    if not writable:
+                        continue
+                    written = os.write(fd, view[offset:])
+                except BlockingIOError:
+                    time.sleep(0.01)
+                    continue
+                except InterruptedError:
+                    continue
+                except OSError:
+                    return False
+                if written <= 0:
+                    return False
+                offset += written
+            return True
+
+        async def output_loop() -> None:
+            assert master_fd is not None
+            while not stop_event.is_set():
+                chunk = await asyncio.to_thread(read_pty_chunk, master_fd)
+                if chunk is None:
                     await websocket.send_json({
                         "type": "error",
                         "message": "tmux session is no longer attachable",
                     })
                     stop_event.set()
                     return
-                output = result.stdout or ""
-                if output != last_output:
-                    counters["output_bytes"] += len(output.encode("utf-8", errors="ignore"))
+                if chunk:
+                    counters["output_bytes"] += len(chunk)
                     await websocket.send_json({
                         "type": "output",
-                        "mode": "snapshot",
-                        "data": output,
+                        "mode": "stream",
+                        "encoding": "base64",
+                        "data": base64.b64encode(chunk).decode("ascii"),
                     })
-                    last_output = output
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
-                except asyncio.TimeoutError:
-                    pass
+
+        async def write_pty(data: bytes) -> bool:
+            if master_fd is None:
+                return False
+            return await asyncio.to_thread(write_pty_all, master_fd, data)
 
         async def receive_loop() -> None:
+            nonlocal current_rows, current_cols
             while not stop_event.is_set():
                 frame = await websocket.receive_json()
                 frame_type = str(frame.get("type") or "").strip().lower()
@@ -4848,45 +4934,20 @@ def create_app(
                         stop_event.set()
                         return
                     if data:
-                        counters["input_bytes"] += len(data.encode("utf-8", errors="ignore"))
-                        result = await _mobile_terminal_tmux_run(
-                            ticket,
-                            "send-keys",
-                            "-t",
-                            ticket.tmux_session,
-                            "-l",
-                            data,
-                        )
-                        if result.returncode != 0:
+                        raw = data.encode("utf-8", errors="ignore")
+                        counters["input_bytes"] += len(raw)
+                        if not await write_pty(raw):
                             await websocket.send_json({"type": "error", "message": "failed to deliver terminal input"})
                             stop_event.set()
                             return
                 elif frame_type == "key":
                     key = str(frame.get("key") or "").strip().lower()
-                    key_map = {
-                        "enter": "Enter",
-                        "esc": "Escape",
-                        "escape": "Escape",
-                        "tab": "Tab",
-                        "backspace": "BSpace",
-                        "ctrl-c": "C-c",
-                        "ctrl-d": "C-d",
-                        "ctrl-z": "C-z",
-                        "ctrl-b": "C-b",
-                    }
-                    tmux_key = key_map.get(key)
-                    if not tmux_key:
+                    raw = _mobile_terminal_key_bytes(key)
+                    if raw is None:
                         await websocket.send_json({"type": "error", "message": f"unsupported key: {key}"})
                         continue
-                    counters["input_bytes"] += 1
-                    result = await _mobile_terminal_tmux_run(
-                        ticket,
-                        "send-keys",
-                        "-t",
-                        ticket.tmux_session,
-                        tmux_key,
-                    )
-                    if result.returncode != 0:
+                    counters["input_bytes"] += len(raw)
+                    if not await write_pty(raw):
                         await websocket.send_json({"type": "error", "message": "failed to deliver terminal key"})
                         stop_event.set()
                         return
@@ -4896,19 +4957,14 @@ def create_app(
                     if not (10 <= rows <= 120 and 20 <= cols <= 300):
                         await websocket.send_json({"type": "error", "message": "ignored invalid resize"})
                     else:
-                        result = await _mobile_terminal_tmux_run(
-                            ticket,
-                            "resize-window",
-                            "-t",
-                            ticket.tmux_session,
-                            "-x",
-                            str(cols),
-                            "-y",
-                            str(rows),
-                        )
-                        if result.returncode != 0:
-                            await websocket.send_json({"type": "error", "message": "failed to resize terminal"})
-                            continue
+                        if master_fd is not None:
+                            try:
+                                await asyncio.to_thread(_mobile_terminal_set_pty_size, master_fd, rows, cols)
+                            except OSError:
+                                await websocket.send_json({"type": "error", "message": "failed to resize terminal"})
+                                continue
+                        current_rows = rows
+                        current_cols = cols
                         await websocket.send_json({"type": "status", "state": "resized", "rows": rows, "cols": cols})
                 elif frame_type == "ping":
                     await websocket.send_json({"type": "status", "state": "pong"})
@@ -4918,13 +4974,25 @@ def create_app(
                 else:
                     await websocket.send_json({"type": "error", "message": "unsupported terminal frame"})
 
-        await send_status("attached", session_id=ticket.session_id)
-        capture_task = asyncio.create_task(capture_loop())
+        try:
+            master_fd, attach_proc = await asyncio.to_thread(start_attach_client)
+        except Exception:
+            logger.exception("failed to start mobile terminal attach client")
+            await websocket.send_json({"type": "error", "message": "failed to attach tmux session"})
+            return
+
+        await send_status(
+            "attached",
+            session_id=ticket.session_id,
+            rows=current_rows,
+            cols=current_cols,
+        )
+        output_task = asyncio.create_task(output_loop())
         receive_task = asyncio.create_task(receive_loop())
         timeout_task = asyncio.create_task(asyncio.sleep(max_attach_seconds))
         try:
             done, pending = await asyncio.wait(
-                {capture_task, receive_task, timeout_task},
+                {output_task, receive_task, timeout_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if timeout_task in done and not stop_event.is_set():
@@ -4934,9 +5002,20 @@ def create_app(
                 task.cancel()
         finally:
             stop_event.set()
-            for task in (capture_task, receive_task, timeout_task):
+            for task in (output_task, receive_task, timeout_task):
                 if not task.done():
                     task.cancel()
+            if attach_proc is not None and attach_proc.poll() is None:
+                attach_proc.terminate()
+                try:
+                    await asyncio.to_thread(attach_proc.wait, 2)
+                except subprocess.TimeoutExpired:
+                    attach_proc.kill()
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
             active = getattr(app.state, "mobile_terminal_active_attaches", {})
             active.pop(attach_id, None)
             _audit_mobile_terminal(

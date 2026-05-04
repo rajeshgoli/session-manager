@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock
 import base64
-import subprocess
+import os
 import time
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from src.models import Session, SessionStatus
-from src.server import _issue_device_access_token, create_app
+from src.server import _issue_device_access_token, _mobile_terminal_key_bytes, create_app
 
 
 def _android_config() -> dict:
@@ -563,17 +563,31 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
 
     commands = []
 
-    def fake_run(args, capture_output, text, check, timeout):
-        commands.append(args)
-        if "capture-pane" in args:
-            return subprocess.CompletedProcess(args, 0, stdout="live pane output", stderr="")
-        if "send-keys" in args:
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        if "resize-window" in args:
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected tmux command")
+    class FakePopen:
+        def __init__(self, args, stdin, stdout, stderr, close_fds, start_new_session, env):
+            commands.append(args)
+            self.returncode = None
+            self.output_fd = os.dup(stdout)
+            os.write(self.output_fd, b"live pane output")
 
-    monkeypatch.setattr("src.server.subprocess.run", fake_run)
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+            try:
+                os.close(self.output_fd)
+            except OSError:
+                pass
+
+        def wait(self, timeout=None):
+            self.terminate()
+            return 0
+
+        def kill(self):
+            self.terminate()
+
+    monkeypatch.setattr("src.server.subprocess.Popen", FakePopen)
 
     with client.websocket_connect("/client/terminal") as websocket:
         websocket.send_json(
@@ -590,15 +604,26 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
                 ),
             }
         )
-        assert websocket.receive_json() == {"type": "status", "state": "attached", "session_id": session.id}
+        attached = websocket.receive_json()
+        assert attached["type"] == "status"
+        assert attached["state"] == "attached"
+        assert attached["session_id"] == session.id
         output = websocket.receive_json()
-        assert output == {"type": "output", "mode": "snapshot", "data": "live pane output"}
-        websocket.send_json({"type": "input", "data": "hello"})
-        websocket.send_json({"type": "key", "key": "enter"})
+        assert output["type"] == "output"
+        assert output["mode"] == "stream"
+        assert output["encoding"] == "base64"
+        assert base64.b64decode(output["data"]) == b"live pane output"
         websocket.send_json({"type": "resize", "rows": 32, "cols": 120})
         assert websocket.receive_json() == {"type": "status", "state": "resized", "rows": 32, "cols": 120}
         websocket.send_json({"type": "detach"})
-    assert any("resize-window" in command for command in commands)
+    assert any("attach-session" in command for command in commands)
+
+
+def test_mobile_terminal_key_bytes_use_terminal_control_sequences():
+    assert _mobile_terminal_key_bytes("enter") == b"\r"
+    assert _mobile_terminal_key_bytes("esc") == b"\x1b"
+    assert _mobile_terminal_key_bytes("ctrl-c") == b"\x03"
+    assert _mobile_terminal_key_bytes("unsupported") is None
 
 
 def test_mobile_terminal_websocket_enforces_active_attach_limit_at_consume_time():

@@ -1,0 +1,159 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="stylesheet" href="vendor/xterm.css">
+  <style>
+    html, body, #terminal {
+      background: #05080d;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      width: 100%;
+    }
+    .terminal {
+      height: 100%;
+      padding: 8px;
+    }
+    .xterm .xterm-viewport {
+      background-color: transparent;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script>
+    const fitAddon = new FitAddon.FitAddon();
+    const term = new Terminal({
+      allowProposedApi: false,
+      convertEol: false,
+      cursorBlink: true,
+      cursorStyle: "block",
+      disableStdin: false,
+      fontFamily: "monospace",
+      fontSize: 13,
+      letterSpacing: 0,
+      lineHeight: 1.12,
+      scrollback: 4000,
+      theme: {
+        background: "#05080d",
+        foreground: "#e7f6f2",
+        cursor: "#2dd4bf",
+        black: "#111827",
+        red: "#fb7185",
+        green: "#34d399",
+        yellow: "#f59e0b",
+        blue: "#60a5fa",
+        magenta: "#c084fc",
+        cyan: "#22d3ee",
+        white: "#f8fafc",
+        brightBlack: "#475569",
+        brightRed: "#f43f5e",
+        brightGreen: "#10b981",
+        brightYellow: "#fbbf24",
+        brightBlue: "#3b82f6",
+        brightMagenta: "#a855f7",
+        brightCyan: "#06b6d4",
+        brightWhite: "#ffffff"
+      }
+    });
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById("terminal"));
+
+    let ready = false;
+    let lastResize = "";
+
+    function bridge() {
+      return window.TerminalBridge;
+    }
+
+    function reportResize() {
+      const key = `${term.cols}x${term.rows}`;
+      if (key === lastResize) {
+        return;
+      }
+      lastResize = key;
+      if (bridge()) {
+        bridge().resize(term.cols, term.rows);
+      }
+    }
+
+    function reportReady() {
+      if (bridge()) {
+        bridge().ready(term.cols, term.rows);
+      }
+    }
+
+    function fitAndReport() {
+      try {
+        fitAddon.fit();
+        reportResize();
+      } catch (_) {
+      }
+    }
+
+    term.onData((data) => {
+      if (bridge()) {
+        bridge().input(data);
+      }
+    });
+
+    term.onResize(() => reportResize());
+
+    window.addEventListener("resize", fitAndReport);
+
+    window.smFocus = function() {
+      term.focus();
+    };
+
+    window.smWriteBase64 = function(payload) {
+      const binary = atob(payload);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      term.write(bytes);
+    };
+
+    window.smWriteText = function(text) {
+      term.write(text);
+    };
+
+    window.smSetStatus = function(status) {
+      if (!ready) {
+        ready = true;
+        fitAndReport();
+        reportReady();
+      }
+    };
+
+    window.smCopySelection = function() {
+      let text = term.getSelection() || "";
+      if (!text) {
+        const buffer = term.buffer.active;
+        const lines = [];
+        for (let i = 0; i < buffer.length; i += 1) {
+          const line = buffer.getLine(i);
+          if (line) {
+            lines.push(line.translateToString(true));
+          }
+        }
+        text = lines.join("\n").trimEnd();
+      }
+      if (bridge()) {
+        bridge().copy(text);
+      }
+    };
+
+    setTimeout(() => {
+      ready = true;
+      fitAndReport();
+      reportReady();
+      term.focus();
+    }, 80);
+  </script>
+</body>
+</html>

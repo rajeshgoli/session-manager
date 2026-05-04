@@ -1,12 +1,19 @@
 package li.rajeshgo.sm.ui.watch
 
+import android.annotation.SuppressLint
+import android.os.Handler
+import android.os.Looper
+import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -66,6 +73,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -73,6 +81,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import org.json.JSONObject
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
@@ -378,10 +387,13 @@ fun WatchScreen(
                 onEsc = { viewModel.sendTerminalKey("esc") },
                 onCtrlC = { viewModel.sendTerminalKey("ctrl-c") },
                 onEnter = { viewModel.sendTerminalKey("enter") },
+                onTerminalInput = viewModel::sendTerminalData,
+                onTerminalResize = viewModel::resizeTerminal,
                 onDetach = viewModel::detachTerminal,
-                onCopy = {
+                onCopy = { selectedText ->
                     val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", terminal.output))
+                    val copiedText = selectedText.ifBlank { terminal.copyBuffer }
+                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", copiedText))
                     toast = "Terminal output copied"
                 },
             )
@@ -397,9 +409,13 @@ private fun MobileTerminalOverlay(
     onEsc: () -> Unit,
     onCtrlC: () -> Unit,
     onEnter: () -> Unit,
+    onTerminalInput: (String) -> Unit,
+    onTerminalResize: (cols: Int, rows: Int) -> Unit,
     onDetach: () -> Unit,
-    onCopy: () -> Unit,
+    onCopy: (String) -> Unit,
 ) {
+    var copyRequest by remember { mutableStateOf(0L) }
+
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background,
@@ -455,15 +471,12 @@ private fun MobileTerminalOverlay(
                 color = Color.Black,
                 border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
             ) {
-                Text(
-                    text = terminal.output.ifBlank { "Waiting for terminal output..." },
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState())
-                        .padding(12.dp),
-                    color = Color(0xFFE7F6F2),
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
+                TerminalWebView(
+                    terminal = terminal,
+                    copyRequest = copyRequest,
+                    onInput = onTerminalInput,
+                    onResize = onTerminalResize,
+                    onCopyText = onCopy,
                 )
             }
 
@@ -471,7 +484,7 @@ private fun MobileTerminalOverlay(
                 OutlinedButton(onClick = onEsc) { Text("Esc") }
                 OutlinedButton(onClick = onCtrlC) { Text("Ctrl-C") }
                 OutlinedButton(onClick = onEnter) { Text("Enter") }
-                OutlinedButton(onClick = onCopy) { Text("Copy") }
+                OutlinedButton(onClick = { copyRequest += 1 }) { Text("Copy") }
             }
 
             Row(
@@ -494,6 +507,118 @@ private fun MobileTerminalOverlay(
         }
     }
 }
+
+@SuppressLint("SetJavaScriptEnabled")
+@Suppress("DEPRECATION")
+@Composable
+private fun TerminalWebView(
+    terminal: TerminalUiState,
+    copyRequest: Long,
+    onInput: (String) -> Unit,
+    onResize: (cols: Int, rows: Int) -> Unit,
+    onCopyText: (String) -> Unit,
+) {
+    var deliveredSequence by remember { mutableStateOf(0L) }
+    var deliveredCopyRequest by remember { mutableStateOf(0L) }
+    var terminalReady by remember { mutableStateOf(false) }
+    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            webViewRef?.destroy()
+            webViewRef = null
+        }
+    }
+
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { context ->
+            WebView(context).apply {
+                setBackgroundColor(android.graphics.Color.rgb(5, 8, 13))
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = false
+                settings.allowContentAccess = false
+                settings.allowFileAccess = true
+                settings.allowFileAccessFromFileURLs = false
+                settings.allowUniversalAccessFromFileURLs = false
+                settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                settings.blockNetworkLoads = true
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                        return true
+                    }
+                }
+                addJavascriptInterface(
+                    TerminalJavascriptBridge(
+                        onInput = onInput,
+                        onResize = onResize,
+                        onCopyText = onCopyText,
+                        onReady = { cols, rows ->
+                            terminalReady = true
+                            onResize(cols, rows)
+                        },
+                    ),
+                    "TerminalBridge",
+                )
+                loadUrl("file:///android_asset/sm_terminal/terminal.html")
+                webViewRef = this
+            }
+        },
+        update = { webView ->
+            webView.evaluateJavascript("window.smSetStatus(${jsString(terminal.status)});", null)
+            if (terminalReady) {
+                terminal.outputFrames
+                    .filter { it.sequence > deliveredSequence }
+                    .forEach { frame ->
+                        if (frame.encoding == "base64") {
+                            webView.evaluateJavascript("window.smWriteBase64(${jsString(frame.data)});", null)
+                        } else {
+                            webView.evaluateJavascript("window.smWriteText(${jsString(frame.data)});", null)
+                        }
+                        deliveredSequence = frame.sequence
+                    }
+                if (terminal.outputFrames.isNotEmpty()) {
+                    webView.evaluateJavascript("window.smFocus();", null)
+                }
+            }
+            if (copyRequest != deliveredCopyRequest) {
+                deliveredCopyRequest = copyRequest
+                webView.evaluateJavascript("window.smCopySelection();", null)
+            }
+        },
+    )
+}
+
+private class TerminalJavascriptBridge(
+    private val onInput: (String) -> Unit,
+    private val onResize: (cols: Int, rows: Int) -> Unit,
+    private val onCopyText: (String) -> Unit,
+    private val onReady: (cols: Int, rows: Int) -> Unit,
+) {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    @JavascriptInterface
+    fun input(data: String) {
+        mainHandler.post { onInput(data) }
+    }
+
+    @JavascriptInterface
+    fun resize(cols: Int, rows: Int) {
+        mainHandler.post { onResize(cols, rows) }
+    }
+
+    @JavascriptInterface
+    fun copy(text: String) {
+        mainHandler.post { onCopyText(text) }
+    }
+
+    @JavascriptInterface
+    fun ready(cols: Int, rows: Int) {
+        mainHandler.post { onReady(cols, rows) }
+    }
+}
+
+private fun jsString(value: String): String = JSONObject.quote(value)
 
 @Composable
 private fun HeaderBar(
