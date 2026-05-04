@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -64,6 +65,10 @@ data class WatchUiState(
 )
 
 class WatchViewModel(application: Application) : AndroidViewModel(application) {
+    private companion object {
+        private const val MOBILE_TERMINAL_SOCKET_RETRY_DELAY_MS = 600L
+    }
+
     private val settingsRepository = SettingsRepository(application)
     private val sessionRepository = SessionManagerRepository()
     private val deviceKeyManager = DeviceKeyManager()
@@ -272,116 +277,167 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     status = "requesting ticket",
                 )
             )
-            val proof = runCatching {
-                deviceKeyManager.signTicketRequest(
-                    method = "POST",
-                    path = path,
-                    sessionId = session.id,
-                    actorEmail = actorEmail,
-                )
-            }.getOrElse { error ->
-                clearTerminalIfCurrent(attachToken)
-                onComplete(Result.failure(error))
-                return@launch
-            }
-            val ticketResult = sessionRepository.createMobileAttachTicket(serverUrl, accessToken, session.id, proof)
-            ticketResult.onFailure { error ->
-                updateTerminalIfCurrent(attachToken) { it.copy(status = "failed", error = error.message) }
-                onComplete(Result.failure(error))
-                return@launch
-            }
-            val ticket = ticketResult.getOrThrow()
-            val wsNonce = UUID.randomUUID().toString()
-            val wsSignature = runCatching {
-                deviceKeyManager.signWebSocketAuth(
-                    ticketId = ticket.ticketId,
-                    sessionId = session.id,
-                    actorEmail = actorEmail,
-                    deviceKeyId = ticket.deviceKeyId,
-                    nonce = wsNonce,
-                )
-            }.getOrElse { error ->
-                updateTerminalIfCurrent(attachToken) { it.copy(status = "failed", error = error.message) }
-                onComplete(Result.failure(error))
-                return@launch
-            }
-            terminalSocket?.close(1000, "new attach")
-            terminalSocket = sessionRepository.openMobileTerminalSocket(ticket, accessToken, object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    val frame = JSONObject()
-                        .put("type", "auth")
-                        .put("ticket_id", ticket.ticketId)
-                        .put("ticket_secret", ticket.ticketSecret)
-                        .put("device_key_id", ticket.deviceKeyId)
-                        .put("nonce", wsNonce)
-                        .put("signature", wsSignature)
-                    webSocket.send(frame.toString())
-                    pendingTerminalResize?.let { (cols, rows) ->
-                        webSocket.send(terminalResizeFrame(cols, rows).toString())
-                    }
-                    viewModelScope.launch {
-                        updateTerminalIfCurrent(attachToken) { it.copy(status = "authenticating", error = null) }
-                    }
-                }
+            var completionSent = false
 
-                override fun onMessage(webSocket: WebSocket, text: String) {
-                    val payload = runCatching { JSONObject(text) }.getOrNull() ?: return
-                    viewModelScope.launch {
-                        when (payload.optString("type")) {
-                            "output" -> updateTerminalIfCurrent(attachToken) { current ->
-                                val data = payload.optString("data")
-                                val encoding = payload.optString("encoding", "text")
-                                val mode = payload.optString("mode")
-                                val sequence = current.outputSequence + 1
-                                val byteCount = terminalOutputByteCount(data, encoding)
-                                current.copy(
-                                    status = "attached",
-                                    outputFrames = (
-                                        current.outputFrames + TerminalOutputFrame(
-                                            sequence = sequence,
-                                            data = data,
-                                            encoding = encoding,
-                                        )
-                                    ).takeLast(500),
-                                    outputSequence = sequence,
-                                    outputFrameCount = current.outputFrameCount + 1,
-                                    outputByteCount = current.outputByteCount + byteCount,
-                                    copyBuffer = if (encoding == "base64") {
-                                        current.copyBuffer
-                                    } else if (mode == "snapshot") {
-                                        data
-                                    } else {
-                                        (current.copyBuffer + data).takeLast(200_000)
-                                    },
-                                    error = null,
-                                )
+            fun completeOnce(result: Result<String>) {
+                if (!completionSent) {
+                    completionSent = true
+                    onComplete(result)
+                }
+            }
+
+            fun failInitialAttach(error: Throwable) {
+                updateTerminalIfCurrent(attachToken) { it.copy(status = "failed", error = error.message) }
+                completeOnce(Result.failure(error))
+            }
+
+            suspend fun connectSocket(attempt: Int) {
+                if (terminalAttachToken != attachToken) {
+                    return
+                }
+                updateTerminalIfCurrent(attachToken) {
+                    it.copy(
+                        status = if (attempt == 0) "requesting ticket" else "retrying attach",
+                        error = if (attempt == 0) null else it.error,
+                    )
+                }
+                val proof = runCatching {
+                    deviceKeyManager.signTicketRequest(
+                        method = "POST",
+                        path = path,
+                        sessionId = session.id,
+                        actorEmail = actorEmail,
+                    )
+                }.getOrElse { error ->
+                    if (attempt == 0) {
+                        clearTerminalIfCurrent(attachToken)
+                        completeOnce(Result.failure(error))
+                    } else {
+                        failInitialAttach(error)
+                    }
+                    return
+                }
+                val ticketResult = sessionRepository.createMobileAttachTicket(serverUrl, accessToken, session.id, proof)
+                ticketResult.onFailure { error ->
+                    failInitialAttach(error)
+                    return
+                }
+                val ticket = ticketResult.getOrThrow()
+                val wsNonce = UUID.randomUUID().toString()
+                val wsSignature = runCatching {
+                    deviceKeyManager.signWebSocketAuth(
+                        ticketId = ticket.ticketId,
+                        sessionId = session.id,
+                        actorEmail = actorEmail,
+                        deviceKeyId = ticket.deviceKeyId,
+                        nonce = wsNonce,
+                    )
+                }.getOrElse { error ->
+                    failInitialAttach(error)
+                    return
+                }
+                terminalSocket?.close(1000, if (attempt == 0) "new attach" else "retry attach")
+                terminalSocket = sessionRepository.openMobileTerminalSocket(ticket, accessToken, object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) {
+                        val frame = JSONObject()
+                            .put("type", "auth")
+                            .put("ticket_id", ticket.ticketId)
+                            .put("ticket_secret", ticket.ticketSecret)
+                            .put("device_key_id", ticket.deviceKeyId)
+                            .put("nonce", wsNonce)
+                            .put("signature", wsSignature)
+                        webSocket.send(frame.toString())
+                        pendingTerminalResize?.let { (cols, rows) ->
+                            webSocket.send(terminalResizeFrame(cols, rows).toString())
+                        }
+                        viewModelScope.launch {
+                            if (terminalSocket == webSocket) {
+                                updateTerminalIfCurrent(attachToken) { it.copy(status = "authenticating", error = null) }
                             }
-                            "status" -> updateTerminalIfCurrent(attachToken) {
-                                it.copy(status = payload.optString("state", it.status))
-                            }
-                            "error" -> updateTerminalIfCurrent(attachToken) {
-                                it.copy(error = payload.optString("message", "Terminal error"))
-                            }
-                            "exit" -> updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
                         }
                     }
-                }
 
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    viewModelScope.launch {
-                        updateTerminalIfCurrent(attachToken) {
-                            it.copy(status = "failed", error = t.message ?: "Terminal socket failed")
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        val payload = runCatching { JSONObject(text) }.getOrNull() ?: return
+                        viewModelScope.launch {
+                            if (terminalSocket != webSocket) {
+                                return@launch
+                            }
+                            when (payload.optString("type")) {
+                                "output" -> updateTerminalIfCurrent(attachToken) { current ->
+                                    val data = payload.optString("data")
+                                    val encoding = payload.optString("encoding", "text")
+                                    val mode = payload.optString("mode")
+                                    val sequence = current.outputSequence + 1
+                                    val byteCount = terminalOutputByteCount(data, encoding)
+                                    current.copy(
+                                        status = "attached",
+                                        outputFrames = (
+                                            current.outputFrames + TerminalOutputFrame(
+                                                sequence = sequence,
+                                                data = data,
+                                                encoding = encoding,
+                                            )
+                                        ).takeLast(500),
+                                        outputSequence = sequence,
+                                        outputFrameCount = current.outputFrameCount + 1,
+                                        outputByteCount = current.outputByteCount + byteCount,
+                                        copyBuffer = if (encoding == "base64") {
+                                            current.copyBuffer
+                                        } else if (mode == "snapshot") {
+                                            data
+                                        } else {
+                                            (current.copyBuffer + data).takeLast(200_000)
+                                        },
+                                        error = null,
+                                    )
+                                }
+                                "status" -> updateTerminalIfCurrent(attachToken) {
+                                    it.copy(status = payload.optString("state", it.status))
+                                }
+                                "error" -> updateTerminalIfCurrent(attachToken) {
+                                    it.copy(error = payload.optString("message", "Terminal error"))
+                                }
+                                "exit" -> updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
+                            }
                         }
                     }
-                }
 
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    viewModelScope.launch {
-                        updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                        viewModelScope.launch {
+                            if (terminalSocket != webSocket || terminalAttachToken != attachToken) {
+                                return@launch
+                            }
+                            val message = mobileTerminalSocketFailureMessage(t, response)
+                            val retryable = attempt == 0 && sessionRepository.isRetryableMobileTerminalSocketFailure(response?.code, t.message)
+                            if (retryable) {
+                                terminalSocket = null
+                                updateTerminalIfCurrent(attachToken) {
+                                    it.copy(status = "retrying attach", error = "$message; retrying once")
+                                }
+                                delay(MOBILE_TERMINAL_SOCKET_RETRY_DELAY_MS)
+                                connectSocket(attempt + 1)
+                                return@launch
+                            }
+                            updateTerminalIfCurrent(attachToken) {
+                                it.copy(status = "failed", error = message)
+                            }
+                        }
                     }
-                }
-            })
-            onComplete(Result.success("Opening terminal for ${sessionDisplayName(session)}"))
+
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        viewModelScope.launch {
+                            if (terminalSocket == webSocket) {
+                                terminalSocket = null
+                                updateTerminalIfCurrent(attachToken) { it.copy(status = "detached") }
+                            }
+                        }
+                    }
+                })
+                completeOnce(Result.success("Opening terminal for ${sessionDisplayName(session)}"))
+            }
+
+            connectSocket(attempt = 0)
         }
     }
 
@@ -521,6 +577,13 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             data.length.toLong()
         }
+    }
+
+    private fun mobileTerminalSocketFailureMessage(error: Throwable, response: Response?): String {
+        val base = error.message ?: "Terminal socket failed"
+        val code = response?.code ?: return base
+        val reason = response.message.takeIf { it.isNotBlank() } ?: "HTTP error"
+        return "$reason ($code): $base"
     }
 
     fun requestStatus(onComplete: (Result<String>) -> Unit) {

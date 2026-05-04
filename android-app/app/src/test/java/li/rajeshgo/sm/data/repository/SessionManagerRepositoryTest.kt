@@ -2,7 +2,9 @@ package li.rajeshgo.sm.data.repository
 
 import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SessionManagerRepositoryTest {
@@ -69,6 +71,24 @@ class SessionManagerRepositoryTest {
         val request = repository.mobileTerminalSocketRequest(ticket(), " ")
 
         assertNull(request.header("Authorization"))
+    }
+
+    @Test
+    fun mobileTerminalSocketRetryableFailureRecognizesUpgradeMisdirection() {
+        val repository = SessionManagerRepository()
+
+        assertTrue(repository.isRetryableMobileTerminalSocketFailure(404, "Expected HTTP 101 response"))
+        assertTrue(repository.isRetryableMobileTerminalSocketFailure(426, null))
+        assertTrue(repository.isRetryableMobileTerminalSocketFailure(503, null))
+        assertTrue(repository.isRetryableMobileTerminalSocketFailure(null, "Expected HTTP 101 response but was 404"))
+    }
+
+    @Test
+    fun mobileTerminalSocketRetryableFailureRejectsAuthAndGenericErrors() {
+        val repository = SessionManagerRepository()
+
+        assertFalse(repository.isRetryableMobileTerminalSocketFailure(401, "Unauthorized"))
+        assertFalse(repository.isRetryableMobileTerminalSocketFailure(null, "timeout"))
     }
 
     private fun ticket(): MobileAttachTicketResponse {

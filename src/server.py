@@ -5112,6 +5112,23 @@ def create_app(
                 output_bytes=counters["output_bytes"],
             )
 
+    @app.get("/client/terminal")
+    async def mobile_terminal_websocket_required(request: Request):
+        """Make non-WebSocket terminal hits diagnosable instead of a blind 404."""
+        _audit_mobile_terminal(
+            "websocket_upgrade_missing",
+            host=request.headers.get("host"),
+            upgrade=request.headers.get("upgrade"),
+            connection=request.headers.get("connection"),
+            has_sec_websocket_key=bool(request.headers.get("sec-websocket-key")),
+            remote_addr=request.client.host if request.client else None,
+        )
+        return JSONResponse(
+            status_code=426,
+            content={"detail": "mobile terminal requires a WebSocket upgrade"},
+            headers={"Upgrade": "websocket", "Connection": "Upgrade"},
+        )
+
     @app.websocket("/client/terminal")
     async def mobile_terminal_websocket(websocket: WebSocket):
         """Authenticated mobile terminal stream over the public HTTPS origin."""

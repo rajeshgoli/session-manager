@@ -261,6 +261,13 @@ class SessionManagerRepository {
         return builder.build()
     }
 
+    fun isRetryableMobileTerminalSocketFailure(httpStatusCode: Int?, message: String?): Boolean {
+        if (httpStatusCode in setOf(404, 426, 502, 503, 504)) {
+            return true
+        }
+        return message.orEmpty().contains("Expected HTTP 101 response", ignoreCase = true)
+    }
+
     suspend fun requestStatus(baseUrl: String, token: String): Result<RequestStatusResponse> = withContext(Dispatchers.IO) {
         runCatching {
             api(baseUrl, token).requestStatus()
