@@ -135,8 +135,7 @@
       if (!text) {
         const buffer = term.buffer.active;
         const lines = [];
-        const start = Math.max(0, buffer.length - term.rows);
-        for (let i = start; i < buffer.length; i += 1) {
+        for (let i = 0; i < buffer.length; i += 1) {
           const line = buffer.getLine(i);
           if (line) {
             lines.push(line.translateToString(true));
