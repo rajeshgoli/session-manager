@@ -222,9 +222,9 @@ def _sign_mobile_ticket_headers(
     actor_email: str = "local_bypass",
     path: str | None = None,
     timestamp: str | None = None,
+    nonce: str = "nonce-1",
 ) -> dict[str, str]:
     timestamp = timestamp or str(time.time())
-    nonce = "nonce-1"
     message = "\n".join(
         [
             "SM-MOBILE-TERMINAL-TICKET-V1",
@@ -471,6 +471,58 @@ def test_mobile_attach_ticket_requires_registered_device_signature():
     assert payload["device_key_id"] == "test-device"
     assert payload["ws_url"] == "wss://sm.rajeshgo.li/client/terminal"
     assert payload["ticket_secret"] not in payload["ws_url"]
+
+
+def test_mobile_attach_ticket_retry_replaces_pending_same_user_device_ticket():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app)
+
+    first = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+    second = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id, nonce="nonce-2"),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["ticket_id"] != second.json()["ticket_id"]
+    assert list(app.state.mobile_terminal_tickets) == [second.json()["ticket_id"]]
+
+
+def test_mobile_attach_ticket_retry_still_rejects_active_attach_for_user():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    app.state.mobile_terminal_active_attaches["active-1"] = {
+        "user_id": "local_bypass",
+        "session_id": "other-session",
+        "provider": "claude",
+        "device_key_id": "test-device",
+        "started_at": time.time(),
+    }
+    client = TestClient(app)
+
+    response = client.post(
+        f"/client/sessions/{session.id}/attach-ticket",
+        json={},
+        headers=_sign_mobile_ticket_headers(private_key, session.id),
+    )
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Too many active mobile attaches for user"
 
 
 def test_mobile_attach_ticket_rejects_non_finite_device_timestamp():

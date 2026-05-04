@@ -4627,6 +4627,13 @@ def create_app(
         ttl_seconds = _mobile_terminal_int("ticket_ttl_seconds", 30, minimum=5, maximum=300)
         async with app.state.mobile_terminal_lock:
             _mobile_terminal_cleanup_expired_tickets(now)
+            for existing_id, existing_ticket in list(app.state.mobile_terminal_tickets.items()):
+                if (
+                    existing_ticket.user_id == user_id
+                    and existing_ticket.device_key_id == str(device_config.get("id") or "")
+                    and existing_ticket.consumed_at is None
+                ):
+                    app.state.mobile_terminal_tickets.pop(existing_id, None)
             active = list(app.state.mobile_terminal_active_attaches.values())
             pending = list(app.state.mobile_terminal_tickets.values())
             max_global = _mobile_terminal_int("max_concurrent_attaches_global", 4, minimum=1, maximum=64)
