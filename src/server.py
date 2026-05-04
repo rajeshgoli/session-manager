@@ -91,8 +91,11 @@ DISPLAY_IDENTITY_SYNC_TIMEOUT_SECONDS = 1.0
 MOBILE_TERMINAL_INPUT_MAX_CHARS = 8192
 MOBILE_TERMINAL_TMUX_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.:@-]+$")
 MOBILE_TERMINAL_SOCKET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+MOBILE_TERMINAL_MIN_ROWS = 2
+MOBILE_TERMINAL_MIN_COLS = 10
 MOBILE_TERMINAL_DEFAULT_ROWS = 24
 MOBILE_TERMINAL_DEFAULT_COLS = 80
+MOBILE_TERMINAL_INITIAL_RESIZE_WAIT_SECONDS = 2.0
 DEFAULT_APP_ARTIFACTS_ROOT = Path(__file__).resolve().parents[1] / "data" / "apps"
 DEFAULT_BUG_REPORTS_DB = Path(__file__).resolve().parents[1] / "data" / "bug_reports.db"
 DEFAULT_EMAIL_INBOUND_WEBHOOK_PATH = "/api/email-inbound"
@@ -2361,6 +2364,23 @@ def create_app(
         try:
             value = int(_mobile_terminal_config().get(name, default))
         except (TypeError, ValueError):
+            value = default
+        value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _mobile_terminal_float(
+        name: str,
+        default: float,
+        minimum: float = 0.0,
+        maximum: Optional[float] = None,
+    ) -> float:
+        try:
+            value = float(_mobile_terminal_config().get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        if not math.isfinite(value):
             value = default
         value = max(minimum, value)
         if maximum is not None:
@@ -4802,8 +4822,15 @@ def create_app(
     async def _run_mobile_terminal_bridge(websocket: WebSocket, ticket: MobileTerminalTicket, attach_id: str) -> None:
         """Bridge authenticated WebSocket frames to a real tmux attach PTY."""
         max_attach_seconds = _mobile_terminal_int("max_attach_seconds", 3600, minimum=30, maximum=24 * 3600)
+        initial_resize_wait_seconds = _mobile_terminal_float(
+            "initial_resize_wait_seconds",
+            MOBILE_TERMINAL_INITIAL_RESIZE_WAIT_SECONDS,
+            minimum=0.0,
+            maximum=10.0,
+        )
         stop_event = asyncio.Event()
         counters = {"input_bytes": 0, "output_bytes": 0}
+        pending_client_frames: list[dict[str, Any]] = []
         active = getattr(app.state, "mobile_terminal_active_attaches", {})
         if attach_id not in active or not _mobile_terminal_enabled():
             await websocket.send_json({
@@ -4823,6 +4850,72 @@ def create_app(
 
         async def send_status(state: str, **extra: Any) -> None:
             await websocket.send_json({"type": "status", "state": state, **extra})
+
+        def valid_terminal_size(rows: int, cols: int) -> bool:
+            return (
+                MOBILE_TERMINAL_MIN_ROWS <= rows <= 120
+                and MOBILE_TERMINAL_MIN_COLS <= cols <= 300
+            )
+
+        async def apply_resize_frame(frame: dict[str, Any], *, notify: bool) -> bool:
+            nonlocal current_rows, current_cols
+            rows = int(frame.get("rows") or 0)
+            cols = int(frame.get("cols") or 0)
+            if not valid_terminal_size(rows, cols):
+                if notify:
+                    await websocket.send_json({"type": "error", "message": "ignored invalid resize"})
+                return False
+            if master_fd is not None:
+                try:
+                    await asyncio.to_thread(_mobile_terminal_set_pty_size, master_fd, rows, cols)
+                except OSError:
+                    if notify:
+                        await websocket.send_json({"type": "error", "message": "failed to resize terminal"})
+                    return False
+            current_rows = rows
+            current_cols = cols
+            if notify:
+                await websocket.send_json({"type": "status", "state": "resized", "rows": rows, "cols": cols})
+            return True
+
+        async def receive_client_frame() -> dict[str, Any]:
+            if pending_client_frames:
+                return pending_client_frames.pop(0)
+            return await websocket.receive_json()
+
+        async def wait_for_initial_resize() -> None:
+            """Give the renderer a chance to size the PTY before tmux attaches."""
+            if initial_resize_wait_seconds <= 0:
+                return
+            deadline = time.monotonic() + initial_resize_wait_seconds
+            while not stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    frame = await asyncio.wait_for(websocket.receive_json(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return
+                frame_type = str(frame.get("type") or "").strip().lower()
+                if frame_type == "resize":
+                    if await apply_resize_frame(frame, notify=False):
+                        _audit_mobile_terminal(
+                            "initial_resize",
+                            user_id=ticket.user_id,
+                            session_id=ticket.session_id,
+                            provider=ticket.provider,
+                            rows=current_rows,
+                            cols=current_cols,
+                        )
+                        return
+                    continue
+                if frame_type == "ping":
+                    await websocket.send_json({"type": "status", "state": "pong"})
+                    continue
+                if frame_type == "detach":
+                    stop_event.set()
+                    return
+                pending_client_frames.append(frame)
 
         def start_attach_client() -> tuple[int, subprocess.Popen[Any]]:
             fd_master, fd_slave = pty.openpty()
@@ -4923,9 +5016,8 @@ def create_app(
             return await asyncio.to_thread(write_pty_all, master_fd, data)
 
         async def receive_loop() -> None:
-            nonlocal current_rows, current_cols
             while not stop_event.is_set():
-                frame = await websocket.receive_json()
+                frame = await receive_client_frame()
                 frame_type = str(frame.get("type") or "").strip().lower()
                 if frame_type == "input":
                     data = str(frame.get("data") or "")
@@ -4952,20 +5044,7 @@ def create_app(
                         stop_event.set()
                         return
                 elif frame_type == "resize":
-                    rows = int(frame.get("rows") or 0)
-                    cols = int(frame.get("cols") or 0)
-                    if not (10 <= rows <= 120 and 20 <= cols <= 300):
-                        await websocket.send_json({"type": "error", "message": "ignored invalid resize"})
-                    else:
-                        if master_fd is not None:
-                            try:
-                                await asyncio.to_thread(_mobile_terminal_set_pty_size, master_fd, rows, cols)
-                            except OSError:
-                                await websocket.send_json({"type": "error", "message": "failed to resize terminal"})
-                                continue
-                        current_rows = rows
-                        current_cols = cols
-                        await websocket.send_json({"type": "status", "state": "resized", "rows": rows, "cols": cols})
+                    await apply_resize_frame(frame, notify=True)
                 elif frame_type == "ping":
                     await websocket.send_json({"type": "status", "state": "pong"})
                 elif frame_type == "detach":
@@ -4973,6 +5052,10 @@ def create_app(
                     return
                 else:
                     await websocket.send_json({"type": "error", "message": "unsupported terminal frame"})
+
+        await wait_for_initial_resize()
+        if stop_event.is_set():
+            return
 
         try:
             master_fd, attach_proc = await asyncio.to_thread(start_attach_client)
