@@ -4828,6 +4828,12 @@ def create_app(
             fd_master, fd_slave = pty.openpty()
             try:
                 _mobile_terminal_set_pty_size(fd_slave, current_rows, current_cols)
+                child_env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"TMUX", "TMUX_PANE"}
+                }
+                child_env["TERM"] = "xterm-256color"
                 proc = subprocess.Popen(
                     _mobile_terminal_tmux_cmd(
                         ticket,
@@ -4840,7 +4846,7 @@ def create_app(
                     stderr=fd_slave,
                     close_fds=True,
                     start_new_session=True,
-                    env={**os.environ, "TERM": "xterm-256color"},
+                    env=child_env,
                 )
             except Exception:
                 os.close(fd_master)
