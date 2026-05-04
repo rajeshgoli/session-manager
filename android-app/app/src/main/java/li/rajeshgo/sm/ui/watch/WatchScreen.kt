@@ -13,6 +13,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -46,6 +48,7 @@ import androidx.compose.material.icons.rounded.UnfoldMore
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -69,6 +72,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -433,16 +437,16 @@ private fun MobileTerminalOverlay(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+                .padding(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Surface(
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(12.dp),
                 color = Panel,
                 border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
             ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -465,11 +469,15 @@ private fun MobileTerminalOverlay(
                             style = MaterialTheme.typography.labelSmall,
                             color = if (terminal.rendererError == null) TextMuted else Rose,
                             fontFamily = FontFamily.Monospace,
-                            maxLines = 2,
+                            maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    OutlinedButton(onClick = onDetach) {
+                    OutlinedButton(
+                        onClick = onDetach,
+                        modifier = Modifier.height(32.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                    ) {
                         Text("Detach")
                     }
                 }
@@ -485,7 +493,7 @@ private fun MobileTerminalOverlay(
 
             Surface(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(12.dp),
                 color = Color.Black,
                 border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
             ) {
@@ -502,16 +510,32 @@ private fun MobileTerminalOverlay(
                 )
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onEsc) { Text("Esc") }
-                OutlinedButton(onClick = onCtrlC) { Text("Ctrl-C") }
-                OutlinedButton(onClick = onEnter) { Text("Enter") }
-                OutlinedButton(onClick = { copyRequest += 1 }) { Text("Copy") }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                OutlinedButton(
+                    onClick = onEsc,
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                ) { Text("Esc") }
+                OutlinedButton(
+                    onClick = onCtrlC,
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                ) { Text("Ctrl-C") }
+                OutlinedButton(
+                    onClick = onEnter,
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                ) { Text("Enter") }
+                OutlinedButton(
+                    onClick = { copyRequest += 1 },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                ) { Text("Copy") }
             }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 OutlinedTextField(
@@ -520,9 +544,13 @@ private fun MobileTerminalOverlay(
                     modifier = Modifier.weight(1f),
                     label = { Text("Input") },
                     singleLine = false,
-                    maxLines = 4,
+                    maxLines = 2,
                 )
-                Button(onClick = onSend) {
+                Button(
+                    onClick = onSend,
+                    modifier = Modifier.height(42.dp),
+                    contentPadding = ButtonDefaults.ContentPadding,
+                ) {
                     Text("Send")
                 }
             }
@@ -557,7 +585,14 @@ private fun TerminalWebView(
     }
 
     AndroidView(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                detectVerticalDragGestures { change, dragAmount ->
+                    change.consume()
+                    webViewRef?.evaluateJavascript("window.smScrollPixels(${-dragAmount});", null)
+                }
+            },
         factory = { context ->
             WebView(context).apply {
                 setBackgroundColor(android.graphics.Color.rgb(5, 8, 13))
