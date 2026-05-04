@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -82,6 +83,7 @@ import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
@@ -538,14 +540,22 @@ private fun TerminalWebView(
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = false
                 settings.allowContentAccess = false
-                settings.allowFileAccess = true
+                settings.allowFileAccess = false
                 settings.allowFileAccessFromFileURLs = false
                 settings.allowUniversalAccessFromFileURLs = false
                 settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                settings.blockNetworkLoads = true
+                settings.blockNetworkLoads = false
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                        return true
+                        val url = request?.url ?: return true
+                        return url.scheme != "https" || url.host != TERMINAL_ASSET_HOST
+                    }
+
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                    ): WebResourceResponse {
+                        return terminalAssetResponse(context, request?.url)
                     }
                 }
                 addJavascriptInterface(
@@ -560,7 +570,7 @@ private fun TerminalWebView(
                     ),
                     "TerminalBridge",
                 )
-                loadUrl("file:///android_asset/sm_terminal/terminal.html")
+                loadUrl(TERMINAL_ASSET_URL)
                 webViewRef = this
             }
         },
@@ -586,6 +596,53 @@ private fun TerminalWebView(
                 webView.evaluateJavascript("window.smCopySelection();", null)
             }
         },
+    )
+}
+
+private const val TERMINAL_ASSET_HOST = "sm-terminal.local"
+private const val TERMINAL_ASSET_URL = "https://$TERMINAL_ASSET_HOST/terminal.html"
+
+private fun terminalAssetResponse(context: android.content.Context, uri: Uri?): WebResourceResponse {
+    if (uri?.scheme != "https" || uri.host != TERMINAL_ASSET_HOST) {
+        return blockedTerminalAssetResponse()
+    }
+    val assetPath = when (uri.path) {
+        "/terminal.html" -> "sm_terminal/terminal.html"
+        "/vendor/xterm.css" -> "sm_terminal/vendor/xterm.css"
+        "/vendor/xterm.js" -> "sm_terminal/vendor/xterm.js"
+        "/vendor/addon-fit.js" -> "sm_terminal/vendor/addon-fit.js"
+        else -> return blockedTerminalAssetResponse()
+    }
+    val mimeType = when {
+        assetPath.endsWith(".html") -> "text/html"
+        assetPath.endsWith(".css") -> "text/css"
+        assetPath.endsWith(".js") -> "application/javascript"
+        else -> "application/octet-stream"
+    }
+    return try {
+        WebResourceResponse(mimeType, "UTF-8", context.assets.open(assetPath)).apply {
+            setResponseHeaders(mapOf("Cache-Control" to "no-store"))
+        }
+    } catch (_: Exception) {
+        WebResourceResponse(
+            "text/plain",
+            "UTF-8",
+            404,
+            "Not Found",
+            mapOf("Cache-Control" to "no-store"),
+            ByteArrayInputStream(ByteArray(0)),
+        )
+    }
+}
+
+private fun blockedTerminalAssetResponse(): WebResourceResponse {
+    return WebResourceResponse(
+        "text/plain",
+        "UTF-8",
+        403,
+        "Forbidden",
+        mapOf("Cache-Control" to "no-store"),
+        ByteArrayInputStream(ByteArray(0)),
     )
 }
 
