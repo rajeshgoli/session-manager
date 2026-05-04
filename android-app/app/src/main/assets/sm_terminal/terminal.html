@@ -33,7 +33,7 @@
     .terminal {
       box-sizing: border-box;
       height: 100%;
-      padding: 8px;
+      padding: 4px;
     }
     .xterm .xterm-viewport {
       background-color: transparent;
@@ -84,9 +84,9 @@
       cursorStyle: "block",
       disableStdin: false,
       fontFamily: "monospace",
-      fontSize: 13,
+      fontSize: 12,
       letterSpacing: 0,
-      lineHeight: 1.12,
+      lineHeight: 1.06,
       scrollback: 4000,
       theme: {
         background: "#05080d",
@@ -212,21 +212,21 @@
       if (scrollHandlersInstalled || !opened) {
         return;
       }
-      const target = terminalViewport();
-      target.addEventListener("wheel", (event) => {
+      const target = terminalElement;
+      const onWheel = (event) => {
         if (scrollTerminalByPixels(event.deltaY)) {
           event.preventDefault();
         }
-      }, { passive: false });
-      target.addEventListener("touchstart", (event) => {
+      };
+      const onTouchStart = (event) => {
         if (event.touches.length !== 1) {
           lastTouchY = null;
           return;
         }
         lastTouchY = event.touches[0].clientY;
         touchScrollRemainder = 0;
-      }, { passive: false });
-      target.addEventListener("touchmove", (event) => {
+      };
+      const onTouchMove = (event) => {
         if (event.touches.length !== 1 || lastTouchY === null) {
           lastTouchY = null;
           return;
@@ -237,15 +237,16 @@
         if (scrollTerminalByPixels(deltaY)) {
           event.preventDefault();
         }
-      }, { passive: false });
-      target.addEventListener("touchend", () => {
+      };
+      const onTouchEnd = () => {
         lastTouchY = null;
         touchScrollRemainder = 0;
-      }, { passive: true });
-      target.addEventListener("touchcancel", () => {
-        lastTouchY = null;
-        touchScrollRemainder = 0;
-      }, { passive: true });
+      };
+      target.addEventListener("wheel", onWheel, { capture: true, passive: false });
+      target.addEventListener("touchstart", onTouchStart, { capture: true, passive: false });
+      target.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
+      target.addEventListener("touchend", onTouchEnd, { capture: true, passive: true });
+      target.addEventListener("touchcancel", onTouchEnd, { capture: true, passive: true });
       scrollHandlersInstalled = true;
     }
 
@@ -385,6 +386,19 @@
         setRendererStatus(`Backend ${lastBackendStatus}; waiting for terminal renderer`, false);
       }
       ensureTerminalOpen();
+    };
+
+    window.smScrollPixels = function(deltaPixels) {
+      return scrollTerminalByPixels(Number(deltaPixels) || 0);
+    };
+
+    window.smScrollLines = function(lines) {
+      const parsed = Number(lines) || 0;
+      if (!ready || parsed === 0) {
+        return false;
+      }
+      term.scrollLines(parsed);
+      return true;
     };
 
     window.smCopySelection = function() {
