@@ -1,7 +1,6 @@
 package li.rajeshgo.sm.ui.watch
 
 import android.app.Application
-import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
@@ -321,11 +320,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                 val encoding = payload.optString("encoding", "text")
                                 val mode = payload.optString("mode")
                                 val sequence = current.outputSequence + 1
-                                val textFallback = if (encoding == "base64") {
-                                    decodeTerminalTextFrame(data)
-                                } else {
-                                    data
-                                }
                                 current.copy(
                                     status = "attached",
                                     outputFrames = (
@@ -336,10 +330,12 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                         )
                                     ).takeLast(500),
                                     outputSequence = sequence,
-                                    copyBuffer = if (mode == "snapshot") {
-                                        textFallback
+                                    copyBuffer = if (encoding == "base64") {
+                                        current.copyBuffer
+                                    } else if (mode == "snapshot") {
+                                        data
                                     } else {
-                                        (current.copyBuffer + textFallback).takeLast(200_000)
+                                        (current.copyBuffer + data).takeLast(200_000)
                                     },
                                     error = null,
                                 )
@@ -443,12 +439,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         }
         terminalAttachToken = null
         _uiState.value = _uiState.value.copy(terminal = null)
-    }
-
-    private fun decodeTerminalTextFrame(data: String): String {
-        return runCatching {
-            String(Base64.decode(data, Base64.DEFAULT), Charsets.UTF_8)
-        }.getOrDefault("")
     }
 
     fun requestStatus(onComplete: (Result<String>) -> Unit) {
