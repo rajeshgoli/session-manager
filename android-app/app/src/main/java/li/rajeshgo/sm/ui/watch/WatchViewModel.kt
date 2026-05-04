@@ -27,12 +27,17 @@ data class TerminalUiState(
     val sessionId: String,
     val title: String,
     val status: String = "connecting",
-    val outputData: String = "",
-    val outputEncoding: String = "text",
+    val outputFrames: List<TerminalOutputFrame> = emptyList(),
     val outputSequence: Long = 0L,
     val copyBuffer: String = "",
     val inputDraft: String = "",
     val error: String? = null,
+)
+
+data class TerminalOutputFrame(
+    val sequence: Long,
+    val data: String,
+    val encoding: String = "text",
 )
 
 data class WatchUiState(
@@ -314,11 +319,17 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                 val data = payload.optString("data")
                                 val encoding = payload.optString("encoding", "text")
                                 val mode = payload.optString("mode")
+                                val sequence = current.outputSequence + 1
                                 current.copy(
                                     status = "attached",
-                                    outputData = data,
-                                    outputEncoding = encoding,
-                                    outputSequence = current.outputSequence + 1,
+                                    outputFrames = (
+                                        current.outputFrames + TerminalOutputFrame(
+                                            sequence = sequence,
+                                            data = data,
+                                            encoding = encoding,
+                                        )
+                                    ).takeLast(500),
+                                    outputSequence = sequence,
                                     copyBuffer = if (encoding == "base64") {
                                         current.copyBuffer
                                     } else if (mode == "snapshot") {

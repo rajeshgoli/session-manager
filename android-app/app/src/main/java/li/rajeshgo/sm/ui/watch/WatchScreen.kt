@@ -520,6 +520,7 @@ private fun TerminalWebView(
 ) {
     var deliveredSequence by remember { mutableStateOf(0L) }
     var deliveredCopyRequest by remember { mutableStateOf(0L) }
+    var terminalReady by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
 
     androidx.compose.runtime.DisposableEffect(Unit) {
@@ -552,6 +553,10 @@ private fun TerminalWebView(
                         onInput = onInput,
                         onResize = onResize,
                         onCopyText = onCopyText,
+                        onReady = { cols, rows ->
+                            terminalReady = true
+                            onResize(cols, rows)
+                        },
                     ),
                     "TerminalBridge",
                 )
@@ -561,14 +566,20 @@ private fun TerminalWebView(
         },
         update = { webView ->
             webView.evaluateJavascript("window.smSetStatus(${jsString(terminal.status)});", null)
-            if (terminal.outputSequence != deliveredSequence) {
-                deliveredSequence = terminal.outputSequence
-                if (terminal.outputEncoding == "base64") {
-                    webView.evaluateJavascript("window.smWriteBase64(${jsString(terminal.outputData)});", null)
-                } else {
-                    webView.evaluateJavascript("window.smWriteText(${jsString(terminal.outputData)});", null)
+            if (terminalReady) {
+                terminal.outputFrames
+                    .filter { it.sequence > deliveredSequence }
+                    .forEach { frame ->
+                        if (frame.encoding == "base64") {
+                            webView.evaluateJavascript("window.smWriteBase64(${jsString(frame.data)});", null)
+                        } else {
+                            webView.evaluateJavascript("window.smWriteText(${jsString(frame.data)});", null)
+                        }
+                        deliveredSequence = frame.sequence
+                    }
+                if (terminal.outputFrames.isNotEmpty()) {
+                    webView.evaluateJavascript("window.smFocus();", null)
                 }
-                webView.evaluateJavascript("window.smFocus();", null)
             }
             if (copyRequest != deliveredCopyRequest) {
                 deliveredCopyRequest = copyRequest
@@ -582,6 +593,7 @@ private class TerminalJavascriptBridge(
     private val onInput: (String) -> Unit,
     private val onResize: (cols: Int, rows: Int) -> Unit,
     private val onCopyText: (String) -> Unit,
+    private val onReady: (cols: Int, rows: Int) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -598,6 +610,11 @@ private class TerminalJavascriptBridge(
     @JavascriptInterface
     fun copy(text: String) {
         mainHandler.post { onCopyText(text) }
+    }
+
+    @JavascriptInterface
+    fun ready(cols: Int, rows: Int) {
+        mainHandler.post { onReady(cols, rows) }
     }
 }
 

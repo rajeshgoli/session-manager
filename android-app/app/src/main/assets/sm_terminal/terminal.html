@@ -81,6 +81,12 @@
       }
     }
 
+    function reportReady() {
+      if (bridge()) {
+        bridge().ready(term.cols, term.rows);
+      }
+    }
+
     function fitAndReport() {
       try {
         fitAddon.fit();
@@ -120,6 +126,7 @@
       if (!ready) {
         ready = true;
         fitAndReport();
+        reportReady();
       }
     };
 
@@ -132,6 +139,7 @@
     setTimeout(() => {
       ready = true;
       fitAndReport();
+      reportReady();
       term.focus();
     }, 80);
   </script>

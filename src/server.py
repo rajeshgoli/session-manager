@@ -4867,6 +4867,30 @@ def create_app(
                 return None
             return data if data else None
 
+        def write_pty_all(fd: int, data: bytes) -> bool:
+            deadline = time.monotonic() + 5
+            offset = 0
+            view = memoryview(data)
+            while offset < len(data):
+                if time.monotonic() > deadline:
+                    return False
+                try:
+                    _, writable, _ = select.select([], [fd], [], 0.2)
+                    if not writable:
+                        continue
+                    written = os.write(fd, view[offset:])
+                except BlockingIOError:
+                    time.sleep(0.01)
+                    continue
+                except InterruptedError:
+                    continue
+                except OSError:
+                    return False
+                if written <= 0:
+                    return False
+                offset += written
+            return True
+
         async def output_loop() -> None:
             assert master_fd is not None
             while not stop_event.is_set():
@@ -4890,11 +4914,7 @@ def create_app(
         async def write_pty(data: bytes) -> bool:
             if master_fd is None:
                 return False
-            try:
-                await asyncio.to_thread(os.write, master_fd, data)
-                return True
-            except OSError:
-                return False
+            return await asyncio.to_thread(write_pty_all, master_fd, data)
 
         async def receive_loop() -> None:
             nonlocal current_rows, current_cols
