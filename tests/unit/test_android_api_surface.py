@@ -630,6 +630,57 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
     assert any("attach-session" in command for command in commands)
 
 
+def test_mobile_terminal_plain_http_terminal_route_reports_upgrade_required():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    token = _issue_device_access_token(config, email="local_bypass", name="Local")["access_token"]
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.get("/client/terminal", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 426
+    assert response.headers["upgrade"] == "websocket"
+    assert response.headers["connection"] == "Upgrade"
+    assert response.json() == {"detail": "mobile terminal requires a WebSocket upgrade"}
+
+
+def test_mobile_terminal_plain_http_terminal_route_requires_authentication():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    app = create_app(
+        session_manager=_manager(session),
+        config=_mobile_terminal_config(private_key),
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.get("/client/terminal")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Authentication required"
+
+
+def test_mobile_terminal_plain_http_terminal_route_requires_terminal_user():
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    session = _session()
+    config = _mobile_terminal_config(private_key)
+    token = _issue_device_access_token(config, email="other@example.com", name="Other")["access_token"]
+    app = create_app(
+        session_manager=_manager(session),
+        config=config,
+    )
+    client = TestClient(app, base_url="https://sm.rajeshgo.li")
+
+    response = client.get("/client/terminal", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "User is not allowed to use mobile terminal attach"
+
+
 def test_mobile_terminal_key_bytes_use_terminal_control_sequences():
     assert _mobile_terminal_key_bytes("enter") == b"\r"
     assert _mobile_terminal_key_bytes("esc") == b"\x1b"

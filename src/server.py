@@ -5112,6 +5112,30 @@ def create_app(
                 output_bytes=counters["output_bytes"],
             )
 
+    @app.get("/client/terminal")
+    async def mobile_terminal_websocket_required(request: Request):
+        """Make non-WebSocket terminal hits diagnosable instead of a blind 404."""
+        actor_email = _request_actor_email(request)
+        if actor_email is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user_match = _mobile_terminal_visible_user(actor_email)
+        if user_match is None or user_match[1].get("interactive_shell_access") is not True:
+            raise HTTPException(status_code=403, detail="User is not allowed to use mobile terminal attach")
+        _audit_mobile_terminal(
+            "websocket_upgrade_missing",
+            user_id=user_match[0],
+            host=request.headers.get("host"),
+            upgrade=request.headers.get("upgrade"),
+            connection=request.headers.get("connection"),
+            has_sec_websocket_key=bool(request.headers.get("sec-websocket-key")),
+            remote_addr=request.client.host if request.client else None,
+        )
+        return JSONResponse(
+            status_code=426,
+            content={"detail": "mobile terminal requires a WebSocket upgrade"},
+            headers={"Upgrade": "websocket", "Connection": "Upgrade"},
+        )
+
     @app.websocket("/client/terminal")
     async def mobile_terminal_websocket(websocket: WebSocket):
         """Authenticated mobile terminal stream over the public HTTPS origin."""
