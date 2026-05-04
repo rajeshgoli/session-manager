@@ -27,6 +27,8 @@ data class TerminalUiState(
     val sessionId: String,
     val title: String,
     val status: String = "connecting",
+    val rendererCols: Int = 0,
+    val rendererRows: Int = 0,
     val rendererStatus: String = "renderer loading",
     val rendererLastAckSequence: Long = 0L,
     val rendererError: String? = null,
@@ -68,6 +70,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private var refreshJob: Job? = null
     private var terminalSocket: WebSocket? = null
     private var terminalAttachToken: String? = null
+    private var pendingTerminalResize: Pair<Int, Int>? = null
 
     private val _uiState = MutableStateFlow(WatchUiState())
     val uiState: StateFlow<WatchUiState> = _uiState
@@ -89,6 +92,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         terminalAttachToken = null
+        pendingTerminalResize = null
         terminalSocket?.close(1000, "viewmodel cleared")
         terminalSocket = null
         super.onCleared()
@@ -255,6 +259,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             }
             val attachToken = UUID.randomUUID().toString()
             terminalAttachToken = attachToken
+            pendingTerminalResize = null
             val path = sessionRepository.mobileAttachTicketPath(
                 baseUrl = serverUrl,
                 sessionId = session.id,
@@ -311,6 +316,9 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                         .put("nonce", wsNonce)
                         .put("signature", wsSignature)
                     webSocket.send(frame.toString())
+                    pendingTerminalResize?.let { (cols, rows) ->
+                        webSocket.send(terminalResizeFrame(cols, rows).toString())
+                    }
                     viewModelScope.launch {
                         updateTerminalIfCurrent(attachToken) { it.copy(status = "authenticating", error = null) }
                     }
@@ -390,9 +398,12 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun markTerminalRendererReady(cols: Int, rows: Int) {
-        resizeTerminal(cols, rows)
+        rememberTerminalResize(cols, rows)
+        sendPendingTerminalResize()
         _uiState.value = _uiState.value.copy(
             terminal = _uiState.value.terminal?.copy(
+                rendererCols = cols,
+                rendererRows = rows,
                 rendererStatus = "renderer ready ${cols}x${rows}",
                 rendererError = null,
             )
@@ -446,20 +457,15 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        if (cols !in 10..300 || rows !in 2..120) {
+        if (!rememberTerminalResize(cols, rows)) {
             return
         }
-        terminalSocket?.send(
-            JSONObject()
-                .put("type", "resize")
-                .put("cols", cols)
-                .put("rows", rows)
-                .toString()
-        )
+        sendPendingTerminalResize()
     }
 
     fun detachTerminal() {
         terminalAttachToken = null
+        pendingTerminalResize = null
         terminalSocket?.send(JSONObject().put("type", "detach").toString())
         terminalSocket?.close(1000, "detach")
         terminalSocket = null
@@ -483,7 +489,29 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         terminalAttachToken = null
+        pendingTerminalResize = null
         _uiState.value = _uiState.value.copy(terminal = null)
+    }
+
+    private fun rememberTerminalResize(cols: Int, rows: Int): Boolean {
+        if (cols !in 10..300 || rows !in 2..120) {
+            return false
+        }
+        pendingTerminalResize = cols to rows
+        return true
+    }
+
+    private fun sendPendingTerminalResize() {
+        val socket = terminalSocket ?: return
+        val (cols, rows) = pendingTerminalResize ?: return
+        socket.send(terminalResizeFrame(cols, rows).toString())
+    }
+
+    private fun terminalResizeFrame(cols: Int, rows: Int): JSONObject {
+        return JSONObject()
+            .put("type", "resize")
+            .put("cols", cols)
+            .put("rows", rows)
     }
 
     private fun terminalOutputByteCount(data: String, encoding: String): Long {
