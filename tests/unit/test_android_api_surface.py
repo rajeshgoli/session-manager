@@ -1,6 +1,9 @@
 from unittest.mock import MagicMock
 import base64
+import fcntl
 import os
+import struct
+import termios
 import time
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -562,10 +565,14 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
     ticket = ticket_response.json()
 
     commands = []
+    initial_pty_sizes = []
 
     class FakePopen:
         def __init__(self, args, stdin, stdout, stderr, close_fds, start_new_session, env):
             commands.append(args)
+            initial_pty_sizes.append(
+                struct.unpack("HHHH", fcntl.ioctl(stdin, termios.TIOCGWINSZ, b"\0" * 8))[:2]
+            )
             self.returncode = None
             self.output_fd = os.dup(stdout)
             os.write(self.output_fd, b"live pane output")
@@ -604,17 +611,21 @@ def test_mobile_terminal_websocket_consumes_ticket_and_bridges_tmux(monkeypatch)
                 ),
             }
         )
+        websocket.send_json({"type": "resize", "rows": 7, "cols": 42})
         attached = websocket.receive_json()
         assert attached["type"] == "status"
         assert attached["state"] == "attached"
         assert attached["session_id"] == session.id
+        assert attached["rows"] == 7
+        assert attached["cols"] == 42
+        assert initial_pty_sizes == [(7, 42)]
         output = websocket.receive_json()
         assert output["type"] == "output"
         assert output["mode"] == "stream"
         assert output["encoding"] == "base64"
         assert base64.b64decode(output["data"]) == b"live pane output"
-        websocket.send_json({"type": "resize", "rows": 32, "cols": 120})
-        assert websocket.receive_json() == {"type": "status", "state": "resized", "rows": 32, "cols": 120}
+        websocket.send_json({"type": "resize", "rows": 3, "cols": 15})
+        assert websocket.receive_json() == {"type": "status", "state": "resized", "rows": 3, "cols": 15}
         websocket.send_json({"type": "detach"})
     assert any("attach-session" in command for command in commands)
 

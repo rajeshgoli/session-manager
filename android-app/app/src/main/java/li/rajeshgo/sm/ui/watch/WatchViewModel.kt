@@ -446,7 +446,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        if (cols !in 20..300 || rows !in 10..120) {
+        if (cols !in 10..300 || rows !in 2..120) {
             return
         }
         terminalSocket?.send(
