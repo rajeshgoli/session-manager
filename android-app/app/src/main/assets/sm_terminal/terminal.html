@@ -212,12 +212,7 @@
       if (scrollHandlersInstalled || !opened) {
         return;
       }
-      const targets = new Set([
-        terminalElement,
-        terminalViewport(),
-        terminalElement.querySelector(".xterm"),
-        terminalElement.querySelector(".xterm-screen"),
-      ].filter(Boolean));
+      const target = terminalElement;
       const onWheel = (event) => {
         if (scrollTerminalByPixels(event.deltaY)) {
           event.preventDefault();
@@ -247,13 +242,11 @@
         lastTouchY = null;
         touchScrollRemainder = 0;
       };
-      targets.forEach((target) => {
-        target.addEventListener("wheel", onWheel, { capture: true, passive: false });
-        target.addEventListener("touchstart", onTouchStart, { capture: true, passive: false });
-        target.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
-        target.addEventListener("touchend", onTouchEnd, { capture: true, passive: true });
-        target.addEventListener("touchcancel", onTouchEnd, { capture: true, passive: true });
-      });
+      target.addEventListener("wheel", onWheel, { capture: true, passive: false });
+      target.addEventListener("touchstart", onTouchStart, { capture: true, passive: false });
+      target.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
+      target.addEventListener("touchend", onTouchEnd, { capture: true, passive: true });
+      target.addEventListener("touchcancel", onTouchEnd, { capture: true, passive: true });
       scrollHandlersInstalled = true;
     }
 
