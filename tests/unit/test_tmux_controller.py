@@ -74,7 +74,7 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
     )
 
     assert ok is True
-    assert calls[:8] == [
+    assert calls[:9] == [
         (
             "new-session",
             "-d",
@@ -87,6 +87,7 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
             "sleep 315360000",
         ),
         ("new-session", "-d", "-s", "claude-test123", "-c", str(tmp_path), "-n", "__sm_bootstrap"),
+        ("set-option", "-g", "focus-events", "on"),
         ("show-options", "-gqv", "terminal-overrides"),
         ("set-option", "-as", "terminal-overrides", ",*:smcup@:rmcup@"),
         ("set-option", "-t", "claude-test123", "history-limit", "12345"),
@@ -135,6 +136,42 @@ def test_create_session_with_command_uses_existing_server_anchor(tmp_path, monke
         call[:4] == ("new-session", "-d", "-s", TmuxController.SERVER_ANCHOR_SESSION)
         for call in calls
     )
+
+
+def test_create_session_with_command_enables_focus_events_without_native_scrollback(tmp_path, monkeypatch):
+    controller = TmuxController(
+        log_dir=str(tmp_path),
+        config={
+            "tmux": {
+                "socket_name": "session-manager-test",
+                "native_scrollback": False,
+            },
+            "timeouts": {"tmux": {"shell_export_settle_seconds": 0}},
+        },
+    )
+    calls = []
+
+    def _fake_run_tmux(*args, **kwargs):
+        calls.append(args)
+        return MagicMock(returncode=0, stdout="")
+
+    monkeypatch.setattr(controller, "session_exists", lambda _: False)
+    monkeypatch.setattr(controller, "_session_exists_on_socket", lambda *_: False)
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    ok = controller.create_session_with_command(
+        "claude-focus",
+        str(tmp_path),
+        str(tmp_path / "claude-focus.log"),
+        command="sh",
+        args=["-lc", "sleep 1"],
+    )
+
+    assert ok is True
+    assert ("set-option", "-g", "focus-events", "on") in calls
+    assert ("show-options", "-gqv", "terminal-overrides") not in calls
+    assert ("set-option", "-as", "terminal-overrides", ",*:smcup@:rmcup@") not in calls
 
 
 def test_create_session_with_command_enables_exit_diagnostics(tmp_path, monkeypatch):
