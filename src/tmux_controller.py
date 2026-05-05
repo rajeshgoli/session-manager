@@ -121,7 +121,16 @@ class TmuxController:
 
     def _ensure_server_options(self) -> None:
         """Apply SM-owned tmux server options that are safe only on the configured socket."""
-        if not self.socket_name or not self.native_scrollback:
+        if not self.socket_name:
+            return
+        self._run_tmux(
+            "set-option",
+            "-g",
+            "focus-events",
+            "on",
+            check=False,
+        )
+        if not self.native_scrollback:
             return
         current = self._run_tmux(
             "show-options",
