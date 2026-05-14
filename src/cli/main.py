@@ -12,7 +12,8 @@ from . import commands
 SEND_HELP_EPILOG = (
     "Flag placement: send options may appear before the recipient, between the "
     "recipient and message, or after the message. The message is exactly one "
-    "shell argument. Pass one recipient only; "
+    "shell argument; use '-' to read the full message from piped stdin. "
+    "Pass one recipient only; "
     "if you copied '<friendly-name> [<sm-id>]' from list output, use either the "
     "friendly name or the sm-id, not both."
 )
@@ -117,9 +118,35 @@ def _parse_send_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def _resolve_send_text_argument(text: str, stdin=None) -> str:
+    """Resolve `sm send` text, including '-' as piped stdin."""
+    if text != "-":
+        return text
+
+    input_stream = stdin if stdin is not None else sys.stdin
+    if input_stream.isatty():
+        raise ValueError("sm send '-' reads message text from piped stdin; pipe input or pass a message argument")
+
+    try:
+        stdin_text = input_stream.read()
+    except OSError as exc:
+        raise ValueError(f"sm send '-' failed to read stdin: {exc}") from exc
+
+    if stdin_text is None or stdin_text == "":
+        raise ValueError("sm send '-' received empty stdin; refusing to send an empty message")
+
+    return stdin_text
+
+
 def _handle_send(argv: list[str]) -> int:
     """Handle `sm send` with subcommand-specific parsing and dispatch."""
     args = _parse_send_args(argv)
+    try:
+        text = _resolve_send_text_argument(args.text)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     delivery_mode = "sequential"
     if args.urgent:
         delivery_mode = "urgent"
@@ -132,7 +159,7 @@ def _handle_send(argv: list[str]) -> int:
     return commands.cmd_send(
         client,
         args.session_id,
-        args.text,
+        text,
         delivery_mode,
         wait_seconds=getattr(args, "wait", None),
         notify_on_stop=not getattr(args, "no_notify_on_stop", False),

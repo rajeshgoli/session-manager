@@ -7,7 +7,14 @@ import os
 from unittest.mock import MagicMock, patch
 from io import StringIO
 
-from src.cli.main import main, _build_send_parser, _normalize_optional_track_args, _parse_send_args
+from src.cli.main import (
+    main,
+    _build_send_parser,
+    _handle_send,
+    _normalize_optional_track_args,
+    _parse_send_args,
+    _resolve_send_text_argument,
+)
 from src.cli.commands import (
     parse_duration,
     resolve_session_id,
@@ -323,7 +330,50 @@ class TestSendCommand:
         help_text = " ".join(captured.out.split())
         assert "Flag placement:" in captured.out
         assert "before the recipient, between the recipient and message, or after the message" in help_text
+        assert "use '-' to read the full message from piped stdin" in help_text
         assert "use either the friendly name or the sm-id, not both" in help_text
+
+    def test_send_dash_reads_piped_stdin(self):
+        """A '-' message argument reads the full stdin payload."""
+        assert _resolve_send_text_argument("-", stdin=StringIO("line one\nline two\n")) == "line one\nline two\n"
+
+    def test_send_dash_rejects_interactive_stdin(self):
+        """A '-' message argument should not send a literal dash from a TTY."""
+        class TtyInput(StringIO):
+            def isatty(self):
+                return True
+
+        with pytest.raises(ValueError, match="reads message text from piped stdin"):
+            _resolve_send_text_argument("-", stdin=TtyInput(""))
+
+    def test_send_dash_rejects_empty_stdin(self):
+        """Empty stdin is almost certainly a caller mistake."""
+        with pytest.raises(ValueError, match="received empty stdin"):
+            _resolve_send_text_argument("-", stdin=StringIO(""))
+
+    def test_send_dash_reports_stdin_read_failure(self):
+        """Non-interactive stdin wrappers can reject reads."""
+        class UnreadableInput(StringIO):
+            def read(self, *args, **kwargs):
+                raise OSError("stdin capture disabled")
+
+        with pytest.raises(ValueError, match="failed to read stdin"):
+            _resolve_send_text_argument("-", stdin=UnreadableInput(""))
+
+    def test_handle_send_passes_stdin_body_to_cmd_send(self, monkeypatch):
+        """The top-level send handler passes stdin content, not '-'."""
+        fake_client = MagicMock()
+        monkeypatch.setattr(sys, "stdin", StringIO("handoff body\nwith context\n"))
+        monkeypatch.setattr("src.cli.main.SessionManagerClient", MagicMock(return_value=fake_client))
+
+        with patch("src.cli.main.commands.cmd_send", return_value=0) as mock_cmd_send:
+            rc = _handle_send(["target-session", "-"])
+
+        assert rc == 0
+        mock_cmd_send.assert_called_once()
+        args, kwargs = mock_cmd_send.call_args
+        assert args[:4] == (fake_client, "target-session", "handoff body\nwith context\n", "sequential")
+        assert kwargs["wait_seconds"] is None
 
 
 class TestEmailCommand:

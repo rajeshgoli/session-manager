@@ -19,13 +19,13 @@ class TestSendWithWait:
         mock_client.session_id = "sender123"
         mock_client.send_input.return_value = (True, False)  # success, not unavailable
 
-        # Mock resolve_session_id to return a valid session
-        with patch('src.cli.commands.resolve_session_id') as mock_resolve:
+        # Mock current resolver path to return a valid session
+        with patch('src.cli.commands.resolve_session_id_with_status') as mock_resolve:
             mock_resolve.return_value = ("target456", {
                 "id": "target456",
                 "friendly_name": "target-session",
                 "name": "target-session"
-            })
+            }, False)
 
             # Call cmd_send with wait_seconds
             exit_code = cmd_send(
