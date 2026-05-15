@@ -540,6 +540,14 @@ class CreateSessionRequest(BaseModel):
     parent_session_id: Optional[str] = None
 
 
+class ForkSessionRequest(BaseModel):
+    """Request to fork a provider-native session under a new SM session."""
+    name: Optional[str] = None
+    attach: bool = False
+    fork_point: str = "current"
+    requester_session_id: Optional[str] = None
+
+
 class AdoptionProposalResponse(BaseModel):
     """Response payload for a pending or resolved adoption proposal."""
     id: str
@@ -564,6 +572,12 @@ class SessionResponse(BaseModel):
     tmux_session: str
     tmux_socket_name: Optional[str] = None
     provider: Optional[str] = "claude"
+    provider_resume_id: Optional[str] = None
+    forked_from_session_id: Optional[str] = None
+    forked_from_provider_resume_id: Optional[str] = None
+    forked_provider_resume_id: Optional[str] = None
+    forked_at: Optional[str] = None
+    forked_by_session_id: Optional[str] = None
     friendly_name: Optional[str] = None
     telegram_chat_id: Optional[int] = None
     telegram_thread_id: Optional[int] = None
@@ -2170,6 +2184,12 @@ def create_app(
             tmux_session=session.tmux_session,
             tmux_socket_name=session.tmux_socket_name,
             provider=provider,
+            provider_resume_id=getattr(session, "provider_resume_id", None),
+            forked_from_session_id=getattr(session, "forked_from_session_id", None),
+            forked_from_provider_resume_id=getattr(session, "forked_from_provider_resume_id", None),
+            forked_provider_resume_id=getattr(session, "forked_provider_resume_id", None),
+            forked_at=session.forked_at.isoformat() if getattr(session, "forked_at", None) else None,
+            forked_by_session_id=getattr(session, "forked_by_session_id", None),
             friendly_name=_effective_session_name(
                 session,
                 sync_native_title=sync_display_name,
@@ -5338,6 +5358,43 @@ def create_app(
             if s.context_monitor_enabled
         ]
         return {"monitored": monitored}
+
+    @app.post("/sessions/{session_id}/fork")
+    async def fork_session(session_id: str, request: ForkSessionRequest):
+        """Fork a provider-native session into a new SM-owned session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        source = _resolve_session_or_registry_role(session_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        success, forked_session, error = await app.state.session_manager.fork_session(
+            source.id,
+            name=request.name,
+            fork_point=request.fork_point,
+            forked_by_session_id=request.requester_session_id,
+        )
+        if not success or not forked_session:
+            detail = error or "Failed to fork session"
+            if detail == "Session not found":
+                status_code = 404
+            elif "runtime unavailable" in detail.lower() or "launch command" in detail.lower():
+                status_code = 503
+            else:
+                status_code = 400
+            raise HTTPException(status_code=status_code, detail=detail)
+
+        if app.state.output_monitor and getattr(forked_session, "provider", "claude") != "codex-app":
+            await app.state.output_monitor.start_monitoring(forked_session)
+
+        return {
+            "source_session": _response_dict(_session_to_response(source, sync_display_name=False)),
+            "fork_session": _response_dict(_session_to_response(forked_session, sync_display_name=False)),
+            "source_provider_resume_id": getattr(forked_session, "forked_from_provider_resume_id", None),
+            "fork_provider_resume_id": getattr(forked_session, "forked_provider_resume_id", None)
+            or getattr(forked_session, "provider_resume_id", None),
+        }
 
     @app.get("/sessions/{session_id}", response_model=SessionResponse)
     async def get_session(session_id: str):

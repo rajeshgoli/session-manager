@@ -881,6 +881,59 @@ class SessionManagerClient:
         result = self.restore_session_result(session_id)
         return result.get("data") if result.get("ok") else None
 
+    def fork_session_result(
+        self,
+        session_id: str,
+        *,
+        name: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
+        fork_point: str = "current",
+    ) -> dict:
+        """Fork a session and preserve API error details."""
+        payload: dict[str, object] = {"fork_point": fork_point}
+        if name is not None:
+            payload["name"] = name
+        if requester_session_id is not None:
+            payload["requester_session_id"] = requester_session_id
+
+        session_path = urllib.parse.quote(session_id, safe="")
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/sessions/{session_path}/fork",
+            payload,
+            timeout=max(MUTATION_API_TIMEOUT, 45.0),
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "data": None, "detail": None}
+
+        ok = status_code in (200, 201)
+        detail = None
+        if isinstance(data, dict):
+            detail = data.get("detail") or data.get("error") or data.get("raw")
+
+        return {
+            "ok": ok,
+            "unavailable": False,
+            "status_code": status_code,
+            "data": data,
+            "detail": detail,
+        }
+
+    def fork_session(
+        self,
+        session_id: str,
+        *,
+        name: Optional[str] = None,
+        requester_session_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Fork a session."""
+        result = self.fork_session_result(
+            session_id,
+            name=name,
+            requester_session_id=requester_session_id,
+        )
+        return result.get("data") if result.get("ok") else None
+
     def send_email_result(
         self,
         *,

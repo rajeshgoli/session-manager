@@ -1167,6 +1167,28 @@ def _create_watch_session(
     return session, tmux_session, None
 
 
+def _fork_watch_session(
+    client,
+    session_id: str,
+) -> tuple[Optional[dict], Optional[dict], Optional[str]]:
+    """Fork a session from sm watch and return (source, fork, error)."""
+    fork_result = client.fork_session_result(
+        session_id,
+        requester_session_id=getattr(client, "session_id", None),
+    )
+    if fork_result.get("unavailable"):
+        return None, None, "Session manager unavailable"
+    if not fork_result.get("ok"):
+        return None, None, fork_result.get("detail") or "Failed to fork session"
+
+    data = fork_result.get("data") or {}
+    source = data.get("source_session")
+    fork_session = data.get("fork_session")
+    if not isinstance(source, dict) or not isinstance(fork_session, dict):
+        return None, None, "Failed to fork session"
+    return source, fork_session, None
+
+
 def _resolve_tmux_attach_target(
     client,
     session: dict,
@@ -1355,7 +1377,7 @@ def _render(
     if restore_mode:
         footer = f"j/k: move  Enter: restore+attach  o: sort={restore_sort}  R: hide repo  U: show repos  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
     else:
-        footer = "j/k: move  +: create  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
+        footer = "j/k: move  +: create  F: fork  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
     stdscr.refresh()
 
@@ -1596,7 +1618,7 @@ def run_watch_tui(
                     next_refresh = 0.0
                     continue
 
-                if restore_mode and key in (ord("s"), ord("+"), ord("K"), ord("n"), ord("A"), ord("X")):
+                if restore_mode and key in (ord("s"), ord("+"), ord("F"), ord("K"), ord("n"), ord("A"), ord("X")):
                     flash_message = "Not available in restore mode"
                     flash_until = time.monotonic() + 2.0
                     continue
@@ -1624,6 +1646,31 @@ def run_watch_tui(
                         flash_message = "Session manager unavailable"
                     else:
                         flash_message = "Failed to send"
+                    flash_until = time.monotonic() + 2.5
+                    next_refresh = 0.0
+                    continue
+
+                if key in (ord("F"),):
+                    if not selected_session_id:
+                        flash_message = "No session selected"
+                        flash_until = time.monotonic() + 2.0
+                        continue
+                    source, fork_session, error = _fork_watch_session(client, selected_session_id)
+                    if error:
+                        flash_message = error
+                        flash_until = time.monotonic() + 2.5
+                        next_refresh = 0.0
+                        continue
+                    fork_session_id = fork_session.get("id") if fork_session else None
+                    if not fork_session_id:
+                        flash_message = "Failed to fork session"
+                        flash_until = time.monotonic() + 2.5
+                        next_refresh = 0.0
+                        continue
+                    source_name = (source or {}).get("friendly_name") or (source or {}).get("name") or selected_session_id
+                    fork_name = fork_session.get("friendly_name") or fork_session.get("name") or fork_session_id
+                    selected_session_id = fork_session_id
+                    flash_message = f"Forked {source_name} ({source.get('id') if source else ''}) -> {fork_name} ({fork_session_id})"
                     flash_until = time.monotonic() + 2.5
                     next_refresh = 0.0
                     continue

@@ -514,6 +514,14 @@ def main():
     )
     restore_parser.add_argument("session", help="Session ID or friendly name to restore")
 
+    # sm fork [session] [--self] [--name NAME] [--attach] [--json]
+    fork_parser = subparsers.add_parser("fork", help="Fork a session into a new SM-owned session")
+    fork_parser.add_argument("session", nargs="?", help="Session ID or friendly name to fork")
+    fork_parser.add_argument("--self", action="store_true", help="Fork the current managed session")
+    fork_parser.add_argument("--name", help="Friendly name for the fork session")
+    fork_parser.add_argument("--attach", action="store_true", help="Attach to the fork after it is confirmed")
+    fork_parser.add_argument("--json", action="store_true", help="Output JSON")
+
     # sm clean [--session-id ID ...]
     clean_parser = subparsers.add_parser(
         "clean",
@@ -904,7 +912,7 @@ def main():
     # Commands that don't need session_id: lock, unlock, hooks, all, send, wait, what, subagents, children, kill/retire, restore, new, attach, output, clear
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
-        "subagents", "children", "kill", "retire", "restore", "unkill", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
+        "subagents", "children", "kill", "retire", "restore", "unkill", "fork", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server",
         "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
     ]
@@ -1215,6 +1223,18 @@ def main():
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
     elif args.command in ("restore", "unkill"):
         sys.exit(commands.cmd_restore(client, args.session))
+    elif args.command == "fork":
+        sys.exit(
+            commands.cmd_fork(
+                client,
+                session_id,
+                args.session,
+                self_target=args.self,
+                name=args.name,
+                attach=args.attach,
+                json_output=args.json,
+            )
+        )
     elif args.command == "clean":
         sys.exit(commands.cmd_clean(client, session_ids=getattr(args, 'session_ids', None)))
     elif args.command == "claude":

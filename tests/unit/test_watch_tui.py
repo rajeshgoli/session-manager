@@ -10,6 +10,7 @@ from src.cli.watch_tui import (
     DetailSnapshot,
     _arm_retire_confirmation,
     _create_watch_session,
+    _fork_watch_session,
     _compute_column_widths,
     _default_create_working_dir,
     _normalize_create_working_dir,
@@ -90,6 +91,43 @@ def test_resolve_tmux_attach_target_falls_back_to_session_without_descriptor():
     assert error is None
     assert tmux_session == "session-target"
     assert tmux_socket_name == "session-manager-test"
+
+
+def test_fork_watch_session_returns_source_and_fork():
+    class _Client:
+        session_id = "caller01"
+
+        def fork_session_result(self, session_id, *, requester_session_id=None):
+            assert session_id == "source01"
+            assert requester_session_id == "caller01"
+            return {
+                "ok": True,
+                "unavailable": False,
+                "data": {
+                    "source_session": {"id": "source01", "friendly_name": "source"},
+                    "fork_session": {"id": "fork01", "friendly_name": "source-fork"},
+                },
+            }
+
+    source, fork_session, error = _fork_watch_session(_Client(), "source01")
+
+    assert error is None
+    assert source["id"] == "source01"
+    assert fork_session["id"] == "fork01"
+
+
+def test_fork_watch_session_surfaces_api_error():
+    class _Client:
+        session_id = "caller01"
+
+        def fork_session_result(self, session_id, *, requester_session_id=None):
+            return {"ok": False, "unavailable": False, "detail": "unsupported provider"}
+
+    source, fork_session, error = _fork_watch_session(_Client(), "source01")
+
+    assert source is None
+    assert fork_session is None
+    assert error == "unsupported provider"
 
 
 def _session(

@@ -299,6 +299,9 @@ class SessionManager:
         self.codex_fork_control_timeout_seconds = float(
             codex_fork_config.get("control_timeout_seconds", 5.0)
         )
+        self.codex_fork_fork_timeout_seconds = float(
+            codex_fork_config.get("fork_timeout_seconds", 30.0)
+        )
         self.codex_fork_control_tmux_fallback_enabled = _coerce_rollout_flag(
             codex_fork_config.get("control_tmux_fallback_enabled"),
             default=True,
@@ -1122,8 +1125,11 @@ class SessionManager:
         session: Session,
         *,
         resume_id: Optional[str] = None,
+        fork_id: Optional[str] = None,
     ) -> tuple[str, list[str], str, Optional[str]]:
         """Return launch command/args, falling back to codex when codex-fork is unavailable."""
+        if resume_id and fork_id:
+            raise ValueError("resume_id and fork_id are mutually exclusive")
         _, fork_error = self._resolve_cli_command(
             self.codex_fork_command,
             working_dir=session.working_dir,
@@ -1132,6 +1138,8 @@ class SessionManager:
             args = list(self.codex_cli_args)
             if resume_id:
                 args = ["resume", resume_id, *args]
+            elif fork_id:
+                args = ["fork", fork_id, *args]
             return (
                 self.codex_cli_command,
                 args,
@@ -1142,6 +1150,8 @@ class SessionManager:
         args = list(self.codex_fork_args)
         if resume_id:
             args = ["resume", resume_id, *args]
+        elif fork_id:
+            args = ["fork", fork_id, *args]
         event_stream_path = self._codex_fork_event_stream_path(session)
         control_socket_path = self._codex_fork_control_socket_path(session)
         event_stream_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1626,6 +1636,63 @@ class SessionManager:
         if not thread_id or thread_id.lower() in {"unknown", "none", "null"}:
             return None
         return thread_id
+
+    def _extract_codex_fork_thread_started(
+        self,
+        event_type: Any,
+        payload: dict[str, Any],
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Return (thread_id, forked_from_id) for codex-fork thread/started events."""
+        raw_event_type = str(event_type or "").strip()
+        normalized_event_type = self._normalize_codex_fork_event_type(raw_event_type.replace("/", "_"))
+        if raw_event_type not in {"thread/started", "thread_started"} and normalized_event_type != "thread_started":
+            return None, None
+
+        thread_payload = payload.get("thread") if isinstance(payload.get("thread"), dict) else payload
+        thread_id = self._normalize_codex_thread_id(
+            thread_payload.get("id")
+            or thread_payload.get("thread_id")
+            or payload.get("thread_id")
+            or payload.get("session_id")
+        )
+        forked_from_id = self._normalize_codex_thread_id(
+            thread_payload.get("forkedFromId")
+            or thread_payload.get("forked_from_id")
+            or payload.get("forkedFromId")
+            or payload.get("forked_from_id")
+        )
+        return thread_id, forked_from_id
+
+    @staticmethod
+    def _epoch_ns_to_naive_utc(value: Optional[int]) -> datetime:
+        if value is None:
+            return datetime.now()
+        return datetime.fromtimestamp(value / 1_000_000_000, tz=timezone.utc).replace(tzinfo=None)
+
+    def _record_codex_fork_lineage_from_thread_started(
+        self,
+        session: Session,
+        *,
+        thread_id: str,
+        forked_from_id: str,
+        previous_provider_resume_id: Optional[str],
+        event_timestamp_ns: Optional[int],
+    ) -> bool:
+        """Persist lineage for a codex-fork thread/started fork event before rebinding."""
+        changed = False
+        if session.forked_from_provider_resume_id != forked_from_id:
+            session.forked_from_provider_resume_id = forked_from_id
+            changed = True
+        if session.forked_provider_resume_id != thread_id:
+            session.forked_provider_resume_id = thread_id
+            changed = True
+        if session.forked_at is None:
+            session.forked_at = self._epoch_ns_to_naive_utc(event_timestamp_ns)
+            changed = True
+        if not session.forked_from_session_id and previous_provider_resume_id == forked_from_id:
+            session.forked_from_session_id = session.id
+            changed = True
+        return changed
 
     def _read_codex_session_index(self) -> dict[str, tuple[str, Optional[int]]]:
         """Read Codex's local thread index keyed by provider resume/thread id."""
@@ -2222,11 +2289,27 @@ class SessionManager:
         provider_session_id = event.get("session_id")
         if not provider_session_id and payload:
             provider_session_id = payload.get("session_id")
+        thread_started_id, forked_from_id = self._extract_codex_fork_thread_started(event_type, payload)
+        if thread_started_id:
+            provider_session_id = thread_started_id
         if isinstance(provider_session_id, str) and provider_session_id.strip() and provider_session_id != "unknown":
             session = self.sessions.get(session_id)
-            if session and session.provider in ("codex", "codex-fork") and session.provider_resume_id != provider_session_id:
-                session.provider_resume_id = provider_session_id
-                self._save_state()
+            if session and session.provider in ("codex", "codex-fork"):
+                changed = False
+                previous_provider_resume_id = session.provider_resume_id
+                if thread_started_id and forked_from_id:
+                    changed = self._record_codex_fork_lineage_from_thread_started(
+                        session,
+                        thread_id=thread_started_id,
+                        forked_from_id=forked_from_id,
+                        previous_provider_resume_id=previous_provider_resume_id,
+                        event_timestamp_ns=self._timestamp_to_epoch_ns(event.get("ts")),
+                    )
+                if session.provider_resume_id != provider_session_id:
+                    session.provider_resume_id = provider_session_id
+                    changed = True
+                if changed:
+                    self._save_state()
         seq_raw = event.get("seq")
         seq = int(seq_raw) if isinstance(seq_raw, int) or (isinstance(seq_raw, str) and seq_raw.isdigit()) else None
         session_epoch = event.get("session_epoch")
@@ -2537,6 +2620,10 @@ class SessionManager:
         initial_prompt: Optional[str] = None,
         provider: str = "claude",
         defer_telegram_topic: bool = False,
+        codex_fork_source_resume_id: Optional[str] = None,
+        forked_from_session_id: Optional[str] = None,
+        forked_from_provider_resume_id: Optional[str] = None,
+        forked_by_session_id: Optional[str] = None,
     ) -> Optional[Session]:
         """
         Common session creation logic (private method).
@@ -2569,6 +2656,12 @@ class SessionManager:
             provider=provider,
             model=model,
         )
+        if forked_from_session_id:
+            session.forked_from_session_id = forked_from_session_id
+        if forked_from_provider_resume_id:
+            session.forked_from_provider_resume_id = forked_from_provider_resume_id
+        if forked_by_session_id:
+            session.forked_by_session_id = forked_by_session_id
 
         if friendly_name:
             self.set_session_friendly_name(session, friendly_name, explicit=True)
@@ -2597,13 +2690,23 @@ class SessionManager:
                 default_model = self.codex_default_model
             else:
                 # Codex-fork config with codex fallback when the fork binary is unavailable.
-                command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(session)
+                command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
+                    session,
+                    fork_id=codex_fork_source_resume_id,
+                )
                 default_model = (
                     self.codex_fork_default_model
                     if effective_provider == "codex-fork"
                     else self.codex_default_model
                 )
                 if effective_provider != session.provider:
+                    if codex_fork_source_resume_id:
+                        logger.error(
+                            "Rejecting codex-fork fork create for %s because runtime is unavailable: %s",
+                            session.id,
+                            fallback_reason,
+                        )
+                        return None
                     logger.warning(
                         "Falling back from codex-fork to codex for %s: %s",
                         session.id,
@@ -2929,6 +3032,164 @@ class SessionManager:
     def get_session(self, session_id: str) -> Optional[Session]:
         """Get a session by ID."""
         return self.sessions.get(session_id)
+
+    def _default_fork_friendly_name(self, source: Session) -> str:
+        """Derive a short explicit name for a fork session."""
+        base = self.get_effective_session_name(source) or source.name or source.id
+        safe_base = re.sub(r"[^a-zA-Z0-9_-]+", "-", base).strip("-") or source.id
+        suffix = uuid.uuid4().hex[:4]
+        max_base_len = max(1, 32 - len("-fork-") - len(suffix))
+        return f"{safe_base[:max_base_len]}-fork-{suffix}"
+
+    def _validate_fork_friendly_name(self, name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        if not self._is_safe_provider_native_rename_name(name):
+            return "Fork name must be 1-32 characters of letters, numbers, underscore, or hyphen"
+        normalized_name = self.normalize_agent_role(name)
+        reserved_aliases = {"maintainer"}
+        registration_map = self._get_agent_registration_map()
+        self._prune_agent_registrations(persist=True)
+        reserved_aliases.update(registration_map.keys())
+        if normalized_name in reserved_aliases:
+            return f'Name "{name}" is reserved for registry identity "{normalized_name}"'
+        return self.validate_reserved_human_name(name)
+
+    async def _wait_for_codex_fork_result(
+        self,
+        fork_session: Session,
+        source_resume_id: str,
+    ) -> tuple[bool, Optional[str], Optional[str]]:
+        """Wait for codex-fork to report the native fork thread id."""
+        stream_path = self._codex_fork_event_stream_path(fork_session)
+        deadline = time.monotonic() + max(0.1, self.codex_fork_fork_timeout_seconds)
+        offset = 0
+        buffer = ""
+        poll_interval = max(0.05, min(0.5, self.codex_fork_event_poll_interval_seconds))
+
+        while time.monotonic() < deadline:
+            if (
+                fork_session.provider_resume_id
+                and fork_session.forked_provider_resume_id == fork_session.provider_resume_id
+                and fork_session.forked_from_provider_resume_id == source_resume_id
+            ):
+                return True, fork_session.provider_resume_id, None
+
+            if stream_path.exists():
+                with open(stream_path, "r", encoding="utf-8", errors="ignore") as handle:
+                    handle.seek(offset)
+                    chunk = handle.read()
+                    offset = handle.tell()
+                if chunk:
+                    buffer += chunk
+                    lines = buffer.splitlines()
+                    if buffer and not buffer.endswith("\n"):
+                        buffer = lines.pop() if lines else buffer
+                    else:
+                        buffer = ""
+
+                    for line in lines:
+                        raw = line.strip()
+                        if not raw:
+                            continue
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                        event_type = event.get("event_type") or event.get("type")
+                        thread_id, forked_from_id = self._extract_codex_fork_thread_started(event_type, payload)
+                        if not thread_id or not forked_from_id:
+                            continue
+                        if forked_from_id != source_resume_id:
+                            return (
+                                False,
+                                None,
+                                "Provider fork result did not match the source thread "
+                                f"({forked_from_id} != {source_resume_id})",
+                            )
+                        self._record_codex_fork_lineage_from_thread_started(
+                            fork_session,
+                            thread_id=thread_id,
+                            forked_from_id=forked_from_id,
+                            previous_provider_resume_id=fork_session.provider_resume_id,
+                            event_timestamp_ns=self._timestamp_to_epoch_ns(event.get("ts")),
+                        )
+                        fork_session.provider_resume_id = thread_id
+                        self._save_state()
+                        return True, thread_id, None
+
+            await asyncio.sleep(poll_interval)
+
+        return False, None, "Timed out waiting for provider fork confirmation"
+
+    async def fork_session(
+        self,
+        source_id: str,
+        *,
+        name: Optional[str] = None,
+        fork_point: str = "current",
+        forked_by_session_id: Optional[str] = None,
+    ) -> tuple[bool, Optional[Session], Optional[str]]:
+        """Create an SM-owned provider-native fork session."""
+        source = self.sessions.get(source_id)
+        if source is None:
+            return False, None, "Session not found"
+        if fork_point != "current":
+            return False, None, "Only fork_point=current is supported"
+        if source.provider != "codex-fork":
+            return False, None, f"Session forking is not supported for provider={source.provider} yet."
+
+        source_resume_id = self.get_session_resume_id(source)
+        if not source_resume_id:
+            return False, None, "Source session has no provider resume id to fork"
+
+        provider_rejection = self.get_provider_create_rejection("codex-fork", working_dir=source.working_dir)
+        if provider_rejection:
+            return False, None, provider_rejection
+
+        fork_name = name or self._default_fork_friendly_name(source)
+        name_error = self._validate_fork_friendly_name(fork_name)
+        if name_error:
+            return False, None, name_error
+
+        fork_session = await self._create_session_common(
+            working_dir=source.working_dir,
+            friendly_name=fork_name,
+            model=source.model,
+            provider="codex-fork",
+            defer_telegram_topic=True,
+            codex_fork_source_resume_id=source_resume_id,
+            forked_from_session_id=source.id,
+            forked_from_provider_resume_id=source_resume_id,
+            forked_by_session_id=forked_by_session_id,
+        )
+        if fork_session is None:
+            return False, None, "Failed to create fork session"
+
+        success, fork_resume_id, error = await self._wait_for_codex_fork_result(
+            fork_session,
+            source_resume_id,
+        )
+        if not success or not fork_resume_id:
+            with contextlib.suppress(Exception):
+                self.kill_session(fork_session.id)
+            fork_session.error_message = error or "Failed to confirm provider fork"
+            if fork_session.status != SessionStatus.STOPPED:
+                fork_session.status = SessionStatus.STOPPED
+                fork_session.stopped_at = datetime.now()
+                fork_session.completed_at = fork_session.stopped_at
+            self._save_state()
+            return False, fork_session, fork_session.error_message
+
+        fork_session.provider_resume_id = fork_resume_id
+        fork_session.forked_provider_resume_id = fork_resume_id
+        if fork_session.forked_at is None:
+            fork_session.forked_at = datetime.now()
+        self._save_state()
+        return True, fork_session, None
 
     def get_session_by_name(self, name: str) -> Optional[Session]:
         """Get a session by name."""
