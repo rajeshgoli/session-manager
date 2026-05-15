@@ -306,6 +306,11 @@ class Session:
     transcript_path: Optional[str] = None  # Claude's transcript file path
     provider_resume_id: Optional[str] = None  # Provider-native conversation/thread/session id for restore
     model: Optional[str] = None  # Explicit provider model passed at launch; replayed on restore
+    forked_from_session_id: Optional[str] = None  # SM session id this session was forked from
+    forked_from_provider_resume_id: Optional[str] = None  # Source provider resume id captured before fork
+    forked_provider_resume_id: Optional[str] = None  # Provider resume id produced by the fork
+    forked_at: Optional[datetime] = None  # When SM confirmed or detected the fork
+    forked_by_session_id: Optional[str] = None  # Session that requested the fork, if known
     friendly_name: Optional[str] = None  # Session Manager label for display
     friendly_name_is_explicit: bool = False  # True when sm name / PATCH explicitly set the label
     friendly_name_updated_at_ns: Optional[int] = None  # Last SM-side friendly-name update time
@@ -398,6 +403,11 @@ class Session:
             "transcript_path": self.transcript_path,
             "provider_resume_id": self.provider_resume_id,
             "model": self.model,
+            "forked_from_session_id": self.forked_from_session_id,
+            "forked_from_provider_resume_id": self.forked_from_provider_resume_id,
+            "forked_provider_resume_id": self.forked_provider_resume_id,
+            "forked_at": self.forked_at.isoformat() if self.forked_at else None,
+            "forked_by_session_id": self.forked_by_session_id,
             "friendly_name": self.friendly_name,
             "friendly_name_is_explicit": self.friendly_name_is_explicit,
             "friendly_name_updated_at_ns": self.friendly_name_updated_at_ns,
@@ -491,6 +501,11 @@ class Session:
             transcript_path=data.get("transcript_path"),
             provider_resume_id=data.get("provider_resume_id"),
             model=data.get("model"),
+            forked_from_session_id=data.get("forked_from_session_id"),
+            forked_from_provider_resume_id=data.get("forked_from_provider_resume_id"),
+            forked_provider_resume_id=data.get("forked_provider_resume_id"),
+            forked_at=datetime.fromisoformat(data["forked_at"]) if data.get("forked_at") else None,
+            forked_by_session_id=data.get("forked_by_session_id"),
             friendly_name=data.get("friendly_name"),
             friendly_name_is_explicit=bool(data.get("friendly_name_is_explicit", False)),
             friendly_name_updated_at_ns=data.get("friendly_name_updated_at_ns"),

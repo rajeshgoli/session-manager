@@ -1338,6 +1338,59 @@ class TestEmailBridgeEndpoints:
         assert "Configured codex-fork runtime unavailable" in response.json()["detail"]
         mock_session_manager.create_session.assert_not_called()
 
+    def test_fork_session(self, test_client, mock_session_manager, sample_session, mock_output_monitor):
+        """POST /sessions/{id}/fork returns source and fork session payloads."""
+        sample_session.provider = "codex-fork"
+        sample_session.provider_resume_id = "thread-source"
+        forked_session = Session(
+            id="fork1234",
+            name="codex-fork-fork1234",
+            working_dir=sample_session.working_dir,
+            tmux_session="codex-fork-fork1234",
+            log_file="/tmp/fork.log",
+            provider="codex-fork",
+            provider_resume_id="thread-fork",
+            forked_from_session_id=sample_session.id,
+            forked_from_provider_resume_id="thread-source",
+            forked_provider_resume_id="thread-fork",
+            forked_by_session_id="caller123",
+            friendly_name="test-fork",
+        )
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.fork_session = AsyncMock(return_value=(True, forked_session, None))
+        mock_session_manager.get_activity_state.return_value = "idle"
+
+        response = test_client.post(
+            "/sessions/test123/fork",
+            json={"name": "test-fork", "requester_session_id": "caller123"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source_provider_resume_id"] == "thread-source"
+        assert data["fork_provider_resume_id"] == "thread-fork"
+        assert data["fork_session"]["id"] == "fork1234"
+        assert data["fork_session"]["forked_from_session_id"] == "test123"
+        mock_session_manager.fork_session.assert_awaited_once_with(
+            "test123",
+            name="test-fork",
+            fork_point="current",
+            forked_by_session_id="caller123",
+        )
+        mock_output_monitor.start_monitoring.assert_awaited_once_with(forked_session)
+
+    def test_fork_session_surfaces_provider_error(self, test_client, mock_session_manager, sample_session):
+        """POST /sessions/{id}/fork returns clear provider errors."""
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.fork_session = AsyncMock(
+            return_value=(False, None, "Session forking is not supported for provider=claude yet.")
+        )
+
+        response = test_client.post("/sessions/test123/fork", json={})
+
+        assert response.status_code == 400
+        assert "not supported" in response.json()["detail"]
+
     def test_kill_session(self, test_client, mock_session_manager, sample_session, mock_output_monitor):
         """DELETE /sessions/{id} kills session."""
         mock_session_manager.get_session.return_value = sample_session

@@ -35,6 +35,12 @@ class TestSession:
             telegram_thread_id=789,
             error_message="test error",
             transcript_path="/tmp/transcripts/test.jsonl",
+            provider_resume_id="provider-thread-source",
+            forked_from_session_id="source123",
+            forked_from_provider_resume_id="provider-thread-source",
+            forked_provider_resume_id="provider-thread-fork",
+            forked_at=datetime(2024, 1, 15, 10, 45, 0),
+            forked_by_session_id="caller123",
             friendly_name="My Test Session",
             friendly_name_is_explicit=True,
             friendly_name_updated_at_ns=123456789,
@@ -74,6 +80,12 @@ class TestSession:
         assert restored.telegram_thread_id == original.telegram_thread_id
         assert restored.error_message == original.error_message
         assert restored.transcript_path == original.transcript_path
+        assert restored.provider_resume_id == original.provider_resume_id
+        assert restored.forked_from_session_id == original.forked_from_session_id
+        assert restored.forked_from_provider_resume_id == original.forked_from_provider_resume_id
+        assert restored.forked_provider_resume_id == original.forked_provider_resume_id
+        assert restored.forked_at == original.forked_at
+        assert restored.forked_by_session_id == original.forked_by_session_id
         assert restored.friendly_name == original.friendly_name
         assert restored.friendly_name_is_explicit == original.friendly_name_is_explicit
         assert restored.friendly_name_updated_at_ns == original.friendly_name_updated_at_ns
@@ -111,6 +123,11 @@ class TestSession:
         assert session.telegram_chat_id is None
         assert session.telegram_thread_id is None
         assert session.error_message is None
+        assert session.forked_from_session_id is None
+        assert session.forked_from_provider_resume_id is None
+        assert session.forked_provider_resume_id is None
+        assert session.forked_at is None
+        assert session.forked_by_session_id is None
         assert session.friendly_name is None
         assert session.current_task is None
         assert session.subagents == []

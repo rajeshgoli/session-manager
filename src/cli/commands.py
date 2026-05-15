@@ -827,6 +827,13 @@ def cmd_me(client: SessionManagerClient, session_id: str) -> int:
         return 1
 
     print(format_session_line(session, show_working_dir=True))
+    if session.get("forked_from_session_id") or session.get("forked_from_provider_resume_id"):
+        if session.get("forked_from_session_id"):
+            print(f"Forked from: {session.get('forked_from_session_id')}")
+        if session.get("forked_from_provider_resume_id"):
+            print(f"Original provider thread: {session.get('forked_from_provider_resume_id')}")
+        if session.get("forked_provider_resume_id"):
+            print(f"Fork provider thread: {session.get('forked_provider_resume_id')}")
     return 0
 
 
@@ -2776,6 +2783,101 @@ def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
         )
         return 0
     return cmd_attach(client, target_session_id)
+
+
+def cmd_fork(
+    client: SessionManagerClient,
+    current_session_id: Optional[str],
+    target_identifier: Optional[str],
+    *,
+    self_target: bool = False,
+    name: Optional[str] = None,
+    attach: bool = False,
+    json_output: bool = False,
+) -> int:
+    """
+    Fork a provider-native session into a new SM-owned session.
+
+    Exit codes:
+        0: Success
+        1: Invalid target or fork failed
+        2: Session manager unavailable
+    """
+    if self_target and target_identifier:
+        print("Error: use either a session target or --self, not both", file=sys.stderr)
+        return 1
+    if self_target:
+        if not current_session_id:
+            print("Error: CLAUDE_SESSION_MANAGER_ID not set (required for --self)", file=sys.stderr)
+            return 2
+        target_session_id, source_session, unavailable = resolve_session_id_with_status(
+            client,
+            current_session_id,
+            include_stopped=True,
+        )
+        error = None
+    else:
+        if not target_identifier:
+            print("Error: sm fork requires a session target or --self", file=sys.stderr)
+            return 1
+        target_session_id, source_session, unavailable = resolve_session_id_with_status(
+            client,
+            target_identifier,
+            include_stopped=True,
+        )
+        error = None
+
+    if unavailable:
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not target_session_id:
+        missing_identifier = current_session_id if self_target else target_identifier
+        print(f"Error: Session '{missing_identifier}' not found", file=sys.stderr)
+        return 1
+
+    result = client.fork_session_result(
+        target_session_id,
+        name=name,
+        requester_session_id=current_session_id,
+    )
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        detail = result.get("detail") or error or "Failed to fork session"
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+
+    data = result.get("data") or {}
+    source = data.get("source_session") if isinstance(data.get("source_session"), dict) else (source_session or {})
+    fork_session = data.get("fork_session") if isinstance(data.get("fork_session"), dict) else {}
+    fork_session_id = fork_session.get("id")
+    if json_output:
+        payload = {
+            "source_session_id": source.get("id") or target_session_id,
+            "source_provider_resume_id": data.get("source_provider_resume_id"),
+            "fork_session_id": fork_session_id,
+            "fork_provider_resume_id": data.get("fork_provider_resume_id"),
+            "provider": fork_session.get("provider") or source.get("provider"),
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        source_name = source.get("friendly_name") or source.get("name") or target_session_id
+        fork_name = fork_session.get("friendly_name") or fork_session.get("name") or fork_session_id
+        print(f"Forked {source_name} ({target_session_id})")
+        print(f"Original provider thread: {data.get('source_provider_resume_id') or 'unknown'}")
+        print(f"Fork session: {fork_name} ({fork_session_id or 'unknown'})")
+        print(f"Fork provider thread: {data.get('fork_provider_resume_id') or 'unknown'}")
+
+    if attach and fork_session_id:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            print(
+                f"Automatic attach skipped: current shell is not interactive. "
+                f"Run `sm attach {fork_session_id}` from an interactive terminal."
+            )
+            return 0
+        return cmd_attach(client, fork_session_id)
+    return 0
 
 
 def cmd_new(

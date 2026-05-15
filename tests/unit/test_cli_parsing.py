@@ -152,6 +152,14 @@ class TestCliParsing:
         restore_parser = subparsers.add_parser("restore")
         restore_parser.add_argument("session")
 
+        # sm fork
+        fork_parser = subparsers.add_parser("fork")
+        fork_parser.add_argument("session", nargs="?")
+        fork_parser.add_argument("--self", action="store_true")
+        fork_parser.add_argument("--name")
+        fork_parser.add_argument("--attach", action="store_true")
+        fork_parser.add_argument("--json", action="store_true")
+
         # sm output
         output_parser = subparsers.add_parser("output")
         output_parser.add_argument("session")
@@ -887,6 +895,49 @@ class TestRestoreCommand:
 
         assert exc_info.value.code == 0
         mock_cmd_restore.assert_called_once_with(mock_client, "dead123")
+
+
+class TestForkCommand:
+    """Tests for fork command parsing."""
+
+    def test_fork_command_parses_target_and_flags(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["fork", "maintainer", "--name", "maintainer-fork", "--attach", "--json"])
+
+        assert args.command == "fork"
+        assert args.session == "maintainer"
+        assert args.name == "maintainer-fork"
+        assert args.attach is True
+        assert args.json is True
+
+    def test_fork_command_parses_self(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["fork", "--self"])
+
+        assert args.command == "fork"
+        assert args.session is None
+        assert args.self is True
+
+    def test_main_fork_allowed_without_managed_session_for_target(self):
+        mock_client = MagicMock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["sm", "fork", "dead123"]):
+                with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                    with patch("src.cli.main.commands.cmd_fork", return_value=0) as mock_cmd_fork:
+                        with pytest.raises(SystemExit) as exc_info:
+                            main()
+
+        assert exc_info.value.code == 0
+        mock_cmd_fork.assert_called_once_with(
+            mock_client,
+            None,
+            "dead123",
+            self_target=False,
+            name=None,
+            attach=False,
+            json_output=False,
+        )
 
 
 class TestSessionResolution:
