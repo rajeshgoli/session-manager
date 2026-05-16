@@ -290,7 +290,7 @@ fun WatchScreen(
                             },
                             onKill = { session ->
                                 viewModel.killSession(session.id) { result ->
-                                    toast = result.exceptionOrNull()?.message ?: "Killed ${session.id}"
+                                    toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },
                         )
@@ -336,7 +336,7 @@ fun WatchScreen(
                             },
                             onKill = { session ->
                                 viewModel.killSession(session.id) { result ->
-                                    toast = result.exceptionOrNull()?.message ?: "Killed ${session.id}"
+                                    toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },
                         )
@@ -1176,7 +1176,7 @@ private fun SessionRow(
                         if (telegramLink(session) != null) {
                             ActionPill(label = "TG", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = onOpenTelegram, tint = Cyan)
                         }
-                        ActionPill(label = "Kill", icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
+                        ActionPill(label = RETIRE_SESSION_ACTION_LABEL, icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
                     }
                     if (session.mobileTerminal?.supported == false && session.termuxAttach?.supported != true) {
                         StatusChip(label = session.mobileTerminal.reason ?: "mobile attach unavailable", tint = TextMuted)

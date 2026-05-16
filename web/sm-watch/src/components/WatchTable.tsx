@@ -150,7 +150,7 @@ function SessionDetailBlock({
           className="inline-flex items-center gap-2 rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-rose-200 transition hover:border-rose-400/60"
         >
           <Trash2 size={13} />
-          Kill session
+          Retire session
         </button>
         <button
           type="button"

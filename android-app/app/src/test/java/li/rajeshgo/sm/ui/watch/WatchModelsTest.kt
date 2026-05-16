@@ -8,6 +8,14 @@ import org.junit.Test
 
 class WatchModelsTest {
     @Test
+    fun retireSessionCopyUsesRetireLanguage() {
+        assertEquals("Retire", RETIRE_SESSION_ACTION_LABEL)
+        assertEquals("Sign in to retire sessions", SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE)
+        assertFalse(RETIRE_SESSION_ACTION_LABEL.contains("kill", ignoreCase = true))
+        assertFalse(SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE.contains("kill", ignoreCase = true))
+    }
+
+    @Test
     fun projectedStatusTreatsWorkingIdleSessionAsActive() {
         val session = session(status = "idle", activityState = "working")
 

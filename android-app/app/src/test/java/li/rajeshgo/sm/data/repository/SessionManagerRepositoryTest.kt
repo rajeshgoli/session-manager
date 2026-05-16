@@ -9,6 +9,12 @@ import org.junit.Test
 
 class SessionManagerRepositoryTest {
     @Test
+    fun retireFallbackErrorCopyUsesRetireLanguage() {
+        assertEquals("Retire request failed", RETIRE_REQUEST_FAILED_MESSAGE)
+        assertFalse(RETIRE_REQUEST_FAILED_MESSAGE.contains("kill", ignoreCase = true))
+    }
+
+    @Test
     fun mobileAttachTicketPathIncludesBaseUrlPathPrefix() {
         val repository = SessionManagerRepository()
 
