@@ -25,6 +25,9 @@ data class WatchRepoGroup(
     val children: List<WatchSessionNode>,
 )
 
+const val RETIRE_SESSION_ACTION_LABEL = "Retire"
+const val SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE = "Sign in to retire sessions"
+
 fun sessionDisplayName(session: ClientSession): String {
     return session.friendlyName?.takeIf { it.isNotBlank() } ?: session.name.ifBlank { session.id }
 }

@@ -343,14 +343,14 @@ export default function App() {
       const result = await postKill(id);
       if (!result.ok) {
         if (result.httpStatus === 422) {
-          showToast('Kill request rejected by API payload validation.');
+          showToast('Retire request rejected by API payload validation.');
           return;
         }
-        showToast('Kill request failed. Session manager endpoint not reachable.');
+        showToast('Retire request failed. Session manager endpoint not reachable.');
         return;
       }
       if (!result.killed) {
-        showToast(result.error || 'Kill request failed.');
+        showToast(result.error || 'Retire request failed.');
         return;
       }
       setSessions((prev) => prev.filter((session) => session.id !== id));
@@ -364,9 +364,9 @@ export default function App() {
         delete next[id];
         return next;
       });
-      showToast(`Killed ${id}.`);
+      showToast(`Retired ${id}.`);
     } catch {
-      showToast('Kill request failed.');
+      showToast('Retire request failed.');
     }
   };
 

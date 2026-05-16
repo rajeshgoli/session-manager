@@ -228,7 +228,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             val serverUrl = settingsRepository.serverUrl.first()
             val accessToken = settingsRepository.accessToken.first()
             val result = if (serverUrl.isBlank() || accessToken.isBlank()) {
-                Result.failure(IllegalStateException("Sign in to kill sessions"))
+                Result.failure(IllegalStateException(SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE))
             } else {
                 sessionRepository.killSession(serverUrl, accessToken, sessionId)
             }

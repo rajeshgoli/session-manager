@@ -38,6 +38,8 @@ class SessionManagerAuthException(message: String, cause: Throwable? = null) : S
 class SessionManagerTransientException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 class SessionManagerBackendUnavailableException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 
+const val RETIRE_REQUEST_FAILED_MESSAGE = "Retire request failed"
+
 class SessionManagerRepository {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -199,7 +201,7 @@ class SessionManagerRepository {
     suspend fun killSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val response = api(baseUrl, token).killSession(sessionId)
-            check(response.status == "killed") { response.error ?: "Kill request failed" }
+            check(response.status == "killed") { response.error ?: RETIRE_REQUEST_FAILED_MESSAGE }
         }.mapFailure(::classifyWriteFailure)
     }
 
