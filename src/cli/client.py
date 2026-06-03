@@ -375,11 +375,18 @@ class SessionManagerClient:
         """Ensure the maintainer service session exists."""
         return self.ensure_role("maintainer", requester_session_id=requester_session_id)
 
-    def ensure_role(self, role: str, requester_session_id: Optional[str] = None) -> dict:
+    def ensure_role(
+        self,
+        role: str,
+        requester_session_id: Optional[str] = None,
+        node: Optional[str] = None,
+    ) -> dict:
         """Ensure one configured auto-bootstrap registry role session exists."""
         payload = {}
         if requester_session_id:
             payload["requester_session_id"] = requester_session_id
+        if node:
+            payload["node"] = node
         role_path = urllib.parse.quote(role, safe="")
         data, status_code, unavailable = self._request_with_status(
             "POST",
@@ -738,6 +745,7 @@ class SessionManagerClient:
         model: Optional[str] = None,
         working_dir: Optional[str] = None,
         provider: Optional[str] = None,
+        node: Optional[str] = None,
         track_seconds: Optional[int] = None,
     ) -> Optional[dict]:
         """
@@ -768,6 +776,8 @@ class SessionManagerClient:
             payload["working_dir"] = working_dir
         if provider:
             payload["provider"] = provider
+        if node:
+            payload["node"] = node
         if track_seconds is not None:
             payload["track_seconds"] = track_seconds
 
@@ -1045,6 +1055,7 @@ class SessionManagerClient:
         working_dir: str,
         provider: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        node: Optional[str] = None,
     ) -> dict:
         """
         Create a new Claude Code session and preserve API error details.
@@ -1062,6 +1073,8 @@ class SessionManagerClient:
             payload["provider"] = provider
         if parent_session_id is not None:
             payload["parent_session_id"] = parent_session_id
+        if node:
+            payload["node"] = node
         data, status_code, unavailable = self._request_with_status(
             "POST",
             "/sessions",
@@ -1089,6 +1102,7 @@ class SessionManagerClient:
         working_dir: str,
         provider: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        node: Optional[str] = None,
     ) -> Optional[dict]:
         """
         Create a new Claude Code session.
@@ -1105,8 +1119,24 @@ class SessionManagerClient:
             working_dir,
             provider=provider,
             parent_session_id=parent_session_id,
+            node=node,
         )
         return result.get("data") if result.get("ok") else None
+
+    def list_nodes(self) -> Optional[dict]:
+        data, success, unavailable = self._request("GET", "/nodes")
+        if unavailable or not success:
+            return None
+        return data
+
+    def ping_node(self, node_id: str) -> dict:
+        path = f"/nodes/{urllib.parse.quote(node_id, safe='')}/ping"
+        data, status_code, unavailable = self._request_with_status("POST", path, {})
+        if unavailable:
+            return {"ok": False, "unavailable": True, "status_code": None, "detail": None, "data": None}
+        ok = status_code in (200, 201)
+        detail = data.get("detail") if isinstance(data, dict) else None
+        return {"ok": ok, "unavailable": False, "status_code": status_code, "detail": detail, "data": data}
 
     def get_queue_status(self, session_id: str) -> Optional[dict]:
         """

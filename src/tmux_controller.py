@@ -7,7 +7,9 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+from .node_runner import NodeRegistry, NodeRunner, PRIMARY_NODE, normalize_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +19,21 @@ class TmuxController:
 
     SERVER_ANCHOR_SESSION = "__sm_server_anchor"
 
-    def __init__(self, log_dir: str = "/tmp/claude-sessions", config: Optional[dict] = None):
+    def __init__(
+        self,
+        log_dir: str = "/tmp/claude-sessions",
+        config: Optional[dict] = None,
+        node_runner: Optional[NodeRunner] = None,
+        node_resolver: Optional[Callable[[str], str]] = None,
+        runtime_env_resolver: Optional[Callable[[str], dict[str, str]]] = None,
+    ):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.config = config or {}
         self.last_error_message: Optional[str] = None
+        self.node_runner = node_runner or NodeRunner(NodeRegistry.from_config(self.config))
+        self._node_resolver = node_resolver
+        self._runtime_env_resolver = runtime_env_resolver
 
         tmux_config = self.config.get("tmux", {}) if isinstance(self.config, dict) else {}
         raw_socket_name = str(tmux_config.get("socket_name", "") or "").strip()
@@ -51,6 +63,12 @@ class TmuxController:
         self.submit_verify_seconds = tmux_timeouts.get("submit_verify_seconds", 0.6)
         self.submit_retry_seconds = tmux_timeouts.get("submit_retry_seconds", 0.6)
         self.shell_fd_limit = int(tmux_timeouts.get("shell_fd_limit", 65536))
+
+    def set_node_resolver(self, resolver: Callable[[str], str]) -> None:
+        self._node_resolver = resolver
+
+    def set_runtime_env_resolver(self, resolver: Callable[[str], dict[str, str]]) -> None:
+        self._runtime_env_resolver = resolver
 
     @staticmethod
     def _coerce_bool(value: object, default: bool = False) -> bool:
@@ -83,8 +101,30 @@ class TmuxController:
         """Return the tmux session portion of a target that may include window/pane suffixes."""
         return str(session_name or "").split(":", 1)[0].split(".", 1)[0]
 
-    def tmux_cmd(self, *args: str, socket_name: Optional[str] = "__primary__") -> list[str]:
+    def _node_for_session(self, session_name: str) -> str:
+        target = self._normalize_session_target(session_name)
+        if self._node_resolver:
+            try:
+                return normalize_node_id(self._node_resolver(target))
+            except Exception:
+                logger.debug("Failed to resolve node for tmux session %s", target, exc_info=True)
+        return PRIMARY_NODE
+
+    def tmux_cmd(
+        self,
+        *args: str,
+        socket_name: Optional[str] = "__primary__",
+        node: Optional[str] = PRIMARY_NODE,
+    ) -> list[str]:
         """Build one tmux command using the configured SM socket unless overridden."""
+        return self.node_runner.command(node, self._tmux_argv(*args, socket_name=socket_name))
+
+    def _tmux_argv(
+        self,
+        *args: str,
+        socket_name: Optional[str] = "__primary__",
+    ) -> list[str]:
+        """Build the raw tmux argv before local/SSH node routing."""
         effective_socket = self.socket_name if socket_name == "__primary__" else socket_name
         cmd = ["tmux"]
         if effective_socket:
@@ -94,32 +134,72 @@ class TmuxController:
 
     def tmux_cmd_for_session(self, session_name: str, *args: str) -> list[str]:
         """Build a tmux command for an existing target, falling back for legacy sessions."""
-        return self.tmux_cmd(*args, socket_name=self._resolve_socket_for_session(session_name))
+        node = self._node_for_session(session_name)
+        return self.tmux_cmd(
+            *args,
+            socket_name=self._resolve_socket_for_session(session_name, node=node),
+            node=node,
+        )
 
-    def _session_exists_on_socket(self, session_name: str, socket_name: Optional[str]) -> bool:
+    def attach_command_for_session(self, session_name: str) -> list[str]:
+        """Build an interactive attach command for a session's owning node."""
+        target = self._normalize_session_target(session_name)
+        node = self._node_for_session(target)
+        socket_name = self._resolve_socket_for_session(target, node=node)
+        return self.node_runner.attach_command(
+            node,
+            self._tmux_argv("attach", "-t", target, socket_name=socket_name),
+        )
+
+    def _session_exists_on_socket(
+        self,
+        session_name: str,
+        socket_name: Optional[str],
+        *,
+        node: Optional[str] = PRIMARY_NODE,
+    ) -> bool:
         target = self._normalize_session_target(session_name)
         if not target:
             return False
         result = subprocess.run(
-            self.tmux_cmd("has-session", "-t", target, socket_name=socket_name),
+            self.tmux_cmd("has-session", "-t", target, socket_name=socket_name, node=node),
             capture_output=True,
             text=True,
             check=False,
         )
+        if normalize_node_id(node) != PRIMARY_NODE and result.returncode == 255:
+            detail = (result.stderr or result.stdout or "").strip() or "ssh transport failed"
+            raise RuntimeError(f"Node {normalize_node_id(node)} unreachable: {detail}")
         return result.returncode == 0
 
-    def _resolve_socket_for_session(self, session_name: str) -> Optional[str]:
+    def _session_exists_on_socket_for_node(
+        self,
+        session_name: str,
+        socket_name: Optional[str],
+        *,
+        node: Optional[str] = PRIMARY_NODE,
+    ) -> bool:
+        """Call _session_exists_on_socket with backward compatibility for tests/mocks."""
+        try:
+            return self._session_exists_on_socket(session_name, socket_name, node=node)
+        except TypeError as exc:
+            if "unexpected keyword argument 'node'" not in str(exc):
+                raise
+            return self._session_exists_on_socket(session_name, socket_name)
+
+    def _resolve_socket_for_session(self, session_name: str, *, node: Optional[str] = None) -> Optional[str]:
         """Resolve which tmux server owns a session, supporting legacy default-server panes."""
         target = self._normalize_session_target(session_name)
+        effective_node = normalize_node_id(node or self._node_for_session(target))
         if not target:
             return self.socket_name
-        if self.socket_name and self._session_exists_on_socket(target, self.socket_name):
+        if self.socket_name and self._session_exists_on_socket_for_node(target, self.socket_name, node=effective_node):
             return self.socket_name
-        if self.socket_name and self._session_exists_on_socket(target, None):
+        if self.socket_name and self._session_exists_on_socket_for_node(target, None, node=effective_node):
             return None
         return self.socket_name
 
-    def _ensure_server_options(self) -> None:
+    def _ensure_server_options(self, *, node: Optional[str] = PRIMARY_NODE) -> None:
         """Apply SM-owned tmux server options that are safe only on the configured socket."""
         if not self.socket_name:
             return
@@ -129,6 +209,7 @@ class TmuxController:
             "focus-events",
             "on",
             check=False,
+            node=node,
         )
         if not self.native_scrollback:
             return
@@ -137,6 +218,7 @@ class TmuxController:
             "-gqv",
             "terminal-overrides",
             check=False,
+            node=node,
         )
         if "smcup@:rmcup@" in (current.stdout or ""):
             return
@@ -145,9 +227,10 @@ class TmuxController:
             "-as",
             "terminal-overrides",
             ",*:smcup@:rmcup@",
+            node=node,
         )
 
-    def _ensure_server_anchor(self) -> None:
+    def _ensure_server_anchor(self, *, node: Optional[str] = PRIMARY_NODE) -> None:
         """Start the configured tmux server under a neutral SM-owned session.
 
         tmux server processes keep the argv from the command that first created
@@ -158,7 +241,7 @@ class TmuxController:
         """
         if not self.socket_name:
             return
-        if self._session_exists_on_socket(self.SERVER_ANCHOR_SESSION, self.socket_name):
+        if self._session_exists_on_socket_for_node(self.SERVER_ANCHOR_SESSION, self.socket_name, node=node):
             return
         result = self._run_tmux(
             "new-session",
@@ -171,6 +254,7 @@ class TmuxController:
             str(self.log_dir),
             "sleep 315360000",
             check=False,
+            node=node,
         )
         if result.returncode == 0:
             logger.info(
@@ -181,7 +265,7 @@ class TmuxController:
         elif "duplicate session" not in (result.stderr or "").lower():
             logger.warning("Could not create tmux server anchor: %s", result.stderr)
 
-    def _enable_exit_diagnostics(self, session_name: str) -> None:
+    def _enable_exit_diagnostics(self, session_name: str, *, node: Optional[str] = None) -> None:
         """Keep dead panes around long enough for the monitor to read exit status."""
         try:
             self._run_tmux(
@@ -191,6 +275,7 @@ class TmuxController:
                 "remain-on-exit",
                 "on",
                 check=False,
+                node=node,
             )
             pane_id = (
                 self._run_tmux(
@@ -200,6 +285,7 @@ class TmuxController:
                     session_name,
                     "#{pane_id}",
                     check=False,
+                    node=node,
                 ).stdout
                 or ""
             ).strip()
@@ -211,13 +297,19 @@ class TmuxController:
                     "@sm_main_pane_id",
                     pane_id,
                     check=False,
+                    node=node,
                 )
         except Exception:
             # Exit diagnostics are best-effort. Spawn should not fail if tmux
             # lacks this option or the pane disappeared during setup.
             logger.debug("Could not enable remain-on-exit for %s", session_name, exc_info=True)
 
-    def _list_sessions_on_socket(self, socket_name: Optional[str]) -> list[str]:
+    def _list_sessions_on_socket(
+        self,
+        socket_name: Optional[str],
+        *,
+        node: Optional[str] = PRIMARY_NODE,
+    ) -> list[str]:
         """Return tmux session names on one socket without using fallback resolution."""
         result = self._run_tmux(
             "list-sessions",
@@ -225,6 +317,7 @@ class TmuxController:
             "#{session_name}",
             check=False,
             socket_name=socket_name,
+            node=node,
         )
         if result.returncode != 0:
             return []
@@ -243,10 +336,11 @@ class TmuxController:
         legacy/default-socket mismatch.
         """
         target = self._normalize_session_target(session_name)
-        socket_name = self._resolve_socket_for_session(target)
-        exists = self._session_exists_on_socket(target, socket_name)
+        node = self._node_for_session(target)
+        socket_name = self._resolve_socket_for_session(target, node=node)
+        exists = self._session_exists_on_socket_for_node(target, socket_name, node=node)
         if not exists and self.socket_name:
-            legacy_exists = self._session_exists_on_socket(target, None)
+            legacy_exists = self._session_exists_on_socket_for_node(target, None, node=node)
             if legacy_exists:
                 socket_name = None
                 exists = True
@@ -254,12 +348,13 @@ class TmuxController:
         diagnostics: dict[str, object] = {
             "session_name": target,
             "socket_name": socket_name,
+            "node": node,
             "configured_socket_name": self.socket_name,
             "exists": exists,
             "pane_dead": False,
             "panes": [],
-            "sessions_on_configured_socket": self._list_sessions_on_socket(self.socket_name),
-            "sessions_on_default_socket": self._list_sessions_on_socket(None),
+            "sessions_on_configured_socket": self._list_sessions_on_socket(self.socket_name, node=node),
+            "sessions_on_default_socket": self._list_sessions_on_socket(None, node=node),
         }
 
         if not exists:
@@ -274,6 +369,7 @@ class TmuxController:
                 "@sm_main_pane_id",
                 check=False,
                 socket_name=socket_name,
+                node=node,
             ).stdout
             or ""
         ).strip() or None
@@ -287,6 +383,7 @@ class TmuxController:
             "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_current_command}\t#{pane_pid}\t#{pane_tty}\t#{pane_active}\t#{pane_title}",
             check=False,
             socket_name=socket_name,
+            node=node,
         )
         if result.returncode != 0:
             diagnostics["pane_error"] = (result.stderr or "").strip()
@@ -339,13 +436,20 @@ class TmuxController:
         self,
         command: str,
         *,
-        working_path: Path,
+        working_path: Path | str,
+        node: Optional[str] = PRIMARY_NODE,
     ) -> tuple[Optional[str], Optional[str]]:
         """Resolve and validate one CLI launch command before creating tmux state."""
         raw_command = str(command or "").strip()
         if not raw_command:
             return None, "Launch command is empty"
 
+        if normalize_node_id(node) != PRIMARY_NODE:
+            if self.node_runner.command_available(node, raw_command, cwd=str(working_path)):
+                return raw_command, None
+            return None, f"Launch command not found or not executable on node {node}: {raw_command}"
+
+        working_path = Path(str(working_path))
         if raw_command.startswith("~") or "/" in raw_command:
             candidate = Path(raw_command).expanduser()
             if not candidate.is_absolute():
@@ -364,15 +468,42 @@ class TmuxController:
             return None, f"Launch command not found on PATH: {raw_command}"
         return raw_command, None
 
+    def _prepare_working_dir(self, working_dir: str, *, node: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        """Validate a working directory on the node that will run the session."""
+        if normalize_node_id(node) == PRIMARY_NODE:
+            working_path = Path(working_dir).expanduser().resolve()
+            if not working_path.exists():
+                return None, f"Working directory does not exist: {working_dir}"
+            if not working_path.is_dir():
+                return None, f"Working directory is not a directory: {working_dir}"
+            return str(working_path), None
+
+        if not self.node_runner.path_is_dir(node, working_dir):
+            return None, f"Working directory does not exist on node {node}: {working_dir}"
+        return working_dir, None
+
+    def _prepare_log_file(self, log_file: str, *, node: Optional[str]) -> tuple[bool, Optional[str]]:
+        """Create the session log file on the node where tmux will run."""
+        if normalize_node_id(node) == PRIMARY_NODE:
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch()
+            return True, None
+
+        if self.node_runner.ensure_file(node, log_file):
+            return True, None
+        return False, f"Failed to create log file on node {node}: {log_file}"
+
     def _run_tmux(
         self,
         *args: str,
         check: bool = True,
         timeout: Optional[float] = None,
         socket_name: Optional[str] = "__primary__",
+        node: Optional[str] = PRIMARY_NODE,
     ) -> subprocess.CompletedProcess:
         """Run a tmux command."""
-        cmd = self.tmux_cmd(*args, socket_name=socket_name)
+        cmd = self.tmux_cmd(*args, socket_name=socket_name, node=node)
         logger.debug(f"Running tmux command: {' '.join(cmd)}")
         return subprocess.run(
             cmd,
@@ -388,9 +519,17 @@ class TmuxController:
         *args: str,
         check: bool = True,
         timeout: Optional[float] = None,
+        node: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
         """Run a tmux command against an existing target, with legacy fallback."""
-        cmd = self.tmux_cmd_for_session(session_name, *args)
+        if node is None:
+            cmd = self.tmux_cmd_for_session(session_name, *args)
+        else:
+            cmd = self.tmux_cmd(
+                *args,
+                socket_name=self._resolve_socket_for_session(session_name, node=node),
+                node=node,
+            )
         logger.debug(f"Running tmux command: {' '.join(cmd)}")
         return subprocess.run(
             cmd,
@@ -468,7 +607,7 @@ class TmuxController:
         except Exception:
             return None
 
-    def _initialize_pane_title(self, session_name: str) -> None:
+    def _initialize_pane_title(self, session_name: str, *, node: Optional[str] = None) -> None:
         """Seed a fresh pane with a neutral title before provider-specific updates arrive."""
         try:
             self._run_tmux(
@@ -476,27 +615,37 @@ class TmuxController:
                 "-t", session_name,
                 "-T", session_name,
                 check=False,
+                node=node,
             )
         except Exception:
             # Non-fatal: pane title is best-effort only.
             pass
 
-    def _prepare_managed_shell(self, session_name: str, session_id: Optional[str]) -> None:
+    def _prepare_managed_shell(
+        self,
+        session_name: str,
+        session_id: Optional[str],
+        *,
+        node: Optional[str] = None,
+        runtime_env: Optional[dict[str, str]] = None,
+    ) -> None:
         """Set shell state inherited by Claude/Codex before launching the provider."""
-        if self.shell_fd_limit > 0:
+        def send_shell(command: str) -> None:
+            kwargs = {}
+            if normalize_node_id(node) != PRIMARY_NODE:
+                kwargs["node"] = node
             self._run_tmux(
                 "send-keys",
                 "-t", session_name,
-                f"ulimit -n {self.shell_fd_limit}",
+                command,
                 "Enter",
+                **kwargs,
             )
 
-        self._run_tmux(
-            "send-keys",
-            "-t", session_name,
-            "unset NO_COLOR",
-            "Enter",
-        )
+        if self.shell_fd_limit > 0:
+            send_shell(f"ulimit -n {self.shell_fd_limit}")
+
+        send_shell("unset NO_COLOR")
         color_env = {
             "TERM_PROGRAM": os.environ.get("TERM_PROGRAM"),
             "TERM_PROGRAM_VERSION": os.environ.get("TERM_PROGRAM_VERSION"),
@@ -510,37 +659,24 @@ class TmuxController:
                 color_cmd = f"export {name}={shlex.quote(value)}"
             else:
                 color_cmd = f"unset {name}"
-            self._run_tmux(
-                "send-keys",
-                "-t", session_name,
-                color_cmd,
-                "Enter",
-            )
+            send_shell(color_cmd)
 
         # Claude Code can leave this behind after exits; managed tmux panes are independent
         # launches, so nested-session detection should not apply.
-        self._run_tmux(
-            "send-keys",
-            "-t", session_name,
-            "unset CLAUDECODE",
-            "Enter",
-        )
+        send_shell("unset CLAUDECODE")
         # Workaround for Claude Code bug: ToolSearch infinite loop (issues #20329, #20468, #20982)
-        self._run_tmux(
-            "send-keys",
-            "-t", session_name,
-            "export ENABLE_TOOL_SEARCH=false",
-            "Enter",
-        )
+        send_shell("export ENABLE_TOOL_SEARCH=false")
 
         if session_id:
             # Export session ID so it persists even if user exits and restarts the provider.
-            self._run_tmux(
-                "send-keys",
-                "-t", session_name,
-                f"export CLAUDE_SESSION_MANAGER_ID={session_id}",
-                "Enter",
-            )
+            send_shell(f"export CLAUDE_SESSION_MANAGER_ID={shlex.quote(session_id)}")
+
+        if runtime_env is None and self._runtime_env_resolver and session_id:
+            runtime_env = self._runtime_env_resolver(session_id)
+        for name, value in (runtime_env or {}).items():
+            if value is None:
+                continue
+            send_shell(f"export {name}={shlex.quote(str(value))}")
 
     def _exit_copy_mode_if_needed(self, session_name: str) -> tuple[Optional[int], Optional[int]]:
         """Exit tmux copy-mode on active pane when present."""
@@ -840,13 +976,23 @@ class TmuxController:
         )
         return True
 
-    def session_exists(self, session_name: str) -> bool:
+    def session_exists(self, session_name: str, *, node: Optional[str] = None) -> bool:
         """Check if a tmux session exists."""
-        if self._session_exists_on_socket(session_name, self.socket_name):
+        effective_node = normalize_node_id(node or self._node_for_session(session_name))
+        if self._session_exists_on_socket_for_node(session_name, self.socket_name, node=effective_node):
             return True
-        if self.socket_name and self._session_exists_on_socket(session_name, None):
+        if self.socket_name and self._session_exists_on_socket_for_node(session_name, None, node=effective_node):
             return True
         return False
+
+    def _session_exists_for_node(self, session_name: str, *, node: Optional[str] = None) -> bool:
+        """Call session_exists with backward compatibility for tests/mocks."""
+        try:
+            return self.session_exists(session_name, node=node)
+        except TypeError as exc:
+            if "unexpected keyword argument 'node'" not in str(exc):
+                raise
+            return self.session_exists(session_name)
 
     def get_history_limit(self, session_name: str) -> Optional[int]:
         """Return the active pane history limit for a tmux session."""
@@ -917,6 +1063,8 @@ class TmuxController:
         working_dir: str,
         log_file: str,
         session_id: Optional[str] = None,
+        node: Optional[str] = PRIMARY_NODE,
+        runtime_env: Optional[dict[str, str]] = None,
     ) -> bool:
         """
         Create a new tmux session with Claude Code running inside.
@@ -931,35 +1079,35 @@ class TmuxController:
             True if session created successfully
         """
         self.last_error_message = None
-        if self.session_exists(session_name):
+        if self._session_exists_for_node(session_name, node=node):
             logger.warning(f"Session {session_name} already exists")
             self.last_error_message = f"Tmux session already exists: {session_name}"
             return False
 
-        working_path = Path(working_dir).expanduser().resolve()
-        if not working_path.exists():
-            self.last_error_message = f"Working directory does not exist: {working_dir}"
+        working_path, working_error = self._prepare_working_dir(working_dir, node=node)
+        if working_error:
+            self.last_error_message = working_error
             logger.error(self.last_error_message)
             return False
 
         launch_command, command_error = self._resolve_launch_command(
             "claude",
             working_path=working_path,
+            node=node,
         )
         if command_error:
             self.last_error_message = command_error
             logger.error(command_error)
             return False
 
-        # Ensure log file parent directory exists
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Touch the log file
-        log_path.touch()
+        log_ready, log_error = self._prepare_log_file(log_file, node=node)
+        if not log_ready:
+            self.last_error_message = log_error
+            logger.error(log_error)
+            return False
 
         try:
-            self._ensure_server_anchor()
+            self._ensure_server_anchor(node=node)
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
@@ -967,23 +1115,25 @@ class TmuxController:
                 "-s", session_name,
                 "-c", str(working_path),
                 "-n", "__sm_bootstrap",
+                node=node,
             )
-            self._ensure_server_options()
-            self._run_tmux("set-option", "-t", session_name, "history-limit", str(self.history_limit))
-            self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
-            self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
-            self._run_tmux("select-window", "-t", f"{session_name}:main")
-            self._enable_exit_diagnostics(session_name)
-            self._initialize_pane_title(session_name)
+            self._ensure_server_options(node=node)
+            self._run_tmux("set-option", "-t", session_name, "history-limit", str(self.history_limit), node=node)
+            self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path), node=node)
+            self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap", node=node)
+            self._run_tmux("select-window", "-t", f"{session_name}:main", node=node)
+            self._enable_exit_diagnostics(session_name, node=node)
+            self._initialize_pane_title(session_name, node=node)
 
             # Set up pipe-pane to capture output to log file
             self._run_tmux(
                 "pipe-pane",
                 "-t", session_name,
-                f"cat >> {log_file}",
+                f"cat >> {shlex.quote(log_file)}",
+                node=node,
             )
 
-            self._prepare_managed_shell(session_name, session_id)
+            self._prepare_managed_shell(session_name, session_id, node=node, runtime_env=runtime_env)
 
             # Small delay to ensure exports complete
             import time
@@ -995,6 +1145,7 @@ class TmuxController:
                 "-t", session_name,
                 launch_command,
                 "Enter",
+                node=node,
             )
 
             self.last_error_message = None
@@ -1016,6 +1167,8 @@ class TmuxController:
         args: list[str] = None,
         model: Optional[str] = None,
         initial_prompt: Optional[str] = None,
+        node: Optional[str] = PRIMARY_NODE,
+        runtime_env: Optional[dict[str, str]] = None,
     ) -> bool:
         """
         Create a new tmux session with custom Claude Code command.
@@ -1034,33 +1187,35 @@ class TmuxController:
             True if session created successfully
         """
         self.last_error_message = None
-        if self.session_exists(session_name):
+        if self._session_exists_for_node(session_name, node=node):
             logger.warning(f"Session {session_name} already exists")
             self.last_error_message = f"Tmux session already exists: {session_name}"
             return False
 
-        working_path = Path(working_dir).expanduser().resolve()
-        if not working_path.exists():
-            self.last_error_message = f"Working directory does not exist: {working_dir}"
+        working_path, working_error = self._prepare_working_dir(working_dir, node=node)
+        if working_error:
+            self.last_error_message = working_error
             logger.error(self.last_error_message)
             return False
 
         launch_command, command_error = self._resolve_launch_command(
             command,
             working_path=working_path,
+            node=node,
         )
         if command_error:
             self.last_error_message = command_error
             logger.error(command_error)
             return False
 
-        # Ensure log file parent directory exists
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.touch()
+        log_ready, log_error = self._prepare_log_file(log_file, node=node)
+        if not log_ready:
+            self.last_error_message = log_error
+            logger.error(log_error)
+            return False
 
         try:
-            self._ensure_server_anchor()
+            self._ensure_server_anchor(node=node)
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
                 "new-session",
@@ -1068,23 +1223,25 @@ class TmuxController:
                 "-s", session_name,
                 "-c", str(working_path),
                 "-n", "__sm_bootstrap",
+                node=node,
             )
-            self._ensure_server_options()
-            self._run_tmux("set-option", "-t", session_name, "history-limit", str(self.history_limit))
-            self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path))
-            self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap")
-            self._run_tmux("select-window", "-t", f"{session_name}:main")
-            self._enable_exit_diagnostics(session_name)
-            self._initialize_pane_title(session_name)
+            self._ensure_server_options(node=node)
+            self._run_tmux("set-option", "-t", session_name, "history-limit", str(self.history_limit), node=node)
+            self._run_tmux("new-window", "-d", "-t", session_name, "-n", "main", "-c", str(working_path), node=node)
+            self._run_tmux("kill-window", "-t", f"{session_name}:__sm_bootstrap", node=node)
+            self._run_tmux("select-window", "-t", f"{session_name}:main", node=node)
+            self._enable_exit_diagnostics(session_name, node=node)
+            self._initialize_pane_title(session_name, node=node)
 
             # Set up pipe-pane to capture output to log file
             self._run_tmux(
                 "pipe-pane",
                 "-t", session_name,
-                f"cat >> {log_file}",
+                f"cat >> {shlex.quote(log_file)}",
+                node=node,
             )
 
-            self._prepare_managed_shell(session_name, session_id)
+            self._prepare_managed_shell(session_name, session_id, node=node, runtime_env=runtime_env)
 
             # Small delay to ensure exports complete
             import time
@@ -1111,12 +1268,14 @@ class TmuxController:
                 "-t", session_name,
                 "--",
                 launch_command,
+                node=node,
             )
             time.sleep(self._compute_settle_delay_seconds(launch_command))
             self._run_tmux(
                 "send-keys",
                 "-t", session_name,
                 "Enter",
+                node=node,
             )
 
             if initial_prompt:
@@ -1389,7 +1548,8 @@ class TmuxController:
             return False
 
         try:
-            self._run_tmux(
+            self._run_tmux_for_session(
+                session_name,
                 "send-keys",
                 "-t", session_name,
                 key,
@@ -1427,29 +1587,35 @@ class TmuxController:
     def list_sessions(self) -> list[str]:
         """List all tmux sessions."""
         sessions: set[str] = set()
-        result = self._run_tmux("list-sessions", "-F", "#{session_name}", check=False)
-        if result.returncode != 0:
-            result = None
-        if result is not None:
-            sessions.update(
-                s.strip()
-                for s in result.stdout.strip().split("\n")
-                if s.strip() and s.strip() != self.SERVER_ANCHOR_SESSION
-            )
-        if self.socket_name:
-            legacy = self._run_tmux(
+        for node in self.node_runner.registry.ids():
+            result = self._run_tmux(
                 "list-sessions",
                 "-F",
                 "#{session_name}",
                 check=False,
-                socket_name=None,
+                node=node,
             )
-            if legacy.returncode == 0:
+            if result.returncode == 0:
                 sessions.update(
                     s.strip()
-                    for s in legacy.stdout.strip().split("\n")
+                    for s in result.stdout.strip().split("\n")
                     if s.strip() and s.strip() != self.SERVER_ANCHOR_SESSION
                 )
+            if self.socket_name:
+                legacy = self._run_tmux(
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}",
+                    check=False,
+                    socket_name=None,
+                    node=node,
+                )
+                if legacy.returncode == 0:
+                    sessions.update(
+                        s.strip()
+                        for s in legacy.stdout.strip().split("\n")
+                        if s.strip() and s.strip() != self.SERVER_ANCHOR_SESSION
+                    )
         return sorted(sessions)
 
     def capture_pane(self, session_name: str, lines: int = 50) -> Optional[str]:

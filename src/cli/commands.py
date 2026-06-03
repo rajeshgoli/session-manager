@@ -52,10 +52,15 @@ def _tmux_socket_from_descriptor(descriptor: Optional[dict]) -> Optional[str]:
 
 def _attach_tmux_session(tmux_session: str, descriptor: Optional[dict] = None) -> int:
     """Attach the current terminal to a tmux session."""
-    tmux_socket_name = _tmux_socket_from_descriptor(descriptor)
+    attach_command = descriptor.get("attach_command") if isinstance(descriptor, dict) else None
+    if isinstance(attach_command, list) and attach_command:
+        cmd = [str(part) for part in attach_command]
+    else:
+        tmux_socket_name = _tmux_socket_from_descriptor(descriptor)
+        cmd = _tmux_command(["attach", "-t", tmux_session], tmux_socket_name)
     try:
         subprocess.run(
-            _tmux_command(["attach", "-t", tmux_session], tmux_socket_name),
+            cmd,
             check=True,
         )
         return 0
@@ -881,6 +886,45 @@ def cmd_who(client: SessionManagerClient, session_id: str) -> int:
     return 0
 
 
+def cmd_nodes(client: SessionManagerClient) -> int:
+    """List configured execution nodes."""
+    payload = client.list_nodes()
+    if payload is None:
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    nodes = payload.get("nodes") or []
+    if not nodes:
+        print("No nodes configured.")
+        return 0
+    headers = ("Node", "Primary", "SSH", "API URL", "Hook Base")
+    rows = [
+        (
+            str(node.get("id") or ""),
+            "yes" if node.get("primary") else "",
+            str(node.get("ssh") or ""),
+            str(node.get("api_url") or ""),
+            str(node.get("hook_base_url") or ""),
+        )
+        for node in nodes
+    ]
+    _print_roster_table(headers, rows)
+    return 0
+
+
+def cmd_node_ping(client: SessionManagerClient, node_id: str) -> int:
+    """Ping one configured execution node."""
+    result = client.ping_node(node_id)
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        print(f"Error: {result.get('detail') or 'ping failed'}", file=sys.stderr)
+        return 1
+    data = result.get("data") or {}
+    print(f"{data.get('node') or node_id}: ok")
+    return 0
+
+
 def cmd_what(client: SessionManagerClient, identifier: str, lines: int, deep: bool = False) -> int:
     """
     Get AI-generated summary of what a session is doing.
@@ -1377,6 +1421,7 @@ def cmd_dispatch(
     no_clear: bool = False,
     delivery_mode: str = "sequential",
     notify_on_stop: bool = True,
+    node: Optional[str] = None,
 ) -> int:
     """Dispatch a template-expanded prompt to a target agent.
 
@@ -1429,16 +1474,53 @@ def cmd_dispatch(
 
     # Resolve target once so clear/send/role-update all operate on same session.
     target_session_id, _ = resolve_session_id(client, agent_id)
+    target_session = None
     if target_session_id is None:
+        if node:
+            ensure_result = client.ensure_role(agent_id, requester_session_id=em_id, node=node)
+            if ensure_result.get("unavailable"):
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+                return 2
+            if not ensure_result.get("ok"):
+                status_code = ensure_result.get("status_code")
+                detail = ensure_result.get("detail")
+                if status_code not in (None, 404):
+                    print(f"Error: {detail or 'Failed to bootstrap role'}", file=sys.stderr)
+                    return 1
+                print(f"Error: Session '{agent_id}' not found", file=sys.stderr)
+                return 1
+            payload = ensure_result.get("data") or {}
+            target_session = payload.get("session") or {}
+            target_session_id = target_session.get("id")
+            if not target_session_id:
+                print(f"Error: Role bootstrap for '{agent_id}' returned no session", file=sys.stderr)
+                return 1
+            if payload.get("created"):
+                boot_name = target_session.get("friendly_name") or target_session.get("name") or target_session_id
+                provider = target_session.get("provider") or "unknown"
+                print(f"Role bootstrapped: {agent_id} -> {boot_name} ({target_session_id}) [{provider}]")
+        else:
+            sessions = client.list_sessions()
+            if sessions is None:
+                print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+                return 2
+            print(f"Error: Session '{agent_id}' not found", file=sys.stderr)
+            return 1
+    else:
         sessions = client.list_sessions()
         if sessions is None:
             print(UNAVAILABLE_MESSAGE, file=sys.stderr)
             return 2
-        print(f"Error: Session '{agent_id}' not found", file=sys.stderr)
-        return 1
+        target_session = next((item for item in sessions if item.get("id") == target_session_id), None)
+        if node and target_session and (target_session.get("node") or "primary") != node:
+            print(
+                f"Error: --node {node} does not match existing target node {target_session.get('node') or 'primary'}",
+                file=sys.stderr,
+            )
+            return 1
 
     # Clear target before dispatch unless opted out (#234).
-    if not no_clear:
+    if target_session_id is not None and not no_clear:
         rc = cmd_clear(client, em_id, target_session_id)
         if rc != 0:
             return rc
@@ -2331,6 +2413,7 @@ def cmd_spawn(
     working_dir: Optional[str] = None,
     json_output: bool = False,
     track_seconds: Optional[int] = None,
+    node: Optional[str] = None,
 ) -> int:
     """
     Spawn a child agent session.
@@ -2381,16 +2464,19 @@ def cmd_spawn(
         return 1
 
     # Spawn child session
-    result = client.spawn_child(
-        parent_session_id=parent_session_id,
-        prompt=prompt,
-        name=name,
-        wait=wait,
-        model=model,
-        working_dir=working_dir,
-        provider=provider,
-        track_seconds=track_seconds,
-    )
+    spawn_kwargs = {
+        "parent_session_id": parent_session_id,
+        "prompt": prompt,
+        "name": name,
+        "wait": wait,
+        "model": model,
+        "working_dir": working_dir,
+        "provider": provider,
+        "track_seconds": track_seconds,
+    }
+    if node:
+        spawn_kwargs["node"] = node
+    result = client.spawn_child(**spawn_kwargs)
 
     if result is None:
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
@@ -2885,6 +2971,7 @@ def cmd_new(
     working_dir: Optional[str] = None,
     provider: str = "claude",
     parent_session_id: Optional[str] = None,
+    node: Optional[str] = None,
 ) -> int:
     """
     Create a new session (Claude/Codex attach; Codex app is headless).
@@ -2908,30 +2995,34 @@ def cmd_new(
     if working_dir is None:
         working_dir = os.getcwd()
 
-    # Expand and resolve path
-    try:
-        path = Path(working_dir).expanduser().resolve()
-        if not path.exists():
-            print(f"Error: Directory does not exist: {working_dir}", file=sys.stderr)
+    if not node or node == "primary":
+        # Expand and resolve path locally for primary sessions. Remote nodes are
+        # preflighted by the server on the target machine.
+        try:
+            path = Path(working_dir).expanduser().resolve()
+            if not path.exists():
+                print(f"Error: Directory does not exist: {working_dir}", file=sys.stderr)
+                return 1
+            if not path.is_dir():
+                print(f"Error: Not a directory: {working_dir}", file=sys.stderr)
+                return 1
+            working_dir = str(path)
+        except Exception as e:
+            print(f"Error: Invalid path: {e}", file=sys.stderr)
             return 1
-        if not path.is_dir():
-            print(f"Error: Not a directory: {working_dir}", file=sys.stderr)
-            return 1
-        working_dir = str(path)
-    except Exception as e:
-        print(f"Error: Invalid path: {e}", file=sys.stderr)
-        return 1
 
     if provider == "codex-app" and not _print_codex_app_guidance_for_create(client):
         return 1
 
     # Create session via API
     print(f"Creating session in {working_dir}...")
-    result = client.create_session_result(
-        working_dir,
-        provider=provider,
-        parent_session_id=parent_session_id,
-    )
+    create_kwargs = {
+        "provider": provider,
+        "parent_session_id": parent_session_id,
+    }
+    if node:
+        create_kwargs["node"] = node
+    result = client.create_session_result(working_dir, **create_kwargs)
 
     if result.get("unavailable"):
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
@@ -2971,6 +3062,7 @@ def cmd_codex_2(
     client: SessionManagerClient,
     working_dir: Optional[str] = None,
     parent_session_id: Optional[str] = None,
+    node: Optional[str] = None,
 ) -> int:
     """
     Create a new codex-fork session and immediately attach via attach-descriptor flow.
@@ -2991,25 +3083,28 @@ def cmd_codex_2(
     if working_dir is None:
         working_dir = os.getcwd()
 
-    try:
-        path = Path(working_dir).expanduser().resolve()
-        if not path.exists():
-            print(f"Error: Directory does not exist: {working_dir}", file=sys.stderr)
+    if not node or node == "primary":
+        try:
+            path = Path(working_dir).expanduser().resolve()
+            if not path.exists():
+                print(f"Error: Directory does not exist: {working_dir}", file=sys.stderr)
+                return 1
+            if not path.is_dir():
+                print(f"Error: Not a directory: {working_dir}", file=sys.stderr)
+                return 1
+            working_dir = str(path)
+        except Exception as e:
+            print(f"Error: Invalid path: {e}", file=sys.stderr)
             return 1
-        if not path.is_dir():
-            print(f"Error: Not a directory: {working_dir}", file=sys.stderr)
-            return 1
-        working_dir = str(path)
-    except Exception as e:
-        print(f"Error: Invalid path: {e}", file=sys.stderr)
-        return 1
 
     print(f"Creating codex-fork session in {working_dir}...")
-    result = client.create_session_result(
-        working_dir,
-        provider="codex-fork",
-        parent_session_id=parent_session_id,
-    )
+    create_kwargs = {
+        "provider": "codex-fork",
+        "parent_session_id": parent_session_id,
+    }
+    if node:
+        create_kwargs["node"] = node
+    result = client.create_session_result(working_dir, **create_kwargs)
     if result.get("unavailable"):
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
@@ -3179,8 +3274,11 @@ def cmd_output(client: SessionManagerClient, identifier: str, lines: int) -> int
         print(f"Error: Session has no tmux session", file=sys.stderr)
         return 1
 
-    descriptor = client.get_attach_descriptor(session_id)
-    output = _capture_tmux_pane(tmux_session, lines=lines, descriptor=descriptor)
+    output_payload = client.get_output(session_id, lines=lines, timeout=10)
+    output = output_payload.get("output") if isinstance(output_payload, dict) else None
+    if output is None:
+        descriptor = client.get_attach_descriptor(session_id)
+        output = _capture_tmux_pane(tmux_session, lines=lines, descriptor=descriptor)
 
     if output is None:
         print(f"Error: Failed to capture output from {tmux_session}", file=sys.stderr)
@@ -3773,8 +3871,11 @@ def cmd_tail(
             print("Error: Session has no tmux session", file=sys.stderr)
             return 1
 
-        descriptor = client.get_attach_descriptor(session_id)
-        output = _capture_tmux_pane(tmux_session, lines=n, descriptor=descriptor)
+        output_payload = client.get_output(session_id, lines=n, timeout=10)
+        output = output_payload.get("output") if isinstance(output_payload, dict) else None
+        if output is None:
+            descriptor = client.get_attach_descriptor(session_id)
+            output = _capture_tmux_pane(tmux_session, lines=n, descriptor=descriptor)
         if output is None:
             print(f"Error: Failed to capture output from {tmux_session}", file=sys.stderr)
             return 1
@@ -4977,6 +5078,22 @@ def cmd_clear(
     if not tmux_session:
         print(f"Error: Session {target_session_id} has no tmux session", file=sys.stderr)
         return 1
+
+    if (session.get("node") or "primary") != "primary":
+        success, unavailable = client.clear_session(target_session_id, new_prompt)
+        if unavailable:
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
+        if not success:
+            print(f"Error: Failed to clear session {target_session_id}", file=sys.stderr)
+            return 1
+        name = session.get("friendly_name") or session.get("name") or target_session_id
+        if new_prompt:
+            print(f"Cleared {name} ({target_session_id}) and sent new prompt")
+        else:
+            print(f"Cleared {name} ({target_session_id})")
+        return 0
+
     descriptor = client.get_attach_descriptor(target_session_id)
     tmux_socket_name = _tmux_socket_from_descriptor(descriptor) or session.get("tmux_socket_name")
 

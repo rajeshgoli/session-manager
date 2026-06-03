@@ -7,6 +7,7 @@ import sqlite3
 import time
 from datetime import datetime
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 
@@ -1724,6 +1725,66 @@ class TestHookEndpoints:
 
         data = response.json()
         assert data["status"] == "logged"
+
+    def test_remote_claude_hook_requires_secret(self, test_client, mock_session_manager, sample_session):
+        """Remote Claude hooks with configured node secrets reject spoofed payloads."""
+        sample_session.node = "worker"
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.get_node_config.return_value = SimpleNamespace(hook_secret="secret123")
+
+        response = test_client.post(
+            "/hooks/claude",
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": "test123",
+                "transcript_path": "/remote/transcript.jsonl",
+                "sm_last_message": "done",
+                "sm_transcript_mtime_ns": 123,
+            },
+        )
+        assert response.status_code == 403
+
+        ok_response = test_client.post(
+            "/hooks/claude",
+            headers={"X-SM-Hook-Secret": "secret123"},
+            json={
+                "hook_event_name": "Stop",
+                "session_manager_id": "test123",
+                "transcript_path": "/remote/transcript.jsonl",
+                "sm_last_message": "done",
+                "sm_transcript_mtime_ns": 123,
+            },
+        )
+        assert ok_response.status_code == 200
+
+    def test_remote_tool_use_hook_requires_secret(self, test_client, mock_session_manager, sample_session):
+        """Remote tool-use hooks share the same node secret check."""
+        sample_session.node = "worker"
+        mock_session_manager.get_session.return_value = sample_session
+        mock_session_manager.get_node_config.return_value = SimpleNamespace(hook_secret="secret123")
+
+        response = test_client.post(
+            "/hooks/tool-use",
+            json={
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/tmp/test.py"},
+                "session_manager_id": "test123",
+            },
+        )
+        assert response.status_code == 403
+
+        ok_response = test_client.post(
+            "/hooks/tool-use",
+            headers={"X-SM-Hook-Secret": "secret123"},
+            json={
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/tmp/test.py"},
+                "session_manager_id": "test123",
+            },
+        )
+        assert ok_response.status_code == 200
 
 
 class TestSubagentEndpoints:

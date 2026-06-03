@@ -34,6 +34,7 @@ from .models import (
     SessionStatus,
     TelegramTopicRecord,
 )
+from .node_runner import NodeRegistry, NodeRunner, PRIMARY_NODE, normalize_node_id
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
 from .codex_activity_projection import CodexActivityProjection
@@ -161,8 +162,19 @@ class SessionManager:
             mq_timeouts.get("input_delivery_wait_seconds", 1.0)
         )
 
-        self.tmux = TmuxController(log_dir=log_dir, config=self.config)
         self.sessions: dict[str, Session] = {}
+        self.node_registry = NodeRegistry.from_config(self.config)
+        self.node_runner = NodeRunner(self.node_registry)
+        self._tmux_session_node_cache: dict[str, str] = {}
+        self._node_unreachable_sessions: set[str] = set()
+        self.last_create_error: Optional[str] = None
+        self.tmux = TmuxController(
+            log_dir=log_dir,
+            config=self.config,
+            node_runner=self.node_runner,
+            node_resolver=self._resolve_node_for_tmux_session,
+            runtime_env_resolver=self._runtime_env_for_session_id,
+        )
         self._event_handlers: list[Callable[[NotificationEvent], Awaitable[None]]] = []
         self.codex_sessions: dict[str, CodexAppServerSession] = {}
         self.codex_turns_in_flight: set[str] = set()
@@ -437,6 +449,97 @@ class SessionManager:
         except Exception:
             return None
         return history_limit if isinstance(history_limit, int) else None
+
+    def _cache_session_node(self, session: Session) -> None:
+        if session.tmux_session:
+            self._tmux_session_node_cache[session.tmux_session] = normalize_node_id(session.node)
+
+    def _resolve_node_for_tmux_session(self, tmux_session: str) -> str:
+        target = str(tmux_session or "").split(":", 1)[0].split(".", 1)[0]
+        if target in self._tmux_session_node_cache:
+            return self._tmux_session_node_cache[target]
+        for session in self.sessions.values():
+            if session.tmux_session == target:
+                node = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+                self._tmux_session_node_cache[target] = node
+                return node
+        return PRIMARY_NODE
+
+    def get_node_config(self, node: Optional[str]) -> Optional[Any]:
+        return self.node_registry.get(node)
+
+    def list_nodes(self) -> list[dict[str, object]]:
+        return self.node_registry.as_list()
+
+    def ping_node(self, node: str) -> dict[str, object]:
+        node_id = normalize_node_id(node)
+        if not self.node_registry.has(node_id):
+            return {"node": node_id, "ok": False, "error": f"Unknown node: {node_id}"}
+        try:
+            ok = self.node_runner.ping(node_id)
+        except Exception as exc:
+            return {"node": node_id, "ok": False, "error": str(exc)}
+        return {"node": node_id, "ok": ok, "error": None if ok else "ping failed"}
+
+    def _resolve_create_node(self, requested_node: Optional[str], parent_session_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        if requested_node:
+            node = normalize_node_id(requested_node)
+        elif parent_session_id and parent_session_id in self.sessions:
+            node = normalize_node_id(getattr(self.sessions[parent_session_id], "node", PRIMARY_NODE))
+        else:
+            node = PRIMARY_NODE
+
+        if not self.node_registry.has(node):
+            return None, f"Unknown node: {node}"
+        return node, None
+
+    @staticmethod
+    def _provider_node_rejection(provider: str, node: str) -> Optional[str]:
+        if normalize_node_id(node) != PRIMARY_NODE and provider != "claude":
+            return f"Remote placement is Claude-only in this phase (provider={provider})"
+        return None
+
+    def validate_create_node_provider(
+        self,
+        provider: str,
+        *,
+        requested_node: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        node, node_error = self._resolve_create_node(requested_node, parent_session_id)
+        if node_error:
+            return node, node_error
+        return node, self._provider_node_rejection(provider, node or PRIMARY_NODE)
+
+    def _runtime_env_for_session(self, session: Session) -> dict[str, str]:
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id == PRIMARY_NODE:
+            return {}
+        node = self.node_registry.get(node_id)
+        if node is None:
+            return {}
+        env: dict[str, str] = {}
+        if node.api_url:
+            env["SM_API_URL"] = node.api_url
+        if node.hook_base_url:
+            env["SM_HOOK_BASE_URL"] = node.hook_base_url.rstrip("/")
+        if node.hook_secret:
+            env["SM_HOOK_SECRET"] = node.hook_secret
+        return env
+
+    def _runtime_env_for_session_id(self, session_id: str) -> dict[str, str]:
+        session = self.sessions.get(session_id)
+        return self._runtime_env_for_session(session) if session else {}
+
+    def mark_node_unreachable(self, session_id: str, unreachable: bool = True) -> None:
+        if unreachable:
+            self._node_unreachable_sessions.add(session_id)
+        else:
+            self._node_unreachable_sessions.discard(session_id)
+
+    def is_session_node_unreachable(self, session_or_id: Session | str) -> bool:
+        session_id = session_or_id.id if isinstance(session_or_id, Session) else str(session_or_id)
+        return session_id in self._node_unreachable_sessions
 
     def _migrate_legacy_state_file_if_needed(self) -> None:
         """Copy a pre-durable temp-backed session registry into the configured path once."""
@@ -791,6 +894,7 @@ class SessionManager:
                 continue
             cleaned_sessions.append(session_data)
             session = Session.from_dict(session_data)
+            self._cache_session_node(session)
             if session.telegram_chat_id and session.telegram_thread_id:
                 key = (session.telegram_chat_id, session.telegram_thread_id)
                 if key not in self.telegram_topic_registry:
@@ -848,7 +952,31 @@ class SessionManager:
                 continue
 
             # Verify tmux session still exists (Claude/Codex CLI)
-            if self.tmux.session_exists(session.tmux_session):
+            try:
+                tmux_exists = self.tmux.session_exists(session.tmux_session)
+            except Exception as exc:
+                if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                    logger.warning(
+                        "Node %s unreachable while restoring session %s; preserving state: %s",
+                        getattr(session, "node", PRIMARY_NODE),
+                        session.name,
+                        exc,
+                    )
+                    if session.telegram_chat_id and session.telegram_thread_id:
+                        self._upsert_telegram_topic_record(
+                            session,
+                            session.telegram_chat_id,
+                            session.telegram_thread_id,
+                            persist=True,
+                            revive_deleted=True,
+                        )
+                    self.sessions[session.id] = session
+                    self.mark_node_unreachable(session.id, True)
+                    if session.provider == "codex-fork":
+                        self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
+                    continue
+                raise
+            if tmux_exists:
                 if session.telegram_chat_id and session.telegram_thread_id:
                     self._upsert_telegram_topic_record(
                         session,
@@ -1019,7 +1147,7 @@ class SessionManager:
             except Exception as e:
                 logger.error(f"Event handler error: {e}")
 
-    async def _get_git_remote_url_async(self, working_dir: str) -> Optional[str]:
+    async def _get_git_remote_url_async(self, working_dir: str, node: Optional[str] = PRIMARY_NODE) -> Optional[str]:
         """
         Get the git remote URL for a working directory (async, non-blocking).
 
@@ -1030,19 +1158,28 @@ class SessionManager:
             Git remote URL or None if not a git repo
         """
         try:
-            working_path = Path(working_dir).expanduser().resolve()
-            proc = await asyncio.create_subprocess_exec(
-                "git", "config", "--get", "remote.origin.url",
-                cwd=working_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            if normalize_node_id(node) == PRIMARY_NODE:
+                working_path = Path(working_dir).expanduser().resolve()
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "config", "--get", "remote.origin.url",
+                    cwd=working_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+                if proc.returncode == 0:
+                    return stdout.decode().strip()
+                return None
+            result = await self.node_runner.run_async(
+                node,
+                ["git", "-C", working_dir, "config", "--get", "remote.origin.url"],
+                timeout=5,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
-            if proc.returncode == 0:
-                return stdout.decode().strip()
+            if result.returncode == 0:
+                return (result.stdout or "").strip()
             return None
         except Exception as e:
-            logger.debug(f"Failed to get git remote for {working_dir}: {e}")
+            logger.debug(f"Failed to get git remote for {working_dir} on node {node}: {e}")
             return None
 
     def _get_git_remote_url(self, working_dir: str) -> Optional[str]:
@@ -2624,6 +2761,7 @@ class SessionManager:
         forked_from_session_id: Optional[str] = None,
         forked_from_provider_resume_id: Optional[str] = None,
         forked_by_session_id: Optional[str] = None,
+        node: Optional[str] = None,
     ) -> Optional[Session]:
         """
         Common session creation logic (private method).
@@ -2641,8 +2779,27 @@ class SessionManager:
         Returns:
             Created Session or None on failure
         """
+        self.last_create_error = None
+        resolved_node, node_error = self._resolve_create_node(node, parent_session_id)
+        if node_error:
+            self.last_create_error = node_error
+            logger.error("Rejecting session create in %s: %s", working_dir, node_error)
+            return None
+
+        provider_node_rejection = self._provider_node_rejection(provider, resolved_node or PRIMARY_NODE)
+        if provider_node_rejection:
+            self.last_create_error = provider_node_rejection
+            logger.error(
+                "Rejecting %s session create on node %s: %s",
+                provider,
+                resolved_node,
+                provider_node_rejection,
+            )
+            return None
+
         provider_rejection = self.get_provider_create_rejection(provider, working_dir=working_dir)
         if provider_rejection:
+            self.last_create_error = provider_rejection
             logger.error("Rejecting %s session create in %s: %s", provider, working_dir, provider_rejection)
             return None
 
@@ -2653,9 +2810,11 @@ class SessionManager:
             parent_session_id=parent_session_id,
             spawn_prompt=spawn_prompt,
             spawned_at=datetime.now() if parent_session_id else None,
+            node=resolved_node or PRIMARY_NODE,
             provider=provider,
             model=model,
         )
+        self._cache_session_node(session)
         if forked_from_session_id:
             session.forked_from_session_id = forked_from_session_id
         if forked_from_provider_resume_id:
@@ -2671,7 +2830,10 @@ class SessionManager:
             session.name = name
 
         # Detect git remote URL for repo matching (async to avoid blocking)
-        session.git_remote_url = await self._get_git_remote_url_async(working_dir)
+        if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) == PRIMARY_NODE:
+            session.git_remote_url = await self._get_git_remote_url_async(working_dir)
+        else:
+            session.git_remote_url = await self._get_git_remote_url_async(working_dir, node=session.node)
 
         # Set up log file path and tmux session for CLI providers
         if provider in ("claude", "codex", "codex-fork"):
@@ -2720,19 +2882,28 @@ class SessionManager:
 
             # Create the tmux session with config args
             # NOTE: session.tmux_session is auto-set by __post_init__ to {provider}-{id}
+            tmux_create_kwargs = {
+                "session_id": session.id,
+                "command": command,
+                "args": args,
+                "model": selected_model if model else None,  # Only pass if explicitly set
+                "initial_prompt": initial_prompt,
+            }
+            runtime_env = self._runtime_env_for_session(session)
+            if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                tmux_create_kwargs["node"] = session.node
+            if runtime_env:
+                tmux_create_kwargs["runtime_env"] = runtime_env
             created = await asyncio.to_thread(
                 self.tmux.create_session_with_command,
                 session.tmux_session,
                 working_dir,
                 session.log_file,
-                session_id=session.id,
-                command=command,
-                args=args,
-                model=selected_model if model else None,  # Only pass if explicitly set
-                initial_prompt=initial_prompt,
+                **tmux_create_kwargs,
             )
             if not created:
                 tmux_error = getattr(self.tmux, "last_error_message", None)
+                self.last_create_error = tmux_error or "Failed to create tmux session"
                 if tmux_error:
                     logger.error("Failed to create tmux session for %s: %s", session.name, tmux_error)
                 else:
@@ -2780,6 +2951,7 @@ class SessionManager:
         else:
             session.status = SessionStatus.RUNNING
         self.sessions[session.id] = session
+        self._cache_session_node(session)
         self._sync_session_resume_id(session)
         self._save_state()
 
@@ -2940,6 +3112,7 @@ class SessionManager:
         telegram_chat_id: Optional[int] = None,
         provider: str = "claude",
         parent_session_id: Optional[str] = None,
+        node: Optional[str] = None,
     ) -> Optional[Session]:
         """
         Create a new Claude Code session (async, non-blocking).
@@ -2959,6 +3132,7 @@ class SessionManager:
             telegram_chat_id=telegram_chat_id,
             provider=provider,
             parent_session_id=parent_session_id,
+            node=node,
         )
 
     async def spawn_child_session(
@@ -2970,6 +3144,7 @@ class SessionManager:
         model: Optional[str] = None,
         working_dir: Optional[str] = None,
         provider: Optional[str] = None,
+        node: Optional[str] = None,
         defer_telegram_topic: bool = False,
     ) -> Optional[Session]:
         """
@@ -3013,6 +3188,7 @@ class SessionManager:
             model=model,
             initial_prompt=prompt,
             provider=selected_provider,
+            node=node,
             defer_telegram_topic=defer_telegram_topic,
         )
 
@@ -3572,8 +3748,15 @@ class SessionManager:
         normalized_role = self.normalize_agent_role(role)
         return self._service_role_bootstrap_locks.setdefault(normalized_role, asyncio.Lock())
 
-    def _resolve_service_role_working_dir(self, spec: dict[str, Any]) -> str:
+    def _resolve_service_role_working_dir(
+        self,
+        spec: dict[str, Any],
+        *,
+        node: Optional[str] = PRIMARY_NODE,
+    ) -> str:
         """Resolve one service-role working directory."""
+        if normalize_node_id(node) != PRIMARY_NODE:
+            return str(spec["working_dir"]).strip()
         candidate = Path(str(spec["working_dir"])).expanduser().resolve()
         role = spec["role"]
         if not candidate.exists():
@@ -3605,7 +3788,7 @@ class SessionManager:
             .replace("{role}", role)
         )
 
-    def _provider_entrypoint_available(self, provider: str) -> bool:
+    def _provider_entrypoint_available(self, provider: str, *, node: Optional[str] = PRIMARY_NODE) -> bool:
         """Best-effort preflight for tmux-backed providers used during maintainer bootstrap."""
         if provider == "codex-fork":
             command = self.codex_fork_command
@@ -3625,6 +3808,9 @@ class SessionManager:
             entrypoint = str(command).strip()
         if not entrypoint:
             return False
+
+        if normalize_node_id(node) != PRIMARY_NODE:
+            return self.node_runner.command_available(node, entrypoint)
 
         if "/" in entrypoint or entrypoint.startswith("~"):
             candidate = Path(entrypoint).expanduser()
@@ -3671,7 +3857,7 @@ class SessionManager:
             return None
         return self._get_live_registered_session(registration.session_id)
 
-    async def ensure_role_session(self, role: str) -> tuple[Session, bool]:
+    async def ensure_role_session(self, role: str, node: Optional[str] = None) -> tuple[Session, bool]:
         """Return the live session for one auto-bootstrap service role, spawning it if needed."""
         normalized_role = self.normalize_agent_role(role)
         if not normalized_role:
@@ -3683,19 +3869,45 @@ class SessionManager:
 
         existing = self.get_service_role_session(normalized_role)
         if existing:
+            if node and normalize_node_id(getattr(existing, "node", PRIMARY_NODE)) != normalize_node_id(node):
+                raise ValueError(
+                    f'Role "{normalized_role}" already exists on node '
+                    f'{getattr(existing, "node", PRIMARY_NODE)}; requested node {normalize_node_id(node)}'
+                )
             return existing, False
 
         async with self._get_service_role_bootstrap_lock(normalized_role):
             existing = self.get_service_role_session(normalized_role)
             if existing:
+                if node and normalize_node_id(getattr(existing, "node", PRIMARY_NODE)) != normalize_node_id(node):
+                    raise ValueError(
+                        f'Role "{normalized_role}" already exists on node '
+                        f'{getattr(existing, "node", PRIMARY_NODE)}; requested node {normalize_node_id(node)}'
+                    )
                 return existing, False
 
-            working_dir = self._resolve_service_role_working_dir(spec)
+            resolved_node = normalize_node_id(node) if node else PRIMARY_NODE
+            working_dir = self._resolve_service_role_working_dir(spec, node=resolved_node)
             bootstrap_prompt = self._render_service_role_bootstrap_prompt(spec, working_dir)
             last_error: Optional[str] = None
 
             for provider in spec["preferred_providers"]:
-                if not self._provider_entrypoint_available(provider):
+                provider_node_rejection = self._provider_node_rejection(provider, resolved_node)
+                if provider_node_rejection:
+                    last_error = provider_node_rejection
+                    logger.warning(
+                        "Skipping %s bootstrap provider %s on node %s: %s",
+                        normalized_role,
+                        provider,
+                        resolved_node,
+                        provider_node_rejection,
+                    )
+                    continue
+                if node:
+                    entrypoint_available = self._provider_entrypoint_available(provider, node=resolved_node)
+                else:
+                    entrypoint_available = self._provider_entrypoint_available(provider)
+                if not entrypoint_available:
                     last_error = f"{provider} entrypoint unavailable"
                     logger.warning(
                         "Skipping %s bootstrap provider %s: entrypoint unavailable",
@@ -3704,12 +3916,15 @@ class SessionManager:
                     )
                     continue
 
-                session = await self._create_session_common(
-                    working_dir=working_dir,
-                    friendly_name=spec["friendly_name"],
-                    initial_prompt=bootstrap_prompt,
-                    provider=provider,
-                )
+                create_kwargs = {
+                    "working_dir": working_dir,
+                    "friendly_name": spec["friendly_name"],
+                    "initial_prompt": bootstrap_prompt,
+                    "provider": provider,
+                }
+                if node:
+                    create_kwargs["node"] = resolved_node
+                session = await self._create_session_common(**create_kwargs)
                 if not session:
                     last_error = f"{provider} session creation failed"
                     logger.warning(
@@ -5252,8 +5467,21 @@ class SessionManager:
         """Mark a tmux-backed session stopped when delivery proves the runtime is gone."""
         if session.provider == "codex-app" or not session.tmux_session:
             return False
-        if self.tmux.session_exists(session.tmux_session):
-            return False
+        try:
+            if self.tmux.session_exists(session.tmux_session):
+                self.mark_node_unreachable(session.id, False)
+                return False
+        except Exception as exc:
+            if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                logger.warning(
+                    "Node %s unreachable while checking tmux runtime for %s: %s",
+                    getattr(session, "node", PRIMARY_NODE),
+                    session.id,
+                    exc,
+                )
+                self.mark_node_unreachable(session.id, True)
+                return False
+            raise
 
         diagnostics = None
         get_exit_diagnostics = getattr(self.tmux, "get_session_exit_diagnostics", None)
@@ -5954,11 +6182,14 @@ class SessionManager:
             if not session:
                 return ActivityState.STOPPED.value
 
-        if session.provider == "codex-fork":
-            return self._compute_codex_fork_activity(session)
-
         if session.status == SessionStatus.STOPPED:
             return ActivityState.STOPPED.value
+
+        if self.is_session_node_unreachable(session):
+            return ActivityState.NODE_UNREACHABLE.value
+
+        if session.provider == "codex-fork":
+            return self._compute_codex_fork_activity(session)
 
         if session.provider == "codex-app":
             return self._compute_codex_app_activity(session)
@@ -6090,11 +6321,22 @@ class SessionManager:
                 "runtime_mode": "stopped",
                 "message": "Session is stopped and no live runtime is available for attach.",
             }
+        attach_command = None
+        attach_command_getter = getattr(self.tmux, "attach_command_for_session", None)
+        if callable(attach_command_getter) and session.tmux_session:
+            try:
+                candidate = attach_command_getter(session.tmux_session)
+            except Exception:
+                candidate = None
+            if isinstance(candidate, list):
+                attach_command = [str(part) for part in candidate]
+
         if provider == "codex-fork":
             lifecycle = self.get_codex_fork_lifecycle_state(session_id) or {}
-            return {
+            descriptor = {
                 "session_id": session.id,
                 "provider": provider,
+                "node": getattr(session, "node", PRIMARY_NODE),
                 "attach_supported": True,
                 "attach_transport": "tmux",
                 "tmux_session": session.tmux_session,
@@ -6109,6 +6351,9 @@ class SessionManager:
                 "control_socket_path": str(self._codex_fork_control_socket_path(session)),
                 "event_stream_path": str(self._codex_fork_event_stream_path(session)),
             }
+            if attach_command:
+                descriptor["attach_command"] = attach_command
+            return descriptor
 
         if provider == "codex-app":
             return {
@@ -6119,9 +6364,10 @@ class SessionManager:
                 "message": "provider=codex-app is headless; use watch/status APIs instead of attach.",
             }
 
-        return {
+        descriptor = {
             "session_id": session.id,
             "provider": provider,
+            "node": getattr(session, "node", PRIMARY_NODE),
             "attach_supported": True,
             "attach_transport": "tmux",
             "tmux_session": session.tmux_session,
@@ -6130,6 +6376,9 @@ class SessionManager:
             "tmux_configured_history_limit": self._tmux_history_limit(),
             "runtime_mode": "tmux",
         }
+        if attach_command:
+            descriptor["attach_command"] = attach_command
+        return descriptor
 
     def get_codex_events(self, session_id: str, since_seq: Optional[int] = None, limit: int = 200) -> dict:
         """Read persisted codex event timeline for one session."""
@@ -6384,7 +6633,20 @@ class SessionManager:
                     state="shutdown",
                     cause_event_type="session_killed",
                 )
-            self.tmux.kill_session(session.tmux_session)
+            try:
+                self.tmux.kill_session(session.tmux_session)
+                self.mark_node_unreachable(session.id, False)
+            except Exception as exc:
+                if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                    logger.warning(
+                        "Node %s unreachable while killing session %s: %s",
+                        getattr(session, "node", PRIMARY_NODE),
+                        session.id,
+                        exc,
+                    )
+                    self.mark_node_unreachable(session.id, True)
+                    return False
+                raise
         now = datetime.now()
         session.status = SessionStatus.STOPPED
         session.completion_status = CompletionStatus.KILLED
@@ -6402,10 +6664,23 @@ class SessionManager:
         session = self.sessions.get(session_id)
         if not session:
             return False, None, "Session not found"
-        tmux_runtime_missing = (
-            session.provider != "codex-app"
-            and not self.tmux.session_exists(session.tmux_session)
-        )
+        try:
+            tmux_runtime_missing = (
+                session.provider != "codex-app"
+                and not self.tmux.session_exists(session.tmux_session)
+            )
+            self.mark_node_unreachable(session.id, False)
+        except Exception as exc:
+            if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                logger.warning(
+                    "Node %s unreachable while restoring session %s: %s",
+                    getattr(session, "node", PRIMARY_NODE),
+                    session.id,
+                    exc,
+                )
+                self.mark_node_unreachable(session.id, True)
+                return False, session, f"Node {getattr(session, 'node', PRIMARY_NODE)} unreachable"
+            raise
         if session.status != SessionStatus.STOPPED and not tmux_runtime_missing:
             return False, session, "Session is not stopped"
 
@@ -6430,6 +6705,8 @@ class SessionManager:
                 command=command,
                 args=args,
                 model=session.model,
+                node=session.node,
+                runtime_env=self._runtime_env_for_session(session),
             ):
                 tmux_error = getattr(self.tmux, "last_error_message", None)
                 if tmux_error:
@@ -6438,6 +6715,9 @@ class SessionManager:
                 return False, session, tmux_error or "Failed to restore Claude session runtime"
             session.tmux_socket_name = self._tmux_socket_name()
         elif session.provider in ("codex", "codex-fork"):
+            provider_node_rejection = self._provider_node_rejection(session.provider, session.node)
+            if provider_node_rejection:
+                return False, session, provider_node_rejection
             if not resume_id:
                 return False, session, "No Codex resume id is available for this session"
             if session.provider == "codex":
@@ -6462,6 +6742,8 @@ class SessionManager:
                 session_id=session.id,
                 command=command,
                 args=args,
+                node=session.node,
+                runtime_env=self._runtime_env_for_session(session),
             ):
                 tmux_error = getattr(self.tmux, "last_error_message", None)
                 if tmux_error:
@@ -6809,6 +7091,7 @@ class SessionManager:
             model=model,
             initial_prompt=None,  # No prompt — we send /review instead
             provider="codex",
+            node=PRIMARY_NODE,
         )
 
         if not session:

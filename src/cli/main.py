@@ -176,7 +176,7 @@ def _handle_dispatch(session_id: Optional[str]) -> int:
     """
     from .dispatch import parse_dispatch_args
 
-    agent_id, role, dry_run, no_clear, delivery_mode, notify_on_stop, dynamic_params = \
+    agent_id, role, dry_run, no_clear, delivery_mode, notify_on_stop, node, dynamic_params = \
         parse_dispatch_args(sys.argv[2:])
 
     # em_id check: required for send mode, placeholder for dry-run
@@ -193,7 +193,7 @@ def _handle_dispatch(session_id: Optional[str]) -> int:
     return commands.cmd_dispatch(
         client, agent_id, role, dynamic_params, em_id,
         dry_run=dry_run, no_clear=no_clear,
-        delivery_mode=delivery_mode, notify_on_stop=notify_on_stop,
+        delivery_mode=delivery_mode, notify_on_stop=notify_on_stop, node=node,
     )
 
 
@@ -236,6 +236,13 @@ def main():
 
     # sm who
     subparsers.add_parser("who", help="List other active sessions in this workspace")
+
+    # sm nodes / sm node ping <node-id>
+    subparsers.add_parser("nodes", help="List configured execution nodes")
+    node_parser = subparsers.add_parser("node", help="Inspect one execution node")
+    node_subparsers = node_parser.add_subparsers(dest="node_command")
+    node_ping_parser = node_subparsers.add_parser("ping", help="Check node reachability")
+    node_ping_parser.add_argument("node_id", help="Execution node ID")
 
     # sm what <session-id>
     what_parser = subparsers.add_parser("what", help="Get summary of what a session is doing")
@@ -477,6 +484,7 @@ def main():
         ),
     )
     spawn_parser.add_argument("--working-dir", help="Override working directory (defaults to parent's directory)")
+    spawn_parser.add_argument("--node", help="Execution node for the child session")
     spawn_parser.add_argument("--json", action="store_true", help="Output JSON")
     spawn_parser.add_argument(
         "--track",
@@ -545,6 +553,7 @@ def main():
         nargs="?",
         help="Working directory (defaults to current directory)"
     )
+    parser_claude.add_argument("--node", help="Execution node for the session")
 
     # sm codex [working_dir]
     parser_codex = subparsers.add_parser(
@@ -556,6 +565,7 @@ def main():
         nargs="?",
         help="Working directory (defaults to current directory)"
     )
+    parser_codex.add_argument("--node", help="Execution node (remote Codex is rejected in Phase 1)")
 
     # sm codex-legacy [working_dir]
     parser_codex_legacy = subparsers.add_parser(
@@ -567,6 +577,7 @@ def main():
         nargs="?",
         help="Working directory (defaults to current directory)"
     )
+    parser_codex_legacy.add_argument("--node", help="Execution node (remote Codex is rejected in Phase 1)")
 
     # sm codex-fork [working_dir]
     parser_codex_fork = subparsers.add_parser(
@@ -579,6 +590,7 @@ def main():
         nargs="?",
         help="Working directory (defaults to current directory)"
     )
+    parser_codex_fork.add_argument("--node", help="Execution node (remote Codex is rejected in Phase 1)")
 
     # sm codex-2 [working_dir]
     parser_codex_2 = subparsers.add_parser(
@@ -590,6 +602,7 @@ def main():
         nargs="?",
         help="Working directory (defaults to current directory)"
     )
+    parser_codex_2.add_argument("--node", help="Execution node (remote Codex is rejected in Phase 1)")
 
     # sm codex-app [working_dir]
     parser_codex_app = subparsers.add_parser(
@@ -601,6 +614,7 @@ def main():
         nargs="?",
         help="Working directory (defaults to current directory)"
     )
+    parser_codex_app.add_argument("--node", help="Execution node (remote Codex is rejected in Phase 1)")
 
     # sm codex-server [working_dir] (removed entrypoint)
     parser_codex_server = subparsers.add_parser(
@@ -623,6 +637,7 @@ def main():
         nargs="?",
         help="Working directory (defaults to current directory)"
     )
+    parser_new.add_argument("--node", help="Execution node for the session")
 
     # sm attach [session]
     parser_attach = subparsers.add_parser(
@@ -913,7 +928,7 @@ def main():
     no_session_needed = [
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "retire", "restore", "unkill", "fork", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
-        "codex-2", "codex-app", "codex-server",
+        "codex-2", "codex-app", "codex-server", "nodes", "node",
         "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
     ]
     # Commands that require session_id: self-directed managed-session actions
@@ -939,6 +954,13 @@ def main():
         sys.exit(commands.cmd_me(client, session_id))
     elif args.command == "who":
         sys.exit(commands.cmd_who(client, session_id))
+    elif args.command == "nodes":
+        sys.exit(commands.cmd_nodes(client))
+    elif args.command == "node":
+        if args.node_command == "ping":
+            sys.exit(commands.cmd_node_ping(client, args.node_id))
+        print("Error: node subcommand required (ping)", file=sys.stderr)
+        sys.exit(2)
     elif args.command == "what":
         sys.exit(commands.cmd_what(client, args.session_id, args.lines, args.deep))
     elif args.command == "others":
@@ -1194,6 +1216,7 @@ def main():
             args.working_dir,
             args.json,
             getattr(args, "track", None),
+            node=args.node,
         ))
     elif args.command == "children":
         if args.session_id:
@@ -1238,21 +1261,21 @@ def main():
     elif args.command == "clean":
         sys.exit(commands.cmd_clean(client, session_ids=getattr(args, 'session_ids', None)))
     elif args.command == "claude":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude", parent_session_id=session_id))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude", parent_session_id=session_id, node=args.node))
     elif args.command == "codex":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork", parent_session_id=session_id))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork", parent_session_id=session_id, node=args.node))
     elif args.command == "codex-legacy":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex", parent_session_id=session_id))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex", parent_session_id=session_id, node=args.node))
     elif args.command in ("codex-fork", "codex_fork"):
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork", parent_session_id=session_id))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-fork", parent_session_id=session_id, node=args.node))
     elif args.command == "codex-2":
-        sys.exit(commands.cmd_codex_2(client, args.working_dir, parent_session_id=session_id))
+        sys.exit(commands.cmd_codex_2(client, args.working_dir, parent_session_id=session_id, node=args.node))
     elif args.command == "codex-app":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app", parent_session_id=session_id))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="codex-app", parent_session_id=session_id, node=args.node))
     elif args.command == "codex-server":
         sys.exit(commands.cmd_removed_entrypoint("codex-server"))
     elif args.command == "new":
-        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude", parent_session_id=session_id))
+        sys.exit(commands.cmd_new(client, args.working_dir, provider="claude", parent_session_id=session_id, node=args.node))
     elif args.command == "attach":
         sys.exit(commands.cmd_attach(client, args.session))
     elif args.command == "output":

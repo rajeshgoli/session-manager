@@ -27,6 +27,7 @@ _COLUMN_SPECS = [
     ("ID", 8, 0, "left"),
     ("Parent", 18, 2, "left"),
     ("Role", 8, 1, "left"),
+    ("Node", 8, 1, "left"),
     ("Provider", 10, 1, "left"),
     ("Activity", 11, 1, "left"),
     ("Status", 8, 1, "left"),
@@ -40,6 +41,7 @@ _COLUMN_FLOORS = {
     "ID": 4,
     "Parent": 8,
     "Role": 4,
+    "Node": 4,
     "Provider": 6,
     "Activity": 7,
     "Status": 5,
@@ -50,6 +52,7 @@ _DYNAMIC_COLUMN_CAPS = {
     "ID": 8,
     "Parent": 36,
     "Role": 16,
+    "Node": 12,
     "Provider": 10,
     "Activity": 18,
     "Status": 10,
@@ -62,6 +65,7 @@ _RESTORE_COLUMN_SPECS = [
     ("ID", 8, 0, "left"),
     ("Parent", 18, 2, "left"),
     ("Role", 8, 1, "left"),
+    ("Node", 8, 1, "left"),
     ("Provider", 10, 1, "left"),
     ("Repo", 12, 2, "left"),
     ("Last Active", 11, 1, "left"),
@@ -73,6 +77,7 @@ _RESTORE_COLUMN_FLOORS = {
     "ID": 4,
     "Parent": 8,
     "Role": 4,
+    "Node": 4,
     "Provider": 6,
     "Repo": 6,
     "Last Active": 5,
@@ -83,6 +88,7 @@ _RESTORE_DYNAMIC_COLUMN_CAPS = {
     "ID": 8,
     "Parent": 36,
     "Role": 16,
+    "Node": 12,
     "Provider": 10,
     "Repo": 28,
     "Last Active": 12,
@@ -684,6 +690,7 @@ def build_watch_rows(
             "ID": session.get("id", ""),
             "Parent": _parent_label(session, sessions_by_id),
             "Role": role,
+            "Node": session.get("node") or "primary",
             "Provider": provider,
             "Activity": _state_label(activity_state, spinner_index),
             "Status": status,
@@ -877,6 +884,7 @@ def build_restore_rows(
             "ID": session_id or "",
             "Parent": _parent_label(session, sessions_by_id),
             "Role": session.get("role") or "-",
+            "Node": session.get("node") or "primary",
             "Provider": session.get("provider", "claude"),
             "Repo": repo_label,
             "Last Active": _age_from_iso(session.get("last_activity")),
@@ -1163,6 +1171,8 @@ def _create_watch_session(
         return session, None, "Created session has no tmux target"
     if descriptor and descriptor.get("tmux_socket_name"):
         session["tmux_socket_name"] = descriptor.get("tmux_socket_name")
+    if descriptor and isinstance(descriptor.get("attach_command"), list):
+        session["_attach_command"] = [str(part) for part in descriptor["attach_command"]]
 
     return session, tmux_session, None
 
@@ -1213,6 +1223,8 @@ def _resolve_tmux_attach_target(
         session["tmux_session"] = tmux_session
         if tmux_socket_name:
             session["tmux_socket_name"] = tmux_socket_name
+        if isinstance(descriptor.get("attach_command"), list):
+            session["_attach_command"] = [str(part) for part in descriptor["attach_command"]]
 
     return tmux_session, tmux_socket_name, None
 
@@ -1225,11 +1237,17 @@ def _tmux_attach_command(tmux_session: str, tmux_socket_name: str | None = None)
     return cmd
 
 
-def _attach_tmux(stdscr, tmux_session: str, tmux_socket_name: str | None = None):
+def _attach_tmux(
+    stdscr,
+    tmux_session: str,
+    tmux_socket_name: str | None = None,
+    attach_command: Optional[list[str]] = None,
+):
     curses.def_prog_mode()
     curses.endwin()
     try:
-        subprocess.run(_tmux_attach_command(tmux_session, tmux_socket_name), check=False)
+        command = attach_command if attach_command else _tmux_attach_command(tmux_session, tmux_socket_name)
+        subprocess.run(command, check=False)
     finally:
         curses.reset_prog_mode()
         curses.curs_set(0)
@@ -1719,7 +1737,7 @@ def run_watch_tui(
 
                     selected_session_id = session.get("id") or selected_session_id
                     next_refresh = 0.0
-                    _attach_tmux(stdscr, tmux_session, session.get("tmux_socket_name"))
+                    _attach_tmux(stdscr, tmux_session, session.get("tmux_socket_name"), session.get("_attach_command"))
                     flash_message = f"Created {selected_session_id}"
                     flash_until = time.monotonic() + 2.5
                     next_refresh = 0.0
@@ -1834,7 +1852,7 @@ def run_watch_tui(
                             else:
                                 tmux_session, tmux_socket_name, attach_error = None, None, None
                             if can_attach_session(restored) and tmux_session:
-                                _attach_tmux(stdscr, tmux_session, tmux_socket_name)
+                                _attach_tmux(stdscr, tmux_session, tmux_socket_name, restored.get("_attach_command"))
                                 flash_message = f"Restored {selected_session_id}"
                             else:
                                 flash_message = attach_error or f"Restored {selected_session_id} (headless)"
@@ -1852,7 +1870,7 @@ def run_watch_tui(
                         flash_message = attach_error
                         flash_until = time.monotonic() + 2.5
                         continue
-                    _attach_tmux(stdscr, tmux_session, tmux_socket_name)
+                    _attach_tmux(stdscr, tmux_session, tmux_socket_name, selected.get("_attach_command"))
                     next_refresh = 0.0
         finally:
             if detail_worker:

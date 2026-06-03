@@ -538,6 +538,7 @@ class CreateSessionRequest(BaseModel):
     name: Optional[str] = None
     provider: Optional[str] = "claude"
     parent_session_id: Optional[str] = None
+    node: Optional[str] = None
 
 
 class ForkSessionRequest(BaseModel):
@@ -571,6 +572,7 @@ class SessionResponse(BaseModel):
     stopped_at: Optional[str] = None
     tmux_session: str
     tmux_socket_name: Optional[str] = None
+    node: str = "primary"
     provider: Optional[str] = "claude"
     provider_resume_id: Optional[str] = None
     forked_from_session_id: Optional[str] = None
@@ -664,6 +666,7 @@ class MobileTerminalTicket:
     actor_email: str
     session_id: str
     provider: str
+    node: str
     tmux_session: str
     tmux_socket_name: Optional[str]
     device_key_id: str
@@ -962,6 +965,7 @@ class EnsureMaintainerRequest(BaseModel):
 class EnsureRoleRequest(BaseModel):
     """Request to ensure a generic service role session exists."""
     requester_session_id: Optional[str] = None
+    node: Optional[str] = None
 
 
 class RoleRegistrationRequest(BaseModel):
@@ -1069,6 +1073,7 @@ class SpawnChildRequest(BaseModel):
     model: Optional[str] = None
     working_dir: Optional[str] = None
     provider: Optional[str] = None
+    node: Optional[str] = None
     track_seconds: Optional[int] = Field(default=None, gt=0)
 
 
@@ -1449,6 +1454,81 @@ def create_app(
         if isinstance(state, str):
             return state
         return _fallback_activity_state(session)
+
+    def _node_id_for_session(session: Session) -> str:
+        return str(getattr(session, "node", None) or "primary").strip() or "primary"
+
+    def _hook_secret_for_session(session: Session) -> Optional[str]:
+        node_id = _node_id_for_session(session)
+        if node_id == "primary":
+            return None
+        sm = app.state.session_manager
+        if not sm:
+            return None
+        getter = getattr(sm, "get_node_config", None)
+        if not callable(getter):
+            return None
+        node_config = getter(node_id)
+        if isinstance(node_config, dict):
+            raw_secret = node_config.get("hook_secret")
+        else:
+            raw_secret = getattr(node_config, "hook_secret", None)
+        if not isinstance(raw_secret, str):
+            return None
+        secret = raw_secret.strip()
+        return secret or None
+
+    def _verify_remote_hook_secret(payload: dict[str, Any], request: Request) -> Optional[Session]:
+        """Reject spoofed hooks for remote sessions that have a configured hook secret."""
+        session_manager_id = payload.get("session_manager_id") or payload.get("CLAUDE_SESSION_MANAGER_ID")
+        if not session_manager_id:
+            return None
+        sm = app.state.session_manager
+        if not sm:
+            return None
+        session = sm.get_session(session_manager_id)
+        if not session:
+            return None
+        expected_secret = _hook_secret_for_session(session)
+        if not expected_secret:
+            return session
+        actual_secret = request.headers.get("x-sm-hook-secret") or ""
+        if not hmac.compare_digest(actual_secret, expected_secret):
+            raise HTTPException(status_code=403, detail="Invalid hook secret")
+        return session
+
+    def _payload_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_create_node_provider(
+        provider: str,
+        *,
+        requested_node: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        sm = app.state.session_manager
+        validator = getattr(sm, "validate_create_node_provider", None) if sm else None
+        if callable(validator):
+            result = validator(
+                provider,
+                requested_node=requested_node,
+                parent_session_id=parent_session_id,
+            )
+            if isinstance(result, (tuple, list)) and len(result) == 2:
+                return result[0], result[1]
+        return requested_node or "primary", None
+
+    def _last_create_error(default: str) -> str:
+        sm = app.state.session_manager
+        detail = getattr(sm, "last_create_error", None) if sm else None
+        if isinstance(detail, str) and detail:
+            return detail
+        return default
 
     def _cached_session_name(session: Session) -> str:
         sm = app.state.session_manager
@@ -2183,6 +2263,7 @@ def create_app(
             stopped_at=session.stopped_at.isoformat() if session.stopped_at else None,
             tmux_session=session.tmux_session,
             tmux_socket_name=session.tmux_socket_name,
+            node=getattr(session, "node", "primary"),
             provider=provider,
             provider_resume_id=getattr(session, "provider_resume_id", None),
             forked_from_session_id=getattr(session, "forked_from_session_id", None),
@@ -3040,6 +3121,12 @@ def create_app(
             return {
                 "supported": False,
                 "reason": descriptor.get("message") or "attach not supported",
+                "transport": "termux-ssh-tmux",
+            }
+        if str(descriptor.get("node") or "primary") != "primary":
+            return {
+                "supported": False,
+                "reason": "external SSH attach for remote nodes is not supported; use mobile terminal",
                 "transport": "termux-ssh-tmux",
             }
         if not public_ssh_host or not ssh_username:
@@ -4375,21 +4462,31 @@ def create_app(
         creation_rejection = _codex_app_create_rejection(provider)
         if creation_rejection:
             raise HTTPException(status_code=400, detail=creation_rejection)
+        resolved_node, node_provider_rejection = _validate_create_node_provider(
+            provider,
+            requested_node=request.node,
+            parent_session_id=request.parent_session_id,
+        )
+        if node_provider_rejection:
+            raise HTTPException(status_code=400, detail=node_provider_rejection)
         provider_rejection = app.state.session_manager.get_provider_create_rejection(
             provider,
             working_dir=request.working_dir,
         )
         if provider_rejection:
             raise HTTPException(status_code=503, detail=provider_rejection)
-        session = await app.state.session_manager.create_session(
-            working_dir=request.working_dir,
-            name=request.name,
-            provider=provider,
-            parent_session_id=request.parent_session_id,
-        )
+        create_kwargs = {
+            "working_dir": request.working_dir,
+            "name": request.name,
+            "provider": provider,
+            "parent_session_id": request.parent_session_id,
+        }
+        if request.node:
+            create_kwargs["node"] = resolved_node
+        session = await app.state.session_manager.create_session(**create_kwargs)
 
         if not session:
-            raise HTTPException(status_code=500, detail="Failed to create session")
+            raise HTTPException(status_code=500, detail=_last_create_error("Failed to create session"))
 
         # Start monitoring the session (tmux providers only)
         if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
@@ -4402,6 +4499,7 @@ def create_app(
         working_dir: str,
         provider: str = "claude",
         parent_session_id: Optional[str] = None,
+        node: Optional[str] = None,
     ):
         """
         Create a new Claude Code session.
@@ -4420,21 +4518,31 @@ def create_app(
         creation_rejection = _codex_app_create_rejection(provider)
         if creation_rejection:
             raise HTTPException(status_code=400, detail=creation_rejection)
+        resolved_node, node_provider_rejection = _validate_create_node_provider(
+            provider,
+            requested_node=node,
+            parent_session_id=parent_session_id,
+        )
+        if node_provider_rejection:
+            raise HTTPException(status_code=400, detail=node_provider_rejection)
         provider_rejection = app.state.session_manager.get_provider_create_rejection(
             provider,
             working_dir=working_dir,
         )
         if provider_rejection:
             raise HTTPException(status_code=503, detail=provider_rejection)
-        session = await app.state.session_manager.create_session(
-            working_dir=working_dir,
-            telegram_chat_id=None,  # No Telegram association
-            provider=provider,
-            parent_session_id=parent_session_id,
-        )
+        create_kwargs = {
+            "working_dir": working_dir,
+            "telegram_chat_id": None,  # No Telegram association
+            "provider": provider,
+            "parent_session_id": parent_session_id,
+        }
+        if node:
+            create_kwargs["node"] = resolved_node
+        session = await app.state.session_manager.create_session(**create_kwargs)
 
         if not session:
-            raise HTTPException(status_code=500, detail="Failed to create session")
+            raise HTTPException(status_code=500, detail=_last_create_error("Failed to create session"))
 
         # Start monitoring (tmux providers only)
         if app.state.output_monitor and getattr(session, "provider", "claude") != "codex-app":
@@ -4456,6 +4564,27 @@ def create_app(
                 for s in sessions
             ]
         }
+
+    @app.get("/nodes")
+    async def list_nodes():
+        """List configured execution nodes."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        return {
+            "default": getattr(app.state.session_manager.node_registry, "default_node", "primary"),
+            "nodes": app.state.session_manager.list_nodes(),
+        }
+
+    @app.post("/nodes/{node_id}/ping")
+    async def ping_node(node_id: str):
+        """Probe one configured execution node."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        result = app.state.session_manager.ping_node(node_id)
+        if not result.get("ok"):
+            status = 404 if str(result.get("error") or "").startswith("Unknown node") else 503
+            raise HTTPException(status_code=status, detail=result.get("error") or "ping failed")
+        return result
 
     @app.get("/client/sessions")
     async def list_client_sessions(request: Request):
@@ -4731,6 +4860,7 @@ def create_app(
                 actor_email=actor_email,
                 session_id=session.id,
                 provider=str(session.provider or "claude"),
+                node=str(getattr(session, "node", "primary") or "primary"),
                 tmux_session=tmux_session,
                 tmux_socket_name=tmux_socket_name,
                 device_key_id=str(device_config.get("id") or ""),
@@ -4832,11 +4962,16 @@ def create_app(
             )
             return ticket, attach_id
 
-    def _mobile_terminal_tmux_cmd(ticket: MobileTerminalTicket, *args: str) -> list[str]:
+    def _mobile_terminal_tmux_cmd(ticket: MobileTerminalTicket, *args: str, tty: bool = False) -> list[str]:
         cmd = ["tmux"]
         if ticket.tmux_socket_name:
             cmd.extend(["-L", ticket.tmux_socket_name])
         cmd.extend(args)
+        node_id = str(getattr(ticket, "node", "primary") or "primary")
+        if node_id != "primary" and app.state.session_manager:
+            runner = getattr(app.state.session_manager, "node_runner", None)
+            if runner is not None:
+                return runner.attach_command(node_id, cmd) if tty else runner.command(node_id, cmd)
         return cmd
 
     async def _run_mobile_terminal_bridge(websocket: WebSocket, ticket: MobileTerminalTicket, attach_id: str) -> None:
@@ -4953,6 +5088,7 @@ def create_app(
                         "attach-session",
                         "-t",
                         ticket.tmux_session,
+                        tty=True,
                     ),
                     stdin=fd_slave,
                     stdout=fd_slave,
@@ -5752,7 +5888,10 @@ def create_app(
             raise HTTPException(status_code=503, detail="Role bootstrap unavailable")
 
         try:
-            session, created = await ensurer(role)
+            if request.node:
+                session, created = await ensurer(role, node=request.node)
+            else:
+                session, created = await ensurer(role)
         except ValueError as exc:
             detail = str(exc)
             status_code = 404 if "not configured for auto-bootstrap" in detail else 400
@@ -6860,12 +6999,44 @@ Provide ONLY the summary, no preamble or questions."""
         claude_session_id = payload.get("session_id")
         # This will be set by the environment variable we pass when launching Claude
         session_manager_id = payload.get("session_manager_id") or payload.get("CLAUDE_SESSION_MANAGER_ID")
+        target_session_for_hook = None
+        if session_manager_id:
+            target_session_for_hook = _verify_remote_hook_secret(payload, request)
+
+        inline_last_message = str(payload.get("sm_last_message") or "").strip() or None
+        inline_native_title = str(payload.get("sm_native_title") or "").strip() or None
+        inline_native_title_mtime_ns = _payload_int(payload.get("sm_transcript_mtime_ns"))
+        remote_hook_session = bool(
+            target_session_for_hook
+            and _node_id_for_session(target_session_for_hook) != "primary"
+        )
+        use_inline_transcript = bool(
+            remote_hook_session
+            and (
+                inline_last_message is not None
+                or inline_native_title is not None
+                or inline_native_title_mtime_ns is not None
+            )
+        )
 
         # Read transcript metadata in a thread pool to avoid blocking the event loop.
-        last_message = None
-        native_title = None
-        native_title_mtime_ns = None
-        if transcript_path:
+        last_message = inline_last_message if use_inline_transcript else None
+        native_title = inline_native_title if use_inline_transcript else None
+        native_title_mtime_ns = inline_native_title_mtime_ns if use_inline_transcript else None
+        if transcript_path and use_inline_transcript:
+            logger.debug(
+                "Using inline remote transcript metadata for %s from node %s",
+                session_manager_id,
+                _node_id_for_session(target_session_for_hook),
+            )
+        elif transcript_path and remote_hook_session:
+            logger.info(
+                "Remote hook for %s did not include inline transcript metadata; "
+                "skipping primary-local read of node-local path %s",
+                session_manager_id,
+                transcript_path,
+            )
+        elif transcript_path:
             def read_transcript():
                 """
                 Read transcript file synchronously (runs in thread pool).
@@ -6990,7 +7161,7 @@ Provide ONLY the summary, no preamble or questions."""
                         native_title_mtime_ns = None
 
         if session_manager_id and app.state.session_manager:
-            target_session = app.state.session_manager.get_session(session_manager_id)
+            target_session = target_session_for_hook or app.state.session_manager.get_session(session_manager_id)
             if target_session:
                 state_changed = False
                 title_changed = False
@@ -7306,6 +7477,13 @@ Provide ONLY the summary, no preamble or questions."""
         if creation_rejection:
             raise HTTPException(status_code=400, detail=creation_rejection)
         selected_working_dir = request.working_dir or parent_session.working_dir
+        resolved_node, node_provider_rejection = _validate_create_node_provider(
+            selected_provider,
+            requested_node=request.node,
+            parent_session_id=request.parent_session_id,
+        )
+        if node_provider_rejection:
+            raise HTTPException(status_code=400, detail=node_provider_rejection)
         provider_rejection = app.state.session_manager.get_provider_create_rejection(
             selected_provider,
             working_dir=selected_working_dir,
@@ -7313,19 +7491,22 @@ Provide ONLY the summary, no preamble or questions."""
         if provider_rejection:
             raise HTTPException(status_code=503, detail=provider_rejection)
         _validate_requested_friendly_name(request.name)
-        child_session = await app.state.session_manager.spawn_child_session(
-            parent_session_id=request.parent_session_id,
-            prompt=request.prompt,
-            name=request.name,
-            wait=request.wait,
-            model=request.model,
-            working_dir=selected_working_dir,
-            provider=provider,
-            defer_telegram_topic=True,
-        )
+        spawn_kwargs = {
+            "parent_session_id": request.parent_session_id,
+            "prompt": request.prompt,
+            "name": request.name,
+            "wait": request.wait,
+            "model": request.model,
+            "working_dir": selected_working_dir,
+            "provider": provider,
+            "defer_telegram_topic": True,
+        }
+        if request.node:
+            spawn_kwargs["node"] = resolved_node
+        child_session = await app.state.session_manager.spawn_child_session(**spawn_kwargs)
 
         if not child_session:
-            return {"error": "Failed to spawn child session"}
+            return {"error": _last_create_error("Failed to spawn child session")}
 
         spawn_warnings = _register_spawn_monitoring(
             child_session,
@@ -7346,6 +7527,7 @@ Provide ONLY the summary, no preamble or questions."""
             "working_dir": child_session.working_dir,
             "parent_session_id": child_session.parent_session_id,
             "tmux_session": child_session.tmux_session,
+            "node": getattr(child_session, "node", "primary"),
             "provider": getattr(child_session, "provider", "claude"),
             "created_at": child_session.created_at.isoformat(),
         }
@@ -8374,6 +8556,7 @@ Provide ONLY the summary, no preamble or questions."""
 
         # Our session ID (injected by hook script)
         session_manager_id = data.get("session_manager_id")
+        session = _verify_remote_hook_secret(data, request)
 
         # Claude Code's native fields
         claude_session_id = data.get("session_id")  # Claude's internal ID
@@ -8388,8 +8571,7 @@ Provide ONLY the summary, no preamble or questions."""
         agent_id = data.get("agent_id")  # From SubagentStart context
 
         # Get session info if available
-        session = None
-        if session_manager_id and app.state.session_manager:
+        if session is None and session_manager_id and app.state.session_manager:
             session = app.state.session_manager.get_session(session_manager_id)
 
         # Clear stale is_idle on PreToolUse — signals turn has started (sm#183)

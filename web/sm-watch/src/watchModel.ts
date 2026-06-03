@@ -369,6 +369,7 @@ export function buildWatchRows(
         ID: session.id,
         Parent: parentLabel(session, sessionsById),
         Role: session.role || (session.is_em ? 'em' : '-'),
+        Node: session.node || 'primary',
         Provider: session.provider || 'claude',
         Activity: stateLabel(session.activity_state),
         Status: session.status || '-',
