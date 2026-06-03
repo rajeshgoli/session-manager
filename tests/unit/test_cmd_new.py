@@ -69,3 +69,58 @@ def test_cmd_new_surfaces_create_error_detail(tmp_path, capsys):
 
     assert rc == 1
     assert "Configured codex-fork runtime unavailable" in capsys.readouterr().err
+
+
+def test_cmd_new_skips_local_path_validation_for_remote_default():
+    client = MagicMock()
+    client.list_nodes.return_value = {"default": "worker", "nodes": []}
+    client.create_session_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "id": "remote123",
+            "provider": "claude",
+            "tmux_session": "claude-remote123",
+        },
+    }
+
+    with patch("subprocess.run") as run_mock, patch("time.sleep"):
+        rc = cmd_new(client, working_dir="/remote/only/path", provider="claude")
+
+    assert rc == 0
+    client.create_session_result.assert_called_once_with(
+        "/remote/only/path",
+        provider="claude",
+        parent_session_id=None,
+    )
+    run_mock.assert_called_once_with(["tmux", "attach", "-t", "claude-remote123"], check=True)
+
+
+def test_cmd_new_skips_local_path_validation_for_remote_parent():
+    client = MagicMock()
+    client.list_sessions.return_value = [{"id": "parent123", "node": "worker"}]
+    client.create_session_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "id": "child123",
+            "provider": "claude",
+            "tmux_session": "claude-child123",
+        },
+    }
+
+    with patch("subprocess.run") as run_mock, patch("time.sleep"):
+        rc = cmd_new(
+            client,
+            working_dir="/remote/parent/path",
+            provider="claude",
+            parent_session_id="parent123",
+        )
+
+    assert rc == 0
+    client.create_session_result.assert_called_once_with(
+        "/remote/parent/path",
+        provider="claude",
+        parent_session_id="parent123",
+    )
+    run_mock.assert_called_once_with(["tmux", "attach", "-t", "claude-child123"], check=True)

@@ -90,6 +90,9 @@ def format_session_line(
     parts.append(f"[{session_id}]")
     parts.append(f"- {status}")
     parts.append(f"- {time_str}")
+    node = str(session.get("node") or "primary")
+    if node != "primary":
+        parts.append(f"- node={node}")
 
     if show_working_dir:
         working_dir = session.get("working_dir", "")

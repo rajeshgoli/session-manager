@@ -77,6 +77,31 @@ def test_resolve_tmux_attach_target_hydrates_descriptor_socket():
     assert calls == ["agent123"]
 
 
+def test_resolve_tmux_attach_target_hydrates_descriptor_attach_command():
+    attach_command = ["ssh", "-tt", "worker", "/bin/sh", "-lc", "'tmux attach-session -t remote-target'"]
+    client = type(
+        "_Client",
+        (),
+        {
+            "get_attach_descriptor": staticmethod(
+                lambda session_id: {
+                    "attach_supported": True,
+                    "tmux_session": "remote-target",
+                    "attach_command": attach_command,
+                }
+            ),
+        },
+    )()
+    session = {"id": "agent123", "provider": "claude", "tmux_session": "stale-target"}
+
+    tmux_session, tmux_socket_name, error = _resolve_tmux_attach_target(client, session)
+
+    assert error is None
+    assert tmux_session == "remote-target"
+    assert tmux_socket_name is None
+    assert session["_attach_command"] == attach_command
+
+
 def test_resolve_tmux_attach_target_falls_back_to_session_without_descriptor():
     client = type("_Client", (), {"get_attach_descriptor": staticmethod(lambda session_id: None)})()
     session = {

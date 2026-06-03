@@ -23,7 +23,7 @@ interface WatchTableProps {
 }
 
 const GRID_CLASS =
-  'grid min-w-[1180px] grid-cols-[minmax(18rem,2.5fr)_minmax(6rem,0.8fr)_minmax(12rem,1.5fr)_minmax(7rem,0.8fr)_minmax(8rem,0.9fr)_minmax(8rem,0.9fr)_minmax(7rem,0.8fr)_minmax(15rem,2fr)_minmax(4rem,0.55fr)] items-center gap-x-3';
+  'grid min-w-[1260px] grid-cols-[minmax(18rem,2.5fr)_minmax(6rem,0.8fr)_minmax(12rem,1.5fr)_minmax(7rem,0.8fr)_minmax(7rem,0.75fr)_minmax(8rem,0.9fr)_minmax(8rem,0.9fr)_minmax(7rem,0.8fr)_minmax(15rem,2fr)_minmax(4rem,0.55fr)] items-center gap-x-3';
 
 function normalizeChatId(chatId?: number | null): string {
   if (!chatId) {
@@ -66,6 +66,8 @@ function activityTone(activityState?: string): string {
     case 'waiting_input':
     case 'waiting_permission':
       return 'text-amber-300';
+    case 'node-unreachable':
+      return 'text-orange-300';
     case 'stopped':
       return 'text-rose-300';
     default:
@@ -197,6 +199,7 @@ export function WatchTable({
             <div>ID</div>
             <div>Parent</div>
             <div>Role</div>
+            <div>Node</div>
             <div>Provider</div>
             <div>Activity</div>
             <div>Status</div>
@@ -283,6 +286,7 @@ export function WatchTable({
                   <div className="font-mono text-[12px] text-zinc-300">{row.columns.ID}</div>
                   <div className="truncate text-[12px] text-zinc-400">{row.columns.Parent}</div>
                   <div className="truncate text-[12px] text-zinc-300">{row.columns.Role}</div>
+                  <div className="truncate font-mono text-[12px] text-zinc-400">{row.columns.Node}</div>
                   <div className={`truncate text-[12px] font-medium ${providerTone(row.columns.Provider)}`}>{row.columns.Provider}</div>
                   <div className={`truncate text-[12px] font-semibold uppercase tracking-[0.16em] ${activityTone(row.activityState)}`}>
                     {row.columns.Activity}

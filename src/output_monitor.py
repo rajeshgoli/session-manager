@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import re
 import logging
+import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
@@ -192,9 +193,23 @@ class OutputMonitor:
             self._last_response_sent[session.id] = datetime.now()
 
         # Get initial file position (end of file)
-        log_path = Path(session.log_file)
-        if log_path.exists():
-            self._file_positions[session.id] = log_path.stat().st_size
+        try:
+            initial_size = await asyncio.to_thread(self._current_log_size_for_session, session)
+            self._mark_node_unreachable(session, False)
+        except Exception as exc:
+            initial_size = None
+            if self._is_remote_session(session):
+                logger.warning(
+                    "Node %s unreachable while initializing log monitor for %s: %s",
+                    self._session_node(session),
+                    session.id,
+                    exc,
+                )
+                self._mark_node_unreachable(session, True)
+            else:
+                raise
+        if initial_size is not None:
+            self._file_positions[session.id] = initial_size
 
         task = asyncio.create_task(self._monitor_loop(session))
         self._tasks[session.id] = task
@@ -246,7 +261,6 @@ class OutputMonitor:
 
     async def _monitor_loop(self, session: Session):
         """Main monitoring loop for a session."""
-        log_path = Path(session.log_file)
         check_counter = 0
 
         while True:
@@ -259,10 +273,23 @@ class OutputMonitor:
                     session_exists = True
                     exit_diagnostics = None
                     if self._session_manager:
-                        session_exists = await asyncio.to_thread(
-                            self._session_manager.tmux.session_exists,
-                            session.tmux_session,
-                        )
+                        try:
+                            session_exists = await asyncio.to_thread(
+                                self._session_manager.tmux.session_exists,
+                                session.tmux_session,
+                            )
+                            self._mark_node_unreachable(session, False)
+                        except Exception as exc:
+                            if self._is_remote_session(session):
+                                logger.warning(
+                                    "Node %s unreachable while checking tmux session %s: %s",
+                                    self._session_node(session),
+                                    session.tmux_session,
+                                    exc,
+                                )
+                                self._mark_node_unreachable(session, True)
+                                continue
+                            raise
                         tmux_controller = self._session_manager.tmux
                         get_exit_diagnostics = getattr(
                             tmux_controller,
@@ -275,10 +302,23 @@ class OutputMonitor:
                             is not None
                         )
                         if has_real_diagnostics:
-                            exit_diagnostics = await asyncio.to_thread(
-                                get_exit_diagnostics,
-                                session.tmux_session,
-                            )
+                            try:
+                                exit_diagnostics = await asyncio.to_thread(
+                                    get_exit_diagnostics,
+                                    session.tmux_session,
+                                )
+                                self._mark_node_unreachable(session, False)
+                            except Exception as exc:
+                                if self._is_remote_session(session):
+                                    logger.warning(
+                                        "Node %s unreachable while collecting exit diagnostics for %s: %s",
+                                        self._session_node(session),
+                                        session.tmux_session,
+                                        exc,
+                                    )
+                                    self._mark_node_unreachable(session, True)
+                                    continue
+                                raise
                             if exit_diagnostics.get("pane_dead"):
                                 logger.info(
                                     "Tmux session %s has a dead pane, cleaning up",
@@ -292,11 +332,25 @@ class OutputMonitor:
                         break
 
                 last_pos = self._file_positions.get(session.id, 0)
-                current_size, new_content = await asyncio.to_thread(
-                    self._read_new_log_content,
-                    log_path,
-                    last_pos,
-                )
+                try:
+                    current_size, new_content = await asyncio.to_thread(
+                        self._read_new_log_content_for_session,
+                        session,
+                        last_pos,
+                    )
+                    self._mark_node_unreachable(session, False)
+                except Exception as exc:
+                    if self._is_remote_session(session):
+                        logger.warning(
+                            "Node %s unreachable while reading log for %s: %s",
+                            self._session_node(session),
+                            session.id,
+                            exc,
+                        )
+                        self._mark_node_unreachable(session, True)
+                        await asyncio.sleep(5)
+                        continue
+                    raise
                 if current_size is None:
                     continue
 
@@ -358,6 +412,81 @@ class OutputMonitor:
         with open(log_path, 'r', errors='ignore') as f:
             f.seek(last_pos)
             return current_size, f.read()
+
+    def _session_node(self, session: Session) -> str:
+        return str(getattr(session, "node", None) or "primary").strip() or "primary"
+
+    def _is_remote_session(self, session: Session) -> bool:
+        return self._session_node(session) != "primary"
+
+    def _mark_node_unreachable(self, session: Session, unreachable: bool) -> None:
+        marker = getattr(self._session_manager, "mark_node_unreachable", None) if self._session_manager else None
+        if callable(marker):
+            marker(session.id, unreachable)
+
+    def _current_log_size_for_session(self, session: Session) -> Optional[int]:
+        if not self._is_remote_session(session):
+            log_path = Path(session.log_file)
+            return log_path.stat().st_size if log_path.exists() else None
+
+        runner = getattr(self._session_manager, "node_runner", None) if self._session_manager else None
+        if runner is None:
+            return None
+        result = runner.run(
+            self._session_node(session),
+            [
+                "/bin/sh",
+                "-lc",
+                f"if [ -f {shlex.quote(session.log_file)} ]; then wc -c < {shlex.quote(session.log_file)}; else exit 3; fi",
+            ],
+            check=False,
+            timeout=5,
+        )
+        if result.returncode == 3:
+            return None
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or f"failed to stat {session.log_file}")
+        text = (result.stdout or "").strip()
+        return int(text) if text.isdigit() else None
+
+    def _read_new_log_content_for_session(self, session: Session, last_pos: int) -> tuple[Optional[int], str]:
+        if not self._is_remote_session(session):
+            return self._read_new_log_content(Path(session.log_file), last_pos)
+
+        runner = getattr(self._session_manager, "node_runner", None) if self._session_manager else None
+        if runner is None:
+            return None, ""
+
+        marker = "__SM_LOG_CONTENT__"
+        log_file = shlex.quote(session.log_file)
+        safe_last_pos = max(0, int(last_pos or 0))
+        script = (
+            f"file={log_file}; "
+            "if [ ! -f \"$file\" ]; then exit 3; fi; "
+            "size=$(wc -c < \"$file\" | tr -d '[:space:]'); "
+            f"printf '%s\\n{marker}\\n' \"$size\"; "
+            f"if [ \"$size\" -gt {safe_last_pos} ]; then "
+            f"tail -c +$(({safe_last_pos} + 1)) \"$file\"; "
+            "fi"
+        )
+        result = runner.run(
+            self._session_node(session),
+            ["/bin/sh", "-lc", script],
+            check=False,
+            timeout=5,
+        )
+        if result.returncode == 3:
+            return None, ""
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or f"failed to read {session.log_file}")
+        stdout = result.stdout or ""
+        if f"\n{marker}\n" not in stdout:
+            return None, ""
+        size_text, content = stdout.split(f"\n{marker}\n", 1)
+        size_text = size_text.strip()
+        if not size_text.isdigit():
+            return None, ""
+        return int(size_text), content
 
     async def _analyze_content(self, session: Session, content: str):
         """Analyze new content for patterns."""

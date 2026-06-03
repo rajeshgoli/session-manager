@@ -76,3 +76,45 @@ def test_cmd_attach_uses_descriptor_tmux_socket(monkeypatch):
     assert calls == [
         (["tmux", "-L", "session-manager-test", "attach", "-t", "claude-claude1001"], True)
     ]
+
+
+def test_cmd_attach_uses_descriptor_attach_command(monkeypatch):
+    calls = []
+
+    def _fake_run(args, check):
+        calls.append((args, check))
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    session = {
+        "id": "remote1001",
+        "provider": "claude",
+        "tmux_session": "claude-remote1001",
+        "status": "running",
+        "node": "worker",
+    }
+    descriptor = {
+        "session_id": "remote1001",
+        "provider": "claude",
+        "attach_supported": True,
+        "tmux_session": "claude-remote1001",
+        "node": "worker",
+        "attach_command": [
+            "ssh",
+            "-tt",
+            "worker",
+            "/bin/sh",
+            "-lc",
+            "'tmux attach -t claude-remote1001'",
+        ],
+    }
+
+    rc = commands.cmd_attach(_AttachClient(session, descriptor), "remote1001")
+
+    assert rc == 0
+    assert calls == [
+        (
+            ["ssh", "-tt", "worker", "/bin/sh", "-lc", "'tmux attach -t claude-remote1001'"],
+            True,
+        )
+    ]

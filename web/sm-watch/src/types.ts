@@ -6,6 +6,7 @@ export type ActivityState =
   | 'waiting'
   | 'waiting_permission'
   | 'waiting_input'
+  | 'node-unreachable'
   | 'stopped';
 
 export interface AdoptionProposal {
@@ -67,6 +68,7 @@ export interface Session {
   name: string;
   working_dir: string;
   status: SessionStatus;
+  node?: string;
   created_at: string;
   last_activity: string;
   tmux_session: string;

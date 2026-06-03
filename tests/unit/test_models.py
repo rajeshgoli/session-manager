@@ -28,6 +28,7 @@ class TestSession:
             working_dir="/tmp/workspace",
             tmux_session="claude-test123",
             log_file="/tmp/logs/test.log",
+            node="worker",
             status=SessionStatus.RUNNING,
             created_at=datetime(2024, 1, 15, 10, 30, 0),
             last_activity=datetime(2024, 1, 15, 11, 45, 0),
@@ -73,6 +74,7 @@ class TestSession:
         assert restored.working_dir == original.working_dir
         assert restored.tmux_session == original.tmux_session
         assert restored.log_file == original.log_file
+        assert restored.node == original.node
         assert restored.status == original.status
         assert restored.created_at == original.created_at
         assert restored.last_activity == original.last_activity
@@ -117,6 +119,7 @@ class TestSession:
         assert session.working_dir == ""
         assert session.tmux_session == f"claude-{session.id}"
         assert session.log_file == ""
+        assert session.node == "primary"
         assert session.status == SessionStatus.RUNNING
         assert isinstance(session.created_at, datetime)
         assert isinstance(session.last_activity, datetime)
