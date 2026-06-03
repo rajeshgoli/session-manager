@@ -209,8 +209,32 @@ class NodeRunner:
         return result.returncode == 0
 
     def path_is_dir(self, node_id: Optional[str], path: str, timeout: float = 5.0) -> bool:
-        result = self.run(node_id, ["test", "-d", path], check=False, timeout=timeout)
-        return result.returncode == 0
+        return self.resolve_directory(node_id, path, timeout=timeout) is not None
+
+    def resolve_directory(self, node_id: Optional[str], path: str, timeout: float = 5.0) -> Optional[str]:
+        """Return the node-local physical directory path, or None if it is not a directory."""
+        if self.is_primary(node_id):
+            candidate = Path(path).expanduser().resolve()
+            return str(candidate) if candidate.is_dir() else None
+
+        script = """
+path=$1
+case "$path" in
+  "~") path=${HOME:-~} ;;
+  "~/"*) path="${HOME%/}/${path#\\~/}" ;;
+esac
+CDPATH= cd -- "$path" 2>/dev/null && pwd -P
+"""
+        result = self.run(
+            node_id,
+            ["/bin/sh", "-lc", script, "sh", path],
+            check=False,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        resolved = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        return resolved[0] if resolved else None
 
     def ensure_file(self, node_id: Optional[str], path: str, timeout: float = 5.0) -> bool:
         parent = str(Path(path).parent)

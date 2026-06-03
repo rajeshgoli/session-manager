@@ -1,4 +1,5 @@
 import os
+import subprocess
 
 from src.node_runner import NodeRegistry, NodeRunner
 
@@ -54,3 +55,39 @@ def test_remote_attach_allocates_tty():
         "-lc",
         "'tmux attach -t claude-1234'",
     ]
+
+
+def test_remote_resolve_directory_expands_home_relative_path(monkeypatch):
+    registry = NodeRegistry.from_config(
+        {"nodes": {"registry": {"worker": {"ssh": "dev@example"}}}}
+    )
+    runner = NodeRunner(registry)
+    captured = {}
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="/home/dev/repo\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    resolved = runner.resolve_directory("worker", "~/repo")
+
+    assert resolved == "/home/dev/repo"
+    assert "${HOME%/}/${path#\\~/}" in captured["cmd"][-1]
+    assert "sh " in captured["cmd"][-1]
+    assert "~/repo" in captured["cmd"][-1]
+
+
+def test_remote_resolve_directory_returns_none_for_empty_stdout(monkeypatch):
+    registry = NodeRegistry.from_config(
+        {"nodes": {"registry": {"worker": {"ssh": "dev@example"}}}}
+    )
+    runner = NodeRunner(registry)
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+
+    assert runner.resolve_directory("worker", "~/missing") is None

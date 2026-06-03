@@ -478,9 +478,10 @@ class TmuxController:
                 return None, f"Working directory is not a directory: {working_dir}"
             return str(working_path), None
 
-        if not self.node_runner.path_is_dir(node, working_dir):
+        remote_working_path = self.node_runner.resolve_directory(node, working_dir)
+        if not remote_working_path:
             return None, f"Working directory does not exist on node {node}: {working_dir}"
-        return working_dir, None
+        return remote_working_path, None
 
     def _prepare_log_file(self, log_file: str, *, node: Optional[str]) -> tuple[bool, Optional[str]]:
         """Create the session log file on the node where tmux will run."""

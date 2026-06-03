@@ -216,6 +216,54 @@ def test_create_session_with_command_enables_exit_diagnostics(tmp_path, monkeypa
     ) in calls
 
 
+def test_create_session_with_command_uses_remote_resolved_working_dir(tmp_path, monkeypatch):
+    controller = TmuxController(
+        log_dir=str(tmp_path),
+        config={"timeouts": {"tmux": {"shell_export_settle_seconds": 0}}},
+    )
+    calls = []
+    resolve_directory = MagicMock(return_value="/home/dev/repo")
+    command_available = MagicMock(return_value=True)
+    ensure_file = MagicMock(return_value=True)
+    monkeypatch.setattr(controller.node_runner, "resolve_directory", resolve_directory)
+    monkeypatch.setattr(controller.node_runner, "command_available", command_available)
+    monkeypatch.setattr(controller.node_runner, "ensure_file", ensure_file)
+
+    def _fake_run_tmux(*args, **kwargs):
+        calls.append(args)
+        if args[:3] == ("display-message", "-p", "-t"):
+            return MagicMock(returncode=0, stdout="%main\n")
+        return MagicMock(returncode=0, stdout="")
+
+    monkeypatch.setattr(controller, "_session_exists_for_node", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(controller, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    ok = controller.create_session_with_command(
+        "claude-remote",
+        "~/repo",
+        "/remote/logs/claude-remote.log",
+        command="claude",
+        node="worker",
+    )
+
+    assert ok is True
+    resolve_directory.assert_called_once_with("worker", "~/repo")
+    command_available.assert_called_once_with("worker", "claude", cwd="/home/dev/repo")
+    ensure_file.assert_called_once_with("worker", "/remote/logs/claude-remote.log")
+    assert (
+        "new-session",
+        "-d",
+        "-s",
+        "claude-remote",
+        "-c",
+        "/home/dev/repo",
+        "-n",
+        "__sm_bootstrap",
+    ) in calls
+    assert ("new-window", "-d", "-t", "claude-remote", "-n", "main", "-c", "/home/dev/repo") in calls
+
+
 def test_get_session_exit_diagnostics_reports_dead_pane(monkeypatch):
     controller = TmuxController(config={"tmux": {"socket_name": "session-manager-test"}})
     monkeypatch.setattr(
