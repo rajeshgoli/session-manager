@@ -201,18 +201,46 @@ Three distinct methods — non-interactive execution must not share the interact
   a liveness probe (`ssh <node> true`) live in `NodeRunner`; stale sockets re-establish
   transparently.
 
-### Hook + transcript parity (remote)
+### Remote runtime environment (API, hooks, tool-use)
 
-1. On remote spawn, the managed-shell export step (`tmux_controller.py:536`) also exports
-   `SM_HOOK_URL` = `nodes.<id>.hook_url` (a primary address the node can reach). The remote agent
-   POSTs hooks straight to the primary.
-2. `notify_server.sh`, when running on a node (i.e. `SM_HOOK_URL` is remote), extracts the last
-   assistant message + native title from the **local** transcript and inlines them in the POST,
-   **replicating the server's retry semantics**: retry empty reads after 0.5s
-   (`EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS`) and stale reads after 0.3s
-   (`TRANSCRIPT_RETRY_DELAY_SECONDS`). The server prefers inlined fields when present and only
-   falls back to a local `transcript_path` read for the primary node — preserving final-response
-   correctness for remote sessions.
+A remote agent is a full SM participant: it issues `sm` commands and its hooks must reach the
+primary. The managed-shell export step (`tmux_controller.py:484-543`, which today exports only
+`ENABLE_TOOL_SEARCH` and `CLAUDE_SESSION_MANAGER_ID`) is extended so that **for remote sessions**
+it additionally exports a fixed env contract:
+
+| Env var | Value | Purpose |
+|---|---|---|
+| `SM_API_URL` | `nodes.<id>.api_url` | The `sm` CLI talks to the primary (default would be `127.0.0.1:8420` on the node — wrong) |
+| `SM_HOOK_BASE_URL` | `nodes.<id>.hook_base_url` (scheme://host:port, no path) | Base for all hook POSTs |
+| `SM_HOOK_SECRET` | `nodes.<id>.hook_secret` | Per-node auth header on hook POSTs |
+| `CLAUDE_SESSION_MANAGER_ID` | session id | Unchanged |
+
+**Precedence is explicit:** a remote session's managed shell *sets* `SM_API_URL`/
+`SM_HOOK_BASE_URL`/`SM_HOOK_SECRET` to the node-specific primary values, overriding any node-local
+default. **Primary/local sessions are unchanged** — these are not forcibly set, so existing default
+behavior (and any user-configured `SM_API_URL`) applies. `api_url` and `hook_base_url` usually
+point at the same primary `host:port`; they are separate keys only because one drives the CLI API
+and the other drives hook delivery.
+
+**Child-spawn inheritance:** when a remote agent runs `sm spawn claude`, the request routes to the
+primary via `SM_API_URL`, and placement resolves from the **parent session's node** — so the child
+lands on the same remote node (subject to the validation gate).
+
+**One hook delivery surface (both endpoints).** `/hooks/claude` and `/hooks/tool-use` are treated
+as one remote-hook surface. Both `notify_server.sh` and `log_tool_use.sh` become URL-configurable
+off the single base: target = `${SM_HOOK_BASE_URL:-http://localhost:8420}` + the fixed path
+(`/hooks/claude`, `/hooks/tool-use` respectively). The default preserves today's localhost
+behavior. When `SM_HOOK_SECRET` is set, both scripts send it as an `X-SM-Hook-Secret` header and
+the server verifies it for remote-originated hooks against `nodes.<id>.hook_secret`. This keeps
+tool-use activity/audit (`server.py:8364-8498`) intact for remote sessions rather than silently
+dropping it. (`notify_server.sh` may keep honoring a pre-set full `SM_HOOK_URL` for backward
+compat, but the canonical remote mechanism is `SM_HOOK_BASE_URL`.)
+
+**Transcript parity:** `notify_server.sh`, when posting to a remote base, extracts the last
+assistant message + native title from the **local** transcript and inlines them, **replicating the
+server's retry semantics** — empty reads retried after 0.5s (`EMPTY_TRANSCRIPT_RETRY_DELAY_SECONDS`)
+and stale reads after 0.3s (`TRANSCRIPT_RETRY_DELAY_SECONDS`). The server prefers inlined fields
+when present and only falls back to a local `transcript_path` read for the primary node.
 
 ### Provider/node validation gate
 
@@ -272,10 +300,14 @@ nodes:
       ssh: "user@worker.local"
       ssh_proxy_command: "cloudflared access ssh --hostname %h"   # optional
       control_path: "~/.ssh/cm-sm-worker.sock"
-      hook_url: "http://primary.local:8420/hooks/claude"
-      hook_secret: "<per-node shared secret>"   # see Security
+      api_url: "http://primary.local:8420"        # SM_API_URL for the node's sm CLI
+      hook_base_url: "http://primary.local:8420"  # base for /hooks/claude + /hooks/tool-use
+      hook_secret: "<per-node shared secret>"     # X-SM-Hook-Secret; see Security
       projects_root: "~/projects"
 ```
+
+`api_url` and `hook_base_url` are scheme://host:port (no path) and usually identical — separate
+keys only because one drives the CLI API and the other drives hook delivery.
 
 ## API & CLI Changes
 
@@ -283,8 +315,13 @@ nodes:
   unaffected: `POST /sessions`, `/sessions/create`, `/sessions/spawn` (`SpawnChildRequest`),
   `/sessions/review`, and CLI `sm claude` / `sm codex` / `sm new` / `sm spawn` / `sm dispatch` /
   `sm review --new` / `sm watch` create / fork / role bootstrap.
-- **Phase 1 exposes `--node`** on `sm claude`, `sm spawn`, and `sm dispatch`. Children inherit the
-  parent node via `SpawnChildRequest`. Other surfaces accept only `primary` (default).
+- **Phase 1 exposes `--node`** on `sm claude` and `sm spawn`. Children inherit the parent node via
+  `SpawnChildRequest`. Other surfaces accept only `primary` (default).
+- **`sm dispatch --node`:** `--node` is a **reserved** flag in dispatch's phase-1 (known-args)
+  parser, so it is never captured as a dynamic template parameter (`cli/dispatch.py:253-337`). It
+  takes effect **only when dispatch creates/bootstraps** the target. If the target session already
+  exists, `--node` must equal that session's existing node, otherwise dispatch **rejects** — there
+  is no implicit migration of a live session between nodes.
 - **Validation:** resolved node (post-inheritance) `!= primary` with a non-Claude provider →
   `400`, uniformly for codex / codex-fork / codex-app.
 - `SessionResponse` includes `node`; `sm all` and `cli/watch_tui.py` show a node column.
@@ -294,11 +331,13 @@ nodes:
 
 - Remote control is plain SSH (key auth, optional authenticated proxy); no new inbound port beyond
   sshd.
-- **Hook authenticity:** `/hooks/claude` currently trusts payload `session_manager_id` with no
-  auth (`server.py:6859-7063`). Once it is reachable from remote nodes, add an optional **per-node
-  shared secret** (`nodes.<id>.hook_secret`) sent as a header by `notify_server.sh` and verified
-  by the endpoint for remote-originated hooks. Trusted-path (LAN/tunnel) remains the baseline; the
-  secret closes the `session_manager_id` spoofing gap.
+- **Hook authenticity:** `/hooks/claude` (`server.py:6859-7063`) and `/hooks/tool-use`
+  (`server.py:8364-8498`) currently trust the payload `session_manager_id` with no auth. Once
+  reachable from remote nodes, both honor an optional **per-node shared secret**
+  (`nodes.<id>.hook_secret`), exported to the session as `SM_HOOK_SECRET` and sent by both
+  `notify_server.sh` and `log_tool_use.sh` as an `X-SM-Hook-Secret` header; the server verifies it
+  for remote-originated hooks. Trusted-path (LAN/tunnel) remains the baseline; the secret closes
+  the `session_manager_id` spoofing gap.
 - Validate `node` strictly against the registry; never interpolate an arbitrary host into `ssh`.
 
 ## Alternatives Considered
@@ -327,9 +366,11 @@ Invariants:
 Demote a standalone install to a node:
 
 1. Stop that machine's SM server and Telegram bot; let existing local sessions drain.
-2. Keep tmux + the SM-owned socket; ensure `notify_server.sh` is installed. The primary injects
-   `SM_HOOK_URL` (and the per-node hook secret) at spawn, so the node needs no static hook config.
-3. Point that machine's `sm` CLI at the primary (`SM_API_URL=http://<primary>:8420`).
+2. Keep tmux + the SM-owned socket; ensure `notify_server.sh` and `log_tool_use.sh` are installed.
+   The primary injects `SM_API_URL`, `SM_HOOK_BASE_URL`, and `SM_HOOK_SECRET` into managed sessions
+   at spawn, so the node needs no static hook/API config for managed agents.
+3. For interactive (non-managed) shells on that machine, point its `sm` CLI at the primary
+   (`SM_API_URL=http://<primary>:8420`).
 4. Register the node in the primary's `nodes:` registry and confirm `sm node ping <id>` is green.
 5. The machine is now reachable two ways: as a thin client (its CLI drives the primary) and as an
    execution target (`--node`).
@@ -341,14 +382,18 @@ the primary, reconciled via git on reconnect. Explicit operator mode, never auto
 ## Implementation Plan (maps to sub-tickets)
 
 1. **Node model + config registry + CLI surfacing + validation gate** — `Session.node`, `nodes:`
-   config, `--node` on `sm claude`/`sm spawn`/`sm dispatch`, inheritance, the provider/node
+   config, `--node` on `sm claude`/`sm spawn` and as a **reserved** flag on `sm dispatch`
+   (create/bootstrap only; reject on existing-node mismatch), inheritance, the provider/node
    rejection (direct + inherited), `sm all`/TUI column, `sm nodes`/`sm node ping`. Primary-only
    execution; zero behavior change for primary.
 2. **`NodeRunner` + per-session routing** — `run`/`run_async`/`attach`, ControlMaster + liveness;
    route every must-route control site through resolved node. Spawn a remote Claude session and
    confirm send/status/kill/attach all target the node.
-3. **Hook + transcript parity** — export `SM_HOOK_URL` + hook secret on remote spawn; node-side
-   `notify_server.sh` extraction replicating the 0.5s/0.3s retries; server prefers inline.
+3. **Remote runtime env + hook/transcript parity** — export `SM_API_URL`, `SM_HOOK_BASE_URL`,
+   `SM_HOOK_SECRET` into remote managed shells; make `notify_server.sh` and `log_tool_use.sh`
+   base-URL + secret aware (both `/hooks/claude` and `/hooks/tool-use` reach the primary);
+   node-side transcript extraction replicating the 0.5s/0.3s retries; server prefers inline.
+   Validate a remote agent can run `sm status`/`sm send`/`sm spawn claude` against the primary.
 4. **Remote output streaming** — persistent `ssh tail -F` per remote session.
 5. **Remote attach** — CLI + WS/mobile bridge via `attach()` / `ssh -tt`.
 6. **Node liveness overlay + failure UX + cutover docs** — `node-unreachable` overlay (no
@@ -363,6 +408,12 @@ the primary, reconciled via git on reconnect. Explicit operator mode, never auto
   `primary`.
 - **Validation:** codex / codex-fork / codex-app with a non-primary node → `400`, both passed
   directly and inherited from a parent; never silently created on primary.
+- **Remote runtime env:** a remotely spawned Claude session can run `sm status`, `sm send`, and
+  `sm spawn claude` against the primary (i.e. `SM_API_URL` is exported), and the spawned child
+  inherits the parent's node. Tool-use events from a remote session reach `/hooks/tool-use` on the
+  primary (audit/activity intact), authenticated by the per-node secret.
+- **Dispatch `--node`:** parsed as a reserved flag (not a template param); rejected when the target
+  already exists on a different node.
 - Integration (local "fake remote" via `ssh localhost`): spawn a remote **Claude** session; assert
   it appears, status transitions fire from hooks, last-message/title populate (incl. the retry
   path), attach connects, kill tears down the remote tmux.
@@ -386,6 +437,10 @@ the primary, reconciled via git on reconnect. Explicit operator mode, never auto
 - Remote Claude reaches `working`/`waiting-input`/`completed` from real hook events; last message
   and native title populate, including the empty/stale retry path.
 - `sm attach` connects to a remote session's live tmux; `sm kill` removes the remote tmux.
+- A remote Claude agent can use SM APIs against the primary (`sm status`/`sm send`/`sm spawn
+  claude`), and its tool-use events land in the primary's audit via `/hooks/tool-use`.
+- `sm dispatch --node` is parsed as a reserved flag (never a template param) and rejects when the
+  existing target is on a different node.
 - codex / codex-fork / codex-app with a non-primary node (direct or inherited) is rejected with an
   explicit message and is never created on the primary.
 - Omitting `--node` is byte-for-byte current behavior; existing tests pass unmodified.
