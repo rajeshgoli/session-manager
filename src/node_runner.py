@@ -237,10 +237,24 @@ CDPATH= cd -- "$path" 2>/dev/null && pwd -P
         return resolved[0] if resolved else None
 
     def ensure_file(self, node_id: Optional[str], path: str, timeout: float = 5.0) -> bool:
-        parent = str(Path(path).parent)
+        if self.is_primary(node_id):
+            local_path = Path(path).expanduser()
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.touch()
+            return True
+
+        script = """
+path=$1
+case "$path" in
+  "~") path=${HOME:-~} ;;
+  "~/"*) path="${HOME%/}/${path#\\~/}" ;;
+esac
+parent=$(dirname "$path")
+mkdir -p "$parent" && : >> "$path"
+"""
         result = self.run(
             node_id,
-            ["/bin/sh", "-lc", f"mkdir -p {shlex.quote(parent)} && : > {shlex.quote(path)}"],
+            ["/bin/sh", "-lc", script, "sh", path],
             check=False,
             timeout=timeout,
         )
@@ -255,12 +269,21 @@ CDPATH= cd -- "$path" 2>/dev/null && pwd -P
         timeout: float = 5.0,
     ) -> bool:
         if "/" in command or command.startswith("~"):
-            payload = f"test -f {shlex.quote(command)} && test -x {shlex.quote(command)}"
+            payload = """
+path=$1
+case "$path" in
+  "~") path=${HOME:-~} ;;
+  "~/"*) path="${HOME%/}/${path#\\~/}" ;;
+esac
+test -f "$path" && test -x "$path"
+"""
+            argv = ["/bin/sh", "-lc", payload, "sh", command]
         else:
             payload = f"command -v {shlex.quote(command)} >/dev/null 2>&1"
+            argv = ["/bin/sh", "-lc", payload]
         result = self.run(
             node_id,
-            ["/bin/sh", "-lc", payload],
+            argv,
             cwd=cwd,
             check=False,
             timeout=timeout,
