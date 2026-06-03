@@ -117,6 +117,47 @@ def _print_codex_app_guidance_for_create(client: SessionManagerClient) -> bool:
     return True
 
 
+def _effective_create_node_for_cli(
+    client: SessionManagerClient,
+    *,
+    node: Optional[str] = None,
+    parent_session_id: Optional[str] = None,
+) -> str:
+    """Best-effort mirror of server-side create node resolution for CLI preflight."""
+    if node:
+        return str(node).strip() or "primary"
+
+    if parent_session_id:
+        sessions_getter = getattr(client, "list_sessions", None)
+        if callable(sessions_getter):
+            sessions = sessions_getter()
+            if isinstance(sessions, list):
+                parent = next((item for item in sessions if item.get("id") == parent_session_id), None)
+                if isinstance(parent, dict):
+                    return str(parent.get("node") or "primary").strip() or "primary"
+
+    nodes_getter = getattr(client, "list_nodes", None)
+    if callable(nodes_getter):
+        payload = nodes_getter()
+        if isinstance(payload, dict):
+            return str(payload.get("default") or "primary").strip() or "primary"
+
+    return "primary"
+
+
+def _should_validate_working_dir_locally(
+    client: SessionManagerClient,
+    *,
+    node: Optional[str] = None,
+    parent_session_id: Optional[str] = None,
+) -> bool:
+    return _effective_create_node_for_cli(
+        client,
+        node=node,
+        parent_session_id=parent_session_id,
+    ) == "primary"
+
+
 def cmd_removed_entrypoint(entrypoint: str) -> int:
     """Return actionable error text for removed legacy commands."""
     normalized = (entrypoint or "").strip().lower()
@@ -2995,7 +3036,7 @@ def cmd_new(
     if working_dir is None:
         working_dir = os.getcwd()
 
-    if not node or node == "primary":
+    if _should_validate_working_dir_locally(client, node=node, parent_session_id=parent_session_id):
         # Expand and resolve path locally for primary sessions. Remote nodes are
         # preflighted by the server on the target machine.
         try:
@@ -3083,7 +3124,7 @@ def cmd_codex_2(
     if working_dir is None:
         working_dir = os.getcwd()
 
-    if not node or node == "primary":
+    if _should_validate_working_dir_locally(client, node=node, parent_session_id=parent_session_id):
         try:
             path = Path(working_dir).expanduser().resolve()
             if not path.exists():

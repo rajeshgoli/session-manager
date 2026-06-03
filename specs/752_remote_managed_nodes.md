@@ -98,8 +98,9 @@ single-brain model.
    identically to local ones, including the Stop-hook retry/staleness semantics.
 4. **Attach** (CLI and web/mobile terminal) works against a remote session.
 5. **Teardown / kill / restart** route to the correct node.
-6. Default behavior is **unchanged**: omitting a node places the session on the primary host. Zero
-   behavior change for existing single-host users.
+6. Default behavior is **unchanged unless configured**: with no `nodes.default` override, omitting
+   a node places the session on the primary host. If `nodes.default` is configured, top-level
+   creation uses that node; child sessions still inherit the parent node.
 7. Requesting a non-primary node with an unsupported provider is an **explicit rejection**,
    whether the node was passed directly or inherited from a parent — never a silent primary
    fallback.
@@ -311,10 +312,12 @@ keys only because one drives the CLI API and the other drives hook delivery.
 
 ## API & CLI Changes
 
-- **`node` defaults to `"primary"` on every creation path**, so unlisted/legacy surfaces are
-  unaffected: `POST /sessions`, `/sessions/create`, `/sessions/spawn` (`SpawnChildRequest`),
-  `/sessions/review`, and CLI `sm claude` / `sm codex` / `sm new` / `sm spawn` / `sm dispatch` /
-  `sm review --new` / `sm watch` create / fork / role bootstrap.
+- **`node` resolves consistently**: explicit `node` wins; children inherit their parent; top-level
+  creates use `nodes.default` (which itself defaults to `"primary"`). This applies to
+  `POST /sessions`, `/sessions/create`, `/sessions/spawn` (`SpawnChildRequest`), and CLI
+  `sm claude` / `sm codex` / `sm new` / `sm spawn` / `sm dispatch`. Primary-only/default-only
+  surfaces (`/sessions/review`, `sm review --new`, fork, and existing watch/role bootstrap flows)
+  continue to pass no non-primary node unless explicitly wired in this phase.
 - **Phase 1 exposes `--node`** on `sm claude` and `sm spawn`. Children inherit the parent node via
   `SpawnChildRequest`. Other surfaces accept only `primary` (default).
 - **`sm dispatch --node`:** `--node` is a **reserved** flag in dispatch's phase-1 (known-args)
@@ -417,7 +420,7 @@ the primary, reconciled via git on reconnect. Explicit operator mode, never auto
 - Integration (local "fake remote" via `ssh localhost`): spawn a remote **Claude** session; assert
   it appears, status transitions fire from hooks, last-message/title populate (incl. the retry
   path), attach connects, kill tears down the remote tmux.
-- Regression: full existing suite with `node="primary"` — zero behavior change.
+- Regression: full existing suite with `nodes.default` absent/`primary` — zero behavior change.
 - Liveness: node down → sessions show `node-unreachable` (not `dead`, no cleanup); node returns →
   recovers.
 - Remote **Codex** acceptance is owned by the deferred sub-ticket, not Phase 1.

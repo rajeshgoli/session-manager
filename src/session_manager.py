@@ -487,7 +487,7 @@ class SessionManager:
         elif parent_session_id and parent_session_id in self.sessions:
             node = normalize_node_id(getattr(self.sessions[parent_session_id], "node", PRIMARY_NODE))
         else:
-            node = PRIMARY_NODE
+            node = normalize_node_id(getattr(self.node_registry, "default_node", PRIMARY_NODE))
 
         if not self.node_registry.has(node):
             return None, f"Unknown node: {node}"
