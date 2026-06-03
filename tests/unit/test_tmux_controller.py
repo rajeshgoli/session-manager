@@ -264,6 +264,45 @@ def test_create_session_with_command_uses_remote_resolved_working_dir(tmp_path, 
     assert ("new-window", "-d", "-t", "claude-remote", "-n", "main", "-c", "/home/dev/repo") in calls
 
 
+def test_create_session_reports_remote_preflight_unreachable(tmp_path, monkeypatch):
+    controller = TmuxController(log_dir=str(tmp_path))
+
+    def _raise_unreachable(*_args, **_kwargs):
+        raise RuntimeError("Node worker unreachable: ssh transport failed")
+
+    monkeypatch.setattr(controller, "_session_exists_for_node", _raise_unreachable)
+
+    ok = controller.create_session(
+        "claude-remote",
+        "/home/dev/repo",
+        str(tmp_path / "claude-remote.log"),
+        node="worker",
+    )
+
+    assert ok is False
+    assert controller.last_error_message == "Node worker unreachable: ssh transport failed"
+
+
+def test_create_session_with_command_reports_remote_preflight_unreachable(tmp_path, monkeypatch):
+    controller = TmuxController(log_dir=str(tmp_path))
+
+    def _raise_unreachable(*_args, **_kwargs):
+        raise RuntimeError("Node worker unreachable: ssh transport failed")
+
+    monkeypatch.setattr(controller, "_session_exists_for_node", _raise_unreachable)
+
+    ok = controller.create_session_with_command(
+        "claude-remote",
+        "/home/dev/repo",
+        str(tmp_path / "claude-remote.log"),
+        command="claude",
+        node="worker",
+    )
+
+    assert ok is False
+    assert controller.last_error_message == "Node worker unreachable: ssh transport failed"
+
+
 def test_get_session_exit_diagnostics_reports_dead_pane(monkeypatch):
     controller = TmuxController(config={"tmux": {"socket_name": "session-manager-test"}})
     monkeypatch.setattr(

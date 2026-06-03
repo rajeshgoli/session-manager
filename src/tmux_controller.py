@@ -1080,34 +1080,34 @@ class TmuxController:
             True if session created successfully
         """
         self.last_error_message = None
-        if self._session_exists_for_node(session_name, node=node):
-            logger.warning(f"Session {session_name} already exists")
-            self.last_error_message = f"Tmux session already exists: {session_name}"
-            return False
-
-        working_path, working_error = self._prepare_working_dir(working_dir, node=node)
-        if working_error:
-            self.last_error_message = working_error
-            logger.error(self.last_error_message)
-            return False
-
-        launch_command, command_error = self._resolve_launch_command(
-            "claude",
-            working_path=working_path,
-            node=node,
-        )
-        if command_error:
-            self.last_error_message = command_error
-            logger.error(command_error)
-            return False
-
-        log_ready, log_error = self._prepare_log_file(log_file, node=node)
-        if not log_ready:
-            self.last_error_message = log_error
-            logger.error(log_error)
-            return False
-
         try:
+            if self._session_exists_for_node(session_name, node=node):
+                logger.warning(f"Session {session_name} already exists")
+                self.last_error_message = f"Tmux session already exists: {session_name}"
+                return False
+
+            working_path, working_error = self._prepare_working_dir(working_dir, node=node)
+            if working_error:
+                self.last_error_message = working_error
+                logger.error(self.last_error_message)
+                return False
+
+            launch_command, command_error = self._resolve_launch_command(
+                "claude",
+                working_path=working_path,
+                node=node,
+            )
+            if command_error:
+                self.last_error_message = command_error
+                logger.error(command_error)
+                return False
+
+            log_ready, log_error = self._prepare_log_file(log_file, node=node)
+            if not log_ready:
+                self.last_error_message = log_error
+                logger.error(log_error)
+                return False
+
             self._ensure_server_anchor(node=node)
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
@@ -1157,6 +1157,10 @@ class TmuxController:
             self.last_error_message = f"Failed to create tmux session: {e.stderr}"
             logger.error(f"Failed to create session: {e.stderr}")
             return False
+        except RuntimeError as e:
+            self.last_error_message = str(e)
+            logger.error("Failed to create session: %s", e)
+            return False
 
     def create_session_with_command(
         self,
@@ -1188,34 +1192,34 @@ class TmuxController:
             True if session created successfully
         """
         self.last_error_message = None
-        if self._session_exists_for_node(session_name, node=node):
-            logger.warning(f"Session {session_name} already exists")
-            self.last_error_message = f"Tmux session already exists: {session_name}"
-            return False
-
-        working_path, working_error = self._prepare_working_dir(working_dir, node=node)
-        if working_error:
-            self.last_error_message = working_error
-            logger.error(self.last_error_message)
-            return False
-
-        launch_command, command_error = self._resolve_launch_command(
-            command,
-            working_path=working_path,
-            node=node,
-        )
-        if command_error:
-            self.last_error_message = command_error
-            logger.error(command_error)
-            return False
-
-        log_ready, log_error = self._prepare_log_file(log_file, node=node)
-        if not log_ready:
-            self.last_error_message = log_error
-            logger.error(log_error)
-            return False
-
         try:
+            if self._session_exists_for_node(session_name, node=node):
+                logger.warning(f"Session {session_name} already exists")
+                self.last_error_message = f"Tmux session already exists: {session_name}"
+                return False
+
+            working_path, working_error = self._prepare_working_dir(working_dir, node=node)
+            if working_error:
+                self.last_error_message = working_error
+                logger.error(self.last_error_message)
+                return False
+
+            launch_command, command_error = self._resolve_launch_command(
+                command,
+                working_path=working_path,
+                node=node,
+            )
+            if command_error:
+                self.last_error_message = command_error
+                logger.error(command_error)
+                return False
+
+            log_ready, log_error = self._prepare_log_file(log_file, node=node)
+            if not log_ready:
+                self.last_error_message = log_error
+                logger.error(log_error)
+                return False
+
             self._ensure_server_anchor(node=node)
             # Create bootstrap session, then create provider window after history-limit is set.
             self._run_tmux(
@@ -1294,6 +1298,10 @@ class TmuxController:
         except subprocess.CalledProcessError as e:
             self.last_error_message = f"Failed to create tmux session: {e.stderr}"
             logger.error(f"Failed to create session: {e.stderr}")
+            return False
+        except RuntimeError as e:
+            self.last_error_message = str(e)
+            logger.error("Failed to create session: %s", e)
             return False
 
     def send_input(self, session_name: str, text: str) -> bool:
