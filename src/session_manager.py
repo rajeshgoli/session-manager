@@ -512,10 +512,13 @@ class SessionManager:
         return self.codex_fork_node_agents.is_connected(node_id)
 
     async def attach_codex_fork_node_agent(self, connection: NodeAgentConnection) -> None:
-        """Register a live node-agent connection and re-register active sessions for that node."""
+        """Register a live node-agent connection and mark its sessions reachable."""
         await self.codex_fork_node_agents.attach(connection)
         self._mark_node_sessions_reachable(connection.node_id)
-        await self._register_active_remote_codex_fork_sessions(connection.node_id)
+
+    async def register_active_codex_fork_node_agent_sessions(self, node: str) -> None:
+        """Re-register active remote codex-fork sessions for a connected node-agent."""
+        await self._register_active_remote_codex_fork_sessions(node)
 
     async def detach_codex_fork_node_agent(self, connection: NodeAgentConnection) -> None:
         await self.codex_fork_node_agents.detach(connection)

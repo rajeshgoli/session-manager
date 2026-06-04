@@ -1,6 +1,7 @@
 """FastAPI server for hooks and API endpoints."""
 
 import asyncio
+import contextlib
 import fcntl
 from dataclasses import replace
 import inspect
@@ -4600,6 +4601,7 @@ def create_app(
             return
 
         connection: Optional[NodeAgentConnection] = None
+        registration_task: Optional[asyncio.Task[None]] = None
         try:
             hello = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
             if not isinstance(hello, dict) or hello.get("type") != "hello":
@@ -4628,6 +4630,7 @@ def create_app(
             connection = NodeAgentConnection(node_id, websocket)
             await sm.attach_codex_fork_node_agent(connection)
             await websocket.send_json({"type": "hello_ok", "node_id": node_id})
+            registration_task = asyncio.create_task(sm.register_active_codex_fork_node_agent_sessions(node_id))
             while True:
                 frame = await websocket.receive_json()
                 if isinstance(frame, dict):
@@ -4644,6 +4647,11 @@ def create_app(
             with contextlib.suppress(Exception):
                 await websocket.close(code=1011)
         finally:
+            if registration_task is not None:
+                if not registration_task.done():
+                    registration_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await registration_task
             if connection is not None:
                 await sm.detach_codex_fork_node_agent(connection)
 

@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -44,6 +45,39 @@ def test_node_agent_websocket_authenticates_and_marks_node_healthy(tmp_path):
         assert manager.is_codex_fork_node_agent_healthy("worker") is True
 
     assert manager.is_codex_fork_node_agent_healthy("worker") is False
+
+
+def test_node_agent_websocket_reregisters_active_sessions_after_hello_ok(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="active-remote",
+        name="codex-fork-active-remote",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    client = TestClient(create_app(session_manager=manager))
+
+    with client.websocket_connect("/nodes/agent") as websocket:
+        websocket.send_json({"type": "hello", "node_id": "worker", "secret": "node-secret"})
+        assert websocket.receive_json() == {"type": "hello_ok", "node_id": "worker"}
+
+        frame = websocket.receive_json()
+        assert frame["type"] == "register"
+        assert frame["session_id"] == session.id
+        assert frame["event_stream_path"] == "/tmp/worker-sm/active-remote.codex-fork.events.jsonl"
+        assert frame["control_socket_path"] == "/tmp/worker-sm/active-remote.codex-fork.control.sock"
+
+        websocket.send_json({"type": "registered", "session_id": session.id})
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if manager.codex_fork_node_agents._session_nodes.get(session.id) == "worker":
+                break
+            time.sleep(0.01)
+
+        assert manager.codex_fork_node_agents._session_nodes.get(session.id) == "worker"
 
 
 def test_node_agent_websocket_rejects_invalid_secret(tmp_path):
