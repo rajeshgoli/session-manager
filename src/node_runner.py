@@ -25,7 +25,9 @@ class NodeConfig:
     api_url: Optional[str] = None
     hook_base_url: Optional[str] = None
     hook_secret: Optional[str] = None
+    node_token: Optional[str] = None
     projects_root: Optional[str] = None
+    log_dir: Optional[str] = None
 
     @property
     def is_primary(self) -> bool:
@@ -64,7 +66,9 @@ class NodeRegistry:
                 api_url=_clean_optional(value.get("api_url")),
                 hook_base_url=_clean_optional(value.get("hook_base_url")),
                 hook_secret=_clean_optional(value.get("hook_secret")),
+                node_token=_clean_optional(value.get("node_token")),
                 projects_root=_clean_optional(value.get("projects_root")),
+                log_dir=_clean_optional(value.get("log_dir")),
             )
 
         default_node = _clean_optional(raw_nodes.get("default")) or PRIMARY_NODE
@@ -96,6 +100,7 @@ class NodeRegistry:
                 "api_url": node.api_url,
                 "hook_base_url": node.hook_base_url,
                 "projects_root": node.projects_root,
+                "log_dir": node.log_dir,
             }
             for node in sorted(self._nodes.values(), key=lambda item: item.id)
         ]
@@ -259,6 +264,32 @@ mkdir -p "$parent" && : >> "$path"
             timeout=timeout,
         )
         return result.returncode == 0
+
+    def ensure_directory(self, node_id: Optional[str], path: str, timeout: float = 5.0) -> Optional[str]:
+        """Create a directory on a node and return its node-local physical path."""
+        if self.is_primary(node_id):
+            local_path = Path(path).expanduser()
+            local_path.mkdir(parents=True, exist_ok=True)
+            return str(local_path.resolve())
+
+        script = """
+path=$1
+case "$path" in
+  "~") path=${HOME:-~} ;;
+  "~/"*) path="${HOME%/}/${path#\\~/}" ;;
+esac
+mkdir -p "$path" && CDPATH= cd -- "$path" 2>/dev/null && pwd -P
+"""
+        result = self.run(
+            node_id,
+            ["/bin/sh", "-lc", script, "sh", path],
+            check=False,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        resolved = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        return resolved[0] if resolved else None
 
     def command_available(
         self,

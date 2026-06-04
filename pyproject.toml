@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "google-auth>=2.39.0",
     "cryptography>=42.0.0",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +47,7 @@ dev = [
 [project.scripts]
 claude-session-manager = "src.main:run"
 sm = "src.cli.main:main"
+sm-node-agent = "src.node_agent:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

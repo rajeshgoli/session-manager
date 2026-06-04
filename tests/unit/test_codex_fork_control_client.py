@@ -83,6 +83,57 @@ async def test_deliver_direct_uses_control_socket_primary_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_remote_control_bridge_handles_submit_message_stale_epoch_retry(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="cfctl_remote1",
+        name="codex-fork-cfctl_remote1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    class HealthyConnection:
+        def is_healthy(self):
+            return True
+
+    manager.codex_fork_node_agents._connections["worker"] = HealthyConnection()
+    manager.codex_fork_node_agents.control_roundtrip = AsyncMock(
+        side_effect=[
+            {"ok": True, "result": {"epoch": "epoch-1"}},
+            {
+                "ok": False,
+                "epoch": "epoch-1",
+                "error": {"code": "stale_epoch", "message": "epoch changed"},
+            },
+            {"ok": True, "result": {"epoch": "epoch-2"}},
+            {"ok": True, "epoch": "epoch-2", "result": {"status": "accepted"}},
+        ]
+    )
+
+    success, reason = await manager._send_codex_fork_control_command(
+        session=session,
+        command="submit_message",
+        payload={"message": "hello remote"},
+    )
+
+    assert success is True
+    assert reason == ""
+    frames = [call.kwargs["frame"] for call in manager.codex_fork_node_agents.control_roundtrip.await_args_list]
+    assert [frame["command"] for frame in frames] == [
+        "get_epoch",
+        "submit_message",
+        "get_epoch",
+        "submit_message",
+    ]
+    assert frames[1]["expected_epoch"] == "epoch-1"
+    assert frames[1]["message"] == "hello remote"
+    assert frames[3]["expected_epoch"] == "epoch-2"
+
+
+@pytest.mark.asyncio
 async def test_provider_native_rename_uses_control_socket_primary_path(tmp_path):
     with tempfile.TemporaryDirectory(dir="/tmp", prefix="cfctl-rename-") as short_dir:
         short_root = Path(short_dir)

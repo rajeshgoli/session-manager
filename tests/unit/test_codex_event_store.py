@@ -265,3 +265,73 @@ def test_startup_maintenance_failure_requeues_pending_overflow_sessions(tmp_path
         store._run_startup_maintenance()
 
     assert store._pop_pending_overflow_prune_sessions() == ["sess-pending"]
+
+
+def test_codex_fork_provider_claim_drops_duplicates_and_old_same_epoch_seq(tmp_path):
+    store = CodexEventStore(db_path=str(tmp_path / "codex_events.db"), startup_maintenance=False)
+
+    claimed, previous, cursor = store.claim_codex_fork_provider_event(
+        "fork1",
+        session_epoch={"pid": 1},
+        seq=3,
+    )
+    assert claimed is True
+    assert previous is None
+    assert cursor["seq"] == 3
+
+    claimed, previous, cursor = store.claim_codex_fork_provider_event(
+        "fork1",
+        session_epoch={"pid": 1},
+        seq=2,
+    )
+    assert claimed is False
+    assert previous["seq"] == 3
+    assert cursor["seq"] == 3
+
+    claimed, previous, cursor = store.claim_codex_fork_provider_event(
+        "fork1",
+        session_epoch={"pid": 1},
+        seq=3,
+    )
+    assert claimed is False
+    assert previous["seq"] == 3
+    assert cursor["seq"] == 3
+
+    claimed, previous, cursor = store.claim_codex_fork_provider_event(
+        "fork1",
+        session_epoch={"pid": 1},
+        seq=4,
+    )
+    assert claimed is True
+    assert previous["seq"] == 3
+    assert cursor["seq"] == 4
+
+    claimed, previous, cursor = store.claim_codex_fork_provider_event(
+        "fork1",
+        session_epoch={"pid": 2},
+        seq=1,
+    )
+    assert claimed is True
+    assert previous["seq"] == 4
+    assert cursor["session_epoch"] == {"pid": 2}
+    assert cursor["seq"] == 1
+
+
+def test_codex_fork_provider_cursor_persists_across_store_instances(tmp_path):
+    db_path = tmp_path / "codex_events.db"
+    first = CodexEventStore(db_path=str(db_path), startup_maintenance=False)
+
+    first.claim_codex_fork_provider_event("fork2", session_epoch="epoch-a", seq=9)
+    second = CodexEventStore(db_path=str(db_path), startup_maintenance=False)
+
+    cursor = second.get_codex_fork_provider_cursor("fork2")
+    assert cursor["session_epoch"] == "epoch-a"
+    assert cursor["seq"] == 9
+
+    claimed, _, cursor = second.claim_codex_fork_provider_event(
+        "fork2",
+        session_epoch="epoch-a",
+        seq=8,
+    )
+    assert claimed is False
+    assert cursor["seq"] == 9

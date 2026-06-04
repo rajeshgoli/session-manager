@@ -7,7 +7,7 @@ from src.session_manager import SessionManager
 def _manager(tmp_path):
     return SessionManager(
         state_file=str(tmp_path / "sessions.json"),
-        config={"nodes": {"registry": {"worker": {"ssh": "dev@example"}}}},
+        config={"nodes": {"registry": {"worker": {"ssh": "dev@example", "log_dir": "/tmp/worker-sm"}}}},
     )
 
 
@@ -17,7 +17,7 @@ def _manager_default_worker(tmp_path):
         config={
             "nodes": {
                 "default": "worker",
-                "registry": {"worker": {"ssh": "dev@example"}},
+                "registry": {"worker": {"ssh": "dev@example", "node_token": "node-secret"}},
             }
         },
     )
@@ -32,16 +32,16 @@ def test_create_node_validation_uses_configured_default_for_top_level_claude(tmp
     assert error is None
 
 
-def test_create_node_validation_rejects_default_remote_codex(tmp_path):
+def test_create_node_validation_rejects_default_remote_codex_fork_without_node_agent(tmp_path):
     manager = _manager_default_worker(tmp_path)
 
     node, error = manager.validate_create_node_provider("codex-fork")
 
     assert node == "worker"
-    assert error == "Remote placement is Claude-only in this phase (provider=codex-fork)"
+    assert error == "Remote codex-fork requires a healthy node-agent on node worker"
 
 
-def test_create_node_validation_rejects_inherited_remote_codex(tmp_path):
+def test_create_node_validation_rejects_inherited_remote_codex_fork_without_node_agent(tmp_path):
     manager = _manager(tmp_path)
     parent = Session(id="parent1", node="worker")
     manager.sessions[parent.id] = parent
@@ -52,7 +52,40 @@ def test_create_node_validation_rejects_inherited_remote_codex(tmp_path):
     )
 
     assert node == "worker"
-    assert error == "Remote placement is Claude-only in this phase (provider=codex-fork)"
+    assert error == "Remote codex-fork requires a healthy node-agent on node worker"
+
+
+def test_create_node_validation_allows_remote_codex_fork_with_healthy_node_agent(tmp_path):
+    manager = _manager(tmp_path)
+
+    class HealthyConnection:
+        def is_healthy(self):
+            return True
+
+    manager.codex_fork_node_agents._connections["worker"] = HealthyConnection()
+
+    node, error = manager.validate_create_node_provider("codex-fork", requested_node="worker")
+
+    assert node == "worker"
+    assert error is None
+
+
+def test_create_node_validation_still_rejects_legacy_remote_codex(tmp_path):
+    manager = _manager(tmp_path)
+
+    node, error = manager.validate_create_node_provider("codex", requested_node="worker")
+
+    assert node == "worker"
+    assert error == "Remote placement supports provider=claude or provider=codex-fork in this phase (provider=codex)"
+
+
+def test_node_config_surfaces_remote_codex_fork_artifact_log_dir(tmp_path):
+    manager = _manager(tmp_path)
+
+    worker = next(node for node in manager.list_nodes() if node["id"] == "worker")
+
+    assert worker["log_dir"] == "/tmp/worker-sm"
+    assert worker["codex_fork_node_agent"] is False
 
 
 def test_create_node_validation_allows_inherited_remote_claude(tmp_path):

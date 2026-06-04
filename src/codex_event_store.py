@@ -105,6 +105,27 @@ class CodexEventStore:
                 ON codex_assistant_relays(relayed_at)
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS codex_fork_provider_cursors (
+                    session_id TEXT PRIMARY KEY,
+                    session_epoch_json TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS codex_fork_provider_event_positions (
+                    session_id TEXT NOT NULL,
+                    session_epoch_json TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, session_epoch_json, seq)
+                )
+                """
+            )
             conn.commit()
 
     def _start_startup_maintenance(self) -> None:
@@ -274,6 +295,22 @@ class CodexEventStore:
                 self._append_ring_event_locked(fallback_event)
                 return fallback_event
 
+    def delete_event(self, session_id: str, seq: int) -> None:
+        """Best-effort delete of one persisted event row by store-local sequence."""
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM codex_session_events WHERE session_id = ? AND seq = ?",
+                (session_id, int(seq)),
+            )
+            conn.commit()
+            ring = self._ring_events.get(session_id)
+            if ring:
+                retained = [event for event in ring if event.get("seq") != int(seq)]
+                ring.clear()
+                ring.extend(retained)
+
     def get_events(self, session_id: str, since_seq: Optional[int] = None, limit: int = 200) -> dict[str, Any]:
         """Read persisted events for a session using sequence cursor semantics."""
         limit = max(1, min(limit, 500))
@@ -375,6 +412,264 @@ class CodexEventStore:
             if not ring:
                 return []
             return list(ring)[-limit:]
+
+    @staticmethod
+    def encode_provider_epoch(value: Any) -> str:
+        """Return a stable string key for a provider session_epoch value."""
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def decode_provider_epoch(value: str) -> Any:
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+
+    def get_codex_fork_provider_cursor(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return the durable codex-fork provider cursor for one SM session."""
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT session_epoch_json, seq, updated_at
+                FROM codex_fork_provider_cursors
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            epoch_json, seq, updated_at = row
+            return {
+                "session_id": session_id,
+                "session_epoch": self.decode_provider_epoch(epoch_json),
+                "session_epoch_key": epoch_json,
+                "seq": int(seq),
+                "updated_at": updated_at,
+            }
+
+    def set_codex_fork_provider_cursor(
+        self,
+        session_id: str,
+        *,
+        session_epoch: Any,
+        seq: int,
+        timestamp: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Persist the last applied codex-fork provider `(session_epoch, seq)` cursor."""
+        epoch_json = self.encode_provider_epoch(session_epoch)
+        updated_at = (timestamp or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO codex_fork_provider_cursors
+                (session_id, session_epoch_json, seq, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    session_epoch_json = excluded.session_epoch_json,
+                    seq = excluded.seq,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, epoch_json, int(seq), updated_at),
+            )
+            conn.commit()
+        return {
+            "session_id": session_id,
+            "session_epoch": session_epoch,
+            "session_epoch_key": epoch_json,
+            "seq": int(seq),
+            "updated_at": updated_at,
+        }
+
+    def should_ingest_codex_fork_provider_event(
+        self,
+        session_id: str,
+        *,
+        session_epoch: Any,
+        seq: int,
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """Return whether a provider event position has not been applied yet.
+
+        This is deliberately read-only. The durable cursor is advanced only
+        after event persistence and lifecycle reduction complete.
+        """
+        epoch_json = self.encode_provider_epoch(session_epoch)
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT session_epoch_json, seq, updated_at
+                FROM codex_fork_provider_cursors
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            previous_cursor = None
+            if row:
+                previous_cursor = {
+                    "session_id": session_id,
+                    "session_epoch": self.decode_provider_epoch(row[0]),
+                    "session_epoch_key": row[0],
+                    "seq": int(row[1]),
+                    "updated_at": row[2],
+                }
+                if row[0] == epoch_json and int(seq) <= int(row[1]):
+                    return False, previous_cursor
+            cursor.execute(
+                """
+                SELECT 1
+                FROM codex_fork_provider_event_positions
+                WHERE session_id = ? AND session_epoch_json = ? AND seq = ?
+                """,
+                (session_id, epoch_json, int(seq)),
+            )
+            if cursor.fetchone():
+                return False, previous_cursor
+        return True, previous_cursor
+
+    def record_codex_fork_provider_event_applied(
+        self,
+        session_id: str,
+        *,
+        session_epoch: Any,
+        seq: int,
+        timestamp: Optional[datetime] = None,
+    ) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+        """Persist one fully applied provider event position and advance the cursor."""
+        epoch_json = self.encode_provider_epoch(session_epoch)
+        applied_at = (timestamp or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute(
+                    """
+                    SELECT session_epoch_json, seq, updated_at
+                    FROM codex_fork_provider_cursors
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                row = cursor.fetchone()
+                previous_cursor = None
+                if row:
+                    previous_cursor = {
+                        "session_id": session_id,
+                        "session_epoch": self.decode_provider_epoch(row[0]),
+                        "session_epoch_key": row[0],
+                        "seq": int(row[1]),
+                        "updated_at": row[2],
+                    }
+                cursor.execute(
+                    """
+                    INSERT INTO codex_fork_provider_event_positions
+                    (session_id, session_epoch_json, seq, applied_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (session_id, epoch_json, int(seq), applied_at),
+                )
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT session_epoch_json, seq, updated_at
+                    FROM codex_fork_provider_cursors
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                current = cursor.fetchone()
+                if current:
+                    return previous_cursor, {
+                        "session_id": session_id,
+                        "session_epoch": self.decode_provider_epoch(current[0]),
+                        "session_epoch_key": current[0],
+                        "seq": int(current[1]),
+                        "updated_at": current[2],
+                    }
+                return previous_cursor, {
+                    "session_id": session_id,
+                    "session_epoch": session_epoch,
+                    "session_epoch_key": epoch_json,
+                    "seq": int(seq),
+                    "updated_at": applied_at,
+                }
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO codex_fork_provider_cursors
+                        (session_id, session_epoch_json, seq, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            session_epoch_json = excluded.session_epoch_json,
+                            seq = excluded.seq,
+                            updated_at = excluded.updated_at
+                        """,
+                        (session_id, epoch_json, int(seq), applied_at),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+        new_cursor = {
+            "session_id": session_id,
+            "session_epoch": session_epoch,
+            "session_epoch_key": epoch_json,
+            "seq": int(seq),
+            "updated_at": applied_at,
+        }
+        return previous_cursor, new_cursor
+
+    def claim_codex_fork_provider_event(
+        self,
+        session_id: str,
+        *,
+        session_epoch: Any,
+        seq: int,
+        timestamp: Optional[datetime] = None,
+    ) -> tuple[bool, Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+        """Compatibility wrapper: check and immediately mark one provider event applied."""
+        should_ingest, previous_cursor = self.should_ingest_codex_fork_provider_event(
+            session_id,
+            session_epoch=session_epoch,
+            seq=seq,
+        )
+        if not should_ingest:
+            return False, previous_cursor, previous_cursor
+        previous_cursor, new_cursor = self.record_codex_fork_provider_event_applied(
+            session_id,
+            session_epoch=session_epoch,
+            seq=seq,
+            timestamp=timestamp,
+        )
+        return True, previous_cursor, new_cursor
+
+    def clear_codex_fork_provider_cursor(self, session_id: str) -> None:
+        """Delete the durable provider cursor for one codex-fork session."""
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM codex_fork_provider_cursors WHERE session_id = ?",
+                (session_id,),
+            )
+            cursor.execute(
+                "DELETE FROM codex_fork_provider_event_positions WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.commit()
 
     def has_assistant_message_relayed(
         self,

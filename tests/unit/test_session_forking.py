@@ -121,6 +121,48 @@ async def test_fork_session_launches_codex_fork_and_preserves_source_resume_id(t
 
 
 @pytest.mark.asyncio
+async def test_fork_session_creates_native_fork_on_source_node(tmp_path):
+    manager = _manager(tmp_path)
+    source = Session(
+        id="source01",
+        name="codex-fork-source01",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        provider_resume_id="thread-source",
+        model="gpt-test",
+        node="worker",
+    )
+    manager.sessions[source.id] = source
+    create_kwargs = {}
+    manager.get_provider_create_rejection = lambda *args, **kwargs: None
+
+    async def _create_session_common(**kwargs):
+        create_kwargs.update(kwargs)
+        return Session(
+            working_dir=kwargs["working_dir"],
+            provider=kwargs["provider"],
+            model=kwargs["model"],
+            node=kwargs["node"],
+            friendly_name=kwargs["friendly_name"],
+        )
+
+    async def _confirm(fork_session: Session, source_resume_id: str):
+        assert source_resume_id == "thread-source"
+        return True, "thread-fork", None
+
+    manager._create_session_common = _create_session_common
+    manager._wait_for_codex_fork_result = _confirm
+
+    ok, fork_session, error = await manager.fork_session(source.id, name="source-fork")
+
+    assert ok is True
+    assert error is None
+    assert fork_session is not None
+    assert create_kwargs["node"] == "worker"
+    assert fork_session.node == "worker"
+
+
+@pytest.mark.asyncio
 async def test_fork_session_rejects_unsupported_provider(tmp_path):
     manager = _manager(tmp_path)
     manager.sessions["claude01"] = Session(

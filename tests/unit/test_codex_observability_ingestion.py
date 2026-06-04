@@ -252,6 +252,186 @@ def test_codex_fork_raw_function_call_ingestion_logs_tool_event(tmp_path):
     assert session.last_tool_call is not None
 
 
+def test_codex_fork_provider_seq_guard_drops_replay_before_event_append(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkdedupe1",
+        name="codex-fork-forkdedupe1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    first_event = {
+        "schema_version": 2,
+        "event_type": "turn_started",
+        "session_id": "thread-dedupe",
+        "seq": 3,
+        "session_epoch": {"pid": 111},
+        "payload": {"turn_id": "turn-dedupe"},
+    }
+    duplicate_event = dict(first_event)
+    older_event = {**first_event, "seq": 2, "payload": {"turn_id": "turn-old"}}
+
+    assert manager.ingest_codex_fork_event(session.id, first_event) is not None
+    initial_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
+    assert manager.ingest_codex_fork_event(session.id, duplicate_event) is None
+    assert manager.ingest_codex_fork_event(session.id, older_event) is None
+
+    stored_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
+    assert len(stored_events) == len(initial_events)
+    provider_events = [
+        event for event in stored_events if event["event_type"] == "codex_fork_turn_started"
+    ]
+    assert len(provider_events) == 1
+    assert provider_events[0]["payload_preview"]["seq"] == 3
+
+
+def test_codex_fork_provider_cursor_not_advanced_when_append_not_persisted(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkappendfail1",
+        name="codex-fork-forkappendfail1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    event = {
+        "schema_version": 2,
+        "event_type": "turn_started",
+        "session_id": "thread-appendfail",
+        "seq": 3,
+        "session_epoch": {"pid": 222},
+        "payload": {"turn_id": "turn-appendfail"},
+    }
+
+    with patch.object(
+        manager.codex_event_store,
+        "append_event",
+        return_value={"session_id": session.id, "seq": None, "persisted": False},
+    ):
+        assert manager.ingest_codex_fork_event(session.id, event) is None
+
+    assert manager.codex_event_store.get_codex_fork_provider_cursor(session.id) is None
+    assert manager.ingest_codex_fork_event(session.id, event) is not None
+    cursor = manager.codex_event_store.get_codex_fork_provider_cursor(session.id)
+    assert cursor["seq"] == 3
+    stored_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
+    provider_events = [item for item in stored_events if item["event_type"] == "codex_fork_turn_started"]
+    assert len(provider_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_process_line_continues_for_unpositioned_fallback_event(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkfallback1",
+        name="codex-fork-forkfallback1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    manager._handle_codex_fork_assistant_relay_event = AsyncMock()
+    manager._handle_codex_fork_turn_complete = AsyncMock()
+    event = {
+        "schema_version": 2,
+        "event_type": "turn_complete",
+        "session_id": "thread-fallback",
+        "payload": {
+            "turn_id": "turn-fallback",
+            "last_agent_message": "done despite persistence fallback",
+        },
+    }
+
+    with patch.object(
+        manager.codex_event_store,
+        "append_event",
+        return_value={"session_id": session.id, "seq": None, "persisted": False},
+    ):
+        await manager._process_codex_fork_event_line(session.id, json.dumps(event))
+
+    assert manager.codex_event_store.get_codex_fork_provider_cursor(session.id) is None
+    manager._handle_codex_fork_assistant_relay_event.assert_awaited_once_with(session.id, event)
+    manager._handle_codex_fork_turn_complete.assert_awaited_once_with(
+        session_id=session.id,
+        last_message="done despite persistence fallback",
+        event=event,
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_process_line_skips_provider_event_when_append_not_persisted(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkfallback2",
+        name="codex-fork-forkfallback2",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    manager._handle_codex_fork_assistant_relay_event = AsyncMock()
+    manager._handle_codex_fork_turn_complete = AsyncMock()
+    event = {
+        "schema_version": 2,
+        "event_type": "turn_complete",
+        "session_id": "thread-provider-fallback",
+        "seq": 6,
+        "session_epoch": {"pid": 555},
+        "payload": {
+            "turn_id": "turn-provider-fallback",
+            "last_agent_message": "must wait for durable checkpoint",
+        },
+    }
+
+    with patch.object(
+        manager.codex_event_store,
+        "append_event",
+        return_value={"session_id": session.id, "seq": None, "persisted": False},
+    ):
+        await manager._process_codex_fork_event_line(session.id, json.dumps(event))
+
+    assert manager.codex_event_store.get_codex_fork_provider_cursor(session.id) is None
+    manager._handle_codex_fork_assistant_relay_event.assert_not_awaited()
+    manager._handle_codex_fork_turn_complete.assert_not_awaited()
+
+
+def test_codex_fork_provider_cursor_and_event_row_rollback_when_reducer_fails(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkreducefail1",
+        name="codex-fork-forkreducefail1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    event = {
+        "schema_version": 2,
+        "event_type": "turn_started",
+        "session_id": "thread-reducefail",
+        "seq": 4,
+        "session_epoch": {"pid": 333},
+        "payload": {"turn_id": "turn-reducefail"},
+    }
+
+    with patch.object(manager, "_reduce_codex_fork_lifecycle", side_effect=RuntimeError("forced reducer failure")):
+        with pytest.raises(RuntimeError, match="forced reducer failure"):
+            manager.ingest_codex_fork_event(session.id, event)
+
+    assert manager.codex_event_store.get_codex_fork_provider_cursor(session.id) is None
+    assert manager.codex_event_store.get_events(session.id, limit=10)["events"] == []
+    assert manager.ingest_codex_fork_event(session.id, event) is not None
+    cursor = manager.codex_event_store.get_codex_fork_provider_cursor(session.id)
+    assert cursor["seq"] == 4
+    stored_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
+    provider_events = [item for item in stored_events if item["event_type"] == "codex_fork_turn_started"]
+    assert len(provider_events) == 1
+
+
 @pytest.mark.asyncio
 async def test_codex_fork_turn_complete_updates_last_message_and_notifies(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
