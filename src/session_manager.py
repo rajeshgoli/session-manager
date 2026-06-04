@@ -35,6 +35,13 @@ from .models import (
     TelegramTopicRecord,
 )
 from .node_runner import NodeRegistry, NodeRunner, PRIMARY_NODE, normalize_node_id
+from .codex_fork_remote import (
+    CodexForkTransport,
+    LocalCodexForkTransport,
+    NodeAgentConnection,
+    NodeAgentRegistry,
+    RemoteCodexForkTransport,
+)
 from .tmux_controller import TmuxController
 from .codex_app_server import CodexAppServerSession, CodexAppServerConfig, CodexAppServerError
 from .codex_activity_projection import CodexActivityProjection
@@ -165,6 +172,7 @@ class SessionManager:
         self.sessions: dict[str, Session] = {}
         self.node_registry = NodeRegistry.from_config(self.config)
         self.node_runner = NodeRunner(self.node_registry)
+        self.codex_fork_node_agents = NodeAgentRegistry()
         self._tmux_session_node_cache: dict[str, str] = {}
         self._node_unreachable_sessions: set[str] = set()
         self.last_create_error: Optional[str] = None
@@ -336,6 +344,7 @@ class SessionManager:
         self.codex_fork_wait_kind: dict[str, str] = {}
         self.codex_fork_last_seq: dict[str, int] = {}
         self.codex_fork_session_epoch: dict[str, Any] = {}
+        self.codex_fork_provider_cursors: dict[str, dict[str, Any]] = {}
         self.codex_fork_control_epoch: dict[str, str] = {}
         self.codex_fork_control_degraded: dict[str, str] = {}
         self.codex_fork_runtime_owner: dict[str, str] = {}
@@ -469,7 +478,11 @@ class SessionManager:
         return self.node_registry.get(node)
 
     def list_nodes(self) -> list[dict[str, object]]:
-        return self.node_registry.as_list()
+        nodes = self.node_registry.as_list()
+        for node in nodes:
+            node_id = str(node.get("id") or PRIMARY_NODE)
+            node["codex_fork_node_agent"] = self.codex_fork_node_agents.is_connected(node_id)
+        return nodes
 
     def ping_node(self, node: str) -> dict[str, object]:
         node_id = normalize_node_id(node)
@@ -480,6 +493,57 @@ class SessionManager:
         except Exception as exc:
             return {"node": node_id, "ok": False, "error": str(exc)}
         return {"node": node_id, "ok": ok, "error": None if ok else "ping failed"}
+
+    def node_agent_secret_for_node(self, node: str) -> Optional[str]:
+        """Return the configured node-agent auth secret for one node."""
+        node_config = self.node_registry.get(node)
+        if node_config is None:
+            return None
+        token = getattr(node_config, "node_token", None) or getattr(node_config, "hook_secret", None)
+        if not isinstance(token, str):
+            return None
+        token = token.strip()
+        return token or None
+
+    def is_codex_fork_node_agent_healthy(self, node: str) -> bool:
+        node_id = normalize_node_id(node)
+        if node_id == PRIMARY_NODE:
+            return True
+        return self.codex_fork_node_agents.is_connected(node_id)
+
+    async def attach_codex_fork_node_agent(self, connection: NodeAgentConnection) -> None:
+        """Register a live node-agent connection and re-register active sessions for that node."""
+        await self.codex_fork_node_agents.attach(connection)
+        self._mark_node_sessions_reachable(connection.node_id)
+        await self._register_active_remote_codex_fork_sessions(connection.node_id)
+
+    async def detach_codex_fork_node_agent(self, connection: NodeAgentConnection) -> None:
+        await self.codex_fork_node_agents.detach(connection)
+        self._mark_node_sessions_unreachable(connection.node_id)
+
+    def _mark_node_sessions_reachable(self, node: str) -> None:
+        node_id = normalize_node_id(node)
+        for session in self.sessions.values():
+            if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) == node_id:
+                self.mark_node_unreachable(session.id, False)
+
+    def _mark_node_sessions_unreachable(self, node: str) -> None:
+        node_id = normalize_node_id(node)
+        for session in self.sessions.values():
+            if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) == node_id:
+                if session.provider == "codex-fork" and session.status != SessionStatus.STOPPED:
+                    self.mark_node_unreachable(session.id, True)
+
+    async def _register_active_remote_codex_fork_sessions(self, node: str) -> None:
+        node_id = normalize_node_id(node)
+        for session in list(self.sessions.values()):
+            if (
+                session.provider == "codex-fork"
+                and session.status != SessionStatus.STOPPED
+                and normalize_node_id(getattr(session, "node", PRIMARY_NODE)) == node_id
+            ):
+                with contextlib.suppress(Exception):
+                    await self._register_codex_fork_remote_bridge(session)
 
     def _resolve_create_node(self, requested_node: Optional[str], parent_session_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         if requested_node:
@@ -495,8 +559,15 @@ class SessionManager:
 
     @staticmethod
     def _provider_node_rejection(provider: str, node: str) -> Optional[str]:
-        if normalize_node_id(node) != PRIMARY_NODE and provider != "claude":
-            return f"Remote placement is Claude-only in this phase (provider={provider})"
+        if normalize_node_id(node) != PRIMARY_NODE and provider not in {"claude", "codex-fork"}:
+            return f"Remote placement supports provider=claude or provider=codex-fork in this phase (provider={provider})"
+        return None
+
+    def _codex_fork_remote_capability_rejection(self, provider: str, node: str) -> Optional[str]:
+        if provider != "codex-fork" or normalize_node_id(node) == PRIMARY_NODE:
+            return None
+        if not self.is_codex_fork_node_agent_healthy(node):
+            return f"Remote codex-fork requires a healthy node-agent on node {normalize_node_id(node)}"
         return None
 
     def validate_create_node_provider(
@@ -509,7 +580,10 @@ class SessionManager:
         node, node_error = self._resolve_create_node(requested_node, parent_session_id)
         if node_error:
             return node, node_error
-        return node, self._provider_node_rejection(provider, node or PRIMARY_NODE)
+        provider_rejection = self._provider_node_rejection(provider, node or PRIMARY_NODE)
+        if provider_rejection:
+            return node, provider_rejection
+        return node, self._codex_fork_remote_capability_rejection(provider, node or PRIMARY_NODE)
 
     def _runtime_env_for_session(self, session: Session) -> dict[str, str]:
         node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
@@ -1213,11 +1287,108 @@ class SessionManager:
 
     def _codex_fork_event_stream_path(self, session: Session) -> Path:
         """Return event-stream JSONL path for one codex-fork session."""
-        return self.log_dir / f"{session.id}.codex-fork.events.jsonl"
+        return Path(self._codex_fork_event_stream_path_string(session))
 
     def _codex_fork_control_socket_path(self, session: Session) -> Path:
         """Return control-socket path for one codex-fork session."""
-        return self.log_dir / f"{session.id}.codex-fork.control.sock"
+        return Path(self._codex_fork_control_socket_path_string(session))
+
+    def _codex_fork_node_log_dir(self, session: Session) -> str:
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id == PRIMARY_NODE:
+            return str(self.log_dir)
+        node_config = self.node_registry.get(node_id)
+        configured = getattr(node_config, "log_dir", None) if node_config else None
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        return "~/.local/share/claude-sessions"
+
+    def _codex_fork_artifact_basename(self, session: Session, suffix: str) -> str:
+        return f"{session.id}.codex-fork.{suffix}"
+
+    def _codex_fork_event_stream_path_string(self, session: Session) -> str:
+        return str(Path(self._codex_fork_node_log_dir(session)) / self._codex_fork_artifact_basename(session, "events.jsonl"))
+
+    def _codex_fork_control_socket_path_string(self, session: Session) -> str:
+        return str(Path(self._codex_fork_node_log_dir(session)) / self._codex_fork_artifact_basename(session, "control.sock"))
+
+    def _codex_fork_artifact_path_strings(self, session: Session) -> tuple[str, str]:
+        return (
+            self._codex_fork_event_stream_path_string(session),
+            self._codex_fork_control_socket_path_string(session),
+        )
+
+    def _prepare_codex_fork_runtime_artifacts(self, session: Session) -> tuple[bool, Optional[str]]:
+        """Prepare event/control artifacts on the node that will run codex-fork."""
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        event_stream_path, control_socket_path = self._codex_fork_artifact_path_strings(session)
+        if node_id == PRIMARY_NODE:
+            event_path = Path(event_stream_path)
+            control_path = Path(control_socket_path)
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            if event_path.exists():
+                event_path.unlink()
+            if control_path.exists():
+                control_path.unlink()
+            return True, None
+
+        script = """
+event_path=$1
+control_path=$2
+for path in "$event_path" "$control_path"; do
+  case "$path" in
+    "~") path=${HOME:-~} ;;
+    "~/"*) path="${HOME%/}/${path#\\~/}" ;;
+  esac
+  parent=$(dirname "$path")
+  mkdir -p "$parent" || exit 1
+done
+case "$event_path" in
+  "~") event_path=${HOME:-~} ;;
+  "~/"*) event_path="${HOME%/}/${event_path#\\~/}" ;;
+esac
+case "$control_path" in
+  "~") control_path=${HOME:-~} ;;
+  "~/"*) control_path="${HOME%/}/${control_path#\\~/}" ;;
+esac
+rm -f "$event_path" "$control_path" && : > "$event_path"
+"""
+        result = self.node_runner.run(
+            node_id,
+            ["/bin/sh", "-lc", script, "sh", event_stream_path, control_socket_path],
+            check=False,
+            timeout=5.0,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            return False, detail or f"failed to prepare codex-fork artifacts on node {node_id}"
+        return True, None
+
+    def _unlink_codex_fork_runtime_artifacts(self, session: Session) -> None:
+        """Best-effort removal of codex-fork runtime artifacts on their owning node."""
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        event_stream_path, control_socket_path = self._codex_fork_artifact_path_strings(session)
+        if node_id == PRIMARY_NODE:
+            for path in (Path(event_stream_path), Path(control_socket_path)):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+            return
+        script = """
+for path in "$@"; do
+  case "$path" in
+    "~") path=${HOME:-~} ;;
+    "~/"*) path="${HOME%/}/${path#\\~/}" ;;
+  esac
+  rm -f "$path"
+done
+"""
+        with contextlib.suppress(Exception):
+            self.node_runner.run(
+                node_id,
+                ["/bin/sh", "-lc", script, "sh", event_stream_path, control_socket_path],
+                check=False,
+                timeout=5.0,
+            )
 
     @staticmethod
     def _resolve_cli_command(
@@ -1267,10 +1438,16 @@ class SessionManager:
         """Return launch command/args, falling back to codex when codex-fork is unavailable."""
         if resume_id and fork_id:
             raise ValueError("resume_id and fork_id are mutually exclusive")
-        _, fork_error = self._resolve_cli_command(
-            self.codex_fork_command,
-            working_dir=session.working_dir,
-        )
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id == PRIMARY_NODE:
+            _, fork_error = self._resolve_cli_command(
+                self.codex_fork_command,
+                working_dir=session.working_dir,
+            )
+        else:
+            fork_error = None
+            if not self.node_runner.command_available(node_id, self.codex_fork_command, cwd=session.working_dir):
+                fork_error = f"Launch command not found or not executable on node {node_id}: {self.codex_fork_command}"
         if fork_error:
             args = list(self.codex_cli_args)
             if resume_id:
@@ -1289,21 +1466,18 @@ class SessionManager:
             args = ["resume", resume_id, *args]
         elif fork_id:
             args = ["fork", fork_id, *args]
-        event_stream_path = self._codex_fork_event_stream_path(session)
-        control_socket_path = self._codex_fork_control_socket_path(session)
-        event_stream_path.parent.mkdir(parents=True, exist_ok=True)
-        if event_stream_path.exists():
-            event_stream_path.unlink()
-        if control_socket_path.exists():
-            control_socket_path.unlink()
+        prepared, prepare_error = self._prepare_codex_fork_runtime_artifacts(session)
+        if not prepared:
+            raise RuntimeError(f"Failed to prepare codex-fork runtime artifacts: {prepare_error}")
+        event_stream_path, control_socket_path = self._codex_fork_artifact_path_strings(session)
         args.extend(
             [
                 "--event-stream",
-                str(event_stream_path),
+                event_stream_path,
                 "--event-schema-version",
                 str(self.codex_fork_event_schema_version),
                 "--control-socket",
-                str(control_socket_path),
+                control_socket_path,
             ]
         )
         return self.codex_fork_command, args, "codex-fork", None
@@ -1313,17 +1487,25 @@ class SessionManager:
         provider: str,
         *,
         working_dir: str,
+        node: Optional[str] = PRIMARY_NODE,
     ) -> Optional[str]:
         """Return a user-facing rejection reason when a fresh provider create cannot proceed."""
         if provider != "codex-fork":
             return None
 
-        _, fork_error = self._resolve_cli_command(
-            self.codex_fork_command,
-            working_dir=working_dir,
-        )
-        if fork_error:
-            return f"Configured codex-fork runtime unavailable: {fork_error}"
+        node_id = normalize_node_id(node)
+        if node_id == PRIMARY_NODE:
+            _, fork_error = self._resolve_cli_command(
+                self.codex_fork_command,
+                working_dir=working_dir,
+            )
+            if fork_error:
+                return f"Configured codex-fork runtime unavailable: {fork_error}"
+        elif not self.node_runner.command_available(node_id, self.codex_fork_command, cwd=working_dir):
+            return (
+                "Configured codex-fork runtime unavailable on "
+                f"node {node_id}: {self.codex_fork_command}"
+            )
         return None
 
     @staticmethod
@@ -1379,6 +1561,17 @@ class SessionManager:
         """Return True when a codex-fork detached runtime still answers on its control socket."""
         if getattr(session, "provider", "") != "codex-fork":
             return False
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id != PRIMARY_NODE:
+            try:
+                tmux_exists = bool(session.tmux_session) and self.tmux.session_exists(session.tmux_session)
+            except Exception:
+                self.mark_node_unreachable(session.id, True)
+                return False
+            return (
+                self.is_codex_fork_node_agent_healthy(node_id)
+                and tmux_exists
+            )
         socket_path = self._codex_fork_control_socket_path(session)
         if not socket_path.exists():
             return False
@@ -2422,6 +2615,8 @@ class SessionManager:
         event_type = event.get("event_type") or event.get("type")
         if not event_type:
             return None
+        if not self._claim_codex_fork_provider_event(session_id, event):
+            return None
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         provider_session_id = event.get("session_id")
         if not provider_session_id and payload:
@@ -2643,6 +2838,69 @@ class SessionManager:
                 return recovered
         return None
 
+    @staticmethod
+    def _codex_fork_event_provider_seq(event: dict[str, Any]) -> Optional[int]:
+        seq_raw = event.get("seq")
+        if isinstance(seq_raw, int):
+            return seq_raw
+        if isinstance(seq_raw, str) and seq_raw.isdigit():
+            return int(seq_raw)
+        return None
+
+    def _get_codex_fork_provider_cursor(self, session_id: str) -> Optional[dict[str, Any]]:
+        cursor = self.codex_fork_provider_cursors.get(session_id)
+        if cursor is not None:
+            return dict(cursor)
+        stored = self.codex_event_store.get_codex_fork_provider_cursor(session_id)
+        if stored is not None:
+            self.codex_fork_provider_cursors[session_id] = dict(stored)
+        return stored
+
+    def _claim_codex_fork_provider_event(self, session_id: str, event: dict[str, Any]) -> bool:
+        """Return True when one codex-fork provider event should be ingested."""
+        seq = self._codex_fork_event_provider_seq(event)
+        if seq is None or event.get("session_epoch") is None:
+            return True
+        session_epoch = event.get("session_epoch")
+        claimed, previous, cursor = self.codex_event_store.claim_codex_fork_provider_event(
+            session_id,
+            session_epoch=session_epoch,
+            seq=seq,
+        )
+        if not claimed:
+            return False
+        if previous is not None and previous.get("session_epoch_key") == cursor.get("session_epoch_key"):
+            previous_seq = int(previous.get("seq") or 0)
+            if seq > previous_seq + 1:
+                logger.warning(
+                    "Codex-fork provider event gap for %s epoch=%s previous_seq=%s next_seq=%s",
+                    session_id,
+                    session_epoch,
+                    previous_seq,
+                    seq,
+                )
+        self.codex_fork_provider_cursors[session_id] = dict(cursor)
+        return True
+
+    def _codex_fork_transport_for_session(self, session: Session) -> CodexForkTransport:
+        """Select the raw codex-fork IPC transport for the session's owning node."""
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id == PRIMARY_NODE:
+            return LocalCodexForkTransport(
+                socket_path=self._codex_fork_control_socket_path(session),
+                roundtrip=self._codex_fork_control_roundtrip,
+            )
+        event_stream_path, control_socket_path = self._codex_fork_artifact_path_strings(session)
+        return RemoteCodexForkTransport(
+            registry=self.codex_fork_node_agents,
+            node_id=node_id,
+            session_id=session.id,
+            event_stream_path=event_stream_path,
+            control_socket_path=control_socket_path,
+            cursor=self._get_codex_fork_provider_cursor(session.id),
+            control_timeout=max(0.5, self.codex_fork_control_timeout_seconds),
+        )
+
     def get_codex_fork_lifecycle_state(self, session_id: str) -> Optional[dict[str, Any]]:
         """Return current codex-fork lifecycle reducer snapshot."""
         state = self.codex_fork_lifecycle.get(session_id)
@@ -2656,7 +2914,7 @@ class SessionManager:
             return
         if session.provider != "codex-fork":
             return
-        if from_eof:
+        if from_eof and normalize_node_id(getattr(session, "node", PRIMARY_NODE)) == PRIMARY_NODE:
             stream_path = self._codex_fork_event_stream_path(session)
             if stream_path.exists():
                 self.codex_fork_event_offsets[session.id] = stream_path.stat().st_size
@@ -2666,6 +2924,16 @@ class SessionManager:
             return
         task = loop.create_task(self._monitor_codex_fork_event_stream(session.id))
         self.codex_fork_event_monitors[session.id] = task
+
+    async def _register_codex_fork_remote_bridge(self, session: Session) -> asyncio.Queue[Optional[str]]:
+        """Register one remote codex-fork session's node-local artifacts with its node-agent."""
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id == PRIMARY_NODE:
+            raise RuntimeError("codex-fork remote bridge requested for primary session")
+        queue = await self._codex_fork_transport_for_session(session).register_event_stream()
+        if queue is None:
+            raise RuntimeError("remote codex-fork transport did not return an event queue")
+        return queue
 
     async def _stop_codex_fork_event_monitor(self, session_id: str):
         """Stop one codex-fork event monitor task."""
@@ -2677,6 +2945,35 @@ class SessionManager:
             except asyncio.CancelledError:
                 pass
 
+    async def _process_codex_fork_event_line(self, session_id: str, line: str) -> None:
+        raw = line.strip()
+        if not raw:
+            return
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.debug("Skipping non-JSON codex-fork event line for %s", session_id)
+            return
+        if not isinstance(event, dict):
+            logger.debug("Skipping malformed codex-fork event line for %s", session_id)
+            return
+        lifecycle = self.ingest_codex_fork_event(session_id, event)
+        if lifecycle is None:
+            return
+        await self._handle_codex_fork_assistant_relay_event(session_id, event)
+        normalized = self._normalize_codex_fork_event_type(
+            event.get("event_type") or event.get("type")
+        )
+        if normalized == "turn_complete":
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            last_message = payload.get("last_agent_message")
+            if isinstance(last_message, str) and last_message.strip():
+                await self._handle_codex_fork_turn_complete(
+                    session_id=session_id,
+                    last_message=last_message,
+                    event=event,
+                )
+
     async def _monitor_codex_fork_event_stream(self, session_id: str):
         """Tail codex-fork event-stream file and feed reducer."""
         buffer = self.codex_fork_event_buffers.get(session_id, "")
@@ -2684,6 +2981,9 @@ class SessionManager:
             while True:
                 session = self.sessions.get(session_id)
                 if not session or session.provider != "codex-fork":
+                    return
+                if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                    await self._monitor_remote_codex_fork_event_stream(session)
                     return
 
                 stream_path = self._codex_fork_event_stream_path(session)
@@ -2705,31 +3005,7 @@ class SessionManager:
                         self.codex_fork_event_buffers[session_id] = buffer
 
                         for line in lines:
-                            raw = line.strip()
-                            if not raw:
-                                continue
-                            try:
-                                event = json.loads(raw)
-                            except json.JSONDecodeError:
-                                logger.debug("Skipping non-JSON codex-fork event line for %s", session_id)
-                                continue
-                            if not isinstance(event, dict):
-                                logger.debug("Skipping malformed codex-fork event line for %s", session_id)
-                                continue
-                            self.ingest_codex_fork_event(session_id, event)
-                            await self._handle_codex_fork_assistant_relay_event(session_id, event)
-                            normalized = self._normalize_codex_fork_event_type(
-                                event.get("event_type") or event.get("type")
-                            )
-                            if normalized == "turn_complete":
-                                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                                last_message = payload.get("last_agent_message")
-                                if isinstance(last_message, str) and last_message.strip():
-                                    await self._handle_codex_fork_turn_complete(
-                                        session_id=session_id,
-                                        last_message=last_message,
-                                        event=event,
-                                    )
+                            await self._process_codex_fork_event_line(session_id, line)
 
                 await asyncio.sleep(self.codex_fork_event_poll_interval_seconds)
         except asyncio.CancelledError:
@@ -2744,6 +3020,39 @@ class SessionManager:
         finally:
             self.codex_fork_event_monitors.pop(session_id, None)
             self.codex_fork_event_buffers.pop(session_id, None)
+
+    async def _monitor_remote_codex_fork_event_stream(self, session: Session) -> None:
+        """Consume remote codex-fork event lines delivered by a node-agent."""
+        session_id = session.id
+        while True:
+            current = self.sessions.get(session_id)
+            if not current or current.provider != "codex-fork":
+                return
+            node_id = normalize_node_id(getattr(current, "node", PRIMARY_NODE))
+            if node_id == PRIMARY_NODE:
+                return
+            try:
+                queue = await self._register_codex_fork_remote_bridge(current)
+                self.mark_node_unreachable(session_id, False)
+            except Exception as exc:
+                logger.warning("Remote codex-fork bridge unavailable for %s: %s", session_id, exc)
+                self.mark_node_unreachable(session_id, True)
+                await asyncio.sleep(max(1.0, self.codex_fork_event_poll_interval_seconds))
+                continue
+
+            while True:
+                current = self.sessions.get(session_id)
+                if not current or current.provider != "codex-fork":
+                    return
+                try:
+                    line = await queue.get()
+                except asyncio.CancelledError:
+                    raise
+                if line is None:
+                    self.mark_node_unreachable(session_id, True)
+                    break
+                self.mark_node_unreachable(session_id, False)
+                await self._process_codex_fork_event_line(session_id, line)
 
     async def _create_session_common(
         self,
@@ -2796,8 +3105,22 @@ class SessionManager:
                 provider_node_rejection,
             )
             return None
+        capability_rejection = self._codex_fork_remote_capability_rejection(provider, resolved_node or PRIMARY_NODE)
+        if capability_rejection:
+            self.last_create_error = capability_rejection
+            logger.error(
+                "Rejecting %s session create on node %s: %s",
+                provider,
+                resolved_node,
+                capability_rejection,
+            )
+            return None
 
-        provider_rejection = self.get_provider_create_rejection(provider, working_dir=working_dir)
+        provider_rejection = self.get_provider_create_rejection(
+            provider,
+            working_dir=working_dir,
+            node=resolved_node or PRIMARY_NODE,
+        )
         if provider_rejection:
             self.last_create_error = provider_rejection
             logger.error("Rejecting %s session create in %s: %s", provider, working_dir, provider_rejection)
@@ -2852,10 +3175,15 @@ class SessionManager:
                 default_model = self.codex_default_model
             else:
                 # Codex-fork config with codex fallback when the fork binary is unavailable.
-                command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
-                    session,
-                    fork_id=codex_fork_source_resume_id,
-                )
+                try:
+                    command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
+                        session,
+                        fork_id=codex_fork_source_resume_id,
+                    )
+                except RuntimeError as exc:
+                    self.last_create_error = str(exc)
+                    logger.error("Rejecting codex-fork session create for %s: %s", session.id, exc)
+                    return None
                 default_model = (
                     self.codex_fork_default_model
                     if effective_provider == "codex-fork"
@@ -2894,6 +3222,15 @@ class SessionManager:
                 tmux_create_kwargs["node"] = session.node
             if runtime_env:
                 tmux_create_kwargs["runtime_env"] = runtime_env
+            remote_bridge_registered = False
+            if provider == "codex-fork" and normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                try:
+                    await self._register_codex_fork_remote_bridge(session)
+                    remote_bridge_registered = True
+                except Exception as exc:
+                    self.last_create_error = str(exc)
+                    logger.error("Rejecting remote codex-fork create for %s: %s", session.id, exc)
+                    return None
             created = await asyncio.to_thread(
                 self.tmux.create_session_with_command,
                 session.tmux_session,
@@ -2908,6 +3245,9 @@ class SessionManager:
                     logger.error("Failed to create tmux session for %s: %s", session.name, tmux_error)
                 else:
                     logger.error(f"Failed to create tmux session for {session.name}")
+                if remote_bridge_registered:
+                    with contextlib.suppress(Exception):
+                        await self.codex_fork_node_agents.unregister_session(session.id)
                 return None
             session.tmux_socket_name = self._tmux_socket_name()
         elif provider == "codex-app":
@@ -3322,7 +3662,11 @@ class SessionManager:
         if not source_resume_id:
             return False, None, "Source session has no provider resume id to fork"
 
-        provider_rejection = self.get_provider_create_rejection("codex-fork", working_dir=source.working_dir)
+        provider_rejection = self.get_provider_create_rejection(
+            "codex-fork",
+            working_dir=source.working_dir,
+            node=getattr(source, "node", PRIMARY_NODE),
+        )
         if provider_rejection:
             return False, None, provider_rejection
 
@@ -3901,6 +4245,17 @@ class SessionManager:
                         provider,
                         resolved_node,
                         provider_node_rejection,
+                    )
+                    continue
+                capability_rejection = self._codex_fork_remote_capability_rejection(provider, resolved_node)
+                if capability_rejection:
+                    last_error = capability_rejection
+                    logger.warning(
+                        "Skipping %s bootstrap provider %s on node %s: %s",
+                        normalized_role,
+                        provider,
+                        resolved_node,
+                        capability_rejection,
                     )
                     continue
                 if node:
@@ -5160,6 +5515,10 @@ class SessionManager:
         """Recreate one codex-fork runtime in place to restore missing bridge artifacts."""
         if session.provider != "codex-fork":
             return False, "session is not codex-fork"
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id != PRIMARY_NODE and not self.is_codex_fork_node_agent_healthy(node_id):
+            self.mark_node_unreachable(session.id, True)
+            return False, f"node-agent not connected for node {node_id}"
 
         resume_id = self.get_session_resume_id(session)
         if not resume_id:
@@ -5176,13 +5535,26 @@ class SessionManager:
         self.codex_fork_control_epoch.pop(session.id, None)
         self.codex_fork_control_degraded.pop(session.id, None)
 
-        if session.tmux_session and self.tmux.session_exists(session.tmux_session):
-            self.tmux.kill_session(session.tmux_session)
+        if session.tmux_session:
+            try:
+                tmux_exists = self.tmux.session_exists(session.tmux_session)
+            except Exception as exc:
+                if node_id != PRIMARY_NODE:
+                    self.mark_node_unreachable(session.id, True)
+                    return False, f"node {node_id} unreachable: {exc}"
+                raise
+            if tmux_exists:
+                self.tmux.kill_session(session.tmux_session)
 
-        command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
-            session,
-            resume_id=resume_id,
-        )
+        try:
+            command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
+                session,
+                resume_id=resume_id,
+            )
+        except RuntimeError as exc:
+            return False, str(exc)
+        if effective_provider != session.provider and node_id != PRIMARY_NODE:
+            return False, fallback_reason or "remote codex-fork cannot fall back to legacy codex"
         if effective_provider != session.provider:
             logger.warning(
                 "Falling back from codex-fork to codex while recreating %s: %s",
@@ -5191,15 +5563,36 @@ class SessionManager:
             )
             session.provider = effective_provider
 
+        remote_bridge_registered = False
+        if session.provider == "codex-fork" and node_id != PRIMARY_NODE:
+            try:
+                await self._register_codex_fork_remote_bridge(session)
+                remote_bridge_registered = True
+            except Exception as exc:
+                self.mark_node_unreachable(session.id, True)
+                return False, str(exc)
+
+        tmux_kwargs: dict[str, Any] = {
+            "session_id": session.id,
+            "command": command,
+            "args": args,
+        }
+        runtime_env = self._runtime_env_for_session(session)
+        if node_id != PRIMARY_NODE:
+            tmux_kwargs["node"] = session.node
+        if runtime_env:
+            tmux_kwargs["runtime_env"] = runtime_env
+
         if not self.tmux.create_session_with_command(
             session.tmux_session,
             session.working_dir,
             session.log_file,
-            session_id=session.id,
-            command=command,
-            args=args,
+            **tmux_kwargs,
         ):
             tmux_error = getattr(self.tmux, "last_error_message", None)
+            if remote_bridge_registered:
+                with contextlib.suppress(Exception):
+                    await self.codex_fork_node_agents.unregister_session(session.id)
             session.error_message = f"codex_fork_runtime_artifacts_missing: {reason}"
             if tmux_error:
                 session.error_message = f"{session.error_message} ({tmux_error})"
@@ -5233,7 +5626,41 @@ class SessionManager:
         for session in list(self.sessions.values()):
             if session.provider != "codex-fork" or session.status == SessionStatus.STOPPED:
                 continue
-            if not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
+            node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+            try:
+                tmux_exists = bool(session.tmux_session) and self.tmux.session_exists(session.tmux_session)
+            except Exception as exc:
+                if node_id != PRIMARY_NODE:
+                    logger.warning(
+                        "Node %s unreachable while maintaining codex-fork artifacts for %s: %s",
+                        node_id,
+                        session.id,
+                        exc,
+                    )
+                    self.mark_node_unreachable(session.id, True)
+                    degraded.append(session.id)
+                    continue
+                raise
+            if not tmux_exists:
+                continue
+            if node_id != PRIMARY_NODE:
+                if not self.is_codex_fork_node_agent_healthy(node_id):
+                    self.mark_node_unreachable(session.id, True)
+                    degraded.append(session.id)
+                    continue
+                try:
+                    await self._register_codex_fork_remote_bridge(session)
+                except Exception as exc:
+                    logger.warning("Remote codex-fork bridge registration failed for %s: %s", session.id, exc)
+                    self.mark_node_unreachable(session.id, True)
+                    degraded.append(session.id)
+                    continue
+                self.mark_node_unreachable(session.id, False)
+                if session.id not in self.codex_fork_event_monitors:
+                    self._start_codex_fork_event_monitor(session, from_eof=True)
+                if session.error_message and session.error_message.startswith("codex_fork_runtime_artifacts_missing:"):
+                    session.error_message = None
+                    self._save_state()
                 continue
 
             missing: list[str] = []
@@ -5338,13 +5765,16 @@ class SessionManager:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
-    async def _refresh_codex_fork_control_epoch(self, session: Session, socket_path: Path) -> tuple[bool, str]:
+    async def _codex_fork_control_roundtrip_for_session(self, session: Session, request: dict[str, Any]) -> dict[str, Any]:
+        return await self._codex_fork_transport_for_session(session).control_roundtrip(request)
+
+    async def _refresh_codex_fork_control_epoch(self, session: Session) -> tuple[bool, str]:
         request = {
             "request_id": uuid.uuid4().hex,
             "command": "get_epoch",
         }
         try:
-            response = await self._codex_fork_control_roundtrip(socket_path, request)
+            response = await self._codex_fork_control_roundtrip_for_session(session, request)
         except Exception as exc:
             return False, f"failed to read control epoch: {exc}"
         if not response.get("ok"):
@@ -5369,13 +5799,17 @@ class SessionManager:
         command: str,
         payload: dict[str, Any],
     ) -> tuple[bool, str]:
-        socket_path = self._codex_fork_control_socket_path(session)
-        if not socket_path.exists():
-            return False, f"control socket not found: {socket_path}"
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        if node_id == PRIMARY_NODE:
+            socket_path = self._codex_fork_control_socket_path(session)
+            if not socket_path.exists():
+                return False, f"control socket not found: {socket_path}"
+        elif not self.is_codex_fork_node_agent_healthy(node_id):
+            return False, f"node-agent not connected for node {node_id}"
 
         epoch = self.codex_fork_control_epoch.get(session.id)
         if not epoch:
-            ok, epoch_or_error = await self._refresh_codex_fork_control_epoch(session, socket_path)
+            ok, epoch_or_error = await self._refresh_codex_fork_control_epoch(session)
             if not ok:
                 return False, epoch_or_error
             epoch = epoch_or_error
@@ -5387,7 +5821,7 @@ class SessionManager:
                 "command": command,
                 **payload,
             }
-            return await self._codex_fork_control_roundtrip(socket_path, request)
+            return await self._codex_fork_control_roundtrip_for_session(session, request)
 
         try:
             response = await send_with_epoch(epoch)
@@ -5398,7 +5832,7 @@ class SessionManager:
             error = response.get("error") if isinstance(response.get("error"), dict) else {}
             error_code = error.get("code", "unknown_error")
             if error_code == "stale_epoch":
-                ok, epoch_or_error = await self._refresh_codex_fork_control_epoch(session, socket_path)
+                ok, epoch_or_error = await self._refresh_codex_fork_control_epoch(session)
                 if not ok:
                     return False, epoch_or_error
                 try:
@@ -6333,10 +6767,11 @@ class SessionManager:
 
         if provider == "codex-fork":
             lifecycle = self.get_codex_fork_lifecycle_state(session_id) or {}
+            artifact_node = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
             descriptor = {
                 "session_id": session.id,
                 "provider": provider,
-                "node": getattr(session, "node", PRIMARY_NODE),
+                "node": artifact_node,
                 "attach_supported": True,
                 "attach_transport": "tmux",
                 "tmux_session": session.tmux_session,
@@ -6348,8 +6783,11 @@ class SessionManager:
                 "runtime_owner": self.codex_fork_runtime_owner.get(session.id),
                 "lifecycle_state": lifecycle.get("state", "idle"),
                 "lifecycle_cause": lifecycle.get("cause_event_type"),
-                "control_socket_path": str(self._codex_fork_control_socket_path(session)),
-                "event_stream_path": str(self._codex_fork_event_stream_path(session)),
+                "artifact_paths_node": artifact_node,
+                "artifact_paths_scope": "primary-local" if artifact_node == PRIMARY_NODE else "node-local",
+                "artifact_paths_debug_only": artifact_node != PRIMARY_NODE,
+                "control_socket_path": self._codex_fork_control_socket_path_string(session),
+                "event_stream_path": self._codex_fork_event_stream_path_string(session),
             }
             if attach_command:
                 descriptor["attach_command"] = attach_command
@@ -6622,12 +7060,12 @@ class SessionManager:
                 self.codex_fork_control_epoch.pop(session_id, None)
                 self.codex_fork_control_degraded.pop(session_id, None)
                 self.codex_fork_runtime_owner.pop(session_id, None)
-                event_stream_path = self._codex_fork_event_stream_path(session)
-                control_socket_path = self._codex_fork_control_socket_path(session)
-                if event_stream_path.exists():
-                    event_stream_path.unlink()
-                if control_socket_path.exists():
-                    control_socket_path.unlink()
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.codex_fork_node_agents.unregister_session(session_id))
+                except RuntimeError:
+                    asyncio.run(self.codex_fork_node_agents.unregister_session(session_id))
+                self._unlink_codex_fork_runtime_artifacts(session)
                 self._set_codex_fork_lifecycle_state(
                     session_id=session_id,
                     state="shutdown",
@@ -6687,7 +7125,7 @@ class SessionManager:
         resume_id = self.get_session_resume_id(session)
         if session.provider != "codex-app" and not session.log_file:
             session.log_file = str(self.log_dir / f"{session.name}.log")
-        if session.provider != "codex-app" and self.tmux.session_exists(session.tmux_session):
+        if session.provider != "codex-app" and not tmux_runtime_missing:
             self.tmux.kill_session(session.tmux_session)
 
         if session.provider == "claude":
@@ -6718,16 +7156,24 @@ class SessionManager:
             provider_node_rejection = self._provider_node_rejection(session.provider, session.node)
             if provider_node_rejection:
                 return False, session, provider_node_rejection
+            capability_rejection = self._codex_fork_remote_capability_rejection(session.provider, session.node)
+            if capability_rejection:
+                return False, session, capability_rejection
             if not resume_id:
                 return False, session, "No Codex resume id is available for this session"
             if session.provider == "codex":
                 command = self.codex_cli_command
                 args = ["resume", resume_id, *self.codex_cli_args]
             else:
-                command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
-                    session,
-                    resume_id=resume_id,
-                )
+                try:
+                    command, args, effective_provider, fallback_reason = self._build_codex_fork_launch_spec(
+                        session,
+                        resume_id=resume_id,
+                    )
+                except RuntimeError as exc:
+                    return False, session, str(exc)
+                if effective_provider != session.provider and normalize_node_id(session.node) != PRIMARY_NODE:
+                    return False, session, fallback_reason or "remote codex-fork cannot fall back to legacy codex"
                 if effective_provider != session.provider:
                     logger.warning(
                         "Falling back from codex-fork to codex while restoring %s: %s",
@@ -6735,6 +7181,14 @@ class SessionManager:
                         fallback_reason,
                     )
                     session.provider = effective_provider
+            remote_bridge_registered = False
+            if session.provider == "codex-fork" and normalize_node_id(session.node) != PRIMARY_NODE:
+                try:
+                    await self._register_codex_fork_remote_bridge(session)
+                    remote_bridge_registered = True
+                except Exception as exc:
+                    self.mark_node_unreachable(session.id, True)
+                    return False, session, str(exc)
             if not self.tmux.create_session_with_command(
                 session.tmux_session,
                 session.working_dir,
@@ -6746,6 +7200,9 @@ class SessionManager:
                 runtime_env=self._runtime_env_for_session(session),
             ):
                 tmux_error = getattr(self.tmux, "last_error_message", None)
+                if remote_bridge_registered:
+                    with contextlib.suppress(Exception):
+                        await self.codex_fork_node_agents.unregister_session(session.id)
                 if tmux_error:
                     session.error_message = tmux_error
                     self._save_state()

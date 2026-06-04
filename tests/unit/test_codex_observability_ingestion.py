@@ -252,6 +252,42 @@ def test_codex_fork_raw_function_call_ingestion_logs_tool_event(tmp_path):
     assert session.last_tool_call is not None
 
 
+def test_codex_fork_provider_seq_guard_drops_replay_before_event_append(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkdedupe1",
+        name="codex-fork-forkdedupe1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+
+    first_event = {
+        "schema_version": 2,
+        "event_type": "turn_started",
+        "session_id": "thread-dedupe",
+        "seq": 3,
+        "session_epoch": {"pid": 111},
+        "payload": {"turn_id": "turn-dedupe"},
+    }
+    duplicate_event = dict(first_event)
+    older_event = {**first_event, "seq": 2, "payload": {"turn_id": "turn-old"}}
+
+    assert manager.ingest_codex_fork_event(session.id, first_event) is not None
+    initial_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
+    assert manager.ingest_codex_fork_event(session.id, duplicate_event) is None
+    assert manager.ingest_codex_fork_event(session.id, older_event) is None
+
+    stored_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
+    assert len(stored_events) == len(initial_events)
+    provider_events = [
+        event for event in stored_events if event["event_type"] == "codex_fork_turn_started"
+    ]
+    assert len(provider_events) == 1
+    assert provider_events[0]["payload_preview"]["seq"] == 3
+
+
 @pytest.mark.asyncio
 async def test_codex_fork_turn_complete_updates_last_message_and_notifies(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))

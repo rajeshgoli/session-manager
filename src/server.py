@@ -48,6 +48,7 @@ from .codex_provider_policy import (
     REMOVED_CODEX_SERVER_ENTRYPOINT_MESSAGE,
     get_codex_app_policy,
 )
+from .codex_fork_remote import NodeAgentConnection
 from .models import (
     AdoptionProposal,
     CompletionStatus,
@@ -4472,6 +4473,7 @@ def create_app(
         provider_rejection = app.state.session_manager.get_provider_create_rejection(
             provider,
             working_dir=request.working_dir,
+            node=resolved_node or "primary",
         )
         if provider_rejection:
             raise HTTPException(status_code=503, detail=provider_rejection)
@@ -4528,6 +4530,7 @@ def create_app(
         provider_rejection = app.state.session_manager.get_provider_create_rejection(
             provider,
             working_dir=working_dir,
+            node=resolved_node or "primary",
         )
         if provider_rejection:
             raise HTTPException(status_code=503, detail=provider_rejection)
@@ -4585,6 +4588,64 @@ def create_app(
             status = 404 if str(result.get("error") or "").startswith("Unknown node") else 503
             raise HTTPException(status_code=status, detail=result.get("error") or "ping failed")
         return result
+
+    @app.websocket("/nodes/agent")
+    async def node_agent_websocket(websocket: WebSocket):
+        """Authenticated node-initiated codex-fork IPC bridge."""
+        await websocket.accept()
+        sm = app.state.session_manager
+        if not sm:
+            await websocket.send_json({"type": "error", "message": "Session manager not configured"})
+            await websocket.close(code=1011)
+            return
+
+        connection: Optional[NodeAgentConnection] = None
+        try:
+            hello = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+            if not isinstance(hello, dict) or hello.get("type") != "hello":
+                await websocket.send_json({"type": "error", "message": "First node-agent frame must be hello"})
+                await websocket.close(code=1008)
+                return
+
+            node_id = str(hello.get("node_id") or "").strip()
+            if not node_id or node_id == "primary":
+                await websocket.send_json({"type": "error", "message": "Invalid node id"})
+                await websocket.close(code=1008)
+                return
+
+            getter = getattr(sm, "node_agent_secret_for_node", None)
+            expected_secret = getter(node_id) if callable(getter) else None
+            supplied_secret = hello.get("secret")
+            if not isinstance(expected_secret, str) or not expected_secret:
+                await websocket.send_json({"type": "error", "message": "Node-agent secret not configured"})
+                await websocket.close(code=1008)
+                return
+            if not isinstance(supplied_secret, str) or not hmac.compare_digest(supplied_secret, expected_secret):
+                await websocket.send_json({"type": "error", "message": "Invalid node-agent secret"})
+                await websocket.close(code=1008)
+                return
+
+            connection = NodeAgentConnection(node_id, websocket)
+            await sm.attach_codex_fork_node_agent(connection)
+            await websocket.send_json({"type": "hello_ok", "node_id": node_id})
+            while True:
+                frame = await websocket.receive_json()
+                if isinstance(frame, dict):
+                    await connection.handle_frame(frame)
+        except WebSocketDisconnect:
+            pass
+        except asyncio.TimeoutError:
+            await websocket.send_json({"type": "error", "message": "Node-agent hello timed out"})
+            await websocket.close(code=1008)
+        except Exception:
+            logger.exception("Node-agent WebSocket failed")
+            with contextlib.suppress(Exception):
+                await websocket.send_json({"type": "error", "message": "Node-agent bridge failed"})
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1011)
+        finally:
+            if connection is not None:
+                await sm.detach_codex_fork_node_agent(connection)
 
     @app.get("/client/sessions")
     async def list_client_sessions(request: Request):
@@ -7487,6 +7548,7 @@ Provide ONLY the summary, no preamble or questions."""
         provider_rejection = app.state.session_manager.get_provider_create_rejection(
             selected_provider,
             working_dir=selected_working_dir,
+            node=resolved_node or "primary",
         )
         if provider_rejection:
             raise HTTPException(status_code=503, detail=provider_rejection)

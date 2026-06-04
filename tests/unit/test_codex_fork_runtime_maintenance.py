@@ -216,6 +216,75 @@ async def test_maintain_codex_fork_runtime_artifacts_marks_unhealable_session_de
     assert session.error_message.startswith("codex_fork_runtime_artifacts_missing: event_stream, control_socket")
 
 
+@pytest.mark.asyncio
+async def test_maintain_remote_codex_fork_marks_node_unreachable_when_agent_missing(tmp_path):
+    manager = SessionManager(
+        log_dir=str(tmp_path),
+        state_file=str(tmp_path / "state.json"),
+        config={"nodes": {"registry": {"worker": {"ssh": "dev@example", "node_token": "secret"}}}},
+    )
+    session = Session(
+        id="remoteagentmissing",
+        name="codex-fork-remoteagentmissing",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+        status=SessionStatus.RUNNING,
+        log_file=str(tmp_path / "remoteagentmissing.log"),
+        provider_resume_id="resume-remoteagentmissing",
+    )
+    manager.sessions[session.id] = session
+    manager.tmux.session_exists = Mock(return_value=True)
+    manager.tmux.create_session_with_command = Mock(return_value=True)
+    manager._start_codex_fork_event_monitor = Mock()
+
+    result = await manager.maintain_codex_fork_runtime_artifacts()
+
+    assert result["healed"] == []
+    assert result["degraded"] == [session.id]
+    assert manager.is_session_node_unreachable(session.id)
+    manager.tmux.create_session_with_command.assert_not_called()
+    manager._start_codex_fork_event_monitor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maintain_remote_codex_fork_registers_healthy_bridge_without_primary_path_checks(tmp_path):
+    manager = SessionManager(
+        log_dir=str(tmp_path),
+        state_file=str(tmp_path / "state.json"),
+        config={"nodes": {"registry": {"worker": {"ssh": "dev@example", "node_token": "secret"}}}},
+    )
+    session = Session(
+        id="remotehealthy",
+        name="codex-fork-remotehealthy",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+        status=SessionStatus.RUNNING,
+        log_file=str(tmp_path / "remotehealthy.log"),
+        provider_resume_id="resume-remotehealthy",
+    )
+    manager.sessions[session.id] = session
+    manager.mark_node_unreachable(session.id, True)
+    manager.tmux.session_exists = Mock(return_value=True)
+    manager._register_codex_fork_remote_bridge = AsyncMock()
+    manager._start_codex_fork_event_monitor = Mock()
+
+    class HealthyConnection:
+        def is_healthy(self):
+            return True
+
+    manager.codex_fork_node_agents._connections["worker"] = HealthyConnection()
+
+    result = await manager.maintain_codex_fork_runtime_artifacts()
+
+    assert result["healed"] == []
+    assert result["degraded"] == []
+    assert not manager.is_session_node_unreachable(session.id)
+    manager._register_codex_fork_remote_bridge.assert_awaited_once_with(session)
+    manager._start_codex_fork_event_monitor.assert_called_once_with(session, from_eof=True)
+
+
 def test_kill_session_removes_codex_fork_event_stream(tmp_path):
     manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
     session = Session(
