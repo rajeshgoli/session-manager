@@ -136,10 +136,13 @@ transparent; parity is structural, not re-implemented.
 
 - Watch the node-local event JSONL for each active remote codex-fork session, owning the byte offset
   and partial-line buffer **locally** so a WS/primary reconnect never splits a line. Push raw lines;
-  on resubscribe it replays from a primary-supplied durable cursor, not a byte offset the primary
-  does not hold (see Idempotency & replay).
+  on resubscribe it replays from a primary-supplied durable `(session_epoch, seq)` cursor — read from
+  each line's top-level envelope — rather than a byte offset the primary does not hold (see
+  Idempotency & replay).
 - Accept control RPCs, perform `asyncio.open_unix_connection` against the local control socket, relay
-  the one-line response. The agent never parses or interprets — it is a byte/line pipe.
+  the one-line response. The agent does **no semantic parsing or reduction** — event-type/payload
+  interpretation, normalization, and reduction all stay on the primary; its only structural read is
+  the top-level `(session_epoch, seq)` envelope, used solely for replay positioning and gap detection.
 - Report socket/file readiness (mirror `_codex_fork_runtime_reachable`) so the primary knows when the
   codex binary has created the socket post-launch.
 
@@ -174,16 +177,23 @@ reducer ignores them.
 
 Fix — one idempotency point ahead of **both** persistence and reduction:
 
-- Every codex-fork event carries a provider `(session_epoch, seq)` (nested in the payload today,
-  `:2450-2501`). The primary keys idempotency on that pair, **not** on the DB append seq.
+- Every codex-fork event carries a provider `(session_epoch, seq)` **top-level on the raw event**
+  (`:2450-2452`); these are nested into the stored DB payload only at persistence (`:2495-2501`). The
+  primary keys idempotency on that pair, **not** on the DB append seq.
 - Maintain a **durable per-session cursor** = the last applied `(session_epoch, seq)`, persisted so it
   survives a primary restart. An event whose `(epoch, seq)` is `<=` the cursor is dropped *before*
   `append_event` and the reducer; otherwise the cursor advances.
 - On reconnect / primary restart / restore, the primary hands the node-agent the cursor and the agent
-  replays only events after it.
+  replays only events after it (a best-effort optimization off the same top-level envelope).
 - **Gap/epoch rules:** `seq` is monotonic within an `epoch`; a new `epoch` (runtime relaunch/restore)
   resets the seq space and the cursor follows the new epoch. A non-contiguous `seq` within an epoch is
   a detected gap (log + best-effort refetch), not a silent skip.
+
+The **primary-side guard is authoritative**: it sits ahead of `append_event` and the reducer and
+drops anything `<= cursor`, so correctness never depends on the agent's envelope filtering — the
+agent's `(epoch, seq)` read is only an optimization to avoid re-streaming the whole file on reconnect.
+The "no duplicate rows" guarantee therefore holds at the persistence layer even if the agent
+over-replays.
 
 This makes replay safe and keeps the "no duplicate rows" guarantee at the persistence layer.
 
