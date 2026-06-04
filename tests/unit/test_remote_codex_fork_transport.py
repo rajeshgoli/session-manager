@@ -128,6 +128,33 @@ async def test_node_agent_connection_surfaces_register_failure():
 
 
 @pytest.mark.asyncio
+async def test_stale_node_agent_detach_does_not_mark_reconnected_sessions_unreachable(tmp_path):
+    class FakeWebSocket:
+        async def send_json(self, frame: dict):
+            return None
+
+    manager = _manager(tmp_path)
+    session = Session(
+        id="reconnect1",
+        name="codex-fork-reconnect1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    old_connection = NodeAgentConnection("worker", FakeWebSocket())
+    new_connection = NodeAgentConnection("worker", FakeWebSocket())
+
+    await manager.attach_codex_fork_node_agent(old_connection)
+    await manager.attach_codex_fork_node_agent(new_connection)
+    await manager.detach_codex_fork_node_agent(old_connection)
+
+    assert manager.is_codex_fork_node_agent_healthy("worker") is True
+    assert manager.is_session_node_unreachable(session.id) is False
+
+
+@pytest.mark.asyncio
 async def test_node_agent_rejects_registered_paths_outside_log_dir(tmp_path):
     class FakeWebSocket:
         def __init__(self):

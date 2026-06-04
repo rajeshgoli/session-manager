@@ -519,7 +519,8 @@ class SessionManager:
 
     async def detach_codex_fork_node_agent(self, connection: NodeAgentConnection) -> None:
         await self.codex_fork_node_agents.detach(connection)
-        self._mark_node_sessions_unreachable(connection.node_id)
+        if not self.codex_fork_node_agents.is_connected(connection.node_id):
+            self._mark_node_sessions_unreachable(connection.node_id)
 
     def _mark_node_sessions_reachable(self, node: str) -> None:
         node_id = normalize_node_id(node)
