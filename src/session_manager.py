@@ -2654,7 +2654,7 @@ done
         provider_position: Optional[tuple[Any, int]],
         previous_provider_cursor: Optional[dict[str, Any]],
     ) -> Optional[dict[str, Any]]:
-        """Apply one non-duplicate codex-fork event and then advance provider cursor."""
+        """Apply one non-duplicate codex-fork event and advance the cursor after durable persistence."""
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         provider_session_id = event.get("session_id")
         if not provider_session_id and payload:
@@ -2734,8 +2734,6 @@ done
                     "payload": payload_for_store,
                 },
             )
-            if not stored_event.get("persisted"):
-                return None
             lifecycle = self._reduce_codex_fork_lifecycle(
                 session_id=session_id,
                 event_type=normalized,
@@ -2744,7 +2742,7 @@ done
                 session_epoch=session_epoch,
                 event_timestamp_ns=self._timestamp_to_epoch_ns(event.get("ts")),
             )
-            if provider_position is not None:
+            if provider_position is not None and stored_event.get("persisted"):
                 self._record_codex_fork_provider_event_applied(
                     session_id,
                     provider_position[0],

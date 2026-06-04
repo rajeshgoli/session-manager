@@ -312,7 +312,7 @@ def test_codex_fork_provider_cursor_not_advanced_when_append_not_persisted(tmp_p
         "append_event",
         return_value={"session_id": session.id, "seq": None, "persisted": False},
     ):
-        assert manager.ingest_codex_fork_event(session.id, event) is None
+        assert manager.ingest_codex_fork_event(session.id, event) is not None
 
     assert manager.codex_event_store.get_codex_fork_provider_cursor(session.id) is None
     assert manager.ingest_codex_fork_event(session.id, event) is not None
@@ -321,6 +321,47 @@ def test_codex_fork_provider_cursor_not_advanced_when_append_not_persisted(tmp_p
     stored_events = manager.codex_event_store.get_events(session.id, limit=10)["events"]
     provider_events = [item for item in stored_events if item["event_type"] == "codex_fork_turn_started"]
     assert len(provider_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_process_line_continues_when_append_not_persisted(tmp_path):
+    manager = SessionManager(log_dir=str(tmp_path), state_file=str(tmp_path / "state.json"))
+    session = Session(
+        id="forkfallback1",
+        name="codex-fork-forkfallback1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.RUNNING,
+    )
+    manager.sessions[session.id] = session
+    manager._handle_codex_fork_assistant_relay_event = AsyncMock()
+    manager._handle_codex_fork_turn_complete = AsyncMock()
+    event = {
+        "schema_version": 2,
+        "event_type": "turn_complete",
+        "session_id": "thread-fallback",
+        "seq": 5,
+        "session_epoch": {"pid": 444},
+        "payload": {
+            "turn_id": "turn-fallback",
+            "last_agent_message": "done despite persistence fallback",
+        },
+    }
+
+    with patch.object(
+        manager.codex_event_store,
+        "append_event",
+        return_value={"session_id": session.id, "seq": None, "persisted": False},
+    ):
+        await manager._process_codex_fork_event_line(session.id, json.dumps(event))
+
+    assert manager.codex_event_store.get_codex_fork_provider_cursor(session.id) is None
+    manager._handle_codex_fork_assistant_relay_event.assert_awaited_once_with(session.id, event)
+    manager._handle_codex_fork_turn_complete.assert_awaited_once_with(
+        session_id=session.id,
+        last_message="done despite persistence fallback",
+        event=event,
+    )
 
 
 def test_codex_fork_provider_cursor_and_event_row_rollback_when_reducer_fails(tmp_path):
