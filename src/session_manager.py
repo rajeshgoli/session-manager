@@ -463,6 +463,18 @@ class SessionManager:
         if session.tmux_session:
             self._tmux_session_node_cache[session.tmux_session] = normalize_node_id(session.node)
 
+    def _tmux_session_exists_for_session(self, session: Session) -> bool:
+        """Check tmux reachability on the node that owns this session."""
+        if not session.tmux_session:
+            return False
+        node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
+        try:
+            return self.tmux.session_exists(session.tmux_session, node=node_id)
+        except TypeError as exc:
+            if "unexpected keyword argument 'node'" not in str(exc):
+                raise
+            return self.tmux.session_exists(session.tmux_session)
+
     def _resolve_node_for_tmux_session(self, tmux_session: str) -> str:
         target = str(tmux_session or "").split(":", 1)[0].split(".", 1)[0]
         if target in self._tmux_session_node_cache:
@@ -1031,7 +1043,7 @@ class SessionManager:
 
             # Verify tmux session still exists (Claude/Codex CLI)
             try:
-                tmux_exists = self.tmux.session_exists(session.tmux_session)
+                tmux_exists = self._tmux_session_exists_for_session(session)
             except Exception as exc:
                 if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
                     logger.warning(
@@ -1568,7 +1580,7 @@ done
         node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
         if node_id != PRIMARY_NODE:
             try:
-                tmux_exists = bool(session.tmux_session) and self.tmux.session_exists(session.tmux_session)
+                tmux_exists = self._tmux_session_exists_for_session(session)
             except Exception:
                 self.mark_node_unreachable(session.id, True)
                 return False
@@ -1579,7 +1591,7 @@ done
         socket_path = self._codex_fork_control_socket_path(session)
         if not socket_path.exists():
             return False
-        if not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
+        if not self._tmux_session_exists_for_session(session):
             return False
 
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -5582,7 +5594,7 @@ done
                 should_remove = True
             elif session.status == SessionStatus.STOPPED:
                 should_remove = True
-            elif not session.tmux_session or not self.tmux.session_exists(session.tmux_session):
+            elif not self._tmux_session_exists_for_session(session):
                 should_remove = True
 
             if not should_remove:
@@ -5625,7 +5637,7 @@ done
 
         if session.tmux_session:
             try:
-                tmux_exists = self.tmux.session_exists(session.tmux_session)
+                tmux_exists = self._tmux_session_exists_for_session(session)
             except Exception as exc:
                 if node_id != PRIMARY_NODE:
                     self.mark_node_unreachable(session.id, True)
@@ -5716,7 +5728,7 @@ done
                 continue
             node_id = normalize_node_id(getattr(session, "node", PRIMARY_NODE))
             try:
-                tmux_exists = bool(session.tmux_session) and self.tmux.session_exists(session.tmux_session)
+                tmux_exists = self._tmux_session_exists_for_session(session)
             except Exception as exc:
                 if node_id != PRIMARY_NODE:
                     logger.warning(
@@ -5990,7 +6002,7 @@ done
         if session.provider == "codex-app" or not session.tmux_session:
             return False
         try:
-            if self.tmux.session_exists(session.tmux_session):
+            if self._tmux_session_exists_for_session(session):
                 self.mark_node_unreachable(session.id, False)
                 return False
         except Exception as exc:
@@ -7193,7 +7205,7 @@ done
         try:
             tmux_runtime_missing = (
                 session.provider != "codex-app"
-                and not self.tmux.session_exists(session.tmux_session)
+                and not self._tmux_session_exists_for_session(session)
             )
             self.mark_node_unreachable(session.id, False)
         except Exception as exc:
