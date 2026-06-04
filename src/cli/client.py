@@ -1,15 +1,19 @@
 """HTTP client for Session Manager API."""
 
 import os
-import sys
+from pathlib import Path
 from typing import Optional
 import urllib.error
 import urllib.parse
 import urllib.request
 import json
 
+import yaml
+
 # Default API endpoint
 DEFAULT_API_URL = "http://127.0.0.1:8420"
+CLIENT_CONFIG_ENV = "SM_CLIENT_CONFIG"
+CLIENT_CONFIG_SUBPATH = "session-manager/client.yaml"
 DEFAULT_API_TIMEOUT = 5.0  # seconds
 DEFAULT_SEND_API_TIMEOUT = 15.0  # seconds
 DEFAULT_MUTATION_API_TIMEOUT = 15.0  # seconds
@@ -29,6 +33,74 @@ def _read_api_timeout() -> float:
 
 
 API_TIMEOUT = _read_api_timeout()
+
+
+def default_client_config_path() -> Path:
+    """Return the default shared SM client config path."""
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return Path(xdg_config_home).expanduser() / CLIENT_CONFIG_SUBPATH
+    return Path.home() / ".config" / CLIENT_CONFIG_SUBPATH
+
+
+def _client_config_path() -> Path:
+    """Return the configured SM client config path."""
+    override = os.environ.get(CLIENT_CONFIG_ENV)
+    if override:
+        return Path(override).expanduser()
+    return default_client_config_path()
+
+
+def _coerce_api_url(value: object) -> Optional[str]:
+    """Normalize a candidate API URL, rejecting empty or non-HTTP values."""
+    if not isinstance(value, str):
+        return None
+    api_url = value.strip().rstrip("/")
+    if api_url.startswith("http://") or api_url.startswith("https://"):
+        return api_url
+    return None
+
+
+def read_client_config_api_url(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read the shared SM client API URL from YAML config, if present."""
+    path = config_path or _client_config_path()
+    try:
+        with path.open() as config_file:
+            payload = yaml.safe_load(config_file) or {}
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    api_url = _coerce_api_url(payload.get("api_url"))
+    if api_url:
+        return api_url
+
+    client_payload = payload.get("client")
+    if isinstance(client_payload, dict):
+        return _coerce_api_url(client_payload.get("api_url"))
+
+    return None
+
+
+def resolve_api_url(api_url: Optional[str] = None) -> str:
+    """Resolve the API URL using explicit arg, env, shared config, then localhost."""
+    explicit_url = _coerce_api_url(api_url)
+    if explicit_url:
+        return explicit_url
+
+    env_url = _coerce_api_url(os.environ.get("SM_API_URL"))
+    if env_url:
+        return env_url
+
+    config_url = read_client_config_api_url()
+    if config_url:
+        return config_url
+
+    return DEFAULT_API_URL
 
 
 def _read_send_api_timeout() -> float:
@@ -73,7 +145,7 @@ class SessionManagerClient:
         Args:
             api_url: Base URL for API (default: http://127.0.0.1:8420)
         """
-        self.api_url = api_url or os.environ.get("SM_API_URL", DEFAULT_API_URL)
+        self.api_url = resolve_api_url(api_url)
         self.session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
 
     def _request(self, method: str, path: str, data: Optional[dict] = None, timeout: Optional[int] = None) -> tuple[Optional[dict], bool, bool]:

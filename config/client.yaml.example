@@ -1,0 +1,8 @@
+# Shared Session Manager client config.
+#
+# `sm` and GUI clients such as DeskBar resolve the API URL in this order:
+# explicit override, SM_API_URL, this file, localhost fallback.
+#
+# Copy to ~/.config/session-manager/client.yaml on machines that should talk to
+# a primary Session Manager server running somewhere else.
+api_url: "http://127.0.0.1:8420"
