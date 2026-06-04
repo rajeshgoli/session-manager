@@ -2734,6 +2734,8 @@ done
                     "payload": payload_for_store,
                 },
             )
+            if provider_position is not None and not stored_event.get("persisted"):
+                return None
             lifecycle = self._reduce_codex_fork_lifecycle(
                 session_id=session_id,
                 event_type=normalized,
