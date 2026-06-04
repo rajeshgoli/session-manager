@@ -438,3 +438,27 @@ async def test_restore_remote_codex_fork_registers_bridge_before_launch_and_uses
     control_socket_path = args[args.index("--control-socket") + 1]
     assert event_stream_path == "/tmp/worker-sm/restoreremote1.codex-fork.events.jsonl"
     assert control_socket_path == "/tmp/worker-sm/restoreremote1.codex-fork.control.sock"
+
+
+@pytest.mark.asyncio
+async def test_remote_codex_fork_create_rejects_legacy_codex_fallback(tmp_path):
+    manager = _manager(tmp_path)
+
+    class HealthyConnection:
+        def is_healthy(self):
+            return True
+
+    manager.codex_fork_node_agents._connections["worker"] = HealthyConnection()
+    manager.node_runner.command_available = Mock(side_effect=[True, False])
+    manager.tmux.create_session_with_command = Mock(return_value=True)
+
+    session = await manager.create_session(
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+    )
+
+    assert session is None
+    assert manager.last_create_error is not None
+    assert "falling back to codex" in manager.last_create_error
+    manager.tmux.create_session_with_command.assert_not_called()

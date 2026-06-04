@@ -3265,10 +3265,19 @@ done
                 )
                 if effective_provider != session.provider:
                     if codex_fork_source_resume_id:
+                        self.last_create_error = fallback_reason or "codex-fork fork create cannot fall back to legacy codex"
                         logger.error(
                             "Rejecting codex-fork fork create for %s because runtime is unavailable: %s",
                             session.id,
                             fallback_reason,
+                        )
+                        return None
+                    if normalize_node_id(getattr(session, "node", PRIMARY_NODE)) != PRIMARY_NODE:
+                        self.last_create_error = fallback_reason or "remote codex-fork cannot fall back to legacy codex"
+                        logger.error(
+                            "Rejecting remote codex-fork create for %s because runtime is unavailable: %s",
+                            session.id,
+                            self.last_create_error,
                         )
                         return None
                     logger.warning(
