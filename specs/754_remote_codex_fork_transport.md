@@ -125,16 +125,19 @@ Introduce `CodexForkTransport` with two implementations selected by `session.nod
   send control round-trips as RPCs over the node-agent WS.
 
 `_monitor_codex_fork_event_stream` and `_codex_fork_control_roundtrip` swap their raw I/O to the
-transport. **Everything downstream is unchanged** — normalization, `ingest_codex_fork_event`, the
-reducer, turn-complete, Telegram, `codex_events.db`, epoch management all stay on the primary and
-operate on bytes the transport delivers. This is the key property: the bridge is transparent;
-parity is structural, not re-implemented.
+transport. **Everything downstream is unchanged but for one deliberate addition** — normalization,
+the reducer, turn-complete, Telegram, `codex_events.db`, and epoch management all stay on the primary
+and operate on bytes the transport delivers; the single new primitive is a provider
+`(session_epoch, seq)` **idempotency guard inserted ahead of both `codex_event_store.append_event`
+and the lifecycle reducer** (see Idempotency & replay). This is the key property: the bridge is
+transparent; parity is structural, not re-implemented.
 
 ### Node-agent responsibilities (deliberately minimal)
 
-- Watch the node-local event JSONL for each active remote codex-fork session (it owns the offset +
-  partial-line buffer **locally**, so a primary restart resumes by replaying from a primary-tracked
-  last-seq, not a byte offset the primary no longer holds — see Edge Cases). Push raw lines.
+- Watch the node-local event JSONL for each active remote codex-fork session, owning the byte offset
+  and partial-line buffer **locally** so a WS/primary reconnect never splits a line. Push raw lines;
+  on resubscribe it replays from a primary-supplied durable cursor, not a byte offset the primary
+  does not hold (see Idempotency & replay).
 - Accept control RPCs, perform `asyncio.open_unix_connection` against the local control socket, relay
   the one-line response. The agent never parses or interprets — it is a byte/line pipe.
 - Report socket/file readiness (mirror `_codex_fork_runtime_reachable`) so the primary knows when the
@@ -142,26 +145,75 @@ parity is structural, not re-implemented.
 
 ### Launch & restore
 
-codex-fork is spawned on the node via the existing `NodeRunner`/tmux path with `--event-stream` /
-`--control-socket` at **node-local** paths (under the node's `log_dir`). The primary tells the
-node-agent the session id + paths to bridge. Restore is identical: relaunch on the node with the
-resume id (discovered on the primary from `codex_events.db` / `provider_resume_id`, both of which
-live on the primary and are fed by the streamed events — so resume-id discovery is already portable),
-and the node-agent re-tails / reconnects.
+codex-fork is spawned on the node via the existing `NodeRunner`/tmux path. The event-stream and
+control-socket paths must be **node-local** — which today they are not: `_build_codex_fork_launch_spec`
+derives them from the **primary's** `self.log_dir` and `mkdir`/`unlink`s them on the **primary**
+filesystem (`:1214-1220`, `:1292-1308`). So this feature adds a **node artifact path resolver +
+bootstrap**:
+
+- A node log directory — `NodeConfig.log_dir` (new; defaults to the node's
+  `~/.local/share/claude-sessions` or derived from `projects_root`) — is the base for the node-local
+  event/control paths.
+- For a remote session, `_build_codex_fork_launch_spec` becomes node-aware: it computes the
+  node-local paths, and the **parent-mkdir and stale file/socket unlink run on the node via
+  `NodeRunner.run`**, not on the primary. The primary records the exact node-local absolute paths it
+  passes to the runtime and registers them with the node-agent to watch.
+
+Restore is identical: relaunch on the node with the resume id (discovered on the primary from
+`codex_events.db` / `provider_resume_id`, which live on the primary and are fed by the streamed
+events — so resume-id discovery is already portable), and the node-agent re-tails / reconnects from
+the durable cursor.
+
+### Idempotency & replay (durable cursor)
+
+The duplication risk is in **persistence**, not just reduction: `ingest_codex_fork_event` appends to
+`codex_events.db` via the store's own DB-local sequence (`codex_event_store.append_event`,
+`:184-190`) **before** the lifecycle reducer dedupes on the runtime provider seq
+(`codex_fork_last_seq`, `:1486-1490`). So replayed raw lines would double-insert rows even though the
+reducer ignores them.
+
+Fix — one idempotency point ahead of **both** persistence and reduction:
+
+- Every codex-fork event carries a provider `(session_epoch, seq)` (nested in the payload today,
+  `:2450-2501`). The primary keys idempotency on that pair, **not** on the DB append seq.
+- Maintain a **durable per-session cursor** = the last applied `(session_epoch, seq)`, persisted so it
+  survives a primary restart. An event whose `(epoch, seq)` is `<=` the cursor is dropped *before*
+  `append_event` and the reducer; otherwise the cursor advances.
+- On reconnect / primary restart / restore, the primary hands the node-agent the cursor and the agent
+  replays only events after it.
+- **Gap/epoch rules:** `seq` is monotonic within an `epoch`; a new `epoch` (runtime relaunch/restore)
+  resets the seq space and the cursor follows the new epoch. A non-contiguous `seq` within an epoch is
+  a detected gap (log + best-effort refetch), not a silent skip.
+
+This makes replay safe and keeps the "no duplicate rows" guarantee at the persistence layer.
 
 ### Lifting the gate
 
-`_provider_node_rejection` is relaxed to allow `codex-fork` on non-primary nodes **once a healthy
-node-agent transport exists for that node**; codex-app stays rejected. The gate becomes
-provider-and-capability aware rather than Claude-only.
+`_provider_node_rejection` stays a fast static provider/node check, but create/restore gain a
+**capability + health gate** layered on top:
+
+- A primary-side **node-agent registry/health API** tracks, per node, whether a healthy node-agent is
+  connected and ready to bridge. `_provider_node_rejection` is relaxed to *allow* `codex-fork` on a
+  non-primary node, and the capability gate enforces a healthy agent at the existing enforcement
+  points: `validate_create_node_provider` (`:512`), create (`:2789-2798`), restore (`:6717-6720`),
+  service-role bootstrap (`:3895-3903`), and the API preflight (`server.py:1508-1526`). codex-app
+  stays rejected outright.
+- **Launch ordering (no missed early lines):** the bridge for a session must be **registered and
+  watching the node-local file before the runtime is launched** — register paths → agent begins
+  tailing the pre-created file → launch codex-fork. If no healthy node-agent exists for the node,
+  **reject before launch** with a clear error; never launch-then-`node-unreachable`.
 
 ## Control Protocol Over the Bridge
 
 The existing request frame `{request_id, expected_epoch, command, **payload}` and one-line JSON
 response are tunneled verbatim as a WS RPC: the primary sends `{type: "control", session_id, frame}`
 and the agent replies `{type: "control_result", request_id, line}`. Epoch logic stays entirely on
-the primary (`:5341-5417`); the agent is transparent, so `get_epoch`, `set_thread_name`, and stale-
-epoch retry behave identically. Timeouts map to the same `RuntimeError` surfaces.
+the primary (`:5341-5417`); the agent is transparent, so the full command set behaves identically,
+including **`submit_message`** — the `sm send` / input path to codex-fork (`:5528-5533`), which sends
+over the control socket and **falls back to tmux send-keys** on failure. Over the bridge,
+`submit_message` must preserve both the stale-epoch retry and that degraded tmux fallback (the tmux
+leg already routes to the node via `NodeRunner`). `get_epoch` and `set_thread_name` tunnel unchanged.
+Timeouts map to the same `RuntimeError` surfaces.
 
 ## Data Model / Config
 
@@ -169,8 +221,10 @@ epoch retry behave identically. Timeouts map to the same `RuntimeError` surfaces
 - Node-agent connection auth: reuse `nodes.<id>.hook_secret` or add `nodes.<id>.node_token`.
 - Per-session bridge registration is runtime state on the primary (which node-agent serves which
   session), not persisted in `sessions.json`.
-- Primary tracks a per-session **last applied event seq** (already implied by `codex_event_store`
-  seq) so reconnect/restart resumes without a node-side byte offset.
+- Primary persists a per-session **durable cursor** = last applied provider `(session_epoch, seq)`
+  (distinct from the DB-local `codex_event_store` append seq) so reconnect/restart/restore resume
+  idempotently without a node-side byte offset (see Idempotency & replay).
+- `NodeConfig` gains **`log_dir`** — the node-local base for codex event/control artifacts.
 
 ## Security
 
@@ -206,31 +260,43 @@ epoch retry behave identically. Timeouts map to the same `RuntimeError` surfaces
    reports runtime readiness. Single authenticated WebSocket dialed to the primary.
 3. **`RemoteTransport` + wiring** — implement the primary-side transport over the node-agent WS;
    select transport by `session.node`; manage node-agent lifecycle/health per node and per session.
-4. **Remote spawn + restore + gate** — spawn/restore codex-fork on a node end-to-end; relax
+4. **Remote spawn + restore + gate** — spawn/restore codex-fork on a node end-to-end; node-agent
+   registry/health + capability gate (bridge watching before launch, reject-before-launch if no
+   healthy agent); node-local artifact path resolver + on-node mkdir/unlink; relax
    `_provider_node_rejection` for codex-fork (keep codex-app); validate resume-id flow.
-5. **Liveness / reconnect** — `node-unreachable` for remote codex-fork; resume from last-seq on
-   reconnect and on primary restart; readiness wait for the post-launch socket.
+5. **Liveness / reconnect** — `ActivityState.NODE_UNREACHABLE` for remote codex-fork; resume from the
+   durable provider-`(epoch, seq)` cursor on reconnect and on primary restart; readiness wait for the
+   post-launch socket.
 6. **Attach** — `sm attach` for a remote codex-fork (detached-runtime descriptor over the node,
    building on #327's attach descriptor which already carries `control_socket_path`/
-   `event_stream_path`/lifecycle).
+   `event_stream_path`/lifecycle). For a remote session those two path fields are **node-local**, not
+   client-local: mark them node-qualified / debug-only (or omit for remote clients), since attach
+   itself runs over `attach_command`/SSH and needs no client-resolvable path.
 
 ## Tests
 
 - Unit: `CodexForkTransport` selection by node; control-frame tunneling round-trip incl. stale-epoch
-  retry; event-line buffering across a simulated reconnect.
+  retry for `get_epoch`, `set_thread_name`, and **`submit_message`** (and its tmux fallback);
+  event-line buffering across a simulated reconnect.
+- **Idempotency:** replaying already-applied lines (same provider `(epoch, seq)`) inserts **zero** new
+  `codex_events.db` rows and causes no reducer state change; a new `epoch` resets the seq space; a seq
+  gap is detected.
 - Integration (local fake-remote via `ssh localhost` + a node-agent): spawn a remote codex-fork;
   assert lifecycle/turn-complete/last-message/approval events reach the primary's reducer and
-  `codex_events.db`; `set_thread_name`/`get_epoch` succeed; restore resumes on the node.
-- Liveness: kill the node-agent → control surfaces unreachable and lifecycle shows `node-unreachable`
-  (no `_handle_session_died`); restart → events resume from last seq, no duplicates/gaps.
+  `codex_events.db`; `submit_message`/`set_thread_name`/`get_epoch` succeed; restore resumes on the
+  node; the node-local event/control paths are created **on the node**, not the primary.
+- Liveness: kill the node-agent → control surfaces unreachable and the session's **`ActivityState`
+  projects `NODE_UNREACHABLE`** (`models.py:60`), with no `_handle_session_died`; restart → events
+  resume from the cursor, no duplicates/gaps.
 - Regression: primary-local codex-fork unchanged (LocalTransport); codex-app on a node still rejected.
 
 ## Edge Cases
 
 - **Socket created post-launch** — the agent retries readiness until the codex binary creates the
   control socket; control RPCs before readiness return a clear `not-ready` error, not a hang.
-- **Primary restart mid-session** — primary resumes from its last persisted event seq
-  (`codex_events.db`), asking the agent to replay from there; dedupe by seq so no double-ingest.
+- **Primary restart mid-session** — primary resumes from its durable provider-`(epoch, seq)` cursor,
+  asking the agent to replay from there; the idempotency guard ahead of `append_event` + reducer means
+  no double-ingest into `codex_events.db`.
 - **Partial JSON across a reconnect** — line buffering lives on the node-agent (local to the file),
   so a primary/WS reconnect never splits a line.
 - **Fork lineage** — `thread_started`/`codex_fork_session_configured` events must arrive in order so
@@ -243,12 +309,13 @@ epoch retry behave identically. Timeouts map to the same `RuntimeError` surfaces
 - `sm spawn codex --node <node>` (and `sm codex --node <node>`) runs the codex-fork runtime on the
   node; `sm all` shows `node=<node>`, provider codex-fork.
 - The primary's lifecycle/status, last-agent-message, approvals, and `codex_events.db` reflect the
-  remote runtime identically to a local one.
-- Control round-trips (`set_thread_name`, `get_epoch`, stale-epoch retry) succeed against the remote
-  runtime.
-- `sm restore <id>` resumes a stopped remote codex-fork on its node.
-- A remote codex-fork on a downed node reports `node-unreachable`, and recovers (events resume, no
-  duplicates) on reconnect.
+  remote runtime identically to a local one, with no duplicate rows across reconnects.
+- Control round-trips succeed against the remote runtime: **`submit_message`** (`sm send`, incl. its
+  tmux fallback), `set_thread_name`, `get_epoch`, and stale-epoch retry.
+- `sm restore <id>` resumes a stopped remote codex-fork on its node, resuming from the durable cursor.
+- A remote codex-fork on a downed node surfaces **`ActivityState.NODE_UNREACHABLE`** (the existing
+  activity-state projection, not a new lifecycle state) and recovers (events resume from the cursor,
+  no duplicates) on reconnect.
 - codex-app on a non-primary node is still rejected; primary-local codex-fork is byte-for-byte
   unchanged and existing tests pass.
 
