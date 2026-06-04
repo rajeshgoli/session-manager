@@ -380,6 +380,59 @@ async def test_node_agent_control_timeout_closes_unresponsive_socket():
     assert "timed out" in frame["error"]["message"]
 
 
+@pytest.mark.asyncio
+async def test_node_agent_reregister_suppresses_stale_tail_task_failure(tmp_path):
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def send(self, frame: str):
+            self.sent.append(frame)
+
+    async def failed_tail():
+        raise RuntimeError("stale websocket closed")
+
+    log_dir = tmp_path / "node-log"
+    log_dir.mkdir()
+    event_path = log_dir / "session1.codex-fork.events.jsonl"
+    control_path = log_dir / "session1.codex-fork.control.sock"
+    websocket = FakeWebSocket()
+    stale_registration = TailRegistration(
+        websocket=websocket,
+        session_id="session1",
+        event_stream_path=event_path,
+        control_socket_path=control_path,
+        cursor=ProviderCursor(),
+        poll_interval=0.01,
+    )
+    stale_registration.task = asyncio.create_task(failed_tail())
+    await asyncio.sleep(0)
+
+    agent = CodexForkNodeAgent(
+        node_id="worker",
+        primary_url="http://primary",
+        secret="secret",
+        log_dir=str(log_dir),
+    )
+    agent.registrations["session1"] = stale_registration
+
+    await agent._register(
+        websocket,
+        {
+            "type": "register",
+            "session_id": "session1",
+            "event_stream_path": str(event_path),
+            "control_socket_path": str(control_path),
+        },
+    )
+    await agent._unregister("session1")
+
+    frame = json.loads(websocket.sent[-1])
+    assert frame["type"] == "registered"
+    assert frame["session_id"] == "session1"
+    assert stale_registration.task is None
+
+
 def test_codex_fork_transport_selection_by_node(tmp_path):
     manager = _manager(tmp_path)
     local_session = Session(

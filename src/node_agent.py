@@ -130,8 +130,14 @@ class TailRegistration:
         if self.task is None:
             return
         self.task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await self.task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("Tail task for session %s failed during cleanup", self.session_id, exc_info=True)
+        finally:
+            self.task = None
 
     async def _send(self, frame: dict[str, Any]) -> None:
         await self.websocket.send(json.dumps(frame, separators=(",", ":")))
