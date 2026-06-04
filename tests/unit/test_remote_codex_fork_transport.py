@@ -1,6 +1,9 @@
 import asyncio
 import json
+import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -128,6 +131,44 @@ async def test_node_agent_connection_surfaces_register_failure():
 
 
 @pytest.mark.asyncio
+async def test_node_agent_connection_forwards_control_timeout():
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent: list[dict] = []
+
+        async def send_json(self, frame: dict):
+            self.sent.append(frame)
+
+    websocket = FakeWebSocket()
+    connection = NodeAgentConnection("worker", websocket)
+
+    control_task = asyncio.create_task(
+        connection.control_roundtrip(
+            session_id="session1",
+            frame={"command": "get_epoch"},
+            timeout=0.75,
+        )
+    )
+    await asyncio.sleep(0)
+
+    request = websocket.sent[0]
+    assert request["type"] == "control"
+    assert request["session_id"] == "session1"
+    assert request["timeout"] == 0.75
+
+    await connection.handle_frame(
+        {
+            "type": "control_result",
+            "request_id": request["request_id"],
+            "ok": True,
+            "line": '{"ok":true}',
+        }
+    )
+
+    assert await control_task == {"ok": True}
+
+
+@pytest.mark.asyncio
 async def test_stale_node_agent_detach_does_not_mark_reconnected_sessions_unreachable(tmp_path):
     class FakeWebSocket:
         async def send_json(self, frame: dict):
@@ -235,6 +276,74 @@ async def test_node_agent_control_before_socket_ready_returns_not_ready(tmp_path
     assert frame["ok"] is False
     assert frame["error"]["code"] == "not_ready"
     assert "control socket not ready" in frame["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_node_agent_control_timeout_closes_unresponsive_socket():
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def send(self, frame: str):
+            self.sent.append(frame)
+
+    log_dir = Path(tempfile.mkdtemp(prefix="smna-", dir="/tmp"))
+    event_path = log_dir / "session1.codex-fork.events.jsonl"
+    control_path = log_dir / "s.sock"
+    client_closed = asyncio.Event()
+
+    async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            await reader.readline()
+            if await reader.read() == b"":
+                client_closed.set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(handle_control, path=str(control_path))
+    websocket = FakeWebSocket()
+    agent = CodexForkNodeAgent(
+        node_id="worker",
+        primary_url="http://primary",
+        secret="secret",
+        log_dir=str(log_dir),
+        control_timeout=0.05,
+    )
+    agent.registrations["session1"] = TailRegistration(
+        websocket=websocket,
+        session_id="session1",
+        event_stream_path=event_path,
+        control_socket_path=control_path,
+        cursor=ProviderCursor(),
+        poll_interval=0.01,
+    )
+
+    try:
+        await asyncio.wait_for(
+            agent._control(
+                websocket,
+                {
+                    "type": "control",
+                    "request_id": "request1",
+                    "session_id": "session1",
+                    "frame": {"command": "get_epoch"},
+                    "timeout": 0.05,
+                },
+            ),
+            timeout=2.0,
+        )
+        await asyncio.wait_for(client_closed.wait(), timeout=1.0)
+    finally:
+        server.close()
+        await server.wait_closed()
+        shutil.rmtree(log_dir, ignore_errors=True)
+
+    frame = json.loads(websocket.sent[-1])
+    assert frame["type"] == "control_result"
+    assert frame["ok"] is False
+    assert frame["error"]["code"] == "control_failed"
+    assert "timed out" in frame["error"]["message"]
 
 
 def test_codex_fork_transport_selection_by_node(tmp_path):

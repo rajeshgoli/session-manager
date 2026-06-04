@@ -190,6 +190,7 @@ class NodeAgentConnection:
                     "request_id": bridge_request_id,
                     "session_id": session_id,
                     "frame": frame,
+                    "timeout": timeout,
                 }
             )
             return await asyncio.wait_for(future, timeout=timeout)

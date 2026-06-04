@@ -75,6 +75,17 @@ def _coerce_seq(value: Any) -> Optional[int]:
     return None
 
 
+def _coerce_timeout(value: Any, default: float) -> float:
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            timeout = float(value)
+            if timeout > 0:
+                return timeout
+    return default
+
+
 def _ws_url(primary_url: str) -> str:
     parsed = urlparse(primary_url)
     scheme = parsed.scheme
@@ -197,11 +208,13 @@ class CodexForkNodeAgent:
         secret: Optional[str],
         poll_interval: float = 0.2,
         log_dir: Optional[str] = None,
+        control_timeout: float = 5.0,
     ):
         self.node_id = node_id
         self.primary_url = primary_url
         self.secret = secret
         self.poll_interval = poll_interval
+        self.control_timeout = max(0.5, float(control_timeout))
         self.log_dir = Path(log_dir or "~/.local/share/claude-sessions").expanduser().resolve(strict=False)
         self.registrations: dict[str, TailRegistration] = {}
 
@@ -362,18 +375,30 @@ class CodexForkNodeAgent:
             )
             return
 
+        timeout = max(0.5, _coerce_timeout(frame.get("timeout"), self.control_timeout))
         try:
-            reader, writer = await asyncio.open_unix_connection(str(registration.control_socket_path))
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(str(registration.control_socket_path)),
+                timeout=timeout,
+            )
             try:
                 writer.write((json.dumps(request_frame, separators=(",", ":")) + "\n").encode("utf-8"))
-                await writer.drain()
-                line = await reader.readline()
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+                line = await asyncio.wait_for(reader.readline(), timeout=timeout)
                 if not line:
                     raise RuntimeError("control socket closed without response")
             finally:
                 writer.close()
                 with contextlib.suppress(Exception):
                     await writer.wait_closed()
+        except TimeoutError:
+            await self._send_control_error(
+                websocket,
+                request_id=request_id,
+                code="control_failed",
+                message=f"control socket timed out after {timeout:.1f}s",
+            )
+            return
         except Exception as exc:
             await self._send_control_error(
                 websocket,
@@ -411,6 +436,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Node-local base directory for codex-fork event/control artifacts",
     )
     parser.add_argument("--poll-interval", type=float, default=0.2)
+    parser.add_argument(
+        "--control-timeout",
+        type=float,
+        default=_coerce_timeout(os.environ.get("SM_NODE_CONTROL_TIMEOUT"), 5.0),
+        help="Seconds to wait for codex-fork control socket connect/write/read operations",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -424,6 +455,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         secret=args.secret,
         poll_interval=args.poll_interval,
         log_dir=args.log_dir,
+        control_timeout=args.control_timeout,
     )
     try:
         asyncio.run(agent.run_forever())
