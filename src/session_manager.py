@@ -3736,10 +3736,11 @@ done
         if not source_resume_id:
             return False, None, "Source session has no provider resume id to fork"
 
+        source_node = normalize_node_id(getattr(source, "node", PRIMARY_NODE))
         provider_rejection = self.get_provider_create_rejection(
             "codex-fork",
             working_dir=source.working_dir,
-            node=getattr(source, "node", PRIMARY_NODE),
+            node=source_node,
         )
         if provider_rejection:
             return False, None, provider_rejection
@@ -3759,6 +3760,7 @@ done
             forked_from_session_id=source.id,
             forked_from_provider_resume_id=source_resume_id,
             forked_by_session_id=forked_by_session_id,
+            node=source_node,
         )
         if fork_session is None:
             return False, None, "Failed to create fork session"
