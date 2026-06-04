@@ -2615,8 +2615,42 @@ done
         event_type = event.get("event_type") or event.get("type")
         if not event_type:
             return None
-        if not self._claim_codex_fork_provider_event(session_id, event):
-            return None
+        provider_position = self._codex_fork_provider_position(event)
+        previous_provider_cursor = None
+        if provider_position is not None:
+            should_ingest, previous_provider_cursor = self._should_ingest_codex_fork_provider_event(
+                session_id,
+                provider_position[0],
+                provider_position[1],
+            )
+            if not should_ingest:
+                return None
+        if provider_position is not None:
+            return self._ingest_claimed_codex_fork_event(
+                session_id=session_id,
+                event=event,
+                event_type=event_type,
+                provider_position=provider_position,
+                previous_provider_cursor=previous_provider_cursor,
+            )
+        return self._ingest_claimed_codex_fork_event(
+            session_id=session_id,
+            event=event,
+            event_type=event_type,
+            provider_position=None,
+            previous_provider_cursor=None,
+        )
+
+    def _ingest_claimed_codex_fork_event(
+        self,
+        *,
+        session_id: str,
+        event: dict[str, Any],
+        event_type: Any,
+        provider_position: Optional[tuple[Any, int]],
+        previous_provider_cursor: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """Apply one non-duplicate codex-fork event and then advance provider cursor."""
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         provider_session_id = event.get("session_id")
         if not provider_session_id and payload:
@@ -2683,25 +2717,42 @@ done
                 payload_for_reducer = {**payload_for_store, "session_id": event_thread_id}
 
         turn_id = self._codex_fork_turn_id_for_event(event, payload_for_store)
-        self.codex_event_store.append_event(
-            session_id=session_id,
-            event_type=f"codex_fork_{normalized}",
-            turn_id=turn_id,
-            payload={
-                "schema_version": event.get("schema_version"),
-                "seq": seq,
-                "session_epoch": session_epoch,
-                "payload": payload_for_store,
-            },
-        )
-        return self._reduce_codex_fork_lifecycle(
-            session_id=session_id,
-            event_type=normalized,
-            payload=payload_for_reducer,
-            seq=seq,
-            session_epoch=session_epoch,
-            event_timestamp_ns=self._timestamp_to_epoch_ns(event.get("ts")),
-        )
+        stored_event: Optional[dict[str, Any]] = None
+        try:
+            stored_event = self.codex_event_store.append_event(
+                session_id=session_id,
+                event_type=f"codex_fork_{normalized}",
+                turn_id=turn_id,
+                payload={
+                    "schema_version": event.get("schema_version"),
+                    "seq": seq,
+                    "session_epoch": session_epoch,
+                    "payload": payload_for_store,
+                },
+            )
+            if not stored_event.get("persisted"):
+                return None
+            lifecycle = self._reduce_codex_fork_lifecycle(
+                session_id=session_id,
+                event_type=normalized,
+                payload=payload_for_reducer,
+                seq=seq,
+                session_epoch=session_epoch,
+                event_timestamp_ns=self._timestamp_to_epoch_ns(event.get("ts")),
+            )
+            if provider_position is not None:
+                self._record_codex_fork_provider_event_applied(
+                    session_id,
+                    provider_position[0],
+                    provider_position[1],
+                    previous_provider_cursor=previous_provider_cursor,
+                )
+            return lifecycle
+        except Exception:
+            if stored_event and stored_event.get("persisted") and isinstance(stored_event.get("seq"), int):
+                with contextlib.suppress(Exception):
+                    self.codex_event_store.delete_event(session_id, stored_event["seq"])
+            raise
 
     def _sync_session_resume_id(self, session: Session) -> bool:
         """Synchronize one session's provider-native resume identifier."""
@@ -2847,6 +2898,13 @@ done
             return int(seq_raw)
         return None
 
+    def _codex_fork_provider_position(self, event: dict[str, Any]) -> Optional[tuple[Any, int]]:
+        seq = self._codex_fork_event_provider_seq(event)
+        session_epoch = event.get("session_epoch")
+        if seq is None or session_epoch is None:
+            return None
+        return session_epoch, seq
+
     def _get_codex_fork_provider_cursor(self, session_id: str) -> Optional[dict[str, Any]]:
         cursor = self.codex_fork_provider_cursors.get(session_id)
         if cursor is not None:
@@ -2856,19 +2914,35 @@ done
             self.codex_fork_provider_cursors[session_id] = dict(stored)
         return stored
 
-    def _claim_codex_fork_provider_event(self, session_id: str, event: dict[str, Any]) -> bool:
-        """Return True when one codex-fork provider event should be ingested."""
-        seq = self._codex_fork_event_provider_seq(event)
-        if seq is None or event.get("session_epoch") is None:
-            return True
-        session_epoch = event.get("session_epoch")
-        claimed, previous, cursor = self.codex_event_store.claim_codex_fork_provider_event(
+    def _should_ingest_codex_fork_provider_event(
+        self,
+        session_id: str,
+        session_epoch: Any,
+        seq: int,
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """Return whether this provider event has not already been fully applied."""
+        return self.codex_event_store.should_ingest_codex_fork_provider_event(
             session_id,
             session_epoch=session_epoch,
             seq=seq,
         )
-        if not claimed:
-            return False
+
+    def _record_codex_fork_provider_event_applied(
+        self,
+        session_id: str,
+        session_epoch: Any,
+        seq: int,
+        *,
+        previous_provider_cursor: Optional[dict[str, Any]],
+    ) -> None:
+        """Advance the provider cursor after persistence and reducer side effects succeed."""
+        previous, cursor = self.codex_event_store.record_codex_fork_provider_event_applied(
+            session_id,
+            session_epoch=session_epoch,
+            seq=seq,
+        )
+        if previous_provider_cursor is not None:
+            previous = previous_provider_cursor
         if previous is not None and previous.get("session_epoch_key") == cursor.get("session_epoch_key"):
             previous_seq = int(previous.get("seq") or 0)
             if seq > previous_seq + 1:
@@ -2880,7 +2954,6 @@ done
                     seq,
                 )
         self.codex_fork_provider_cursors[session_id] = dict(cursor)
-        return True
 
     def _codex_fork_transport_for_session(self, session: Session) -> CodexForkTransport:
         """Select the raw codex-fork IPC transport for the session's owning node."""
