@@ -187,11 +187,19 @@ def _should_validate_working_dir_locally(
     node: Optional[str] = None,
     parent_session_id: Optional[str] = None,
 ) -> bool:
-    return _effective_create_node_for_cli(
+    effective_node = _effective_create_node_for_cli(
         client,
         node=node,
         parent_session_id=parent_session_id,
-    ) == "primary"
+    )
+    if effective_node == "primary":
+        return True
+
+    client_default_node = _client_default_create_node(
+        client,
+        parent_session_id=parent_session_id,
+    )
+    return client_default_node is not None and effective_node == client_default_node
 
 
 def cmd_removed_entrypoint(entrypoint: str) -> int:

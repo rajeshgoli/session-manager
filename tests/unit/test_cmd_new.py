@@ -97,6 +97,33 @@ def test_cmd_new_uses_client_default_node_for_top_level_create(tmp_path):
     run_mock.assert_called_once_with(["tmux", "attach", "-t", "codex-fork-node1234"], check=True)
 
 
+def test_cmd_new_resolves_relative_path_for_client_default_node(monkeypatch, tmp_path):
+    client = MagicMock()
+    client.default_node = "macbook"
+    client.create_session_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "id": "node5678",
+            "provider": "codex-fork",
+            "tmux_session": "codex-fork-node5678",
+        },
+    }
+    monkeypatch.chdir(tmp_path)
+
+    with patch("subprocess.run") as run_mock, patch("time.sleep"):
+        rc = cmd_new(client, working_dir=".", provider="codex-fork")
+
+    assert rc == 0
+    client.create_session_result.assert_called_once_with(
+        str(tmp_path.resolve()),
+        provider="codex-fork",
+        parent_session_id=None,
+        node="macbook",
+    )
+    run_mock.assert_called_once_with(["tmux", "attach", "-t", "codex-fork-node5678"], check=True)
+
+
 def test_cmd_new_does_not_override_parent_inherited_node(tmp_path):
     client = MagicMock()
     client.default_node = "macbook"
