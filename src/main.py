@@ -736,6 +736,9 @@ class SessionManagerApp:
         Called from the ASGI lifespan hook so that doomed instances
         (port already in use) never reach this code.
         """
+        if self.session_manager.sessions:
+            self.session_manager.tmux.ensure_client_event_hooks()
+
         # Reconcile Telegram topics
         if self.telegram_bot:
             await self._reconcile_telegram_topics()

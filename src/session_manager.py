@@ -442,8 +442,6 @@ class SessionManager:
 
         # Load existing sessions from state file
         self._load_state()
-        if self.sessions:
-            self.tmux.ensure_client_event_hooks()
         if self.sync_codex_native_titles_from_index(persist=False):
             self._save_state()
 
