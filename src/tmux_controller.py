@@ -211,6 +211,7 @@ class TmuxController:
             check=False,
             node=node,
         )
+        self.ensure_client_event_hooks(node=node)
         if not self.native_scrollback:
             return
         current = self._run_tmux(
@@ -229,6 +230,66 @@ class TmuxController:
             ",*:smcup@:rmcup@",
             node=node,
         )
+
+    def ensure_client_event_hooks(self, *, node: Optional[str] = PRIMARY_NODE) -> None:
+        """Install tmux client event hooks when SM owns a named tmux socket."""
+        if not self.socket_name:
+            return
+        self._ensure_client_event_hooks(node=node)
+
+    def _ensure_client_event_hooks(self, *, node: Optional[str] = PRIMARY_NODE) -> None:
+        """Install cheap tmux client attach/detach hooks for local SM eventing."""
+        if normalize_node_id(node) != PRIMARY_NODE:
+            return
+
+        endpoint = self._tmux_client_hook_endpoint()
+        for event_name in ("client-attached", "client-detached", "client-session-changed"):
+            self._run_tmux(
+                "set-hook",
+                "-g",
+                f"{event_name}[90]",
+                self._tmux_client_event_hook_command(event_name, endpoint),
+                check=False,
+                node=node,
+            )
+
+    def _tmux_client_hook_endpoint(self) -> str:
+        tmux_config = self.config.get("tmux", {}) if isinstance(self.config, dict) else {}
+        configured_url = str(tmux_config.get("client_event_hook_url") or "").strip()
+        if configured_url:
+            return configured_url
+
+        server_config = self.config.get("server", {}) if isinstance(self.config, dict) else {}
+        try:
+            port = int(server_config.get("port", 8420))
+        except (TypeError, ValueError):
+            port = 8420
+        return f"http://127.0.0.1:{port}/hooks/tmux-client"
+
+    @staticmethod
+    def _tmux_client_event_hook_command(event_name: str, endpoint: str) -> str:
+        curl_args = [
+            "curl",
+            "-fsS",
+            "-m",
+            "1",
+            "-X",
+            "POST",
+            "-G",
+            "--data-urlencode",
+            f"event={event_name}",
+            "--data-urlencode",
+            "session=#{hook_session_name}",
+            "--data-urlencode",
+            "client_session=#{client_session}",
+            "--data-urlencode",
+            "tty=#{client_tty}",
+            "--data-urlencode",
+            "client_pid=#{client_pid}",
+            endpoint,
+        ]
+        shell_command = " ".join(shlex.quote(part) for part in curl_args)
+        return "run-shell -b " + shlex.quote(f"{shell_command} >/dev/null 2>&1 || true")
 
     def _ensure_server_anchor(self, *, node: Optional[str] = PRIMARY_NODE) -> None:
         """Start the configured tmux server under a neutral SM-owned session.

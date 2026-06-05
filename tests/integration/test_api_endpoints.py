@@ -140,6 +140,55 @@ class TestHealthEndpoints:
         data = response.json()
         assert data["status"] == "healthy"
 
+    def test_event_state_defaults_without_recorder(self, test_client):
+        """GET /events/state returns a stable default payload for desktop clients."""
+        response = test_client.get("/events/state")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["tmux_client_event_version"] == 0
+        assert data["last_tmux_client_event"] is None
+
+    def test_tmux_client_hook_records_event(self, test_client, mock_session_manager):
+        """POST /hooks/tmux-client records a local tmux attach/detach event."""
+        mock_session_manager.record_tmux_client_event.return_value = {
+            "type": "tmux_client_event",
+            "event": "client-attached",
+            "tmux_session": "codex-fork-abc12345",
+            "tty": "/dev/ttys001",
+            "client_pid": "123",
+            "version": 7,
+            "received_at": "2026-06-05T00:00:00+00:00",
+        }
+
+        response = test_client.post(
+            "/hooks/tmux-client",
+            params={
+                "event": "client-attached",
+                "session": "codex-fork-abc12345",
+                "tty": "/dev/ttys001",
+                "client_pid": "123",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["tmux_client_event_version"] == 7
+        mock_session_manager.record_tmux_client_event.assert_called_once_with(
+            event="client-attached",
+            tmux_session="codex-fork-abc12345",
+            tty="/dev/ttys001",
+            client_pid="123",
+        )
+
+    def test_tmux_client_hook_rejects_unknown_event(self, test_client):
+        """POST /hooks/tmux-client accepts only tmux client hook events."""
+        response = test_client.post(
+            "/hooks/tmux-client",
+            params={"event": "pane-exited"},
+        )
+
+        assert response.status_code == 400
+
 
 class TestSessionEndpoints:
     """Tests for session CRUD endpoints."""
