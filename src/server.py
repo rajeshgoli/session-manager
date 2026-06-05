@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token as google_id_token
 from fastapi import FastAPI, HTTPException, Body, Request, Query, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.requests import ClientDisconnect
@@ -1421,6 +1421,20 @@ def create_app(
     app.state.mobile_terminal_secret = secrets.token_bytes(32)
     app.state.mobile_terminal_runtime_disabled = False
     app.state.mobile_terminal_revoked_keys: set[tuple[str, str]] = set()
+    app.state.event_stream_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+
+    async def _broadcast_event_stream_event(event: dict[str, Any]) -> None:
+        subscribers = list(app.state.event_stream_subscribers)
+        for queue in subscribers:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                with contextlib.suppress(KeyError):
+                    app.state.event_stream_subscribers.remove(queue)
+
+    def _event_stream_payload(event_type: str, data: dict[str, Any]) -> str:
+        rendered_data = json.dumps(data, separators=(",", ":"))
+        return f"event: {event_type}\ndata: {rendered_data}\n\n"
 
     # Wire _app back-reference so _execute_handoff can clear server-side caches (#196)
     if session_manager:
@@ -3621,6 +3635,93 @@ def create_app(
         if _google_auth_requested(app.state.config) and not _is_local_bypass_request(request, app.state.config):
             return RedirectResponse(url="/watch/", status_code=302)
         return {"status": "ok", "service": "session-manager"}
+
+    @app.get("/events/state")
+    async def event_state():
+        """Return lightweight event versions for desktop clients."""
+        sm = app.state.session_manager
+        state_getter = getattr(sm, "tmux_client_event_state", None) if sm else None
+        tmux_state = state_getter() if callable(state_getter) else {"version": 0, "last_event": None}
+        if not isinstance(tmux_state, dict):
+            tmux_state = {"version": 0, "last_event": None}
+        return {
+            "tmux_client_event_version": int(tmux_state.get("version") or 0),
+            "last_tmux_client_event": tmux_state.get("last_event"),
+        }
+
+    @app.get("/events")
+    async def event_stream(request: Request):
+        """Server-sent event stream for low-latency desktop UI invalidations."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=32)
+        app.state.event_stream_subscribers.add(queue)
+
+        async def stream():
+            try:
+                yield _event_stream_payload("hello", await event_state())
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+
+                    event_type = str(event.get("type") or "message")
+                    yield _event_stream_payload(event_type, event)
+            finally:
+                with contextlib.suppress(KeyError):
+                    app.state.event_stream_subscribers.remove(queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/hooks/tmux-client")
+    async def tmux_client_hook(
+        request: Request,
+        event: str = Query(...),
+        session: Optional[str] = Query(default=None),
+        client_session: Optional[str] = Query(default=None),
+        tty: Optional[str] = Query(default=None),
+        client_pid: Optional[str] = Query(default=None),
+    ):
+        """Receive best-effort local tmux client attach/detach hook notifications."""
+        if not _is_local_bypass_request(request, app.state.config):
+            raise HTTPException(status_code=403, detail="tmux client hooks must originate locally")
+
+        event_name = str(event or "").strip()
+        if event_name not in {"client-attached", "client-detached", "client-session-changed"}:
+            raise HTTPException(status_code=400, detail="unsupported tmux client event")
+
+        sm = app.state.session_manager
+        recorder = getattr(sm, "record_tmux_client_event", None) if sm else None
+        payload = None
+        if callable(recorder):
+            payload = recorder(
+                event=event_name,
+                tmux_session=session or client_session,
+                tty=tty,
+                client_pid=client_pid,
+            )
+        if not isinstance(payload, dict):
+            payload = {
+                "type": "tmux_client_event",
+                "event": event_name,
+                "tmux_session": session or client_session,
+                "tty": tty,
+                "client_pid": client_pid,
+                "version": 0,
+                "received_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        await _broadcast_event_stream_event(payload)
+        return {
+            "status": "ok",
+            "tmux_client_event_version": int(payload.get("version") or 0),
+        }
 
     @app.get("/auth/session")
     async def auth_session(request: Request):

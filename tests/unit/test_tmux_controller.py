@@ -74,7 +74,7 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
     )
 
     assert ok is True
-    assert calls[:9] == [
+    assert calls[:12] == [
         (
             "new-session",
             "-d",
@@ -88,6 +88,33 @@ def test_create_session_with_command_bootstraps_history_before_provider_window(t
         ),
         ("new-session", "-d", "-s", "claude-test123", "-c", str(tmp_path), "-n", "__sm_bootstrap"),
         ("set-option", "-g", "focus-events", "on"),
+        (
+            "set-hook",
+            "-g",
+            "client-attached[90]",
+            TmuxController._tmux_client_event_hook_command(
+                "client-attached",
+                "http://127.0.0.1:8420/hooks/tmux-client",
+            ),
+        ),
+        (
+            "set-hook",
+            "-g",
+            "client-detached[90]",
+            TmuxController._tmux_client_event_hook_command(
+                "client-detached",
+                "http://127.0.0.1:8420/hooks/tmux-client",
+            ),
+        ),
+        (
+            "set-hook",
+            "-g",
+            "client-session-changed[90]",
+            TmuxController._tmux_client_event_hook_command(
+                "client-session-changed",
+                "http://127.0.0.1:8420/hooks/tmux-client",
+            ),
+        ),
         ("show-options", "-gqv", "terminal-overrides"),
         ("set-option", "-as", "terminal-overrides", ",*:smcup@:rmcup@"),
         ("set-option", "-t", "claude-test123", "history-limit", "12345"),
@@ -170,8 +197,24 @@ def test_create_session_with_command_enables_focus_events_without_native_scrollb
 
     assert ok is True
     assert ("set-option", "-g", "focus-events", "on") in calls
+    assert any(call[:3] == ("set-hook", "-g", "client-attached[90]") for call in calls)
+    assert any(call[:3] == ("set-hook", "-g", "client-detached[90]") for call in calls)
     assert ("show-options", "-gqv", "terminal-overrides") not in calls
     assert ("set-option", "-as", "terminal-overrides", ",*:smcup@:rmcup@") not in calls
+
+
+def test_client_event_hook_command_posts_tmux_formats():
+    command = TmuxController._tmux_client_event_hook_command(
+        "client-attached",
+        "http://127.0.0.1:8420/hooks/tmux-client",
+    )
+
+    assert command.startswith("run-shell -b ")
+    assert "client-attached" in command
+    assert "session=#{hook_session_name}" in command
+    assert "tty=#{client_tty}" in command
+    assert "client_pid=#{client_pid}" in command
+    assert "/hooks/tmux-client" in command
 
 
 def test_create_session_with_command_enables_exit_diagnostics(tmp_path, monkeypatch):

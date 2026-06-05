@@ -179,6 +179,9 @@ class SessionManager:
         self._node_restore_inventory_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._tmux_session_node_cache: dict[str, str] = {}
         self._node_unreachable_sessions: set[str] = set()
+        self._tmux_client_event_lock = threading.Lock()
+        self._tmux_client_event_version = 0
+        self._last_tmux_client_event: Optional[dict[str, Any]] = None
         self.last_create_error: Optional[str] = None
         self.tmux = TmuxController(
             log_dir=log_dir,
@@ -439,8 +442,46 @@ class SessionManager:
 
         # Load existing sessions from state file
         self._load_state()
+        if self.sessions:
+            self.tmux.ensure_client_event_hooks()
         if self.sync_codex_native_titles_from_index(persist=False):
             self._save_state()
+
+    def record_tmux_client_event(
+        self,
+        *,
+        event: str,
+        tmux_session: Optional[str] = None,
+        tty: Optional[str] = None,
+        client_pid: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Record a tmux client attach/detach event and return the new event state."""
+        normalized_event = str(event or "").strip()
+        normalized_session = str(tmux_session or "").strip()
+        normalized_tty = str(tty or "").strip()
+        normalized_client_pid = str(client_pid or "").strip()
+
+        with self._tmux_client_event_lock:
+            self._tmux_client_event_version += 1
+            payload = {
+                "type": "tmux_client_event",
+                "event": normalized_event,
+                "tmux_session": normalized_session or None,
+                "tty": normalized_tty or None,
+                "client_pid": normalized_client_pid or None,
+                "version": self._tmux_client_event_version,
+                "received_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._last_tmux_client_event = payload
+            return dict(payload)
+
+    def tmux_client_event_state(self) -> dict[str, Any]:
+        """Return current tmux attach/detach event state for lightweight clients."""
+        with self._tmux_client_event_lock:
+            return {
+                "version": self._tmux_client_event_version,
+                "last_event": dict(self._last_tmux_client_event) if self._last_tmux_client_event else None,
+            }
 
     def _tmux_socket_name(self) -> Optional[str]:
         """Return configured tmux socket name, treating partial mocks as legacy default-server."""
