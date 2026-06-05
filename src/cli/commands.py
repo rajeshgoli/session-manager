@@ -54,11 +54,11 @@ def _localize_attach_descriptor(client: SessionManagerClient, descriptor: Option
     """Prefer local tmux attach when this client is running on the session's node."""
     if not isinstance(descriptor, dict):
         return descriptor
-    default_node = getattr(client, "default_node", None)
-    if not isinstance(default_node, str) or not default_node.strip():
+    local_node = getattr(client, "local_node", None)
+    if not isinstance(local_node, str) or not local_node.strip():
         return descriptor
     descriptor_node = descriptor.get("node")
-    if not isinstance(descriptor_node, str) or descriptor_node.strip() != default_node.strip():
+    if not isinstance(descriptor_node, str) or descriptor_node.strip() != local_node.strip():
         return descriptor
     if "attach_command" not in descriptor:
         return descriptor
@@ -181,6 +181,15 @@ def _client_default_create_node(
     return default_node or None
 
 
+def _client_local_node(client: SessionManagerClient) -> Optional[str]:
+    """Return this client's local execution node id, when configured."""
+    local_node = getattr(client, "local_node", None)
+    if not isinstance(local_node, str):
+        return None
+    local_node = local_node.strip()
+    return local_node or None
+
+
 def _should_validate_working_dir_locally(
     client: SessionManagerClient,
     *,
@@ -195,11 +204,8 @@ def _should_validate_working_dir_locally(
     if effective_node == "primary":
         return True
 
-    client_default_node = _client_default_create_node(
-        client,
-        parent_session_id=parent_session_id,
-    )
-    return client_default_node is not None and effective_node == client_default_node
+    client_local_node = _client_local_node(client)
+    return client_local_node is not None and effective_node == client_local_node
 
 
 def cmd_removed_entrypoint(entrypoint: str) -> int:

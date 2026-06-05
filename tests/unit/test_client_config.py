@@ -8,8 +8,10 @@ from src.cli.client import (
     SessionManagerClient,
     read_client_config_api_url,
     read_client_config_default_node,
+    read_client_config_local_node,
     resolve_api_url,
     resolve_default_node,
+    resolve_local_node,
 )
 
 
@@ -108,6 +110,20 @@ def test_read_client_config_default_node_from_client_section(tmp_path: Path):
     assert read_client_config_default_node(config_path) == "worker"
 
 
+def test_read_client_config_local_node_from_top_level_key(tmp_path: Path):
+    config_path = tmp_path / "client.yaml"
+    config_path.write_text("local_node: macbook\n")
+
+    assert read_client_config_local_node(config_path) == "macbook"
+
+
+def test_read_client_config_local_node_from_client_section(tmp_path: Path):
+    config_path = tmp_path / "client.yaml"
+    config_path.write_text("client:\n  local_node: worker\n")
+
+    assert read_client_config_local_node(config_path) == "worker"
+
+
 def test_resolve_default_node_precedence(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "client.yaml"
     config_path.write_text("default_node: config-node\n")
@@ -121,6 +137,19 @@ def test_resolve_default_node_precedence(monkeypatch, tmp_path: Path):
     assert resolve_default_node() == "config-node"
 
 
+def test_resolve_local_node_precedence(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "client.yaml"
+    config_path.write_text("local_node: config-node\n")
+    monkeypatch.setenv("SM_CLIENT_CONFIG", str(config_path))
+    monkeypatch.setenv("SM_LOCAL_NODE", "env-node")
+
+    assert resolve_local_node("explicit-node") == "explicit-node"
+    assert resolve_local_node() == "env-node"
+
+    monkeypatch.delenv("SM_LOCAL_NODE")
+    assert resolve_local_node() == "config-node"
+
+
 def test_invalid_client_config_default_node_raises(tmp_path: Path):
     config_path = tmp_path / "client.yaml"
     config_path.write_text("default_node: ''\n")
@@ -129,14 +158,28 @@ def test_invalid_client_config_default_node_raises(tmp_path: Path):
         read_client_config_default_node(config_path)
 
 
+def test_invalid_client_config_local_node_raises(tmp_path: Path):
+    config_path = tmp_path / "client.yaml"
+    config_path.write_text("local_node: ''\n")
+
+    with pytest.raises(ClientConfigError, match="local_node must be a non-empty string"):
+        read_client_config_local_node(config_path)
+
+
 def test_session_manager_client_uses_shared_config(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "client.yaml"
-    config_path.write_text("api_url: http://config.example.test:8420\ndefault_node: macbook\n")
+    config_path.write_text(
+        "api_url: http://config.example.test:8420\n"
+        "default_node: macbook\n"
+        "local_node: macbook\n"
+    )
     monkeypatch.setenv("SM_CLIENT_CONFIG", str(config_path))
     monkeypatch.delenv("SM_API_URL", raising=False)
     monkeypatch.delenv("SM_DEFAULT_NODE", raising=False)
+    monkeypatch.delenv("SM_LOCAL_NODE", raising=False)
 
     client = SessionManagerClient()
 
     assert client.api_url == "http://config.example.test:8420"
     assert client.default_node == "macbook"
+    assert client.local_node == "macbook"

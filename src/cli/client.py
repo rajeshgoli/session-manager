@@ -15,6 +15,7 @@ DEFAULT_API_URL = "http://127.0.0.1:8420"
 CLIENT_CONFIG_ENV = "SM_CLIENT_CONFIG"
 CLIENT_CONFIG_SUBPATH = "session-manager/client.yaml"
 DEFAULT_NODE_ENV = "SM_DEFAULT_NODE"
+LOCAL_NODE_ENV = "SM_LOCAL_NODE"
 DEFAULT_API_TIMEOUT = 5.0  # seconds
 DEFAULT_SEND_API_TIMEOUT = 15.0  # seconds
 DEFAULT_MUTATION_API_TIMEOUT = 15.0  # seconds
@@ -138,6 +139,30 @@ def read_client_config_default_node(config_path: Optional[Path] = None) -> Optio
     return None
 
 
+def read_client_config_local_node(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read this client's local execution node id from YAML config, if present."""
+    payload = _read_client_config_payload(config_path)
+    if payload is None:
+        return None
+
+    if "local_node" in payload:
+        local_node = _coerce_node_id(payload.get("local_node"))
+        if not local_node:
+            raise ClientConfigError("Invalid Session Manager client config: local_node must be a non-empty string")
+        return local_node
+
+    client_payload = payload.get("client")
+    if client_payload is not None and not isinstance(client_payload, dict):
+        raise ClientConfigError("Invalid Session Manager client config: client must be a mapping")
+    if isinstance(client_payload, dict) and "local_node" in client_payload:
+        local_node = _coerce_node_id(client_payload.get("local_node"))
+        if not local_node:
+            raise ClientConfigError("Invalid Session Manager client config: client.local_node must be a non-empty string")
+        return local_node
+
+    return None
+
+
 def resolve_api_url(api_url: Optional[str] = None) -> str:
     """Resolve the API URL using explicit arg, env, shared config, then localhost."""
     explicit_url = _coerce_api_url(api_url)
@@ -161,7 +186,7 @@ def resolve_api_url(api_url: Optional[str] = None) -> str:
 
 
 def resolve_default_node(default_node: Optional[str] = None) -> Optional[str]:
-    """Resolve the client-local preferred create node."""
+    """Resolve the preferred top-level create node."""
     explicit_node = _coerce_node_id(default_node)
     if explicit_node:
         return explicit_node
@@ -171,6 +196,19 @@ def resolve_default_node(default_node: Optional[str] = None) -> Optional[str]:
         return env_node
 
     return read_client_config_default_node()
+
+
+def resolve_local_node(local_node: Optional[str] = None) -> Optional[str]:
+    """Resolve the node id that represents this client machine."""
+    explicit_node = _coerce_node_id(local_node)
+    if explicit_node:
+        return explicit_node
+
+    env_node = _coerce_node_id(os.environ.get(LOCAL_NODE_ENV))
+    if env_node:
+        return env_node
+
+    return read_client_config_local_node()
 
 
 def _read_send_api_timeout() -> float:
@@ -217,6 +255,7 @@ class SessionManagerClient:
         """
         self.api_url = resolve_api_url(api_url)
         self.default_node = resolve_default_node()
+        self.local_node = resolve_local_node()
         self.session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
 
     def _request(self, method: str, path: str, data: Optional[dict] = None, timeout: Optional[int] = None) -> tuple[Optional[dict], bool, bool]:
