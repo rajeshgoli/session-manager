@@ -71,6 +71,62 @@ def test_cmd_new_surfaces_create_error_detail(tmp_path, capsys):
     assert "Configured codex-fork runtime unavailable" in capsys.readouterr().err
 
 
+def test_cmd_new_uses_client_default_node_for_top_level_create(tmp_path):
+    client = MagicMock()
+    client.default_node = "macbook"
+    client.create_session_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "id": "node1234",
+            "provider": "codex-fork",
+            "tmux_session": "codex-fork-node1234",
+        },
+    }
+
+    with patch("subprocess.run") as run_mock, patch("time.sleep"):
+        rc = cmd_new(client, working_dir=str(tmp_path), provider="codex-fork")
+
+    assert rc == 0
+    client.create_session_result.assert_called_once_with(
+        str(tmp_path),
+        provider="codex-fork",
+        parent_session_id=None,
+        node="macbook",
+    )
+    run_mock.assert_called_once_with(["tmux", "attach", "-t", "codex-fork-node1234"], check=True)
+
+
+def test_cmd_new_does_not_override_parent_inherited_node(tmp_path):
+    client = MagicMock()
+    client.default_node = "macbook"
+    client.create_session_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {
+            "id": "child1234",
+            "provider": "codex-fork",
+            "tmux_session": "codex-fork-child1234",
+        },
+    }
+
+    with patch("subprocess.run") as run_mock, patch("time.sleep"):
+        rc = cmd_new(
+            client,
+            working_dir=str(tmp_path),
+            provider="codex-fork",
+            parent_session_id="parent123",
+        )
+
+    assert rc == 0
+    client.create_session_result.assert_called_once_with(
+        str(tmp_path),
+        provider="codex-fork",
+        parent_session_id="parent123",
+    )
+    run_mock.assert_called_once_with(["tmux", "attach", "-t", "codex-fork-child1234"], check=True)
+
+
 def test_cmd_new_skips_local_path_validation_for_remote_default():
     client = MagicMock()
     client.list_nodes.return_value = {"default": "worker", "nodes": []}

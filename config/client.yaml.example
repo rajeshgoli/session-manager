@@ -6,3 +6,7 @@
 # Copy to ~/.config/session-manager/client.yaml on machines that should talk to
 # a primary Session Manager server running somewhere else.
 api_url: "http://127.0.0.1:8420"
+
+# Optional: default execution node for top-level `sm claude` / `sm codex`
+# commands from this client. Managed sessions still inherit their parent node.
+# default_node: "macbook"

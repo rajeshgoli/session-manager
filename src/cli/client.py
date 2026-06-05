@@ -14,6 +14,7 @@ import yaml
 DEFAULT_API_URL = "http://127.0.0.1:8420"
 CLIENT_CONFIG_ENV = "SM_CLIENT_CONFIG"
 CLIENT_CONFIG_SUBPATH = "session-manager/client.yaml"
+DEFAULT_NODE_ENV = "SM_DEFAULT_NODE"
 DEFAULT_API_TIMEOUT = 5.0  # seconds
 DEFAULT_SEND_API_TIMEOUT = 15.0  # seconds
 DEFAULT_MUTATION_API_TIMEOUT = 15.0  # seconds
@@ -86,6 +87,39 @@ def read_client_config_api_url(config_path: Optional[Path] = None) -> Optional[s
     return None
 
 
+def _coerce_node_id(value: object) -> Optional[str]:
+    """Normalize a candidate node id, rejecting empty values."""
+    if not isinstance(value, str):
+        return None
+    node_id = value.strip()
+    return node_id or None
+
+
+def read_client_config_default_node(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read the preferred top-level create node from YAML config, if present."""
+    path = config_path or _client_config_path()
+    try:
+        with path.open() as config_file:
+            payload = yaml.safe_load(config_file) or {}
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    default_node = _coerce_node_id(payload.get("default_node"))
+    if default_node:
+        return default_node
+
+    client_payload = payload.get("client")
+    if isinstance(client_payload, dict):
+        return _coerce_node_id(client_payload.get("default_node"))
+
+    return None
+
+
 def resolve_api_url(api_url: Optional[str] = None) -> str:
     """Resolve the API URL using explicit arg, env, shared config, then localhost."""
     explicit_url = _coerce_api_url(api_url)
@@ -101,6 +135,19 @@ def resolve_api_url(api_url: Optional[str] = None) -> str:
         return config_url
 
     return DEFAULT_API_URL
+
+
+def resolve_default_node(default_node: Optional[str] = None) -> Optional[str]:
+    """Resolve the client-local preferred create node."""
+    explicit_node = _coerce_node_id(default_node)
+    if explicit_node:
+        return explicit_node
+
+    env_node = _coerce_node_id(os.environ.get(DEFAULT_NODE_ENV))
+    if env_node:
+        return env_node
+
+    return read_client_config_default_node()
 
 
 def _read_send_api_timeout() -> float:
@@ -146,6 +193,7 @@ class SessionManagerClient:
             api_url: Base URL for API (default: http://127.0.0.1:8420)
         """
         self.api_url = resolve_api_url(api_url)
+        self.default_node = resolve_default_node()
         self.session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
 
     def _request(self, method: str, path: str, data: Optional[dict] = None, timeout: Optional[int] = None) -> tuple[Optional[dict], bool, bool]:

@@ -2,9 +2,10 @@ from src.cli import commands
 
 
 class _AttachClient:
-    def __init__(self, session: dict, descriptor: dict):
+    def __init__(self, session: dict, descriptor: dict, default_node: str | None = None):
         self._session = session
         self._descriptor = descriptor
+        self.default_node = default_node
 
     def get_session(self, session_id: str):
         if session_id == self._session["id"]:
@@ -115,6 +116,49 @@ def test_cmd_attach_uses_descriptor_attach_command(monkeypatch):
     assert calls == [
         (
             ["ssh", "-tt", "worker", "/bin/sh", "-lc", "'tmux attach -t claude-remote1001'"],
+            True,
+        )
+    ]
+
+
+def test_cmd_attach_prefers_local_tmux_when_descriptor_node_matches_client_default(monkeypatch):
+    calls = []
+
+    def _fake_run(args, check):
+        calls.append((args, check))
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    session = {
+        "id": "localnode1",
+        "provider": "codex-fork",
+        "tmux_session": "codex-fork-localnode1",
+        "status": "running",
+        "node": "macbook",
+    }
+    descriptor = {
+        "session_id": "localnode1",
+        "provider": "codex-fork",
+        "attach_supported": True,
+        "tmux_session": "codex-fork-localnode1",
+        "tmux_socket_name": "session-manager-test",
+        "node": "macbook",
+        "attach_command": [
+            "ssh",
+            "-tt",
+            "rajesh@macbook.local",
+            "/bin/sh",
+            "-lc",
+            "'tmux -L session-manager-test attach -t codex-fork-localnode1'",
+        ],
+    }
+
+    rc = commands.cmd_attach(_AttachClient(session, descriptor, default_node="macbook"), "localnode1")
+
+    assert rc == 0
+    assert calls == [
+        (
+            ["tmux", "-L", "session-manager-test", "attach", "-t", "codex-fork-localnode1"],
             True,
         )
     ]
