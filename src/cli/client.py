@@ -21,6 +21,10 @@ DEFAULT_MUTATION_API_TIMEOUT = 15.0  # seconds
 KILL_TIMEOUT = 30  # seconds (kill triggers cleanup that may involve network I/O)
 
 
+class ClientConfigError(ValueError):
+    """Raised when a present shared client config cannot be used safely."""
+
+
 def _read_api_timeout() -> float:
     """Return CLI API timeout from env with a sane fallback."""
     raw = os.environ.get("SM_API_TIMEOUT")
@@ -62,27 +66,42 @@ def _coerce_api_url(value: object) -> Optional[str]:
     return None
 
 
-def read_client_config_api_url(config_path: Optional[Path] = None) -> Optional[str]:
-    """Read the shared SM client API URL from YAML config, if present."""
+def _read_client_config_payload(config_path: Optional[Path] = None) -> Optional[dict]:
+    """Read shared client config YAML, ignoring only a missing config file."""
     path = config_path or _client_config_path()
     try:
         with path.open() as config_file:
             payload = yaml.safe_load(config_file) or {}
     except FileNotFoundError:
         return None
-    except Exception:
-        return None
+    except Exception as exc:
+        raise ClientConfigError(f"Invalid Session Manager client config {path}: {exc}") from exc
 
     if not isinstance(payload, dict):
+        raise ClientConfigError(f"Invalid Session Manager client config {path}: expected a YAML mapping")
+    return payload
+
+
+def read_client_config_api_url(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read the shared SM client API URL from YAML config, if present."""
+    payload = _read_client_config_payload(config_path)
+    if payload is None:
         return None
 
-    api_url = _coerce_api_url(payload.get("api_url"))
-    if api_url:
+    if "api_url" in payload:
+        api_url = _coerce_api_url(payload.get("api_url"))
+        if not api_url:
+            raise ClientConfigError("Invalid Session Manager client config: api_url must be http(s)")
         return api_url
 
     client_payload = payload.get("client")
-    if isinstance(client_payload, dict):
-        return _coerce_api_url(client_payload.get("api_url"))
+    if client_payload is not None and not isinstance(client_payload, dict):
+        raise ClientConfigError("Invalid Session Manager client config: client must be a mapping")
+    if isinstance(client_payload, dict) and "api_url" in client_payload:
+        api_url = _coerce_api_url(client_payload.get("api_url"))
+        if not api_url:
+            raise ClientConfigError("Invalid Session Manager client config: client.api_url must be http(s)")
+        return api_url
 
     return None
 
@@ -97,25 +116,24 @@ def _coerce_node_id(value: object) -> Optional[str]:
 
 def read_client_config_default_node(config_path: Optional[Path] = None) -> Optional[str]:
     """Read the preferred top-level create node from YAML config, if present."""
-    path = config_path or _client_config_path()
-    try:
-        with path.open() as config_file:
-            payload = yaml.safe_load(config_file) or {}
-    except FileNotFoundError:
-        return None
-    except Exception:
+    payload = _read_client_config_payload(config_path)
+    if payload is None:
         return None
 
-    if not isinstance(payload, dict):
-        return None
-
-    default_node = _coerce_node_id(payload.get("default_node"))
-    if default_node:
+    if "default_node" in payload:
+        default_node = _coerce_node_id(payload.get("default_node"))
+        if not default_node:
+            raise ClientConfigError("Invalid Session Manager client config: default_node must be a non-empty string")
         return default_node
 
     client_payload = payload.get("client")
-    if isinstance(client_payload, dict):
-        return _coerce_node_id(client_payload.get("default_node"))
+    if client_payload is not None and not isinstance(client_payload, dict):
+        raise ClientConfigError("Invalid Session Manager client config: client must be a mapping")
+    if isinstance(client_payload, dict) and "default_node" in client_payload:
+        default_node = _coerce_node_id(client_payload.get("default_node"))
+        if not default_node:
+            raise ClientConfigError("Invalid Session Manager client config: client.default_node must be a non-empty string")
+        return default_node
 
     return None
 
