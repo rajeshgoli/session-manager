@@ -9,7 +9,7 @@ import signal
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Optional
 
@@ -327,14 +327,14 @@ class SessionManagerApp:
         if self.telegram_bot:
             self.telegram_bot.set_telemetry_logger(self.tool_logger)
 
-        # Create ASGI lifespan — runs post-bind work only after uvicorn
-        # successfully binds the port.  Doomed instances (port already in use)
-        # exit before the lifespan fires, so no Telegram API calls leak.
+        # Create ASGI lifespan. Uvicorn runs lifespan startup before binding the
+        # listening socket, so work here must not mutate global runtime state
+        # that only the bound server should own.
         sm_app = self
 
         @asynccontextmanager
         async def _lifespan(app):
-            await sm_app._post_bind_startup()
+            await sm_app._lifespan_startup()
             yield
 
         # Create FastAPI app
@@ -730,15 +730,13 @@ class SessionManagerApp:
             self._run_telegram_topic_cleanup_loop()
         )
 
-    async def _post_bind_startup(self):
-        """Run side-effect-bearing startup work after uvicorn binds the port.
+    async def _lifespan_startup(self):
+        """Run ASGI lifespan startup work before the app begins serving.
 
-        Called from the ASGI lifespan hook so that doomed instances
-        (port already in use) never reach this code.
+        Uvicorn invokes lifespan startup before binding the real listener, so
+        tmux hook installation and other bound-server ownership work must run
+        elsewhere after ``server.started`` flips true.
         """
-        if self.session_manager.sessions:
-            self.session_manager.tmux.ensure_client_event_hooks()
-
         # Reconcile Telegram topics
         if self.telegram_bot:
             await self._reconcile_telegram_topics()
@@ -746,6 +744,14 @@ class SessionManagerApp:
 
         # Restore monitoring for existing sessions
         await self._restore_monitoring()
+
+    async def _install_tmux_client_hooks_after_bind(self, server: uvicorn.Server) -> None:
+        """Install global tmux client hooks only after uvicorn owns the listener."""
+        while not server.started and not server.should_exit:
+            await asyncio.sleep(0.05)
+
+        if server.started and self.session_manager.sessions:
+            self.session_manager.tmux.ensure_client_event_hooks()
 
     async def _restore_monitoring(self):
         """Restore output monitoring for sessions that were running before restart."""
@@ -940,7 +946,7 @@ class SessionManagerApp:
             logger.info("Telegram bot started")
 
         # NOTE: _reconcile_telegram_topics() and monitoring restoration run
-        # via the ASGI lifespan hook (_post_bind_startup).  The pre-flight
+        # via the ASGI lifespan hook (_lifespan_startup).  The pre-flight
         # socket probe above is the primary guard — it exits doomed instances
         # before any side effects fire.
 
@@ -956,7 +962,15 @@ class SessionManagerApp:
         logger.info(f"Starting server on http://{self.host}:{self.port}")
 
         # Run until shutdown
-        await server.serve()
+        tmux_hook_task = asyncio.create_task(
+            self._install_tmux_client_hooks_after_bind(server)
+        )
+        try:
+            await server.serve()
+        finally:
+            tmux_hook_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await tmux_hook_task
 
     async def stop(self):
         """Stop all components."""
