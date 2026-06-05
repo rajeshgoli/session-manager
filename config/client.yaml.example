@@ -1,0 +1,16 @@
+# Shared Session Manager client config.
+#
+# `sm` and GUI clients such as DeskBar resolve the API URL in this order:
+# explicit override, SM_API_URL, this file, localhost fallback.
+#
+# Copy to ~/.config/session-manager/client.yaml on machines that should talk to
+# a primary Session Manager server running somewhere else.
+api_url: "http://127.0.0.1:8420"
+
+# Optional: default execution node for top-level `sm claude` / `sm codex`
+# commands from this client. Managed sessions still inherit their parent node.
+# default_node: "macbook"
+
+# Optional: node id for this machine. Set this when `default_node` points at
+# this same host so the CLI can attach through local tmux instead of SSH.
+# local_node: "macbook"

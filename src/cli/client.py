@@ -1,19 +1,29 @@
 """HTTP client for Session Manager API."""
 
 import os
-import sys
+from pathlib import Path
 from typing import Optional
 import urllib.error
 import urllib.parse
 import urllib.request
 import json
 
+import yaml
+
 # Default API endpoint
 DEFAULT_API_URL = "http://127.0.0.1:8420"
+CLIENT_CONFIG_ENV = "SM_CLIENT_CONFIG"
+CLIENT_CONFIG_SUBPATH = "session-manager/client.yaml"
+DEFAULT_NODE_ENV = "SM_DEFAULT_NODE"
+LOCAL_NODE_ENV = "SM_LOCAL_NODE"
 DEFAULT_API_TIMEOUT = 5.0  # seconds
 DEFAULT_SEND_API_TIMEOUT = 15.0  # seconds
 DEFAULT_MUTATION_API_TIMEOUT = 15.0  # seconds
 KILL_TIMEOUT = 30  # seconds (kill triggers cleanup that may involve network I/O)
+
+
+class ClientConfigError(ValueError):
+    """Raised when a present shared client config cannot be used safely."""
 
 
 def _read_api_timeout() -> float:
@@ -29,6 +39,176 @@ def _read_api_timeout() -> float:
 
 
 API_TIMEOUT = _read_api_timeout()
+
+
+def default_client_config_path() -> Path:
+    """Return the default shared SM client config path."""
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return Path(xdg_config_home).expanduser() / CLIENT_CONFIG_SUBPATH
+    return Path.home() / ".config" / CLIENT_CONFIG_SUBPATH
+
+
+def _client_config_path() -> Path:
+    """Return the configured SM client config path."""
+    override = os.environ.get(CLIENT_CONFIG_ENV)
+    if override:
+        return Path(override).expanduser()
+    return default_client_config_path()
+
+
+def _coerce_api_url(value: object) -> Optional[str]:
+    """Normalize a candidate API URL, rejecting empty or non-HTTP values."""
+    if not isinstance(value, str):
+        return None
+    api_url = value.strip().rstrip("/")
+    if api_url.startswith("http://") or api_url.startswith("https://"):
+        return api_url
+    return None
+
+
+def _read_client_config_payload(config_path: Optional[Path] = None) -> Optional[dict]:
+    """Read shared client config YAML, ignoring only a missing config file."""
+    path = config_path or _client_config_path()
+    try:
+        with path.open() as config_file:
+            payload = yaml.safe_load(config_file) or {}
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        raise ClientConfigError(f"Invalid Session Manager client config {path}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ClientConfigError(f"Invalid Session Manager client config {path}: expected a YAML mapping")
+    return payload
+
+
+def read_client_config_api_url(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read the shared SM client API URL from YAML config, if present."""
+    payload = _read_client_config_payload(config_path)
+    if payload is None:
+        return None
+
+    if "api_url" in payload:
+        api_url = _coerce_api_url(payload.get("api_url"))
+        if not api_url:
+            raise ClientConfigError("Invalid Session Manager client config: api_url must be http(s)")
+        return api_url
+
+    client_payload = payload.get("client")
+    if client_payload is not None and not isinstance(client_payload, dict):
+        raise ClientConfigError("Invalid Session Manager client config: client must be a mapping")
+    if isinstance(client_payload, dict) and "api_url" in client_payload:
+        api_url = _coerce_api_url(client_payload.get("api_url"))
+        if not api_url:
+            raise ClientConfigError("Invalid Session Manager client config: client.api_url must be http(s)")
+        return api_url
+
+    return None
+
+
+def _coerce_node_id(value: object) -> Optional[str]:
+    """Normalize a candidate node id, rejecting empty values."""
+    if not isinstance(value, str):
+        return None
+    node_id = value.strip()
+    return node_id or None
+
+
+def read_client_config_default_node(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read the preferred top-level create node from YAML config, if present."""
+    payload = _read_client_config_payload(config_path)
+    if payload is None:
+        return None
+
+    if "default_node" in payload:
+        default_node = _coerce_node_id(payload.get("default_node"))
+        if not default_node:
+            raise ClientConfigError("Invalid Session Manager client config: default_node must be a non-empty string")
+        return default_node
+
+    client_payload = payload.get("client")
+    if client_payload is not None and not isinstance(client_payload, dict):
+        raise ClientConfigError("Invalid Session Manager client config: client must be a mapping")
+    if isinstance(client_payload, dict) and "default_node" in client_payload:
+        default_node = _coerce_node_id(client_payload.get("default_node"))
+        if not default_node:
+            raise ClientConfigError("Invalid Session Manager client config: client.default_node must be a non-empty string")
+        return default_node
+
+    return None
+
+
+def read_client_config_local_node(config_path: Optional[Path] = None) -> Optional[str]:
+    """Read this client's local execution node id from YAML config, if present."""
+    payload = _read_client_config_payload(config_path)
+    if payload is None:
+        return None
+
+    if "local_node" in payload:
+        local_node = _coerce_node_id(payload.get("local_node"))
+        if not local_node:
+            raise ClientConfigError("Invalid Session Manager client config: local_node must be a non-empty string")
+        return local_node
+
+    client_payload = payload.get("client")
+    if client_payload is not None and not isinstance(client_payload, dict):
+        raise ClientConfigError("Invalid Session Manager client config: client must be a mapping")
+    if isinstance(client_payload, dict) and "local_node" in client_payload:
+        local_node = _coerce_node_id(client_payload.get("local_node"))
+        if not local_node:
+            raise ClientConfigError("Invalid Session Manager client config: client.local_node must be a non-empty string")
+        return local_node
+
+    return None
+
+
+def resolve_api_url(api_url: Optional[str] = None) -> str:
+    """Resolve the API URL using explicit arg, env, shared config, then localhost."""
+    explicit_url = _coerce_api_url(api_url)
+    if explicit_url:
+        return explicit_url
+    if api_url is not None:
+        raise ClientConfigError("Invalid Session Manager API URL: explicit api_url must be http(s)")
+
+    raw_env_url = os.environ.get("SM_API_URL")
+    env_url = _coerce_api_url(raw_env_url)
+    if env_url:
+        return env_url
+    if raw_env_url is not None:
+        raise ClientConfigError("Invalid Session Manager API URL: SM_API_URL must be http(s)")
+
+    config_url = read_client_config_api_url()
+    if config_url:
+        return config_url
+
+    return DEFAULT_API_URL
+
+
+def resolve_default_node(default_node: Optional[str] = None) -> Optional[str]:
+    """Resolve the preferred top-level create node."""
+    explicit_node = _coerce_node_id(default_node)
+    if explicit_node:
+        return explicit_node
+
+    env_node = _coerce_node_id(os.environ.get(DEFAULT_NODE_ENV))
+    if env_node:
+        return env_node
+
+    return read_client_config_default_node()
+
+
+def resolve_local_node(local_node: Optional[str] = None) -> Optional[str]:
+    """Resolve the node id that represents this client machine."""
+    explicit_node = _coerce_node_id(local_node)
+    if explicit_node:
+        return explicit_node
+
+    env_node = _coerce_node_id(os.environ.get(LOCAL_NODE_ENV))
+    if env_node:
+        return env_node
+
+    return read_client_config_local_node()
 
 
 def _read_send_api_timeout() -> float:
@@ -73,7 +253,9 @@ class SessionManagerClient:
         Args:
             api_url: Base URL for API (default: http://127.0.0.1:8420)
         """
-        self.api_url = api_url or os.environ.get("SM_API_URL", DEFAULT_API_URL)
+        self.api_url = resolve_api_url(api_url)
+        self.default_node = resolve_default_node()
+        self.local_node = resolve_local_node()
         self.session_id = os.environ.get("CLAUDE_SESSION_MANAGER_ID")
 
     def _request(self, method: str, path: str, data: Optional[dict] = None, timeout: Optional[int] = None) -> tuple[Optional[dict], bool, bool]:
@@ -177,6 +359,25 @@ class SessionManagerClient:
         """List all sessions."""
         path = "/sessions?include_stopped=true" if include_stopped else "/sessions"
         data, success, _ = self._request("GET", path, timeout=timeout)
+        if success and data:
+            return data.get("sessions", [])
+        return None
+
+    def list_node_restore_sessions(
+        self,
+        node: str,
+        *,
+        timeout: Optional[float] = None,
+        refresh: bool = False,
+    ) -> Optional[list]:
+        """List stopped restore candidates from one node's local inventory."""
+        node_path = urllib.parse.quote(str(node), safe="")
+        suffix = "?refresh=true" if refresh else ""
+        data, success, _ = self._request(
+            "GET",
+            f"/nodes/{node_path}/restore-candidates{suffix}",
+            timeout=timeout,
+        )
         if success and data:
             return data.get("sessions", [])
         return None
@@ -862,11 +1063,13 @@ class SessionManagerClient:
             return None
         return data
 
-    def restore_session_result(self, session_id: str) -> dict:
+    def restore_session_result(self, session_id: str, node: Optional[str] = None) -> dict:
         """Restore a stopped session and preserve API error details."""
+        # Node-scoped restore candidates resolve to session ids before restore.
+        path = f"/sessions/{session_id}/restore"
         data, status_code, unavailable = self._request_with_status(
             "POST",
-            f"/sessions/{session_id}/restore",
+            path,
             {},
             timeout=10,
         )

@@ -50,6 +50,23 @@ def _tmux_socket_from_descriptor(descriptor: Optional[dict]) -> Optional[str]:
     return socket_name or None
 
 
+def _localize_attach_descriptor(client: SessionManagerClient, descriptor: Optional[dict]) -> Optional[dict]:
+    """Prefer local tmux attach when this client is running on the session's node."""
+    if not isinstance(descriptor, dict):
+        return descriptor
+    local_node = getattr(client, "local_node", None)
+    if not isinstance(local_node, str) or not local_node.strip():
+        return descriptor
+    descriptor_node = descriptor.get("node")
+    if not isinstance(descriptor_node, str) or descriptor_node.strip() != local_node.strip():
+        return descriptor
+    if "attach_command" not in descriptor:
+        return descriptor
+    localized = dict(descriptor)
+    localized.pop("attach_command", None)
+    return localized
+
+
 def _attach_tmux_session(tmux_session: str, descriptor: Optional[dict] = None) -> int:
     """Attach the current terminal to a tmux session."""
     attach_command = descriptor.get("attach_command") if isinstance(descriptor, dict) else None
@@ -127,6 +144,10 @@ def _effective_create_node_for_cli(
     if node:
         return str(node).strip() or "primary"
 
+    default_node = _client_default_create_node(client, parent_session_id=parent_session_id)
+    if default_node:
+        return default_node
+
     if parent_session_id:
         sessions_getter = getattr(client, "list_sessions", None)
         if callable(sessions_getter):
@@ -145,17 +166,46 @@ def _effective_create_node_for_cli(
     return "primary"
 
 
+def _client_default_create_node(
+    client: SessionManagerClient,
+    *,
+    parent_session_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return a client-local node default for top-level creates only."""
+    if parent_session_id:
+        return None
+    default_node = getattr(client, "default_node", None)
+    if not isinstance(default_node, str):
+        return None
+    default_node = default_node.strip()
+    return default_node or None
+
+
+def _client_local_node(client: SessionManagerClient) -> Optional[str]:
+    """Return this client's local execution node id, when configured."""
+    local_node = getattr(client, "local_node", None)
+    if not isinstance(local_node, str):
+        return None
+    local_node = local_node.strip()
+    return local_node or None
+
+
 def _should_validate_working_dir_locally(
     client: SessionManagerClient,
     *,
     node: Optional[str] = None,
     parent_session_id: Optional[str] = None,
 ) -> bool:
-    return _effective_create_node_for_cli(
+    effective_node = _effective_create_node_for_cli(
         client,
         node=node,
         parent_session_id=parent_session_id,
-    ) == "primary"
+    )
+    if effective_node == "primary":
+        return True
+
+    client_local_node = _client_local_node(client)
+    return client_local_node is not None and effective_node == client_local_node
 
 
 def cmd_removed_entrypoint(entrypoint: str) -> int:
@@ -937,11 +987,12 @@ def cmd_nodes(client: SessionManagerClient) -> int:
     if not nodes:
         print("No nodes configured.")
         return 0
-    headers = ("Node", "Primary", "SSH", "API URL", "Hook Base")
+    headers = ("Node", "Primary", "Agent", "SSH", "API URL", "Hook Base")
     rows = [
         (
             str(node.get("id") or ""),
             "yes" if node.get("primary") else "",
+            "yes" if node.get("codex_fork_node_agent") else "",
             str(node.get("ssh") or ""),
             str(node.get("api_url") or ""),
             str(node.get("hook_base_url") or ""),
@@ -3036,6 +3087,8 @@ def cmd_new(
     if working_dir is None:
         working_dir = os.getcwd()
 
+    node = node or _client_default_create_node(client, parent_session_id=parent_session_id)
+
     if _should_validate_working_dir_locally(client, node=node, parent_session_id=parent_session_id):
         # Expand and resolve path locally for primary sessions. Remote nodes are
         # preflighted by the server on the target machine.
@@ -3056,7 +3109,10 @@ def cmd_new(
         return 1
 
     # Create session via API
-    print(f"Creating session in {working_dir}...")
+    if node:
+        print(f"Creating session on node {node} in {working_dir}...")
+    else:
+        print(f"Creating session in {working_dir}...")
     create_kwargs = {
         "provider": provider,
         "parent_session_id": parent_session_id,
@@ -3096,6 +3152,7 @@ def cmd_new(
     time.sleep(1)
 
     descriptor = client.get_attach_descriptor(session_id) if session_id else None
+    descriptor = _localize_attach_descriptor(client, descriptor)
     return _attach_tmux_session(tmux_session, descriptor)
 
 
@@ -3124,6 +3181,8 @@ def cmd_codex_2(
     if working_dir is None:
         working_dir = os.getcwd()
 
+    node = node or _client_default_create_node(client, parent_session_id=parent_session_id)
+
     if _should_validate_working_dir_locally(client, node=node, parent_session_id=parent_session_id):
         try:
             path = Path(working_dir).expanduser().resolve()
@@ -3138,7 +3197,10 @@ def cmd_codex_2(
             print(f"Error: Invalid path: {e}", file=sys.stderr)
             return 1
 
-    print(f"Creating codex-fork session in {working_dir}...")
+    if node:
+        print(f"Creating codex-fork session on node {node} in {working_dir}...")
+    else:
+        print(f"Creating codex-fork session in {working_dir}...")
     create_kwargs = {
         "provider": "codex-fork",
         "parent_session_id": parent_session_id,
@@ -3181,6 +3243,7 @@ def cmd_attach(client: SessionManagerClient, identifier: Optional[str] = None) -
     def _attach_with_descriptor(session: dict) -> int:
         session_id = session.get("id")
         descriptor = client.get_attach_descriptor(session_id) if session_id else None
+        descriptor = _localize_attach_descriptor(client, descriptor)
         if descriptor:
             if not descriptor.get("attach_supported", True):
                 message = descriptor.get("message") or "Attach not supported for this session"

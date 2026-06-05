@@ -5,7 +5,7 @@ import sys
 import os
 from typing import Optional
 
-from .client import SessionManagerClient
+from .client import ClientConfigError, SessionManagerClient
 from . import commands
 
 
@@ -138,6 +138,15 @@ def _resolve_send_text_argument(text: str, stdin=None) -> str:
     return stdin_text
 
 
+def _create_client_or_exit() -> SessionManagerClient:
+    """Create an API client or exit with a concise config error."""
+    try:
+        return SessionManagerClient()
+    except ClientConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
 def _handle_send(argv: list[str]) -> int:
     """Handle `sm send` with subcommand-specific parsing and dispatch."""
     args = _parse_send_args(argv)
@@ -155,7 +164,7 @@ def _handle_send(argv: list[str]) -> int:
     elif args.steer:
         delivery_mode = "steer"
 
-    client = SessionManagerClient()
+    client = _create_client_or_exit()
     return commands.cmd_send(
         client,
         args.session_id,
@@ -189,7 +198,7 @@ def _handle_dispatch(session_id: Optional[str]) -> int:
         )
         return 1
 
-    client = SessionManagerClient()
+    client = _create_client_or_exit()
     return commands.cmd_dispatch(
         client, agent_id, role, dynamic_params, em_id,
         dry_run=dry_run, no_clear=no_clear,
@@ -943,7 +952,7 @@ def main():
         sys.exit(2)
 
     # Create client
-    client = SessionManagerClient()
+    client = _create_client_or_exit()
 
     # Dispatch to command handler
     if args.command == "name":
