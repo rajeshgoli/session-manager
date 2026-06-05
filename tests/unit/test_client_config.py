@@ -40,6 +40,26 @@ def test_resolve_api_url_precedence(monkeypatch, tmp_path: Path):
     assert resolve_api_url() == "http://config.example.test:8420"
 
 
+def test_resolve_api_url_rejects_invalid_explicit_url(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "client.yaml"
+    config_path.write_text("api_url: http://config.example.test:8420\n")
+    monkeypatch.setenv("SM_CLIENT_CONFIG", str(config_path))
+    monkeypatch.delenv("SM_API_URL", raising=False)
+
+    with pytest.raises(ClientConfigError, match="explicit api_url must be http"):
+        resolve_api_url("config.example.test:8420")
+
+
+def test_resolve_api_url_rejects_invalid_env_url(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "client.yaml"
+    config_path.write_text("api_url: http://config.example.test:8420\n")
+    monkeypatch.setenv("SM_CLIENT_CONFIG", str(config_path))
+    monkeypatch.setenv("SM_API_URL", "env.example.test:8420")
+
+    with pytest.raises(ClientConfigError, match="SM_API_URL must be http"):
+        resolve_api_url()
+
+
 def test_resolve_api_url_falls_back_to_localhost(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "missing.yaml"
     monkeypatch.setenv("SM_CLIENT_CONFIG", str(config_path))

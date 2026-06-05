@@ -143,10 +143,15 @@ def resolve_api_url(api_url: Optional[str] = None) -> str:
     explicit_url = _coerce_api_url(api_url)
     if explicit_url:
         return explicit_url
+    if api_url is not None:
+        raise ClientConfigError("Invalid Session Manager API URL: explicit api_url must be http(s)")
 
-    env_url = _coerce_api_url(os.environ.get("SM_API_URL"))
+    raw_env_url = os.environ.get("SM_API_URL")
+    env_url = _coerce_api_url(raw_env_url)
     if env_url:
         return env_url
+    if raw_env_url is not None:
+        raise ClientConfigError("Invalid Session Manager API URL: SM_API_URL must be http(s)")
 
     config_url = read_client_config_api_url()
     if config_url:
@@ -315,6 +320,25 @@ class SessionManagerClient:
         """List all sessions."""
         path = "/sessions?include_stopped=true" if include_stopped else "/sessions"
         data, success, _ = self._request("GET", path, timeout=timeout)
+        if success and data:
+            return data.get("sessions", [])
+        return None
+
+    def list_node_restore_sessions(
+        self,
+        node: str,
+        *,
+        timeout: Optional[float] = None,
+        refresh: bool = False,
+    ) -> Optional[list]:
+        """List stopped restore candidates from one node's local inventory."""
+        node_path = urllib.parse.quote(str(node), safe="")
+        suffix = "?refresh=true" if refresh else ""
+        data, success, _ = self._request(
+            "GET",
+            f"/nodes/{node_path}/restore-candidates{suffix}",
+            timeout=timeout,
+        )
         if success and data:
             return data.get("sessions", [])
         return None
@@ -1000,11 +1024,17 @@ class SessionManagerClient:
             return None
         return data
 
-    def restore_session_result(self, session_id: str) -> dict:
+    def restore_session_result(self, session_id: str, node: Optional[str] = None) -> dict:
         """Restore a stopped session and preserve API error details."""
+        if node and node != "primary":
+            node_path = urllib.parse.quote(str(node), safe="")
+            session_path = urllib.parse.quote(str(session_id), safe="")
+            path = f"/nodes/{node_path}/restore-candidates/{session_path}/restore"
+        else:
+            path = f"/sessions/{session_id}/restore"
         data, status_code, unavailable = self._request_with_status(
             "POST",
-            f"/sessions/{session_id}/restore",
+            path,
             {},
             timeout=10,
         )
