@@ -243,3 +243,18 @@ def test_restore_session_uses_explicit_empty_json_body():
         {},
         timeout=10,
     )
+
+
+def test_restore_session_with_node_uses_existing_restore_endpoint():
+    client = _make_client()
+    payload = {"id": "abc123", "status": "running"}
+    with patch.object(client, "_request_with_status", return_value=(payload, 200, False)) as req:
+        result = client.restore_session_result("abc123", node="macbook")
+    assert result["ok"] is True
+    assert result["data"] == payload
+    req.assert_called_once_with(
+        "POST",
+        "/sessions/abc123/restore",
+        {},
+        timeout=10,
+    )

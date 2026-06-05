@@ -1026,12 +1026,8 @@ class SessionManagerClient:
 
     def restore_session_result(self, session_id: str, node: Optional[str] = None) -> dict:
         """Restore a stopped session and preserve API error details."""
-        if node and node != "primary":
-            node_path = urllib.parse.quote(str(node), safe="")
-            session_path = urllib.parse.quote(str(session_id), safe="")
-            path = f"/nodes/{node_path}/restore-candidates/{session_path}/restore"
-        else:
-            path = f"/sessions/{session_id}/restore"
+        # Node-scoped restore candidates resolve to session ids before restore.
+        path = f"/sessions/{session_id}/restore"
         data, status_code, unavailable = self._request_with_status(
             "POST",
             path,
