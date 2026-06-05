@@ -31,6 +31,7 @@ def test_cmd_watch_delegates_to_watch_tui():
         restore_mode=False,
         top_level=False,
         restore_sort="retired",
+        restore_node=None,
     )
 
 
@@ -65,6 +66,7 @@ def test_cmd_watch_delegates_restore_mode_to_watch_tui():
                 restore_mode=True,
                 top_level=True,
                 restore_sort="last-active",
+                restore_node="macbook",
             )
 
     assert rc == 0
@@ -76,4 +78,5 @@ def test_cmd_watch_delegates_restore_mode_to_watch_tui():
         restore_mode=True,
         top_level=True,
         restore_sort="last-active",
+        restore_node="macbook",
     )

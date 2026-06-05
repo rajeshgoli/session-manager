@@ -110,6 +110,7 @@ class NodeAgentConnection:
         self._event_queues: dict[str, asyncio.Queue[Optional[str]]] = {}
         self._pending_control: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending_register: dict[str, asyncio.Future[None]] = {}
+        self._pending_restore_inventory: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._registered_paths: dict[str, CodexForkBridgePaths] = {}
 
     def is_healthy(self) -> bool:
@@ -197,6 +198,17 @@ class NodeAgentConnection:
         finally:
             self._pending_control.pop(bridge_request_id, None)
 
+    async def restore_inventory(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending_restore_inventory[request_id] = future
+        try:
+            await self.send({"type": "restore_inventory", "request_id": request_id})
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._pending_restore_inventory.pop(request_id, None)
+
     async def handle_frame(self, frame: dict[str, Any]) -> None:
         frame_type = frame.get("type")
         if frame_type == "event":
@@ -257,6 +269,17 @@ class NodeAgentConnection:
             future.set_exception(RuntimeError("remote control returned no response"))
             return
 
+        if frame_type == "restore_inventory_result":
+            request_id = str(frame.get("request_id") or "").strip()
+            future = self._pending_restore_inventory.get(request_id)
+            if future is None or future.done():
+                return
+            if frame.get("ok") is False:
+                future.set_exception(RuntimeError(str(frame.get("error") or "restore inventory failed")))
+                return
+            future.set_result(frame)
+            return
+
         if frame_type in {"runtime_ready", "pong"}:
             return
 
@@ -268,6 +291,10 @@ class NodeAgentConnection:
             if not future.done():
                 future.set_exception(RuntimeError(f"Node-agent {self.node_id} disconnected"))
         self._pending_control.clear()
+        for future in list(self._pending_restore_inventory.values()):
+            if not future.done():
+                future.set_exception(RuntimeError(f"Node-agent {self.node_id} disconnected"))
+        self._pending_restore_inventory.clear()
         for future in list(self._pending_register.values()):
             if not future.done():
                 future.set_exception(RuntimeError(f"Node-agent {self.node_id} disconnected"))
@@ -352,3 +379,9 @@ class NodeAgentRegistry:
             frame=frame,
             timeout=timeout,
         )
+
+    async def restore_inventory(self, *, node_id: str, timeout: float = 5.0) -> dict[str, Any]:
+        connection = self.get(node_id)
+        if connection is None:
+            raise RuntimeError(f"Node-agent for {node_id} is not connected")
+        return await connection.restore_inventory(timeout=timeout)

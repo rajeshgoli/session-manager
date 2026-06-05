@@ -14,13 +14,31 @@ class _RestoreClient:
 
     def list_sessions(self, include_stopped: bool = False):
         assert include_stopped is True
-        return self._sessions
+        return [session for session in self._sessions if not session.get("node_inventory_only")]
 
-    def restore_session_result(self, session_id: str):
+    def list_node_restore_sessions(self, node: str, timeout=None):
+        return [
+            {**session, "node": node, "origin_node": node, "source_session_id": session["id"]}
+            for session in self._sessions
+            if session.get("node") == node
+        ]
+
+    def list_node_restore_sessions_result(self, node: str, timeout=None):
+        return {
+            "ok": True,
+            "unavailable": False,
+            "sessions": self.list_node_restore_sessions(node, timeout=timeout),
+            "detail": None,
+        }
+
+    def restore_session_result(self, session_id: str, node: str | None = None):
         restored = self._restored_by_id.get(session_id)
         if restored is None:
             return {"ok": False, "unavailable": False, "detail": "not found"}
-        return {"ok": True, "unavailable": False, "data": restored}
+        data = dict(restored)
+        if node:
+            data["node"] = node
+        return {"ok": True, "unavailable": False, "data": data}
 
     def get_attach_descriptor(self, session_id: str):
         restored = self._restored_by_id.get(session_id)
@@ -142,3 +160,69 @@ def test_cmd_restore_rejects_ambiguous_stopped_name_matches(capsys):
     assert rc == 1
     stderr = capsys.readouterr().err
     assert "Multiple stopped sessions match 'onboarder': dead123, dead456. Use a session ID." in stderr
+
+
+def test_cmd_restore_uses_explicit_node_inventory(monkeypatch, capsys):
+    monkeypatch.setattr(commands.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(commands.sys.stdout, "isatty", lambda: False)
+
+    session = {
+        "id": "macdead1",
+        "friendly_name": "old-local",
+        "status": "stopped",
+        "node": "macbook",
+        "node_inventory_only": True,
+    }
+    restored = {
+        "macdead1": {"id": "macdead1", "provider": "codex-fork", "tmux_session": "codex-fork-macdead1"},
+    }
+    client = _RestoreClient([session], restored)
+
+    rc = commands.cmd_restore(client, "old-local", node="macbook")
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "Session restored: macdead1 on node macbook" in stdout
+
+
+def test_cmd_restore_falls_back_to_client_default_node(monkeypatch, capsys):
+    monkeypatch.setattr(commands.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(commands.sys.stdout, "isatty", lambda: False)
+
+    session = {
+        "id": "macdead2",
+        "friendly_name": "old-default",
+        "status": "stopped",
+        "node": "macbook",
+        "node_inventory_only": True,
+    }
+    restored = {
+        "macdead2": {"id": "macdead2", "provider": "claude", "tmux_session": "claude-macdead2"},
+    }
+    client = _RestoreClient([session], restored)
+    client.default_node = "macbook"
+
+    rc = commands.cmd_restore(client, "old-default")
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "Session restored: macdead2 on node macbook" in stdout
+
+
+def test_cmd_restore_reports_node_inventory_api_error(monkeypatch, capsys):
+    monkeypatch.setattr(commands.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(commands.sys.stdout, "isatty", lambda: False)
+
+    client = _RestoreClient([], {})
+    client.list_node_restore_sessions_result = lambda node, timeout=None: {
+        "ok": False,
+        "unavailable": False,
+        "sessions": [],
+        "detail": f"Unknown node: {node}",
+    }
+
+    rc = commands.cmd_restore(client, "old-local", node="typo")
+
+    assert rc == 1
+    stderr = capsys.readouterr().err
+    assert "Error: Unknown node: typo" in stderr

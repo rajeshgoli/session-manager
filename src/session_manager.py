@@ -173,6 +173,10 @@ class SessionManager:
         self.node_registry = NodeRegistry.from_config(self.config)
         self.node_runner = NodeRunner(self.node_registry)
         self.codex_fork_node_agents = NodeAgentRegistry()
+        self.node_restore_inventory_cache_seconds = float(
+            self.config.get("nodes", {}).get("restore_inventory_cache_seconds", 10.0)
+        )
+        self._node_restore_inventory_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._tmux_session_node_cache: dict[str, str] = {}
         self._node_unreachable_sessions: set[str] = set()
         self.last_create_error: Optional[str] = None
@@ -505,6 +509,152 @@ class SessionManager:
         except Exception as exc:
             return {"node": node_id, "ok": False, "error": str(exc)}
         return {"node": node_id, "ok": ok, "error": None if ok else "ping failed"}
+
+    async def list_node_restore_candidates(
+        self,
+        node: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[bool, list[dict[str, Any]], Optional[str]]:
+        """Return stopped restore candidates from one node's local SM state."""
+        node_id = normalize_node_id(node)
+        if not self.node_registry.has(node_id):
+            return False, [], f"Unknown node: {node_id}"
+
+        if node_id == PRIMARY_NODE:
+            return True, [
+                self._node_restore_candidate_from_session(session, node_id)
+                for session in self.list_sessions(include_stopped=True)
+                if session.status == SessionStatus.STOPPED
+                and normalize_node_id(getattr(session, "node", PRIMARY_NODE)) == PRIMARY_NODE
+            ], None
+
+        now = time.monotonic()
+        cached = self._node_restore_inventory_cache.get(node_id)
+        if (
+            not force_refresh
+            and cached is not None
+            and now - cached[0] < max(0.0, self.node_restore_inventory_cache_seconds)
+        ):
+            candidates = [
+                candidate
+                for item in cached[1]
+                if (candidate := self._normalize_node_restore_candidate(node_id, item)) is not None
+            ]
+            return True, candidates, None
+
+        if not self.is_codex_fork_node_agent_healthy(node_id):
+            return False, [], f"node-agent not connected for node {node_id}"
+
+        try:
+            payload = await self.codex_fork_node_agents.restore_inventory(
+                node_id=node_id,
+                timeout=max(0.5, self.codex_fork_control_timeout_seconds),
+            )
+        except Exception as exc:
+            return False, [], str(exc)
+
+        raw_sessions = payload.get("sessions")
+        if not isinstance(raw_sessions, list):
+            return False, [], "node restore inventory response did not include sessions"
+
+        candidates = [
+            candidate
+            for item in raw_sessions
+            if (candidate := self._normalize_node_restore_candidate(node_id, item)) is not None
+        ]
+        self._node_restore_inventory_cache[node_id] = (now, candidates)
+        return True, list(candidates), None
+
+    def _node_restore_candidate_from_session(self, session: Session, node_id: str) -> dict[str, Any]:
+        candidate = session.to_dict()
+        candidate["node"] = node_id
+        candidate["origin_node"] = node_id
+        candidate["source_session_id"] = session.id
+        candidate["restore_source"] = "server_state" if node_id == PRIMARY_NODE else "node_agent"
+        candidate["activity_state"] = ActivityState.STOPPED.value
+        return candidate
+
+    def _normalize_node_restore_candidate(self, node_id: str, item: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        session_id = str(item.get("source_session_id") or item.get("id") or "").strip()
+        if not session_id or item.get("status") != SessionStatus.STOPPED.value:
+            return None
+
+        current = self.sessions.get(session_id)
+        if current is not None and normalize_node_id(current.node) == node_id:
+            if current.status != SessionStatus.STOPPED:
+                return None
+            return self._node_restore_candidate_from_session(current, node_id)
+        if current is not None and normalize_node_id(current.node) != node_id:
+            return None
+
+        candidate = dict(item)
+        candidate["id"] = session_id
+        candidate["source_session_id"] = session_id
+        candidate["node"] = node_id
+        candidate["origin_node"] = node_id
+        candidate["restore_source"] = "node_agent"
+        candidate["activity_state"] = ActivityState.STOPPED.value
+        return candidate
+
+    async def import_node_restore_candidate(
+        self,
+        node: str,
+        session_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[bool, Optional[Session], Optional[str]]:
+        """Import a node-local stopped session record into primary state."""
+        node_id = normalize_node_id(node)
+        raw_session_id = str(session_id or "").strip()
+        if not raw_session_id:
+            return False, None, "Session id is required"
+        if node_id == PRIMARY_NODE:
+            session = self.sessions.get(raw_session_id)
+            if session is None:
+                return False, None, "Session not found"
+            return True, session, None
+
+        existing = self.sessions.get(raw_session_id)
+        if existing is not None:
+            if normalize_node_id(existing.node) != node_id:
+                return False, existing, f"Session id {raw_session_id} already exists on node {existing.node}"
+            if not force_refresh:
+                return True, existing, None
+
+        ok, candidates, error = await self.list_node_restore_candidates(node_id, force_refresh=force_refresh)
+        if not force_refresh and ok and not any(candidate.get("id") == raw_session_id for candidate in candidates):
+            ok, candidates, error = await self.list_node_restore_candidates(node_id, force_refresh=True)
+        if not ok:
+            return False, None, error
+
+        candidate = next((item for item in candidates if item.get("id") == raw_session_id), None)
+        if candidate is None:
+            return False, None, "Session not found in node restore inventory"
+
+        try:
+            session = Session.from_dict(candidate)
+        except Exception as exc:
+            return False, None, f"Invalid node restore candidate: {exc}"
+        session.node = node_id
+        session.status = SessionStatus.STOPPED
+        self.sessions[session.id] = session
+        self._cache_session_node(session)
+        self._save_state()
+        return True, session, None
+
+    async def restore_node_session(self, node: str, session_id: str) -> tuple[bool, Optional[Session], Optional[str]]:
+        """Import a node-local restore candidate if needed, then restore it."""
+        node_id = normalize_node_id(node)
+        ok, session, error = await self.import_node_restore_candidate(node_id, session_id, force_refresh=True)
+        if not ok or session is None:
+            return False, session, error
+        try:
+            return await self.restore_session(session.id)
+        finally:
+            self._node_restore_inventory_cache.pop(node_id, None)
 
     def node_agent_secret_for_node(self, node: str) -> Optional[str]:
         """Return the configured node-agent auth secret for one node."""

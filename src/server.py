@@ -4590,6 +4590,38 @@ def create_app(
             raise HTTPException(status_code=status, detail=result.get("error") or "ping failed")
         return result
 
+    @app.get("/nodes/{node_id}/restore-candidates")
+    async def list_node_restore_candidates(node_id: str, refresh: bool = Query(default=False)):
+        """List stopped Session Manager records from one node's local restore inventory."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        ok, sessions, error = await app.state.session_manager.list_node_restore_candidates(
+            node_id,
+            force_refresh=refresh,
+        )
+        if not ok:
+            status = 404 if str(error or "").startswith("Unknown node") else 503
+            raise HTTPException(status_code=status, detail=error or "Failed to read node restore inventory")
+        return {"node": node_id, "sessions": sessions}
+
+    @app.post("/nodes/{node_id}/restore-candidates/{session_id}/restore", response_model=SessionResponse)
+    async def restore_node_restore_candidate(node_id: str, session_id: str):
+        """Restore a stopped session from one node's local restore inventory."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+        success, restored_session, error = await app.state.session_manager.restore_node_session(node_id, session_id)
+        if not success or not restored_session:
+            detail = error or "Failed to restore node session"
+            status_code = 409 if detail == "Session is not stopped" else 400
+            if detail.startswith("Unknown node") or detail == "Session not found in node restore inventory":
+                status_code = 404
+            raise HTTPException(status_code=status_code, detail=detail)
+
+        if app.state.output_monitor and getattr(restored_session, "provider", "claude") != "codex-app":
+            await app.state.output_monitor.start_monitoring(restored_session)
+
+        return _session_to_response(restored_session)
+
     @app.websocket("/nodes/agent")
     async def node_agent_websocket(websocket: WebSocket):
         """Authenticated node-initiated codex-fork IPC bridge."""

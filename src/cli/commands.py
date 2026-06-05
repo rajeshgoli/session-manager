@@ -342,6 +342,7 @@ def resolve_restore_session_id(
     identifier: str,
     *,
     timeout: Optional[float] = None,
+    node: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[dict], bool, Optional[str]]:
     """
     Resolve a restore target.
@@ -354,6 +355,56 @@ def resolve_restore_session_id(
     """
     if not identifier or not identifier.strip():
         return None, None, False, None
+
+    if node and node != "primary":
+        list_result = None
+        list_with_result = getattr(client, "list_node_restore_sessions_result", None)
+        if callable(list_with_result):
+            try:
+                list_result = list_with_result(node, timeout=timeout)
+            except TypeError:
+                list_result = list_with_result(node)
+        if isinstance(list_result, dict):
+            if list_result.get("unavailable"):
+                return None, None, True, None
+            if not list_result.get("ok"):
+                error = list_result.get("detail") or f"Failed to list restore inventory for node {node}"
+                return None, None, False, str(error)
+            sessions = list_result.get("sessions")
+        else:
+            try:
+                sessions = client.list_node_restore_sessions(node, timeout=timeout)
+            except TypeError:
+                sessions = client.list_node_restore_sessions(node)
+        if sessions is None:
+            return None, None, True, None
+        direct_matches = [
+            s for s in sessions
+            if identifier in (s.get("id"), s.get("source_session_id"))
+        ]
+        if len(direct_matches) == 1:
+            matched = direct_matches[0]
+            return matched["id"], matched, False, None
+        if len(direct_matches) > 1:
+            matched_ids = ", ".join(s["id"] for s in direct_matches)
+            return None, None, False, (
+                f"Multiple node restore candidates match '{identifier}': {matched_ids}. "
+                "Use a session ID."
+            )
+
+        alias_matches = [s for s in sessions if identifier in (s.get("aliases") or [])]
+        name_matches = [s for s in sessions if s.get("friendly_name") == identifier]
+        candidates = alias_matches or name_matches
+        if not candidates:
+            return None, None, False, None
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            return candidate["id"], candidate, False, None
+        candidate_ids = ", ".join(s["id"] for s in candidates)
+        return None, None, False, (
+            f"Multiple node restore candidates match '{identifier}': {candidate_ids}. "
+            "Use a session ID."
+        )
 
     try:
         session = client.get_session(identifier, timeout=timeout)
@@ -2915,7 +2966,12 @@ def cmd_kill(
     return 0
 
 
-def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
+def _default_restore_node(client: SessionManagerClient) -> Optional[str]:
+    node = getattr(client, "default_node", None)
+    return node if node and node != "primary" else None
+
+
+def cmd_restore(client: SessionManagerClient, target_identifier: str, node: Optional[str] = None) -> int:
     """
     Restore a stopped session and attach to it when supported.
 
@@ -2928,10 +2984,25 @@ def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
         1: Failed
         2: Session manager unavailable
     """
-    target_session_id, _, unavailable, error = resolve_restore_session_id(client, target_identifier)
+    target_node = node if node and node != "primary" else None
+    target_session_id, _, unavailable, error = resolve_restore_session_id(
+        client,
+        target_identifier,
+        node=target_node,
+    )
     if unavailable:
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
+    if target_session_id is None and not target_node and error is None and _default_restore_node(client):
+        target_node = _default_restore_node(client)
+        target_session_id, _, unavailable, error = resolve_restore_session_id(
+            client,
+            target_identifier,
+            node=target_node,
+        )
+        if unavailable:
+            print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+            return 2
     if target_session_id is None:
         if error:
             print(f"Error: {error}", file=sys.stderr)
@@ -2939,7 +3010,7 @@ def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
         print(f"Error: Session '{target_identifier}' not found", file=sys.stderr)
         return 1
 
-    result = client.restore_session_result(target_session_id)
+    result = client.restore_session_result(target_session_id, node=target_node)
     if result.get("unavailable"):
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
@@ -2950,7 +3021,8 @@ def cmd_restore(client: SessionManagerClient, target_identifier: str) -> int:
 
     session = result.get("data") or {}
     provider = session.get("provider")
-    print(f"Session restored: {target_session_id}")
+    node_label = f" on node {target_node}" if target_node else ""
+    print(f"Session restored: {target_session_id}{node_label}")
     if provider == "codex-app":
         print("No tmux attach for Codex app sessions.")
         return 0
@@ -3878,6 +3950,7 @@ def cmd_watch(
     restore_mode: bool = False,
     top_level: bool = False,
     restore_sort: str = "retired",
+    restore_node: Optional[str] = None,
 ) -> int:
     """Launch interactive watch dashboard."""
     if os.environ.get("CLAUDE_SESSION_MANAGER_ID"):
@@ -3902,6 +3975,7 @@ def cmd_watch(
         restore_mode=restore_mode,
         top_level=top_level,
         restore_sort=restore_sort,
+        restore_node=restore_node,
     )
 
 

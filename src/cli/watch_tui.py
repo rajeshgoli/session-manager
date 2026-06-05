@@ -1340,11 +1340,14 @@ def _render(
     palette: dict[str, int],
     restore_mode: bool = False,
     restore_sort: str = "retired",
+    restore_node: Optional[str] = None,
 ):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
-    title = f"sm watch{' --restore' if restore_mode else ''}  {total_sessions} agents - {repo_count} repos"
+    restore_suffix = " --restore" if restore_mode else ""
+    node_suffix = f" --node {restore_node}" if restore_mode and restore_node else ""
+    title = f"sm watch{restore_suffix}{node_suffix}  {total_sessions} agents - {repo_count} repos"
     if filter_text:
         title += f" - filter: {filter_text}"
     stdscr.addnstr(0, 0, title, _render_columns(width, 0), curses.A_BOLD | palette["header"])
@@ -1408,6 +1411,7 @@ def run_watch_tui(
     restore_mode: bool = False,
     top_level: bool = False,
     restore_sort: str = "retired",
+    restore_node: Optional[str] = None,
 ) -> int:
     """Run the sm watch curses UI."""
 
@@ -1438,6 +1442,11 @@ def run_watch_tui(
             collapsed_repo_keys: set[str] = set()
             restore_tree_collapsed = top_level
             restore_sort_mode = restore_sort
+            effective_restore_node = restore_node
+            if restore_mode and not effective_restore_node:
+                default_node = getattr(client, "default_node", None)
+                if default_node and default_node != "primary":
+                    effective_restore_node = default_node
             repo_count = 0
             total_sessions = 0
             spinner_index = 0
@@ -1448,7 +1457,10 @@ def run_watch_tui(
             while True:
                 now = time.monotonic()
                 if now >= next_refresh:
-                    listed = client.list_sessions(include_stopped=restore_mode)
+                    if restore_mode and effective_restore_node:
+                        listed = client.list_node_restore_sessions(effective_restore_node)
+                    else:
+                        listed = client.list_sessions(include_stopped=restore_mode)
                     if listed is None:
                         flash_message = "Session manager unavailable"
                         flash_until = now + 2.5
@@ -1534,6 +1546,7 @@ def run_watch_tui(
                     palette=palette,
                     restore_mode=restore_mode,
                     restore_sort=restore_sort_mode,
+                    restore_node=effective_restore_node,
                 )
 
                 key = stdscr.getch()
@@ -1838,7 +1851,7 @@ def run_watch_tui(
                         flash_until = time.monotonic() + 2.0
                         continue
                     if restore_mode:
-                        result = client.restore_session_result(selected_session_id)
+                        result = client.restore_session_result(selected_session_id, node=effective_restore_node)
                         if result.get("unavailable"):
                             flash_message = "Session manager unavailable"
                         elif result.get("ok"):
