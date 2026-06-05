@@ -21,6 +21,9 @@ from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_NODE_STATE_FILE = "~/.local/share/claude-sessions/sessions.json"
+LEGACY_NODE_STATE_FILE = "/tmp/claude-sessions/sessions.json"
+
 
 @dataclass
 class ProviderCursor:
@@ -214,6 +217,7 @@ class CodexForkNodeAgent:
         secret: Optional[str],
         poll_interval: float = 0.2,
         log_dir: Optional[str] = None,
+        state_file: Optional[str] = None,
         control_timeout: float = 5.0,
     ):
         self.node_id = node_id
@@ -222,6 +226,11 @@ class CodexForkNodeAgent:
         self.poll_interval = poll_interval
         self.control_timeout = max(0.5, float(control_timeout))
         self.log_dir = Path(log_dir or "~/.local/share/claude-sessions").expanduser().resolve(strict=False)
+        state_file_value = str(state_file).strip() if state_file is not None else ""
+        self.state_file_explicit = bool(state_file_value)
+        self.state_file = Path(state_file_value or DEFAULT_NODE_STATE_FILE).expanduser().resolve(strict=False)
+        self.default_state_file = Path(DEFAULT_NODE_STATE_FILE).expanduser().resolve(strict=False)
+        self.legacy_state_file = Path(LEGACY_NODE_STATE_FILE).resolve(strict=False)
         self.registrations: dict[str, TailRegistration] = {}
 
     async def run_forever(self) -> None:
@@ -273,6 +282,9 @@ class CodexForkNodeAgent:
             return
         if frame_type == "control":
             await self._control(websocket, frame)
+            return
+        if frame_type == "restore_inventory":
+            await self._restore_inventory(websocket, frame)
             return
 
     async def _register(self, websocket: Any, frame: dict[str, Any]) -> None:
@@ -426,6 +438,70 @@ class CodexForkNodeAgent:
             )
         )
 
+    async def _restore_inventory(self, websocket: Any, frame: dict[str, Any]) -> None:
+        request_id = str(frame.get("request_id") or "").strip()
+        if not request_id:
+            return
+        try:
+            state_file = self._restore_inventory_state_file()
+            sessions = self._load_restore_inventory(state_file)
+            payload = {
+                "type": "restore_inventory_result",
+                "request_id": request_id,
+                "ok": True,
+                "node_id": self.node_id,
+                "state_file": str(state_file),
+                "sessions": sessions,
+            }
+        except Exception as exc:
+            payload = {
+                "type": "restore_inventory_result",
+                "request_id": request_id,
+                "ok": False,
+                "node_id": self.node_id,
+                "error": str(exc),
+            }
+        await websocket.send(json.dumps(payload, separators=(",", ":")))
+
+    def _restore_inventory_state_file(self) -> Path:
+        if self.state_file.exists():
+            return self.state_file
+        if (
+            not self.state_file_explicit
+            and self.state_file == self.default_state_file
+            and self.legacy_state_file.exists()
+        ):
+            return self.legacy_state_file
+        return self.state_file
+
+    def _load_restore_inventory(self, state_file: Optional[Path] = None) -> list[dict[str, Any]]:
+        """Return stopped node-local SM session records from the configured state file."""
+        state_path = state_file or self._restore_inventory_state_file()
+        try:
+            with state_path.open("r", encoding="utf-8") as state_handle:
+                payload = json.load(state_handle)
+        except FileNotFoundError:
+            return []
+        if not isinstance(payload, dict):
+            raise ValueError(f"state file {state_path} does not contain a JSON object")
+
+        sessions: list[dict[str, Any]] = []
+        for item in payload.get("sessions", []):
+            if not isinstance(item, dict):
+                continue
+            session_id = str(item.get("id") or "").strip()
+            if not session_id or item.get("status") != "stopped":
+                continue
+            session = dict(item)
+            session["id"] = session_id
+            session["source_session_id"] = session_id
+            session["node"] = self.node_id
+            session["origin_node"] = self.node_id
+            session["restore_source"] = "node_agent"
+            session["activity_state"] = "stopped"
+            sessions.append(session)
+        return sessions
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a Session Manager codex-fork node-agent")
@@ -440,6 +516,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-dir",
         default=os.environ.get("SM_NODE_LOG_DIR") or "~/.local/share/claude-sessions",
         help="Node-local base directory for codex-fork event/control artifacts",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=os.environ.get("SM_NODE_STATE_FILE") or None,
+        help=(
+            "Node-local Session Manager state file used for restore inventory "
+            f"(default: {DEFAULT_NODE_STATE_FILE}; falls back to {LEGACY_NODE_STATE_FILE})"
+        ),
     )
     parser.add_argument("--poll-interval", type=float, default=0.2)
     parser.add_argument(
@@ -461,6 +545,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         secret=args.secret,
         poll_interval=args.poll_interval,
         log_dir=args.log_dir,
+        state_file=args.state_file,
         control_timeout=args.control_timeout,
     )
     try:

@@ -530,6 +530,7 @@ def main():
         help="Restore a stopped session",
     )
     restore_parser.add_argument("session", help="Session ID or friendly name to restore")
+    restore_parser.add_argument("--node", help="Restore from a specific node's local history")
 
     # sm fork [session] [--self] [--name NAME] [--attach] [--json]
     fork_parser = subparsers.add_parser("fork", help="Fork a session into a new SM-owned session")
@@ -755,6 +756,11 @@ def main():
         choices=("retired", "last-active", "name"),
         default="retired",
         help="In --restore mode, initial sort order (default: retired)",
+    )
+    watch_parser.add_argument(
+        "--node",
+        default=None,
+        help="In --restore mode, browse a specific node's local restore history",
     )
 
     # sm tail <session> [-n N] [--raw] [--db-path PATH]
@@ -1254,7 +1260,7 @@ def main():
     elif args.command in ("kill", "retire"):
         sys.exit(commands.cmd_kill(client, session_id, args.session_id))
     elif args.command in ("restore", "unkill"):
-        sys.exit(commands.cmd_restore(client, args.session))
+        sys.exit(commands.cmd_restore(client, args.session, node=args.node))
     elif args.command == "fork":
         sys.exit(
             commands.cmd_fork(
@@ -1309,6 +1315,7 @@ def main():
             restore_mode=args.restore,
             top_level=args.top_level,
             restore_sort=args.sort,
+            restore_node=args.node,
         ))
     elif args.command == "tail":
         sys.exit(commands.cmd_tail(

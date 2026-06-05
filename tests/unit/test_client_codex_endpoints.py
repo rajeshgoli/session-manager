@@ -230,6 +230,26 @@ def test_list_sessions_passes_explicit_timeout():
     req.assert_called_once_with("GET", "/sessions?include_stopped=true", timeout=7)
 
 
+def test_list_node_restore_sessions_result_preserves_api_error_detail():
+    client = _make_client()
+    payload = {"detail": "Unknown node: typo"}
+    with patch.object(client, "_request_with_status", return_value=(payload, 404, False)) as req:
+        result = client.list_node_restore_sessions_result("typo", timeout=7)
+    assert result["ok"] is False
+    assert result["unavailable"] is False
+    assert result["status_code"] == 404
+    assert result["detail"] == "Unknown node: typo"
+    req.assert_called_once_with("GET", "/nodes/typo/restore-candidates", timeout=7)
+
+
+def test_list_node_restore_sessions_wraps_successful_result():
+    client = _make_client()
+    payload = {"sessions": [{"id": "abc123", "status": "stopped"}]}
+    with patch.object(client, "_request_with_status", return_value=(payload, 200, False)):
+        result = client.list_node_restore_sessions("macbook")
+    assert result == payload["sessions"]
+
+
 def test_restore_session_uses_explicit_empty_json_body():
     client = _make_client()
     payload = {"id": "abc123", "status": "running"}
@@ -245,16 +265,16 @@ def test_restore_session_uses_explicit_empty_json_body():
     )
 
 
-def test_restore_session_with_node_uses_existing_restore_endpoint():
+def test_restore_session_can_target_node_restore_candidate():
     client = _make_client()
-    payload = {"id": "abc123", "status": "running"}
+    payload = {"id": "abc123", "status": "running", "node": "macbook"}
     with patch.object(client, "_request_with_status", return_value=(payload, 200, False)) as req:
         result = client.restore_session_result("abc123", node="macbook")
     assert result["ok"] is True
     assert result["data"] == payload
     req.assert_called_once_with(
         "POST",
-        "/sessions/abc123/restore",
+        "/nodes/macbook/restore-candidates/abc123/restore",
         {},
         timeout=10,
     )

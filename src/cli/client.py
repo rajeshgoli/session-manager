@@ -371,16 +371,52 @@ class SessionManagerClient:
         refresh: bool = False,
     ) -> Optional[list]:
         """List stopped restore candidates from one node's local inventory."""
+        result = self.list_node_restore_sessions_result(node, timeout=timeout, refresh=refresh)
+        if result.get("ok"):
+            return result.get("sessions", [])
+        return None
+
+    def list_node_restore_sessions_result(
+        self,
+        node: str,
+        *,
+        timeout: Optional[float] = None,
+        refresh: bool = False,
+    ) -> dict:
+        """List node restore candidates while preserving API error details."""
         node_path = urllib.parse.quote(str(node), safe="")
         suffix = "?refresh=true" if refresh else ""
-        data, success, _ = self._request(
+        data, status_code, unavailable = self._request_with_status(
             "GET",
             f"/nodes/{node_path}/restore-candidates{suffix}",
             timeout=timeout,
         )
-        if success and data:
-            return data.get("sessions", [])
-        return None
+        if unavailable:
+            return {
+                "ok": False,
+                "unavailable": True,
+                "status_code": None,
+                "data": None,
+                "sessions": [],
+                "detail": None,
+            }
+
+        ok = status_code in (200, 201)
+        detail = None
+        sessions: list = []
+        if isinstance(data, dict):
+            detail = data.get("detail") or data.get("error") or data.get("raw")
+            raw_sessions = data.get("sessions")
+            if isinstance(raw_sessions, list):
+                sessions = raw_sessions
+        return {
+            "ok": ok,
+            "unavailable": False,
+            "status_code": status_code,
+            "data": data,
+            "sessions": sessions if ok else [],
+            "detail": detail,
+        }
 
     def list_registry(self) -> Optional[list]:
         """List all live agent registry entries."""
@@ -1065,8 +1101,12 @@ class SessionManagerClient:
 
     def restore_session_result(self, session_id: str, node: Optional[str] = None) -> dict:
         """Restore a stopped session and preserve API error details."""
-        # Node-scoped restore candidates resolve to session ids before restore.
-        path = f"/sessions/{session_id}/restore"
+        if node and node != "primary":
+            node_path = urllib.parse.quote(str(node), safe="")
+            session_path = urllib.parse.quote(str(session_id), safe="")
+            path = f"/nodes/{node_path}/restore-candidates/{session_path}/restore"
+        else:
+            path = f"/sessions/{session_id}/restore"
         data, status_code, unavailable = self._request_with_status(
             "POST",
             path,

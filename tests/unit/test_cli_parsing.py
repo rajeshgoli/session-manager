@@ -151,6 +151,7 @@ class TestCliParsing:
         # sm restore
         restore_parser = subparsers.add_parser("restore")
         restore_parser.add_argument("session")
+        restore_parser.add_argument("--node")
 
         # sm fork
         fork_parser = subparsers.add_parser("fork")
@@ -883,6 +884,14 @@ class TestRestoreCommand:
         assert args.command == "restore"
         assert args.session == "engineer-ticket2508"
 
+    def test_restore_command_parses_node(self):
+        parser = TestCliParsing()
+        args = parser._get_parsed_args(["restore", "engineer-ticket2508", "--node", "macbook"])
+
+        assert args.command == "restore"
+        assert args.session == "engineer-ticket2508"
+        assert args.node == "macbook"
+
     def test_main_restore_allowed_without_managed_session(self):
         mock_client = MagicMock()
 
@@ -894,7 +903,7 @@ class TestRestoreCommand:
                             main()
 
         assert exc_info.value.code == 0
-        mock_cmd_restore.assert_called_once_with(mock_client, "dead123")
+        mock_cmd_restore.assert_called_once_with(mock_client, "dead123", node=None)
 
 
 class TestForkCommand:
