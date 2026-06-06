@@ -458,6 +458,9 @@ class SessionManager:
         normalized_session = str(tmux_session or "").strip()
         normalized_tty = str(tty or "").strip()
         normalized_client_pid = str(client_pid or "").strip()
+        revived_session_id = None
+        if normalized_event in {"client-attached", "client-session-changed"}:
+            revived_session_id = self._revive_stopped_tmux_session(normalized_session)
 
         with self._tmux_client_event_lock:
             self._tmux_client_event_version += 1
@@ -470,6 +473,8 @@ class SessionManager:
                 "version": self._tmux_client_event_version,
                 "received_at": datetime.now(timezone.utc).isoformat(),
             }
+            if revived_session_id:
+                payload["revived_session_id"] = revived_session_id
             self._last_tmux_client_event = payload
             return dict(payload)
 
@@ -480,6 +485,70 @@ class SessionManager:
                 "version": self._tmux_client_event_version,
                 "last_event": dict(self._last_tmux_client_event) if self._last_tmux_client_event else None,
             }
+
+    def _revive_stopped_tmux_session(self, tmux_session: str) -> Optional[str]:
+        """Mark a stopped tmux-backed record active again when tmux reports a live client."""
+        normalized_tmux_session = str(tmux_session or "").strip()
+        if not normalized_tmux_session:
+            return None
+
+        session = next(
+            (
+                candidate
+                for candidate in self.sessions.values()
+                if candidate.tmux_session == normalized_tmux_session
+                and candidate.status == SessionStatus.STOPPED
+                and candidate.provider == "codex-fork"
+            ),
+            None,
+        )
+        if session is None:
+            return None
+
+        try:
+            tmux_exists = self._tmux_session_exists_for_session(session)
+        except Exception:
+            return None
+        if not tmux_exists:
+            return None
+
+        now = datetime.now()
+        session.status = SessionStatus.IDLE
+        session.stopped_at = None
+        session.completed_at = None
+        session.completion_status = None
+        session.completion_message = None
+        session.agent_task_completed_at = None
+        session.error_message = None
+        session.last_activity = now
+        session.tmux_socket_name = self._tmux_socket_name()
+        self._cache_session_node(session)
+
+        if session.provider == "codex-fork":
+            self.codex_fork_runtime_owner[session.id] = session.parent_session_id or session.id
+            self._reset_codex_fork_lifecycle_reducer(session.id)
+            self._start_codex_fork_event_monitor(session, from_eof=False)
+
+        self._save_state()
+        logger.info(
+            "Revived stopped session %s from tmux client event for %s",
+            session.id,
+            normalized_tmux_session,
+        )
+        return session.id
+
+    def _reset_codex_fork_lifecycle_reducer(self, session_id: str) -> None:
+        """Clear in-memory codex-fork reducer state before replaying runtime events."""
+        self.codex_fork_lifecycle.pop(session_id, None)
+        self.codex_fork_turns_in_flight.discard(session_id)
+        self.codex_fork_wait_resume_state.pop(session_id, None)
+        self.codex_fork_wait_kind.pop(session_id, None)
+        self.codex_fork_last_seq.pop(session_id, None)
+        self.codex_fork_session_epoch.pop(session_id, None)
+        self.codex_fork_event_offsets.pop(session_id, None)
+        self.codex_fork_event_buffers.pop(session_id, None)
+        self.codex_fork_provider_cursors.pop(session_id, None)
+        self.codex_event_store.clear_codex_fork_provider_cursor(session_id)
 
     def _tmux_socket_name(self) -> Optional[str]:
         """Return configured tmux socket name, treating partial mocks as legacy default-server."""
