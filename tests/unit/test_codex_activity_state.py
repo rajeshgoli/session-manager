@@ -773,11 +773,35 @@ def test_codex_fork_idle_reducer_does_not_capture_pane_on_read_path():
         "cause_event_type": "turn_complete",
         "updated_at": datetime.now().isoformat(),
     }
+    manager.tmux.get_pane_title = MagicMock(return_value=None)
     manager.tmux.capture_pane = MagicMock(
         return_value="• Working (17m 46s • esc to interrupt) · 1 background terminal running · /ps to view"
     )
 
     assert manager.get_activity_state(session.id) == "idle"
+    manager.tmux.capture_pane.assert_not_called()
+
+
+def test_codex_fork_idle_reducer_uses_active_title_spinner_without_capture():
+    manager = _make_manager()
+    session = Session(
+        id="cf-title",
+        name="codex-fork-cf-title",
+        working_dir="/tmp",
+        tmux_session="codex-fork-cf-title",
+        provider="codex-fork",
+        status=SessionStatus.IDLE,
+    )
+    manager.sessions[session.id] = session
+    manager.codex_fork_lifecycle[session.id] = {
+        "state": "idle",
+        "cause_event_type": "turn_complete",
+        "updated_at": datetime.now().isoformat(),
+    }
+    manager.tmux.get_pane_title = MagicMock(return_value=f"{chr(0x283C)} project-title")
+    manager.tmux.capture_pane = MagicMock(return_value="› tab to queue message")
+
+    assert manager.get_activity_state(session.id) == "working"
     manager.tmux.capture_pane.assert_not_called()
 
 
@@ -797,9 +821,11 @@ def test_codex_fork_idle_reducer_remains_idle_without_active_pane_markers():
         "cause_event_type": "turn_complete",
         "updated_at": datetime.now().isoformat(),
     }
+    manager.tmux.get_pane_title = MagicMock(return_value=None)
     manager.tmux.capture_pane = MagicMock(return_value="› tab to queue message")
 
     assert manager.get_activity_state(session.id) == "idle"
+    manager.tmux.capture_pane.assert_not_called()
 
 
 def test_codex_fork_idle_reducer_ignores_stale_background_terminal_scrollback():
@@ -818,6 +844,7 @@ def test_codex_fork_idle_reducer_ignores_stale_background_terminal_scrollback():
         "cause_event_type": "turn_complete",
         "updated_at": datetime.now().isoformat(),
     }
+    manager.tmux.get_pane_title = MagicMock(return_value=None)
     manager.tmux.capture_pane = MagicMock(
         return_value="\n".join(
             [
@@ -832,3 +859,4 @@ def test_codex_fork_idle_reducer_ignores_stale_background_terminal_scrollback():
     )
 
     assert manager.get_activity_state(session.id) == "idle"
+    manager.tmux.capture_pane.assert_not_called()

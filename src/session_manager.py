@@ -6962,54 +6962,58 @@ done
         """Compute activity state for codex-fork sessions from reducer state."""
         if session.status == SessionStatus.STOPPED:
             return ActivityState.STOPPED.value
-        if session.status == SessionStatus.IDLE:
-            return ActivityState.IDLE.value
 
         lifecycle = self.codex_fork_lifecycle.get(session.id)
-        if not lifecycle:
-            return ActivityState.THINKING.value
-
-        state_name = lifecycle.get("state")
-        if state_name == "running":
-            return ActivityState.WORKING.value
-        if state_name == "idle":
-            return ActivityState.IDLE.value
+        state_name = lifecycle.get("state") if lifecycle else None
         if state_name == "waiting_on_approval":
             return ActivityState.WAITING_PERMISSION.value
         if state_name == "waiting_on_user_input":
             return ActivityState.WAITING_INPUT.value
         if state_name in ("shutdown", "error"):
             return ActivityState.STOPPED.value
+        if state_name == "running" and session.status != SessionStatus.IDLE:
+            return ActivityState.WORKING.value
+
+        if self._codex_fork_pane_indicates_working(session):
+            return ActivityState.WORKING.value
+
+        if session.status == SessionStatus.IDLE:
+            return ActivityState.IDLE.value
+
+        if state_name == "running":
+            return ActivityState.WORKING.value
+        if state_name == "idle":
+            return ActivityState.IDLE.value
+        if not lifecycle:
+            return ActivityState.THINKING.value
         return ActivityState.THINKING.value
 
     @staticmethod
-    def _codex_fork_pane_text_indicates_working(pane_text: str) -> bool:
-        """Return True when codex-fork TUI text shows active work not modeled by events."""
-        if not pane_text:
+    def _codex_fork_pane_title_indicates_working(pane_title: str) -> bool:
+        """Return True when the codex-fork pane title has an active spinner prefix."""
+        if not pane_title:
             return False
-        pane_tail = "\n".join(
-            line
-            for line in pane_text.splitlines()[-5:]
-            if line.strip()
-        )
-        markers = (
-            "Working (",
-            "Waiting for background terminal",
-            "background terminal running",
-            "background terminals running",
-        )
-        return any(marker in pane_tail for marker in markers)
+        title = pane_title.strip()
+        first_token, separator, _ = title.partition(" ")
+        if not separator or len(first_token) != 1:
+            return False
+        codepoint = ord(first_token)
+        return 0x2801 <= codepoint <= 0x28FF
 
     def _codex_fork_pane_indicates_working(self, session: Session) -> bool:
         """Use the live codex-fork pane as a bounded correction for idle reducer gaps."""
         if not session.tmux_session:
             return False
-        try:
-            pane_text = self.tmux.capture_pane(session.tmux_session, lines=8)
-        except Exception:
-            logger.debug("Failed to capture codex-fork pane for activity projection", exc_info=True)
-            return False
-        return self._codex_fork_pane_text_indicates_working(pane_text or "")
+        title_getter = getattr(self.tmux, "get_pane_title", None)
+        if callable(title_getter):
+            try:
+                pane_title = title_getter(session.tmux_session)
+            except Exception:
+                logger.debug("Failed to read codex-fork pane title for activity projection", exc_info=True)
+            else:
+                if self._codex_fork_pane_title_indicates_working(pane_title or ""):
+                    return True
+        return False
 
     def _compute_codex_app_activity(self, session: Session) -> str:
         """Compute activity state for codex-app sessions (no tmux/output monitor)."""
