@@ -17,6 +17,20 @@ credentials, or mutating opt-in are reported as skipped when their preconditions
 are not supplied. Retired surfaces are Rust-target checks; current Python may
 still expose them during the migration window.
 
+Fixture values are supplied explicitly:
+
+```bash
+python -m scripts.rust_migration.contracts \
+  --target python \
+  --base-url http://127.0.0.1:8420 \
+  --session-id <disposable-session-id> \
+  --fixture app_name=session-manager-android \
+  --fixture codex_app_session_id=<codex-app-session-id>
+```
+
+Mutating checks never run unless `--include-mutating` is present. Use only
+disposable fixture sessions for checks such as retained mobile/API session stop.
+
 ## Baseline Runner
 
 Run a safe local baseline:
@@ -28,4 +42,3 @@ python -m scripts.rust_migration.baseline --base-url http://127.0.0.1:8420 --rep
 The report records numeric data where it is safe to measure and marks missing
 instrumentation or unsafe workloads explicitly. Do not commit machine-local
 baseline reports if they contain host-specific or private runtime details.
-

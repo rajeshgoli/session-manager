@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -38,6 +39,10 @@ class ContractCheck:
     command: tuple[str, ...] = ()
     expected_exit: tuple[int, ...] = ()
     expected_output_contains_any: tuple[str, ...] = ()
+    body: Any = None
+    read_mode: str = "bytes"
+    read_bytes: int = 1024
+    expected_body_contains_any: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ContractCheck":
@@ -56,6 +61,12 @@ class ContractCheck:
             expected_exit=tuple(int(v) for v in raw.get("expected_exit", [])),
             expected_output_contains_any=tuple(
                 str(v) for v in raw.get("expected_output_contains_any", [])
+            ),
+            body=raw.get("body"),
+            read_mode=str(raw.get("read_mode", "bytes")),
+            read_bytes=int(raw.get("read_bytes", 1024)),
+            expected_body_contains_any=tuple(
+                str(v) for v in raw.get("expected_body_contains_any", [])
             ),
         )
 
@@ -125,16 +136,20 @@ def run_checks(
     base_url: str | None,
     sm_binary: str,
     session_id: str | None,
+    fixtures: dict[str, str] | None = None,
     include_mutating: bool,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
+    fixture_values = dict(fixtures or {})
+    if session_id:
+        fixture_values.setdefault("session_id", session_id)
     for check in checks_for_target(manifest.checks, target, include_mutating):
         skip_reason = _skip_reason(
             check,
             base_url=base_url,
             sm_binary=sm_binary,
-            session_id=session_id,
+            fixtures=fixture_values,
             include_mutating=include_mutating,
         )
         if skip_reason:
@@ -142,7 +157,7 @@ def run_checks(
             continue
 
         if check.surface == "http":
-            results.append(_run_http_check(check, base_url or "", session_id, timeout_seconds))
+            results.append(_run_http_check(check, base_url or "", fixture_values, timeout_seconds))
         elif check.surface == "cli":
             results.append(_run_cli_check(check, sm_binary, timeout_seconds))
         else:
@@ -162,46 +177,62 @@ def _skip_reason(
     *,
     base_url: str | None,
     sm_binary: str,
-    session_id: str | None,
+    fixtures: dict[str, str],
     include_mutating: bool,
 ) -> str | None:
     if "live_server" in check.preconditions and not base_url:
         return "live server URL not supplied"
     if "sm_cli" in check.preconditions and not shutil.which(sm_binary):
         return f"sm CLI not found: {sm_binary}"
-    if "session_id" in check.preconditions and not session_id:
-        return "session id not supplied"
+    for precondition in check.preconditions:
+        if precondition == "session_id" and not fixtures.get("session_id"):
+            return "session id not supplied"
+        if precondition.startswith("fixture:"):
+            fixture_name = precondition.split(":", 1)[1]
+            if not fixtures.get(fixture_name):
+                return f"fixture not supplied: {fixture_name}"
     if "mutating_opt_in" in check.preconditions and not include_mutating:
         return "mutating check requires --include-mutating"
     return None
 
 
 def _run_http_check(
-    check: ContractCheck, base_url: str, session_id: str | None, timeout_seconds: float
+    check: ContractCheck, base_url: str, fixtures: dict[str, str], timeout_seconds: float
 ) -> CheckResult:
     assert check.method and check.path
-    path = check.path
-    if session_id:
-        path = path.replace("{session_id}", session_id)
+    path = _render_template(check.path, fixtures)
     url = base_url.rstrip("/") + path
     start = time.perf_counter()
     data = None
     headers = {}
     if check.method not in {"GET", "HEAD"}:
-        data = b"{}"
+        body = {} if check.body is None else _render_template(check.body, fixtures)
+        data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=check.method)
+    body_text = ""
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             status = response.status
-            response.read(1024)
+            body_text = _read_response_text(response, check)
     except urllib.error.HTTPError as exc:
         status = exc.code
+        body_text = _read_response_text(exc, check)
     except (urllib.error.URLError, TimeoutError) as exc:
         return _result(check, "failed", _elapsed_ms(start), f"live server unavailable: {exc}")
 
-    if status in check.expected_status:
+    body_ok = not check.expected_body_contains_any or any(
+        expected in body_text for expected in check.expected_body_contains_any
+    )
+    if status in check.expected_status and body_ok:
         return _result(check, "passed", _elapsed_ms(start), f"HTTP {status}")
+    if not body_ok:
+        return _result(
+            check,
+            "failed",
+            _elapsed_ms(start),
+            f"HTTP {status}; body missing one of {list(check.expected_body_contains_any)}",
+        )
     return _result(
         check,
         "failed",
@@ -237,6 +268,31 @@ def _run_cli_check(check: ContractCheck, sm_binary: str, timeout_seconds: float)
     return _result(check, "failed", _elapsed_ms(start), detail)
 
 
+def _read_response_text(response: Any, check: ContractCheck) -> str:
+    if check.read_mode == "line":
+        raw = response.readline(check.read_bytes)
+    else:
+        raw = response.read(check.read_bytes)
+    return raw.decode("utf-8", errors="replace")
+
+
+_TEMPLATE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _render_template(value: Any, fixtures: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            key = match.group(1)
+            return fixtures.get(key, match.group(0))
+
+        return _TEMPLATE_PATTERN.sub(replace, value)
+    if isinstance(value, list):
+        return [_render_template(item, fixtures) for item in value]
+    if isinstance(value, dict):
+        return {key: _render_template(item, fixtures) for key, item in value.items()}
+    return value
+
+
 def _result(
     check: ContractCheck, status: str, elapsed_ms: float | None, detail: str
 ) -> CheckResult:
@@ -263,6 +319,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--sm-binary", default="sm")
     parser.add_argument("--session-id", default=None)
+    parser.add_argument(
+        "--fixture",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Fixture value for manifest substitutions; repeatable",
+    )
     parser.add_argument("--include-mutating", action="store_true")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--json", action="store_true", help="Emit JSON report")
@@ -272,12 +335,14 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     manifest = ContractManifest.load(args.manifest)
+    fixtures = _parse_fixtures(args.fixture)
     results = run_checks(
         manifest,
         target=args.target,
         base_url=args.base_url,
         sm_binary=args.sm_binary,
         session_id=args.session_id,
+        fixtures=fixtures,
         include_mutating=args.include_mutating,
         timeout_seconds=args.timeout,
     )
@@ -301,6 +366,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{result.status.upper():7} {result.id}{elapsed}: {result.detail}")
         print(f"Summary: {summary}")
     return 1 if summary.get("failed", 0) else 0
+
+
+def _parse_fixtures(raw_items: list[str]) -> dict[str, str]:
+    fixtures: dict[str, str] = {}
+    for item in raw_items:
+        if "=" not in item:
+            raise SystemExit(f"--fixture must be KEY=VALUE, got: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--fixture key cannot be empty: {item}")
+        fixtures[key] = value
+    return fixtures
 
 
 if __name__ == "__main__":
