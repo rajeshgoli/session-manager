@@ -398,7 +398,10 @@ impl SessionRecord {
         if let Some(native_title) = native_title {
             return Some(native_title.to_owned());
         }
-        friendly_name.map(ToOwned::to_owned)
+        if let Some(friendly_name) = friendly_name {
+            return Some(friendly_name.to_owned());
+        }
+        Some(non_empty_or(self.name.clone(), &self.id))
     }
 
     fn resolved_telegram_thread_id(&self) -> Option<i64> {
@@ -733,6 +736,20 @@ mod tests {
         let response = SessionResponse::from(session);
 
         assert_eq!(response.friendly_name.as_deref(), Some("explicit-name"));
+    }
+
+    #[test]
+    fn cached_display_name_falls_back_to_session_name_or_id() {
+        let mut session = session_record("running");
+        session.friendly_name = None;
+        let response = SessionResponse::from(session.clone());
+
+        assert_eq!(response.friendly_name.as_deref(), Some("claude-abc12345"));
+
+        session.name = String::new();
+        let response = SessionResponse::from(session);
+
+        assert_eq!(response.friendly_name.as_deref(), Some("abc12345"));
     }
 
     #[test]

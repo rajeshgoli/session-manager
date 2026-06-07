@@ -284,6 +284,7 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
     assert_eq!(payload["sessions"][0]["activity_state"], "working");
     assert_eq!(payload["sessions"][0]["provider"], "claude");
     assert_eq!(payload["sessions"][1]["id"], "oldstate");
+    assert_eq!(payload["sessions"][1]["friendly_name"], "claude-oldstate");
     assert_eq!(payload["sessions"][1]["status"], "idle");
     assert_eq!(payload["sessions"][1]["activity_state"], "idle");
     assert!(payload["sessions"]
