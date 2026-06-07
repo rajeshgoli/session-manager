@@ -118,6 +118,8 @@ def test_manifest_covers_rust_only_retired_cli_surfaces():
         "cli.remind_retired",
         "cli.watch_job_retired",
         "cli.queue_policy_retired",
+        "cli.queue_policy_status_retired",
+        "cli.queue_policy_history_retired",
         "cli.telegram_retired",
         "cli.telegram_alias_retired",
         "cli.codex_legacy_retired",

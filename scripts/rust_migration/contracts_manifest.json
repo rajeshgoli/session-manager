@@ -788,6 +788,30 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
     },
     {
+      "id": "cli.queue_policy_status_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["queue", "ci-status", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
+    },
+    {
+      "id": "cli.queue_policy_history_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["queue", "ci-history", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
+    },
+    {
       "id": "cli.telegram_retired",
       "surface": "cli",
       "classification": "retired",
