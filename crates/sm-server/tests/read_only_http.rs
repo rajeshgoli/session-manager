@@ -3,12 +3,25 @@ use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
 };
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use sm_server::{
-    config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig},
+    config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig},
     http::{router, AppState},
 };
-use std::net::SocketAddr;
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tower::ServiceExt;
 
 async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
@@ -23,6 +36,25 @@ async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
 
 async fn get_json_with_host(app: axum::Router, uri: &str, host: &str) -> (StatusCode, Value) {
     get_json_with_host_and_peer(app, uri, host, None).await
+}
+
+async fn get_json_with_host_and_headers(
+    app: axum::Router,
+    uri: &str,
+    host: &str,
+    headers: &[(&str, String)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().uri(uri).header("host", host);
+    for (name, value) in headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
 }
 
 async fn get_json_with_host_and_peer(
@@ -236,4 +268,430 @@ async fn absent_routes_are_not_implemented() {
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload, json!({ "detail": "Not Found" }));
+}
+
+#[tokio::test]
+async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["sessions"][0]["id"], "run12345");
+    assert_eq!(payload["sessions"][0]["friendly_name"], "Runner Native");
+    assert_eq!(payload["sessions"][0]["activity_state"], "working");
+    assert_eq!(payload["sessions"][0]["provider"], "claude");
+    assert_eq!(payload["sessions"][1]["id"], "oldstate");
+    assert_eq!(payload["sessions"][1]["friendly_name"], "claude-oldstate");
+    assert_eq!(payload["sessions"][1]["status"], "idle");
+    assert_eq!(payload["sessions"][1]["activity_state"], "idle");
+    assert!(payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|session| session["id"] != "stop1234"));
+}
+
+#[tokio::test]
+async fn sessions_can_include_stopped_sessions() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions?include_stopped=true").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 3);
+    assert_eq!(payload["sessions"][2]["id"], "stop1234");
+    assert_eq!(payload["sessions"][2]["activity_state"], "stopped");
+}
+
+#[tokio::test]
+async fn client_sessions_adds_read_only_mobile_metadata_without_termux() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/client/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let first = &payload["sessions"][0];
+    assert_eq!(first["id"], "run12345");
+    assert_eq!(first["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(
+        first["attach_descriptor"]["message"],
+        "attach tickets are not implemented in the Rust read-only scaffold"
+    );
+    assert_eq!(first["termux_attach"], Value::Null);
+    assert_eq!(first["mobile_terminal"]["supported"], false);
+    assert_eq!(first["primary_action"]["type"], "details");
+    assert!(payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|session| session["id"] != "stop1234"));
+}
+
+#[tokio::test]
+async fn sessions_missing_state_file_returns_empty_list() {
+    let state_file = unique_temp_path();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "sessions": [] }));
+}
+
+#[tokio::test]
+async fn sessions_reject_public_host_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) = get_json_with_host(app, "/sessions", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        payload,
+        json!({
+            "detail": "Authentication required",
+            "login_url": "/auth/google/login?next=%2Fsessions"
+        })
+    );
+}
+
+#[tokio::test]
+async fn sessions_allow_public_device_bearer_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+    let token = device_access_token("session-cookie-secret", "rajesh@example.com", "Rajesh");
+
+    let (status, payload) = get_json_with_host_and_headers(
+        app,
+        "/sessions",
+        "sm.example.com",
+        &[("authorization", format!("Bearer {token}"))],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn client_sessions_allow_public_browser_cookie_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+    let cookie = starlette_session_cookie(
+        "session-cookie-secret",
+        json!({
+            "google_authenticated": true,
+            "google_email": "rajesh@example.com",
+            "google_name": "Rajesh"
+        }),
+    );
+
+    let (status, payload) = get_json_with_host_and_headers(
+        app,
+        "/client/sessions",
+        "sm.example.com",
+        &[("cookie", format!("sm_auth={cookie}"))],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn auth_session_reports_device_bearer_when_google_auth_enabled() {
+    let token = device_access_token("session-cookie-secret", "rajesh@example.com", "Rajesh");
+    let app = router(AppState::new(config_with_state_file_and_auth(
+        &unique_temp_path(),
+    )));
+
+    let (status, payload) = get_json_with_host_and_headers(
+        app,
+        "/auth/session",
+        "sm.example.com",
+        &[("authorization", format!("Bearer {token}"))],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "enabled": true,
+            "authenticated": true,
+            "bypass": false,
+            "email": "rajesh@example.com",
+            "name": "Rajesh",
+            "auth_type": "device_bearer"
+        })
+    );
+}
+
+#[tokio::test]
+async fn client_sessions_allow_local_bypass_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) = get_json_with_host_and_peer(
+        app,
+        "/client/sessions",
+        "localhost:8421",
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn sessions_project_top_level_registry_and_adoption_state() {
+    let state_file = write_registry_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let sessions = payload["sessions"].as_array().unwrap();
+    let maintainer = sessions
+        .iter()
+        .find(|session| session["id"] == "em123456")
+        .unwrap();
+    let child = sessions
+        .iter()
+        .find(|session| session["id"] == "child001")
+        .unwrap();
+    assert_eq!(maintainer["aliases"], json!(["maintainer"]));
+    assert_eq!(maintainer["is_maintainer"], true);
+    assert_eq!(maintainer["friendly_name"], "maintainer");
+    assert_eq!(child["aliases"], json!(["reviewer"]));
+    assert_eq!(
+        child["pending_adoption_proposals"],
+        json!([
+            {
+                "id": "proposal1",
+                "proposer_session_id": "em123456",
+                "proposer_name": "maintainer",
+                "target_session_id": "child001",
+                "created_at": "2026-06-01T00:03:00",
+                "status": "pending",
+                "decided_at": null
+            }
+        ])
+    );
+}
+
+fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
+    AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        ..AppConfig::default()
+    }
+}
+
+fn config_with_state_file_and_auth(state_file: &PathBuf) -> AppConfig {
+    AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            client_id: Some("web-client-id".to_owned()),
+            android_client_id: Some("android-client-id".to_owned()),
+            client_secret: Some("web-client-secret".to_owned()),
+            redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+            allowlist_emails: vec!["rajesh@example.com".to_owned()],
+            session_cookie_secret: Some("session-cookie-secret".to_owned()),
+        },
+        ..AppConfig::default()
+    }
+}
+
+fn write_session_fixture() -> PathBuf {
+    let path = unique_temp_path();
+    fs::write(
+        &path,
+        json!({
+            "sessions": [
+                {
+                    "id": "run12345",
+                    "name": "claude-run12345",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-run12345",
+                    "tmux_socket_name": null,
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": "/tmp/run12345.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "Runner",
+                    "friendly_name_is_explicit": false,
+                    "friendly_name_updated_at_ns": 10,
+                    "native_title": "Runner Native",
+                    "native_title_updated_at_ns": 20,
+                    "current_task": "Working",
+                    "tokens_used": 42,
+                    "context_monitor_enabled": true
+                },
+                {
+                    "id": "oldstate",
+                    "name": "claude-oldstate",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-oldstate",
+                    "log_file": "/tmp/oldstate.log",
+                    "status": "waiting_permission",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "stop1234",
+                    "name": "claude-stop1234",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-stop1234",
+                    "log_file": "/tmp/stop1234.log",
+                    "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn write_registry_fixture() -> PathBuf {
+    let path = unique_temp_path();
+    fs::write(
+        &path,
+        json!({
+            "sessions": [
+                {
+                    "id": "em123456",
+                    "name": "claude-em123456",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-em123456",
+                    "log_file": "/tmp/em123456.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "em-ops",
+                    "is_em": true
+                },
+                {
+                    "id": "child001",
+                    "name": "claude-child001",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-child001",
+                    "log_file": "/tmp/child001.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ],
+            "maintainer_session_id": "em123456",
+            "agent_registrations": [
+                {
+                    "role": "Reviewer",
+                    "session_id": "child001",
+                    "created_at": "2026-06-01T00:02:00"
+                }
+            ],
+            "adoption_proposals": [
+                {
+                    "id": "proposal1",
+                    "proposer_session_id": "em123456",
+                    "target_session_id": "child001",
+                    "created_at": "2026-06-01T00:03:00",
+                    "status": "pending",
+                    "decided_at": null
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn unique_temp_path() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sm-rust-read-only-sessions-{}-{nanos}-{}.json",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn device_access_token(secret: &str, email: &str, name: &str) -> String {
+    let exp = unix_timestamp() + 3600;
+    let payload = json!({
+        "v": 1,
+        "type": "device_access",
+        "email": email,
+        "name": name,
+        "iat": unix_timestamp(),
+        "exp": exp
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signature = hmac_sha256_urlsafe(secret.as_bytes(), payload_b64.as_bytes());
+    format!("smat_{payload_b64}.{signature}")
+}
+
+fn starlette_session_cookie(secret: &str, payload: Value) -> String {
+    let payload_b64 = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+    let timestamp_b64 = URL_SAFE_NO_PAD.encode(int_to_bytes(unix_timestamp() as u64));
+    let value = format!("{payload_b64}.{timestamp_b64}");
+    let derived_key = itsdangerous_django_concat_key(secret);
+    let signature = hmac_sha1_urlsafe(&derived_key, value.as_bytes());
+    format!("{value}.{signature}")
+}
+
+fn hmac_sha256_urlsafe(key: &[u8], value: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(value);
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn hmac_sha1_urlsafe(key: &[u8], value: &[u8]) -> String {
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).unwrap();
+    mac.update(value);
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn itsdangerous_django_concat_key(secret: &str) -> Vec<u8> {
+    let mut hasher = Sha1::new();
+    hasher.update(b"itsdangerous.Signersigner");
+    hasher.update(secret.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn int_to_bytes(value: u64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first_nonzero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    bytes[first_nonzero..].to_vec()
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
