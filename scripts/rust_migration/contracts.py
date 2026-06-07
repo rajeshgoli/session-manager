@@ -138,13 +138,24 @@ def run_checks(
     session_id: str | None,
     fixtures: dict[str, str] | None = None,
     include_mutating: bool,
+    check_ids: set[str] | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     fixture_values = dict(fixtures or {})
     if session_id:
         fixture_values.setdefault("session_id", session_id)
-    for check in checks_for_target(manifest.checks, target, include_mutating):
+    selected_checks = checks_for_target(manifest.checks, target, include_mutating)
+    if check_ids is not None:
+        known_ids = {check.id for check in selected_checks}
+        unknown_ids = sorted(check_ids - known_ids)
+        if unknown_ids:
+            raise ValueError(
+                f"unknown check id(s) for target {target}: {', '.join(unknown_ids)}"
+            )
+    for check in selected_checks:
+        if check_ids is not None and check.id not in check_ids:
+            continue
         skip_reason = _skip_reason(
             check,
             base_url=base_url,
@@ -320,6 +331,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sm-binary", default="sm")
     parser.add_argument("--session-id", default=None)
     parser.add_argument(
+        "--check-id",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="Run only the named check id; repeatable",
+    )
+    parser.add_argument(
         "--fixture",
         action="append",
         default=[],
@@ -336,16 +354,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     manifest = ContractManifest.load(args.manifest)
     fixtures = _parse_fixtures(args.fixture)
-    results = run_checks(
-        manifest,
-        target=args.target,
-        base_url=args.base_url,
-        sm_binary=args.sm_binary,
-        session_id=args.session_id,
-        fixtures=fixtures,
-        include_mutating=args.include_mutating,
-        timeout_seconds=args.timeout,
-    )
+    try:
+        results = run_checks(
+            manifest,
+            target=args.target,
+            base_url=args.base_url,
+            sm_binary=args.sm_binary,
+            session_id=args.session_id,
+            fixtures=fixtures,
+            check_ids=set(args.check_id) if args.check_id else None,
+            include_mutating=args.include_mutating,
+            timeout_seconds=args.timeout,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     summary = summarize(results)
     if args.json:
         print(

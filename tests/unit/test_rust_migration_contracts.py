@@ -226,3 +226,39 @@ def test_fixture_precondition_reports_missing_value():
 
     assert result_by_id["http.app_artifact_metadata"].status == "skipped"
     assert "app_name" in result_by_id["http.app_artifact_metadata"].detail
+
+
+def test_check_id_filter_limits_selected_checks():
+    manifest = ContractManifest.load()
+    results = run_checks(
+        manifest,
+        target="python",
+        base_url="http://127.0.0.1:8420",
+        sm_binary="sm",
+        session_id=None,
+        fixtures={},
+        check_ids={"http.health"},
+        include_mutating=False,
+    )
+
+    assert [result.id for result in results] == ["http.health"]
+
+
+def test_check_id_filter_rejects_unknown_ids():
+    manifest = ContractManifest.load()
+
+    try:
+        run_checks(
+            manifest,
+            target="python",
+            base_url="http://127.0.0.1:8420",
+            sm_binary="sm",
+            session_id=None,
+            fixtures={},
+            check_ids={"does.not.exist"},
+            include_mutating=False,
+        )
+    except ValueError as exc:
+        assert "does.not.exist" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")

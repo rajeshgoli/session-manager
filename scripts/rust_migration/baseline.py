@@ -35,6 +35,7 @@ def run_baseline(
             sm_binary=sm_binary,
             session_id=None,
             fixtures={},
+            check_ids=None,
             include_mutating=False,
         )
         runs.append([result.to_dict() for result in results])
