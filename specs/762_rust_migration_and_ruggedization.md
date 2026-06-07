@@ -1021,7 +1021,7 @@ Response-relay Stage 3 contract tests must include stale-output suppression, no-
 
 | Input / Trigger | Internal Behavior | Externally Depended Output / Side Effect | Rust Contract |
 |-----------------|-------------------|------------------------------------------|---------------|
-| retire/current Python kill path | Provider-specific cleanup: close codex-app, orphan pending requests, cancel codex-fork monitors and unregister remote bridge, unlink runtime artifacts, kill tmux if applicable, mark stopped/killed/completed timestamps, unregister roles, and save state. | Retiring a session stops runtime, pending requests unblock, queues/roles do not point at dead sessions. Current Python also exposes `sm kill` as an alias. | Preserve provider cleanup and stopped record semantics through `retire`; do not port redundant `sm kill` alias. |
+| retire/current Python session-stop paths | Provider-specific cleanup: close codex-app, orphan pending requests, cancel codex-fork monitors and unregister remote bridge, unlink runtime artifacts, kill tmux if applicable, mark stopped/killed/completed timestamps, unregister roles, and save state. | Retiring a session stops runtime, pending requests unblock, queues/roles do not point at dead sessions. Current Python also exposes `sm kill` as a CLI alias and HTTP/mobile session-stop APIs such as `POST /sessions/{target_session_id}/kill`. | Preserve provider cleanup and stopped record semantics through retained `retire` and API/mobile stop behavior; do not port the redundant `sm kill` CLI alias. |
 | restore | Validate stopped/runtime-missing, resolve resume id, rebuild provider runtime with resume args/thread id, register remote bridge, reset completion/error/stopped fields, restart codex-fork monitor, mark codex-app idle, save, and repair Telegram topic asynchronously. | Stopped sessions can be restored in place without changing id/name/topic. | Preserve in-place restore, provider-specific resume requirements, and failure messages. |
 | clear | Provider/session clear stops current runtime or input, handles skip fences for subsequent Stop hook, may create new prompt, and prevents stale context-monitor alerts from parent delivery. | Agents can clear/reset without triggering false stop notifications. | Preserve clear/skip-fence interaction with message queue. |
 | tmux death | Monitor cleanup marks stopped with diagnostic but preserves record, so restore and postmortem remain possible. | `sm watch`/CLI do not lose dead sessions silently. | Preserve record-preserving cleanup and diagnostics. |
@@ -1223,7 +1223,7 @@ Status: converged after three sequential independent reviewer convergence signal
 
 Stage 5 turns the compatibility inventory, behavior handoff, and threat model into an execution plan. The goal is to make the Rust migration measurable and reversible before any implementation ticket claims runtime ownership.
 
-Owner security feedback after the staged reviews changes the migration from broad compatibility preservation to an explicit cutover port. Generic public `sm.rajeshgo.li` should not return operational data outside an auth/proof boundary, and the high-value remote path is the native mobile app through a device-proofed public-edge/tunnel boundary. Registered nodes may use the same proof-of-possession public edge as a fallback when LAN `studio.local` is unavailable. Email/human recipient delivery and inbound email remain the fallback external channel after Telegram removal. Public browser data, Telegram control, `sm what`, redundant `sm kill`, dispatch, Termux, watch-job, standalone reminders, queue policy/CI helper sprawl, public unauthenticated artifacts, and similar cruft are no longer Rust targets.
+Owner security feedback after the staged reviews changes the migration from broad compatibility preservation to an explicit cutover port. Generic public `sm.rajeshgo.li` should not return operational data outside an auth/proof boundary, and the high-value remote path is the native mobile app through a device-proofed public-edge/tunnel boundary. Registered nodes may use the same proof-of-possession public edge as a fallback when LAN `studio.local` is unavailable. Email/human recipient delivery and inbound email remain the fallback external channel after Telegram removal. Public browser data, Telegram control, `sm what`, the redundant `sm kill` CLI alias, dispatch, Termux, watch-job, standalone reminders, queue policy/CI helper sprawl, public unauthenticated artifacts, and similar cruft are no longer Rust targets.
 
 The owner-approved Stage 5 position is a deliberate cutover scope:
 
@@ -1232,7 +1232,8 @@ The owner-approved Stage 5 position is a deliberate cutover scope:
 - native `sm` mobile app flows and on-the-go attach remain first-class release blockers.
 - email/human recipient delivery and inbound email remain the fallback external channel after Telegram removal.
 - generic public browser/watch operational data is removed; local/authenticated/proofed diagnostics may remain.
-- Telegram, `sm what`, redundant `sm kill`, dispatch, Termux attach, watch-job, standalone reminders, queue policy/CI helpers, and public unauthenticated artifacts are not ported.
+- Telegram, `sm what`, the redundant `sm kill` CLI alias, dispatch, Termux attach, watch-job, standalone reminders, queue policy/CI helpers, and public unauthenticated artifacts are not ported.
+- retiring the `sm kill` CLI alias does not retire retained HTTP/mobile session-stop APIs; preserve `POST /sessions/{target_session_id}/kill` behavior or retarget the native app through a reviewed replacement with fixtures.
 - public remote access requires public-edge/device or node proof before origin, followed by origin auth/capability checks.
 - Python and Rust must not both write the same durable stores during normal operation.
 - rollout must be backup-first, rehearsal-first, and rollback-tested before live cutover.
@@ -1296,7 +1297,7 @@ Rollback must restore Python service ownership and Python-compatible state from 
 
 ### Cutover Decisions
 
-For the first Rust release, Stage 5 now accepts the breaking reductions recorded in [cutover scope](762_stage5_artifacts/cutover_scope.md) and [rollout plan](762_stage5_artifacts/rollout_plan.md). Public browser/watch operational data, Telegram control, `sm what`, redundant `sm kill`, dispatch, Termux attach, watch-job, standalone reminders, queue policy/CI helpers, public unauthenticated app artifacts, non-loopback hook permissiveness, node hook-secret fallback, and unsafe legacy authority assumptions are not compatibility targets. Email/human recipient delivery and inbound email stay retained as the fallback external channel, with stricter worker proof and route allowlisting. Rust should keep the stable core and make removed surfaces fail clearly.
+For the first Rust release, Stage 5 now accepts the breaking reductions recorded in [cutover scope](762_stage5_artifacts/cutover_scope.md) and [rollout plan](762_stage5_artifacts/rollout_plan.md). Public browser/watch operational data, Telegram control, `sm what`, the redundant `sm kill` CLI alias, dispatch, Termux attach, watch-job, standalone reminders, queue policy/CI helpers, public unauthenticated app artifacts, non-loopback hook permissiveness, node hook-secret fallback, and unsafe legacy authority assumptions are not compatibility targets. Email/human recipient delivery and inbound email stay retained as the fallback external channel, with stricter worker proof and route allowlisting. Rust should keep the stable core and make removed surfaces fail clearly.
 
 Hardening remains required for retained surfaces: typed auth policies, secret redaction, abuse-case fixtures, route-local secret tests, mobile attach atomicity or replacement proof fixtures, payload/path validation, audit reliability, and operator-visible diagnostics.
 
@@ -1328,6 +1329,6 @@ Expected workstreams include:
 - tmux/process orchestration.
 - message queue, parent-wake, notify-on-stop, response-relay, and Codex-review behavior.
 - integrations: native mobile, email/human fallback delivery, inbound email, proofed artifacts, GitHub/Codex reviews, and remote nodes.
-- retired-surface absence fixtures for Telegram, `sm what`, `sm kill`, dispatch, Termux, watch-job, standalone reminders, queue policy/CI helpers, public browser operational data, and public unauthenticated artifacts.
+- retired-surface absence fixtures for Telegram, `sm what`, the `sm kill` CLI alias, dispatch, Termux, watch-job, standalone reminders, queue policy/CI helpers, public browser operational data, and public unauthenticated artifacts.
 - ruggedization and threat-model mitigations.
 - migration execution, cutover, rollback, and operations.
