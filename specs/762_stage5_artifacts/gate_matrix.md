@@ -6,7 +6,7 @@ Status: converged after three sequential independent reviewer convergence signal
 
 | Gate | Required Evidence | Blocks |
 | --- | --- | --- |
-| value/falsifiability | Python baseline, Rust spike or prototype comparison, and comparison against feasible Python hardening. | Filing runtime replacement tickets. |
+| value/falsifiability | Current Python baseline, Rust spike or prototype comparison, and recorded owner waiver for Python hardening/config variants. | Filing runtime replacement tickets. |
 | contract capture | Retained Stage 2 route/CLI/protocol/schema/client/config/persistence artifacts converted into executable tests against Python; removed surfaces from `cutover_scope.md` converted into retirement/absence tests. | Any Rust route/CLI/protocol implementation claiming compatibility. |
 | internal behavior | Stage 3 ordered recovery and state-transition fixtures pass against Python. | Rust ownership of queue, sessions, tmux, mobile attach, provider events, and external delivery. |
 | threat controls | Stage 4 threat register and secret matrix have tests for auth, route-local secrets, abuse cases, no-secret logging, retained email/GitHub integrations, and Telegram retirement/absence. | Public exposure, mobile terminal, hooks, node agents, queue runner, app upload, retained email/GitHub integrations, and retired Telegram denial/absence fixtures. |
@@ -35,7 +35,7 @@ Baseline measurements must use retained real state where safe plus fixture workl
 - app artifact metadata/latest/hash serving and upload validation.
 - local/auth/proofed watch diagnostics, SSE `/events`, `/events/state`, and denial of public unauthenticated operational watch data.
 
-Feasible Python hardening/config comparisons must include measured or explicitly ruled-out variants for:
+Python hardening/config variant comparisons are owner-waived for the Rust cutover value gate. Do not spend implementation time on throwaway Python-hardening branches unless the owner explicitly reopens that decision. The baseline artifact should record this waiver instead of measuring:
 
 - disabling integrations that are already disabled or unused in the current config.
 - reducing retained event/log scan windows where compatible.
@@ -47,7 +47,7 @@ Feasible Python hardening/config comparisons must include measured or explicitly
 
 These are acceptance targets for the first replacement release:
 
-- Memory: Rust loaded median RSS and USS must be at least 25% lower than the best measured Python-compatible baseline, or at least 100 MiB RSS and 75 MiB USS lower when those absolute thresholds are smaller. Rust idle median RSS and USS must be at least 15% lower, or at least 50 MiB lower when that absolute threshold is smaller. No first-class workload may use more than 5% higher RSS/USS than the Python-compatible baseline without an approved mitigation.
+- Memory: Rust loaded median RSS and USS must be at least 25% lower than the current Python baseline, or at least 100 MiB RSS and 75 MiB USS lower when those absolute thresholds are smaller. Rust idle median RSS and USS must be at least 15% lower, or at least 50 MiB lower when that absolute threshold is smaller. No first-class workload may use more than 5% higher RSS/USS than the Python baseline without an approved mitigation.
 - Latency: p95 latency for first-class mobile attach/auth/bootstrap, hook ingestion, queue wake delivery, and session-control APIs must be no worse than Python by more than 10% unless an explicit mitigation is approved.
 - Startup/recovery: Rust restore/recovery must be no slower than Python by more than 10% for retained state, and must not change recovery ordering contracts.
 - Reliability: contract fixtures must pass with zero known compatibility regressions for first-class mobile, CLI/operator, queue, hooks, session lifecycle, and persistence surfaces.
