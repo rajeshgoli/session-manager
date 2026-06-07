@@ -253,6 +253,7 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(payload["sessions"][0]["id"], "run12345");
+    assert_eq!(payload["sessions"][0]["friendly_name"], "Runner Native");
     assert_eq!(payload["sessions"][0]["activity_state"], "working");
     assert_eq!(payload["sessions"][0]["provider"], "claude");
     assert_eq!(payload["sessions"][1]["id"], "oldstate");
@@ -342,6 +343,10 @@ fn write_session_fixture() -> PathBuf {
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",
                     "friendly_name": "Runner",
+                    "friendly_name_is_explicit": false,
+                    "friendly_name_updated_at_ns": 10,
+                    "native_title": "Runner Native",
+                    "native_title_updated_at_ns": 20,
                     "current_task": "Working",
                     "tokens_used": 42,
                     "context_monitor_enabled": true

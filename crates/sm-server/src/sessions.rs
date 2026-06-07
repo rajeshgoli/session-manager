@@ -7,14 +7,34 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
+const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     state_file: PathBuf,
+    legacy_state_file: Option<PathBuf>,
 }
 
 impl SessionStore {
     pub fn new(state_file: PathBuf) -> Self {
-        Self { state_file }
+        let legacy_state_file = if state_file == expand_home(DEFAULT_SESSION_STATE_FILE) {
+            Some(PathBuf::from(LEGACY_TMP_SESSION_STATE_FILE))
+        } else {
+            None
+        };
+        Self {
+            state_file,
+            legacy_state_file,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
+        Self {
+            state_file,
+            legacy_state_file: Some(legacy_state_file),
+        }
     }
 
     pub fn list_sessions(&self, include_stopped: bool) -> Result<Vec<SessionRecord>> {
@@ -27,18 +47,25 @@ impl SessionStore {
     }
 
     fn load_snapshot(&self) -> Result<StateSnapshot> {
-        if !self.state_file.exists() {
+        let state_file = self.readable_state_file();
+        if !state_file.exists() {
             return Ok(StateSnapshot::default());
         }
-        let content = fs::read_to_string(&self.state_file).with_context(|| {
-            format!("failed to read session state {}", self.state_file.display())
-        })?;
-        serde_json::from_str(&content).with_context(|| {
-            format!(
-                "failed to parse session state {}",
-                self.state_file.display()
-            )
-        })
+        let content = fs::read_to_string(&state_file)
+            .with_context(|| format!("failed to read session state {}", state_file.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse session state {}", state_file.display()))
+    }
+
+    fn readable_state_file(&self) -> PathBuf {
+        if !self.state_file.exists() {
+            if let Some(legacy_state_file) = &self.legacy_state_file {
+                if legacy_state_file.exists() {
+                    return legacy_state_file.clone();
+                }
+            }
+        }
+        self.state_file.clone()
     }
 }
 
@@ -85,6 +112,16 @@ pub struct SessionRecord {
     #[serde(default)]
     pub friendly_name: Option<String>,
     #[serde(default)]
+    pub friendly_name_is_explicit: bool,
+    #[serde(default)]
+    pub friendly_name_updated_at_ns: Option<i64>,
+    #[serde(default)]
+    pub native_title: Option<String>,
+    #[serde(default)]
+    pub native_title_updated_at_ns: Option<i64>,
+    #[serde(default)]
+    pub native_title_source_mtime_ns: Option<i64>,
+    #[serde(default)]
     pub telegram_chat_id: Option<i64>,
     #[serde(default)]
     pub telegram_thread_id: Option<i64>,
@@ -127,6 +164,40 @@ pub struct SessionRecord {
 impl SessionRecord {
     fn is_stopped(&self) -> bool {
         normalized_status(&self.status) == "stopped"
+    }
+
+    fn cached_display_name(&self) -> Option<String> {
+        let native_title = self.native_title.as_deref().filter(|value| {
+            matches!(
+                self.provider.as_str(),
+                "claude" | "codex" | "codex-app" | "codex-fork"
+            ) && !value.trim().is_empty()
+        });
+        let friendly_name = self
+            .friendly_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        let friendly_name_updated_at_ns = self.friendly_name_updated_at_ns.unwrap_or(0);
+        let native_title_updated_at_ns = self
+            .native_title_updated_at_ns
+            .or(self.native_title_source_mtime_ns)
+            .unwrap_or(0);
+
+        if let (Some(friendly_name), Some(native_title)) = (friendly_name, native_title) {
+            if friendly_name_updated_at_ns >= native_title_updated_at_ns {
+                return Some(friendly_name.to_owned());
+            }
+            return Some(native_title.to_owned());
+        }
+        if self.friendly_name_is_explicit {
+            if let Some(friendly_name) = friendly_name {
+                return Some(friendly_name.to_owned());
+            }
+        }
+        if let Some(native_title) = native_title {
+            return Some(native_title.to_owned());
+        }
+        friendly_name.map(ToOwned::to_owned)
     }
 }
 
@@ -194,6 +265,7 @@ pub struct SessionResponse {
 impl From<SessionRecord> for SessionResponse {
     fn from(session: SessionRecord) -> Self {
         let status = normalized_status(&session.status);
+        let friendly_name = session.cached_display_name();
         Self {
             id: session.id,
             name: session.name,
@@ -213,7 +285,7 @@ impl From<SessionRecord> for SessionResponse {
             forked_provider_resume_id: session.forked_provider_resume_id,
             forked_at: session.forked_at,
             forked_by_session_id: session.forked_by_session_id,
-            friendly_name: session.friendly_name,
+            friendly_name,
             telegram_chat_id: session.telegram_chat_id,
             telegram_thread_id: session.telegram_thread_id,
             current_task: session.current_task,
@@ -347,6 +419,11 @@ mod tests {
             forked_at: None,
             forked_by_session_id: None,
             friendly_name: Some("Example".to_owned()),
+            friendly_name_is_explicit: false,
+            friendly_name_updated_at_ns: None,
+            native_title: None,
+            native_title_updated_at_ns: None,
+            native_title_source_mtime_ns: None,
             telegram_chat_id: None,
             telegram_thread_id: None,
             current_task: None,
@@ -386,5 +463,75 @@ mod tests {
         assert!(response.termux_attach.is_none());
         assert_eq!(response.mobile_terminal["supported"], false);
         assert_eq!(response.primary_action.action_type, "details");
+    }
+
+    #[test]
+    fn cached_display_name_prefers_newer_native_title() {
+        let mut session = session_record("running");
+        session.friendly_name = Some("stale-friendly-name".to_owned());
+        session.friendly_name_updated_at_ns = Some(10);
+        session.native_title = Some("cached-native-title".to_owned());
+        session.native_title_updated_at_ns = Some(20);
+        let response = SessionResponse::from(session);
+
+        assert_eq!(
+            response.friendly_name.as_deref(),
+            Some("cached-native-title")
+        );
+    }
+
+    #[test]
+    fn cached_display_name_keeps_newer_explicit_friendly_name() {
+        let mut session = session_record("running");
+        session.friendly_name = Some("explicit-name".to_owned());
+        session.friendly_name_is_explicit = true;
+        session.friendly_name_updated_at_ns = Some(30);
+        session.native_title = Some("older-native-title".to_owned());
+        session.native_title_updated_at_ns = Some(20);
+        let response = SessionResponse::from(session);
+
+        assert_eq!(response.friendly_name.as_deref(), Some("explicit-name"));
+    }
+
+    #[test]
+    fn default_state_loader_reads_legacy_fallback_when_primary_missing() {
+        let state_file = unique_temp_path("primary");
+        let legacy_state_file = unique_temp_path("legacy");
+        fs::write(
+            &legacy_state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "legacy1",
+                        "name": "claude-legacy1",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-legacy1",
+                        "log_file": "/tmp/legacy1.log",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file, legacy_state_file);
+
+        let sessions = store.list_sessions(false).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "legacy1");
+    }
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "sm-rust-session-store-{label}-{}-{nanos}.json",
+            std::process::id()
+        ))
     }
 }
