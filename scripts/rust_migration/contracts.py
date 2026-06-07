@@ -25,6 +25,29 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
+class JsonExpectation:
+    path: str
+    value_type: str | None = None
+    equals: Any = None
+    has_equals: bool = False
+    one_of: tuple[Any, ...] = ()
+    contains: str | None = None
+    absent: bool = False
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "JsonExpectation":
+        return cls(
+            path=str(raw["path"]),
+            value_type=raw.get("type"),
+            equals=raw.get("equals"),
+            has_equals="equals" in raw,
+            one_of=tuple(raw.get("one_of", [])),
+            contains=raw.get("contains"),
+            absent=bool(raw.get("absent", False)),
+        )
+
+
+@dataclass(frozen=True)
 class ContractCheck:
     id: str
     surface: str
@@ -40,10 +63,13 @@ class ContractCheck:
     expected_exit: tuple[int, ...] = ()
     expected_output_contains_any: tuple[str, ...] = ()
     expected_output_contains_all: tuple[str, ...] = ()
+    request_headers: tuple[tuple[str, str], ...] = ()
     body: Any = None
     read_mode: str = "bytes"
-    read_bytes: int = 1024
+    read_bytes: int = 65536
     expected_body_contains_any: tuple[str, ...] = ()
+    expected_body_contains_all: tuple[str, ...] = ()
+    expected_json: tuple[JsonExpectation, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "ContractCheck":
@@ -66,11 +92,21 @@ class ContractCheck:
             expected_output_contains_all=tuple(
                 str(v) for v in raw.get("expected_output_contains_all", [])
             ),
+            request_headers=tuple(
+                (str(key), str(value))
+                for key, value in raw.get("request_headers", {}).items()
+            ),
             body=raw.get("body"),
             read_mode=str(raw.get("read_mode", "bytes")),
-            read_bytes=int(raw.get("read_bytes", 1024)),
+            read_bytes=int(raw.get("read_bytes", 65536)),
             expected_body_contains_any=tuple(
                 str(v) for v in raw.get("expected_body_contains_any", [])
+            ),
+            expected_body_contains_all=tuple(
+                str(v) for v in raw.get("expected_body_contains_all", [])
+            ),
+            expected_json=tuple(
+                JsonExpectation.from_dict(item) for item in raw.get("expected_json", [])
             ),
         )
 
@@ -170,6 +206,15 @@ def run_checks(
         if skip_reason:
             results.append(_result(check, "skipped", None, skip_reason))
             continue
+        precondition_failure = _precondition_failure(
+            check,
+            base_url=base_url,
+            fixtures=fixture_values,
+            timeout_seconds=timeout_seconds,
+        )
+        if precondition_failure:
+            results.append(_result(check, "failed", None, precondition_failure))
+            continue
 
         if check.surface == "http":
             results.append(_run_http_check(check, base_url or "", fixture_values, timeout_seconds))
@@ -211,6 +256,32 @@ def _skip_reason(
     return None
 
 
+def _precondition_failure(
+    check: ContractCheck,
+    *,
+    base_url: str | None,
+    fixtures: dict[str, str],
+    timeout_seconds: float,
+) -> str | None:
+    if "existing_session" not in check.preconditions:
+        return None
+    assert base_url is not None
+    session_id = fixtures["session_id"]
+    url = base_url.rstrip("/") + f"/sessions/{session_id}"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = response.status
+            response.read(1)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return f"session fixture precondition failed: live server unavailable: {exc}"
+    if status == 200:
+        return None
+    return f"session fixture precondition failed: GET /sessions/{{session_id}} returned HTTP {status}"
+
+
 def _run_http_check(
     check: ContractCheck, base_url: str, fixtures: dict[str, str], timeout_seconds: float
 ) -> CheckResult:
@@ -219,7 +290,9 @@ def _run_http_check(
     url = base_url.rstrip("/") + path
     start = time.perf_counter()
     data = None
-    headers = {}
+    headers = {
+        name: str(_render_template(value, fixtures)) for name, value in check.request_headers
+    }
     if check.method not in {"GET", "HEAD"}:
         body = {} if check.body is None else _render_template(check.body, fixtures)
         data = json.dumps(body).encode("utf-8")
@@ -236,18 +309,31 @@ def _run_http_check(
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return _result(check, "failed", _elapsed_ms(start), f"live server unavailable: {exc}")
 
-    body_ok = not check.expected_body_contains_any or any(
+    body_any_ok = not check.expected_body_contains_any or any(
         expected in body_text for expected in check.expected_body_contains_any
     )
-    if status in check.expected_status and body_ok:
+    missing_body_all = [
+        expected for expected in check.expected_body_contains_all if expected not in body_text
+    ]
+    json_error = _json_expectation_error(body_text, check.expected_json)
+    if status in check.expected_status and body_any_ok and not missing_body_all and not json_error:
         return _result(check, "passed", _elapsed_ms(start), f"HTTP {status}")
-    if not body_ok:
+    if not body_any_ok:
         return _result(
             check,
             "failed",
             _elapsed_ms(start),
             f"HTTP {status}; body missing one of {list(check.expected_body_contains_any)}",
         )
+    if missing_body_all:
+        return _result(
+            check,
+            "failed",
+            _elapsed_ms(start),
+            f"HTTP {status}; body missing required content {missing_body_all}",
+        )
+    if json_error:
+        return _result(check, "failed", _elapsed_ms(start), f"HTTP {status}; {json_error}")
     return _result(
         check,
         "failed",
@@ -294,6 +380,102 @@ def _read_response_text(response: Any, check: ContractCheck) -> str:
     else:
         raw = response.read(check.read_bytes)
     return raw.decode("utf-8", errors="replace")
+
+
+_MISSING = object()
+
+
+def _json_expectation_error(body_text: str, expectations: tuple[JsonExpectation, ...]) -> str | None:
+    if not expectations:
+        return None
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError as exc:
+        return f"response is not valid JSON: {exc}"
+
+    for expectation in expectations:
+        value = _json_pointer(payload, expectation.path)
+        if expectation.absent:
+            if value is _MISSING:
+                continue
+            return f"JSON {expectation.path} expected absent, got {_json_summary(value)}"
+        if value is _MISSING:
+            return f"JSON {expectation.path} is missing"
+        if expectation.value_type and not _json_type_matches(value, expectation.value_type):
+            return (
+                f"JSON {expectation.path} expected type {expectation.value_type}, "
+                f"got {_json_type_name(value)}"
+            )
+        if expectation.has_equals and value != expectation.equals:
+            return (
+                f"JSON {expectation.path} expected {expectation.equals!r}, "
+                f"got {value!r}"
+            )
+        if expectation.one_of and value not in expectation.one_of:
+            return (
+                f"JSON {expectation.path} expected one of {list(expectation.one_of)!r}, "
+                f"got {value!r}"
+            )
+        if expectation.contains is not None:
+            if isinstance(value, str):
+                if expectation.contains not in value:
+                    return f"JSON {expectation.path} missing substring {expectation.contains!r}"
+            elif isinstance(value, list):
+                if expectation.contains not in value:
+                    return f"JSON {expectation.path} missing list item {expectation.contains!r}"
+            else:
+                return f"JSON {expectation.path} cannot be checked with contains"
+    return None
+
+
+def _json_pointer(payload: Any, pointer: str) -> Any:
+    if pointer == "":
+        return payload
+    if not pointer.startswith("/"):
+        raise ValueError(f"JSON expectation path must be a JSON pointer: {pointer}")
+    current = payload
+    for raw_part in pointer.lstrip("/").split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            if part not in current:
+                return _MISSING
+            current = current[part]
+        elif isinstance(current, list):
+            if not part.isdigit():
+                return _MISSING
+            index = int(part)
+            if index >= len(current):
+                return _MISSING
+            current = current[index]
+        else:
+            return _MISSING
+    return current
+
+
+def _json_type_matches(value: Any, expected_type: str) -> bool:
+    return _json_type_name(value) == expected_type
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    return type(value).__name__
+
+
+def _json_summary(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return _json_type_name(value)
+    return repr(value)
 
 
 _TEMPLATE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")

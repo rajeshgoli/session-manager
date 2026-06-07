@@ -17,6 +17,9 @@
       "method": "GET",
       "path": "/health",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/status", "equals": "healthy"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:62"
     },
@@ -29,6 +32,12 @@
       "method": "GET",
       "path": "/health/detailed",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/status", "one_of": ["healthy", "degraded", "unhealthy"]},
+        {"path": "/checks", "type": "object"},
+        {"path": "/resources", "type": "object"},
+        {"path": "/timestamp", "type": "string"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:62"
     },
@@ -41,6 +50,11 @@
       "method": "GET",
       "path": "/auth/session",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/enabled", "type": "boolean"},
+        {"path": "/authenticated", "type": "boolean"},
+        {"path": "/bypass", "type": "boolean"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:63"
     },
@@ -53,6 +67,15 @@
       "method": "GET",
       "path": "/client/bootstrap",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/auth", "type": "object"},
+        {"path": "/auth/session_endpoint", "equals": "/auth/session"},
+        {"path": "/auth/device_auth_endpoint", "equals": "/auth/device/google"},
+        {"path": "/external_access", "type": "object"},
+        {"path": "/external_access/mobile_terminal_supported", "type": "boolean"},
+        {"path": "/session_open_defaults", "type": "object"},
+        {"path": "/session_open_defaults/preferred_action", "type": "string"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:64"
     },
@@ -65,6 +88,9 @@
       "method": "GET",
       "path": "/client/sessions",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/sessions", "type": "array"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:64"
     },
@@ -77,6 +103,9 @@
       "method": "GET",
       "path": "/sessions",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/sessions", "type": "array"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:69"
     },
@@ -89,6 +118,9 @@
       "method": "GET",
       "path": "/events/state",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "", "type": "object"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:71"
     },
@@ -104,6 +136,7 @@
       "read_mode": "line",
       "read_bytes": 128,
       "expected_body_contains_any": ["event: hello"],
+      "expected_body_contains_all": ["event: hello"],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:71"
     },
@@ -128,6 +161,9 @@
       "method": "GET",
       "path": "/nodes",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/nodes", "type": "array"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:73"
     },
@@ -140,6 +176,9 @@
       "method": "GET",
       "path": "/queue-jobs",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/jobs", "type": "array"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:72"
     },
@@ -152,6 +191,9 @@
       "method": "GET",
       "path": "/codex-review-requests",
       "expected_status": [200],
+      "expected_json": [
+        {"path": "/requests", "type": "array"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:72"
     },
@@ -164,8 +206,76 @@
       "method": "GET",
       "path": "/api/sessions",
       "expected_status": [404],
+      "expected_json": [
+        {"path": "/detail", "type": "string"}
+      ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage2_artifacts/external_client_manifest.md:42"
+    },
+    {
+      "id": "http.public_watch_operational_data_denied",
+      "surface": "http",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/watch",
+      "request_headers": {"Host": "sm.example.com"},
+      "expected_status": [401, 403, 404],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:58"
+    },
+    {
+      "id": "http.summary_provider_route_retired",
+      "surface": "http",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/sessions/{session_id}/summary",
+      "expected_status": [404, 410],
+      "expected_json": [
+        {"path": "/detail", "type": "string"}
+      ],
+      "preconditions": ["live_server", "session_id", "existing_session"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:62"
+    },
+    {
+      "id": "http.scheduler_remind_retired",
+      "surface": "http",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "method": "POST",
+      "path": "/scheduler/remind",
+      "body": {},
+      "expected_status": [404, 410],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:60"
+    },
+    {
+      "id": "http.job_watches_retired",
+      "surface": "http",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/job-watches",
+      "expected_status": [404, 410],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:59"
+    },
+    {
+      "id": "http.queue_policy_runs_retired",
+      "surface": "http",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/queue-policy-runs",
+      "expected_status": [404, 410],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
     },
     {
       "id": "http.email_inbound_validation_failure",
