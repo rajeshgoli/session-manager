@@ -2,7 +2,7 @@
 
 These scripts are implementation artifacts for issue #762. They do not reopen
 the migration spec; they turn the converged spec artifacts into executable
-checks and measurable Python baselines.
+checks and minimal value-gate baselines.
 
 ## Contract Harness
 
@@ -58,12 +58,35 @@ that the Python server uses.
 
 ## Baseline Runner
 
-Run a safe local baseline:
+Run a safe local Python baseline:
 
 ```bash
-python -m scripts.rust_migration.baseline --base-url http://127.0.0.1:8420 --repetitions 5 --output /tmp/sm-python-baseline.json
+python -m scripts.rust_migration.baseline \
+  --target python \
+  --base-url http://127.0.0.1:8420 \
+  --repetitions 5 \
+  --output /tmp/sm-python-baseline.json
+```
+
+Run the comparable Rust scaffold subset while `sm-server` is listening:
+
+```bash
+python -m scripts.rust_migration.baseline \
+  --target rust \
+  --base-url http://127.0.0.1:8421 \
+  --check-id http.health \
+  --check-id http.health_detailed \
+  --check-id http.auth_session \
+  --check-id http.client_bootstrap \
+  --check-id http.sessions \
+  --check-id http.client_sessions \
+  --check-id http.api_sessions_absent \
+  --repetitions 5 \
+  --output /tmp/sm-rust-baseline.json
 ```
 
 The report records numeric data where it is safe to measure and marks missing
-instrumentation or unsafe workloads explicitly. Do not commit machine-local
-baseline reports if they contain host-specific or private runtime details.
+instrumentation or unsafe workloads explicitly. Python hardening/config variants
+are owner-waived for the cutover value gate; compare current Python against the
+Rust scaffold/prototype instead. Do not commit machine-local baseline reports if
+they contain host-specific or private runtime details.

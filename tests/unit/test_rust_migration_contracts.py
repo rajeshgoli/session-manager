@@ -2,7 +2,11 @@ import subprocess
 import urllib.error
 from unittest.mock import patch
 
-from scripts.rust_migration.baseline import _port_from_base_url
+from scripts.rust_migration.baseline import (
+    _parse_memory_to_mib,
+    _port_from_base_url,
+    run_baseline,
+)
 from scripts.rust_migration.contracts import (
     ContractCheck,
     ContractManifest,
@@ -347,6 +351,31 @@ def test_baseline_memory_discovery_uses_selected_base_url_port():
     assert _port_from_base_url("http://127.0.0.1") == 80
     assert _port_from_base_url("https://sm.example.test") == 443
     assert _port_from_base_url(None) == 8420
+
+
+def test_memory_unit_parser_handles_vmmap_units():
+    assert _parse_memory_to_mib("512K") == 0.5
+    assert _parse_memory_to_mib("87.3M") == 87.3
+    assert _parse_memory_to_mib("1.5G") == 1536.0
+    assert _parse_memory_to_mib("unknown") is None
+
+
+def test_baseline_runner_records_owner_waived_hardening_and_target():
+    report = run_baseline(
+        target="rust",
+        base_url=None,
+        sm_binary="sm",
+        repetitions=1,
+        output=None,
+        server_pid=None,
+        check_ids={"http.health"},
+    )
+
+    assert report["target"] == "rust"
+    assert report["inputs"]["target"] == "rust"
+    assert report["inputs"]["check_ids"] == ["http.health"]
+    assert report["python_hardening_comparison"]["status"] == "owner_waived"
+    assert report["latency"]["skipped"]["http.health"] == "live server URL not supplied"
 
 
 def test_template_rendering_replaces_nested_fixture_values():

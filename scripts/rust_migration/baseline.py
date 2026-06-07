@@ -1,10 +1,11 @@
-"""Safe Python baseline runner for the Rust migration value gate."""
+"""Minimal baseline runner for the Rust migration value gate."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import platform
+import re
 import statistics
 import subprocess
 import time
@@ -18,11 +19,13 @@ from .contracts import ContractManifest, run_checks
 
 def run_baseline(
     *,
+    target: str,
     base_url: str | None,
     sm_binary: str,
     repetitions: int,
     output: Path | None,
     server_pid: int | None,
+    check_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     start = time.perf_counter()
     manifest = ContractManifest.load()
@@ -30,12 +33,12 @@ def run_baseline(
     for _ in range(repetitions):
         results = run_checks(
             manifest,
-            target="python",
+            target=target,
             base_url=base_url,
             sm_binary=sm_binary,
             session_id=None,
             fixtures={},
-            check_ids=None,
+            check_ids=check_ids,
             include_mutating=False,
         )
         runs.append([result.to_dict() for result in results])
@@ -43,48 +46,30 @@ def run_baseline(
     report = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "target": "python",
+        "target": target,
         "host": {
             "system": platform.system(),
             "machine": platform.machine(),
             "python": platform.python_version(),
         },
         "inputs": {
+            "target": target,
             "base_url": base_url,
             "sm_binary": sm_binary,
             "repetitions": repetitions,
             "server_pid": server_pid,
+            "check_ids": sorted(check_ids) if check_ids else None,
         },
         "memory": _memory_snapshot(server_pid, base_url),
         "latency": _latency_summary(runs),
         "runs": runs,
-        "python_hardening_variants": [
-            {
-                "variant": "disable already-unused integrations by config",
-                "status": "not_measured",
-                "reason": "requires controlled config copy and restart rehearsal",
-            },
-            {
-                "variant": "reduce retained event/log scan windows where compatible",
-                "status": "not_measured",
-                "reason": "requires retained-state workload and compatibility fixture comparison",
-            },
-            {
-                "variant": "defer startup background work not needed for first response",
-                "status": "not_measured",
-                "reason": "requires startup harness and controlled service restart",
-            },
-            {
-                "variant": "remove retired surfaces while isolating optional retained integrations",
-                "status": "not_measured",
-                "reason": "requires feature-gated Python patch or Rust prototype comparison",
-            },
-            {
-                "variant": "reduce logging verbosity or request timing thresholds where compatible",
-                "status": "not_measured",
-                "reason": "requires log/telemetry compatibility comparison",
-            },
-        ],
+        "python_hardening_comparison": {
+            "status": "owner_waived",
+            "reason": (
+                "Owner requested a minimal current-Python versus Rust value baseline "
+                "and no throwaway Python hardening/config variant work."
+            ),
+        },
     }
     report["elapsed_seconds"] = round(time.perf_counter() - start, 3)
     if output:
@@ -159,7 +144,7 @@ def _memory_snapshot(server_pid: int | None, base_url: str | None) -> dict[str, 
             "reason": completed.stderr.strip() or "ps did not return RSS",
         }
     rss_kib = int(completed.stdout.strip().splitlines()[0])
-    return {
+    snapshot = {
         "status": "measured",
         "pid": server_pid,
         "rss_kib": rss_kib,
@@ -169,6 +154,56 @@ def _memory_snapshot(server_pid: int | None, base_url: str | None) -> dict[str, 
             "reason": "USS requires platform-specific tooling not used by the safe stdlib runner",
         },
     }
+    footprint = _darwin_physical_footprint(server_pid)
+    if footprint:
+        snapshot["physical_footprint"] = footprint
+    return snapshot
+
+
+def _darwin_physical_footprint(pid: int) -> dict[str, Any] | None:
+    if platform.system() != "Darwin":
+        return None
+    try:
+        completed = subprocess.run(
+            ["vmmap", "-summary", str(pid)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": "skipped", "reason": str(exc)}
+    if completed.returncode != 0:
+        return {
+            "status": "skipped",
+            "reason": completed.stderr.strip() or "vmmap did not return a summary",
+        }
+    for line in completed.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Physical footprint:"):
+            raw_value = stripped.split(":", 1)[1].strip()
+            return {
+                "status": "measured",
+                "raw": raw_value,
+                "mib": _parse_memory_to_mib(raw_value),
+            }
+    return {"status": "skipped", "reason": "vmmap summary omitted physical footprint"}
+
+
+def _parse_memory_to_mib(raw_value: str) -> float | None:
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)([KMG])$", raw_value.strip())
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit == "K":
+        return round(value / 1024, 3)
+    if unit == "M":
+        return round(value, 3)
+    if unit == "G":
+        return round(value * 1024, 3)
+    return None
 
 
 def _port_from_base_url(base_url: str | None) -> int:
@@ -205,10 +240,17 @@ def _discover_server_pid(port: int) -> int | None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", choices=["python", "rust"], default="python")
     parser.add_argument("--base-url", default="http://127.0.0.1:8420")
     parser.add_argument("--sm-binary", default="sm")
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--server-pid", type=int, default=None)
+    parser.add_argument(
+        "--check-id",
+        action="append",
+        default=[],
+        help="Run only the named check; repeat for multiple checks",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser
 
@@ -216,11 +258,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     report = run_baseline(
+        target=args.target,
         base_url=args.base_url,
         sm_binary=args.sm_binary,
         repetitions=args.repetitions,
         output=args.output,
         server_pid=args.server_pid,
+        check_ids=set(args.check_id) if args.check_id else None,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if report["latency"]["failed"] else 0

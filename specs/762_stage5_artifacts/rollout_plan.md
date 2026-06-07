@@ -18,7 +18,7 @@ The initial shipping shape should be:
 
 ## Falsifiable Decision Gate
 
-Before implementation tickets that replace runtime ownership are filed, capture current Python baselines for:
+Before implementation tickets that replace runtime ownership are filed, capture a minimal current-Python baseline for:
 
 - idle and loaded RSS/USS memory measured as median and max over three runs.
 - startup and restore time with retained real state.
@@ -26,16 +26,16 @@ Before implementation tickets that replace runtime ownership are filed, capture 
 - retained 30-day usage for commands/endpoints/surfaces from the Stage 2 telemetry report.
 - error and slow-request rates from retained logs.
 
-The baseline artifact must include the same retained-state workload for current Python, feasible Python hardening/config variants, and Rust spike/prototype runs. At minimum, feasible Python alternatives must either be measured or explicitly ruled out: disabling unused integrations by config, reducing retained log/event scan windows, tightening startup background tasks, lowering uvicorn/logging overhead where compatible, and isolating retired Telegram plus retained-but-optional email/node/queue-runner/mobile-terminal work when disabled.
+The baseline artifact must compare the current Python service against a Rust spike/prototype on the same safe retained-state workload. The owner has explicitly waived Python hardening/config variant measurement for this cutover: Python hardening is throwaway work and should not block or consume Rust migration effort. Record the waiver in the baseline artifact instead of measuring variant branches.
 
 The Rust migration should pause or narrow if:
 
-- a Rust spike cannot show at least 25% lower median loaded RSS and USS than the best measured Python-compatible baseline, or at least 100 MiB RSS and 75 MiB USS absolute loaded improvement when that is the smaller threshold. Idle memory should be at least 15% lower or 50 MiB RSS/USS lower when that is the smaller threshold. No first-class workload may use more than 5% higher memory than the Python-compatible baseline without a documented mitigation.
+- a Rust spike cannot show at least 25% lower median loaded RSS and USS than the current Python baseline, or at least 100 MiB RSS and 75 MiB USS absolute loaded improvement when that is the smaller threshold. Idle memory should be at least 15% lower or 50 MiB RSS/USS lower when that absolute threshold is smaller. No first-class workload may use more than 5% higher memory than the Python baseline without a documented mitigation.
 - critical mobile attach, hook, queue, or session-control paths are slower than Python without a documented mitigation.
 - compatibility or state-migration cost exceeds the value of the rewrite for first-class surfaces.
 - rollback cannot be rehearsed from copied real state.
 
-The comparison is against current Python plus feasible Python hardening/config changes, not against an unmaintained strawman.
+The comparison is against current Python as operated for retained workflows. Do not file Python hardening work as part of the Rust value gate unless the owner later reopens that decision.
 
 ## Cutover Sequence
 
