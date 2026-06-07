@@ -87,8 +87,10 @@ impl SessionStore {
 fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read session state {}", path.display()))?;
-    serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse session state {}", path.display()))
+    let raw: RawStateSnapshot = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse session state {}", path.display()))?;
+    StateSnapshot::try_from(raw)
+        .with_context(|| format!("failed to parse session records {}", path.display()))
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -111,6 +113,38 @@ struct StateSnapshot {
     agent_registrations: Vec<AgentRegistrationRecord>,
     #[serde(default)]
     adoption_proposals: Vec<AdoptionProposalRecord>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawStateSnapshot {
+    #[serde(default)]
+    sessions: Vec<Value>,
+    #[serde(default)]
+    maintainer_session_id: Option<String>,
+    #[serde(default)]
+    agent_registrations: Vec<AgentRegistrationRecord>,
+    #[serde(default)]
+    adoption_proposals: Vec<AdoptionProposalRecord>,
+}
+
+impl TryFrom<RawStateSnapshot> for StateSnapshot {
+    type Error = serde_json::Error;
+
+    fn try_from(raw: RawStateSnapshot) -> std::result::Result<Self, Self::Error> {
+        let mut sessions = Vec::new();
+        for raw_session in raw.sessions {
+            if is_legacy_codex_app_record(&raw_session) {
+                continue;
+            }
+            sessions.push(serde_json::from_value(raw_session)?);
+        }
+        Ok(Self {
+            sessions,
+            maintainer_session_id: raw.maintainer_session_id,
+            agent_registrations: raw.agent_registrations,
+            adoption_proposals: raw.adoption_proposals,
+        })
+    }
 }
 
 impl StateSnapshot {
@@ -202,6 +236,28 @@ impl StateSnapshot {
     }
 }
 
+fn is_legacy_codex_app_record(value: &Value) -> bool {
+    let Some(record) = value.as_object() else {
+        return false;
+    };
+    let provider = record.get("provider").and_then(Value::as_str);
+    if provider != Some("codex") {
+        return false;
+    }
+    let has_codex_thread_id = record
+        .get("codex_thread_id")
+        .is_some_and(|value| !value.is_null());
+    let has_tmux_session = record
+        .get("tmux_session")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_log_file = record
+        .get("log_file")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    has_codex_thread_id || (!has_tmux_session && !has_log_file)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct AgentRegistrationRecord {
     role: String,
@@ -259,6 +315,10 @@ pub struct SessionRecord {
     pub telegram_chat_id: Option<i64>,
     #[serde(default)]
     pub telegram_thread_id: Option<i64>,
+    #[serde(default)]
+    pub telegram_topic_id: Option<i64>,
+    #[serde(default)]
+    pub telegram_root_msg_id: Option<i64>,
     #[serde(default)]
     pub current_task: Option<String>,
     #[serde(default)]
@@ -340,6 +400,12 @@ impl SessionRecord {
         }
         friendly_name.map(ToOwned::to_owned)
     }
+
+    fn resolved_telegram_thread_id(&self) -> Option<i64> {
+        self.telegram_thread_id
+            .or(self.telegram_topic_id)
+            .or(self.telegram_root_msg_id)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -419,6 +485,7 @@ impl From<SessionRecord> for SessionResponse {
         let status = normalized_status(&session.status);
         let friendly_name = session.cached_display_name();
         let is_maintainer = session.aliases.iter().any(|alias| alias == "maintainer");
+        let telegram_thread_id = session.resolved_telegram_thread_id();
         Self {
             id: session.id,
             name: session.name,
@@ -440,7 +507,7 @@ impl From<SessionRecord> for SessionResponse {
             forked_by_session_id: session.forked_by_session_id,
             friendly_name,
             telegram_chat_id: session.telegram_chat_id,
-            telegram_thread_id: session.telegram_thread_id,
+            telegram_thread_id,
             current_task: session.current_task,
             git_remote_url: session.git_remote_url,
             parent_session_id: session.parent_session_id,
@@ -597,6 +664,8 @@ mod tests {
             native_title_source_mtime_ns: None,
             telegram_chat_id: None,
             telegram_thread_id: None,
+            telegram_topic_id: None,
+            telegram_root_msg_id: None,
             current_task: None,
             git_remote_url: None,
             parent_session_id: None,
@@ -727,6 +796,55 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "legacy2");
+    }
+
+    #[test]
+    fn snapshot_skips_legacy_codex_app_records_before_deserializing_sessions() {
+        let raw = RawStateSnapshot {
+            sessions: vec![
+                json!({
+                    "id": "legacyapp",
+                    "name": "legacy app",
+                    "provider": "codex",
+                    "codex_thread_id": "thread-1",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }),
+                json!({
+                    "id": "tmux1",
+                    "name": "claude-tmux1",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-tmux1",
+                    "log_file": "/tmp/tmux1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }),
+            ],
+            ..RawStateSnapshot::default()
+        };
+
+        let snapshot = StateSnapshot::try_from(raw).unwrap();
+        let sessions = snapshot.into_sessions();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "tmux1");
+    }
+
+    #[test]
+    fn session_projection_uses_legacy_telegram_thread_fields() {
+        let mut session = session_record("running");
+        session.telegram_topic_id = Some(123);
+        let response = SessionResponse::from(session);
+
+        assert_eq!(response.telegram_thread_id, Some(123));
+
+        let mut session = session_record("running");
+        session.telegram_root_msg_id = Some(456);
+        let response = SessionResponse::from(session);
+
+        assert_eq!(response.telegram_thread_id, Some(456));
     }
 
     #[test]
