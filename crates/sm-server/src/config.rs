@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Default)]
 pub struct AppConfig {
+    pub paths: PathsConfig,
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
     pub mobile_terminal: MobileTerminalConfig,
@@ -47,6 +48,24 @@ impl AppConfig {
 
         Ok(config)
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PathsConfig {
+    #[serde(default = "default_state_file")]
+    pub state_file: String,
+}
+
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            state_file: default_state_file(),
+        }
+    }
+}
+
+fn default_state_file() -> String {
+    "~/.local/share/claude-sessions/sessions.json".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -113,6 +132,8 @@ pub struct MobileTerminalConfig {
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
+    paths: PathsConfig,
+    #[serde(default)]
     auth: RawAuthConfig,
     #[serde(default)]
     external_access: ExternalAccessConfig,
@@ -123,6 +144,7 @@ struct RawConfig {
 impl From<RawConfig> for AppConfig {
     fn from(raw: RawConfig) -> Self {
         Self {
+            paths: raw.paths,
             google_auth: raw.auth.google,
             external_access: raw.external_access,
             mobile_terminal: raw.mobile_terminal,

@@ -5,10 +5,15 @@ use axum::{
 };
 use serde_json::{json, Value};
 use sm_server::{
-    config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig},
+    config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig},
     http::{router, AppState},
 };
-use std::net::SocketAddr;
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tower::ServiceExt;
 
 async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
@@ -236,4 +241,147 @@ async fn absent_routes_are_not_implemented() {
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload, json!({ "detail": "Not Found" }));
+}
+
+#[tokio::test]
+async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["sessions"][0]["id"], "run12345");
+    assert_eq!(payload["sessions"][0]["activity_state"], "working");
+    assert_eq!(payload["sessions"][0]["provider"], "claude");
+    assert_eq!(payload["sessions"][1]["id"], "oldstate");
+    assert_eq!(payload["sessions"][1]["status"], "idle");
+    assert_eq!(payload["sessions"][1]["activity_state"], "idle");
+    assert!(payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|session| session["id"] != "stop1234"));
+}
+
+#[tokio::test]
+async fn sessions_can_include_stopped_sessions() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions?include_stopped=true").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 3);
+    assert_eq!(payload["sessions"][2]["id"], "stop1234");
+    assert_eq!(payload["sessions"][2]["activity_state"], "stopped");
+}
+
+#[tokio::test]
+async fn client_sessions_adds_read_only_mobile_metadata_without_termux() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/client/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let first = &payload["sessions"][0];
+    assert_eq!(first["id"], "run12345");
+    assert_eq!(first["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(
+        first["attach_descriptor"]["message"],
+        "attach tickets are not implemented in the Rust read-only scaffold"
+    );
+    assert_eq!(first["termux_attach"], Value::Null);
+    assert_eq!(first["mobile_terminal"]["supported"], false);
+    assert_eq!(first["primary_action"]["type"], "details");
+    assert!(payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|session| session["id"] != "stop1234"));
+}
+
+#[tokio::test]
+async fn sessions_missing_state_file_returns_empty_list() {
+    let state_file = unique_temp_path();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "sessions": [] }));
+}
+
+fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
+    AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        ..AppConfig::default()
+    }
+}
+
+fn write_session_fixture() -> PathBuf {
+    let path = unique_temp_path();
+    fs::write(
+        &path,
+        json!({
+            "sessions": [
+                {
+                    "id": "run12345",
+                    "name": "claude-run12345",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-run12345",
+                    "tmux_socket_name": null,
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": "/tmp/run12345.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "Runner",
+                    "current_task": "Working",
+                    "tokens_used": 42,
+                    "context_monitor_enabled": true
+                },
+                {
+                    "id": "oldstate",
+                    "name": "claude-oldstate",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-oldstate",
+                    "log_file": "/tmp/oldstate.log",
+                    "status": "waiting_permission",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "stop1234",
+                    "name": "claude-stop1234",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-stop1234",
+                    "log_file": "/tmp/stop1234.log",
+                    "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn unique_temp_path() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sm-rust-read-only-sessions-{}-{nanos}.json",
+        std::process::id()
+    ))
 }

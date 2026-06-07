@@ -1,26 +1,34 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Query, Request, State},
     http::{header::HOST, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{trimmed, AppConfig};
+use crate::sessions::{
+    expand_home, ClientSessionResponse, SessionResponse, SessionStore, SessionsEnvelope,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
+    session_store: SessionStore,
 }
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
-        Self { config }
+        let session_store = SessionStore::new(expand_home(&config.paths.state_file));
+        Self {
+            config,
+            session_store,
+        }
     }
 }
 
@@ -30,6 +38,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
         .route("/client/bootstrap", get(client_bootstrap))
+        .route("/sessions", get(list_sessions))
+        .route("/client/sessions", get(list_client_sessions))
         .fallback(not_found)
         .with_state(Arc::new(state))
 }
@@ -121,11 +131,58 @@ async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBoot
     })
 }
 
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListSessionsQuery>,
+) -> Result<Json<SessionsEnvelope<SessionResponse>>, ApiError> {
+    let sessions = state
+        .session_store
+        .list_sessions(query.include_stopped)?
+        .into_iter()
+        .map(SessionResponse::from)
+        .collect::<Vec<_>>();
+    Ok(Json(SessionsEnvelope::from(sessions)))
+}
+
+async fn list_client_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SessionsEnvelope<ClientSessionResponse>>, ApiError> {
+    let sessions = state
+        .session_store
+        .list_sessions(false)?
+        .into_iter()
+        .map(ClientSessionResponse::from)
+        .collect::<Vec<_>>();
+    Ok(Json(SessionsEnvelope::from(sessions)))
+}
+
 async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "detail": "Not Found" })),
     )
+}
+
+#[derive(Debug)]
+struct ApiError(anyhow::Error);
+
+impl<E> From<E> for ApiError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(error: E) -> Self {
+        Self(error.into())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "detail": self.0.to_string() })),
+        )
+            .into_response()
+    }
 }
 
 fn is_local_bypass_request(
@@ -183,6 +240,12 @@ struct HealthCheck {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSessionsQuery {
+    #[serde(default)]
+    include_stopped: bool,
 }
 
 #[derive(Serialize)]
