@@ -134,7 +134,9 @@ async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBoot
 async fn list_sessions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListSessionsQuery>,
+    request: Request,
 ) -> Result<Json<SessionsEnvelope<SessionResponse>>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
     let sessions = state
         .session_store
         .list_sessions(query.include_stopped)?
@@ -146,7 +148,9 @@ async fn list_sessions(
 
 async fn list_client_sessions(
     State(state): State<Arc<AppState>>,
+    request: Request,
 ) -> Result<Json<SessionsEnvelope<ClientSessionResponse>>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
     let sessions = state
         .session_store
         .list_sessions(false)?
@@ -164,25 +168,60 @@ async fn not_found() -> impl IntoResponse {
 }
 
 #[derive(Debug)]
-struct ApiError(anyhow::Error);
+enum ApiError {
+    Internal(anyhow::Error),
+    Auth {
+        status: StatusCode,
+        detail: &'static str,
+    },
+}
 
 impl<E> From<E> for ApiError
 where
     E: Into<anyhow::Error>,
 {
     fn from(error: E) -> Self {
-        Self(error.into())
+        Self::Internal(error.into())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "detail": self.0.to_string() })),
-        )
-            .into_response()
+        match self {
+            Self::Internal(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "detail": error.to_string() })),
+            )
+                .into_response(),
+            Self::Auth { status, detail } => {
+                (status, Json(json!({ "detail": detail }))).into_response()
+            }
+        }
     }
+}
+
+fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
+    let auth = &state.config.google_auth;
+    if !auth.requested() {
+        return Ok(());
+    }
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
+        return Ok(());
+    }
+    if !auth.ready() {
+        return Err(ApiError::Auth {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Google auth is not configured",
+        });
+    }
+    Err(ApiError::Auth {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Authentication required",
+    })
 }
 
 fn is_local_bypass_request(

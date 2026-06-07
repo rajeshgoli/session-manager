@@ -51,10 +51,24 @@ impl SessionStore {
         if !state_file.exists() {
             return Ok(StateSnapshot::default());
         }
-        let content = fs::read_to_string(&state_file)
-            .with_context(|| format!("failed to read session state {}", state_file.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse session state {}", state_file.display()))
+        match read_snapshot(&state_file) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(primary_error) => {
+                if state_file == self.state_file {
+                    if let Some(legacy_state_file) = &self.legacy_state_file {
+                        if legacy_state_file.exists() {
+                            return read_snapshot(legacy_state_file).with_context(|| {
+                                format!(
+                                    "failed to read fallback session state {} after primary failed: {primary_error:#}",
+                                    legacy_state_file.display()
+                                )
+                            });
+                        }
+                    }
+                }
+                Err(primary_error)
+            }
+        }
     }
 
     fn readable_state_file(&self) -> PathBuf {
@@ -67,6 +81,13 @@ impl SessionStore {
         }
         self.state_file.clone()
     }
+}
+
+fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read session state {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse session state {}", path.display()))
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -524,14 +545,48 @@ mod tests {
         assert_eq!(sessions[0].id, "legacy1");
     }
 
+    #[test]
+    fn default_state_loader_reads_legacy_fallback_when_primary_is_invalid() {
+        let state_file = unique_temp_path("primary");
+        let legacy_state_file = unique_temp_path("legacy");
+        fs::write(&state_file, "{not json").unwrap();
+        fs::write(
+            &legacy_state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "legacy2",
+                        "name": "claude-legacy2",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-legacy2",
+                        "log_file": "/tmp/legacy2.log",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file, legacy_state_file);
+
+        let sessions = store.list_sessions(false).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "legacy2");
+    }
+
     fn unique_temp_path(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!(
-            "sm-rust-session-store-{label}-{}-{nanos}.json",
-            std::process::id()
+            "sm-rust-session-store-{label}-{}-{nanos}-{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
 }

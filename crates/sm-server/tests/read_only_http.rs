@@ -12,6 +12,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
@@ -315,10 +316,57 @@ async fn sessions_missing_state_file_returns_empty_list() {
     assert_eq!(payload, json!({ "sessions": [] }));
 }
 
+#[tokio::test]
+async fn sessions_reject_public_host_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) = get_json_with_host(app, "/sessions", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload, json!({ "detail": "Authentication required" }));
+}
+
+#[tokio::test]
+async fn client_sessions_allow_local_bypass_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) = get_json_with_host_and_peer(
+        app,
+        "/client/sessions",
+        "localhost:8421",
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+}
+
 fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        ..AppConfig::default()
+    }
+}
+
+fn config_with_state_file_and_auth(state_file: &PathBuf) -> AppConfig {
+    AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            client_id: Some("web-client-id".to_owned()),
+            android_client_id: Some("android-client-id".to_owned()),
+            client_secret: Some("web-client-secret".to_owned()),
+            redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+            allowlist_emails: vec!["rajesh@example.com".to_owned()],
+            session_cookie_secret: Some("session-cookie-secret".to_owned()),
         },
         ..AppConfig::default()
     }
@@ -381,12 +429,14 @@ fn write_session_fixture() -> PathBuf {
 }
 
 fn unique_temp_path() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "sm-rust-read-only-sessions-{}-{nanos}.json",
-        std::process::id()
+        "sm-rust-read-only-sessions-{}-{nanos}-{}.json",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
 }
