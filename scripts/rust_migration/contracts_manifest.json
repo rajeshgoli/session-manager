@@ -350,6 +350,25 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
     },
     {
+      "id": "cli.review_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["review", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": [
+        "--base",
+        "--uncommitted",
+        "--commit",
+        "--custom",
+        "--new",
+        "--pr"
+      ],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
       "id": "cli.request_codex_review_help",
       "surface": "cli",
       "classification": "retained",
@@ -357,8 +376,15 @@
       "safety": "read_only",
       "command": ["request-codex-review", "--help"],
       "expected_exit": [0],
+      "expected_output_contains_all": [
+        "list",
+        "status",
+        "cancel",
+        "--notify",
+        "--repo"
+      ],
       "preconditions": ["sm_cli"],
-      "source": "specs/762_stage5_artifacts/cutover_scope.md:35"
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
     {
       "id": "cli.codex_help",

@@ -39,6 +39,7 @@ class ContractCheck:
     command: tuple[str, ...] = ()
     expected_exit: tuple[int, ...] = ()
     expected_output_contains_any: tuple[str, ...] = ()
+    expected_output_contains_all: tuple[str, ...] = ()
     body: Any = None
     read_mode: str = "bytes"
     read_bytes: int = 1024
@@ -61,6 +62,9 @@ class ContractCheck:
             expected_exit=tuple(int(v) for v in raw.get("expected_exit", [])),
             expected_output_contains_any=tuple(
                 str(v) for v in raw.get("expected_output_contains_any", [])
+            ),
+            expected_output_contains_all=tuple(
+                str(v) for v in raw.get("expected_output_contains_all", [])
             ),
             body=raw.get("body"),
             read_mode=str(raw.get("read_mode", "bytes")),
@@ -229,7 +233,7 @@ def _run_http_check(
     except urllib.error.HTTPError as exc:
         status = exc.code
         body_text = _read_response_text(exc, check)
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return _result(check, "failed", _elapsed_ms(start), f"live server unavailable: {exc}")
 
     body_ok = not check.expected_body_contains_any or any(
@@ -270,12 +274,17 @@ def _run_cli_check(check: ContractCheck, sm_binary: str, timeout_seconds: float)
     contains_any = not check.expected_output_contains_any or any(
         needle.lower() in output for needle in check.expected_output_contains_any
     )
-    if exit_ok and contains_any:
+    missing_all = [
+        needle for needle in check.expected_output_contains_all if needle.lower() not in output
+    ]
+    if exit_ok and contains_any and not missing_all:
         return _result(check, "passed", _elapsed_ms(start), f"exit {completed.returncode}")
 
     detail = f"exit {completed.returncode}; expected {list(check.expected_exit)}"
     if check.expected_output_contains_any and not contains_any:
         detail += f"; missing one of {list(check.expected_output_contains_any)}"
+    if missing_all:
+        detail += f"; missing required output {missing_all}"
     return _result(check, "failed", _elapsed_ms(start), detail)
 
 

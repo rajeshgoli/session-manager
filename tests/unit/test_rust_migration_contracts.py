@@ -1,3 +1,4 @@
+import subprocess
 import urllib.error
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ from scripts.rust_migration.contracts import (
     ContractCheck,
     ContractManifest,
     _parse_fixtures,
+    _run_cli_check,
     _run_http_check,
     _render_template,
     checks_for_target,
@@ -28,6 +30,30 @@ def test_manifest_preserves_mobile_kill_route_while_retiring_cli_alias():
     assert cli_kill.classification == "retired"
     assert cli_kill.target == "rust_only"
     assert cli_kill.command == ("kill", "--help")
+
+
+def test_manifest_retains_local_and_durable_codex_review_cli_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    review = checks["cli.review_help"]
+    assert review.classification == "retained"
+    assert review.target == "python_and_rust"
+    assert review.command == ("review", "--help")
+    assert review.expected_output_contains_all == (
+        "--base",
+        "--uncommitted",
+        "--commit",
+        "--custom",
+        "--new",
+        "--pr",
+    )
+
+    durable = checks["cli.request_codex_review_help"]
+    assert durable.classification == "retained"
+    assert durable.target == "python_and_rust"
+    assert durable.command == ("request-codex-review", "--help")
+    assert "--notify" in durable.expected_output_contains_all
 
 
 def test_python_target_does_not_run_rust_only_retirement_checks():
@@ -97,6 +123,30 @@ def test_supplied_live_server_connection_failure_is_failed_not_skipped():
     assert "live server unavailable" in result.detail
 
 
+def test_supplied_live_server_connection_reset_is_failed_not_crashed():
+    check = ContractCheck(
+        id="http.test",
+        surface="http",
+        classification="retained",
+        target="python_and_rust",
+        safety="read_only",
+        method="GET",
+        path="/health",
+        expected_status=(200,),
+        preconditions=("live_server",),
+        source="test",
+    )
+
+    with patch(
+        "scripts.rust_migration.contracts.urllib.request.urlopen",
+        side_effect=ConnectionResetError("reset by peer"),
+    ):
+        result = _run_http_check(check, "http://127.0.0.1:8420", {}, 0.1)
+
+    assert result.status == "failed"
+    assert "live server unavailable" in result.detail
+
+
 def test_post_checks_send_empty_json_body():
     check = ContractCheck(
         id="http.post",
@@ -137,6 +187,36 @@ def test_post_checks_send_empty_json_body():
     assert seen["data"] == b"{}"
     assert seen["content_type"] == "application/json"
     assert seen["url"].endswith("/sessions/abc123/kill")
+
+
+def test_cli_check_requires_all_expected_output_tokens():
+    check = ContractCheck(
+        id="cli.review",
+        surface="cli",
+        classification="retained",
+        target="python_and_rust",
+        safety="read_only",
+        command=("review", "--help"),
+        expected_exit=(0,),
+        expected_output_contains_all=("--base", "--pr"),
+        preconditions=("sm_cli",),
+        source="test",
+    )
+    completed = subprocess.CompletedProcess(
+        args=["sm", "review", "--help"],
+        returncode=0,
+        stdout="usage: sm review --base\n",
+        stderr="",
+    )
+
+    with patch(
+        "scripts.rust_migration.contracts.subprocess.run",
+        return_value=completed,
+    ):
+        result = _run_cli_check(check, "sm", 1.0)
+
+    assert result.status == "failed"
+    assert "--pr" in result.detail
 
 
 def test_line_mode_http_check_reads_one_streaming_line():
