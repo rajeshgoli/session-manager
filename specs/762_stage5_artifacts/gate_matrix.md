@@ -40,7 +40,7 @@ Feasible Python hardening/config comparisons must include measured or explicitly
 - disabling integrations that are already disabled or unused in the current config.
 - reducing retained event/log scan windows where compatible.
 - deferring startup background work that is not needed for first response where compatible.
-- removing retired Telegram/what/kill/dispatch/remind/watch-job/policy/Termux surfaces per cutover scope, and isolating retained email/node/queue-runner/mobile-terminal work when disabled by config.
+- removing retired Telegram, `sm what`, the `sm kill` CLI alias, dispatch, remind/watch-job/policy/Termux surfaces per cutover scope, and isolating retained email/node/queue-runner/mobile-terminal work when disabled by config.
 - reducing logging verbosity or request timing thresholds where compatible.
 
 ## Target Thresholds
@@ -63,6 +63,7 @@ Minimum post-cutover smoke checks:
 - `GET /auth/session` for local, browser-auth, and device-bearer modes where configured.
 - `GET /client/bootstrap` and `GET /client/sessions` from the native app perspective.
 - mobile attach-ticket mint and WebSocket auth failure/success paths.
+- retained Android/watch session-stop action through `POST /sessions/{session_id}/kill`, or a reviewed app-retarget replacement.
 - public-edge deny/allow behavior, origin edge-assertion rejection, device list/remove, revoked-device denial, and node public fallback LAN-first behavior.
 - `POST /maintainer/ensure`, `POST /client/request-status`, `GET /client/analytics/summary`, and representative bug-report create/list/detail flows.
 - `GET /sessions`, `sm status`, and `sm send` to a controlled test session.
@@ -72,7 +73,7 @@ Minimum post-cutover smoke checks:
 - node registry and node-agent reconnect status.
 - app artifact `meta.json`, latest APK, hashed APK, and `/apk` redirect.
 - email/human recipient delivery and inbound email webhook smoke checks pass for worker-secret, authorized-sender, trusted-session-header, ignored routing, and delivery paths.
-- Telegram routes and CLI commands, `sm what`, and `sm kill` are absent or return explicit retirement errors.
+- Telegram routes and CLI commands, `sm what`, and the `sm kill` CLI alias are absent or return explicit retirement errors.
 - Codex pending request listing and event cursor status.
 - migration ledger `status` and rollback availability.
 

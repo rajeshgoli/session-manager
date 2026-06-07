@@ -4,7 +4,7 @@ Status: converged after three sequential independent reviewer convergence signal
 
 ## Default Release Position
 
-The first Rust release is the cutover port, not a clone of every Python surface. The owner-approved retained and removed surfaces are in [cutover_scope.md](cutover_scope.md). Native `sm` mobile app flows, on-the-go attach, mobile auth/bootstrap, proofed app artifacts, core CLI/session workflows, email/human fallback delivery, Codex review/runtime, narrow queue jobs, and registered nodes remain first-class. Generic public browser/watch data, Telegram control, `sm what`, redundant `sm kill`, dispatch, Termux attach, watch-job, scheduled reminders, queue policy/CI helpers, and public unauthenticated artifacts are not Rust targets.
+The first Rust release is the cutover port, not a clone of every Python surface. The owner-approved retained and removed surfaces are in [cutover_scope.md](cutover_scope.md). Native `sm` mobile app flows, on-the-go attach, mobile auth/bootstrap, proofed app artifacts, core CLI/session workflows, email/human fallback delivery, Codex review/runtime, narrow queue jobs, and registered nodes remain first-class. Generic public browser/watch data, Telegram control, `sm what`, the redundant `sm kill` CLI alias, dispatch, Termux attach, watch-job, scheduled reminders, queue policy/CI helpers, and public unauthenticated artifacts are not Rust targets.
 
 The initial shipping shape should be:
 
@@ -48,7 +48,7 @@ The comparison is against current Python plus feasible Python hardening/config c
 7. Stop Python through the service wrapper or controlled process ownership check. Do not kill an arbitrary process on the port without proving it is the Session Manager service.
 8. Run Rust preflight against the live config and final backed-up state. Preflight must validate schema versions, required config, path roots, port ownership, auth policy, mobile/public host settings, write permissions, write-freeze ledger state, and restore-point hashes.
 9. Start Rust on the current service port and paths.
-10. Run post-cutover smoke checks: `/health`, `/health/detailed`, `/auth/session`, `/client/bootstrap`, `/client/sessions`, `/sessions`, `/events`, `sm status`, `sm send` to a test session, mobile attach-ticket mint, app artifact metadata, queue health, node registry, and configured external-channel health checks. If public-edge proof is enabled, smoke checks must also prove unauthenticated internet callers cannot reach operational data, origin rejects forwarded public traffic without a valid edge assertion, revoked phones/nodes are denied, and node fallback does not bypass LAN-first behavior.
+10. Run post-cutover smoke checks: `/health`, `/health/detailed`, `/auth/session`, `/client/bootstrap`, `/client/sessions`, `/sessions`, `/events`, `sm status`, `sm send` to a test session, mobile attach-ticket mint, retained mobile/API session-stop behavior or reviewed app-retarget replacement, app artifact metadata, queue health, node registry, and configured external-channel health checks. If public-edge proof is enabled, smoke checks must also prove unauthenticated internet callers cannot reach operational data, origin rejects forwarded public traffic without a valid edge assertion, revoked phones/nodes are denied, and node fallback does not bypass LAN-first behavior.
 11. Keep rollback available until Rust has passed the stabilization window and no incompatible state mutation is pending.
 
 ## Rollback Sequence
@@ -86,7 +86,7 @@ The first Rust release must expose documented operator switches for:
 - Codex review watchers.
 - Codex event ingestion and provider control.
 - email/human recipient delivery and inbound email webhook admission.
-- retired-surface denial behavior for Telegram/what/kill/dispatch/remind/watch-job/policy/Termux/summary-provider routes and commands.
+- retired-surface denial behavior for Telegram, `sm what`, the `sm kill` CLI alias, dispatch, remind/watch-job/policy/Termux/summary-provider routes and commands.
 - service/infra sidecar repair.
 
 Kill switches must have observable status and must fail closed for public or command-execution surfaces where compatible.
@@ -107,7 +107,7 @@ Owner-approved Stage 5 disposition for first Rust release:
 | Require route-local secrets for all non-loopback hooks | Accepted. Non-loopback hooks require route-local proof/secret; local tmux hook remains local-only. |
 | Add stricter requester/capability checks to legacy session graph APIs | Accepted. Rust should use explicit capability checks for mutating session graph APIs; incompatibilities are allowed when they remove unsafe legacy authority. |
 | Disable or gate sensitive read APIs, AI summary generation, and `sm what` | Accepted. Public sensitive reads, the AI summary provider route, and `sm what` are not Rust targets; use `sm tail --raw`, `sm output`, or explicit status prompts. |
-| Remove redundant `sm kill` alias | Accepted. `sm retire` is the retained command for ending a session. |
+| Remove redundant `sm kill` CLI alias | Accepted. `sm retire` is the retained CLI command for ending a session. Retained API/mobile session-stop behavior, including current Android/watch use of `POST /sessions/{session_id}/kill`, remains in scope unless the native app is explicitly retargeted through reviewed fixtures. |
 | Rotate browser/device auth signing secrets or expire current sessions/tokens | Accepted when required by the public-edge/device design. Rollout must force re-login/re-enrollment explicitly rather than silently failing. |
 | Disallow non-default public inbound email webhook aliases | Accepted only for ambiguous/non-proofed aliases. Email/human delivery and inbound email stay retained; Rust supports the default route and explicitly allowlisted/proofed configured routes. |
 | Reject node-agent hook-secret fallback | Accepted. Registered nodes need explicit node credentials. |

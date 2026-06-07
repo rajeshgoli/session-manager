@@ -52,7 +52,7 @@ These surfaces are out of scope for the Rust cutover:
 | --- | --- |
 | `sm dispatch` and dispatch templates/config | Do not port. Remove from first-release CLI. Existing dispatch ideas can be rebuilt later as explicit workflow tickets if still useful. |
 | `sm what` | Do not port. It depends on low-capability summarization and is often wrong. Use `sm tail --raw`, `sm output`, or an explicit `sm send <id> "what are you doing now?"` status request instead. |
-| `sm kill` alias | Do not port. Use `sm retire` as the single lifecycle command for ending a session. |
+| `sm kill` CLI alias | Do not port. Use `sm retire` as the single CLI lifecycle command for ending a session. This does not retire retained HTTP/mobile session-stop APIs such as `POST /sessions/{session_id}/kill`; preserve them or retarget the native app through an explicit reviewed replacement. |
 | Termux/SSH attach metadata and command generation | Do not port. Native mobile terminal is the supported on-the-go attach path. |
 | Telegram bot commands, callbacks, topic cleanup, and remote control | Do not port. Telegram telemetry/topic state may be archived or migrated only for rollback/history. Native app replaces this remote-control surface. |
 | Generic public browser/watch data | Do not expose public operational data at `sm.rajeshgo.li`. Local/authenticated/proofed diagnostics are allowed; unauthenticated public operational browser views are not. |
