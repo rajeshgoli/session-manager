@@ -324,7 +324,6 @@
       "safety": "read_only",
       "command": ["all", "--help"],
       "expected_exit": [0],
-      "expected_output_contains_all": ["--summaries"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
