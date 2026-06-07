@@ -560,6 +560,18 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
     {
+      "id": "cli.queue_run_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["queue", "run", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--script-file", "--notify"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
+    },
+    {
       "id": "cli.queue_list_help",
       "surface": "cli",
       "classification": "retained",
@@ -567,6 +579,31 @@
       "safety": "read_only",
       "command": ["queue", "list", "--help"],
       "expected_exit": [0],
+      "expected_output_contains_all": ["--state", "--json"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
+    },
+    {
+      "id": "cli.queue_status_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["queue", "status", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["job_id", "--json"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
+    },
+    {
+      "id": "cli.queue_cancel_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["queue", "cancel", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["job_id"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
     },
