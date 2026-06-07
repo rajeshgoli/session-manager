@@ -91,6 +91,7 @@ def test_manifest_covers_core_retained_cli_help_surfaces():
         "cli.codex_help",
         "cli.codex_app_help",
         "cli.codex_fork_help",
+        "cli.codex_2_help",
     }
 
     missing = required_ids - set(checks)

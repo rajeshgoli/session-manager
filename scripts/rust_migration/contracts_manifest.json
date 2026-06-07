@@ -656,6 +656,18 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
     {
+      "id": "cli.codex_2_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["codex-2", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["working_dir"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage2_artifacts/usage_telemetry_report.md:105"
+    },
+    {
       "id": "cli.watch_help",
       "surface": "cli",
       "classification": "retained",
