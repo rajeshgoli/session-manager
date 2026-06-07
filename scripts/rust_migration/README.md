@@ -17,6 +17,13 @@ credentials, or mutating opt-in are reported as skipped when their preconditions
 are not supplied. Retired surfaces are Rust-target checks; current Python may
 still expose them during the migration window.
 
+HTTP checks can assert more than status codes. Manifest rows may include:
+
+- `request_headers` for host/proof/auth-boundary fixtures.
+- `expected_body_contains_any` / `expected_body_contains_all` for text or SSE frames.
+- `expected_json` JSON-pointer assertions with `type`, `equals`, `contains`, or
+  `absent` checks for response-shape contracts.
+
 Fixture values are supplied explicitly:
 
 ```bash
@@ -49,7 +56,23 @@ python -m scripts.rust_migration.contracts \
   --check-id http.client_bootstrap \
   --check-id http.sessions \
   --check-id http.client_sessions \
-  --check-id http.api_sessions_absent
+  --check-id http.api_sessions_absent \
+  --check-id http.public_watch_operational_data_denied \
+  --check-id http.scheduler_remind_retired \
+  --check-id http.job_watches_retired \
+  --check-id http.queue_policy_runs_retired
+```
+
+Summary-route retirement must be checked with a real fixture session. The
+harness first verifies `GET /sessions/{session_id}` returns 200 so a stale
+fixture or resource-level 404 cannot masquerade as route retirement:
+
+```bash
+python -m scripts.rust_migration.contracts \
+  --target rust \
+  --base-url http://127.0.0.1:8421 \
+  --session-id <fixture-session-id> \
+  --check-id http.summary_provider_route_retired
 ```
 
 Omit `--config` to load `config.yaml`; the Rust scaffold also applies the same

@@ -11,6 +11,8 @@ from scripts.rust_migration.baseline import (
 from scripts.rust_migration.contracts import (
     ContractCheck,
     ContractManifest,
+    JsonExpectation,
+    _json_expectation_error,
     _parse_fixtures,
     _run_cli_check,
     _run_http_check,
@@ -141,6 +143,42 @@ def test_manifest_covers_rust_only_retired_cli_surfaces():
         assert "removed" in check.expected_output_contains_any
 
 
+def test_manifest_covers_rust_only_retired_http_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    retired_ids = {
+        "http.public_watch_operational_data_denied",
+        "http.summary_provider_route_retired",
+        "http.scheduler_remind_retired",
+        "http.job_watches_retired",
+        "http.queue_policy_runs_retired",
+    }
+
+    missing = retired_ids - set(checks)
+    assert not missing
+    for check_id in retired_ids:
+        check = checks[check_id]
+        assert check.classification == "retired"
+        assert check.target == "rust_only"
+        assert 404 in check.expected_status
+    assert "session_id" in checks["http.summary_provider_route_retired"].preconditions
+
+
+def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    assert checks["http.health"].expected_json
+    assert checks["http.health"].expected_json[0].path == "/status"
+    assert checks["http.health"].expected_json[0].equals == "healthy"
+    assert checks["http.client_bootstrap"].expected_json
+    assert any(
+        expectation.path == "/auth/device_auth_endpoint"
+        and expectation.equals == "/auth/device/google"
+        for expectation in checks["http.client_bootstrap"].expected_json
+    )
+
+
 def test_python_target_does_not_run_rust_only_retirement_checks():
     manifest = ContractManifest.load()
     selected = checks_for_target(manifest.checks, target="python", include_mutating=False)
@@ -150,6 +188,8 @@ def test_python_target_does_not_run_rust_only_retirement_checks():
     assert "cli.what_retired" not in ids
     assert "cli.telegram_alias_retired" not in ids
     assert "cli.codex_server_retired" not in ids
+    assert "http.public_watch_operational_data_denied" not in ids
+    assert "http.summary_provider_route_retired" not in ids
     assert "http.mobile_session_stop" in ids
     assert "http.api_sessions_absent" in ids
 
@@ -168,6 +208,32 @@ def test_mutating_checks_are_reported_as_skipped_without_opt_in():
 
     assert result_by_id["http.mobile_session_stop"].status == "skipped"
     assert result_by_id["http.mobile_session_stop"].detail
+
+
+def test_existing_session_precondition_fails_for_stale_session_fixture():
+    manifest = ContractManifest.load()
+    not_found = urllib.error.HTTPError(
+        url="http://127.0.0.1:8421/sessions/stale",
+        code=404,
+        msg="not found",
+        hdrs=None,
+        fp=None,
+    )
+
+    with patch("scripts.rust_migration.contracts.urllib.request.urlopen", side_effect=not_found):
+        results = run_checks(
+            manifest,
+            target="rust",
+            base_url="http://127.0.0.1:8421",
+            sm_binary="sm",
+            session_id="stale",
+            check_ids={"http.summary_provider_route_retired"},
+            include_mutating=False,
+        )
+
+    assert len(results) == 1
+    assert results[0].status == "failed"
+    assert "session fixture precondition failed" in results[0].detail
 
 
 def test_summary_counts_statuses():
@@ -274,6 +340,107 @@ def test_post_checks_send_empty_json_body():
     assert seen["data"] == b"{}"
     assert seen["content_type"] == "application/json"
     assert seen["url"].endswith("/sessions/abc123/kill")
+
+
+def test_http_check_renders_request_headers_and_checks_json():
+    check = ContractCheck(
+        id="http.header_json",
+        surface="http",
+        classification="retained",
+        target="python_and_rust",
+        safety="read_only",
+        method="GET",
+        path="/sessions",
+        expected_status=(200,),
+        request_headers=(("Host", "{public_host}"),),
+        expected_json=(
+            JsonExpectation(path="/sessions", value_type="array"),
+        ),
+        preconditions=("live_server",),
+        source="test",
+    )
+    seen = {}
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _size):
+            return b'{"sessions":[]}'
+
+    def fake_urlopen(request, timeout):
+        seen["host"] = request.headers.get("Host")
+        return FakeResponse()
+
+    with patch("scripts.rust_migration.contracts.urllib.request.urlopen", fake_urlopen):
+        result = _run_http_check(
+            check,
+            "http://127.0.0.1:8420",
+            {"public_host": "sm.example.com"},
+            1.0,
+        )
+
+    assert result.status == "passed"
+    assert seen["host"] == "sm.example.com"
+
+
+def test_http_check_reports_json_shape_mismatch():
+    check = ContractCheck(
+        id="http.json",
+        surface="http",
+        classification="retained",
+        target="python_and_rust",
+        safety="read_only",
+        method="GET",
+        path="/sessions",
+        expected_status=(200,),
+        expected_json=(
+            JsonExpectation(path="/sessions", value_type="array"),
+        ),
+        preconditions=("live_server",),
+        source="test",
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _size):
+            return b'{"sessions":{}}'
+
+    with patch(
+        "scripts.rust_migration.contracts.urllib.request.urlopen",
+        return_value=FakeResponse(),
+    ):
+        result = _run_http_check(check, "http://127.0.0.1:8420", {}, 1.0)
+
+    assert result.status == "failed"
+    assert "expected type array" in result.detail
+
+
+def test_json_expectations_support_absent_equals_and_contains():
+    expectations = (
+        JsonExpectation(path="/auth/session_endpoint", equals="/auth/session", has_equals=True),
+        JsonExpectation(path="/status", one_of=("healthy", "degraded", "unhealthy")),
+        JsonExpectation(path="/external_access/ssh_proxy_command", absent=True),
+        JsonExpectation(path="/values", contains="mobile"),
+    )
+    body = (
+        '{"auth":{"session_endpoint":"/auth/session"},"status":"degraded",'
+        '"external_access":{},"values":["mobile"]}'
+    )
+
+    assert _json_expectation_error(body, expectations) is None
 
 
 def test_cli_check_requires_all_expected_output_tokens():
