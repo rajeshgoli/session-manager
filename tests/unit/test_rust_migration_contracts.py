@@ -56,6 +56,86 @@ def test_manifest_retains_local_and_durable_codex_review_cli_surfaces():
     assert "--notify" in durable.expected_output_contains_all
 
 
+def test_manifest_covers_core_retained_cli_help_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    required_ids = {
+        "cli.me_help",
+        "cli.who_help",
+        "cli.status_help",
+        "cli.all_help",
+        "cli.watch_help",
+        "cli.send_help",
+        "cli.email_help",
+        "cli.wait_help",
+        "cli.spawn_help",
+        "cli.fork_help",
+        "cli.new_help",
+        "cli.children_help",
+        "cli.retire_help",
+        "cli.restore_help",
+        "cli.attach_help",
+        "cli.output_help",
+        "cli.tail_raw_help",
+        "cli.clear_help",
+        "cli.handoff_help",
+        "cli.context_monitor_help",
+        "cli.maintainer_help",
+        "cli.register_help",
+        "cli.unregister_help",
+        "cli.lookup_help",
+        "cli.roster_help",
+        "cli.queue_run_help",
+        "cli.queue_list_help",
+        "cli.queue_status_help",
+        "cli.queue_cancel_help",
+        "cli.review_help",
+        "cli.request_codex_review_help",
+        "cli.claude_help",
+        "cli.codex_help",
+        "cli.codex_app_help",
+        "cli.codex_fork_help",
+        "cli.codex_2_help",
+    }
+
+    missing = required_ids - set(checks)
+    assert not missing
+    for check_id in required_ids:
+        check = checks[check_id]
+        assert check.classification == "retained"
+        assert check.target == "python_and_rust"
+        assert check.command[-1] == "--help"
+        assert check.expected_exit == (0,)
+
+
+def test_manifest_covers_rust_only_retired_cli_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    retired_ids = {
+        "cli.what_retired",
+        "cli.kill_alias_retired",
+        "cli.dispatch_retired",
+        "cli.remind_retired",
+        "cli.watch_job_retired",
+        "cli.queue_policy_retired",
+        "cli.queue_policy_status_retired",
+        "cli.queue_policy_history_retired",
+        "cli.telegram_retired",
+        "cli.telegram_alias_retired",
+        "cli.codex_legacy_retired",
+        "cli.codex_server_retired",
+    }
+
+    missing = retired_ids - set(checks)
+    assert not missing
+    for check_id in retired_ids:
+        check = checks[check_id]
+        assert check.classification == "retired"
+        assert check.target == "rust_only"
+        assert check.command[-1] == "--help"
+        assert "removed" in check.expected_output_contains_any
+
+
 def test_python_target_does_not_run_rust_only_retirement_checks():
     manifest = ContractManifest.load()
     selected = checks_for_target(manifest.checks, target="python", include_mutating=False)
@@ -63,6 +143,8 @@ def test_python_target_does_not_run_rust_only_retirement_checks():
 
     assert "cli.kill_alias_retired" not in ids
     assert "cli.what_retired" not in ids
+    assert "cli.telegram_alias_retired" not in ids
+    assert "cli.codex_server_retired" not in ids
     assert "http.mobile_session_stop" in ids
     assert "http.api_sessions_absent" in ids
 

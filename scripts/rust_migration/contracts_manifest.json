@@ -295,6 +295,39 @@
       "source": "specs/762_stage5_artifacts/gate_matrix.md:69"
     },
     {
+      "id": "cli.me_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["me", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.who_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["who", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.all_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["all", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
       "id": "cli.send_help",
       "surface": "cli",
       "classification": "retained",
@@ -302,8 +335,69 @@
       "safety": "read_only",
       "command": ["send", "--help"],
       "expected_exit": [0],
+      "expected_output_contains_all": ["--urgent", "--wait"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage2_artifacts/cli_manifest.md:send"
+    },
+    {
+      "id": "cli.wait_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["wait", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["session_id", "seconds"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.spawn_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["spawn", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--name", "--wait", "--model"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.fork_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["fork", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--self", "--attach"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.new_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["new", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["working_dir"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.children_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["children", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--recursive"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
     {
       "id": "cli.tail_raw_help",
@@ -313,6 +407,7 @@
       "safety": "read_only",
       "command": ["tail", "--help"],
       "expected_exit": [0],
+      "expected_output_contains_all": ["--raw"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:70"
     },
@@ -328,6 +423,75 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:37"
     },
     {
+      "id": "cli.restore_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["restore", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.attach_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["attach", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.output_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["output", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--lines"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.clear_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["clear", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.handoff_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["handoff", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["file_path"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.context_monitor_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["context-monitor", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["enable", "disable", "status"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
       "id": "cli.email_help",
       "surface": "cli",
       "classification": "retained",
@@ -335,8 +499,77 @@
       "safety": "read_only",
       "command": ["email", "--help"],
       "expected_exit": [0],
+      "expected_output_contains_all": ["--subject", "--body"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:39"
+    },
+    {
+      "id": "cli.maintainer_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["maintainer", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--clear"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.register_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["register", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.unregister_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["unregister", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.lookup_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["lookup", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.roster_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["roster", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.queue_run_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["queue", "run", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--script-file", "--notify"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
     },
     {
       "id": "cli.queue_list_help",
@@ -346,6 +579,31 @@
       "safety": "read_only",
       "command": ["queue", "list", "--help"],
       "expected_exit": [0],
+      "expected_output_contains_all": ["--state", "--json"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
+    },
+    {
+      "id": "cli.queue_status_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["queue", "status", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["job_id", "--json"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
+    },
+    {
+      "id": "cli.queue_cancel_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["queue", "cancel", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["job_id"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
     },
@@ -387,6 +645,18 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
     {
+      "id": "cli.claude_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["claude", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["working_dir"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
       "id": "cli.codex_help",
       "surface": "cli",
       "classification": "retained",
@@ -394,8 +664,45 @@
       "safety": "read_only",
       "command": ["codex", "--help"],
       "expected_exit": [0],
+      "expected_output_contains_all": ["working_dir"],
       "preconditions": ["sm_cli"],
-      "source": "specs/762_stage5_artifacts/cutover_scope.md:35"
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.codex_app_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["codex-app", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["working_dir"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.codex_fork_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["codex-fork", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["working_dir"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.codex_2_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["codex-2", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["working_dir"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage2_artifacts/usage_telemetry_report.md:105"
     },
     {
       "id": "cli.watch_help",
@@ -416,7 +723,7 @@
       "safety": "read_only",
       "command": ["what", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:54"
     },
@@ -428,7 +735,7 @@
       "safety": "read_only",
       "command": ["kill", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "use sm retire", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "use sm retire", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:55"
     },
@@ -440,7 +747,7 @@
       "safety": "read_only",
       "command": ["dispatch", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:53"
     },
@@ -452,7 +759,7 @@
       "safety": "read_only",
       "command": ["remind", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:60"
     },
@@ -464,7 +771,7 @@
       "safety": "read_only",
       "command": ["watch-job", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:59"
     },
@@ -476,7 +783,31 @@
       "safety": "read_only",
       "command": ["queue", "ci-run", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
+    },
+    {
+      "id": "cli.queue_policy_status_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["queue", "ci-status", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
+    },
+    {
+      "id": "cli.queue_policy_history_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["queue", "ci-history", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
     },
@@ -488,7 +819,19 @@
       "safety": "read_only",
       "command": ["telegram", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:57"
+    },
+    {
+      "id": "cli.telegram_alias_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["tg", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:57"
     },
@@ -500,7 +843,19 @@
       "safety": "read_only",
       "command": ["codex-legacy", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:63"
+    },
+    {
+      "id": "cli.codex_server_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["codex-server", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:63"
     }
