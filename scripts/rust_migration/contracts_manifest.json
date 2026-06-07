@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "source_spec": "specs/762_rust_migration_and_ruggedization.md",
+  "artifacts": [
+    "specs/762_stage2_artifacts/route_auth_matrix.md",
+    "specs/762_stage2_artifacts/external_client_manifest.md",
+    "specs/762_stage5_artifacts/cutover_scope.md",
+    "specs/762_stage5_artifacts/gate_matrix.md"
+  ],
+  "checks": [
+    {
+      "id": "http.health",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/health",
+      "expected_status": [200],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:62"
+    },
+    {
+      "id": "http.health_detailed",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/health/detailed",
+      "expected_status": [200],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:62"
+    },
+    {
+      "id": "http.auth_session",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/auth/session",
+      "expected_status": [200],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:63"
+    },
+    {
+      "id": "http.client_bootstrap",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/client/bootstrap",
+      "expected_status": [200],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:64"
+    },
+    {
+      "id": "http.client_sessions",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/client/sessions",
+      "expected_status": [200],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:64"
+    },
+    {
+      "id": "http.sessions",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/sessions",
+      "expected_status": [200],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:69"
+    },
+    {
+      "id": "http.events_state",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/events/state",
+      "expected_status": [200],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:71"
+    },
+    {
+      "id": "http.mobile_session_stop",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/sessions/{session_id}/kill",
+      "expected_status": [200],
+      "preconditions": ["live_server", "session_id", "mutating_opt_in"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:66"
+    },
+    {
+      "id": "cli.status_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["status", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:69"
+    },
+    {
+      "id": "cli.send_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["send", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage2_artifacts/cli_manifest.md:send"
+    },
+    {
+      "id": "cli.tail_raw_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["tail", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:70"
+    },
+    {
+      "id": "cli.retire_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["retire", "--help"],
+      "expected_exit": [0],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:37"
+    },
+    {
+      "id": "cli.what_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["what", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:54"
+    },
+    {
+      "id": "cli.kill_alias_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["kill", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "not ported", "use sm retire", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:55"
+    },
+    {
+      "id": "cli.dispatch_retired",
+      "surface": "cli",
+      "classification": "retired",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["dispatch", "--help"],
+      "expected_exit": [1, 2],
+      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:53"
+    }
+  ]
+}
