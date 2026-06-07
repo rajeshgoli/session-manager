@@ -241,7 +241,11 @@ def _discover_server_pid(port: int) -> int | None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=["python", "rust"], default="python")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8420")
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Server base URL; defaults to http://127.0.0.1:8420 for Python and is required for Rust",
+    )
     parser.add_argument("--sm-binary", default="sm")
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--server-pid", type=int, default=None)
@@ -255,11 +259,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_base_url(target: str, base_url: str | None) -> str:
+    if base_url:
+        return base_url
+    if target == "rust":
+        raise ValueError("--base-url is required when --target rust")
+    return "http://127.0.0.1:8420"
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        base_url = _resolve_base_url(args.target, args.base_url)
+    except ValueError as exc:
+        parser.error(str(exc))
     report = run_baseline(
         target=args.target,
-        base_url=args.base_url,
+        base_url=base_url,
         sm_binary=args.sm_binary,
         repetitions=args.repetitions,
         output=args.output,

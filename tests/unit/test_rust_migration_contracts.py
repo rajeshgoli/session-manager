@@ -5,6 +5,7 @@ from unittest.mock import patch
 from scripts.rust_migration.baseline import (
     _parse_memory_to_mib,
     _port_from_base_url,
+    _resolve_base_url,
     run_baseline,
 )
 from scripts.rust_migration.contracts import (
@@ -351,6 +352,17 @@ def test_baseline_memory_discovery_uses_selected_base_url_port():
     assert _port_from_base_url("http://127.0.0.1") == 80
     assert _port_from_base_url("https://sm.example.test") == 443
     assert _port_from_base_url(None) == 8420
+
+
+def test_rust_baseline_requires_explicit_base_url():
+    assert _resolve_base_url("python", None) == "http://127.0.0.1:8420"
+    assert _resolve_base_url("rust", "http://127.0.0.1:8421") == "http://127.0.0.1:8421"
+    try:
+        _resolve_base_url("rust", None)
+    except ValueError as exc:
+        assert "--base-url" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_memory_unit_parser_handles_vmmap_units():
