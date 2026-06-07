@@ -37,6 +37,9 @@ wheels/
 .coverage
 htmlcov/
 
+# Rust
+target/
+
 # IDE
 .vscode/
 .idea/
