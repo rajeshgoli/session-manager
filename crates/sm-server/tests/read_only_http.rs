@@ -3,7 +3,14 @@ use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
 };
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use sm_server::{
     config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig},
     http::{router, AppState},
@@ -29,6 +36,25 @@ async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
 
 async fn get_json_with_host(app: axum::Router, uri: &str, host: &str) -> (StatusCode, Value) {
     get_json_with_host_and_peer(app, uri, host, None).await
+}
+
+async fn get_json_with_host_and_headers(
+    app: axum::Router,
+    uri: &str,
+    host: &str,
+    headers: &[(&str, String)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().uri(uri).header("host", host);
+    for (name, value) in headers {
+        builder = builder.header(*name, value);
+    }
+    let response = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
 }
 
 async fn get_json_with_host_and_peer(
@@ -324,7 +350,85 @@ async fn sessions_reject_public_host_when_google_auth_enabled() {
     let (status, payload) = get_json_with_host(app, "/sessions", "sm.example.com").await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(payload, json!({ "detail": "Authentication required" }));
+    assert_eq!(
+        payload,
+        json!({
+            "detail": "Authentication required",
+            "login_url": "/auth/google/login?next=%2Fsessions"
+        })
+    );
+}
+
+#[tokio::test]
+async fn sessions_allow_public_device_bearer_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+    let token = device_access_token("session-cookie-secret", "rajesh@example.com", "Rajesh");
+
+    let (status, payload) = get_json_with_host_and_headers(
+        app,
+        "/sessions",
+        "sm.example.com",
+        &[("authorization", format!("Bearer {token}"))],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn client_sessions_allow_public_browser_cookie_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+    let cookie = starlette_session_cookie(
+        "session-cookie-secret",
+        json!({
+            "google_authenticated": true,
+            "google_email": "rajesh@example.com",
+            "google_name": "Rajesh"
+        }),
+    );
+
+    let (status, payload) = get_json_with_host_and_headers(
+        app,
+        "/client/sessions",
+        "sm.example.com",
+        &[("cookie", format!("sm_auth={cookie}"))],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn auth_session_reports_device_bearer_when_google_auth_enabled() {
+    let token = device_access_token("session-cookie-secret", "rajesh@example.com", "Rajesh");
+    let app = router(AppState::new(config_with_state_file_and_auth(
+        &unique_temp_path(),
+    )));
+
+    let (status, payload) = get_json_with_host_and_headers(
+        app,
+        "/auth/session",
+        "sm.example.com",
+        &[("authorization", format!("Bearer {token}"))],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "enabled": true,
+            "authenticated": true,
+            "bypass": false,
+            "email": "rajesh@example.com",
+            "name": "Rajesh",
+            "auth_type": "device_bearer"
+        })
+    );
 }
 
 #[tokio::test]
@@ -530,4 +634,63 @@ fn unique_temp_path() -> PathBuf {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn device_access_token(secret: &str, email: &str, name: &str) -> String {
+    let exp = unix_timestamp() + 3600;
+    let payload = json!({
+        "v": 1,
+        "type": "device_access",
+        "email": email,
+        "name": name,
+        "iat": unix_timestamp(),
+        "exp": exp
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signature = hmac_sha256_urlsafe(secret.as_bytes(), payload_b64.as_bytes());
+    format!("smat_{payload_b64}.{signature}")
+}
+
+fn starlette_session_cookie(secret: &str, payload: Value) -> String {
+    let payload_b64 = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+    let timestamp_b64 = URL_SAFE_NO_PAD.encode(int_to_bytes(unix_timestamp() as u64));
+    let value = format!("{payload_b64}.{timestamp_b64}");
+    let derived_key = itsdangerous_django_concat_key(secret);
+    let signature = hmac_sha1_urlsafe(&derived_key, value.as_bytes());
+    format!("{value}.{signature}")
+}
+
+fn hmac_sha256_urlsafe(key: &[u8], value: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(value);
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn hmac_sha1_urlsafe(key: &[u8], value: &[u8]) -> String {
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).unwrap();
+    mac.update(value);
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn itsdangerous_django_concat_key(secret: &str) -> Vec<u8> {
+    let mut hasher = Sha1::new();
+    hasher.update(b"itsdangerous.Signersigner");
+    hasher.update(secret.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn int_to_bytes(value: u64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first_nonzero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    bytes[first_nonzero..].to_vec()
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }

@@ -2,19 +2,32 @@ use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{ConnectInfo, Query, Request, State},
-    http::{header::HOST, HeaderMap, StatusCode},
+    http::{
+        header::{AUTHORIZATION, COOKIE, HOST},
+        HeaderMap, StatusCode,
+    },
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{trimmed, AppConfig};
 use crate::sessions::{
     expand_home, ClientSessionResponse, SessionResponse, SessionStore, SessionsEnvelope,
 };
+
+const SESSION_COOKIE_NAME: &str = "sm_auth";
+const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -90,6 +103,18 @@ async fn auth_session(
     }
     if !auth.ready() {
         return Json(AuthSessionResponse::misconfigured());
+    }
+
+    if let Some(user) = authenticated_user(request.headers(), &state.config) {
+        return Json(AuthSessionResponse {
+            enabled: true,
+            authenticated: true,
+            bypass: false,
+            email: Some(user.email),
+            name: user.name,
+            auth_type: Some(user.auth_type),
+            error: None,
+        });
     }
 
     Json(AuthSessionResponse {
@@ -173,6 +198,7 @@ enum ApiError {
     Auth {
         status: StatusCode,
         detail: &'static str,
+        login_url: Option<String>,
     },
 }
 
@@ -193,8 +219,16 @@ impl IntoResponse for ApiError {
                 Json(json!({ "detail": error.to_string() })),
             )
                 .into_response(),
-            Self::Auth { status, detail } => {
-                (status, Json(json!({ "detail": detail }))).into_response()
+            Self::Auth {
+                status,
+                detail,
+                login_url,
+            } => {
+                let mut body = json!({ "detail": detail });
+                if let Some(login_url) = login_url {
+                    body["login_url"] = Value::String(login_url);
+                }
+                (status, Json(body)).into_response()
             }
         }
     }
@@ -215,13 +249,174 @@ fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<()
     if !auth.ready() {
         return Err(ApiError::Auth {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            detail: "Google auth is not configured",
+            detail: "Google auth is enabled but incomplete",
+            login_url: None,
         });
+    }
+    if authenticated_user(request.headers(), &state.config).is_some() {
+        return Ok(());
     }
     Err(ApiError::Auth {
         status: StatusCode::UNAUTHORIZED,
         detail: "Authentication required",
+        login_url: Some(google_login_redirect(request.uri().path())),
     })
+}
+
+#[derive(Debug)]
+struct AuthenticatedUser {
+    email: String,
+    name: Option<String>,
+    auth_type: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceAccessPayload {
+    #[serde(rename = "type")]
+    token_type: String,
+    email: String,
+    #[serde(default)]
+    name: Option<String>,
+    exp: i64,
+}
+
+fn authenticated_user(headers: &HeaderMap, config: &AppConfig) -> Option<AuthenticatedUser> {
+    if let Some(user) = device_auth_user(headers, config) {
+        return Some(user);
+    }
+    browser_session_user(headers, config)
+}
+
+fn device_auth_user(headers: &HeaderMap, config: &AppConfig) -> Option<AuthenticatedUser> {
+    let token = request_bearer_token(headers)?;
+    let secret = trimmed(&config.google_auth.session_cookie_secret)?;
+    let raw = token.strip_prefix("smat_")?;
+    let (payload_b64, signature_b64) = raw.split_once('.')?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(payload_b64.as_bytes());
+    let signature = URL_SAFE_NO_PAD.decode(signature_b64).ok()?;
+    mac.verify_slice(&signature).ok()?;
+
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let payload: DeviceAccessPayload = serde_json::from_slice(&payload_bytes).ok()?;
+    if payload.token_type != "device_access"
+        || payload.exp <= OffsetDateTime::now_utc().unix_timestamp()
+    {
+        return None;
+    }
+    let email = payload.email.trim().to_lowercase();
+    if email.is_empty() {
+        return None;
+    }
+    Some(AuthenticatedUser {
+        email,
+        name: payload.name,
+        auth_type: "device_bearer",
+    })
+}
+
+fn request_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+fn browser_session_user(headers: &HeaderMap, config: &AppConfig) -> Option<AuthenticatedUser> {
+    let cookie = cookie_value(headers, SESSION_COOKIE_NAME)?;
+    let secret = trimmed(&config.google_auth.session_cookie_secret)?;
+    let payload = verify_starlette_session_cookie(&cookie, &secret)?;
+    if payload.get("google_authenticated")?.as_bool()? != true {
+        return None;
+    }
+    Some(AuthenticatedUser {
+        email: payload
+            .get("google_email")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        name: payload
+            .get("google_name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        auth_type: "browser_session",
+    })
+}
+
+fn verify_starlette_session_cookie(cookie: &str, secret: &str) -> Option<Value> {
+    let (value, signature_b64) = cookie.rsplit_once('.')?;
+    let (payload_b64, timestamp_b64) = value.rsplit_once('.')?;
+    let derived_key = itsdangerous_django_concat_key(secret);
+    let mut mac = Hmac::<Sha1>::new_from_slice(&derived_key).ok()?;
+    mac.update(value.as_bytes());
+    let signature = URL_SAFE_NO_PAD.decode(signature_b64).ok()?;
+    mac.verify_slice(&signature).ok()?;
+
+    let timestamp = decode_itsdangerous_timestamp(timestamp_b64)?;
+    let age = OffsetDateTime::now_utc().unix_timestamp() - timestamp;
+    if !(0..=SESSION_COOKIE_MAX_AGE_SECONDS).contains(&age) {
+        return None;
+    }
+    let payload = STANDARD.decode(payload_b64).ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+fn itsdangerous_django_concat_key(secret: &str) -> Vec<u8> {
+    let mut hasher = Sha1::new();
+    hasher.update(b"itsdangerous.Signersigner");
+    hasher.update(secret.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn decode_itsdangerous_timestamp(value: &str) -> Option<i64> {
+    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
+    if bytes.len() > 8 {
+        return None;
+    }
+    let mut padded = [0_u8; 8];
+    let start = 8 - bytes.len();
+    padded[start..].copy_from_slice(&bytes);
+    Some(u64::from_be_bytes(padded) as i64)
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    for header in headers.get_all(COOKIE) {
+        let Ok(value) = header.to_str() else {
+            continue;
+        };
+        for part in value.split(';') {
+            let Some((cookie_name, cookie_value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if cookie_name.trim() == name {
+                let cookie_value = cookie_value.trim();
+                if !cookie_value.is_empty() {
+                    return Some(cookie_value.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn google_login_redirect(path: &str) -> String {
+    format!("/auth/google/login?next={}", percent_encode_path(path))
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn is_local_bypass_request(
