@@ -29,7 +29,7 @@ These surfaces are in scope for the first Rust release:
 | Area | Retained Scope |
 | --- | --- |
 | Core session lifecycle | create/new, spawn, fork, restore, retire, open where local, attach to tmux, output/tail, clear, handoff, parent/child relationships, registry/role/maintainer identity that current agent workflows depend on. |
-| Core CLI | `sm me`, `who`, `status`, `all`, `watch`, `send`, `email`, `wait`, `spawn`, `fork`, `new`, `children`, `retire`, `restore`, `attach`, `output`, `tail`, `clear`, `handoff`, `context-monitor`, `maintainer`, `register`, `unregister`, `lookup`, `roster`, and current Codex provider commands that are active. |
+| Core CLI | `sm me`, `who`, `status`, `all`, `watch`, `send`, `email`, `wait`, `spawn`, `fork`, `new`, `children`, `retire`, `restore`, `attach`, `output`, `tail`, `clear`, `handoff`, `context-monitor`, `maintainer`, `register`, `unregister`, `lookup`, `roster`, `review`, `request-codex-review`, and current Codex provider commands that are active. |
 | Native mobile app | Google/device auth, bootstrap, client session list/detail, mobile terminal attach, request-status, analytics, bug reports, app update/artifact flow, device inventory/revocation. |
 | Mobile terminal | Keep or redesign the current attach-ticket/WebSocket path, but preserve auth, device proof, session binding, quotas, revocation, audit, and fail-closed behavior. Termux is not part of this scope. |
 | Public remote access | Public edge proof is required before operational public traffic reaches origin. Public callers must prove enrolled phone or approved node possession, then pass OAuth/device-bearer or node authorization at origin. |
