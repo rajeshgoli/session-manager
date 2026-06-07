@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -40,7 +41,7 @@ impl SessionStore {
     pub fn list_sessions(&self, include_stopped: bool) -> Result<Vec<SessionRecord>> {
         let snapshot = self.load_snapshot()?;
         Ok(snapshot
-            .sessions
+            .into_sessions()
             .into_iter()
             .filter(|session| include_stopped || !session.is_stopped())
             .collect())
@@ -104,6 +105,118 @@ pub fn expand_home(path: &str) -> PathBuf {
 struct StateSnapshot {
     #[serde(default)]
     sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    maintainer_session_id: Option<String>,
+    #[serde(default)]
+    agent_registrations: Vec<AgentRegistrationRecord>,
+    #[serde(default)]
+    adoption_proposals: Vec<AdoptionProposalRecord>,
+}
+
+impl StateSnapshot {
+    fn into_sessions(mut self) -> Vec<SessionRecord> {
+        let alias_map = self.alias_map();
+        for session in &mut self.sessions {
+            session.aliases = alias_map
+                .get(&session.id)
+                .map(|aliases| aliases.iter().cloned().collect())
+                .unwrap_or_default();
+        }
+
+        let proposer_names = self
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session
+                        .cached_display_name()
+                        .unwrap_or_else(|| non_empty_or(session.name.clone(), &session.id)),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut proposal_map = self.pending_proposal_map(&proposer_names);
+        for session in &mut self.sessions {
+            session.pending_adoption_proposals =
+                proposal_map.remove(&session.id).unwrap_or_default();
+        }
+
+        self.sessions
+    }
+
+    fn alias_map(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut aliases = BTreeMap::<String, BTreeSet<String>>::new();
+        if let Some(session_id) = self
+            .maintainer_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            aliases
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert("maintainer".to_owned());
+        }
+        for registration in &self.agent_registrations {
+            let role = normalize_role(&registration.role);
+            let session_id = registration.session_id.trim();
+            if role.is_empty() || session_id.is_empty() {
+                continue;
+            }
+            aliases
+                .entry(session_id.to_owned())
+                .or_default()
+                .insert(role);
+        }
+        aliases
+    }
+
+    fn pending_proposal_map(
+        &self,
+        proposer_names: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, Vec<AdoptionProposalResponse>> {
+        let mut proposal_map = BTreeMap::<String, Vec<AdoptionProposalResponse>>::new();
+        for proposal in &self.adoption_proposals {
+            if proposal.status != "pending" {
+                continue;
+            }
+            proposal_map
+                .entry(proposal.target_session_id.clone())
+                .or_default()
+                .push(AdoptionProposalResponse {
+                    id: proposal.id.clone(),
+                    proposer_session_id: proposal.proposer_session_id.clone(),
+                    proposer_name: proposer_names.get(&proposal.proposer_session_id).cloned(),
+                    target_session_id: proposal.target_session_id.clone(),
+                    created_at: proposal.created_at.clone(),
+                    status: proposal.status.clone(),
+                    decided_at: proposal.decided_at.clone(),
+                });
+        }
+        for proposals in proposal_map.values_mut() {
+            proposals.sort_by(|left, right| {
+                (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
+            });
+        }
+        proposal_map
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentRegistrationRecord {
+    role: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdoptionProposalRecord {
+    id: String,
+    proposer_session_id: String,
+    target_session_id: String,
+    created_at: String,
+    status: String,
+    #[serde(default)]
+    decided_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,6 +293,10 @@ pub struct SessionRecord {
     pub tokens_used: i64,
     #[serde(default)]
     pub context_monitor_enabled: bool,
+    #[serde(skip)]
+    pub aliases: Vec<String>,
+    #[serde(skip)]
+    pub pending_adoption_proposals: Vec<AdoptionProposalResponse>,
 }
 
 impl SessionRecord {
@@ -188,6 +305,9 @@ impl SessionRecord {
     }
 
     fn cached_display_name(&self) -> Option<String> {
+        if let Some(alias) = self.aliases.first() {
+            return Some(alias.clone());
+        }
         let native_title = self.native_title.as_deref().filter(|value| {
             matches!(
                 self.provider.as_str(),
@@ -240,6 +360,17 @@ impl From<Vec<ClientSessionResponse>> for SessionsEnvelope<ClientSessionResponse
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AdoptionProposalResponse {
+    id: String,
+    proposer_session_id: String,
+    proposer_name: Option<String>,
+    target_session_id: String,
+    created_at: String,
+    status: String,
+    decided_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionResponse {
     id: String,
     name: String,
@@ -278,7 +409,7 @@ pub struct SessionResponse {
     last_action_at: Option<String>,
     tokens_used: i64,
     context_monitor_enabled: bool,
-    pending_adoption_proposals: Vec<Value>,
+    pending_adoption_proposals: Vec<AdoptionProposalResponse>,
     aliases: Vec<String>,
     is_maintainer: bool,
 }
@@ -287,6 +418,7 @@ impl From<SessionRecord> for SessionResponse {
     fn from(session: SessionRecord) -> Self {
         let status = normalized_status(&session.status);
         let friendly_name = session.cached_display_name();
+        let is_maintainer = session.aliases.iter().any(|alias| alias == "maintainer");
         Self {
             id: session.id,
             name: session.name,
@@ -325,9 +457,9 @@ impl From<SessionRecord> for SessionResponse {
             last_action_at: None,
             tokens_used: session.tokens_used,
             context_monitor_enabled: session.context_monitor_enabled,
-            pending_adoption_proposals: Vec::new(),
-            aliases: Vec::new(),
-            is_maintainer: false,
+            pending_adoption_proposals: session.pending_adoption_proposals,
+            aliases: session.aliases,
+            is_maintainer,
         }
     }
 }
@@ -420,6 +552,24 @@ fn default_provider() -> String {
     "claude".to_owned()
 }
 
+fn normalize_role(role: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_dash = false;
+    for ch in role.trim().chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !normalized.is_empty() {
+            normalized.push('-');
+            last_was_dash = true;
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +615,8 @@ mod tests {
             last_tool_name: None,
             tokens_used: 0,
             context_monitor_enabled: false,
+            aliases: Vec::new(),
+            pending_adoption_proposals: Vec::new(),
         }
     }
 
@@ -575,6 +727,60 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "legacy2");
+    }
+
+    #[test]
+    fn snapshot_projects_aliases_and_pending_adoption_proposals() {
+        let snapshot = StateSnapshot {
+            sessions: vec![
+                SessionRecord {
+                    id: "em123456".to_owned(),
+                    friendly_name: Some("em-ops".to_owned()),
+                    is_em: true,
+                    ..session_record("running")
+                },
+                SessionRecord {
+                    id: "child001".to_owned(),
+                    friendly_name: None,
+                    ..session_record("running")
+                },
+            ],
+            maintainer_session_id: Some("em123456".to_owned()),
+            agent_registrations: vec![AgentRegistrationRecord {
+                role: "Reviewer".to_owned(),
+                session_id: "child001".to_owned(),
+            }],
+            adoption_proposals: vec![AdoptionProposalRecord {
+                id: "proposal1".to_owned(),
+                proposer_session_id: "em123456".to_owned(),
+                target_session_id: "child001".to_owned(),
+                created_at: "2026-06-01T00:03:00".to_owned(),
+                status: "pending".to_owned(),
+                decided_at: None,
+            }],
+        };
+
+        let sessions = snapshot.into_sessions();
+        let maintainer = sessions
+            .iter()
+            .find(|session| session.id == "em123456")
+            .unwrap();
+        let child = sessions
+            .iter()
+            .find(|session| session.id == "child001")
+            .unwrap();
+
+        assert_eq!(maintainer.aliases, vec!["maintainer"]);
+        assert_eq!(
+            maintainer.cached_display_name().as_deref(),
+            Some("maintainer")
+        );
+        assert_eq!(child.aliases, vec!["reviewer"]);
+        assert_eq!(child.pending_adoption_proposals.len(), 1);
+        assert_eq!(
+            child.pending_adoption_proposals[0].proposer_name.as_deref(),
+            Some("maintainer")
+        );
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

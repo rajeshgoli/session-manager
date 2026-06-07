@@ -344,6 +344,43 @@ async fn client_sessions_allow_local_bypass_when_google_auth_enabled() {
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
 }
 
+#[tokio::test]
+async fn sessions_project_top_level_registry_and_adoption_state() {
+    let state_file = write_registry_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let sessions = payload["sessions"].as_array().unwrap();
+    let maintainer = sessions
+        .iter()
+        .find(|session| session["id"] == "em123456")
+        .unwrap();
+    let child = sessions
+        .iter()
+        .find(|session| session["id"] == "child001")
+        .unwrap();
+    assert_eq!(maintainer["aliases"], json!(["maintainer"]));
+    assert_eq!(maintainer["is_maintainer"], true);
+    assert_eq!(maintainer["friendly_name"], "maintainer");
+    assert_eq!(child["aliases"], json!(["reviewer"]));
+    assert_eq!(
+        child["pending_adoption_proposals"],
+        json!([
+            {
+                "id": "proposal1",
+                "proposer_session_id": "em123456",
+                "proposer_name": "maintainer",
+                "target_session_id": "child001",
+                "created_at": "2026-06-01T00:03:00",
+                "status": "pending",
+                "decided_at": null
+            }
+        ])
+    );
+}
+
 fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
@@ -419,6 +456,60 @@ fn write_session_fixture() -> PathBuf {
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",
                     "stopped_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn write_registry_fixture() -> PathBuf {
+    let path = unique_temp_path();
+    fs::write(
+        &path,
+        json!({
+            "sessions": [
+                {
+                    "id": "em123456",
+                    "name": "claude-em123456",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-em123456",
+                    "log_file": "/tmp/em123456.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "em-ops",
+                    "is_em": true
+                },
+                {
+                    "id": "child001",
+                    "name": "claude-child001",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-child001",
+                    "log_file": "/tmp/child001.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ],
+            "maintainer_session_id": "em123456",
+            "agent_registrations": [
+                {
+                    "role": "Reviewer",
+                    "session_id": "child001",
+                    "created_at": "2026-06-01T00:02:00"
+                }
+            ],
+            "adoption_proposals": [
+                {
+                    "id": "proposal1",
+                    "proposer_session_id": "em123456",
+                    "target_session_id": "child001",
+                    "created_at": "2026-06-01T00:03:00",
+                    "status": "pending",
+                    "decided_at": null
                 }
             ]
         })
