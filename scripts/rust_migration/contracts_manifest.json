@@ -674,7 +674,7 @@
       "safety": "read_only",
       "command": ["what", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:54"
     },
@@ -686,7 +686,7 @@
       "safety": "read_only",
       "command": ["kill", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "use sm retire", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "use sm retire", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:55"
     },
@@ -698,7 +698,7 @@
       "safety": "read_only",
       "command": ["dispatch", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:53"
     },
@@ -710,7 +710,7 @@
       "safety": "read_only",
       "command": ["remind", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:60"
     },
@@ -722,7 +722,7 @@
       "safety": "read_only",
       "command": ["watch-job", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:59"
     },
@@ -734,7 +734,7 @@
       "safety": "read_only",
       "command": ["queue", "ci-run", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:61"
     },
@@ -746,7 +746,7 @@
       "safety": "read_only",
       "command": ["telegram", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:57"
     },
@@ -758,7 +758,7 @@
       "safety": "read_only",
       "command": ["tg", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:57"
     },
@@ -770,7 +770,7 @@
       "safety": "read_only",
       "command": ["codex-legacy", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:63"
     },
@@ -782,7 +782,7 @@
       "safety": "read_only",
       "command": ["codex-server", "--help"],
       "expected_exit": [1, 2],
-      "expected_output_contains_any": ["retired", "not ported", "unknown command"],
+      "expected_output_contains_any": ["retired", "removed", "not ported", "unknown command"],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:63"
     }

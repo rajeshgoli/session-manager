@@ -126,6 +126,7 @@ def test_manifest_covers_rust_only_retired_cli_surfaces():
         assert check.classification == "retired"
         assert check.target == "rust_only"
         assert check.command[-1] == "--help"
+        assert "removed" in check.expected_output_contains_any
 
 
 def test_python_target_does_not_run_rust_only_retirement_checks():
