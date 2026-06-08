@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -6,7 +6,10 @@ use axum::{
         header::{AUTHORIZATION, COOKIE, HOST},
         HeaderMap, StatusCode,
     },
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Json, Router,
 };
@@ -14,6 +17,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use futures_util::stream::{self, StreamExt};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -175,13 +179,18 @@ async fn events_stream(
 ) -> Result<Response, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
     let data = serde_json::to_string(&event_state_payload())?;
+    let stream =
+        stream::once(
+            async move { Ok::<Event, Infallible>(Event::default().event("hello").data(data)) },
+        )
+        .chain(stream::pending());
     Ok((
-        [
-            ("content-type", "text/event-stream"),
-            ("cache-control", "no-cache"),
-            ("x-accel-buffering", "no"),
-        ],
-        format!("event: hello\ndata: {data}\n\n"),
+        [("x-accel-buffering", "no")],
+        Sse::new(stream).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        ),
     )
         .into_response())
 }

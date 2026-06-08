@@ -7,6 +7,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use futures_util::StreamExt as _;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -20,7 +21,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
 
@@ -296,7 +297,19 @@ async fn events_state_returns_fallback_snapshot() {
 async fn events_stream_emits_hello_frame_with_sse_headers() {
     let app = router(AppState::new(AppConfig::default()));
 
-    let (status, headers, body) = get_response(app, "/events").await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut body_stream = response.into_body().into_data_stream();
+    let first_chunk = body_stream.next().await.unwrap().unwrap();
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -318,8 +331,14 @@ async fn events_stream_emits_hello_frame_with_sse_headers() {
         Some("no")
     );
     assert_eq!(
-        String::from_utf8(body).unwrap(),
+        String::from_utf8(first_chunk.to_vec()).unwrap(),
         "event: hello\ndata: {\"tmux_client_event_version\":0,\"last_tmux_client_event\":null}\n\n"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), body_stream.next())
+            .await
+            .is_err(),
+        "SSE stream closed before the keepalive interval"
     );
 }
 
