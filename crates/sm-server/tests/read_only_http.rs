@@ -21,6 +21,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::PathBuf,
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -852,7 +853,63 @@ async fn fixture_core_writes_are_disabled_by_default() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         payload,
-        json!({ "detail": "Rust core fixture writes are disabled" })
+        json!({ "detail": "Rust core writes are disabled" })
+    );
+}
+
+#[test]
+fn runtime_core_inherits_existing_tmux_socket_config() {
+    let config_path = unique_temp_path();
+    let missing_env_path = unique_temp_path();
+
+    fs::write(
+        &config_path,
+        r#"
+tmux:
+  socket_name: "session-manager"
+timeouts:
+  tmux:
+    send_keys_settle_seconds: 0.25
+    send_keys_settle_max_seconds: 1.25
+    send_keys_settle_per_ki_chars: 0.07
+    send_keys_settle_per_extra_line: 0.02
+    send_keys_max_chunk_chars: 2048
+rust_core:
+  runtime_enabled: true
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&missing_env_path)).unwrap();
+    assert_eq!(
+        config.rust_core.tmux_socket_name.as_deref(),
+        Some("session-manager")
+    );
+    assert_eq!(config.rust_core.send_keys_settle_ms, Some(250.0));
+    assert_eq!(config.rust_core.send_keys_settle_max_ms, Some(1250.0));
+    assert_eq!(config.rust_core.send_keys_settle_per_ki_ms, Some(70.0));
+    assert_eq!(
+        config.rust_core.send_keys_settle_per_extra_line_ms,
+        Some(20.0)
+    );
+    assert_eq!(config.rust_core.send_keys_max_chunk_chars, Some(2048));
+
+    fs::write(
+        &config_path,
+        r#"
+tmux:
+  socket_name: "session-manager"
+rust_core:
+  runtime_enabled: true
+  tmux_socket_name: "rust-core-only"
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&missing_env_path)).unwrap();
+    assert_eq!(
+        config.rust_core.tmux_socket_name.as_deref(),
+        Some("rust-core-only")
     );
 }
 
@@ -867,6 +924,7 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
             log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -1011,6 +1069,7 @@ async fn fixture_core_writes_preserve_concurrent_session_updates() {
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
             log_dir: Some(unique_temp_path().display().to_string()),
+            ..RustCoreConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -1063,6 +1122,7 @@ async fn fixture_core_logs_do_not_collide_for_sanitized_session_ids() {
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
             log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -1106,6 +1166,553 @@ async fn fixture_core_logs_do_not_collide_for_sanitized_session_ids() {
     let output = payload["output"].as_str().unwrap();
     assert!(output.contains("first prompt only"));
     assert!(!output.contains("second prompt only"));
+}
+
+#[tokio::test]
+async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket.clone()),
+            runtime_command: Some(
+                r#"/bin/sh -lc 'while IFS= read -r line; do printf "ids:%s:%s:%s\nruntime:%s\n" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done'"#
+                    .to_owned(),
+            ),
+            runtime_prompt_mode: Some("stdin".to_owned()),
+            runtime_start_settle_ms: Some(100),
+            send_keys_settle_ms: Some(10.0),
+            send_keys_settle_max_ms: Some(50.0),
+            send_keys_max_chunk_chars: Some(128),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimecore",
+            "name": "runtime-core",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "initial runtime prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "runtimecore");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["tmux_socket_name"], tmux_socket);
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+
+    let payload =
+        wait_for_output_contains(app.clone(), "runtimecore", "runtime:initial runtime prompt")
+            .await;
+    assert_eq!(payload["session_id"], "runtimecore");
+    wait_for_output_contains(
+        app.clone(),
+        "runtimecore",
+        "ids:runtimecore:runtimecore:false",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimecore/input",
+        json!({
+            "text": "second runtime message",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+
+    wait_for_output_contains(app.clone(), "runtimecore", "runtime:second runtime message").await;
+
+    let long_runtime_message = format!("{}chunked-runtime-tail", "x".repeat(500));
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimecore/input",
+        json!({
+            "text": long_runtime_message,
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(app.clone(), "runtimecore", "chunked-runtime-tail").await;
+
+    assert!(tmux_enter_copy_mode(&tmux_socket, &tmux_session));
+    assert_eq!(tmux_pane_in_mode(&tmux_socket, &tmux_session), Some(1));
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimecore/input",
+        json!({
+            "text": "copy mode runtime message",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimecore",
+        "runtime:copy mode runtime message",
+    )
+    .await;
+
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimecore/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+
+    let (status, payload) = get_json(app, "/sessions/runtimecore").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "stopped");
+    assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+}
+
+#[tokio::test]
+async fn runtime_core_send_and_retire_use_persisted_tmux_socket() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let socket_a = format!(
+        "sm-rust-test-a-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let socket_b = format!("{socket_a}-b");
+    let _guard_a = TestTmuxSocket(socket_a.clone());
+    let _guard_b = TestTmuxSocket(socket_b.clone());
+    let app_a = runtime_app(&state_file, &log_dir, &socket_a);
+    let app_b = runtime_app(&state_file, &log_dir, &socket_b);
+
+    let (status, payload) = post_json(
+        app_a.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimepersisted",
+            "name": "runtime-persisted",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "persisted socket initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tmux_socket_name"], socket_a);
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    wait_for_output_contains(
+        app_a.clone(),
+        "runtimepersisted",
+        "runtime:persisted socket initial",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app_b.clone(),
+        "/sessions/runtimepersisted/input",
+        json!({ "text": "sent through changed config socket" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app_b.clone(),
+        "runtimepersisted",
+        "runtime:sent through changed config socket",
+    )
+    .await;
+
+    let (status, payload) = post_json(app_b, "/sessions/runtimepersisted/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert!(!tmux_session_exists(&socket_a, &tmux_session));
+}
+
+#[tokio::test]
+async fn runtime_core_expands_bare_home_working_dir_for_tmux() {
+    if !tmux_available() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let tmux_socket = format!(
+        "sm-rust-test-home-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimehome",
+            "name": "runtime-home",
+            "working_dir": "~",
+            "provider": "claude",
+            "initial_message": "home runtime prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["working_dir"], "~");
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    let home_path = PathBuf::from(home);
+    assert_eq!(
+        tmux_pane_current_path(&tmux_socket, &tmux_session).as_deref(),
+        Some(home_path.as_path())
+    );
+
+    let (status, payload) = post_json(app, "/sessions/runtimehome/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+}
+
+#[tokio::test]
+async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-missing-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimemissingsend",
+            "name": "runtime-missing-send",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "missing send initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    assert!(tmux_kill_session(&tmux_socket, &tmux_session));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimemissingsend/input",
+        json!({ "text": "after external kill" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], false);
+    assert_eq!(payload["status"], "stopped");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/runtimemissingsend").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "stopped");
+    assert!(payload["stopped_at"].as_str().is_some());
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimemissingretire",
+            "name": "runtime-missing-retire",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "missing retire initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    assert!(tmux_kill_session(&tmux_socket, &tmux_session));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimemissingretire/kill",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+
+    let (status, payload) = get_json(app, "/sessions/runtimemissingretire").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "stopped");
+    assert!(payload["stopped_at"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn runtime_core_rejects_unsupported_provider() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-provider-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimecodex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex",
+            "initial_message": "codex should not launch claude"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Rust runtime does not support provider codex" })
+    );
+    let (status, _) = get_json(app, "/sessions/runtimecodex").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn runtime_core_rejects_remote_node_create_before_local_tmux_launch() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = runtime_app(&state_file, &log_dir, "sm-rust-test-remote-create");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimeremote",
+            "working_dir": ".",
+            "provider": "claude",
+            "node": "macbook",
+            "initial_message": "remote node should not launch locally"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Rust runtime does not support remote node macbook" })
+    );
+    let (status, _) = get_json(app, "/sessions/runtimeremote").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn runtime_core_rejects_child_create_that_inherits_remote_parent_node() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "remoteparent",
+                    "name": "claude-remoteparent",
+                    "working_dir": "/remote/repo",
+                    "tmux_session": "claude-remoteparent",
+                    "node": "macbook",
+                    "provider": "claude",
+                    "log_file": "/tmp/remoteparent.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let log_dir = unique_temp_path();
+    let app = runtime_app(&state_file, &log_dir, "sm-rust-test-remote-child");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "remotechild",
+            "parent_session_id": "remoteparent",
+            "provider": "claude",
+            "initial_message": "child should inherit remote node and reject"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Rust runtime does not support remote node macbook" })
+    );
+    let (status, _) = get_json(app, "/sessions/remotechild").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn runtime_core_rejects_remote_node_send_and_retire_without_mutating_state() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "remoteruntime",
+                    "name": "claude-remoteruntime",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-remoteruntime",
+                    "node": "macbook",
+                    "provider": "claude",
+                    "log_file": "/tmp/remoteruntime.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let log_dir = unique_temp_path();
+    let app = runtime_app(&state_file, &log_dir, "sm-rust-test-remote-existing");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/remoteruntime/input",
+        json!({ "text": "do not send to local tmux" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Rust runtime does not support remote node macbook" })
+    );
+
+    let (status, payload) = post_json(app.clone(), "/sessions/remoteruntime/kill", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Rust runtime does not support remote node macbook" })
+    );
+
+    let (status, payload) = get_json(app, "/sessions/remoteruntime").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["node"], "macbook");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["stopped_at"], Value::Null);
+}
+
+#[tokio::test]
+async fn runtime_core_fails_create_when_stdin_prompt_cannot_be_delivered() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-exit-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket.clone()),
+            runtime_command: Some("/bin/sh -lc 'exit 0'".to_owned()),
+            runtime_prompt_mode: Some("stdin".to_owned()),
+            runtime_start_settle_ms: Some(100),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimeexited",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "cannot be delivered"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        payload,
+        json!({ "detail": "tmux session exited before initial prompt could be delivered" })
+    );
+    let (status, _) = get_json(app, "/sessions/runtimeexited").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1477,6 +2084,156 @@ fn unique_temp_path() -> PathBuf {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> axum::Router {
+    router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket.to_owned()),
+            runtime_command: Some(
+                r#"/bin/sh -lc 'while IFS= read -r line; do printf "ids:%s:%s:%s\nruntime:%s\n" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done'"#
+                    .to_owned(),
+            ),
+            runtime_prompt_mode: Some("stdin".to_owned()),
+            runtime_start_settle_ms: Some(100),
+            send_keys_settle_ms: Some(10.0),
+            send_keys_settle_max_ms: Some(50.0),
+            send_keys_max_chunk_chars: Some(128),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }))
+}
+
+async fn wait_for_output_contains(app: axum::Router, session_id: &str, needle: &str) -> Value {
+    for _ in 0..30 {
+        let (status, payload) = get_json(
+            app.clone(),
+            &format!("/sessions/{session_id}/output?lines=20"),
+        )
+        .await;
+        if status == StatusCode::OK
+            && payload["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(needle)
+        {
+            return payload;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for output containing {needle:?}");
+}
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn tmux_session_exists(socket: &str, session: &str) -> bool {
+    Command::new("tmux")
+        .arg("-L")
+        .arg(socket)
+        .arg("has-session")
+        .arg("-t")
+        .arg(session)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn tmux_kill_session(socket: &str, session: &str) -> bool {
+    Command::new("tmux")
+        .arg("-L")
+        .arg(socket)
+        .arg("kill-session")
+        .arg("-t")
+        .arg(session)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn tmux_enter_copy_mode(socket: &str, session: &str) -> bool {
+    Command::new("tmux")
+        .arg("-L")
+        .arg(socket)
+        .arg("copy-mode")
+        .arg("-t")
+        .arg(session)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn tmux_pane_in_mode(socket: &str, session: &str) -> Option<i32> {
+    let output = Command::new("tmux")
+        .arg("-L")
+        .arg(socket)
+        .arg("display-message")
+        .arg("-p")
+        .arg("-t")
+        .arg(session)
+        .arg("#{pane_in_mode}")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "0" => Some(0),
+        "1" => Some(1),
+        _ => None,
+    }
+}
+
+fn tmux_pane_current_path(socket: &str, session: &str) -> Option<PathBuf> {
+    let output = Command::new("tmux")
+        .arg("-L")
+        .arg(socket)
+        .arg("display-message")
+        .arg("-p")
+        .arg("-t")
+        .arg(session)
+        .arg("#{pane_current_path}")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+struct TestTmuxSocket(String);
+
+impl Drop for TestTmuxSocket {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .arg("-L")
+            .arg(&self.0)
+            .arg("kill-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 fn device_access_token(secret: &str, email: &str, name: &str) -> String {
