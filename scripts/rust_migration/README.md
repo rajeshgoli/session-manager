@@ -38,10 +38,12 @@ python -m scripts.rust_migration.contracts \
 Mutating checks never run unless `--include-mutating` is present. Use only
 disposable fixture sessions for checks such as retained mobile/API session stop.
 
-Run the first Rust read-only server slice:
+Run the first Rust read-only server slice with the synthetic fixture config:
 
 ```bash
-cargo run -p sm-server -- --port 8421 --config /tmp/sm-rust-missing-config.yaml
+cargo run -p sm-server -- \
+  --port 8421 \
+  --config scripts/rust_migration/fixtures/read_only/config.yaml
 ```
 
 Then, in another shell, run only the implemented Rust scaffold checks:
@@ -63,17 +65,22 @@ python -m scripts.rust_migration.contracts \
   --check-id http.queue_policy_runs_retired
 ```
 
-Summary-route retirement must be checked with a real fixture session. The
-harness first verifies `GET /sessions/{session_id}` returns 200 so a stale
-fixture or resource-level 404 cannot masquerade as route retirement:
+Fixture-backed checks assert concrete session projection and output behavior:
 
 ```bash
 python -m scripts.rust_migration.contracts \
   --target rust \
   --base-url http://127.0.0.1:8421 \
-  --session-id <fixture-session-id> \
+  --session-id fixture001 \
+  --check-id http.session_detail_fixture \
+  --check-id http.client_session_detail_fixture \
+  --check-id http.session_output_fixture \
   --check-id http.summary_provider_route_retired
 ```
+
+Summary-route retirement must be checked with a real fixture session. The
+harness first verifies `GET /sessions/{session_id}` returns 200 so a stale
+fixture or resource-level 404 cannot masquerade as route retirement.
 
 Omit `--config` to load `config.yaml`; the Rust scaffold also applies the same
 default `.local/android-parity/values.env` overlay for the auth/bootstrap fields

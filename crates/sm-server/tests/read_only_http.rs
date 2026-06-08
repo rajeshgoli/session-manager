@@ -333,6 +333,61 @@ async fn client_sessions_adds_read_only_mobile_metadata_without_termux() {
 }
 
 #[tokio::test]
+async fn session_detail_returns_one_projected_session() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "run12345");
+    assert_eq!(payload["friendly_name"], "Runner Native");
+    assert_eq!(payload["activity_state"], "working");
+    assert_eq!(payload["provider"], "claude");
+}
+
+#[tokio::test]
+async fn session_detail_returns_404_for_unknown_session() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/missing-session").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Session not found" }));
+}
+
+#[tokio::test]
+async fn client_session_detail_returns_mobile_metadata_for_one_session() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/client/sessions/run12345").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "run12345");
+    assert_eq!(payload["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(payload["termux_attach"], Value::Null);
+    assert_eq!(payload["mobile_terminal"]["supported"], false);
+    assert_eq!(payload["primary_action"]["type"], "details");
+}
+
+#[tokio::test]
+async fn session_output_tails_fixture_log_file() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/run12345/output?lines=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(
+        payload["output"],
+        "fixture log line 2\nfixture log line 3\n"
+    );
+}
+
+#[tokio::test]
 async fn sessions_missing_state_file_returns_empty_list() {
     let state_file = unique_temp_path();
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -516,6 +571,12 @@ fn config_with_state_file_and_auth(state_file: &PathBuf) -> AppConfig {
 
 fn write_session_fixture() -> PathBuf {
     let path = unique_temp_path();
+    let log_file = unique_temp_path();
+    fs::write(
+        &log_file,
+        "fixture log line 1\nfixture log line 2\nfixture log line 3\n",
+    )
+    .unwrap();
     fs::write(
         &path,
         json!({
@@ -528,7 +589,7 @@ fn write_session_fixture() -> PathBuf {
                     "tmux_socket_name": null,
                     "node": "primary",
                     "provider": "claude",
-                    "log_file": "/tmp/run12345.log",
+                    "log_file": log_file.display().to_string(),
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",

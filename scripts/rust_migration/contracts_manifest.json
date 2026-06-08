@@ -331,6 +331,45 @@
       "source": "specs/762_stage5_artifacts/gate_matrix.md:74"
     },
     {
+      "id": "http.session_detail_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/sessions/{session_id}",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/id", "equals": "{session_id}"},
+        {"path": "/friendly_name", "equals": "Fixture Native Title"},
+        {"path": "/activity_state", "equals": "working"},
+        {"path": "/provider", "equals": "claude"}
+      ],
+      "preconditions": ["live_server", "session_id"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:69"
+    },
+    {
+      "id": "http.client_session_detail_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/client/sessions/{session_id}",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/id", "equals": "{session_id}"},
+        {"path": "/attach_descriptor", "type": "object"},
+        {"path": "/attach_descriptor/attach_supported", "equals": false},
+        {"path": "/termux_attach", "type": "null"},
+        {"path": "/mobile_terminal", "type": "object"},
+        {"path": "/mobile_terminal/supported", "equals": false},
+        {"path": "/primary_action/type", "equals": "details"}
+      ],
+      "preconditions": ["live_server", "session_id"],
+      "source": "specs/762_stage5_artifacts/gate_matrix.md:64"
+    },
+    {
       "id": "http.session_output",
       "surface": "http",
       "classification": "retained",
@@ -340,6 +379,22 @@
       "path": "/sessions/{session_id}/output?lines=5",
       "expected_status": [200],
       "preconditions": ["live_server", "session_id"],
+      "source": "specs/762_stage2_artifacts/external_client_manifest.md:25"
+    },
+    {
+      "id": "http.session_output_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/sessions/{session_id}/output?lines=2",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/session_id", "equals": "{session_id}"},
+        {"path": "/output", "contains": "fixture line 3"}
+      ],
+      "preconditions": ["live_server", "session_id", "existing_session"],
       "source": "specs/762_stage2_artifacts/external_client_manifest.md:25"
     },
     {

@@ -177,6 +177,13 @@ def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
         and expectation.equals == "/auth/device/google"
         for expectation in checks["http.client_bootstrap"].expected_json
     )
+    assert checks["http.session_detail_fixture"].expected_json
+    assert any(
+        expectation.path == "/id" and expectation.equals == "{session_id}"
+        for expectation in checks["http.session_detail_fixture"].expected_json
+    )
+    assert checks["http.client_session_detail_fixture"].expected_json
+    assert checks["http.session_output_fixture"].expected_json
 
 
 def test_python_target_does_not_run_rust_only_retirement_checks():
@@ -387,6 +394,50 @@ def test_http_check_renders_request_headers_and_checks_json():
 
     assert result.status == "passed"
     assert seen["host"] == "sm.example.com"
+
+
+def test_http_check_renders_json_expectation_fixture_values():
+    check = ContractCheck(
+        id="http.fixture_json",
+        surface="http",
+        classification="retained",
+        target="python_and_rust",
+        safety="read_only",
+        method="GET",
+        path="/sessions/{session_id}",
+        expected_status=(200,),
+        expected_json=(
+            JsonExpectation(path="/id", equals="{session_id}", has_equals=True),
+            JsonExpectation(path="/output", contains="{expected_line}"),
+        ),
+        preconditions=("live_server", "session_id"),
+        source="test",
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _size):
+            return b'{"id":"fixture001","output":"fixture line 3"}'
+
+    with patch(
+        "scripts.rust_migration.contracts.urllib.request.urlopen",
+        return_value=FakeResponse(),
+    ):
+        result = _run_http_check(
+            check,
+            "http://127.0.0.1:8420",
+            {"session_id": "fixture001", "expected_line": "line 3"},
+            1.0,
+        )
+
+    assert result.status == "passed"
 
 
 def test_http_check_reports_json_shape_mismatch():

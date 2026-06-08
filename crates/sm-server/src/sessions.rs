@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -45,6 +45,44 @@ impl SessionStore {
             .into_iter()
             .filter(|session| include_stopped || !session.is_stopped())
             .collect())
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .load_snapshot()?
+            .into_sessions()
+            .into_iter()
+            .find(|session| {
+                session.id == session_id || session.aliases.iter().any(|alias| alias == session_id)
+            }))
+    }
+
+    pub fn capture_output(&self, session_id: &str, lines: usize) -> Result<Option<String>> {
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(None);
+        };
+        let Some(log_file) = session
+            .log_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let log_file = expand_home(log_file);
+        let content = match fs::read_to_string(&log_file) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read session log {}", log_file.display()))
+            }
+        };
+        Ok(Some(tail_lines(&content, lines)))
     }
 
     fn load_snapshot(&self) -> Result<StateSnapshot> {
@@ -287,6 +325,8 @@ pub struct SessionRecord {
     pub node: String,
     #[serde(default = "default_provider")]
     pub provider: String,
+    #[serde(default)]
+    pub log_file: Option<String>,
     #[serde(default)]
     pub provider_resume_id: Option<String>,
     #[serde(default)]
@@ -614,6 +654,22 @@ fn non_empty_or(value: String, fallback: &str) -> String {
     }
 }
 
+fn tail_lines(content: &str, lines: usize) -> String {
+    if lines == 0 {
+        return String::new();
+    }
+    let all_lines = content.lines().collect::<Vec<_>>();
+    if all_lines.is_empty() {
+        return String::new();
+    }
+    let start = all_lines.len().saturating_sub(lines);
+    let mut output = all_lines[start..].join("\n");
+    if content.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
 fn default_node() -> String {
     "primary".to_owned()
 }
@@ -653,6 +709,7 @@ mod tests {
             tmux_socket_name: None,
             node: "primary".to_owned(),
             provider: "claude".to_owned(),
+            log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
             forked_from_session_id: None,
             forked_from_provider_resume_id: None,
