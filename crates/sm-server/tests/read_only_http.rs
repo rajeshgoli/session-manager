@@ -1060,6 +1060,97 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
 }
 
 #[tokio::test]
+async fn fixture_core_spawn_endpoint_inherits_parent_fields() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let parent_dir = unique_temp_path();
+    fs::create_dir_all(&parent_dir).unwrap();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "parentfixture",
+                    "name": "claude-parentfixture",
+                    "working_dir": parent_dir.display().to_string(),
+                    "tmux_session": "claude-parentfixture",
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": "/tmp/parentfixture.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ],
+            "agent_registrations": [
+                {
+                    "role": "parent-alias",
+                    "session_id": "parentfixture"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "trackedchildfixture",
+            "parent_session_id": "parentfixture",
+            "prompt": "tracked child fixture prompt",
+            "name": "tracked-child-fixture",
+            "track_seconds": 300
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Rust core spawn does not support track_seconds yet" })
+    );
+    let (status, _payload) = get_json(app.clone(), "/sessions/trackedchildfixture").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "childfixture",
+            "parent_session_id": "parent-alias",
+            "prompt": "child fixture prompt",
+            "name": "child-fixture"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "childfixture");
+    assert_eq!(payload["friendly_name"], "child-fixture");
+    assert_eq!(payload["parent_session_id"], "parentfixture");
+    assert_eq!(payload["working_dir"], parent_dir.display().to_string());
+    assert_eq!(payload["node"], "primary");
+    assert_eq!(payload["provider"], "claude");
+
+    let (status, payload) = get_json(app, "/sessions/childfixture").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["parent_session_id"], "parentfixture");
+    assert_eq!(payload["working_dir"], parent_dir.display().to_string());
+}
+
+#[tokio::test]
 async fn fixture_core_writes_preserve_concurrent_session_updates() {
     let state_file = unique_temp_path();
     let app = router(AppState::new(AppConfig {
@@ -1195,7 +1286,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
             log_dir: Some(log_dir.display().to_string()),
             tmux_socket_name: Some(tmux_socket.clone()),
             runtime_command: Some(
-                r#"/bin/sh -lc 'while IFS= read -r line; do printf "ids:%s:%s:%s\nruntime:%s\n" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done'"#
+                r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#
                     .to_owned(),
             ),
             runtime_prompt_mode: Some("stdin".to_owned()),
@@ -1293,6 +1384,246 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "stopped");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+}
+
+#[tokio::test]
+async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let parent_dir = unique_temp_path();
+    fs::create_dir_all(&parent_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-spawn-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, parent_payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimeparent",
+            "name": "runtime-parent",
+            "working_dir": parent_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "parent runtime prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parent_tmux_session = parent_payload["tmux_session"].as_str().unwrap().to_owned();
+    wait_for_output_contains(
+        app.clone(),
+        "runtimeparent",
+        "runtime:parent runtime prompt",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "runtimechild",
+            "parent_session_id": "runtimeparent",
+            "prompt": "spawn endpoint runtime prompt",
+            "name": "runtime-child",
+            "model": "opus",
+            "wait": 5
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "runtimechild");
+    assert_eq!(payload["friendly_name"], "runtime-child");
+    assert_eq!(payload["parent_session_id"], "runtimeparent");
+    assert_eq!(payload["working_dir"], parent_dir.display().to_string());
+    assert_eq!(payload["node"], "primary");
+    assert_eq!(payload["provider"], "claude");
+    assert_eq!(payload["model"], "opus");
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    assert!(tmux_session.starts_with("sm-rust-claude-runtimechild-"));
+
+    wait_for_output_contains(
+        app.clone(),
+        "runtimechild",
+        "runtime:spawn endpoint runtime prompt",
+    )
+    .await;
+    wait_for_output_contains(app.clone(), "runtimechild", "argv:--model opus").await;
+
+    let (status, payload) = get_json(app.clone(), "/sessions/runtimechild").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["model"], "opus");
+
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimechild/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+
+    wait_for_output_contains(
+        app.clone(),
+        "runtimeparent",
+        "Child runtime-child (runtimec) completed: Session exited",
+    )
+    .await;
+
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimeparent/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
+}
+
+#[tokio::test]
+async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let parent_dir = unique_temp_path();
+    fs::create_dir_all(&parent_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-spawn-exit-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_command(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; case "$line" in *natural-child-prompt*) exit 0;; esac; done' runtime-sh"#,
+    );
+
+    let (status, parent_payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "naturalparent",
+            "name": "natural-parent",
+            "working_dir": parent_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "parent prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parent_tmux_session = parent_payload["tmux_session"].as_str().unwrap().to_owned();
+    wait_for_output_contains(app.clone(), "naturalparent", "runtime:parent prompt").await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "naturalchild",
+            "parent_session_id": "naturalparent",
+            "prompt": "natural-child-prompt",
+            "name": "natural-child",
+            "wait": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let child_tmux_session = payload["tmux_session"].as_str().unwrap();
+
+    wait_for_output_contains(
+        app.clone(),
+        "naturalparent",
+        "Child natural-child (naturalc) completed: Session exited",
+    )
+    .await;
+    assert!(!tmux_session_exists(&tmux_socket, child_tmux_session));
+
+    let (status, payload) = post_json(app.clone(), "/sessions/naturalparent/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
+}
+
+#[tokio::test]
+async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let parent_dir = unique_temp_path();
+    fs::create_dir_all(&parent_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-spawn-active-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_command(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        r#"/bin/sh -lc 'while IFS= read -r line; do case "$line" in *active-child-prompt*) for i in 1 2 3 4 5 6 7 8; do printf "runtime:heartbeat-%s\n" "$i"; sleep 0.2; done; exit 0;; *) printf "runtime:%s\n" "$line";; esac; done' runtime-sh"#,
+    );
+
+    let (status, parent_payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "activeparent",
+            "name": "active-parent",
+            "working_dir": parent_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "parent prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parent_tmux_session = parent_payload["tmux_session"].as_str().unwrap().to_owned();
+    wait_for_output_contains(app.clone(), "activeparent", "runtime:parent prompt").await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "activechild",
+            "parent_session_id": "activeparent",
+            "prompt": "active-child-prompt",
+            "name": "active-child",
+            "wait": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let child_tmux_session = payload["tmux_session"].as_str().unwrap();
+
+    let parent_output = wait_for_output_contains(
+        app.clone(),
+        "activeparent",
+        "Child active-child (activech) completed: Session exited",
+    )
+    .await;
+    assert!(!parent_output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Idle for"));
+    assert!(!tmux_session_exists(&tmux_socket, child_tmux_session));
+
+    let (status, payload) = post_json(app.clone(), "/sessions/activeparent/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
 }
 
 #[tokio::test]
@@ -2087,6 +2418,20 @@ fn unique_temp_path() -> PathBuf {
 }
 
 fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> axum::Router {
+    runtime_app_with_command(
+        state_file,
+        log_dir,
+        tmux_socket,
+        r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#,
+    )
+}
+
+fn runtime_app_with_command(
+    state_file: &PathBuf,
+    log_dir: &PathBuf,
+    tmux_socket: &str,
+    runtime_command: &str,
+) -> axum::Router {
     router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
@@ -2095,10 +2440,7 @@ fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> ax
             runtime_enabled: true,
             log_dir: Some(log_dir.display().to_string()),
             tmux_socket_name: Some(tmux_socket.to_owned()),
-            runtime_command: Some(
-                r#"/bin/sh -lc 'while IFS= read -r line; do printf "ids:%s:%s:%s\nruntime:%s\n" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done'"#
-                    .to_owned(),
-            ),
+            runtime_command: Some(runtime_command.to_owned()),
             runtime_prompt_mode: Some("stdin".to_owned()),
             runtime_start_settle_ms: Some(100),
             send_keys_settle_ms: Some(10.0),

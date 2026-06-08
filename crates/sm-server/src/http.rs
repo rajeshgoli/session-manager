@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::to_bytes,
@@ -30,7 +36,7 @@ use crate::config::{trimmed, AppConfig};
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ClientSessionResponse, CoreRetireOutcome,
-    CreateCoreSessionRequest, SendCoreInputRequest, SessionResponse, SessionStore,
+    CreateCoreSessionRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
     SessionsEnvelope,
 };
 
@@ -64,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/{session_id}", get(get_session))
         .route(
             "/sessions/{session_id}/agent-status",
@@ -242,6 +249,210 @@ async fn create_session(
         state.session_store.create_core_session(payload, log_dir)?
     };
     Ok(Json(SessionResponse::from(session)))
+}
+
+async fn spawn_session(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SpawnCoreSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/sessions/spawn")?;
+    ensure_core_writes_enabled(&state)?;
+    let Some(parent) = state
+        .session_store
+        .get_session(&payload.parent_session_id)?
+    else {
+        return Ok(Json(json!({ "error": "Parent session not found" })));
+    };
+    if payload.track_seconds.is_some() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Rust core spawn does not support track_seconds yet".to_owned(),
+        });
+    }
+    let wait_seconds = payload.wait;
+    let provider = payload
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(parent.provider.as_str())
+        .to_owned();
+    let working_dir = payload
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(parent.working_dir.as_str())
+        .to_owned();
+    let node = payload
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(parent.node.as_str())
+        .to_owned();
+    let create_payload = CreateCoreSessionRequest {
+        id: payload.id,
+        name: payload.name,
+        working_dir: Some(working_dir),
+        provider: Some(provider),
+        parent_session_id: Some(parent.id.clone()),
+        node: Some(node),
+        initial_message: Some(payload.prompt),
+        model: payload.model,
+        wait: wait_seconds,
+    };
+    let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
+    let child = if state.config.rust_core.runtime_enabled {
+        ensure_core_runtime_provider_supported(&create_payload)?;
+        ensure_core_runtime_request_node_supported(&state, &create_payload)?;
+        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        state
+            .session_store
+            .create_core_session_with_runtime(create_payload, log_dir, &runtime)?
+    } else {
+        state
+            .session_store
+            .create_core_session(create_payload, log_dir)?
+    };
+    if let Some(wait_seconds) = wait_seconds {
+        spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
+    }
+    Ok(Json(serde_json::to_value(SpawnSessionResponse::from(
+        child,
+    ))?))
+}
+
+fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_seconds: u64) {
+    let Some(parent_session_id) = child
+        .parent_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    let child_session_id = child.id.clone();
+
+    tokio::spawn(async move {
+        let mut last_activity = child.last_activity.clone();
+        let mut last_output_size = child_output_size(&child);
+        let mut idle_since = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let Ok(Some(child)) = state.session_store.get_session(&child_session_id) else {
+                break;
+            };
+            let output_size = child_output_size(&child);
+            if child.last_activity != last_activity || output_size != last_output_size {
+                last_activity = child.last_activity.clone();
+                last_output_size = output_size;
+                idle_since = Instant::now();
+            }
+
+            let completion_message = if session_status_is_stopped(&child.status)
+                || runtime_child_session_exited(&state, &child)
+            {
+                Some("Session exited".to_owned())
+            } else {
+                Some(idle_since.elapsed().as_secs())
+                    .filter(|idle_seconds| *idle_seconds >= wait_seconds)
+                    .map(|idle_seconds| {
+                        completion_summary(&state.session_store, &child_session_id)
+                            .unwrap_or_else(|| format!("Idle for {idle_seconds}s"))
+                    })
+            };
+            let Some(completion_message) = completion_message else {
+                continue;
+            };
+
+            let notification = format!(
+                "Child {} ({}) completed: {}",
+                child_display_name(&child),
+                short_session_id(&child_session_id),
+                completion_message
+            );
+            let request = SendCoreInputRequest {
+                text: notification,
+                delivery_mode: "sequential".to_owned(),
+                notify_after_seconds: None,
+            };
+            let _ = if state.config.rust_core.runtime_enabled {
+                let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+                state.session_store.send_core_input_with_runtime(
+                    &parent_session_id,
+                    request,
+                    &runtime,
+                )
+            } else {
+                state
+                    .session_store
+                    .send_core_input(&parent_session_id, request)
+            };
+            break;
+        }
+    });
+}
+
+fn session_status_is_stopped(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "stopped" | "killed"
+    )
+}
+
+fn runtime_child_session_exited(state: &AppState, child: &SessionRecord) -> bool {
+    if !state.config.rust_core.runtime_enabled {
+        return false;
+    }
+    let runtime = TmuxRuntime::from_config(&state.config.rust_core)
+        .for_socket_name(child.tmux_socket_name.as_deref());
+    matches!(runtime.session_exists(&child.tmux_session), Ok(false))
+}
+
+fn child_output_size(child: &SessionRecord) -> Option<u64> {
+    let log_file = child
+        .log_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    expand_home(log_file)
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+fn completion_summary(session_store: &SessionStore, child_session_id: &str) -> Option<String> {
+    let output = session_store.capture_output(child_session_id, 10).ok()??;
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() > 10)
+        .map(|line| {
+            if line.chars().count() > 100 {
+                format!("{}...", line.chars().take(100).collect::<String>())
+            } else {
+                line.to_owned()
+            }
+        })
+}
+
+fn child_display_name(child: &SessionRecord) -> String {
+    child
+        .friendly_name
+        .as_deref()
+        .or(Some(child.name.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(child.id.as_str())
+        .to_owned()
+}
+
+fn short_session_id(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
 }
 
 async fn list_client_sessions(
@@ -1238,6 +1449,73 @@ struct SessionOutputQuery {
 struct KillSessionRequest {
     #[serde(default)]
     requester_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpawnCoreSessionRequest {
+    #[serde(default)]
+    id: Option<String>,
+    parent_session_id: String,
+    prompt: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    wait: Option<u64>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    node: Option<String>,
+    #[serde(default)]
+    track_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpawnSessionResponse {
+    session_id: String,
+    name: String,
+    friendly_name: String,
+    working_dir: String,
+    parent_session_id: Option<String>,
+    tmux_session: String,
+    node: String,
+    provider: String,
+    model: Option<String>,
+    created_at: String,
+}
+
+impl From<SessionRecord> for SpawnSessionResponse {
+    fn from(session: SessionRecord) -> Self {
+        let friendly_name = session
+            .friendly_name
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| session.name.clone());
+        Self {
+            session_id: session.id,
+            name: session.name,
+            friendly_name,
+            working_dir: session.working_dir,
+            parent_session_id: session.parent_session_id,
+            tmux_session: session.tmux_session,
+            node: if session.node.trim().is_empty() {
+                "primary".to_owned()
+            } else {
+                session.node
+            },
+            provider: if session.provider.trim().is_empty() {
+                "claude".to_owned()
+            } else {
+                session.provider
+            },
+            model: session.model,
+            created_at: session.created_at,
+        }
+    }
 }
 
 #[derive(Serialize)]

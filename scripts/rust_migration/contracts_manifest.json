@@ -888,10 +888,11 @@
       "target": "rust_only",
       "safety": "mutating",
       "command": ["--api-url", "{base_url}", "spawn", "claude", "initial fixture prompt", "--id", "{session_id}", "--name", "{session_name}", "--working-dir", "{working_dir}", "--json"],
+      "env": {"SESSION_MANAGER_ID": "", "CLAUDE_SESSION_MANAGER_ID": ""},
       "expected_exit": [0],
       "expected_output_contains_all": ["{session_id}", "{session_name}", "running"],
       "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:session_name", "fixture:working_dir", "mutating_opt_in"],
-      "source": "https://github.com/rajeshgoli/session-manager/issues/791"
+      "source": "https://github.com/rajeshgoli/session-manager/issues/795"
     },
     {
       "id": "cli.rust_core_send_fixture",
@@ -916,7 +917,7 @@
       "expected_exit": [0],
       "expected_output_contains_all": ["{child_session_id}", "{child_session_name}", "{session_id}", "{working_dir}"],
       "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:child_session_id", "fixture:child_session_name", "fixture:working_dir", "mutating_opt_in"],
-      "source": "https://github.com/rajeshgoli/session-manager/issues/791"
+      "source": "https://github.com/rajeshgoli/session-manager/issues/795"
     },
     {
       "id": "cli.rust_core_status_fixture",

@@ -331,26 +331,50 @@ fn run() -> Result<()> {
         Command::Spawn(args) => {
             let prompt = args.prompt.join(" ");
             let parent_session_id = optional_current_session_id();
-            let payload = client.post_json(
-                "/sessions",
-                json!({
-                    "id": args.id,
-                    "name": args.name,
-                    "parent_session_id": parent_session_id,
-                    "working_dir": args.working_dir,
-                    "provider": args.provider,
-                    "node": args.node,
-                    "initial_message": prompt,
-                    "wait": args.wait
-                }),
-            )?;
+            let payload = if let Some(parent_session_id) = parent_session_id {
+                client.post_json(
+                    "/sessions/spawn",
+                    json!({
+                        "id": args.id,
+                        "parent_session_id": parent_session_id,
+                        "prompt": prompt,
+                        "name": args.name,
+                        "wait": args.wait,
+                        "model": args.model,
+                        "working_dir": args.working_dir,
+                        "provider": args.provider,
+                        "node": args.node
+                    }),
+                )?
+            } else {
+                client.post_json(
+                    "/sessions",
+                    json!({
+                        "id": args.id,
+                        "name": args.name,
+                        "working_dir": args.working_dir,
+                        "provider": args.provider,
+                        "node": args.node,
+                        "initial_message": prompt,
+                        "model": args.model,
+                        "wait": args.wait
+                    }),
+                )?
+            };
+            if let Some(error) = payload["error"]
+                .as_str()
+                .or_else(|| payload["detail"].as_str())
+            {
+                bail!("{error}");
+            }
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
                 println!(
                     "{}",
-                    payload["id"]
+                    payload["session_id"]
                         .as_str()
+                        .or_else(|| payload["id"].as_str())
                         .ok_or_else(|| anyhow!("spawn response missing id"))?
                 );
             }
