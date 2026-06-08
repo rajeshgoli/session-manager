@@ -297,23 +297,24 @@ def _sanitize_query_string(*, method: str, path: str, query_string: str) -> str:
     if not query_string:
         return ""
 
-    safe_keys = _safe_query_keys(method=method, path=path)
     sanitized_pairs: list[tuple[str, str]] = []
     for key, value in parse_qsl(query_string, keep_blank_values=True):
-        sanitized_pairs.append(
-            (key, value if key in safe_keys else REDACTED_QUERY_VALUE)
-        )
+        sanitized_pairs.append((key, _sanitize_query_value(method, path, key, value)))
     return urlencode(sanitized_pairs)
 
 
-def _safe_query_keys(*, method: str, path: str) -> set[str]:
+def _sanitize_query_value(method: str, path: str, key: str, value: str) -> str:
     if method != "GET":
-        return set()
-    if path == "/sessions":
-        return {"include_stopped"}
-    if path.startswith("/sessions/") and path.endswith("/output"):
-        return {"lines"}
-    return set()
+        return REDACTED_QUERY_VALUE
+    if path == "/sessions" and key == "include_stopped":
+        if value in {"1", "true", "True", "TRUE", "yes", "on"}:
+            return value
+        return REDACTED_QUERY_VALUE
+    if path.startswith("/sessions/") and path.endswith("/output") and key == "lines":
+        if value.isascii() and value.isdigit():
+            return value
+        return REDACTED_QUERY_VALUE
+    return REDACTED_QUERY_VALUE
 
 
 def _decode_bytes(value: bytes | str) -> str:

@@ -245,6 +245,46 @@ def test_rust_shadow_preserves_safe_query_values_for_comparison(tmp_path, monkey
     assert "lines=10&token=REDACTED" in ledger_text
 
 
+def test_rust_shadow_redacts_invalid_safe_query_values(tmp_path, monkeypatch):
+    _FakeAsyncClient.calls.clear()
+    monkeypatch.setattr("src.rust_shadow.httpx.AsyncClient", _FakeAsyncClient)
+    app = _standalone_shadow_app(tmp_path)
+
+    @app.get("/sessions/{session_id}/output")
+    async def output(session_id: str):
+        return {"session_id": session_id}
+
+    response = TestClient(app).get("/sessions/abc123/output?lines=secret-token")
+
+    assert response.status_code == 200
+    envelope = _FakeAsyncClient.calls[0]["json"]
+    assert envelope["request"]["query_string"] == "lines=REDACTED"
+    ledger_text = (tmp_path / "rust_shadow.jsonl").read_text(encoding="utf-8")
+    assert "secret-token" not in ledger_text
+    assert "lines=REDACTED" in ledger_text
+
+
+def test_rust_shadow_redacts_invalid_include_stopped_query_value(
+    tmp_path, monkeypatch
+):
+    _FakeAsyncClient.calls.clear()
+    monkeypatch.setattr("src.rust_shadow.httpx.AsyncClient", _FakeAsyncClient)
+    app = _standalone_shadow_app(tmp_path)
+
+    @app.get("/sessions")
+    async def sessions():
+        return {"sessions": []}
+
+    response = TestClient(app).get("/sessions?include_stopped=secret-token")
+
+    assert response.status_code == 200
+    envelope = _FakeAsyncClient.calls[0]["json"]
+    assert envelope["request"]["query_string"] == "include_stopped=REDACTED"
+    ledger_text = (tmp_path / "rust_shadow.jsonl").read_text(encoding="utf-8")
+    assert "secret-token" not in ledger_text
+    assert "include_stopped=REDACTED" in ledger_text
+
+
 def test_rust_shadow_skips_multipart_requests(tmp_path, monkeypatch):
     _FakeAsyncClient.calls.clear()
     monkeypatch.setattr("src.rust_shadow.httpx.AsyncClient", _FakeAsyncClient)
