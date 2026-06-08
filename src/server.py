@@ -71,6 +71,7 @@ from .response_relay import (
     collect_claude_assistant_outputs_after_turn,
     find_claude_inbound_turn_boundary_offset,
 )
+from .rust_shadow import RustShadowMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -1393,6 +1394,10 @@ def create_app(
 
     # Add timing middleware for debugging (with config)
     app.add_middleware(RequestTimingMiddleware, config=config)
+
+    # Disabled by default. When enabled, Python remains authoritative and sends
+    # bounded request/response hashes to the Rust shadow comparator.
+    app.add_middleware(RustShadowMiddleware, config=config)
 
     # Store references to components
     app.state.session_manager = session_manager

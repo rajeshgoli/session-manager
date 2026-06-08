@@ -124,3 +124,45 @@ instrumentation or unsafe workloads explicitly. Python hardening/config variants
 are owner-waived for the cutover value gate; compare current Python against the
 Rust scaffold/prototype instead. Do not commit machine-local baseline reports if
 they contain host-specific or private runtime details.
+
+## Shadow Comparison Mode
+
+Shadow mode lets Python stay authoritative while Rust observes bounded
+request/response envelopes and reports whether it would match, mismatch, or
+currently lacks a side-effect-free implementation. It is disabled by default.
+
+Start Rust on the shadow port:
+
+```bash
+cargo run -p sm-server -- \
+  --port 8421 \
+  --config scripts/rust_migration/fixtures/read_only/config.yaml
+```
+
+Enable Python shadowing in local config only:
+
+```yaml
+rust_shadow:
+  enabled: true
+  endpoint: "http://127.0.0.1:8421/__shadow/http"
+  ledger_path: "~/.local/share/claude-sessions/rust_shadow.jsonl"
+  timeout_seconds: 0.5
+  max_body_bytes: 65536
+```
+
+The ledger is JSONL. Each row includes method/path/query, Python status and body
+hash, Rust comparison result, Rust support status, latency, and any shadow
+transport error. Raw bodies, cookies, bearer tokens, worker secrets, hook
+secrets, and device signatures are not written to the ledger.
+
+Current Rust shadow support is intentionally side-effect-free:
+
+- stable read-only routes can return `comparison: "match"` or a mismatch.
+- volatile reads such as detailed health may return `status_match`.
+- retained writes such as session create/input/kill return
+  `support_status: "unsupported_retained_write"` and `would_write: false` until
+  native Rust runtime ownership is implemented.
+
+For a cutover trial, run shadow mode for the agreed observation window and treat
+unexplained mismatches on retained core surfaces as blockers before Rust becomes
+the writer.
