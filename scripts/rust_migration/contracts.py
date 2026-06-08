@@ -315,7 +315,9 @@ def _run_http_check(
     missing_body_all = [
         expected for expected in check.expected_body_contains_all if expected not in body_text
     ]
-    json_error = _json_expectation_error(body_text, check.expected_json)
+    json_error = _json_expectation_error(
+        body_text, _render_json_expectations(check.expected_json, fixtures)
+    )
     if status in check.expected_status and body_any_ok and not missing_body_all and not json_error:
         return _result(check, "passed", _elapsed_ms(start), f"HTTP {status}")
     if not body_any_ok:
@@ -476,6 +478,27 @@ def _json_summary(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return _json_type_name(value)
     return repr(value)
+
+
+def _render_json_expectations(
+    expectations: tuple[JsonExpectation, ...], fixtures: dict[str, str]
+) -> tuple[JsonExpectation, ...]:
+    return tuple(
+        JsonExpectation(
+            path=expectation.path,
+            value_type=expectation.value_type,
+            equals=_render_template(expectation.equals, fixtures),
+            has_equals=expectation.has_equals,
+            one_of=tuple(_render_template(value, fixtures) for value in expectation.one_of),
+            contains=(
+                str(_render_template(expectation.contains, fixtures))
+                if expectation.contains is not None
+                else None
+            ),
+            absent=expectation.absent,
+        )
+        for expectation in expectations
+    )
 
 
 _TEMPLATE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")

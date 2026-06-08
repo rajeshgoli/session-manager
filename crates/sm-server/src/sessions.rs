@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -10,6 +11,9 @@ use serde_json::{json, Value};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
 const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
+const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
+const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
+const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -45,6 +49,44 @@ impl SessionStore {
             .into_iter()
             .filter(|session| include_stopped || !session.is_stopped())
             .collect())
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .load_snapshot()?
+            .into_sessions()
+            .into_iter()
+            .find(|session| {
+                session.id == session_id || session.aliases.iter().any(|alias| alias == session_id)
+            }))
+    }
+
+    pub fn capture_output(&self, session_id: &str, lines: usize) -> Result<Option<String>> {
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(None);
+        };
+        let Some(log_file) = session
+            .log_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let log_file = expand_home(log_file);
+        let output = match read_tail_lines(&log_file, lines) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read session log {}", log_file.display()))
+            }
+        };
+        Ok(Some(output))
     }
 
     fn load_snapshot(&self) -> Result<StateSnapshot> {
@@ -185,6 +227,7 @@ impl StateSnapshot {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            .filter(|session_id| self.session_is_restorable_for_registry(session_id))
         {
             aliases
                 .entry(session_id.to_owned())
@@ -197,12 +240,22 @@ impl StateSnapshot {
             if role.is_empty() || session_id.is_empty() {
                 continue;
             }
+            if !self.session_is_restorable_for_registry(session_id) {
+                continue;
+            }
             aliases
                 .entry(session_id.to_owned())
                 .or_default()
                 .insert(role);
         }
         aliases
+    }
+
+    fn session_is_restorable_for_registry(&self, session_id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(SessionRecord::is_restorable_for_registry)
     }
 
     fn pending_proposal_map(
@@ -288,7 +341,13 @@ pub struct SessionRecord {
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
+    pub log_file: Option<String>,
+    #[serde(default)]
     pub provider_resume_id: Option<String>,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub codex_thread_id: Option<String>,
     #[serde(default)]
     pub forked_from_session_id: Option<String>,
     #[serde(default)]
@@ -362,6 +421,19 @@ pub struct SessionRecord {
 impl SessionRecord {
     fn is_stopped(&self) -> bool {
         normalized_status(&self.status) == "stopped"
+    }
+
+    fn is_restorable_for_registry(&self) -> bool {
+        if !self.is_stopped() {
+            return true;
+        }
+        let has_provider_resume_id = has_text(self.provider_resume_id.as_deref());
+        match self.provider.as_str() {
+            "claude" => has_provider_resume_id || has_text(self.transcript_path.as_deref()),
+            "codex-app" => has_provider_resume_id || has_text(self.codex_thread_id.as_deref()),
+            "codex" | "codex-fork" => has_provider_resume_id,
+            _ => has_provider_resume_id,
+        }
     }
 
     fn cached_display_name(&self) -> Option<String> {
@@ -614,6 +686,49 @@ fn non_empty_or(value: String, fallback: &str) -> String {
     }
 }
 
+fn has_text(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn tail_lines(content: &str, lines: usize) -> String {
+    if lines == 0 {
+        return String::new();
+    }
+    let all_lines = content.lines().collect::<Vec<_>>();
+    if all_lines.is_empty() {
+        return String::new();
+    }
+    let start = all_lines.len().saturating_sub(lines);
+    let mut output = all_lines[start..].join("\n");
+    if content.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn read_tail_lines(path: &Path, lines: usize) -> io::Result<String> {
+    if lines == 0 {
+        return Ok(String::new());
+    }
+
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(String::new());
+    }
+
+    let read_len = file_len.min(output_tail_byte_limit(lines));
+    file.seek(SeekFrom::End(-(read_len as i64)))?;
+    let mut bytes = Vec::with_capacity(read_len as usize);
+    file.take(read_len).read_to_end(&mut bytes)?;
+    Ok(tail_lines(&String::from_utf8_lossy(&bytes), lines))
+}
+
+fn output_tail_byte_limit(lines: usize) -> u64 {
+    let requested = (lines as u64).saturating_mul(OUTPUT_TAIL_BYTES_PER_LINE);
+    requested.clamp(MIN_OUTPUT_TAIL_BYTES, MAX_OUTPUT_TAIL_BYTES)
+}
+
 fn default_node() -> String {
     "primary".to_owned()
 }
@@ -653,7 +768,10 @@ mod tests {
             tmux_socket_name: None,
             node: "primary".to_owned(),
             provider: "claude".to_owned(),
+            log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
+            transcript_path: None,
+            codex_thread_id: None,
             forked_from_session_id: None,
             forked_from_provider_resume_id: None,
             forked_provider_resume_id: None,
@@ -916,6 +1034,50 @@ mod tests {
             child.pending_adoption_proposals[0].proposer_name.as_deref(),
             Some("maintainer")
         );
+    }
+
+    #[test]
+    fn snapshot_prunes_stale_aliases_but_keeps_restorable_stopped_aliases() {
+        let snapshot = StateSnapshot {
+            sessions: vec![
+                SessionRecord {
+                    id: "dead001".to_owned(),
+                    provider_resume_id: None,
+                    transcript_path: None,
+                    ..session_record("stopped")
+                },
+                SessionRecord {
+                    id: "restore1".to_owned(),
+                    provider_resume_id: Some("resume-id".to_owned()),
+                    ..session_record("stopped")
+                },
+            ],
+            maintainer_session_id: Some("dead001".to_owned()),
+            agent_registrations: vec![
+                AgentRegistrationRecord {
+                    role: "Stale Role".to_owned(),
+                    session_id: "dead001".to_owned(),
+                },
+                AgentRegistrationRecord {
+                    role: "Restorable Role".to_owned(),
+                    session_id: "restore1".to_owned(),
+                },
+            ],
+            adoption_proposals: Vec::new(),
+        };
+
+        let sessions = snapshot.into_sessions();
+        let stale = sessions
+            .iter()
+            .find(|session| session.id == "dead001")
+            .unwrap();
+        let restorable = sessions
+            .iter()
+            .find(|session| session.id == "restore1")
+            .unwrap();
+
+        assert!(stale.aliases.is_empty());
+        assert_eq!(restorable.aliases, vec!["restorable-role"]);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

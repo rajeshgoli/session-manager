@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{ConnectInfo, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{
         header::{AUTHORIZATION, COOKIE, HOST},
         HeaderMap, StatusCode,
@@ -52,7 +52,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/session", get(auth_session))
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/sessions", get(list_sessions))
+        .route("/sessions/{session_id}", get(get_session))
+        .route("/sessions/{session_id}/output", get(session_output))
         .route("/client/sessions", get(list_client_sessions))
+        .route("/client/sessions/{session_id}", get(get_client_session))
         .fallback(not_found)
         .with_state(Arc::new(state))
 }
@@ -185,6 +188,46 @@ async fn list_client_sessions(
     Ok(Json(SessionsEnvelope::from(sessions)))
 }
 
+async fn get_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    Ok(Json(SessionResponse::from(session)))
+}
+
+async fn get_client_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<ClientSessionResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    Ok(Json(ClientSessionResponse::from(session)))
+}
+
+async fn session_output(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SessionOutputQuery>,
+    request: Request,
+) -> Result<Json<SessionOutputResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    if state.session_store.get_session(&session_id)?.is_none() {
+        return Err(ApiError::NotFound("Session not found"));
+    }
+    let output = state
+        .session_store
+        .capture_output(&session_id, query.lines.unwrap_or(50))?;
+    Ok(Json(SessionOutputResponse { session_id, output }))
+}
+
 async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -195,6 +238,7 @@ async fn not_found() -> impl IntoResponse {
 #[derive(Debug)]
 enum ApiError {
     Internal(anyhow::Error),
+    NotFound(&'static str),
     Auth {
         status: StatusCode,
         detail: &'static str,
@@ -219,6 +263,9 @@ impl IntoResponse for ApiError {
                 Json(json!({ "detail": error.to_string() })),
             )
                 .into_response(),
+            Self::NotFound(detail) => {
+                (StatusCode::NOT_FOUND, Json(json!({ "detail": detail }))).into_response()
+            }
             Self::Auth {
                 status,
                 detail,
@@ -480,6 +527,17 @@ struct HealthCheck {
 struct ListSessionsQuery {
     #[serde(default)]
     include_stopped: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionOutputQuery {
+    lines: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct SessionOutputResponse {
+    session_id: String,
+    output: Option<String>,
 }
 
 #[derive(Serialize)]

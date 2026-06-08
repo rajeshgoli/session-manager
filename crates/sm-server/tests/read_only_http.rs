@@ -333,6 +333,123 @@ async fn client_sessions_adds_read_only_mobile_metadata_without_termux() {
 }
 
 #[tokio::test]
+async fn session_detail_returns_one_projected_session() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "run12345");
+    assert_eq!(payload["friendly_name"], "Runner Native");
+    assert_eq!(payload["activity_state"], "working");
+    assert_eq!(payload["provider"], "claude");
+}
+
+#[tokio::test]
+async fn session_detail_returns_404_for_unknown_session() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/missing-session").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Session not found" }));
+}
+
+#[tokio::test]
+async fn client_session_detail_returns_mobile_metadata_for_one_session() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/client/sessions/run12345").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "run12345");
+    assert_eq!(payload["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(payload["termux_attach"], Value::Null);
+    assert_eq!(payload["mobile_terminal"]["supported"], false);
+    assert_eq!(payload["primary_action"]["type"], "details");
+}
+
+#[tokio::test]
+async fn session_detail_prunes_stale_role_aliases() {
+    let state_file = write_registry_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/stale-role").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Session not found" }));
+
+    let (status, payload) = get_json(app.clone(), "/client/sessions/stale-role").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Session not found" }));
+
+    let (status, payload) = get_json(app, "/sessions/reviewer").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "child001");
+}
+
+#[tokio::test]
+async fn session_output_tails_fixture_log_file() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/run12345/output?lines=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(
+        payload["output"],
+        "fixture log line 2\nfixture log line 3\n"
+    );
+}
+
+#[tokio::test]
+async fn session_output_tails_large_log_file_from_end() {
+    let state_file = unique_temp_path();
+    let log_file = unique_temp_path();
+    fs::write(
+        &log_file,
+        format!(
+            "{}\nlast retained line\nfinal retained line\n",
+            "x".repeat(2 * 1024 * 1024)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "largeout",
+                    "name": "claude-largeout",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-largeout",
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": log_file.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/largeout/output?lines=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["output"],
+        "last retained line\nfinal retained line\n"
+    );
+}
+
+#[tokio::test]
 async fn sessions_missing_state_file_returns_empty_list() {
     let state_file = unique_temp_path();
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -516,6 +633,12 @@ fn config_with_state_file_and_auth(state_file: &PathBuf) -> AppConfig {
 
 fn write_session_fixture() -> PathBuf {
     let path = unique_temp_path();
+    let log_file = unique_temp_path();
+    fs::write(
+        &log_file,
+        "fixture log line 1\nfixture log line 2\nfixture log line 3\n",
+    )
+    .unwrap();
     fs::write(
         &path,
         json!({
@@ -528,7 +651,7 @@ fn write_session_fixture() -> PathBuf {
                     "tmux_socket_name": null,
                     "node": "primary",
                     "provider": "claude",
-                    "log_file": "/tmp/run12345.log",
+                    "log_file": log_file.display().to_string(),
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",
@@ -597,6 +720,17 @@ fn write_registry_fixture() -> PathBuf {
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "deadrole",
+                    "name": "claude-deadrole",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-deadrole",
+                    "log_file": "/tmp/deadrole.log",
+                    "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
                 }
             ],
             "maintainer_session_id": "em123456",
@@ -605,6 +739,11 @@ fn write_registry_fixture() -> PathBuf {
                     "role": "Reviewer",
                     "session_id": "child001",
                     "created_at": "2026-06-01T00:02:00"
+                },
+                {
+                    "role": "Stale Role",
+                    "session_id": "deadrole",
+                    "created_at": "2026-06-01T00:02:30"
                 }
             ],
             "adoption_proposals": [
