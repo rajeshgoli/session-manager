@@ -12,6 +12,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use sm_server::config::RustShadowConfig;
 use sm_server::{
     config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig},
     http::{router, AppState},
@@ -39,6 +40,43 @@ async fn get_response(app: axum::Router, uri: &str) -> (StatusCode, HeaderMap, V
     let headers = response.headers().clone();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     (status, headers, body.to_vec())
+}
+
+async fn post_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, Value) {
+    post_json_with_headers_and_peer(
+        app,
+        uri,
+        payload,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await
+}
+
+async fn post_json_with_headers_and_peer(
+    app: axum::Router,
+    uri: &str,
+    payload: Value,
+    headers: &[(&str, &str)],
+    peer_addr: Option<SocketAddr>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let mut request = builder
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+    if let Some(peer_addr) = peer_addr {
+        request.extensions_mut().insert(ConnectInfo(peer_addr));
+    }
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
 }
 
 async fn get_json_with_host(app: axum::Router, uri: &str, host: &str) -> (StatusCode, Value) {
@@ -124,6 +162,307 @@ async fn auth_session_reports_disabled_bypass_when_google_auth_not_requested() {
             "name": null
         })
     );
+}
+
+#[tokio::test]
+async fn shadow_http_reports_match_for_stable_read_only_route() {
+    let app = router(AppState::new(AppConfig::default()));
+    let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["body_sha256_match"], true);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_body_mismatch_for_stable_read_only_route() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"different")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "body_mismatch");
+    assert_eq!(payload["body_sha256_match"], false);
+}
+
+#[tokio::test]
+async fn shadow_http_classifies_core_writes_without_side_effects() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/sessions",
+                "query_string": "",
+                "headers": {},
+                "body_sha256": sha256_hex(b"{\"working_dir\":\"~\"}")
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"id\":\"python-owned\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "unsupported_retained_write");
+    assert_eq!(payload["comparison"], "not_compared");
+    assert_eq!(payload["would_write"], false);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("never performs retained write side effects"));
+}
+
+#[tokio::test]
+async fn shadow_http_rejects_remote_without_shadow_secret() {
+    let app = router(AppState::new(AppConfig::default()));
+    let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+        &[],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Rust shadow endpoint requires local peer or shadow secret"
+    );
+}
+
+#[tokio::test]
+async fn shadow_http_allows_remote_with_configured_shadow_secret() {
+    let app = router(AppState::new(AppConfig {
+        rust_shadow: RustShadowConfig {
+            secret: Some("shared-shadow-secret".to_owned()),
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+        &[("x-sm-rust-shadow-secret", "shared-shadow-secret")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["comparison"], "match");
+}
+
+#[tokio::test]
+async fn shadow_http_requires_configured_secret_even_from_loopback() {
+    let app = router(AppState::new(AppConfig {
+        rust_shadow: RustShadowConfig {
+            secret: Some("shared-shadow-secret".to_owned()),
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Rust shadow endpoint requires local peer or shadow secret"
+    );
+}
+
+#[tokio::test]
+async fn shadow_http_preserves_python_auth_denial_for_protected_reads() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 401,
+                "body_sha256": sha256_hex(b"{\"detail\":\"Authentication required\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "python_auth_denial");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 401);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_treats_auth_session_as_status_only() {
+    let app = router(AppState::new(AppConfig {
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            client_id: Some("web-client".to_owned()),
+            client_secret: Some("web-secret".to_owned()),
+            redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+            allowlist_emails: vec!["user@example.com".to_owned()],
+            session_cookie_secret: Some("cookie-secret".to_owned()),
+            ..GoogleAuthConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/auth/session",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"authenticated\":true}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_does_not_treat_static_sessions_route_as_session_id() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/context-monitor",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"enabled\":true}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "unsupported");
+    assert_eq!(payload["comparison"], "not_compared");
+    assert_eq!(payload["predicted_status"], Value::Null);
 }
 
 #[tokio::test]
@@ -893,6 +1232,11 @@ fn hmac_sha256_urlsafe(key: &[u8], value: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
     mac.update(value);
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn hmac_sha1_urlsafe(key: &[u8], value: &[u8]) -> String {

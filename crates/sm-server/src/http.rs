@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
+    body::to_bytes,
     extract::{ConnectInfo, Path, Query, Request, State},
     http::{
         header::{AUTHORIZATION, COOKIE, HOST},
@@ -10,7 +11,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use base64::{
@@ -32,6 +33,7 @@ use crate::sessions::{
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
+const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
+        .route("/__shadow/http", post(shadow_http))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/output", get(session_output))
@@ -264,11 +267,446 @@ async fn session_output(
     Ok(Json(SessionOutputResponse { session_id, output }))
 }
 
+async fn shadow_http(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<ShadowHttpResult>, ApiError> {
+    let headers = request.headers().clone();
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    ensure_shadow_allowed(&state.config, &headers, peer_addr)?;
+    let body = to_bytes(request.into_body(), SHADOW_ENVELOPE_MAX_BYTES)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to read shadow envelope: {error}"))?;
+    let envelope: ShadowHttpEnvelope = serde_json::from_slice(&body)?;
+    Ok(Json(shadow_compare(&state, envelope)?))
+}
+
 async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "detail": "Not Found" })),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowHttpEnvelope {
+    request: ShadowRequestEnvelope,
+    python_response: ShadowPythonResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowRequestEnvelope {
+    method: String,
+    path: String,
+    #[serde(default)]
+    query_string: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowPythonResponse {
+    status: u16,
+    body_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ShadowHttpResult {
+    schema_version: u8,
+    method: String,
+    path: String,
+    support_status: &'static str,
+    comparison: &'static str,
+    would_write: bool,
+    python_status: u16,
+    predicted_status: Option<u16>,
+    predicted_body_sha256: Option<String>,
+    body_sha256_match: Option<bool>,
+    detail: Option<String>,
+}
+
+struct ShadowPrediction {
+    status: u16,
+    body_sha256: Option<String>,
+    support_status: &'static str,
+}
+
+fn shadow_compare(
+    state: &AppState,
+    envelope: ShadowHttpEnvelope,
+) -> anyhow::Result<ShadowHttpResult> {
+    let method = envelope.request.method.trim().to_uppercase();
+    let path = envelope.request.path.trim().to_owned();
+    let python_status = envelope.python_response.status;
+
+    if is_retained_write_surface(&method, &path) {
+        return Ok(ShadowHttpResult {
+            schema_version: 1,
+            method,
+            path,
+            support_status: "unsupported_retained_write",
+            comparison: "not_compared",
+            would_write: false,
+            python_status,
+            predicted_status: None,
+            predicted_body_sha256: None,
+            body_sha256_match: None,
+            detail: Some("Rust shadow mode never performs retained write side effects".to_owned()),
+        });
+    }
+
+    if is_auth_denial_status(python_status) && is_protected_read_surface(&method, &path) {
+        return Ok(ShadowHttpResult {
+            schema_version: 1,
+            method,
+            path,
+            support_status: "python_auth_denial",
+            comparison: "status_match",
+            would_write: false,
+            python_status,
+            predicted_status: Some(python_status),
+            predicted_body_sha256: None,
+            body_sha256_match: None,
+            detail: Some(
+                "Python rejected the protected read before handler execution; shadow mode preserves the denial without reading state"
+                    .to_owned(),
+            ),
+        });
+    }
+
+    let Some(prediction) =
+        shadow_predict_read(state, &method, &path, &envelope.request.query_string)?
+    else {
+        return Ok(ShadowHttpResult {
+            schema_version: 1,
+            method,
+            path,
+            support_status: "unsupported",
+            comparison: "not_compared",
+            would_write: false,
+            python_status,
+            predicted_status: None,
+            predicted_body_sha256: None,
+            body_sha256_match: None,
+            detail: Some("No side-effect-free Rust prediction exists for this surface".to_owned()),
+        });
+    };
+
+    let status_matches = prediction.status == python_status;
+    let body_matches = prediction
+        .body_sha256
+        .as_ref()
+        .map(|value| value == &envelope.python_response.body_sha256);
+    let comparison = match (status_matches, body_matches) {
+        (true, Some(true)) => "match",
+        (true, None) => "status_match",
+        (false, _) => "status_mismatch",
+        (true, Some(false)) => "body_mismatch",
+    };
+
+    Ok(ShadowHttpResult {
+        schema_version: 1,
+        method,
+        path,
+        support_status: prediction.support_status,
+        comparison,
+        would_write: false,
+        python_status,
+        predicted_status: Some(prediction.status),
+        predicted_body_sha256: prediction.body_sha256,
+        body_sha256_match: body_matches,
+        detail: None,
+    })
+}
+
+fn shadow_predict_read(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    query_string: &str,
+) -> anyhow::Result<Option<ShadowPrediction>> {
+    if method != "GET" {
+        return Ok(None);
+    }
+
+    let body = match path {
+        "/health" => Some(serde_json::to_vec(&json!({ "status": "healthy" }))?),
+        "/health/detailed" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+        "/auth/session" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+        "/client/bootstrap" => Some(serde_json::to_vec(&shadow_client_bootstrap_response(
+            &state.config,
+        ))?),
+        "/events/state" => Some(serde_json::to_vec(&event_state_payload())?),
+        "/sessions" => {
+            let include_stopped = query_bool(query_string, "include_stopped");
+            let sessions = state
+                .session_store
+                .list_sessions(include_stopped)?
+                .into_iter()
+                .map(SessionResponse::from)
+                .collect::<Vec<_>>();
+            Some(serde_json::to_vec(&SessionsEnvelope::from(sessions))?)
+        }
+        "/client/sessions" => {
+            let sessions = state
+                .session_store
+                .list_sessions(false)?
+                .into_iter()
+                .map(ClientSessionResponse::from)
+                .collect::<Vec<_>>();
+            Some(serde_json::to_vec(&SessionsEnvelope::from(sessions))?)
+        }
+        _ => return shadow_predict_session_read(state, path, query_string),
+    };
+
+    Ok(body.map(|body| ShadowPrediction {
+        status: StatusCode::OK.as_u16(),
+        body_sha256: Some(sha256_hex(&body)),
+        support_status: "implemented_read",
+    }))
+}
+
+fn shadow_predict_session_read(
+    state: &AppState,
+    path: &str,
+    query_string: &str,
+) -> anyhow::Result<Option<ShadowPrediction>> {
+    if is_static_sessions_path(path) {
+        return Ok(None);
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/client/sessions/")
+        .filter(|value| !value.contains('/'))
+    {
+        let Some(session) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        let body = serde_json::to_vec(&ClientSessionResponse::from(session))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/output"))
+    {
+        let Some(_) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        let output = state
+            .session_store
+            .capture_output(session_id, query_usize(query_string, "lines").unwrap_or(50))?;
+        let body = serde_json::to_vec(&SessionOutputResponse {
+            session_id: session_id.to_owned(),
+            output,
+        })?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .filter(|value| !value.contains('/'))
+    {
+        let Some(session) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        let body = serde_json::to_vec(&SessionResponse::from(session))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    Ok(None)
+}
+
+fn shadow_client_bootstrap_response(config: &AppConfig) -> ClientBootstrapResponse {
+    let auth = &config.google_auth;
+    let external = &config.external_access;
+
+    ClientBootstrapResponse {
+        auth: BootstrapAuth {
+            mode_name: "browser_session_cookie",
+            session_endpoint: "/auth/session",
+            login_endpoint: "/auth/google/login",
+            logout_endpoint: "/auth/logout",
+            device_auth_endpoint: "/auth/device/google",
+            device_auth_token_type: "Bearer",
+            google_server_client_id: trimmed(&auth.client_id),
+        },
+        external_access: BootstrapExternalAccess {
+            public_http_host: trimmed(&external.public_http_host),
+            public_ssh_host: trimmed(&external.public_ssh_host),
+            ssh_username: trimmed(&external.ssh_username),
+            termux_attach_supported: false,
+            mobile_terminal_supported: false,
+            mobile_terminal_ws_url: None,
+        },
+        session_open_defaults: SessionOpenDefaults {
+            preferred_action: "details",
+        },
+    }
+}
+
+fn is_static_sessions_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/sessions/context-monitor"
+            | "/sessions/create"
+            | "/sessions/input-batch"
+            | "/sessions/spawn"
+            | "/sessions/review"
+    )
+}
+
+fn is_retained_write_surface(method: &str, path: &str) -> bool {
+    if method == "POST" && (path == "/sessions" || path == "/sessions/input-batch") {
+        return true;
+    }
+    if path.starts_with("/sessions/") {
+        return matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
+    }
+    if method == "POST" && path == "/codex-review-requests" {
+        return true;
+    }
+    if path.starts_with("/codex-review-requests/") {
+        return matches!(method, "POST" | "DELETE");
+    }
+    if method == "POST" && path == "/queue-jobs" {
+        return true;
+    }
+    if path.starts_with("/queue-jobs/") {
+        return matches!(method, "POST" | "DELETE");
+    }
+    false
+}
+
+fn is_auth_denial_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 503)
+}
+
+fn is_protected_read_surface(method: &str, path: &str) -> bool {
+    if method != "GET" {
+        return false;
+    }
+    path == "/events"
+        || path == "/events/state"
+        || path == "/sessions"
+        || path == "/client/sessions"
+        || path.starts_with("/sessions/")
+        || path.starts_with("/client/sessions/")
+}
+
+fn ensure_shadow_allowed(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> Result<(), ApiError> {
+    let expected = trimmed(&config.rust_shadow.secret);
+    let provided = headers
+        .get("x-sm-rust-shadow-secret")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(expected) = expected {
+        if provided
+            .map(|provided| constant_time_eq(expected.as_bytes(), provided.as_bytes()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        return Err(ApiError::Auth {
+            status: StatusCode::FORBIDDEN,
+            detail: "Rust shadow endpoint requires local peer or shadow secret",
+            login_url: None,
+        });
+    }
+
+    if peer_addr
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    Err(ApiError::Auth {
+        status: StatusCode::FORBIDDEN,
+        detail: "Rust shadow endpoint requires local peer or shadow secret",
+        login_url: None,
+    })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
+fn query_bool(query_string: &str, key: &str) -> bool {
+    query_value(query_string, key)
+        .map(|value| matches!(value, "1" | "true" | "True" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn query_usize(query_string: &str, key: &str) -> Option<usize> {
+    query_value(query_string, key).and_then(|value| value.parse().ok())
+}
+
+fn query_value<'a>(query_string: &'a str, key: &str) -> Option<&'a str> {
+    query_string.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+        if name == key {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Debug)]

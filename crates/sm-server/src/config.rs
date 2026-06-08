@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
     pub mobile_terminal: MobileTerminalConfig,
+    pub rust_shadow: RustShadowConfig,
 }
 
 impl AppConfig {
@@ -129,6 +130,12 @@ pub struct MobileTerminalConfig {
     pub ws_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RustShadowConfig {
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
@@ -139,6 +146,8 @@ struct RawConfig {
     external_access: ExternalAccessConfig,
     #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
+    #[serde(default)]
+    rust_shadow: RustShadowConfig,
 }
 
 impl From<RawConfig> for AppConfig {
@@ -148,6 +157,7 @@ impl From<RawConfig> for AppConfig {
             google_auth: raw.auth.google,
             external_access: raw.external_access,
             mobile_terminal: raw.mobile_terminal,
+            rust_shadow: raw.rust_shadow,
         }
     }
 }
