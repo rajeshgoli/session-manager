@@ -373,6 +373,24 @@ async fn client_session_detail_returns_mobile_metadata_for_one_session() {
 }
 
 #[tokio::test]
+async fn session_detail_prunes_stale_role_aliases() {
+    let state_file = write_registry_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/stale-role").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Session not found" }));
+
+    let (status, payload) = get_json(app.clone(), "/client/sessions/stale-role").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Session not found" }));
+
+    let (status, payload) = get_json(app, "/sessions/reviewer").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "child001");
+}
+
+#[tokio::test]
 async fn session_output_tails_fixture_log_file() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -658,6 +676,17 @@ fn write_registry_fixture() -> PathBuf {
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "deadrole",
+                    "name": "claude-deadrole",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-deadrole",
+                    "log_file": "/tmp/deadrole.log",
+                    "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
                 }
             ],
             "maintainer_session_id": "em123456",
@@ -666,6 +695,11 @@ fn write_registry_fixture() -> PathBuf {
                     "role": "Reviewer",
                     "session_id": "child001",
                     "created_at": "2026-06-01T00:02:00"
+                },
+                {
+                    "role": "Stale Role",
+                    "session_id": "deadrole",
+                    "created_at": "2026-06-01T00:02:30"
                 }
             ],
             "adoption_proposals": [

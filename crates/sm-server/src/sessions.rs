@@ -223,6 +223,7 @@ impl StateSnapshot {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            .filter(|session_id| self.session_is_restorable_for_registry(session_id))
         {
             aliases
                 .entry(session_id.to_owned())
@@ -235,12 +236,22 @@ impl StateSnapshot {
             if role.is_empty() || session_id.is_empty() {
                 continue;
             }
+            if !self.session_is_restorable_for_registry(session_id) {
+                continue;
+            }
             aliases
                 .entry(session_id.to_owned())
                 .or_default()
                 .insert(role);
         }
         aliases
+    }
+
+    fn session_is_restorable_for_registry(&self, session_id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(SessionRecord::is_restorable_for_registry)
     }
 
     fn pending_proposal_map(
@@ -330,6 +341,10 @@ pub struct SessionRecord {
     #[serde(default)]
     pub provider_resume_id: Option<String>,
     #[serde(default)]
+    pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub codex_thread_id: Option<String>,
+    #[serde(default)]
     pub forked_from_session_id: Option<String>,
     #[serde(default)]
     pub forked_from_provider_resume_id: Option<String>,
@@ -402,6 +417,19 @@ pub struct SessionRecord {
 impl SessionRecord {
     fn is_stopped(&self) -> bool {
         normalized_status(&self.status) == "stopped"
+    }
+
+    fn is_restorable_for_registry(&self) -> bool {
+        if !self.is_stopped() {
+            return true;
+        }
+        let has_provider_resume_id = has_text(self.provider_resume_id.as_deref());
+        match self.provider.as_str() {
+            "claude" => has_provider_resume_id || has_text(self.transcript_path.as_deref()),
+            "codex-app" => has_provider_resume_id || has_text(self.codex_thread_id.as_deref()),
+            "codex" | "codex-fork" => has_provider_resume_id,
+            _ => has_provider_resume_id,
+        }
     }
 
     fn cached_display_name(&self) -> Option<String> {
@@ -654,6 +682,10 @@ fn non_empty_or(value: String, fallback: &str) -> String {
     }
 }
 
+fn has_text(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
 fn tail_lines(content: &str, lines: usize) -> String {
     if lines == 0 {
         return String::new();
@@ -711,6 +743,8 @@ mod tests {
             provider: "claude".to_owned(),
             log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
+            transcript_path: None,
+            codex_thread_id: None,
             forked_from_session_id: None,
             forked_from_provider_resume_id: None,
             forked_provider_resume_id: None,
@@ -973,6 +1007,50 @@ mod tests {
             child.pending_adoption_proposals[0].proposer_name.as_deref(),
             Some("maintainer")
         );
+    }
+
+    #[test]
+    fn snapshot_prunes_stale_aliases_but_keeps_restorable_stopped_aliases() {
+        let snapshot = StateSnapshot {
+            sessions: vec![
+                SessionRecord {
+                    id: "dead001".to_owned(),
+                    provider_resume_id: None,
+                    transcript_path: None,
+                    ..session_record("stopped")
+                },
+                SessionRecord {
+                    id: "restore1".to_owned(),
+                    provider_resume_id: Some("resume-id".to_owned()),
+                    ..session_record("stopped")
+                },
+            ],
+            maintainer_session_id: Some("dead001".to_owned()),
+            agent_registrations: vec![
+                AgentRegistrationRecord {
+                    role: "Stale Role".to_owned(),
+                    session_id: "dead001".to_owned(),
+                },
+                AgentRegistrationRecord {
+                    role: "Restorable Role".to_owned(),
+                    session_id: "restore1".to_owned(),
+                },
+            ],
+            adoption_proposals: Vec::new(),
+        };
+
+        let sessions = snapshot.into_sessions();
+        let stale = sessions
+            .iter()
+            .find(|session| session.id == "dead001")
+            .unwrap();
+        let restorable = sessions
+            .iter()
+            .find(|session| session.id == "restore1")
+            .unwrap();
+
+        assert!(stale.aliases.is_empty());
+        assert_eq!(restorable.aliases, vec!["restorable-role"]);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {
