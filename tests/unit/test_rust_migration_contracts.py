@@ -164,6 +164,33 @@ def test_manifest_covers_rust_only_retired_http_surfaces():
     assert "session_id" in checks["http.summary_provider_route_retired"].preconditions
 
 
+def test_manifest_covers_rust_core_fixture_lifecycle_cli_checks():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    required_ids = {
+        "cli.rust_core_spawn_fixture",
+        "cli.rust_core_spawn_child_inherits_parent_fixture",
+        "cli.rust_core_status_fixture",
+        "cli.rust_core_send_fixture",
+        "cli.rust_core_send_urgent_fixture",
+        "cli.rust_core_send_wait_fixture",
+        "cli.rust_core_output_fixture",
+        "cli.rust_core_tail_fixture",
+        "cli.rust_core_retire_fixture",
+        "cli.rust_core_wait_retired_fixture",
+    }
+
+    missing = required_ids - set(checks)
+    assert not missing
+    for check_id in required_ids:
+        check = checks[check_id]
+        assert check.classification == "retained"
+        assert check.target == "rust_only"
+        assert check.safety == "mutating"
+        assert "mutating_opt_in" in check.preconditions
+        assert "fixture:base_url" in check.preconditions
+
+
 def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
@@ -522,10 +549,87 @@ def test_cli_check_requires_all_expected_output_tokens():
         "scripts.rust_migration.contracts.subprocess.run",
         return_value=completed,
     ):
-        result = _run_cli_check(check, "sm", 1.0)
+        result = _run_cli_check(check, "sm", {}, 1.0)
 
     assert result.status == "failed"
     assert "--pr" in result.detail
+
+
+def test_cli_check_renders_fixture_values_in_command():
+    check = ContractCheck(
+        id="cli.fixture",
+        surface="cli",
+        classification="retained",
+        target="rust_only",
+        safety="mutating",
+        command=("--api-url", "{base_url}", "output", "{session_id}"),
+        expected_exit=(0,),
+        expected_output_contains_any=("hello",),
+        preconditions=("sm_cli", "fixture:base_url", "session_id"),
+        source="test",
+    )
+    completed = subprocess.CompletedProcess(
+        args=["target/debug/sm", "--api-url", "http://127.0.0.1:8421", "output", "rustcore"],
+        returncode=0,
+        stdout="hello\n",
+        stderr="",
+    )
+
+    with patch(
+        "scripts.rust_migration.contracts.subprocess.run",
+        return_value=completed,
+    ) as run:
+        result = _run_cli_check(
+            check,
+            "target/debug/sm",
+            {"base_url": "http://127.0.0.1:8421", "session_id": "rustcore"},
+            1.0,
+        )
+
+    assert result.status == "passed"
+    assert run.call_args.args[0] == [
+        "target/debug/sm",
+        "--api-url",
+        "http://127.0.0.1:8421",
+        "output",
+        "rustcore",
+    ]
+
+
+def test_cli_check_renders_fixture_values_in_environment():
+    check = ContractCheck(
+        id="cli.env_fixture",
+        surface="cli",
+        classification="retained",
+        target="rust_only",
+        safety="mutating",
+        command=("status", "{status_text}"),
+        expected_exit=(0,),
+        expected_output_contains_any=("Status set",),
+        env=(("SESSION_MANAGER_ID", "{session_id}"),),
+        preconditions=("sm_cli", "session_id", "fixture:status_text"),
+        source="test",
+    )
+    completed = subprocess.CompletedProcess(
+        args=["target/debug/sm", "status", "working"],
+        returncode=0,
+        stdout="Status set: working\n",
+        stderr="",
+    )
+
+    with patch(
+        "scripts.rust_migration.contracts.subprocess.run",
+        return_value=completed,
+    ) as run:
+        result = _run_cli_check(
+            check,
+            "target/debug/sm",
+            {"session_id": "rustcore", "status_text": "working"},
+            1.0,
+        )
+
+    assert result.status == "passed"
+    assert run.call_args.kwargs["env"]["SESSION_MANAGER_ID"] == "rustcore"
 
 
 def test_line_mode_http_check_reads_one_streaming_line():

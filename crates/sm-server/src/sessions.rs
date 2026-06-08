@@ -1,24 +1,30 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
 const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
 const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
 const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
 const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
+static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     state_file: PathBuf,
     legacy_state_file: Option<PathBuf>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl SessionStore {
@@ -31,6 +37,7 @@ impl SessionStore {
         Self {
             state_file,
             legacy_state_file,
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -39,6 +46,7 @@ impl SessionStore {
         Self {
             state_file,
             legacy_state_file: Some(legacy_state_file),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -89,6 +97,240 @@ impl SessionStore {
         Ok(Some(output))
     }
 
+    pub fn create_core_session(
+        &self,
+        request: CreateCoreSessionRequest,
+        log_dir: Option<PathBuf>,
+    ) -> Result<SessionRecord> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let session_id = request
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(generate_session_id);
+        if session_object_mut(sessions, &session_id).is_some() {
+            anyhow::bail!("session already exists: {session_id}");
+        }
+        let parent_working_dir = request.parent_session_id.as_deref().and_then(|parent_id| {
+            sessions
+                .iter()
+                .find(|value| value.get("id").and_then(Value::as_str) == Some(parent_id))
+                .and_then(|value| json_text(value.get("working_dir")))
+        });
+
+        let provider = request
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("claude")
+            .to_owned();
+        let name = request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{provider}-{session_id}"));
+        let working_dir = request
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(parent_working_dir.as_deref())
+            .unwrap_or(".")
+            .to_owned();
+        let node = request
+            .node
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("primary")
+            .to_owned();
+        let now = now_rfc3339();
+        let log_file = core_log_file_path(&self.state_file, log_dir.as_deref(), &session_id);
+        append_log_line(&log_file, "[sm-rust] fixture session created")?;
+        if let Some(initial_message) = request
+            .initial_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            append_log_line(&log_file, initial_message)?;
+        }
+        if let Some(wait) = request.wait {
+            append_log_line(
+                &log_file,
+                &format!("[sm-rust] fixture watch requested: {wait}s"),
+            )?;
+        }
+
+        let record = SessionRecord {
+            id: session_id.clone(),
+            name,
+            working_dir,
+            tmux_session: format!("sm-rust-{session_id}"),
+            tmux_socket_name: None,
+            node,
+            provider,
+            log_file: Some(log_file.display().to_string()),
+            provider_resume_id: None,
+            transcript_path: None,
+            codex_thread_id: None,
+            forked_from_session_id: None,
+            forked_from_provider_resume_id: None,
+            forked_provider_resume_id: None,
+            forked_at: None,
+            forked_by_session_id: None,
+            friendly_name: request.name,
+            friendly_name_is_explicit: true,
+            friendly_name_updated_at_ns: None,
+            native_title: None,
+            native_title_updated_at_ns: None,
+            native_title_source_mtime_ns: None,
+            telegram_chat_id: None,
+            telegram_thread_id: None,
+            telegram_topic_id: None,
+            telegram_root_msg_id: None,
+            current_task: None,
+            git_remote_url: None,
+            parent_session_id: request.parent_session_id,
+            last_handoff_path: None,
+            agent_status_text: None,
+            agent_status_at: None,
+            agent_task_completed_at: None,
+            completed_at: None,
+            stopped_at: None,
+            is_em: false,
+            role: None,
+            status: "running".to_owned(),
+            created_at: now.clone(),
+            last_activity: now,
+            last_tool_call: None,
+            last_tool_name: None,
+            tokens_used: 0,
+            context_monitor_enabled: false,
+            aliases: Vec::new(),
+            pending_adoption_proposals: Vec::new(),
+        };
+        sessions.push(serde_json::to_value(&record)?);
+        self.write_raw_json_value(&state)?;
+        Ok(record)
+    }
+
+    pub fn send_core_input(
+        &self,
+        session_id: &str,
+        request: SendCoreInputRequest,
+    ) -> Result<Option<CoreInputResult>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
+        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+        let delivered = normalized_status(&status) != "stopped";
+        if delivered {
+            let now = now_rfc3339();
+            session.insert("last_activity".to_owned(), Value::String(now));
+            if let Some(log_file) = json_text(session.get("log_file")) {
+                append_log_line(&expand_home(&log_file), &request.text)?;
+                if let Some(seconds) = request.notify_after_seconds {
+                    append_log_line(
+                        &expand_home(&log_file),
+                        &format!("[sm-rust] fixture notify requested: {seconds}s"),
+                    )?;
+                }
+            }
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(Some(CoreInputResult {
+            ok: true,
+            session_id: session_id.to_owned(),
+            delivered,
+            delivery_mode: request.delivery_mode,
+            notify_after_seconds: request.notify_after_seconds,
+            status,
+        }))
+    }
+
+    pub fn retire_core_session(
+        &self,
+        session_id: &str,
+        requester_session_id: Option<&str>,
+    ) -> Result<CoreRetireOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(CoreRetireOutcome::NotFound);
+        };
+        if let Some(requester_session_id) = requester_session_id {
+            if !requester_session_id.is_empty()
+                && json_text(session.get("parent_session_id")).as_deref()
+                    != Some(requester_session_id)
+            {
+                return Ok(CoreRetireOutcome::NotChild);
+            }
+        }
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
+        if let Some(log_file) = json_text(session.get("log_file")) {
+            append_log_line(&expand_home(&log_file), "[sm-rust] fixture session retired")?;
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(CoreRetireOutcome::Retired(CoreRetireResult {
+            ok: true,
+            session_id: session_id.to_owned(),
+            status: "killed".to_owned(),
+        }))
+    }
+
+    pub fn set_agent_status(
+        &self,
+        session_id: &str,
+        request: AgentStatusRequest,
+    ) -> Result<Option<AgentStatusResult>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
+        let now = now_rfc3339();
+        match request.text {
+            Some(text) => {
+                session.insert("agent_status_text".to_owned(), Value::String(text.clone()));
+                session.insert("agent_status_at".to_owned(), Value::String(now.clone()));
+                session.insert("last_activity".to_owned(), Value::String(now));
+                self.write_raw_json_value(&state)?;
+                Ok(Some(AgentStatusResult {
+                    status: "updated".to_owned(),
+                    session_id: session_id.to_owned(),
+                    agent_status_text: Some(text),
+                }))
+            }
+            None => {
+                session.insert("agent_status_text".to_owned(), Value::Null);
+                session.insert("agent_status_at".to_owned(), Value::Null);
+                session.insert("last_activity".to_owned(), Value::String(now));
+                self.write_raw_json_value(&state)?;
+                Ok(Some(AgentStatusResult {
+                    status: "updated".to_owned(),
+                    session_id: session_id.to_owned(),
+                    agent_status_text: None,
+                }))
+            }
+        }
+    }
+
     fn load_snapshot(&self) -> Result<StateSnapshot> {
         let state_file = self.readable_state_file();
         if !state_file.exists() {
@@ -124,6 +366,111 @@ impl SessionStore {
         }
         self.state_file.clone()
     }
+
+    fn load_raw_json_value(&self) -> Result<Value> {
+        let state_file = self.readable_state_file();
+        if !state_file.exists() {
+            return Ok(json!({ "sessions": [] }));
+        }
+        let content = fs::read_to_string(&state_file)
+            .with_context(|| format!("failed to read session state {}", state_file.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse session state {}", state_file.display()))
+    }
+
+    fn write_raw_json_value(&self, value: &Value) -> Result<()> {
+        if let Some(parent) = self.state_file.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create state directory {}", parent.display())
+            })?;
+        }
+        let tmp = self.state_file.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            STATE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&tmp, serde_json::to_vec_pretty(value)?)
+            .with_context(|| format!("failed to write temp state {}", tmp.display()))?;
+        fs::rename(&tmp, &self.state_file).with_context(|| {
+            format!(
+                "failed to atomically replace session state {}",
+                self.state_file.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn write_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateCoreSessionRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default, alias = "prompt")]
+    pub initial_message: Option<String>,
+    #[serde(default)]
+    pub wait: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SendCoreInputRequest {
+    pub text: String,
+    #[serde(default = "default_delivery_mode")]
+    pub delivery_mode: String,
+    #[serde(default)]
+    pub notify_after_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentStatusRequest {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreInputResult {
+    pub ok: bool,
+    pub session_id: String,
+    pub delivered: bool,
+    pub delivery_mode: String,
+    pub notify_after_seconds: Option<u64>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreRetireResult {
+    pub ok: bool,
+    pub session_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum CoreRetireOutcome {
+    Retired(CoreRetireResult),
+    NotFound,
+    NotChild,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStatusResult {
+    pub status: String,
+    pub session_id: String,
+    pub agent_status_text: Option<String>,
 }
 
 fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
@@ -133,6 +480,106 @@ fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
         .with_context(|| format!("failed to parse session state {}", path.display()))?;
     StateSnapshot::try_from(raw)
         .with_context(|| format!("failed to parse session records {}", path.display()))
+}
+
+fn ensure_sessions_array_mut(value: &mut Value) -> Result<&mut Vec<Value>> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    let object = value.as_object_mut().expect("object value set above");
+    let sessions = object
+        .entry("sessions".to_owned())
+        .or_insert_with(|| json!([]));
+    if !sessions.is_array() {
+        anyhow::bail!("session state field 'sessions' is not an array");
+    }
+    Ok(sessions.as_array_mut().expect("array checked above"))
+}
+
+fn session_object_mut<'a>(
+    sessions: &'a mut [Value],
+    session_id: &str,
+) -> Option<&'a mut Map<String, Value>> {
+    sessions.iter_mut().find_map(|value| {
+        if value.get("id").and_then(Value::as_str) == Some(session_id) {
+            value.as_object_mut()
+        } else {
+            None
+        }
+    })
+}
+
+fn json_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn append_log_line(path: &Path, line: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open session log {}", path.display()))?;
+    writeln!(file, "{line}")
+        .with_context(|| format!("failed to append session log {}", path.display()))?;
+    Ok(())
+}
+
+fn core_log_file_path(state_file: &Path, log_dir: Option<&Path>, session_id: &str) -> PathBuf {
+    let safe_id = sanitize_path_component(session_id);
+    let id_hash = stable_session_id_hash(session_id);
+    let dir = log_dir
+        .map(Path::to_path_buf)
+        .or_else(|| state_file.parent().map(|parent| parent.join("logs")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    dir.join(format!("{safe_id}-{id_hash}.log"))
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let mut safe = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect::<String>();
+    if safe.is_empty() {
+        safe = "session".to_owned();
+    }
+    safe
+}
+
+fn stable_session_id_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hash = String::with_capacity(12);
+    for byte in &digest[..6] {
+        hash.push(hex_char(byte >> 4));
+        hash.push(hex_char(byte & 0x0f));
+    }
+    hash
+}
+
+fn hex_char(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + (value - 10)),
+        _ => unreachable!("hex nibble out of range"),
+    }
+}
+
+fn generate_session_id() -> String {
+    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    format!("rs{:x}", nanos as u128)
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -328,7 +775,7 @@ struct AdoptionProposalRecord {
     decided_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SessionRecord {
     pub id: String,
     pub name: String,
@@ -735,6 +1182,10 @@ fn default_node() -> String {
 
 fn default_provider() -> String {
     "claude".to_owned()
+}
+
+fn default_delivery_mode() -> String {
+    "sequential".to_owned()
 }
 
 fn normalize_role(role: &str) -> String {

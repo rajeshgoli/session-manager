@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub external_access: ExternalAccessConfig,
     pub mobile_terminal: MobileTerminalConfig,
     pub rust_shadow: RustShadowConfig,
+    pub rust_core: RustCoreConfig,
 }
 
 impl AppConfig {
@@ -136,6 +137,14 @@ pub struct RustShadowConfig {
     pub secret: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RustCoreConfig {
+    #[serde(default)]
+    pub fixture_writes_enabled: bool,
+    #[serde(default)]
+    pub log_dir: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
@@ -148,6 +157,8 @@ struct RawConfig {
     mobile_terminal: MobileTerminalConfig,
     #[serde(default)]
     rust_shadow: RustShadowConfig,
+    #[serde(default)]
+    rust_core: RustCoreConfig,
 }
 
 impl From<RawConfig> for AppConfig {
@@ -158,6 +169,7 @@ impl From<RawConfig> for AppConfig {
             external_access: raw.external_access,
             mobile_terminal: raw.mobile_terminal,
             rust_shadow: raw.rust_shadow,
+            rust_core: raw.rust_core,
         }
     }
 }
