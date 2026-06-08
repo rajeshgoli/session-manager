@@ -13,6 +13,8 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use crate::runtime::{TmuxRuntime, TmuxSessionSpec};
+
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
 const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
 const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
@@ -105,54 +107,13 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
-        let session_id = request
-            .id
+        let record =
+            self.build_core_session_record(sessions, &request, log_dir.as_deref(), false, None)?;
+        let log_file = record
+            .log_file
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(generate_session_id);
-        if session_object_mut(sessions, &session_id).is_some() {
-            anyhow::bail!("session already exists: {session_id}");
-        }
-        let parent_working_dir = request.parent_session_id.as_deref().and_then(|parent_id| {
-            sessions
-                .iter()
-                .find(|value| value.get("id").and_then(Value::as_str) == Some(parent_id))
-                .and_then(|value| json_text(value.get("working_dir")))
-        });
-
-        let provider = request
-            .provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("claude")
-            .to_owned();
-        let name = request
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("{provider}-{session_id}"));
-        let working_dir = request
-            .working_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or(parent_working_dir.as_deref())
-            .unwrap_or(".")
-            .to_owned();
-        let node = request
-            .node
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("primary")
-            .to_owned();
-        let now = now_rfc3339();
-        let log_file = core_log_file_path(&self.state_file, log_dir.as_deref(), &session_id);
+            .map(expand_home)
+            .ok_or_else(|| anyhow::anyhow!("fixture session missing log file"))?;
         append_log_line(&log_file, "[sm-rust] fixture session created")?;
         if let Some(initial_message) = request
             .initial_message
@@ -168,57 +129,45 @@ impl SessionStore {
                 &format!("[sm-rust] fixture watch requested: {wait}s"),
             )?;
         }
-
-        let record = SessionRecord {
-            id: session_id.clone(),
-            name,
-            working_dir,
-            tmux_session: format!("sm-rust-{session_id}"),
-            tmux_socket_name: None,
-            node,
-            provider,
-            log_file: Some(log_file.display().to_string()),
-            provider_resume_id: None,
-            transcript_path: None,
-            codex_thread_id: None,
-            forked_from_session_id: None,
-            forked_from_provider_resume_id: None,
-            forked_provider_resume_id: None,
-            forked_at: None,
-            forked_by_session_id: None,
-            friendly_name: request.name,
-            friendly_name_is_explicit: true,
-            friendly_name_updated_at_ns: None,
-            native_title: None,
-            native_title_updated_at_ns: None,
-            native_title_source_mtime_ns: None,
-            telegram_chat_id: None,
-            telegram_thread_id: None,
-            telegram_topic_id: None,
-            telegram_root_msg_id: None,
-            current_task: None,
-            git_remote_url: None,
-            parent_session_id: request.parent_session_id,
-            last_handoff_path: None,
-            agent_status_text: None,
-            agent_status_at: None,
-            agent_task_completed_at: None,
-            completed_at: None,
-            stopped_at: None,
-            is_em: false,
-            role: None,
-            status: "running".to_owned(),
-            created_at: now.clone(),
-            last_activity: now,
-            last_tool_call: None,
-            last_tool_name: None,
-            tokens_used: 0,
-            context_monitor_enabled: false,
-            aliases: Vec::new(),
-            pending_adoption_proposals: Vec::new(),
-        };
         sessions.push(serde_json::to_value(&record)?);
         self.write_raw_json_value(&state)?;
+        Ok(record)
+    }
+
+    pub fn create_core_session_with_runtime(
+        &self,
+        request: CreateCoreSessionRequest,
+        log_dir: Option<PathBuf>,
+        runtime: &TmuxRuntime,
+    ) -> Result<SessionRecord> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let record = self.build_core_session_record(
+            sessions,
+            &request,
+            log_dir.as_deref(),
+            true,
+            runtime.socket_name(),
+        )?;
+        ensure_runtime_local_node(&record.node)?;
+        let log_file = record
+            .log_file
+            .as_deref()
+            .map(expand_home)
+            .ok_or_else(|| anyhow::anyhow!("runtime session missing log file"))?;
+        runtime.create_session(&TmuxSessionSpec {
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            working_dir: expand_home(&record.working_dir).display().to_string(),
+            log_file,
+            initial_message: request.initial_message.clone(),
+        })?;
+        sessions.push(serde_json::to_value(&record)?);
+        if let Err(error) = self.write_raw_json_value(&state) {
+            let _ = runtime.kill_session(&record.tmux_session);
+            return Err(error);
+        }
         Ok(record)
     }
 
@@ -259,6 +208,49 @@ impl SessionStore {
         }))
     }
 
+    pub fn send_core_input_with_runtime(
+        &self,
+        session_id: &str,
+        request: SendCoreInputRequest,
+        runtime: &TmuxRuntime,
+    ) -> Result<Option<CoreInputResult>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
+        let node = json_text(session.get("node")).unwrap_or_else(default_node);
+        ensure_runtime_local_node(&node)?;
+        let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let mut delivered = false;
+        if normalized_status(&status) != "stopped" {
+            delivered = session_runtime.send_input(&tmux_session, &request.text)?;
+            let now = now_rfc3339();
+            if delivered {
+                session.insert("last_activity".to_owned(), Value::String(now));
+            } else {
+                status = "stopped".to_owned();
+                session.insert("status".to_owned(), Value::String(status.clone()));
+                session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+                session.insert("last_activity".to_owned(), Value::String(now));
+            }
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(Some(CoreInputResult {
+            ok: true,
+            session_id: session_id.to_owned(),
+            delivered,
+            delivery_mode: request.delivery_mode,
+            notify_after_seconds: request.notify_after_seconds,
+            status,
+        }))
+    }
+
     pub fn retire_core_session(
         &self,
         session_id: &str,
@@ -285,6 +277,47 @@ impl SessionStore {
         if let Some(log_file) = json_text(session.get("log_file")) {
             append_log_line(&expand_home(&log_file), "[sm-rust] fixture session retired")?;
         }
+        self.write_raw_json_value(&state)?;
+        Ok(CoreRetireOutcome::Retired(CoreRetireResult {
+            ok: true,
+            session_id: session_id.to_owned(),
+            status: "killed".to_owned(),
+        }))
+    }
+
+    pub fn retire_core_session_with_runtime(
+        &self,
+        session_id: &str,
+        requester_session_id: Option<&str>,
+        runtime: &TmuxRuntime,
+    ) -> Result<CoreRetireOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(CoreRetireOutcome::NotFound);
+        };
+        if let Some(requester_session_id) = requester_session_id {
+            if !requester_session_id.is_empty()
+                && json_text(session.get("parent_session_id")).as_deref()
+                    != Some(requester_session_id)
+            {
+                return Ok(CoreRetireOutcome::NotChild);
+            }
+        }
+        let node = json_text(session.get("node")).unwrap_or_else(default_node);
+        if !is_primary_node(&node) {
+            return Ok(CoreRetireOutcome::UnsupportedNode(node));
+        }
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let _ = session_runtime.kill_session(&tmux_session)?;
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
         self.write_raw_json_value(&state)?;
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
             ok: true,
@@ -405,6 +438,121 @@ impl SessionStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
     }
+
+    fn build_core_session_record(
+        &self,
+        sessions: &[Value],
+        request: &CreateCoreSessionRequest,
+        log_dir: Option<&Path>,
+        runtime_backed: bool,
+        tmux_socket_name: Option<&str>,
+    ) -> Result<SessionRecord> {
+        let session_id = request
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(generate_session_id);
+        if sessions
+            .iter()
+            .any(|value| value.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
+        {
+            anyhow::bail!("session already exists: {session_id}");
+        }
+        let parent_session = request.parent_session_id.as_deref().and_then(|parent_id| {
+            sessions
+                .iter()
+                .find(|value| value.get("id").and_then(Value::as_str) == Some(parent_id))
+        });
+        let parent_working_dir =
+            parent_session.and_then(|value| json_text(value.get("working_dir")));
+        let parent_node = parent_session.and_then(|value| json_text(value.get("node")));
+        let provider = request
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("claude")
+            .to_owned();
+        let name = request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{provider}-{session_id}"));
+        let working_dir = request
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(parent_working_dir.as_deref())
+            .unwrap_or(".")
+            .to_owned();
+        let node = request
+            .node
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(parent_node.as_deref())
+            .unwrap_or("primary")
+            .to_owned();
+        let now = now_rfc3339();
+        let log_file = core_log_file_path(&self.state_file, log_dir, &session_id);
+        Ok(SessionRecord {
+            id: session_id.clone(),
+            name,
+            working_dir,
+            tmux_session: if runtime_backed {
+                core_tmux_session_name(&provider, &session_id)
+            } else {
+                format!("sm-rust-{session_id}")
+            },
+            tmux_socket_name: tmux_socket_name.map(ToOwned::to_owned),
+            node,
+            provider,
+            log_file: Some(log_file.display().to_string()),
+            provider_resume_id: None,
+            transcript_path: None,
+            codex_thread_id: None,
+            forked_from_session_id: None,
+            forked_from_provider_resume_id: None,
+            forked_provider_resume_id: None,
+            forked_at: None,
+            forked_by_session_id: None,
+            friendly_name: request.name.clone(),
+            friendly_name_is_explicit: true,
+            friendly_name_updated_at_ns: None,
+            native_title: None,
+            native_title_updated_at_ns: None,
+            native_title_source_mtime_ns: None,
+            telegram_chat_id: None,
+            telegram_thread_id: None,
+            telegram_topic_id: None,
+            telegram_root_msg_id: None,
+            current_task: None,
+            git_remote_url: None,
+            parent_session_id: request.parent_session_id.clone(),
+            last_handoff_path: None,
+            agent_status_text: None,
+            agent_status_at: None,
+            agent_task_completed_at: None,
+            completed_at: None,
+            stopped_at: None,
+            is_em: false,
+            role: None,
+            status: "running".to_owned(),
+            created_at: now.clone(),
+            last_activity: now,
+            last_tool_call: None,
+            last_tool_name: None,
+            tokens_used: 0,
+            context_monitor_enabled: false,
+            aliases: Vec::new(),
+            pending_adoption_proposals: Vec::new(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -464,6 +612,7 @@ pub enum CoreRetireOutcome {
     Retired(CoreRetireResult),
     NotFound,
     NotChild,
+    UnsupportedNode(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -542,6 +691,13 @@ fn core_log_file_path(state_file: &Path, log_dir: Option<&Path>, session_id: &st
     dir.join(format!("{safe_id}-{id_hash}.log"))
 }
 
+fn core_tmux_session_name(provider: &str, session_id: &str) -> String {
+    let safe_provider = sanitize_path_component(provider);
+    let safe_id = sanitize_path_component(session_id);
+    let id_hash = stable_session_id_hash(session_id);
+    format!("sm-rust-{safe_provider}-{safe_id}-{id_hash}")
+}
+
 fn sanitize_path_component(value: &str) -> String {
     let mut safe = value
         .chars()
@@ -583,6 +739,11 @@ fn now_rfc3339() -> String {
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
+    if path == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
     let Some(rest) = path.strip_prefix("~/") else {
         return PathBuf::from(path);
     };
@@ -1180,6 +1341,18 @@ fn default_node() -> String {
     "primary".to_owned()
 }
 
+pub fn is_primary_node(node: &str) -> bool {
+    let node = node.trim();
+    node.is_empty() || node == "primary"
+}
+
+fn ensure_runtime_local_node(node: &str) -> Result<()> {
+    if is_primary_node(node) {
+        return Ok(());
+    }
+    anyhow::bail!("Rust runtime does not support remote node {node}");
+}
+
 fn default_provider() -> String {
     "claude".to_owned()
 }
@@ -1209,6 +1382,17 @@ fn normalize_role(role: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_home_handles_bare_home_and_home_relative_paths() {
+        let Some(home) = env::var_os("HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/work"), home.join("work"));
+        assert_eq!(expand_home("/tmp/work"), PathBuf::from("/tmp/work"));
+    }
 
     fn session_record(status: &str) -> SessionRecord {
         SessionRecord {

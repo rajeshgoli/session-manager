@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
     pub mobile_terminal: MobileTerminalConfig,
+    pub tmux: TmuxConfig,
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
 }
@@ -132,6 +133,12 @@ pub struct MobileTerminalConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct TmuxConfig {
+    #[serde(default)]
+    pub socket_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
     pub secret: Option<String>,
@@ -142,7 +149,27 @@ pub struct RustCoreConfig {
     #[serde(default)]
     pub fixture_writes_enabled: bool,
     #[serde(default)]
+    pub runtime_enabled: bool,
+    #[serde(default)]
     pub log_dir: Option<String>,
+    #[serde(default)]
+    pub tmux_socket_name: Option<String>,
+    #[serde(default)]
+    pub runtime_command: Option<String>,
+    #[serde(default)]
+    pub runtime_prompt_mode: Option<String>,
+    #[serde(default)]
+    pub runtime_start_settle_ms: Option<u64>,
+    #[serde(default)]
+    pub send_keys_settle_ms: Option<f64>,
+    #[serde(default)]
+    pub send_keys_settle_max_ms: Option<f64>,
+    #[serde(default)]
+    pub send_keys_settle_per_ki_ms: Option<f64>,
+    #[serde(default)]
+    pub send_keys_settle_per_extra_line_ms: Option<f64>,
+    #[serde(default)]
+    pub send_keys_max_chunk_chars: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -156,6 +183,10 @@ struct RawConfig {
     #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
     #[serde(default)]
+    tmux: TmuxConfig,
+    #[serde(default)]
+    timeouts: RawTimeoutsConfig,
+    #[serde(default)]
     rust_shadow: RustShadowConfig,
     #[serde(default)]
     rust_core: RustCoreConfig,
@@ -163,13 +194,38 @@ struct RawConfig {
 
 impl From<RawConfig> for AppConfig {
     fn from(raw: RawConfig) -> Self {
+        let mut rust_core = raw.rust_core;
+        if trimmed(&rust_core.tmux_socket_name).is_none() {
+            rust_core.tmux_socket_name = trimmed(&raw.tmux.socket_name);
+        }
+        let tmux_timeouts = raw.timeouts.tmux;
+        if rust_core.send_keys_settle_ms.is_none() {
+            rust_core.send_keys_settle_ms =
+                seconds_to_millis(tmux_timeouts.send_keys_settle_seconds);
+        }
+        if rust_core.send_keys_settle_max_ms.is_none() {
+            rust_core.send_keys_settle_max_ms =
+                seconds_to_millis(tmux_timeouts.send_keys_settle_max_seconds);
+        }
+        if rust_core.send_keys_settle_per_ki_ms.is_none() {
+            rust_core.send_keys_settle_per_ki_ms =
+                seconds_to_millis(tmux_timeouts.send_keys_settle_per_ki_chars);
+        }
+        if rust_core.send_keys_settle_per_extra_line_ms.is_none() {
+            rust_core.send_keys_settle_per_extra_line_ms =
+                seconds_to_millis(tmux_timeouts.send_keys_settle_per_extra_line);
+        }
+        if rust_core.send_keys_max_chunk_chars.is_none() {
+            rust_core.send_keys_max_chunk_chars = tmux_timeouts.send_keys_max_chunk_chars;
+        }
         Self {
             paths: raw.paths,
             google_auth: raw.auth.google,
             external_access: raw.external_access,
             mobile_terminal: raw.mobile_terminal,
+            tmux: raw.tmux,
             rust_shadow: raw.rust_shadow,
-            rust_core: raw.rust_core,
+            rust_core,
         }
     }
 }
@@ -178,6 +234,26 @@ impl From<RawConfig> for AppConfig {
 struct RawAuthConfig {
     #[serde(default)]
     google: GoogleAuthConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTimeoutsConfig {
+    #[serde(default)]
+    tmux: RawTmuxTimeoutsConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTmuxTimeoutsConfig {
+    #[serde(default)]
+    send_keys_settle_seconds: Option<f64>,
+    #[serde(default)]
+    send_keys_settle_max_seconds: Option<f64>,
+    #[serde(default)]
+    send_keys_settle_per_ki_chars: Option<f64>,
+    #[serde(default)]
+    send_keys_settle_per_extra_line: Option<f64>,
+    #[serde(default)]
+    send_keys_max_chunk_chars: Option<usize>,
 }
 
 pub fn trimmed(value: &Option<String>) -> Option<String> {
@@ -190,6 +266,12 @@ pub fn trimmed(value: &Option<String>) -> Option<String> {
 
 fn has_text(value: &Option<String>) -> bool {
     trimmed(value).is_some()
+}
+
+fn seconds_to_millis(value: Option<f64>) -> Option<f64> {
+    value
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| seconds * 1000.0)
 }
 
 fn load_env_file(path: &Path) -> Result<BTreeMap<String, String>> {

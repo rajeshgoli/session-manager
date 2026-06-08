@@ -27,8 +27,9 @@ use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{trimmed, AppConfig};
+use crate::runtime::TmuxRuntime;
 use crate::sessions::{
-    expand_home, AgentStatusRequest, ClientSessionResponse, CoreRetireOutcome,
+    expand_home, is_primary_node, AgentStatusRequest, ClientSessionResponse, CoreRetireOutcome,
     CreateCoreSessionRequest, SendCoreInputRequest, SessionResponse, SessionStore,
     SessionsEnvelope,
 };
@@ -228,9 +229,18 @@ async fn create_session(
     Json(payload): Json<CreateCoreSessionRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/sessions")?;
-    ensure_core_fixture_writes_enabled(&state)?;
+    ensure_core_writes_enabled(&state)?;
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
-    let session = state.session_store.create_core_session(payload, log_dir)?;
+    let session = if state.config.rust_core.runtime_enabled {
+        ensure_core_runtime_provider_supported(&payload)?;
+        ensure_core_runtime_request_node_supported(&state, &payload)?;
+        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        state
+            .session_store
+            .create_core_session_with_runtime(payload, log_dir, &runtime)?
+    } else {
+        state.session_store.create_core_session(payload, log_dir)?
+    };
     Ok(Json(SessionResponse::from(session)))
 }
 
@@ -285,14 +295,23 @@ async fn send_session_input(
         Some(peer_addr),
         &format!("/sessions/{session_id}/input"),
     )?;
-    ensure_core_fixture_writes_enabled(&state)?;
+    ensure_core_writes_enabled(&state)?;
     if payload.text.trim().is_empty() {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
             detail: "text is required".to_owned(),
         });
     }
-    let Some(result) = state.session_store.send_core_input(&session_id, payload)? else {
+    let result = if state.config.rust_core.runtime_enabled {
+        ensure_core_runtime_session_node_supported(&state, &session_id)?;
+        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        state
+            .session_store
+            .send_core_input_with_runtime(&session_id, payload, &runtime)?
+    } else {
+        state.session_store.send_core_input(&session_id, payload)?
+    };
+    let Some(result) = result else {
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(serde_json::to_value(result)?))
@@ -311,7 +330,7 @@ async fn set_agent_status(
         Some(peer_addr),
         &format!("/sessions/{session_id}/agent-status"),
     )?;
-    ensure_core_fixture_writes_enabled(&state)?;
+    ensure_core_writes_enabled(&state)?;
     let Some(result) = state.session_store.set_agent_status(&session_id, payload)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -331,16 +350,25 @@ async fn retire_session(
         Some(peer_addr),
         &format!("/sessions/{session_id}/kill"),
     )?;
-    ensure_core_fixture_writes_enabled(&state)?;
+    ensure_core_writes_enabled(&state)?;
     let requester_session_id = payload
         .requester_session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    match state
-        .session_store
-        .retire_core_session(&session_id, requester_session_id)?
-    {
+    let outcome = if state.config.rust_core.runtime_enabled {
+        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        state.session_store.retire_core_session_with_runtime(
+            &session_id,
+            requester_session_id,
+            &runtime,
+        )?
+    } else {
+        state
+            .session_store
+            .retire_core_session(&session_id, requester_session_id)?
+    };
+    match outcome {
         CoreRetireOutcome::Retired(result) => Ok(Json(serde_json::to_value(result)?)),
         CoreRetireOutcome::NotFound => Ok(Json(json!({
             "error": format!("Session {session_id} not found")
@@ -348,6 +376,10 @@ async fn retire_session(
         CoreRetireOutcome::NotChild => Ok(Json(json!({
             "error": format!("Cannot kill session {session_id} - not your child session")
         }))),
+        CoreRetireOutcome::UnsupportedNode(node) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Rust runtime does not support remote node {node}"),
+        }),
     }
 }
 
@@ -862,13 +894,76 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn ensure_core_fixture_writes_enabled(state: &AppState) -> Result<(), ApiError> {
-    if state.config.rust_core.fixture_writes_enabled {
+fn ensure_core_writes_enabled(state: &AppState) -> Result<(), ApiError> {
+    if state.config.rust_core.fixture_writes_enabled || state.config.rust_core.runtime_enabled {
         return Ok(());
     }
     Err(ApiError::Status {
         status: StatusCode::SERVICE_UNAVAILABLE,
-        detail: "Rust core fixture writes are disabled".to_owned(),
+        detail: "Rust core writes are disabled".to_owned(),
+    })
+}
+
+fn ensure_core_runtime_provider_supported(
+    payload: &CreateCoreSessionRequest,
+) -> Result<(), ApiError> {
+    let provider = payload
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("claude");
+    if provider == "claude" {
+        return Ok(());
+    }
+    Err(ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: format!("Rust runtime does not support provider {provider}"),
+    })
+}
+
+fn ensure_core_runtime_request_node_supported(
+    state: &AppState,
+    payload: &CreateCoreSessionRequest,
+) -> Result<(), ApiError> {
+    if let Some(node) = payload
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return ensure_core_runtime_node_supported(node);
+    }
+    if let Some(parent_session_id) = payload
+        .parent_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(parent) = state.session_store.get_session(parent_session_id)? {
+            return ensure_core_runtime_node_supported(&parent.node);
+        }
+    }
+    ensure_core_runtime_node_supported("primary")
+}
+
+fn ensure_core_runtime_session_node_supported(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), ApiError> {
+    let Some(session) = state.session_store.get_session(session_id)? else {
+        return Ok(());
+    };
+    ensure_core_runtime_node_supported(&session.node)
+}
+
+fn ensure_core_runtime_node_supported(node: &str) -> Result<(), ApiError> {
+    if is_primary_node(node) {
+        return Ok(());
+    }
+    Err(ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: format!("Rust runtime does not support remote node {node}"),
     })
 }
 
