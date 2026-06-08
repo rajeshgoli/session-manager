@@ -396,6 +396,76 @@ async fn shadow_http_preserves_python_auth_denial_for_protected_reads() {
 }
 
 #[tokio::test]
+async fn shadow_http_treats_auth_session_as_status_only() {
+    let app = router(AppState::new(AppConfig {
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            client_id: Some("web-client".to_owned()),
+            client_secret: Some("web-secret".to_owned()),
+            redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+            allowlist_emails: vec!["user@example.com".to_owned()],
+            session_cookie_secret: Some("cookie-secret".to_owned()),
+            ..GoogleAuthConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/auth/session",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"authenticated\":true}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_does_not_treat_static_sessions_route_as_session_id() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/context-monitor",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"enabled\":true}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "unsupported");
+    assert_eq!(payload["comparison"], "not_compared");
+    assert_eq!(payload["predicted_status"], Value::Null);
+}
+
+#[tokio::test]
 async fn auth_session_reports_local_bypass_for_localhost_when_auth_is_misconfigured() {
     let app = router(AppState::new(AppConfig {
         google_auth: GoogleAuthConfig {

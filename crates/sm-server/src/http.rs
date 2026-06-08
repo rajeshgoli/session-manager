@@ -439,9 +439,13 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
-        "/auth/session" => Some(serde_json::to_vec(&shadow_auth_session_response(
-            &state.config,
-        ))?),
+        "/auth/session" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         "/client/bootstrap" => Some(serde_json::to_vec(&shadow_client_bootstrap_response(
             &state.config,
         ))?),
@@ -480,6 +484,10 @@ fn shadow_predict_session_read(
     path: &str,
     query_string: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
+    if is_static_sessions_path(path) {
+        return Ok(None);
+    }
+
     if let Some(session_id) = path
         .strip_prefix("/client/sessions/")
         .filter(|value| !value.contains('/'))
@@ -549,25 +557,6 @@ fn shadow_predict_session_read(
     Ok(None)
 }
 
-fn shadow_auth_session_response(config: &AppConfig) -> AuthSessionResponse {
-    let auth = &config.google_auth;
-    if !auth.requested() {
-        return AuthSessionResponse::disabled_bypass();
-    }
-    if !auth.ready() {
-        return AuthSessionResponse::misconfigured();
-    }
-    AuthSessionResponse {
-        enabled: true,
-        authenticated: false,
-        bypass: false,
-        email: None,
-        name: None,
-        auth_type: None,
-        error: None,
-    }
-}
-
 fn shadow_client_bootstrap_response(config: &AppConfig) -> ClientBootstrapResponse {
     let auth = &config.google_auth;
     let external = &config.external_access;
@@ -594,6 +583,17 @@ fn shadow_client_bootstrap_response(config: &AppConfig) -> ClientBootstrapRespon
             preferred_action: "details",
         },
     }
+}
+
+fn is_static_sessions_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/sessions/context-monitor"
+            | "/sessions/create"
+            | "/sessions/input-batch"
+            | "/sessions/spawn"
+            | "/sessions/review"
+    )
 }
 
 fn is_retained_write_surface(method: &str, path: &str) -> bool {
