@@ -62,6 +62,7 @@ class RustShadowMiddleware:
         shadow_config = (config or {}).get("rust_shadow") or {}
         self.enabled = bool(shadow_config.get("enabled", False))
         self.endpoint = str(shadow_config.get("endpoint") or DEFAULT_SHADOW_ENDPOINT)
+        self.secret = str(shadow_config.get("secret") or "")
         self.ledger_path = Path(
             str(shadow_config.get("ledger_path") or DEFAULT_LEDGER_PATH)
         ).expanduser()
@@ -188,8 +189,11 @@ class RustShadowMiddleware:
             "python_body_sha256": envelope["python_response"]["body_sha256"],
         }
         try:
+            headers = {}
+            if self.secret:
+                headers["x-sm-rust-shadow-secret"] = self.secret
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(self.endpoint, json=envelope)
+                response = await client.post(self.endpoint, json=envelope, headers=headers)
             record["rust_http_status"] = response.status_code
             try:
                 record["rust_result"] = response.json()

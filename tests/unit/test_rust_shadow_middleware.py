@@ -32,14 +32,28 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def post(self, endpoint, json):
-        self.calls.append({"endpoint": endpoint, "json": json, "timeout": self.timeout})
+    async def post(self, endpoint, json, headers=None):
+        self.calls.append(
+            {
+                "endpoint": endpoint,
+                "json": json,
+                "headers": headers or {},
+                "timeout": self.timeout,
+            }
+        )
         return _FakeShadowResponse()
 
 
 class _FailingAsyncClient(_FakeAsyncClient):
-    async def post(self, endpoint, json):
-        self.calls.append({"endpoint": endpoint, "json": json, "timeout": self.timeout})
+    async def post(self, endpoint, json, headers=None):
+        self.calls.append(
+            {
+                "endpoint": endpoint,
+                "json": json,
+                "headers": headers or {},
+                "timeout": self.timeout,
+            }
+        )
         raise RuntimeError("rust shadow offline")
 
 
@@ -93,6 +107,21 @@ def test_rust_shadow_posts_sanitized_envelope_and_writes_ledger(tmp_path, monkey
     assert ledger["method"] == "GET"
     assert ledger["path"] == "/health"
     assert ledger["rust_result"]["comparison"] == "match"
+
+
+def test_rust_shadow_sends_configured_secret_only_to_shadow_endpoint(tmp_path, monkeypatch):
+    _FakeAsyncClient.calls.clear()
+    monkeypatch.setattr("src.rust_shadow.httpx.AsyncClient", _FakeAsyncClient)
+    app = create_app(config=_shadow_config(tmp_path, secret="shared-shadow-secret"))
+
+    response = TestClient(app).get("/health")
+
+    assert response.status_code == 200
+    assert _FakeAsyncClient.calls[0]["headers"] == {
+        "x-sm-rust-shadow-secret": "shared-shadow-secret"
+    }
+    ledger_text = (tmp_path / "rust_shadow.jsonl").read_text(encoding="utf-8")
+    assert "shared-shadow-secret" not in ledger_text
 
 
 def test_rust_shadow_failure_keeps_authoritative_response_and_records_error(

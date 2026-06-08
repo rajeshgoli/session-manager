@@ -145,6 +145,8 @@ Enable Python shadowing in local config only:
 rust_shadow:
   enabled: true
   endpoint: "http://127.0.0.1:8421/__shadow/http"
+  # Required when Rust is not reached over loopback, optional for localhost.
+  secret: "local-dev-shared-secret"
   ledger_path: "~/.local/share/claude-sessions/rust_shadow.jsonl"
   timeout_seconds: 0.5
   max_body_bytes: 65536
@@ -154,6 +156,11 @@ The ledger is JSONL. Each row includes method/path/query, Python status and body
 hash, Rust comparison result, Rust support status, latency, and any shadow
 transport error. Raw bodies, cookies, bearer tokens, worker secrets, hook
 secrets, and device signatures are not written to the ledger.
+
+The Rust shadow endpoint accepts loopback callers by default. If Rust is behind
+a proxy or bound on a non-local interface, configure the same `rust_shadow.secret`
+for Python and Rust so the comparator rejects unauthenticated remote envelopes
+before reading state.
 
 Current Rust shadow support is intentionally side-effect-free:
 

@@ -12,6 +12,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use sm_server::config::RustShadowConfig;
 use sm_server::{
     config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig},
     http::{router, AppState},
@@ -42,17 +43,37 @@ async fn get_response(app: axum::Router, uri: &str) -> (StatusCode, HeaderMap, V
 }
 
 async fn post_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, Value) {
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
-                .unwrap(),
-        )
-        .await
+    post_json_with_headers_and_peer(
+        app,
+        uri,
+        payload,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await
+}
+
+async fn post_json_with_headers_and_peer(
+    app: axum::Router,
+    uri: &str,
+    payload: Value,
+    headers: &[(&str, &str)],
+    peer_addr: Option<SocketAddr>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let mut request = builder
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
+    if let Some(peer_addr) = peer_addr {
+        request.extensions_mut().insert(ConnectInfo(peer_addr));
+    }
+    let response = app.oneshot(request).await.unwrap();
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap())
@@ -236,6 +257,74 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
         .as_str()
         .unwrap()
         .contains("never performs retained write side effects"));
+}
+
+#[tokio::test]
+async fn shadow_http_rejects_remote_without_shadow_secret() {
+    let app = router(AppState::new(AppConfig::default()));
+    let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+        &[],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Rust shadow endpoint requires local peer or shadow secret"
+    );
+}
+
+#[tokio::test]
+async fn shadow_http_allows_remote_with_configured_shadow_secret() {
+    let app = router(AppState::new(AppConfig {
+        rust_shadow: RustShadowConfig {
+            secret: Some("shared-shadow-secret".to_owned()),
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+        &[("x-sm-rust-shadow-secret", "shared-shadow-secret")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["comparison"], "match");
 }
 
 #[tokio::test]

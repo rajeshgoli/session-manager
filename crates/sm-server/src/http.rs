@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
+    body::to_bytes,
     extract::{ConnectInfo, Path, Query, Request, State},
     http::{
         header::{AUTHORIZATION, COOKIE, HOST},
@@ -32,6 +33,7 @@ use crate::sessions::{
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
+const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -267,8 +269,18 @@ async fn session_output(
 
 async fn shadow_http(
     State(state): State<Arc<AppState>>,
-    Json(envelope): Json<ShadowHttpEnvelope>,
+    request: Request,
 ) -> Result<Json<ShadowHttpResult>, ApiError> {
+    let headers = request.headers().clone();
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    ensure_shadow_allowed(&state.config, &headers, peer_addr)?;
+    let body = to_bytes(request.into_body(), SHADOW_ENVELOPE_MAX_BYTES)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to read shadow envelope: {error}"))?;
+    let envelope: ShadowHttpEnvelope = serde_json::from_slice(&body)?;
     Ok(Json(shadow_compare(&state, envelope)?))
 }
 
@@ -585,6 +597,47 @@ fn is_retained_write_surface(method: &str, path: &str) -> bool {
         return matches!(method, "POST" | "DELETE");
     }
     false
+}
+
+fn ensure_shadow_allowed(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> Result<(), ApiError> {
+    if peer_addr
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let expected = trimmed(&config.rust_shadow.secret);
+    let provided = headers
+        .get("x-sm-rust-shadow-secret")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(expected), Some(provided)) = (expected, provided) {
+        if constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+            return Ok(());
+        }
+    }
+
+    Err(ApiError::Auth {
+        status: StatusCode::FORBIDDEN,
+        detail: "Rust shadow endpoint requires local peer or shadow secret",
+        login_url: None,
+    })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 fn query_bool(query_string: &str, key: &str) -> bool {
