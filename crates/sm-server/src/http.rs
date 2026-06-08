@@ -356,6 +356,25 @@ fn shadow_compare(
         });
     }
 
+    if is_auth_denial_status(python_status) && is_protected_read_surface(&method, &path) {
+        return Ok(ShadowHttpResult {
+            schema_version: 1,
+            method,
+            path,
+            support_status: "python_auth_denial",
+            comparison: "status_match",
+            would_write: false,
+            python_status,
+            predicted_status: Some(python_status),
+            predicted_body_sha256: None,
+            body_sha256_match: None,
+            detail: Some(
+                "Python rejected the protected read before handler execution; shadow mode preserves the denial without reading state"
+                    .to_owned(),
+            ),
+        });
+    }
+
     let Some(prediction) =
         shadow_predict_read(state, &method, &path, &envelope.request.query_string)?
     else {
@@ -599,28 +618,52 @@ fn is_retained_write_surface(method: &str, path: &str) -> bool {
     false
 }
 
+fn is_auth_denial_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 503)
+}
+
+fn is_protected_read_surface(method: &str, path: &str) -> bool {
+    if method != "GET" {
+        return false;
+    }
+    path == "/events"
+        || path == "/events/state"
+        || path == "/sessions"
+        || path == "/client/sessions"
+        || path.starts_with("/sessions/")
+        || path.starts_with("/client/sessions/")
+}
+
 fn ensure_shadow_allowed(
     config: &AppConfig,
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
 ) -> Result<(), ApiError> {
-    if peer_addr
-        .map(|addr| addr.ip().is_loopback())
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
-
     let expected = trimmed(&config.rust_shadow.secret);
     let provided = headers
         .get("x-sm-rust-shadow-secret")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let (Some(expected), Some(provided)) = (expected, provided) {
-        if constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+    if let Some(expected) = expected {
+        if provided
+            .map(|provided| constant_time_eq(expected.as_bytes(), provided.as_bytes()))
+            .unwrap_or(false)
+        {
             return Ok(());
         }
+        return Err(ApiError::Auth {
+            status: StatusCode::FORBIDDEN,
+            detail: "Rust shadow endpoint requires local peer or shadow secret",
+            login_url: None,
+        });
+    }
+
+    if peer_addr
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false)
+    {
+        return Ok(());
     }
 
     Err(ApiError::Auth {

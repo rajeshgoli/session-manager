@@ -328,6 +328,74 @@ async fn shadow_http_allows_remote_with_configured_shadow_secret() {
 }
 
 #[tokio::test]
+async fn shadow_http_requires_configured_secret_even_from_loopback() {
+    let app = router(AppState::new(AppConfig {
+        rust_shadow: RustShadowConfig {
+            secret: Some("shared-shadow-secret".to_owned()),
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/health",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Rust shadow endpoint requires local peer or shadow secret"
+    );
+}
+
+#[tokio::test]
+async fn shadow_http_preserves_python_auth_denial_for_protected_reads() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 401,
+                "body_sha256": sha256_hex(b"{\"detail\":\"Authentication required\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "python_auth_denial");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 401);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+}
+
+#[tokio::test]
 async fn auth_session_reports_local_bypass_for_localhost_when_auth_is_misconfigured() {
     let app = router(AppState::new(AppConfig {
         google_auth: GoogleAuthConfig {

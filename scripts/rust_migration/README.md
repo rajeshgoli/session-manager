@@ -157,10 +157,11 @@ hash, Rust comparison result, Rust support status, latency, and any shadow
 transport error. Raw bodies, cookies, bearer tokens, worker secrets, hook
 secrets, and device signatures are not written to the ledger.
 
-The Rust shadow endpoint accepts loopback callers by default. If Rust is behind
-a proxy or bound on a non-local interface, configure the same `rust_shadow.secret`
-for Python and Rust so the comparator rejects unauthenticated remote envelopes
-before reading state.
+The Rust shadow endpoint accepts loopback callers by default only when no
+`rust_shadow.secret` is configured. If Rust is behind a proxy, tunnel, or bound
+on a non-local interface, configure the same `rust_shadow.secret` for Python and
+Rust. Once configured, the secret is required even from loopback so local proxies
+cannot bypass it.
 
 Current Rust shadow support is intentionally side-effect-free:
 
