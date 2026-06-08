@@ -1,7 +1,7 @@
 use axum::{
     body::{to_bytes, Body},
     extract::ConnectInfo,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
 };
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -25,13 +25,19 @@ use std::{
 use tower::ServiceExt;
 
 async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let (status, _headers, body) = get_response(app, uri).await;
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn get_response(app: axum::Router, uri: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
     let response = app
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    (status, serde_json::from_slice(&body).unwrap())
+    (status, headers, body.to_vec())
 }
 
 async fn get_json_with_host(app: axum::Router, uri: &str, host: &str) -> (StatusCode, Value) {
@@ -268,6 +274,70 @@ async fn absent_routes_are_not_implemented() {
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload, json!({ "detail": "Not Found" }));
+}
+
+#[tokio::test]
+async fn events_state_returns_fallback_snapshot() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = get_json(app, "/events/state").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "tmux_client_event_version": 0,
+            "last_tmux_client_event": null
+        })
+    );
+}
+
+#[tokio::test]
+async fn events_stream_emits_hello_frame_with_sse_headers() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, headers, body) = get_response(app, "/events").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    assert_eq!(
+        headers
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok()),
+        Some("no")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "event: hello\ndata: {\"tmux_client_event_version\":0,\"last_tmux_client_event\":null}\n\n"
+    );
+}
+
+#[tokio::test]
+async fn events_state_rejects_public_host_when_google_auth_enabled() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) = get_json_with_host(app, "/events/state", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        payload,
+        json!({
+            "detail": "Authentication required",
+            "login_url": "/auth/google/login?next=%2Fevents%2Fstate"
+        })
+    );
 }
 
 #[tokio::test]

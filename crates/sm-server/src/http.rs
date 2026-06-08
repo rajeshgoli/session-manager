@@ -6,7 +6,7 @@ use axum::{
         header::{AUTHORIZATION, COOKIE, HOST},
         HeaderMap, StatusCode,
     },
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -51,6 +51,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
         .route("/client/bootstrap", get(client_bootstrap))
+        .route("/events/state", get(events_state))
+        .route("/events", get(events_stream))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/output", get(session_output))
@@ -157,6 +159,31 @@ async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBoot
             preferred_action: "details",
         },
     })
+}
+
+async fn events_state(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<EventStateResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    Ok(Json(event_state_payload()))
+}
+
+async fn events_stream(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let data = serde_json::to_string(&event_state_payload())?;
+    Ok((
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+            ("x-accel-buffering", "no"),
+        ],
+        format!("event: hello\ndata: {data}\n\n"),
+    )
+        .into_response())
 }
 
 async fn list_sessions(
@@ -538,6 +565,19 @@ struct SessionOutputQuery {
 struct SessionOutputResponse {
     session_id: String,
     output: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EventStateResponse {
+    tmux_client_event_version: i64,
+    last_tmux_client_event: Option<Value>,
+}
+
+fn event_state_payload() -> EventStateResponse {
+    EventStateResponse {
+        tmux_client_event_version: 0,
+        last_tmux_client_event: None,
+    }
 }
 
 #[derive(Serialize)]
