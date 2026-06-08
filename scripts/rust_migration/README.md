@@ -56,6 +56,8 @@ python -m scripts.rust_migration.contracts \
   --check-id http.health_detailed \
   --check-id http.auth_session \
   --check-id http.client_bootstrap \
+  --check-id http.events_state \
+  --check-id http.events_sse_hello \
   --check-id http.sessions \
   --check-id http.client_sessions \
   --check-id http.api_sessions_absent \
@@ -108,6 +110,8 @@ python -m scripts.rust_migration.baseline \
   --check-id http.health_detailed \
   --check-id http.auth_session \
   --check-id http.client_bootstrap \
+  --check-id http.events_state \
+  --check-id http.events_sse_hello \
   --check-id http.sessions \
   --check-id http.client_sessions \
   --check-id http.api_sessions_absent \

@@ -184,6 +184,10 @@ def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
     )
     assert checks["http.client_session_detail_fixture"].expected_json
     assert checks["http.session_output_fixture"].expected_json
+    assert any(
+        expectation.path == "/tmux_client_event_version" and expectation.value_type == "number"
+        for expectation in checks["http.events_state"].expected_json
+    )
 
 
 def test_python_target_does_not_run_rust_only_retirement_checks():

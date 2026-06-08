@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -6,7 +6,10 @@ use axum::{
         header::{AUTHORIZATION, COOKIE, HOST},
         HeaderMap, StatusCode,
     },
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Json, Router,
 };
@@ -14,6 +17,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use futures_util::stream::{self, StreamExt};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +55,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
         .route("/client/bootstrap", get(client_bootstrap))
+        .route("/events/state", get(events_state))
+        .route("/events", get(events_stream))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/output", get(session_output))
@@ -157,6 +163,36 @@ async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBoot
             preferred_action: "details",
         },
     })
+}
+
+async fn events_state(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<EventStateResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    Ok(Json(event_state_payload()))
+}
+
+async fn events_stream(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let data = serde_json::to_string(&event_state_payload())?;
+    let stream =
+        stream::once(
+            async move { Ok::<Event, Infallible>(Event::default().event("hello").data(data)) },
+        )
+        .chain(stream::pending());
+    Ok((
+        [("x-accel-buffering", "no")],
+        Sse::new(stream).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        ),
+    )
+        .into_response())
 }
 
 async fn list_sessions(
@@ -538,6 +574,19 @@ struct SessionOutputQuery {
 struct SessionOutputResponse {
     session_id: String,
     output: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EventStateResponse {
+    tmux_client_event_version: i64,
+    last_tmux_client_event: Option<Value>,
+}
+
+fn event_state_payload() -> EventStateResponse {
+    EventStateResponse {
+        tmux_client_event_version: 0,
+        last_tmux_client_event: None,
+    }
 }
 
 #[derive(Serialize)]

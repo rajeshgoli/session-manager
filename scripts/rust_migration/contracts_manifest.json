@@ -119,7 +119,8 @@
       "path": "/events/state",
       "expected_status": [200],
       "expected_json": [
-        {"path": "", "type": "object"}
+        {"path": "", "type": "object"},
+        {"path": "/tmux_client_event_version", "type": "number"}
       ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:71"
