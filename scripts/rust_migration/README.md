@@ -152,10 +152,15 @@ rust_shadow:
   max_body_bytes: 65536
 ```
 
-The ledger is JSONL. Each row includes method/path/query, Python status and body
-hash, Rust comparison result, Rust support status, latency, and any shadow
-transport error. Raw bodies, cookies, bearer tokens, worker secrets, hook
-secrets, and device signatures are not written to the ledger.
+The ledger is JSONL. Each row includes method/path, redacted query metadata,
+Python status and body hash, Rust comparison result, Rust support status,
+latency, and any shadow transport error. Raw request and response bodies are not
+forwarded or written to the ledger. Cookies, bearer tokens, worker secrets, hook
+secrets, device signatures, and sensitive query values such as OAuth
+`code`/`state` are omitted or redacted before the Rust envelope and ledger are
+written. Shadow mode preserves only query values currently needed for
+side-effect-free comparisons, such as `/sessions?include_stopped=...` and
+`/sessions/{id}/output?lines=...`.
 
 The Rust shadow endpoint accepts loopback callers by default only when no
 `rust_shadow.secret` is configured. If Rust is behind a proxy, tunnel, or bound
