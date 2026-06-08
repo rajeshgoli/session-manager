@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode
 
 import httpx
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -41,11 +41,7 @@ SAFE_HEADER_NAMES = {
     "x-sm-shadow-mode",
 }
 
-BODY_CONTENT_TYPE_PREFIXES = (
-    "application/json",
-    "application/x-www-form-urlencoded",
-    "text/",
-)
+REDACTED_QUERY_VALUE = "REDACTED"
 
 
 class RustShadowMiddleware:
@@ -85,7 +81,7 @@ class RustShadowMiddleware:
         path = str(scope.get("path") or "")
         query_string = _decode_bytes(scope.get("query_string", b""))
         request_headers = _headers_from_scope(scope)
-        request_capture = _CaptureBuffer(self.max_body_bytes)
+        request_capture = _CaptureBuffer(0)
         response_capture = _CaptureBuffer(self.max_body_bytes)
         response_status: Optional[int] = None
         response_headers: dict[str, str] = {}
@@ -144,9 +140,11 @@ class RustShadowMiddleware:
         ):
             return None
 
-        body_content_type = request_headers.get("content-type", "")
-        include_request_body = _is_shadowable_body_content_type(body_content_type)
-        request_body = request_capture.bytes if include_request_body else b""
+        sanitized_query_string = _sanitize_query_string(
+            method=method,
+            path=path,
+            query_string=query_string,
+        )
 
         return {
             "schema_version": 1,
@@ -154,14 +152,11 @@ class RustShadowMiddleware:
             "request": {
                 "method": method,
                 "path": path,
-                "query_string": query_string,
+                "query_string": sanitized_query_string,
                 "headers": _sanitize_headers(request_headers),
                 "body_sha256": request_capture.sha256_hex,
-                "body_base64": base64.b64encode(request_body).decode("ascii")
-                if request_body and not request_capture.truncated
-                else None,
                 "body_truncated": request_capture.truncated,
-                "body_omitted": not include_request_body or request_capture.truncated,
+                "body_omitted": True,
             },
             "python_response": {
                 "status": response_status,
@@ -269,16 +264,6 @@ def _is_shadowable_http(
     return True
 
 
-def _is_shadowable_body_content_type(content_type: str) -> bool:
-    if not content_type:
-        return False
-    normalized = content_type.split(";", 1)[0].strip().lower()
-    return any(
-        normalized == prefix.rstrip("/") or normalized.startswith(prefix)
-        for prefix in BODY_CONTENT_TYPE_PREFIXES
-    )
-
-
 def _headers_from_scope(scope: Scope) -> dict[str, str]:
     headers: dict[str, str] = {}
     for raw_name, raw_value in scope.get("headers", []):
@@ -306,6 +291,30 @@ def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
         if normalized in SAFE_HEADER_NAMES:
             sanitized[normalized] = value[:512]
     return sanitized
+
+
+def _sanitize_query_string(*, method: str, path: str, query_string: str) -> str:
+    if not query_string:
+        return ""
+
+    sanitized_pairs: list[tuple[str, str]] = []
+    for key, value in parse_qsl(query_string, keep_blank_values=True):
+        sanitized_pairs.append((key, _sanitize_query_value(method, path, key, value)))
+    return urlencode(sanitized_pairs)
+
+
+def _sanitize_query_value(method: str, path: str, key: str, value: str) -> str:
+    if method != "GET":
+        return REDACTED_QUERY_VALUE
+    if path == "/sessions" and key == "include_stopped":
+        if value in {"1", "true", "True", "TRUE", "yes", "on"}:
+            return value
+        return REDACTED_QUERY_VALUE
+    if path.startswith("/sessions/") and path.endswith("/output") and key == "lines":
+        if value.isascii() and value.isdigit():
+            return value
+        return REDACTED_QUERY_VALUE
+    return REDACTED_QUERY_VALUE
 
 
 def _decode_bytes(value: bytes | str) -> str:
