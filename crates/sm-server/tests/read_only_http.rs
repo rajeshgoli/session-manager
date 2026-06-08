@@ -406,6 +406,50 @@ async fn session_output_tails_fixture_log_file() {
 }
 
 #[tokio::test]
+async fn session_output_tails_large_log_file_from_end() {
+    let state_file = unique_temp_path();
+    let log_file = unique_temp_path();
+    fs::write(
+        &log_file,
+        format!(
+            "{}\nlast retained line\nfinal retained line\n",
+            "x".repeat(2 * 1024 * 1024)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "largeout",
+                    "name": "claude-largeout",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-largeout",
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": log_file.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/largeout/output?lines=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["output"],
+        "last retained line\nfinal retained line\n"
+    );
+}
+
+#[tokio::test]
 async fn sessions_missing_state_file_returns_empty_list() {
     let state_file = unique_temp_path();
     let app = router(AppState::new(config_with_state_file(&state_file)));

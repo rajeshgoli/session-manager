@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    env, fs,
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -10,6 +11,9 @@ use serde_json::{json, Value};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
 const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
+const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
+const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
+const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -74,7 +78,7 @@ impl SessionStore {
             return Ok(None);
         };
         let log_file = expand_home(log_file);
-        let content = match fs::read_to_string(&log_file) {
+        let output = match read_tail_lines(&log_file, lines) {
             Ok(content) => content,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -82,7 +86,7 @@ impl SessionStore {
                     .with_context(|| format!("failed to read session log {}", log_file.display()))
             }
         };
-        Ok(Some(tail_lines(&content, lines)))
+        Ok(Some(output))
     }
 
     fn load_snapshot(&self) -> Result<StateSnapshot> {
@@ -700,6 +704,29 @@ fn tail_lines(content: &str, lines: usize) -> String {
         output.push('\n');
     }
     output
+}
+
+fn read_tail_lines(path: &Path, lines: usize) -> io::Result<String> {
+    if lines == 0 {
+        return Ok(String::new());
+    }
+
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(String::new());
+    }
+
+    let read_len = file_len.min(output_tail_byte_limit(lines));
+    file.seek(SeekFrom::End(-(read_len as i64)))?;
+    let mut bytes = Vec::with_capacity(read_len as usize);
+    file.take(read_len).read_to_end(&mut bytes)?;
+    Ok(tail_lines(&String::from_utf8_lossy(&bytes), lines))
+}
+
+fn output_tail_byte_limit(lines: usize) -> u64 {
+    let requested = (lines as u64).saturating_mul(OUTPUT_TAIL_BYTES_PER_LINE);
+    requested.clamp(MIN_OUTPUT_TAIL_BYTES, MAX_OUTPUT_TAIL_BYTES)
 }
 
 fn default_node() -> String {
