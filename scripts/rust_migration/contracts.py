@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -64,6 +65,7 @@ class ContractCheck:
     expected_output_contains_any: tuple[str, ...] = ()
     expected_output_contains_all: tuple[str, ...] = ()
     request_headers: tuple[tuple[str, str], ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
     body: Any = None
     read_mode: str = "bytes"
     read_bytes: int = 65536
@@ -96,6 +98,7 @@ class ContractCheck:
                 (str(key), str(value))
                 for key, value in raw.get("request_headers", {}).items()
             ),
+            env=tuple((str(key), str(value)) for key, value in raw.get("env", {}).items()),
             body=raw.get("body"),
             read_mode=str(raw.get("read_mode", "bytes")),
             read_bytes=int(raw.get("read_bytes", 65536)),
@@ -219,7 +222,7 @@ def run_checks(
         if check.surface == "http":
             results.append(_run_http_check(check, base_url or "", fixture_values, timeout_seconds))
         elif check.surface == "cli":
-            results.append(_run_cli_check(check, sm_binary, timeout_seconds))
+            results.append(_run_cli_check(check, sm_binary, fixture_values, timeout_seconds))
         else:
             results.append(_result(check, "skipped", None, f"unsupported surface {check.surface}"))
     return results
@@ -344,14 +347,30 @@ def _run_http_check(
     )
 
 
-def _run_cli_check(check: ContractCheck, sm_binary: str, timeout_seconds: float) -> CheckResult:
+def _run_cli_check(
+    check: ContractCheck,
+    sm_binary: str,
+    fixtures: dict[str, str],
+    timeout_seconds: float,
+) -> CheckResult:
     start = time.perf_counter()
+    command = tuple(str(value) for value in _render_template(list(check.command), fixtures))
+    env = None
+    if check.env:
+        env = dict(os.environ)
+        env.update(
+            {
+                key: str(_render_template(value, fixtures))
+                for key, value in check.env
+            }
+        )
     try:
         completed = subprocess.run(
-            [sm_binary, *check.command],
+            [sm_binary, *command],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
             timeout=timeout_seconds,
             check=False,
         )
@@ -359,18 +378,24 @@ def _run_cli_check(check: ContractCheck, sm_binary: str, timeout_seconds: float)
         return _result(check, "failed", _elapsed_ms(start), f"timed out after {timeout_seconds}s")
     output = (completed.stdout + completed.stderr).lower()
     exit_ok = completed.returncode in check.expected_exit
-    contains_any = not check.expected_output_contains_any or any(
-        needle.lower() in output for needle in check.expected_output_contains_any
+    expected_any = tuple(
+        str(value)
+        for value in _render_template(list(check.expected_output_contains_any), fixtures)
     )
+    expected_all = tuple(
+        str(value)
+        for value in _render_template(list(check.expected_output_contains_all), fixtures)
+    )
+    contains_any = not expected_any or any(needle.lower() in output for needle in expected_any)
     missing_all = [
-        needle for needle in check.expected_output_contains_all if needle.lower() not in output
+        needle for needle in expected_all if needle.lower() not in output
     ]
     if exit_ok and contains_any and not missing_all:
         return _result(check, "passed", _elapsed_ms(start), f"exit {completed.returncode}")
 
     detail = f"exit {completed.returncode}; expected {list(check.expected_exit)}"
-    if check.expected_output_contains_any and not contains_any:
-        detail += f"; missing one of {list(check.expected_output_contains_any)}"
+    if expected_any and not contains_any:
+        detail += f"; missing one of {list(expected_any)}"
     if missing_all:
         detail += f"; missing required output {missing_all}"
     return _result(check, "failed", _elapsed_ms(start), detail)

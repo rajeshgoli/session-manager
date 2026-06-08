@@ -7,14 +7,14 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use futures_util::StreamExt as _;
+use futures_util::{future::join, StreamExt as _};
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use sm_server::config::RustShadowConfig;
 use sm_server::{
-    config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig},
+    config::{AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig, RustCoreConfig},
     http::{router, AppState},
 };
 use std::{
@@ -831,6 +831,281 @@ async fn session_output_tails_fixture_log_file() {
         payload["output"],
         "fixture log line 2\nfixture log line 3\n"
     );
+}
+
+#[tokio::test]
+async fn fixture_core_writes_are_disabled_by_default() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "rustcore",
+            "name": "rust-core",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Rust core fixture writes are disabled" })
+    );
+}
+
+#[tokio::test]
+async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "rustcore",
+            "name": "rust-core",
+            "working_dir": "/repo",
+            "provider": "claude",
+            "initial_message": "initial fixture prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "rustcore");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["friendly_name"], "rust-core");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "rustchild",
+            "name": "rust-child",
+            "parent_session_id": "rustcore",
+            "provider": "claude",
+            "initial_message": "child fixture prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "rustchild");
+    assert_eq!(payload["parent_session_id"], "rustcore");
+    assert_eq!(payload["working_dir"], "/repo");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/rustcore/input",
+        json!({
+            "text": "hello from rust fixture",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    assert_eq!(payload["delivery_mode"], "sequential");
+    assert_eq!(payload["notify_after_seconds"], Value::Null);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/rustcore/input",
+        json!({
+            "text": "urgent fixture note",
+            "delivery_mode": "urgent",
+            "notify_after_seconds": 7
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    assert_eq!(payload["delivery_mode"], "urgent");
+    assert_eq!(payload["notify_after_seconds"], 7);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/rustcore/agent-status",
+        json!({
+            "text": "writing Rust status"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "updated");
+    assert_eq!(payload["agent_status_text"], "writing Rust status");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/rustcore/output?lines=4").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("hello from rust fixture"));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/rustcore").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["agent_status_text"], "writing Rust status");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/rustchild/kill",
+        json!({ "requester_session_id": "otherparent" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["error"],
+        "Cannot kill session rustchild - not your child session"
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/rustchild").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "running");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/rustchild/kill",
+        json!({ "requester_session_id": "rustcore" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["session_id"], "rustchild");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/rustchild").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "stopped");
+
+    let (status, payload) = post_json(app.clone(), "/sessions/missingcore/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"], "Session missingcore not found");
+
+    let (status, payload) = post_json(app.clone(), "/sessions/rustcore/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+
+    let (status, payload) = get_json(app, "/sessions?include_stopped=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["sessions"][0]["id"], "rustcore");
+    assert_eq!(payload["sessions"][0]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn fixture_core_writes_preserve_concurrent_session_updates() {
+    let state_file = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(unique_temp_path().display().to_string()),
+        },
+        ..AppConfig::default()
+    }));
+
+    let first = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "rustcore1",
+            "name": "rust-core-1",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    );
+    let second = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "rustcore2",
+            "name": "rust-core-2",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    );
+
+    let ((status1, _payload1), (status2, _payload2)) = join(first, second).await;
+    assert_eq!(status1, StatusCode::OK);
+    assert_eq!(status2, StatusCode::OK);
+
+    let (status, payload) = get_json(app, "/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    let mut ids = payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| session["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec!["rustcore1", "rustcore2"]);
+}
+
+#[tokio::test]
+async fn fixture_core_logs_do_not_collide_for_sanitized_session_ids() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, _first) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "ab",
+            "name": "rust-core-ab",
+            "initial_message": "first prompt only"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _second) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "a/b",
+            "name": "rust-core-slash",
+            "initial_message": "second prompt only"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let log_files = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| session["log_file"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(log_files.len(), 2);
+    assert_ne!(log_files[0], log_files[1]);
+
+    let (status, payload) = get_json(app, "/sessions/ab/output?lines=10").await;
+    assert_eq!(status, StatusCode::OK);
+    let output = payload["output"].as_str().unwrap();
+    assert!(output.contains("first prompt only"));
+    assert!(!output.contains("second prompt only"));
 }
 
 #[tokio::test]

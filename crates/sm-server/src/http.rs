@@ -28,7 +28,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{trimmed, AppConfig};
 use crate::sessions::{
-    expand_home, ClientSessionResponse, SessionResponse, SessionStore, SessionsEnvelope,
+    expand_home, AgentStatusRequest, ClientSessionResponse, CoreRetireOutcome,
+    CreateCoreSessionRequest, SendCoreInputRequest, SessionResponse, SessionStore,
+    SessionsEnvelope,
 };
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
@@ -60,8 +62,14 @@ pub fn router(state: AppState) -> Router {
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
-        .route("/sessions", get(list_sessions))
+        .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}", get(get_session))
+        .route(
+            "/sessions/{session_id}/agent-status",
+            post(set_agent_status),
+        )
+        .route("/sessions/{session_id}/input", post(send_session_input))
+        .route("/sessions/{session_id}/kill", post(retire_session))
         .route("/sessions/{session_id}/output", get(session_output))
         .route("/client/sessions", get(list_client_sessions))
         .route("/client/sessions/{session_id}", get(get_client_session))
@@ -213,6 +221,19 @@ async fn list_sessions(
     Ok(Json(SessionsEnvelope::from(sessions)))
 }
 
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateCoreSessionRequest>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/sessions")?;
+    ensure_core_fixture_writes_enabled(&state)?;
+    let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
+    let session = state.session_store.create_core_session(payload, log_dir)?;
+    Ok(Json(SessionResponse::from(session)))
+}
+
 async fn list_client_sessions(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -249,6 +270,85 @@ async fn get_client_session(
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(ClientSessionResponse::from(session)))
+}
+
+async fn send_session_input(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SendCoreInputRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/input"),
+    )?;
+    ensure_core_fixture_writes_enabled(&state)?;
+    if payload.text.trim().is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "text is required".to_owned(),
+        });
+    }
+    let Some(result) = state.session_store.send_core_input(&session_id, payload)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    Ok(Json(serde_json::to_value(result)?))
+}
+
+async fn set_agent_status(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentStatusRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/agent-status"),
+    )?;
+    ensure_core_fixture_writes_enabled(&state)?;
+    let Some(result) = state.session_store.set_agent_status(&session_id, payload)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    Ok(Json(serde_json::to_value(result)?))
+}
+
+async fn retire_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<KillSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/kill"),
+    )?;
+    ensure_core_fixture_writes_enabled(&state)?;
+    let requester_session_id = payload
+        .requester_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match state
+        .session_store
+        .retire_core_session(&session_id, requester_session_id)?
+    {
+        CoreRetireOutcome::Retired(result) => Ok(Json(serde_json::to_value(result)?)),
+        CoreRetireOutcome::NotFound => Ok(Json(json!({
+            "error": format!("Session {session_id} not found")
+        }))),
+        CoreRetireOutcome::NotChild => Ok(Json(json!({
+            "error": format!("Cannot kill session {session_id} - not your child session")
+        }))),
+    }
 }
 
 async fn session_output(
@@ -713,6 +813,10 @@ fn sha256_hex(value: &[u8]) -> String {
 enum ApiError {
     Internal(anyhow::Error),
     NotFound(&'static str),
+    Status {
+        status: StatusCode,
+        detail: String,
+    },
     Auth {
         status: StatusCode,
         detail: &'static str,
@@ -740,6 +844,9 @@ impl IntoResponse for ApiError {
             Self::NotFound(detail) => {
                 (StatusCode::NOT_FOUND, Json(json!({ "detail": detail }))).into_response()
             }
+            Self::Status { status, detail } => {
+                (status, Json(json!({ "detail": detail }))).into_response()
+            }
             Self::Auth {
                 status,
                 detail,
@@ -755,16 +862,40 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
-    let auth = &state.config.google_auth;
-    if !auth.requested() {
+fn ensure_core_fixture_writes_enabled(state: &AppState) -> Result<(), ApiError> {
+    if state.config.rust_core.fixture_writes_enabled {
         return Ok(());
     }
+    Err(ApiError::Status {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        detail: "Rust core fixture writes are disabled".to_owned(),
+    })
+}
+
+fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
     let peer_addr = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|value| value.0);
-    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        request.headers(),
+        peer_addr,
+        request.uri().path(),
+    )
+}
+
+fn ensure_session_allowed_from_parts(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    path: &str,
+) -> Result<(), ApiError> {
+    let auth = &config.google_auth;
+    if !auth.requested() {
+        return Ok(());
+    }
+    if is_local_bypass_request(headers, peer_addr, config) {
         return Ok(());
     }
     if !auth.ready() {
@@ -774,13 +905,13 @@ fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<()
             login_url: None,
         });
     }
-    if authenticated_user(request.headers(), &state.config).is_some() {
+    if authenticated_user(headers, config).is_some() {
         return Ok(());
     }
     Err(ApiError::Auth {
         status: StatusCode::UNAUTHORIZED,
         detail: "Authentication required",
-        login_url: Some(google_login_redirect(request.uri().path())),
+        login_url: Some(google_login_redirect(path)),
     })
 }
 
@@ -1006,6 +1137,12 @@ struct ListSessionsQuery {
 #[derive(Debug, Deserialize)]
 struct SessionOutputQuery {
     lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KillSessionRequest {
+    #[serde(default)]
+    requester_session_id: Option<String>,
 }
 
 #[derive(Serialize)]
