@@ -1300,7 +1300,15 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
 
     let (status, payload) = get_json(app.clone(), "/sessions/graphchild").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["last_handoff_path"], "/tmp/handoff.md");
+    assert_eq!(payload["last_handoff_path"], Value::Null);
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let graph_child = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "graphchild")
+        .unwrap();
+    assert_eq!(graph_child["pending_handoff_path"], "/tmp/handoff.md");
 
     let (status, payload) = post_json(app.clone(), "/sessions/graphchild/kill", json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -1762,7 +1770,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
 }
 
 #[tokio::test]
-async fn runtime_core_handoff_executes_clear_and_prompt() {
+async fn runtime_core_handoff_records_without_interrupting_active_turn() {
     if !tmux_available() {
         return;
     }
@@ -1818,21 +1826,27 @@ async fn runtime_core_handoff_executes_clear_and_prompt() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "executed");
-    wait_for_output_contains(
-        app.clone(),
-        "runtimehandoff",
-        &format!(
-            "runtime:Read {} and continue from where you left off.",
-            handoff_path.display()
-        ),
-    )
-    .await;
+    assert_eq!(payload["status"], "recorded");
+
+    let (status, output) = get_json(app.clone(), "/sessions/runtimehandoff/output?lines=20").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!output["output"]
+        .as_str()
+        .unwrap()
+        .contains("continue from where you left off"));
 
     let (status, payload) = get_json(app, "/sessions/runtimehandoff").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["last_handoff_path"], Value::Null);
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let runtime_handoff = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "runtimehandoff")
+        .unwrap();
     assert_eq!(
-        payload["last_handoff_path"],
+        runtime_handoff["pending_handoff_path"],
         handoff_path.display().to_string()
     );
 }

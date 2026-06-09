@@ -779,19 +779,12 @@ async fn schedule_handoff(
         &format!("/sessions/{session_id}/handoff"),
     )?;
     ensure_core_writes_enabled(&state)?;
-    let result = if state.config.rust_core.runtime_enabled {
+    if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
-        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
-        state
-            .session_store
-            .execute_handoff_with_runtime(&session_id, payload, &runtime)?
-    } else {
-        state.session_store.schedule_handoff(&session_id, payload)?
-    };
+    }
+    let result = state.session_store.schedule_handoff(&session_id, payload)?;
     match result {
-        HandoffOutcome::Recorded(result) | HandoffOutcome::Executed(result) => {
-            Ok(Json(serde_json::to_value(result)?))
-        }
+        HandoffOutcome::Recorded(result) => Ok(Json(serde_json::to_value(result)?)),
         HandoffOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
     }
 }
