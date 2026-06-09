@@ -190,6 +190,25 @@ impl TmuxRuntime {
         Ok(true)
     }
 
+    pub fn send_urgent_input(
+        &self,
+        tmux_session: &str,
+        text: &str,
+        background_claude_task: bool,
+    ) -> Result<bool> {
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
+        }
+        if background_claude_task {
+            self.send_key(tmux_session, "C-b")?;
+            let _ = self.wait_for_prompt(tmux_session, Duration::from_millis(300));
+        }
+        self.send_key(tmux_session, "Escape")?;
+        let _ = self.wait_for_prompt(tmux_session, Duration::from_millis(300));
+        self.send_text_then_enter(tmux_session, text)?;
+        Ok(true)
+    }
+
     pub fn clear_session(
         &self,
         tmux_session: &str,
@@ -514,6 +533,40 @@ mod tests {
         assert!(clear_enter < post_clear_wait);
         assert!(post_clear_wait < prompt_text);
         assert!(prompt_text < prompt_enter);
+    }
+
+    #[test]
+    fn urgent_input_backgrounds_interrupts_and_sends_payload() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert!(runtime
+            .send_urgent_input("sm-test", "urgent task", true)
+            .unwrap());
+
+        let log = fs::read_to_string(log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        let background = position_after(&lines, "send-keys -t sm-test C-b", 0);
+        let background_wait = position_after(&lines, "capture-pane -p -t sm-test", background + 1);
+        let escape = position_after(&lines, "send-keys -t sm-test Escape", background_wait + 1);
+        let interrupt_wait = position_after(&lines, "capture-pane -p -t sm-test", escape + 1);
+        let payload = position_after(
+            &lines,
+            "send-keys -t sm-test -l -- urgent task",
+            interrupt_wait + 1,
+        );
+        let enter = position_after(&lines, "send-keys -t sm-test Enter", payload + 1);
+
+        assert!(background < background_wait);
+        assert!(background_wait < escape);
+        assert!(escape < interrupt_wait);
+        assert!(interrupt_wait < payload);
+        assert!(payload < enter);
     }
 
     fn fake_tmux_binary() -> (PathBuf, PathBuf, PathBuf) {

@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::queue::RetainedQueueStore;
+use crate::queue::{QueueMessageMetadata, RetainedQueueStore};
 use crate::runtime::{TmuxRuntime, TmuxSessionSpec};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -287,30 +287,86 @@ impl SessionStore {
     ) -> Result<Option<CoreInputResult>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
+
+        let Some(initial_status) = runtime_session_status_raw(&mut state, session_id)? else {
             return Ok(None);
         };
-        let node = json_text(session.get("node")).unwrap_or_else(default_node);
-        ensure_runtime_local_node(&node)?;
-        let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        let tmux_session = json_text(session.get("tmux_session"))
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-        let session_socket_name = json_text(session.get("tmux_socket_name"));
-        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let mut delivered = false;
-        if normalized_status(&status) != "stopped" {
-            delivered = session_runtime.send_input(&tmux_session, &request.text)?;
-            let now = now_rfc3339();
-            if delivered {
-                session.insert("last_activity".to_owned(), Value::String(now));
-            } else {
-                status = "stopped".to_owned();
-                session.insert("status".to_owned(), Value::String(status.clone()));
-                session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-                session.insert("last_activity".to_owned(), Value::String(now));
+        if normalized_status(&initial_status) == "stopped" {
+            return Ok(Some(CoreInputResult {
+                ok: true,
+                session_id: session_id.to_owned(),
+                delivered: false,
+                delivery_mode: request.delivery_mode,
+                notify_after_seconds: request.notify_after_seconds,
+                status: initial_status,
+            }));
+        }
+
+        let delivery_mode = normalized_delivery_mode(&request.delivery_mode);
+        let (queued_text, sender_name) = format_send_input_text_raw(&state, &request);
+        if should_persist_runtime_send(&delivery_mode) {
+            if let Some(queue) = &self.queue_store {
+                let metadata =
+                    queue_metadata_for_send_request(&state, session_id, &request, sender_name);
+                let has_delivery_side_effects = metadata.has_delivery_side_effects();
+                let message_id = queue.enqueue_message_with_metadata(
+                    session_id,
+                    &queued_text,
+                    &delivery_mode,
+                    metadata,
+                )?;
+                if has_delivery_side_effects {
+                    return Ok(Some(CoreInputResult {
+                        ok: true,
+                        session_id: session_id.to_owned(),
+                        delivered: false,
+                        delivery_mode: request.delivery_mode,
+                        notify_after_seconds: request.notify_after_seconds,
+                        status: initial_status,
+                    }));
+                }
+                let drain = if delivery_mode == "urgent" {
+                    deliver_urgent_runtime_message_raw(
+                        &mut state,
+                        session_id,
+                        runtime,
+                        queue,
+                        &message_id,
+                        &queued_text,
+                    )?
+                } else {
+                    drain_pending_runtime_messages_raw(
+                        &mut state,
+                        session_id,
+                        runtime,
+                        queue,
+                        if delivery_mode == "important" {
+                            Some("important")
+                        } else {
+                            None
+                        },
+                        Some(&message_id),
+                    )?
+                };
+                self.write_raw_json_value(&state)?;
+                let delivered = drain
+                    .delivered_message_ids
+                    .iter()
+                    .any(|id| id == &message_id)
+                    || queue.message_delivered(&message_id)?;
+                return Ok(Some(CoreInputResult {
+                    ok: true,
+                    session_id: session_id.to_owned(),
+                    delivered,
+                    delivery_mode: request.delivery_mode,
+                    notify_after_seconds: request.notify_after_seconds,
+                    status: drain.status,
+                }));
             }
         }
+
+        let (status, delivered) =
+            deliver_runtime_text_to_session_raw(&mut state, session_id, &queued_text, runtime)?;
         self.write_raw_json_value(&state)?;
         Ok(Some(CoreInputResult {
             ok: true,
@@ -320,6 +376,19 @@ impl SessionStore {
             notify_after_seconds: request.notify_after_seconds,
             status,
         }))
+    }
+
+    pub fn runtime_send_delivery_side_effects_requested(
+        &self,
+        session_id: &str,
+        request: &SendCoreInputRequest,
+    ) -> Result<Option<bool>> {
+        let state = self.load_raw_json_value()?;
+        if raw_session_object(&state, session_id).is_none() {
+            return Ok(None);
+        }
+        let metadata = queue_metadata_for_send_request(&state, session_id, request, None);
+        Ok(Some(metadata.has_delivery_side_effects()))
     }
 
     pub fn clear_core_session(
@@ -1324,7 +1393,25 @@ pub struct SendCoreInputRequest {
     #[serde(default = "default_delivery_mode")]
     pub delivery_mode: String,
     #[serde(default)]
+    pub sender_session_id: Option<String>,
+    #[serde(default)]
+    pub from_sm_send: bool,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub notify_on_delivery: bool,
+    #[serde(default)]
     pub notify_after_seconds: Option<u64>,
+    #[serde(default)]
+    pub notify_on_stop: bool,
+    #[serde(default)]
+    pub remind_soft_threshold: Option<u64>,
+    #[serde(default)]
+    pub remind_hard_threshold: Option<u64>,
+    #[serde(default)]
+    pub remind_cancel_on_reply_session_id: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1651,6 +1738,271 @@ fn push_retained_message_raw(
         "created_at": now_rfc3339(),
     }));
     Ok(())
+}
+
+#[derive(Debug)]
+struct QueueDrainResult {
+    status: String,
+    delivered_message_ids: Vec<String>,
+}
+
+fn should_persist_runtime_send(delivery_mode: &str) -> bool {
+    matches!(
+        normalized_delivery_mode(delivery_mode).as_str(),
+        "sequential" | "important" | "urgent"
+    )
+}
+
+fn normalized_delivery_mode(delivery_mode: &str) -> String {
+    delivery_mode.trim().to_ascii_lowercase()
+}
+
+fn format_send_input_text_raw(
+    state: &Value,
+    request: &SendCoreInputRequest,
+) -> (String, Option<String>) {
+    let Some(sender_session_id) = optional_trimmed(request.sender_session_id.as_deref()) else {
+        return (request.text.clone(), None);
+    };
+    let Some(sessions) = state.get("sessions").and_then(Value::as_array) else {
+        return (request.text.clone(), None);
+    };
+    let Some(sender) = session_object(sessions, &sender_session_id) else {
+        return (request.text.clone(), None);
+    };
+    let sender_name = raw_session_display_name(sender, &sender_session_id);
+    (
+        format!(
+            "[Input from: {sender_name} ({}) via sm send]\n{}",
+            short_session_id(&sender_session_id),
+            request.text
+        ),
+        Some(sender_name),
+    )
+}
+
+fn queue_metadata_for_send_request(
+    state: &Value,
+    target_session_id: &str,
+    request: &SendCoreInputRequest,
+    sender_name: Option<String>,
+) -> QueueMessageMetadata {
+    let sender_session_id = optional_trimmed(request.sender_session_id.as_deref());
+    let notify_on_stop = request.notify_on_stop
+        && sender_session_id.as_deref().is_some_and(|sender_id| {
+            sender_id != target_session_id
+                && raw_session_is_em(state, sender_id)
+                && raw_session_provider(state, target_session_id).as_deref() != Some("codex-fork")
+        });
+    QueueMessageMetadata {
+        sender_session_id,
+        sender_name,
+        from_sm_send: request.from_sm_send,
+        timeout_seconds: request.timeout_seconds,
+        notify_on_delivery: request.notify_on_delivery,
+        notify_after_seconds: request.notify_after_seconds,
+        notify_on_stop,
+        remind_soft_threshold: request.remind_soft_threshold,
+        remind_hard_threshold: request.remind_hard_threshold,
+        remind_cancel_on_reply_session_id: request.remind_cancel_on_reply_session_id.clone(),
+        parent_session_id: request.parent_session_id.clone(),
+        message_category: None,
+        response_relay_source: None,
+    }
+}
+
+fn raw_session_display_name(session: &Map<String, Value>, fallback_id: &str) -> String {
+    json_text(session.get("friendly_name"))
+        .or_else(|| json_text(session.get("name")))
+        .unwrap_or_else(|| fallback_id.to_owned())
+}
+
+fn raw_session_is_em(state: &Value, session_id: &str) -> bool {
+    raw_session_object(state, session_id)
+        .and_then(|session| session.get("is_em"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn raw_session_provider(state: &Value, session_id: &str) -> Option<String> {
+    raw_session_object(state, session_id).and_then(|session| json_text(session.get("provider")))
+}
+
+fn raw_session_object<'a>(state: &'a Value, session_id: &str) -> Option<&'a Map<String, Value>> {
+    let sessions = state.get("sessions").and_then(Value::as_array)?;
+    session_object(sessions, session_id)
+}
+
+fn short_session_id(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
+}
+
+fn runtime_session_status_raw(state: &mut Value, session_id: &str) -> Result<Option<String>> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let Some(session) = session_object_mut(sessions, session_id) else {
+        return Ok(None);
+    };
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let _tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    Ok(Some(
+        json_text(session.get("status")).unwrap_or_else(|| "running".to_owned()),
+    ))
+}
+
+fn deliver_runtime_text_to_session_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<(String, bool)> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let session = session_object_mut(sessions, session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    let session_socket_name = json_text(session.get("tmux_socket_name"));
+    let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+    let mut delivered = false;
+    if normalized_status(&status) != "stopped" {
+        delivered = session_runtime.send_input(&tmux_session, text)?;
+        let now = now_rfc3339();
+        if delivered {
+            session.insert("last_activity".to_owned(), Value::String(now));
+        } else {
+            status = "stopped".to_owned();
+            session.insert("status".to_owned(), Value::String(status.clone()));
+            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+            session.insert("last_activity".to_owned(), Value::String(now));
+        }
+    }
+    Ok((status, delivered))
+}
+
+fn deliver_urgent_runtime_text_to_session_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<(String, bool)> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let session = session_object_mut(sessions, session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+    let session_socket_name = json_text(session.get("tmux_socket_name"));
+    let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+    let mut delivered = false;
+    if normalized_status(&status) != "stopped" {
+        delivered = session_runtime.send_urgent_input(
+            &tmux_session,
+            text,
+            provider.eq_ignore_ascii_case("claude"),
+        )?;
+        let now = now_rfc3339();
+        if delivered {
+            session.insert("last_activity".to_owned(), Value::String(now));
+        } else {
+            status = "stopped".to_owned();
+            session.insert("status".to_owned(), Value::String(status.clone()));
+            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+            session.insert("last_activity".to_owned(), Value::String(now));
+        }
+    }
+    Ok((status, delivered))
+}
+
+fn drain_pending_runtime_messages_raw(
+    state: &mut Value,
+    session_id: &str,
+    runtime: &TmuxRuntime,
+    queue: &RetainedQueueStore,
+    delivery_mode_filter: Option<&str>,
+    stop_after_message_id: Option<&str>,
+) -> Result<QueueDrainResult> {
+    let mut status =
+        runtime_session_status_raw(state, session_id)?.unwrap_or_else(|| "stopped".to_owned());
+    let mut delivered_message_ids = Vec::new();
+    loop {
+        let messages = match delivery_mode_filter {
+            Some(delivery_mode) => {
+                queue.pending_messages_for_target_by_mode(session_id, delivery_mode, 10)?
+            }
+            None => queue.pending_messages_for_target(session_id, 10)?,
+        };
+        if messages.is_empty() {
+            break;
+        }
+
+        let mut should_continue = true;
+        for message in messages {
+            if message.has_delivery_side_effects {
+                should_continue = false;
+                break;
+            }
+            let (next_status, delivered) =
+                if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
+                    deliver_urgent_runtime_text_to_session_raw(
+                        state,
+                        session_id,
+                        &message.text,
+                        runtime,
+                    )?
+                } else {
+                    deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?
+                };
+            status = next_status;
+            if !delivered {
+                should_continue = false;
+                break;
+            }
+            queue.mark_delivered(&message.id)?;
+            let delivered_target =
+                stop_after_message_id.is_some_and(|target_id| target_id == message.id);
+            delivered_message_ids.push(message.id);
+            if delivered_target {
+                should_continue = false;
+                break;
+            }
+        }
+
+        if !should_continue {
+            break;
+        }
+    }
+    Ok(QueueDrainResult {
+        status,
+        delivered_message_ids,
+    })
+}
+
+fn deliver_urgent_runtime_message_raw(
+    state: &mut Value,
+    session_id: &str,
+    runtime: &TmuxRuntime,
+    queue: &RetainedQueueStore,
+    message_id: &str,
+    text: &str,
+) -> Result<QueueDrainResult> {
+    let (status, delivered) =
+        deliver_urgent_runtime_text_to_session_raw(state, session_id, text, runtime)?;
+    let mut delivered_message_ids = Vec::new();
+    if delivered {
+        queue.mark_delivered(message_id)?;
+        delivered_message_ids.push(message_id.to_owned());
+    }
+    Ok(QueueDrainResult {
+        status,
+        delivered_message_ids,
+    })
 }
 
 fn upsert_stop_notify_raw(

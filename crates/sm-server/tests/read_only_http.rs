@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use sm_server::config::RustShadowConfig;
+use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
         AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig, RustCoreConfig,
@@ -2313,6 +2314,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
         return;
     }
     let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
     let log_dir = unique_temp_path();
     let working_dir = unique_temp_path();
     fs::create_dir_all(&working_dir).unwrap();
@@ -2328,6 +2330,11 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(&state_file)
+                .display()
+                .to_string(),
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -2389,6 +2396,15 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(payload["delivered"], true);
 
     wait_for_output_contains(app.clone(), "runtimecore", "runtime:second runtime message").await;
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let delivered_at: Option<String> = queue_conn
+        .query_row(
+            "SELECT delivered_at FROM message_queue WHERE target_session_id = 'runtimecore' AND text = 'second runtime message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(delivered_at.is_some());
 
     let long_runtime_message = format!("{}chunked-runtime-tail", "x".repeat(500));
     let (status, payload) = post_json(
@@ -2453,6 +2469,437 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], true);
     wait_for_output_contains(app, "runtimecore", "runtime:restored runtime message").await;
+}
+
+#[tokio::test]
+async fn runtime_core_delivers_sm_send_metadata_rows() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-side-effects-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimesmsend",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "sm send initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimesender",
+            "name": "runtime-sender",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "sender initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(app.clone(), "runtimesmsend", "runtime:sm send initial").await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimesmsend/input",
+        json!({
+            "text": "ordinary sm send metadata delivered",
+            "sender_session_id": "runtimesender",
+            "delivery_mode": "sequential",
+            "from_sm_send": true,
+            "timeout_seconds": 60,
+            "notify_on_stop": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    assert_eq!(payload["status"], "running");
+    wait_for_output_contains(
+        app.clone(),
+        "runtimesmsend",
+        "runtime:ordinary sm send metadata delivered",
+    )
+    .await;
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let pending: (
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+        i64,
+        Option<i64>,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = queue_conn
+        .query_row(
+            r#"
+            SELECT text, sender_session_id, sender_name, from_sm_send, timeout_at,
+                   notify_on_delivery, notify_after_seconds, notify_on_stop,
+                   remind_soft_threshold, remind_hard_threshold,
+                   remind_cancel_on_reply_session_id, parent_session_id,
+                   response_relay_source, delivered_at
+            FROM message_queue
+            WHERE target_session_id = 'runtimesmsend'
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
+        )
+        .unwrap();
+    let timeout_at = pending.4.clone();
+    assert!(timeout_at.is_some());
+    assert_eq!(
+        pending.0,
+        "[Input from: runtime-sender (runtimes) via sm send]\nordinary sm send metadata delivered"
+    );
+    assert_eq!(pending.1.as_deref(), Some("runtimesender"));
+    assert_eq!(pending.2.as_deref(), Some("runtime-sender"));
+    assert_eq!(pending.3, 1);
+    assert_eq!(pending.4, timeout_at);
+    assert_eq!(pending.5, 0);
+    assert_eq!(pending.6, None);
+    assert_eq!(pending.7, 0);
+    assert_eq!(pending.8, None);
+    assert_eq!(pending.9, None);
+    assert_eq!(pending.10, None);
+    assert_eq!(pending.11, None);
+    assert_eq!(pending.12.as_deref(), Some("sm-send"));
+    assert!(pending.13.is_some());
+}
+
+#[tokio::test]
+async fn runtime_core_rejects_unimplemented_send_side_effect_options() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-side-effects-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimesideeffects",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "side effect initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimesideeffects",
+        "runtime:side effect initial",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimesideeffects/input",
+        json!({
+            "text": "side effect delivery should be rejected",
+            "delivery_mode": "sequential",
+            "notify_on_delivery": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        payload["detail"],
+        "Rust runtime send delivery side effects are not implemented"
+    );
+
+    RetainedQueueStore::new(queue_db_path.clone())
+        .ensure_schema()
+        .unwrap();
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let row_count: i64 = queue_conn
+        .query_row("SELECT COUNT(*) FROM message_queue", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(row_count, 0);
+
+    let (status, output) =
+        get_json(app.clone(), "/sessions/runtimesideeffects/output?lines=20").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("side effect delivery should be rejected"));
+}
+
+#[tokio::test]
+async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-priority-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimepriority",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "priority initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(app.clone(), "runtimepriority", "runtime:priority initial").await;
+
+    let queue = RetainedQueueStore::new(queue_db_path.clone());
+    for index in 0..12 {
+        queue
+            .enqueue_message(
+                "runtimepriority",
+                &format!("stale sequential backlog {index}"),
+                "sequential",
+                None,
+            )
+            .unwrap();
+    }
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimepriority/input",
+        json!({
+            "text": "sequential after large backlog",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimepriority",
+        "runtime:sequential after large backlog",
+    )
+    .await;
+
+    for index in 0..12 {
+        queue
+            .enqueue_message(
+                "runtimepriority",
+                &format!("second stale sequential backlog {index}"),
+                "sequential",
+                None,
+            )
+            .unwrap();
+    }
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimepriority/input",
+        json!({
+            "text": "important priority message",
+            "delivery_mode": "important"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimepriority",
+        "runtime:important priority message",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimepriority/input",
+        json!({
+            "text": "urgent priority message",
+            "delivery_mode": "urgent"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(app.clone(), "runtimepriority", "urgent priority message").await;
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let delivered_priority_count: i64 = queue_conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM message_queue
+            WHERE target_session_id = 'runtimepriority'
+                AND text IN (
+                    'sequential after large backlog',
+                    'important priority message',
+                    'urgent priority message'
+                )
+                AND delivered_at IS NOT NULL
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered_priority_count, 3);
+    let delivered_backlog_count: i64 = queue_conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM message_queue
+            WHERE target_session_id = 'runtimepriority'
+                AND text LIKE 'second stale sequential backlog%'
+                AND delivered_at IS NOT NULL
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered_backlog_count, 0);
+}
+
+#[tokio::test]
+async fn runtime_core_replays_retained_urgent_rows_with_interrupt_semantics() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-retained-urgent-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimeurgentreplay",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "urgent replay initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimeurgentreplay",
+        "runtime:urgent replay initial",
+    )
+    .await;
+
+    let queue = RetainedQueueStore::new(queue_db_path.clone());
+    let urgent_id = queue
+        .enqueue_message(
+            "runtimeurgentreplay",
+            "retained urgent replay",
+            "urgent",
+            None,
+        )
+        .unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimeurgentreplay/input",
+        json!({
+            "text": "sequential trigger after retained urgent",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    let payload = wait_for_output_contains(
+        app.clone(),
+        "runtimeurgentreplay",
+        "sequential trigger after retained urgent",
+    )
+    .await;
+    let output = payload["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("runtime:\u{2}\u{1b}retained urgent replay"),
+        "retained urgent row was not replayed through the interrupt path: {output:?}",
+    );
+    assert!(queue.message_delivered(&urgent_id).unwrap());
 }
 
 #[tokio::test]
@@ -2938,12 +3385,28 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     let (status, payload) = post_json(
         app.clone(),
         "/sessions/runtimemissingsend/input",
-        json!({ "text": "after external kill" }),
+        json!({
+            "text": "after external kill",
+            "delivery_mode": "sequential"
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], false);
     assert_eq!(payload["status"], "stopped");
+    let queue_conn = Connection::open(queue_db_path_for_state_file(&state_file)).unwrap();
+    let pending: (String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT text, delivered_at
+            FROM message_queue
+            WHERE target_session_id = 'runtimemissingsend'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, ("after external kill".to_owned(), None));
 
     let (status, payload) = get_json(app.clone(), "/sessions/runtimemissingsend").await;
     assert_eq!(status, StatusCode::OK);
@@ -2979,6 +3442,52 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "stopped");
     assert!(payload["stopped_at"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn runtime_core_does_not_queue_sends_to_already_stopped_sessions() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "runtimestopped",
+                    "name": "runtime-stopped",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-runtimestopped",
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": "/tmp/runtimestopped.log",
+                    "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let log_dir = unique_temp_path();
+    let app = runtime_app(&state_file, &log_dir, "sm-rust-test-stopped-send");
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions/runtimestopped/input",
+        json!({
+            "text": "do not retain for stopped session",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], false);
+    assert_eq!(payload["status"], "stopped");
+    assert!(!queue_db_path_for_state_file(&state_file).exists());
 }
 
 #[tokio::test]
@@ -3172,6 +3681,11 @@ async fn runtime_core_fails_create_when_stdin_prompt_cannot_be_delivered() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(&state_file)
+                .display()
+                .to_string(),
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -3708,6 +4222,11 @@ fn runtime_app_with_command(
     router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(state_file)
+                .display()
+                .to_string(),
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
