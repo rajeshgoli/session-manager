@@ -398,18 +398,25 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn enqueue_runtime_stop_notification_for_session(
+    pub fn enqueue_stop_notification_for_session(
         &self,
         session_id: &str,
         text: &str,
-        runtime: &TmuxRuntime,
+        runtime: Option<&TmuxRuntime>,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let Some(queue) = &self.queue_store else {
-            return Ok(());
-        };
-        enqueue_stop_notification_raw(self, &mut state, Some(runtime), queue, session_id, text)?;
+        if let Some(queue) = &self.queue_store {
+            enqueue_stop_notification_raw(self, &mut state, runtime, queue, session_id, text)?;
+        } else if raw_session_object(&state, session_id).is_some() {
+            push_retained_message_raw(
+                &mut state,
+                session_id,
+                text,
+                "important",
+                Some("stop_notify"),
+            )?;
+        }
         self.write_raw_json_value(&state)?;
         Ok(())
     }
@@ -2308,16 +2315,14 @@ fn complete_stop_notify_after_stop_raw(
 
     let text = runtime_stop_notification_text(recipient_name, session_id);
     if stop_notify.delay_seconds > 0 {
-        if let Some(runtime) = runtime {
-            schedule_runtime_stop_notification(
-                store.clone(),
-                runtime.clone(),
-                stop_notify.sender_session_id,
-                text,
-                stop_notify.delay_seconds as u64,
-            );
-            return Ok(());
-        }
+        schedule_stop_notification(
+            store.clone(),
+            runtime.cloned(),
+            stop_notify.sender_session_id,
+            text,
+            stop_notify.delay_seconds as u64,
+        );
+        return Ok(());
     }
 
     if let Some(queue) = queue {
@@ -2374,9 +2379,9 @@ fn enqueue_stop_notification_raw(
     Ok(())
 }
 
-fn schedule_runtime_stop_notification(
+fn schedule_stop_notification(
     store: SessionStore,
-    runtime: TmuxRuntime,
+    runtime: Option<TmuxRuntime>,
     sender_session_id: String,
     text: String,
     delay_seconds: u64,
@@ -2384,10 +2389,10 @@ fn schedule_runtime_stop_notification(
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
             tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
-            let _ = store.enqueue_runtime_stop_notification_for_session(
+            let _ = store.enqueue_stop_notification_for_session(
                 &sender_session_id,
                 &text,
-                &runtime,
+                runtime.as_ref(),
             );
         });
     }

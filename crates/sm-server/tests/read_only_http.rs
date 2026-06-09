@@ -1642,6 +1642,71 @@ async fn fixture_notify_on_stop_preserves_authorization_and_state_contract() {
 }
 
 #[tokio::test]
+async fn fixture_retire_honors_delayed_stop_notify_without_runtime() {
+    let state_file = write_completion_fixture();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/notify-on-stop",
+        json!({
+            "sender_session_id": "em001",
+            "requester_session_id": "em001",
+            "delay_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+
+    let (status, payload) = post_json(app.clone(), "/sessions/child001/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let immediate_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'em001' AND message_category = 'stop_notify'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(immediate_count, 0);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let delayed: (String, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT text, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'em001' AND message_category = 'stop_notify'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        delayed,
+        (
+            "[sm] worker-1 (child001) completed (Stop hook fired)".to_owned(),
+            "important".to_owned(),
+            Some("stop_notify".to_owned())
+        )
+    );
+    let remaining_stop_notify_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM rust_stop_notify_states WHERE session_id = 'child001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_stop_notify_count, 0);
+}
+
+#[tokio::test]
 async fn fixture_registry_and_maintainer_endpoints_round_trip_state() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();
