@@ -2612,7 +2612,7 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
 }
 
 #[tokio::test]
-async fn runtime_core_rejects_unimplemented_send_side_effect_options() {
+async fn runtime_core_materializes_send_delivery_side_effects() {
     if !tmux_available() {
         return;
     }
@@ -2636,53 +2636,172 @@ async fn runtime_core_rejects_unimplemented_send_side_effect_options() {
         app.clone(),
         "/sessions",
         json!({
-            "id": "runtimesideeffects",
+            "id": "runtimeem",
             "working_dir": working_dir.display().to_string(),
             "provider": "claude",
-            "initial_message": "side effect initial"
+            "initial_message": "em side effect initial"
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimechild",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "parent_session_id": "runtimeem",
+            "initial_message": "child side effect initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let em = raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "runtimeem")
+        .unwrap();
+    em["is_em"] = Value::Bool(true);
+    em["friendly_name"] = Value::String("runtime-em".to_owned());
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&raw_state).unwrap(),
+    )
+    .unwrap();
     wait_for_output_contains(
         app.clone(),
-        "runtimesideeffects",
-        "runtime:side effect initial",
+        "runtimechild",
+        "runtime:child side effect initial",
     )
     .await;
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/runtimesideeffects/input",
+        "/sessions/runtimechild/input",
         json!({
-            "text": "side effect delivery should be rejected",
+            "text": "side effect delivery should be materialized",
             "delivery_mode": "sequential",
-            "notify_on_delivery": true
+            "sender_session_id": "runtimeem",
+            "from_sm_send": true,
+            "notify_on_delivery": true,
+            "notify_after_seconds": 1,
+            "notify_on_stop": true,
+            "remind_soft_threshold": 30,
+            "remind_hard_threshold": 45,
+            "remind_cancel_on_reply_session_id": "runtimeem",
+            "parent_session_id": "runtimeem"
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimechild",
+        "runtime:side effect delivery should be materialized",
+    )
+    .await;
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let original: (
+        Option<String>,
+        i64,
+        Option<i64>,
+        i64,
+        Option<i64>,
+        Option<String>,
+    ) = queue_conn
+        .query_row(
+            r#"
+                SELECT delivered_at, notify_on_delivery, notify_after_seconds,
+                       notify_on_stop, remind_soft_threshold, parent_session_id
+                FROM message_queue
+                WHERE target_session_id = 'runtimechild'
+                "#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert!(original.0.is_some());
+    assert_eq!(original.1, 1);
+    assert_eq!(original.2, Some(1));
+    assert_eq!(original.3, 1);
+    assert_eq!(original.4, Some(30));
+    assert_eq!(original.5.as_deref(), Some("runtimeem"));
+
+    let delivery_notification_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimeem' AND text LIKE '[sm] Message delivered%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivery_notification_count, 1);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let followup_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimeem' AND text LIKE '[sm] Reminder: 1s since%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(followup_count, 1);
+
+    let remind: (i64, i64, Option<String>, i64) = queue_conn
+        .query_row(
+            "SELECT soft_threshold_seconds, hard_threshold_seconds, cancel_on_reply_session_id, is_active FROM remind_registrations WHERE target_session_id = 'runtimechild'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(remind, (30, 45, Some("runtimeem".to_owned()), 1));
+    let parent_wake: (String, i64, i64) = queue_conn
+        .query_row(
+            "SELECT parent_session_id, period_seconds, is_active FROM parent_wake_registrations WHERE child_session_id = 'runtimechild'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(parent_wake, ("runtimeem".to_owned(), 600, 1));
+    let stop_notify: (String, String, i64) = queue_conn
+        .query_row(
+            "SELECT sender_session_id, sender_name, delay_seconds FROM rust_stop_notify_states WHERE session_id = 'runtimechild'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
     assert_eq!(
-        payload["detail"],
-        "Rust runtime send delivery side effects are not implemented"
+        stop_notify,
+        ("runtimeem".to_owned(), "runtime-em".to_owned(), 0)
     );
 
-    RetainedQueueStore::new(queue_db_path.clone())
-        .ensure_schema()
-        .unwrap();
-    let queue_conn = Connection::open(&queue_db_path).unwrap();
-    let row_count: i64 = queue_conn
-        .query_row("SELECT COUNT(*) FROM message_queue", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(row_count, 0);
-
-    let (status, output) =
-        get_json(app.clone(), "/sessions/runtimesideeffects/output?lines=20").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(!output["output"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("side effect delivery should be rejected"));
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(
+        raw_state["retained_stop_notify_states"][0]["sender_session_id"],
+        "runtimeem"
+    );
+    assert_eq!(
+        raw_state["retained_remind_registrations"][0]["target_session_id"],
+        "runtimechild"
+    );
+    assert_eq!(
+        raw_state["retained_parent_wake_registrations"][0]["parent_session_id"],
+        "runtimeem"
+    );
 }
 
 #[tokio::test]
@@ -3366,6 +3485,20 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
     let app = runtime_app(&state_file, &log_dir, &tmux_socket);
 
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimemissingsender",
+            "name": "runtime-missing-sender",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "missing sender initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
     let (status, payload) = post_json(
         app.clone(),
         "/sessions",
@@ -3387,7 +3520,10 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
         "/sessions/runtimemissingsend/input",
         json!({
             "text": "after external kill",
-            "delivery_mode": "sequential"
+            "delivery_mode": "sequential",
+            "sender_session_id": "runtimemissingsender",
+            "from_sm_send": true,
+            "notify_on_delivery": true
         }),
     )
     .await;
@@ -3395,18 +3531,34 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     assert_eq!(payload["delivered"], false);
     assert_eq!(payload["status"], "stopped");
     let queue_conn = Connection::open(queue_db_path_for_state_file(&state_file)).unwrap();
-    let pending: (String, Option<String>) = queue_conn
+    let pending: (String, Option<String>, i64) = queue_conn
         .query_row(
             r#"
-            SELECT text, delivered_at
+            SELECT text, delivered_at, notify_on_delivery
             FROM message_queue
             WHERE target_session_id = 'runtimemissingsend'
             "#,
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(pending, ("after external kill".to_owned(), None));
+    assert_eq!(
+        pending,
+        (
+            "[Input from: runtime-missing-sender (runtimem) via sm send]\nafter external kill"
+                .to_owned(),
+            None,
+            1
+        )
+    );
+    let sender_notification_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimemissingsender' AND text LIKE '[sm] Message delivered%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sender_notification_count, 0);
 
     let (status, payload) = get_json(app.clone(), "/sessions/runtimemissingsend").await;
     assert_eq!(status, StatusCode::OK);

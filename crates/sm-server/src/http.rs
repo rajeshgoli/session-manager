@@ -614,16 +614,6 @@ async fn send_session_input(
     }
     let result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
-        if state
-            .session_store
-            .runtime_send_delivery_side_effects_requested(&session_id, &payload)?
-            .unwrap_or(false)
-        {
-            return Err(ApiError::Status {
-                status: StatusCode::NOT_IMPLEMENTED,
-                detail: "Rust runtime send delivery side effects are not implemented".to_owned(),
-            });
-        }
         let runtime = TmuxRuntime::from_config(&state.config.rust_core);
         state
             .session_store

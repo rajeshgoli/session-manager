@@ -19,6 +19,18 @@ pub struct PendingMessage {
     pub text: String,
     pub delivery_mode: String,
     pub has_delivery_side_effects: bool,
+    pub sender_session_id: Option<String>,
+    pub sender_name: Option<String>,
+    pub from_sm_send: bool,
+    pub notify_on_delivery: bool,
+    pub notify_after_seconds: Option<u64>,
+    pub notify_on_stop: bool,
+    pub remind_soft_threshold: Option<u64>,
+    pub remind_hard_threshold: Option<u64>,
+    pub remind_cancel_on_reply_session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub message_category: Option<String>,
+    pub response_relay_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,44 +107,13 @@ impl RetainedQueueStore {
         metadata: QueueMessageMetadata,
     ) -> Result<String> {
         self.with_connection(|conn| {
-            let id = generate_record_id("msg");
-            let timeout_at = timeout_at_rfc3339(metadata.timeout_seconds)?;
-            let response_relay_source = metadata
-                .response_relay_source
-                .or_else(|| metadata.from_sm_send.then(|| "sm-send".to_owned()));
-            conn.execute(
-                r#"
-                INSERT INTO message_queue
-                    (id, target_session_id, sender_session_id, sender_name, text,
-                     delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery,
-                     notify_after_seconds, notify_on_stop, remind_soft_threshold,
-                     remind_hard_threshold, remind_cancel_on_reply_session_id, parent_session_id,
-                     message_category, response_relay_source)
-                VALUES
-                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-                "#,
-                params![
-                    id,
-                    target_session_id,
-                    metadata.sender_session_id,
-                    metadata.sender_name,
-                    text,
-                    delivery_mode,
-                    metadata.from_sm_send,
-                    now_rfc3339(),
-                    timeout_at,
-                    metadata.notify_on_delivery,
-                    metadata.notify_after_seconds.map(u64_to_i64).transpose()?,
-                    metadata.notify_on_stop,
-                    metadata.remind_soft_threshold.map(u64_to_i64).transpose()?,
-                    metadata.remind_hard_threshold.map(u64_to_i64).transpose()?,
-                    metadata.remind_cancel_on_reply_session_id,
-                    metadata.parent_session_id,
-                    metadata.message_category,
-                    response_relay_source,
-                ],
-            )?;
-            Ok(id)
+            enqueue_message_with_metadata_conn(
+                conn,
+                target_session_id,
+                text,
+                delivery_mode,
+                metadata,
+            )
         })
     }
 
@@ -177,7 +158,11 @@ impl RetainedQueueStore {
                             parent_session_id IS NOT NULL
                             AND trim(parent_session_id) != ''
                         )
-                    THEN 1 ELSE 0 END AS has_delivery_side_effects
+                    THEN 1 ELSE 0 END AS has_delivery_side_effects,
+                    sender_session_id, sender_name, from_sm_send, notify_on_delivery,
+                    notify_after_seconds, notify_on_stop, remind_soft_threshold,
+                    remind_hard_threshold, remind_cancel_on_reply_session_id,
+                    parent_session_id, message_category, response_relay_source
                 FROM message_queue
                 WHERE target_session_id = ?1 AND delivered_at IS NULL
                 ORDER BY queued_at ASC, id ASC
@@ -192,6 +177,18 @@ impl RetainedQueueStore {
                         text: row.get(2)?,
                         delivery_mode: row.get(3)?,
                         has_delivery_side_effects: row.get::<_, i64>(4)? != 0,
+                        sender_session_id: row.get(5)?,
+                        sender_name: row.get(6)?,
+                        from_sm_send: row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                        notify_on_delivery: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+                        notify_after_seconds: row.get::<_, Option<i64>>(9)?.map(i64_to_u64),
+                        notify_on_stop: row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
+                        remind_soft_threshold: row.get::<_, Option<i64>>(11)?.map(i64_to_u64),
+                        remind_hard_threshold: row.get::<_, Option<i64>>(12)?.map(i64_to_u64),
+                        remind_cancel_on_reply_session_id: row.get(13)?,
+                        parent_session_id: row.get(14)?,
+                        message_category: row.get(15)?,
+                        response_relay_source: row.get(16)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -224,7 +221,11 @@ impl RetainedQueueStore {
                             parent_session_id IS NOT NULL
                             AND trim(parent_session_id) != ''
                         )
-                    THEN 1 ELSE 0 END AS has_delivery_side_effects
+                    THEN 1 ELSE 0 END AS has_delivery_side_effects,
+                    sender_session_id, sender_name, from_sm_send, notify_on_delivery,
+                    notify_after_seconds, notify_on_stop, remind_soft_threshold,
+                    remind_hard_threshold, remind_cancel_on_reply_session_id,
+                    parent_session_id, message_category, response_relay_source
                 FROM message_queue
                 WHERE target_session_id = ?1
                     AND delivery_mode = ?2
@@ -243,6 +244,18 @@ impl RetainedQueueStore {
                             text: row.get(2)?,
                             delivery_mode: row.get(3)?,
                             has_delivery_side_effects: row.get::<_, i64>(4)? != 0,
+                            sender_session_id: row.get(5)?,
+                            sender_name: row.get(6)?,
+                            from_sm_send: row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                            notify_on_delivery: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+                            notify_after_seconds: row.get::<_, Option<i64>>(9)?.map(i64_to_u64),
+                            notify_on_stop: row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
+                            remind_soft_threshold: row.get::<_, Option<i64>>(11)?.map(i64_to_u64),
+                            remind_hard_threshold: row.get::<_, Option<i64>>(12)?.map(i64_to_u64),
+                            remind_cancel_on_reply_session_id: row.get(13)?,
+                            parent_session_id: row.get(14)?,
+                            message_category: row.get(15)?,
+                            response_relay_source: row.get(16)?,
                         })
                     },
                 )?
@@ -253,15 +266,74 @@ impl RetainedQueueStore {
 
     pub fn mark_delivered(&self, message_id: &str) -> Result<()> {
         self.with_connection(|conn| {
-            conn.execute(
-                r#"
-                UPDATE message_queue
-                SET delivered_at = ?2
-                WHERE id = ?1 AND delivered_at IS NULL
-                "#,
-                params![message_id, now_rfc3339()],
-            )?;
+            let _ = mark_delivered_conn(conn, message_id)?;
             Ok(())
+        })
+    }
+
+    pub fn mark_delivered_and_apply_side_effects(&self, message: &PendingMessage) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<()> {
+                if !mark_delivered_conn(conn, &message.id)? {
+                    return Ok(());
+                }
+                if message.notify_on_delivery {
+                    if let Some(sender_session_id) = message.sender_session_id.as_deref() {
+                        enqueue_message_with_metadata_conn(
+                            conn,
+                            sender_session_id,
+                            &delivery_notification_text(message),
+                            "sequential",
+                            QueueMessageMetadata::default(),
+                        )?;
+                    }
+                }
+                if message.notify_on_stop {
+                    if let Some(sender_session_id) = message.sender_session_id.as_deref() {
+                        upsert_stop_notify_conn(
+                            conn,
+                            &message.target_session_id,
+                            sender_session_id,
+                            message.sender_name.as_deref().unwrap_or(""),
+                            0,
+                        )?;
+                    }
+                }
+                if let Some(soft_threshold) = message.remind_soft_threshold {
+                    let hard_threshold = message
+                        .remind_hard_threshold
+                        .unwrap_or_else(|| soft_threshold.saturating_add(120));
+                    register_remind_conn(
+                        conn,
+                        &message.target_session_id,
+                        soft_threshold,
+                        hard_threshold,
+                        message.remind_cancel_on_reply_session_id.as_deref(),
+                    )?;
+                }
+                if message.remind_soft_threshold.is_some() {
+                    if let Some(parent_session_id) = message.parent_session_id.as_deref() {
+                        register_parent_wake_conn(
+                            conn,
+                            &message.target_session_id,
+                            parent_session_id,
+                            600,
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -289,30 +361,30 @@ impl RetainedQueueStore {
         period_seconds: i64,
     ) -> Result<String> {
         self.with_connection(|conn| {
-            self.cancel_parent_wake_with_connection(conn, child_session_id)?;
-            let id = generate_record_id("wake");
-            conn.execute(
-                r#"
-                INSERT OR REPLACE INTO parent_wake_registrations
-                    (id, child_session_id, parent_session_id, period_seconds, registered_at,
-                     last_wake_at, last_status_at_prev_wake, escalated, is_active)
-                VALUES
-                    (?1, ?2, ?3, ?4, ?5, NULL, NULL, 0, 1)
-                "#,
-                params![
-                    id,
-                    child_session_id,
-                    parent_session_id,
-                    period_seconds,
-                    now_rfc3339()
-                ],
-            )?;
-            Ok(id)
+            register_parent_wake_conn(conn, child_session_id, parent_session_id, period_seconds)
+        })
+    }
+
+    pub fn register_remind(
+        &self,
+        target_session_id: &str,
+        soft_threshold_seconds: u64,
+        hard_threshold_seconds: u64,
+        cancel_on_reply_session_id: Option<&str>,
+    ) -> Result<String> {
+        self.with_connection(|conn| {
+            register_remind_conn(
+                conn,
+                target_session_id,
+                soft_threshold_seconds,
+                hard_threshold_seconds,
+                cancel_on_reply_session_id,
+            )
         })
     }
 
     pub fn cancel_parent_wake(&self, child_session_id: &str) -> Result<()> {
-        self.with_connection(|conn| self.cancel_parent_wake_with_connection(conn, child_session_id))
+        self.with_connection(|conn| cancel_parent_wake_conn(conn, child_session_id))
     }
 
     pub fn cancel_remind(&self, target_session_id: &str) -> Result<()> {
@@ -337,25 +409,12 @@ impl RetainedQueueStore {
         delay_seconds: i64,
     ) -> Result<()> {
         self.with_connection(|conn| {
-            conn.execute(
-                r#"
-                INSERT INTO rust_stop_notify_states
-                    (session_id, sender_session_id, sender_name, delay_seconds, armed_at)
-                VALUES
-                    (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    sender_session_id = excluded.sender_session_id,
-                    sender_name = excluded.sender_name,
-                    delay_seconds = excluded.delay_seconds,
-                    armed_at = excluded.armed_at
-                "#,
-                params![
-                    session_id,
-                    sender_session_id,
-                    sender_name,
-                    delay_seconds,
-                    now_rfc3339()
-                ],
+            upsert_stop_notify_conn(
+                conn,
+                session_id,
+                sender_session_id,
+                sender_name,
+                delay_seconds,
             )?;
             Ok(())
         })
@@ -374,21 +433,195 @@ impl RetainedQueueStore {
         init_schema(&conn)?;
         f(&conn)
     }
+}
 
-    fn cancel_parent_wake_with_connection(
-        &self,
-        conn: &Connection,
-        child_session_id: &str,
-    ) -> Result<()> {
-        conn.execute(
-            r#"
-            UPDATE parent_wake_registrations
-            SET is_active = 0
-            WHERE child_session_id = ?1
-                "#,
-            params![child_session_id],
-        )?;
-        Ok(())
+fn enqueue_message_with_metadata_conn(
+    conn: &Connection,
+    target_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    metadata: QueueMessageMetadata,
+) -> Result<String> {
+    let id = generate_record_id("msg");
+    let timeout_at = timeout_at_rfc3339(metadata.timeout_seconds)?;
+    let response_relay_source = metadata
+        .response_relay_source
+        .or_else(|| metadata.from_sm_send.then(|| "sm-send".to_owned()));
+    conn.execute(
+        r#"
+        INSERT INTO message_queue
+            (id, target_session_id, sender_session_id, sender_name, text,
+             delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery,
+             notify_after_seconds, notify_on_stop, remind_soft_threshold,
+             remind_hard_threshold, remind_cancel_on_reply_session_id, parent_session_id,
+             message_category, response_relay_source)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        "#,
+        params![
+            id,
+            target_session_id,
+            metadata.sender_session_id,
+            metadata.sender_name,
+            text,
+            delivery_mode,
+            metadata.from_sm_send,
+            now_rfc3339(),
+            timeout_at,
+            metadata.notify_on_delivery,
+            metadata.notify_after_seconds.map(u64_to_i64).transpose()?,
+            metadata.notify_on_stop,
+            metadata.remind_soft_threshold.map(u64_to_i64).transpose()?,
+            metadata.remind_hard_threshold.map(u64_to_i64).transpose()?,
+            metadata.remind_cancel_on_reply_session_id,
+            metadata.parent_session_id,
+            metadata.message_category,
+            response_relay_source,
+        ],
+    )?;
+    Ok(id)
+}
+
+fn mark_delivered_conn(conn: &Connection, message_id: &str) -> Result<bool> {
+    let changed = conn.execute(
+        r#"
+        UPDATE message_queue
+        SET delivered_at = ?2
+        WHERE id = ?1 AND delivered_at IS NULL
+        "#,
+        params![message_id, now_rfc3339()],
+    )?;
+    Ok(changed > 0)
+}
+
+fn register_remind_conn(
+    conn: &Connection,
+    target_session_id: &str,
+    soft_threshold_seconds: u64,
+    hard_threshold_seconds: u64,
+    cancel_on_reply_session_id: Option<&str>,
+) -> Result<String> {
+    let id = generate_record_id("remind");
+    let now = now_rfc3339();
+    conn.execute(
+        "UPDATE remind_registrations SET is_active = 0 WHERE target_session_id = ?1",
+        params![target_session_id],
+    )?;
+    conn.execute(
+        r#"
+        INSERT OR REPLACE INTO remind_registrations
+            (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
+             registered_at, last_reset_at, cancel_on_reply_session_id, persistent_tracking,
+             tracked_status_nudge_fired, soft_fired, is_active)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 0, 0, 0, 1)
+        "#,
+        params![
+            id,
+            target_session_id,
+            u64_to_i64(soft_threshold_seconds)?,
+            u64_to_i64(hard_threshold_seconds)?,
+            now,
+            cancel_on_reply_session_id,
+        ],
+    )?;
+    Ok(id)
+}
+
+fn register_parent_wake_conn(
+    conn: &Connection,
+    child_session_id: &str,
+    parent_session_id: &str,
+    period_seconds: i64,
+) -> Result<String> {
+    cancel_parent_wake_conn(conn, child_session_id)?;
+    let id = generate_record_id("wake");
+    conn.execute(
+        r#"
+        INSERT OR REPLACE INTO parent_wake_registrations
+            (id, child_session_id, parent_session_id, period_seconds, registered_at,
+             last_wake_at, last_status_at_prev_wake, escalated, is_active)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, NULL, NULL, 0, 1)
+        "#,
+        params![
+            id,
+            child_session_id,
+            parent_session_id,
+            period_seconds,
+            now_rfc3339()
+        ],
+    )?;
+    Ok(id)
+}
+
+fn cancel_parent_wake_conn(conn: &Connection, child_session_id: &str) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE parent_wake_registrations
+        SET is_active = 0
+        WHERE child_session_id = ?1
+            "#,
+        params![child_session_id],
+    )?;
+    Ok(())
+}
+
+fn upsert_stop_notify_conn(
+    conn: &Connection,
+    session_id: &str,
+    sender_session_id: &str,
+    sender_name: &str,
+    delay_seconds: i64,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO rust_stop_notify_states
+            (session_id, sender_session_id, sender_name, delay_seconds, armed_at)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(session_id) DO UPDATE SET
+            sender_session_id = excluded.sender_session_id,
+            sender_name = excluded.sender_name,
+            delay_seconds = excluded.delay_seconds,
+            armed_at = excluded.armed_at
+        "#,
+        params![
+            session_id,
+            sender_session_id,
+            sender_name,
+            delay_seconds,
+            now_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn delivery_notification_text(message: &PendingMessage) -> String {
+    let truncated = truncate_chars(&message.text, 100);
+    format!(
+        "[sm] Message delivered to {}\nOriginal: \"{}\"",
+        message.target_session_id, truncated
+    )
+}
+
+pub fn followup_notification_text(message: &PendingMessage) -> Option<String> {
+    let seconds = message.notify_after_seconds?;
+    let truncated = truncate_chars(&message.text, 100);
+    Some(format!(
+        "[sm] Reminder: {seconds}s since your message to {} was delivered\n\
+Original: \"{}\"\n\
+You can check status with: sm output {}",
+        message.target_session_id, truncated, message.target_session_id
+    ))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 
@@ -596,6 +829,10 @@ fn timeout_at_rfc3339(timeout_seconds: Option<u64>) -> Result<Option<String>> {
 
 fn u64_to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).context("queue metadata seconds value is too large")
+}
+
+fn i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 #[cfg(test)]

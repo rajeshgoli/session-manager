@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -13,7 +14,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::queue::{QueueMessageMetadata, RetainedQueueStore};
+use crate::queue::{
+    followup_notification_text, PendingMessage, QueueMessageMetadata, RetainedQueueStore,
+};
 use crate::runtime::{TmuxRuntime, TmuxSessionSpec};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -308,31 +311,29 @@ impl SessionStore {
             if let Some(queue) = &self.queue_store {
                 let metadata =
                     queue_metadata_for_send_request(&state, session_id, &request, sender_name);
-                let has_delivery_side_effects = metadata.has_delivery_side_effects();
+                let pending_message = pending_message_from_metadata(
+                    session_id,
+                    &queued_text,
+                    &delivery_mode,
+                    &metadata,
+                );
                 let message_id = queue.enqueue_message_with_metadata(
                     session_id,
                     &queued_text,
                     &delivery_mode,
                     metadata,
                 )?;
-                if has_delivery_side_effects {
-                    return Ok(Some(CoreInputResult {
-                        ok: true,
-                        session_id: session_id.to_owned(),
-                        delivered: false,
-                        delivery_mode: request.delivery_mode,
-                        notify_after_seconds: request.notify_after_seconds,
-                        status: initial_status,
-                    }));
-                }
+                let pending_message = PendingMessage {
+                    id: message_id.clone(),
+                    ..pending_message
+                };
                 let drain = if delivery_mode == "urgent" {
                     deliver_urgent_runtime_message_raw(
                         &mut state,
                         session_id,
                         runtime,
                         queue,
-                        &message_id,
-                        &queued_text,
+                        &pending_message,
                     )?
                 } else {
                     drain_pending_runtime_messages_raw(
@@ -376,19 +377,6 @@ impl SessionStore {
             notify_after_seconds: request.notify_after_seconds,
             status,
         }))
-    }
-
-    pub fn runtime_send_delivery_side_effects_requested(
-        &self,
-        session_id: &str,
-        request: &SendCoreInputRequest,
-    ) -> Result<Option<bool>> {
-        let state = self.load_raw_json_value()?;
-        if raw_session_object(&state, session_id).is_none() {
-            return Ok(None);
-        }
-        let metadata = queue_metadata_for_send_request(&state, session_id, request, None);
-        Ok(Some(metadata.has_delivery_side_effects()))
     }
 
     pub fn clear_core_session(
@@ -1740,6 +1728,67 @@ fn push_retained_message_raw(
     Ok(())
 }
 
+fn upsert_remind_raw(
+    state: &mut Value,
+    target_session_id: &str,
+    soft_threshold_seconds: u64,
+    hard_threshold_seconds: u64,
+    cancel_on_reply_session_id: Option<&str>,
+) -> Result<()> {
+    let registrations = ensure_array_field_mut(state, "retained_remind_registrations")?;
+    let record = json!({
+        "id": format!("rust-remind-{target_session_id}"),
+        "session_id": target_session_id,
+        "target_session_id": target_session_id,
+        "soft_threshold_seconds": soft_threshold_seconds,
+        "hard_threshold_seconds": hard_threshold_seconds,
+        "cancel_on_reply_session_id": cancel_on_reply_session_id,
+        "registered_at": now_rfc3339(),
+        "last_reset_at": now_rfc3339(),
+        "tracked_status_nudge_fired": false,
+        "soft_fired": false,
+        "persistent_tracking": false,
+        "is_active": true,
+    });
+    if let Some(existing) = registrations.iter_mut().find(|entry| {
+        entry.get("session_id").and_then(Value::as_str) == Some(target_session_id)
+            || entry.get("target_session_id").and_then(Value::as_str) == Some(target_session_id)
+    }) {
+        *existing = record;
+    } else {
+        registrations.push(record);
+    }
+    Ok(())
+}
+
+fn upsert_parent_wake_raw(
+    state: &mut Value,
+    child_session_id: &str,
+    parent_session_id: &str,
+    period_seconds: i64,
+) -> Result<()> {
+    let registrations = ensure_array_field_mut(state, "retained_parent_wake_registrations")?;
+    let record = json!({
+        "id": format!("rust-wake-{child_session_id}"),
+        "child_session_id": child_session_id,
+        "parent_session_id": parent_session_id,
+        "period_seconds": period_seconds,
+        "registered_at": now_rfc3339(),
+        "last_wake_at": null,
+        "last_status_at_prev_wake": null,
+        "escalated": false,
+        "is_active": true,
+    });
+    if let Some(existing) = registrations.iter_mut().find(|entry| {
+        entry.get("child_session_id").and_then(Value::as_str) == Some(child_session_id)
+    }) {
+        *existing = record;
+    } else {
+        registrations.push(record);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct QueueDrainResult {
     status: String,
@@ -1779,6 +1828,36 @@ fn format_send_input_text_raw(
         ),
         Some(sender_name),
     )
+}
+
+fn pending_message_from_metadata(
+    target_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    metadata: &QueueMessageMetadata,
+) -> PendingMessage {
+    PendingMessage {
+        id: String::new(),
+        target_session_id: target_session_id.to_owned(),
+        text: text.to_owned(),
+        delivery_mode: delivery_mode.to_owned(),
+        has_delivery_side_effects: metadata.has_delivery_side_effects(),
+        sender_session_id: metadata.sender_session_id.clone(),
+        sender_name: metadata.sender_name.clone(),
+        from_sm_send: metadata.from_sm_send,
+        notify_on_delivery: metadata.notify_on_delivery,
+        notify_after_seconds: metadata.notify_after_seconds,
+        notify_on_stop: metadata.notify_on_stop,
+        remind_soft_threshold: metadata.remind_soft_threshold,
+        remind_hard_threshold: metadata.remind_hard_threshold,
+        remind_cancel_on_reply_session_id: metadata.remind_cancel_on_reply_session_id.clone(),
+        parent_session_id: metadata.parent_session_id.clone(),
+        message_category: metadata.message_category.clone(),
+        response_relay_source: metadata
+            .response_relay_source
+            .clone()
+            .or_else(|| metadata.from_sm_send.then(|| "sm-send".to_owned())),
+    }
 }
 
 fn queue_metadata_for_send_request(
@@ -1835,6 +1914,16 @@ fn raw_session_object<'a>(state: &'a Value, session_id: &str) -> Option<&'a Map<
 
 fn short_session_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn runtime_session_status_raw(state: &mut Value, session_id: &str) -> Result<Option<String>> {
@@ -1944,10 +2033,6 @@ fn drain_pending_runtime_messages_raw(
 
         let mut should_continue = true;
         for message in messages {
-            if message.has_delivery_side_effects {
-                should_continue = false;
-                break;
-            }
             let (next_status, delivered) =
                 if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
                     deliver_urgent_runtime_text_to_session_raw(
@@ -1964,7 +2049,7 @@ fn drain_pending_runtime_messages_raw(
                 should_continue = false;
                 break;
             }
-            queue.mark_delivered(&message.id)?;
+            complete_runtime_message_delivery_raw(state, queue, &message)?;
             let delivered_target =
                 stop_after_message_id.is_some_and(|target_id| target_id == message.id);
             delivered_message_ids.push(message.id);
@@ -1984,20 +2069,99 @@ fn drain_pending_runtime_messages_raw(
     })
 }
 
+fn complete_runtime_message_delivery_raw(
+    state: &mut Value,
+    queue: &RetainedQueueStore,
+    message: &PendingMessage,
+) -> Result<()> {
+    queue.mark_delivered_and_apply_side_effects(message)?;
+
+    if message.notify_on_delivery {
+        if let Some(sender_session_id) = message.sender_session_id.as_deref() {
+            push_retained_message_raw(
+                state,
+                sender_session_id,
+                &runtime_delivery_notification_text(message),
+                "sequential",
+                None,
+            )?;
+        }
+    }
+
+    if message.notify_on_stop {
+        if let Some(sender_session_id) = message.sender_session_id.as_deref() {
+            upsert_stop_notify_raw(
+                state,
+                &message.target_session_id,
+                sender_session_id,
+                message.sender_name.as_deref().unwrap_or(""),
+                0,
+            )?;
+        }
+    }
+
+    if let Some(soft_threshold) = message.remind_soft_threshold {
+        let hard_threshold = message
+            .remind_hard_threshold
+            .unwrap_or_else(|| soft_threshold.saturating_add(120));
+        upsert_remind_raw(
+            state,
+            &message.target_session_id,
+            soft_threshold,
+            hard_threshold,
+            message.remind_cancel_on_reply_session_id.as_deref(),
+        )?;
+        if let Some(parent_session_id) = message.parent_session_id.as_deref() {
+            upsert_parent_wake_raw(state, &message.target_session_id, parent_session_id, 600)?;
+        }
+    }
+
+    schedule_runtime_followup_notification(queue.clone(), message.clone());
+    Ok(())
+}
+
+fn runtime_delivery_notification_text(message: &PendingMessage) -> String {
+    let truncated = truncate_chars(&message.text, 100);
+    format!(
+        "[sm] Message delivered to {}\nOriginal: \"{}\"",
+        message.target_session_id, truncated
+    )
+}
+
+fn schedule_runtime_followup_notification(queue: RetainedQueueStore, message: PendingMessage) {
+    let Some(sender_session_id) = message.sender_session_id.clone() else {
+        return;
+    };
+    let Some(seconds) = message.notify_after_seconds else {
+        return;
+    };
+    if seconds == 0 {
+        return;
+    }
+    let Some(text) = followup_notification_text(&message) else {
+        return;
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            let _ = queue.enqueue_message(&sender_session_id, &text, "sequential", None);
+        });
+    }
+}
+
 fn deliver_urgent_runtime_message_raw(
     state: &mut Value,
     session_id: &str,
     runtime: &TmuxRuntime,
     queue: &RetainedQueueStore,
-    message_id: &str,
-    text: &str,
+    message: &PendingMessage,
 ) -> Result<QueueDrainResult> {
     let (status, delivered) =
-        deliver_urgent_runtime_text_to_session_raw(state, session_id, text, runtime)?;
+        deliver_urgent_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?;
     let mut delivered_message_ids = Vec::new();
     if delivered {
-        queue.mark_delivered(message_id)?;
-        delivered_message_ids.push(message_id.to_owned());
+        complete_runtime_message_delivery_raw(state, queue, message)?;
+        delivered_message_ids.push(message.id.clone());
     }
     Ok(QueueDrainResult {
         status,
