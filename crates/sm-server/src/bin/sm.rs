@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Read, Write},
+    io::{self, IsTerminal, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     process, thread,
@@ -68,7 +68,7 @@ enum Command {
     Codex(ProviderLaunchArgs),
     #[command(name = "codex-app")]
     CodexApp(ProviderLaunchArgs),
-    #[command(name = "codex-fork")]
+    #[command(name = "codex-fork", alias = "codex_fork")]
     CodexFork(ProviderLaunchArgs),
     #[command(name = "codex-2")]
     Codex2(ProviderLaunchArgs),
@@ -130,6 +130,8 @@ struct ForkArgs {
 #[derive(Args)]
 struct NewArgs {
     working_dir: Option<String>,
+    #[arg(long)]
+    node: Option<String>,
 }
 
 #[derive(Args)]
@@ -294,6 +296,8 @@ enum RequestCodexReviewCommand {
 #[derive(Args)]
 struct ProviderLaunchArgs {
     working_dir: Option<String>,
+    #[arg(long)]
+    node: Option<String>,
 }
 
 struct ApiClient {
@@ -444,6 +448,42 @@ fn run() -> Result<()> {
                 );
             }
         }
+        Command::New(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("new")?,
+            args.working_dir,
+            args.node,
+        )?,
+        Command::Claude(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("claude")?,
+            args.working_dir,
+            args.node,
+        )?,
+        Command::Codex(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("codex")?,
+            args.working_dir,
+            args.node,
+        )?,
+        Command::CodexFork(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("codex-fork")?,
+            args.working_dir,
+            args.node,
+        )?,
+        Command::Codex2(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("codex-2")?,
+            args.working_dir,
+            args.node,
+        )?,
+        Command::CodexApp(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("codex-app")?,
+            args.working_dir,
+            args.node,
+        )?,
         Command::Send(args) => {
             let text = args.text.join(" ");
             if text.trim().is_empty() {
@@ -829,6 +869,113 @@ fn send_input_payload(text: String, delivery_mode: &str, wait: Option<u64>) -> V
         payload["sender_session_id"] = json!(sender_session_id);
     }
     payload
+}
+
+fn launch_provider_for_alias(alias: &str) -> Result<&'static str> {
+    match alias {
+        "new" | "claude" => Ok("claude"),
+        "codex" | "codex-fork" | "codex_fork" | "codex-2" => Ok("codex-fork"),
+        "codex-app" => Ok("codex-app"),
+        _ => bail!("unsupported launch alias {alias}"),
+    }
+}
+
+fn launch_provider_session(
+    client: &ApiClient,
+    provider: &str,
+    working_dir: Option<String>,
+    node: Option<String>,
+) -> Result<()> {
+    let working_dir = resolve_launch_working_dir(working_dir, node.as_deref())?;
+    if let Some(node) = node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        println!("Creating session on node {node} in {working_dir}...");
+    } else {
+        println!("Creating session in {working_dir}...");
+    }
+    let parent_session_id = optional_current_session_id();
+    let payload = create_launch_session_payload(
+        provider,
+        &working_dir,
+        parent_session_id.as_deref(),
+        node.as_deref(),
+    );
+    let response = client.post_json("/sessions", payload)?;
+    if let Some(error) = response["error"]
+        .as_str()
+        .or_else(|| response["detail"].as_str())
+    {
+        bail!("{error}");
+    }
+    let session_id = response["id"]
+        .as_str()
+        .or_else(|| response["session_id"].as_str())
+        .ok_or_else(|| anyhow!("create response missing id"))?;
+    let response_provider = response["provider"].as_str().unwrap_or(provider);
+    if response_provider == "codex-app" {
+        println!("Codex app session created: {session_id}");
+        println!("No tmux attach for Codex app sessions.");
+        return Ok(());
+    }
+    println!("Session created: {session_id}");
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        println!(
+            "Automatic attach skipped: current shell is not interactive. Run `sm attach {session_id}` from an interactive terminal."
+        );
+        return Ok(());
+    }
+    let tmux_session = response["tmux_session"].as_str().unwrap_or(session_id);
+    println!("Attaching to {tmux_session}...");
+    attach_session(client, session_id)
+}
+
+fn create_launch_session_payload(
+    provider: &str,
+    working_dir: &str,
+    parent_session_id: Option<&str>,
+    node: Option<&str>,
+) -> Value {
+    json!({
+        "provider": provider,
+        "working_dir": working_dir,
+        "parent_session_id": parent_session_id,
+        "node": node
+    })
+}
+
+fn resolve_launch_working_dir(working_dir: Option<String>, node: Option<&str>) -> Result<String> {
+    let raw = match working_dir {
+        Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
+        _ => env::current_dir()
+            .with_context(|| "failed to resolve current directory")?
+            .display()
+            .to_string(),
+    };
+    if node.map(is_primary_node_alias) == Some(false) {
+        return Ok(raw);
+    }
+    let path = expand_home_path(&raw);
+    if !path.exists() {
+        bail!("Directory does not exist: {raw}");
+    }
+    if !path.is_dir() {
+        bail!("Not a directory: {raw}");
+    }
+    Ok(path
+        .canonicalize()
+        .with_context(|| format!("Invalid path: {}", path.display()))?
+        .display()
+        .to_string())
+}
+
+fn is_primary_node_alias(node: &str) -> bool {
+    matches!(
+        node.trim(),
+        "" | "primary" | "local" | "localhost" | "studio"
+    )
 }
 
 fn wait_for_session(client: &ApiClient, session_id: &str, seconds: u64) -> Result<()> {
@@ -1628,6 +1775,67 @@ mod tests {
         assert_eq!(
             subagent_stop_summary(&legacy_payload).as_deref(),
             Some("legacy summary")
+        );
+    }
+
+    #[test]
+    fn launch_provider_aliases_match_retained_surface() {
+        assert_eq!(launch_provider_for_alias("new").unwrap(), "claude");
+        assert_eq!(launch_provider_for_alias("claude").unwrap(), "claude");
+        assert_eq!(launch_provider_for_alias("codex").unwrap(), "codex-fork");
+        assert_eq!(
+            launch_provider_for_alias("codex-fork").unwrap(),
+            "codex-fork"
+        );
+        assert_eq!(
+            launch_provider_for_alias("codex_fork").unwrap(),
+            "codex-fork"
+        );
+        assert_eq!(launch_provider_for_alias("codex-2").unwrap(), "codex-fork");
+        assert_eq!(launch_provider_for_alias("codex-app").unwrap(), "codex-app");
+        assert!(launch_provider_for_alias("codex-legacy").is_err());
+    }
+
+    #[test]
+    fn launch_create_payload_preserves_parent_and_node() {
+        let payload =
+            create_launch_session_payload("claude", "/repo", Some("parent001"), Some("worker"));
+
+        assert_eq!(payload["provider"], "claude");
+        assert_eq!(payload["working_dir"], "/repo");
+        assert_eq!(payload["parent_session_id"], "parent001");
+        assert_eq!(payload["node"], "worker");
+
+        let top_level = create_launch_session_payload("codex-fork", "/repo", None, None);
+        assert_eq!(top_level["provider"], "codex-fork");
+        assert_eq!(top_level["parent_session_id"], Value::Null);
+        assert_eq!(top_level["node"], Value::Null);
+    }
+
+    #[test]
+    fn launch_working_dir_validates_local_but_preserves_remote_paths() {
+        let local_dir = env::temp_dir().join(format!(
+            "sm-rust-launch-dir-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&local_dir).unwrap();
+
+        let resolved =
+            resolve_launch_working_dir(Some(local_dir.display().to_string()), None).unwrap();
+        assert_eq!(PathBuf::from(resolved), local_dir.canonicalize().unwrap());
+
+        let missing_local = local_dir.join("missing");
+        assert!(
+            resolve_launch_working_dir(Some(missing_local.display().to_string()), None).is_err()
+        );
+
+        let remote_path = "/remote/node/project";
+        assert_eq!(
+            resolve_launch_working_dir(Some(remote_path.to_owned()), Some("worker")).unwrap(),
+            remote_path
         );
     }
 
