@@ -44,8 +44,9 @@ async fn get_response(app: axum::Router, uri: &str) -> (StatusCode, HeaderMap, V
 }
 
 async fn post_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, Value) {
-    post_json_with_headers_and_peer(
+    json_request_with_headers_and_peer(
         app,
+        "POST",
         uri,
         payload,
         &[],
@@ -61,8 +62,43 @@ async fn post_json_with_headers_and_peer(
     headers: &[(&str, &str)],
     peer_addr: Option<SocketAddr>,
 ) -> (StatusCode, Value) {
+    json_request_with_headers_and_peer(app, "POST", uri, payload, headers, peer_addr).await
+}
+
+async fn put_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, Value) {
+    json_request_with_headers_and_peer(
+        app,
+        "PUT",
+        uri,
+        payload,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await
+}
+
+async fn delete_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, Value) {
+    json_request_with_headers_and_peer(
+        app,
+        "DELETE",
+        uri,
+        payload,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await
+}
+
+async fn json_request_with_headers_and_peer(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    payload: Value,
+    headers: &[(&str, &str)],
+    peer_addr: Option<SocketAddr>,
+) -> (StatusCode, Value) {
     let mut builder = Request::builder()
-        .method("POST")
+        .method(method)
         .uri(uri)
         .header("content-type", "application/json");
     for (name, value) in headers {
@@ -1379,6 +1415,293 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
 }
 
 #[tokio::test]
+async fn fixture_registry_and_maintainer_endpoints_round_trip_state() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "registryowner",
+            "name": "registry-owner",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "otherowner",
+            "name": "other-owner",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = put_json(
+        app.clone(),
+        "/sessions/registryowner/maintainer",
+        json!({ "requester_session_id": "otherowner" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(payload["detail"], "sm maintainer is self-directed only");
+
+    let (status, payload) = put_json(
+        app.clone(),
+        "/sessions/registryowner/maintainer",
+        json!({ "requester_session_id": "registryowner" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "registryowner");
+    assert_eq!(payload["aliases"], json!(["maintainer"]));
+    assert_eq!(payload["is_maintainer"], true);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/registryowner/registry",
+        json!({
+            "requester_session_id": "registryowner",
+            "role": "Review Owner"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["role"], "review-owner");
+    assert_eq!(payload["session_id"], "registryowner");
+    assert_eq!(payload["friendly_name"], "maintainer");
+    assert_eq!(payload["provider"], "claude");
+    assert_eq!(payload["activity_state"], "working");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/otherowner/registry",
+        json!({
+            "requester_session_id": "otherowner",
+            "role": "review-owner"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        payload["detail"],
+        "Role \"review-owner\" is already registered to registryowner"
+    );
+
+    let (status, payload) = get_json(app.clone(), "/registry/review-owner").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["role"], "review-owner");
+    assert_eq!(payload["session_id"], "registryowner");
+
+    let (status, payload) = get_json(app.clone(), "/registry").await;
+    assert_eq!(status, StatusCode::OK);
+    let roles = payload["registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["role"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(roles, vec!["maintainer", "review-owner"]);
+
+    let (status, payload) = get_json(app.clone(), "/sessions/registryowner").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["aliases"], json!(["maintainer", "review-owner"]));
+
+    let (status, payload) = delete_json(
+        app.clone(),
+        "/sessions/otherowner/registry",
+        json!({
+            "requester_session_id": "otherowner",
+            "role": "review-owner"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(payload["detail"], "Role is not owned by this session");
+
+    let (status, payload) = delete_json(
+        app.clone(),
+        "/sessions/registryowner/registry",
+        json!({
+            "requester_session_id": "registryowner",
+            "role": "review-owner"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["role"], "review-owner");
+    assert_eq!(payload["session_id"], "registryowner");
+
+    let (status, payload) = get_json(app.clone(), "/registry/review-owner").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Role not registered" }));
+
+    let (status, payload) = delete_json(
+        app.clone(),
+        "/sessions/registryowner/maintainer",
+        json!({ "requester_session_id": "registryowner" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "registryowner");
+    assert_eq!(payload["aliases"], json!([]));
+    assert_eq!(payload["is_maintainer"], false);
+}
+
+#[tokio::test]
+async fn fixture_registry_prunes_stale_roles_and_updates_maintainer_alias() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "liveagent",
+                    "name": "claude-liveagent",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-liveagent",
+                    "log_file": "/tmp/liveagent.log",
+                    "status": "running",
+                    "provider": "claude",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "restorable",
+                    "name": "claude-restorable",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-restorable",
+                    "log_file": "/tmp/restorable.log",
+                    "status": "stopped",
+                    "provider": "claude",
+                    "provider_resume_id": "resume-restorable",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
+                },
+                {
+                    "id": "staleagent",
+                    "name": "claude-staleagent",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-staleagent",
+                    "log_file": "/tmp/staleagent.log",
+                    "status": "stopped",
+                    "provider": "claude",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
+                }
+            ],
+            "maintainer_session_id": "staleagent",
+            "agent_registrations": [
+                {
+                    "role": "Live Role",
+                    "session_id": "liveagent",
+                    "created_at": "2026-06-01T00:03:00"
+                },
+                {
+                    "role": "Restorable Role",
+                    "session_id": "restorable",
+                    "created_at": "2026-06-01T00:03:01"
+                },
+                {
+                    "role": "Stale Role",
+                    "session_id": "staleagent",
+                    "created_at": "2026-06-01T00:03:02"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app.clone(), "/registry").await;
+    assert_eq!(status, StatusCode::OK);
+    let roles = payload["registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["role"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(roles, vec!["live-role", "restorable-role"]);
+
+    let (status, payload) = get_json(app.clone(), "/registry/stale-role").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Role not registered" }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(raw_state["maintainer_session_id"], Value::Null);
+    assert_eq!(
+        raw_state["agent_role_last_session_ids"]["stale-role"],
+        "staleagent"
+    );
+    assert!(raw_state["agent_registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["role"] != "stale-role"));
+}
+
+#[tokio::test]
+async fn fixture_registry_clears_stale_legacy_maintainer_without_registration() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "staleonly",
+                    "name": "claude-staleonly",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-staleonly",
+                    "log_file": "/tmp/staleonly.log",
+                    "status": "stopped",
+                    "provider": "claude",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
+                }
+            ],
+            "maintainer_session_id": "staleonly",
+            "agent_registrations": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/registry").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "registrations": [] }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(raw_state["maintainer_session_id"], Value::Null);
+    assert_eq!(
+        raw_state["agent_role_last_session_ids"]["maintainer"],
+        "staleonly"
+    );
+}
+
+#[tokio::test]
 async fn shadow_attach_descriptor_reuses_real_attach_support_rules() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -2686,7 +3009,7 @@ async fn sessions_project_top_level_registry_and_adoption_state() {
     let state_file = write_registry_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
-    let (status, payload) = get_json(app, "/sessions").await;
+    let (status, payload) = get_json(app.clone(), "/sessions").await;
 
     assert_eq!(status, StatusCode::OK);
     let sessions = payload["sessions"].as_array().unwrap();
@@ -2716,6 +3039,22 @@ async fn sessions_project_top_level_registry_and_adoption_state() {
             }
         ])
     );
+
+    let (status, payload) = get_json(app, "/registry").await;
+    assert_eq!(status, StatusCode::OK);
+    let roles = payload["registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["role"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(roles, vec!["maintainer", "reviewer"]);
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert!(raw_state["agent_registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["role"] == "maintainer" && entry["session_id"] == "em123456"));
 }
 
 fn config_with_state_file(state_file: &PathBuf) -> AppConfig {

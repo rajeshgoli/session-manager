@@ -594,6 +594,209 @@ impl SessionStore {
         }))
     }
 
+    pub fn list_agent_registrations(&self) -> Result<Vec<AgentRegistrationResponse>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut changed = recover_missing_maintainer_registration_raw(&mut state)?;
+        changed |= prune_agent_registrations_raw(&mut state)?;
+        let registrations = agent_registration_responses_from_state(&state)?;
+        if changed {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(registrations)
+    }
+
+    pub fn lookup_agent_registration(
+        &self,
+        role: &str,
+    ) -> Result<Option<AgentRegistrationResponse>> {
+        let normalized_role = normalize_role(role);
+        if normalized_role.is_empty() {
+            return Ok(None);
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut changed = recover_missing_maintainer_registration_raw(&mut state)?;
+        changed |= prune_agent_registrations_raw(&mut state)?;
+        let registration = agent_registration_responses_from_state(&state)?
+            .into_iter()
+            .find(|registration| registration.role == normalized_role);
+        if changed {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(registration)
+    }
+
+    pub fn register_agent_role(
+        &self,
+        session_id: &str,
+        request: RoleRegistrationRequest,
+    ) -> Result<RegistryMutationOutcome> {
+        if request.requester_session_id.trim() != session_id {
+            return Ok(RegistryMutationOutcome::BadRequest(
+                "sm register is self-directed only".to_owned(),
+            ));
+        }
+        self.register_agent_role_raw(session_id, &request.role)
+    }
+
+    pub fn unregister_agent_role(
+        &self,
+        session_id: &str,
+        request: RoleRegistrationRequest,
+    ) -> Result<RegistryMutationOutcome> {
+        if request.requester_session_id.trim() != session_id {
+            return Ok(RegistryMutationOutcome::BadRequest(
+                "sm unregister is self-directed only".to_owned(),
+            ));
+        }
+        self.unregister_agent_role_raw(session_id, &request.role)
+    }
+
+    pub fn set_maintainer_session(
+        &self,
+        session_id: &str,
+        request: SetMaintainerRequest,
+    ) -> Result<MaintainerMutationOutcome> {
+        if request.requester_session_id.trim() != session_id {
+            return Ok(MaintainerMutationOutcome::BadRequest(
+                "sm maintainer is self-directed only".to_owned(),
+            ));
+        }
+        match self.register_agent_role_raw(session_id, "maintainer")? {
+            RegistryMutationOutcome::Registered(_) => {
+                let session = self.get_session(session_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("session disappeared after maintainer update")
+                })?;
+                Ok(MaintainerMutationOutcome::Updated(session))
+            }
+            RegistryMutationOutcome::NotFound => Ok(MaintainerMutationOutcome::NotFound),
+            RegistryMutationOutcome::BadRequest(_) | RegistryMutationOutcome::Conflict(_) => Ok(
+                MaintainerMutationOutcome::BadRequest("Failed to register maintainer".to_owned()),
+            ),
+            RegistryMutationOutcome::RoleNotRegistered | RegistryMutationOutcome::RoleNotOwned => {
+                Ok(MaintainerMutationOutcome::BadRequest(
+                    "Failed to register maintainer".to_owned(),
+                ))
+            }
+        }
+    }
+
+    pub fn clear_maintainer_session(
+        &self,
+        session_id: &str,
+        request: SetMaintainerRequest,
+    ) -> Result<MaintainerMutationOutcome> {
+        if request.requester_session_id.trim() != session_id {
+            return Ok(MaintainerMutationOutcome::BadRequest(
+                "sm maintainer --clear is self-directed only".to_owned(),
+            ));
+        }
+        match self.unregister_agent_role_raw(session_id, "maintainer")? {
+            RegistryMutationOutcome::Registered(_) => {
+                let session = self
+                    .get_session(session_id)?
+                    .ok_or_else(|| anyhow::anyhow!("session disappeared after maintainer clear"))?;
+                Ok(MaintainerMutationOutcome::Updated(session))
+            }
+            RegistryMutationOutcome::NotFound => Ok(MaintainerMutationOutcome::NotFound),
+            RegistryMutationOutcome::RoleNotRegistered
+            | RegistryMutationOutcome::RoleNotOwned
+            | RegistryMutationOutcome::BadRequest(_)
+            | RegistryMutationOutcome::Conflict(_) => Ok(MaintainerMutationOutcome::BadRequest(
+                "Session is not the active maintainer".to_owned(),
+            )),
+        }
+    }
+
+    fn register_agent_role_raw(
+        &self,
+        session_id: &str,
+        role: &str,
+    ) -> Result<RegistryMutationOutcome> {
+        let normalized_role = normalize_role(role);
+        if normalized_role.is_empty() {
+            return Ok(RegistryMutationOutcome::BadRequest(
+                "Role cannot be empty".to_owned(),
+            ));
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        recover_missing_maintainer_registration_raw(&mut state)?;
+        prune_agent_registrations_raw(&mut state)?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
+            return Ok(RegistryMutationOutcome::NotFound);
+        };
+        if session.is_stopped() {
+            return Ok(RegistryMutationOutcome::Conflict(
+                "Stopped sessions cannot register roles".to_owned(),
+            ));
+        }
+
+        let existing = find_raw_registration(&state, &normalized_role)?;
+        if let Some(existing) = existing
+            .as_ref()
+            .filter(|entry| entry.session_id != session_id)
+        {
+            return Ok(RegistryMutationOutcome::Conflict(format!(
+                "Role \"{}\" is already registered to {}",
+                normalized_role, existing.session_id
+            )));
+        }
+
+        let created_at = existing
+            .and_then(|entry| entry.created_at)
+            .unwrap_or_else(now_rfc3339);
+        upsert_raw_registration(&mut state, &normalized_role, session_id, &created_at)?;
+        sync_maintainer_alias_raw(&mut state)?;
+        let response = agent_registration_responses_from_state(&state)?
+            .into_iter()
+            .find(|registration| registration.role == normalized_role)
+            .ok_or_else(|| anyhow::anyhow!("registered role {normalized_role} was not readable"))?;
+        self.write_raw_json_value(&state)?;
+        Ok(RegistryMutationOutcome::Registered(response))
+    }
+
+    fn unregister_agent_role_raw(
+        &self,
+        session_id: &str,
+        role: &str,
+    ) -> Result<RegistryMutationOutcome> {
+        let normalized_role = normalize_role(role);
+        if normalized_role.is_empty() {
+            return Ok(RegistryMutationOutcome::BadRequest(
+                "Role cannot be empty".to_owned(),
+            ));
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        recover_missing_maintainer_registration_raw(&mut state)?;
+        prune_agent_registrations_raw(&mut state)?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if !sessions.iter().any(|session| session.id == session_id) {
+            return Ok(RegistryMutationOutcome::NotFound);
+        }
+
+        let registrations = agent_registration_responses_from_state(&state)?;
+        let Some(response) = registrations
+            .into_iter()
+            .find(|registration| registration.role == normalized_role)
+        else {
+            return Ok(RegistryMutationOutcome::RoleNotRegistered);
+        };
+        if response.session_id != session_id {
+            return Ok(RegistryMutationOutcome::RoleNotOwned);
+        }
+
+        remove_raw_registration(&mut state, &normalized_role)?;
+        sync_maintainer_alias_raw(&mut state)?;
+        self.write_raw_json_value(&state)?;
+        Ok(RegistryMutationOutcome::Registered(response))
+    }
+
     pub fn retire_core_session(
         &self,
         session_id: &str,
@@ -964,6 +1167,28 @@ pub struct HandoffRequest {
     pub file_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMaintainerRequest {
+    pub requester_session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoleRegistrationRequest {
+    pub requester_session_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRegistrationResponse {
+    pub role: String,
+    pub session_id: String,
+    pub friendly_name: Option<String>,
+    pub provider: Option<String>,
+    pub status: String,
+    pub activity_state: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreInputResult {
     pub ok: bool,
@@ -1050,6 +1275,23 @@ pub enum HandoffOutcome {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub enum RegistryMutationOutcome {
+    Registered(AgentRegistrationResponse),
+    NotFound,
+    RoleNotRegistered,
+    RoleNotOwned,
+    BadRequest(String),
+    Conflict(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum MaintainerMutationOutcome {
+    Updated(SessionRecord),
+    NotFound,
+    BadRequest(String),
+}
+
 fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read session state {}", path.display()))?;
@@ -1059,11 +1301,21 @@ fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
         .with_context(|| format!("failed to parse session records {}", path.display()))
 }
 
-fn ensure_sessions_array_mut(value: &mut Value) -> Result<&mut Vec<Value>> {
+fn snapshot_from_raw_value(value: &Value) -> Result<StateSnapshot> {
+    let raw = serde_json::from_value::<RawStateSnapshot>(value.clone())
+        .context("failed to parse raw session state")?;
+    StateSnapshot::try_from(raw).context("failed to parse raw session records")
+}
+
+fn ensure_object_mut(value: &mut Value) -> Result<&mut Map<String, Value>> {
     if !value.is_object() {
         *value = json!({});
     }
-    let object = value.as_object_mut().expect("object value set above");
+    Ok(value.as_object_mut().expect("object value set above"))
+}
+
+fn ensure_sessions_array_mut(value: &mut Value) -> Result<&mut Vec<Value>> {
+    let object = ensure_object_mut(value)?;
     let sessions = object
         .entry("sessions".to_owned())
         .or_insert_with(|| json!([]));
@@ -1071,6 +1323,258 @@ fn ensure_sessions_array_mut(value: &mut Value) -> Result<&mut Vec<Value>> {
         anyhow::bail!("session state field 'sessions' is not an array");
     }
     Ok(sessions.as_array_mut().expect("array checked above"))
+}
+
+fn ensure_agent_registrations_array_mut(value: &mut Value) -> Result<&mut Vec<Value>> {
+    let object = ensure_object_mut(value)?;
+    let registrations = object
+        .entry("agent_registrations".to_owned())
+        .or_insert_with(|| json!([]));
+    if !registrations.is_array() {
+        anyhow::bail!("session state field 'agent_registrations' is not an array");
+    }
+    Ok(registrations.as_array_mut().expect("array checked above"))
+}
+
+fn raw_registration_record(value: &Value) -> Option<AgentRegistrationRecord> {
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .map(normalize_role)
+        .filter(|role| !role.is_empty())?;
+    let session_id = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())?
+        .to_owned();
+    let created_at = value
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|created_at| !created_at.is_empty())
+        .map(ToOwned::to_owned);
+    Some(AgentRegistrationRecord {
+        role,
+        session_id,
+        created_at,
+    })
+}
+
+fn find_raw_registration(state: &Value, role: &str) -> Result<Option<AgentRegistrationRecord>> {
+    let normalized_role = normalize_role(role);
+    let registrations = state
+        .get("agent_registrations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(registrations
+        .iter()
+        .filter_map(raw_registration_record)
+        .find(|registration| registration.role == normalized_role))
+}
+
+fn upsert_raw_registration(
+    state: &mut Value,
+    role: &str,
+    session_id: &str,
+    created_at: &str,
+) -> Result<()> {
+    let normalized_role = normalize_role(role);
+    let registrations = ensure_agent_registrations_array_mut(state)?;
+    if let Some(existing) = registrations.iter_mut().find(|entry| {
+        entry
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|value| normalize_role(value) == normalized_role)
+    }) {
+        *existing = json!({
+            "role": normalized_role,
+            "session_id": session_id,
+            "created_at": created_at,
+        });
+        return Ok(());
+    }
+    registrations.push(json!({
+        "role": normalized_role,
+        "session_id": session_id,
+        "created_at": created_at,
+    }));
+    Ok(())
+}
+
+fn remove_raw_registration(state: &mut Value, role: &str) -> Result<()> {
+    let normalized_role = normalize_role(role);
+    let registrations = ensure_agent_registrations_array_mut(state)?;
+    registrations.retain(|entry| {
+        !entry
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|value| normalize_role(value) == normalized_role)
+    });
+    Ok(())
+}
+
+fn remember_role_last_session_raw(state: &mut Value, role: &str, session_id: &str) -> Result<()> {
+    if role.is_empty() || session_id.trim().is_empty() {
+        return Ok(());
+    }
+    let object = ensure_object_mut(state)?;
+    let last = object
+        .entry("agent_role_last_session_ids".to_owned())
+        .or_insert_with(|| json!({}));
+    if !last.is_object() {
+        *last = json!({});
+    }
+    last.as_object_mut()
+        .expect("object value set above")
+        .insert(role.to_owned(), Value::String(session_id.to_owned()));
+    Ok(())
+}
+
+fn sync_maintainer_alias_raw(state: &mut Value) -> Result<()> {
+    let maintainer = find_raw_registration(state, "maintainer")?;
+    let object = ensure_object_mut(state)?;
+    object.insert(
+        "maintainer_session_id".to_owned(),
+        maintainer
+            .map(|registration| Value::String(registration.session_id))
+            .unwrap_or(Value::Null),
+    );
+    Ok(())
+}
+
+fn recover_missing_maintainer_registration_raw(state: &mut Value) -> Result<bool> {
+    if find_raw_registration(state, "maintainer")?.is_some() {
+        return Ok(false);
+    }
+    let sessions = snapshot_from_raw_value(state)?.into_sessions();
+    let mut candidates = Vec::<(String, bool)>::new();
+    let legacy_maintainer_session_id = state
+        .get("maintainer_session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(session_id) = legacy_maintainer_session_id.as_deref() {
+        candidates.push((session_id.to_owned(), true));
+    }
+    if let Some(session_id) = state
+        .get("agent_role_last_session_ids")
+        .and_then(Value::as_object)
+        .and_then(|last| last.get("maintainer"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        candidates.push((session_id.to_owned(), false));
+    }
+
+    for (session_id, from_legacy_field) in candidates {
+        let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
+            continue;
+        };
+        if !session.is_restorable_for_registry() {
+            continue;
+        }
+        if !from_legacy_field && !session_has_maintainer_identity(session) {
+            continue;
+        }
+        upsert_raw_registration(state, "maintainer", &session_id, &now_rfc3339())?;
+        remember_role_last_session_raw(state, "maintainer", &session_id)?;
+        sync_maintainer_alias_raw(state)?;
+        return Ok(true);
+    }
+    if let Some(session_id) = legacy_maintainer_session_id {
+        remember_role_last_session_raw(state, "maintainer", &session_id)?;
+        sync_maintainer_alias_raw(state)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn session_has_maintainer_identity(session: &SessionRecord) -> bool {
+    [session.friendly_name.as_deref(), session.role.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| value.trim().eq_ignore_ascii_case("maintainer"))
+}
+
+fn prune_agent_registrations_raw(state: &mut Value) -> Result<bool> {
+    let restorable_session_ids = snapshot_from_raw_value(state)?
+        .into_sessions()
+        .into_iter()
+        .filter(SessionRecord::is_restorable_for_registry)
+        .map(|session| session.id)
+        .collect::<BTreeSet<_>>();
+    let mut removed = Vec::<AgentRegistrationRecord>::new();
+    {
+        let registrations = ensure_agent_registrations_array_mut(state)?;
+        registrations.retain(|entry| {
+            let Some(registration) = raw_registration_record(entry) else {
+                return false;
+            };
+            if restorable_session_ids.contains(&registration.session_id) {
+                return true;
+            }
+            removed.push(registration);
+            false
+        });
+    }
+    for registration in &removed {
+        remember_role_last_session_raw(state, &registration.role, &registration.session_id)?;
+    }
+    if !removed.is_empty() {
+        sync_maintainer_alias_raw(state)?;
+    }
+    Ok(!removed.is_empty())
+}
+
+fn agent_registration_responses_from_state(
+    state: &Value,
+) -> Result<Vec<AgentRegistrationResponse>> {
+    let sessions = snapshot_from_raw_value(state)?.into_sessions();
+    let sessions_by_id = sessions
+        .into_iter()
+        .map(|session| (session.id.clone(), session))
+        .collect::<BTreeMap<_, _>>();
+    let mut responses = state
+        .get("agent_registrations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(raw_registration_record)
+        .filter_map(|registration| {
+            let session = sessions_by_id.get(&registration.session_id)?;
+            Some(agent_registration_response(
+                &registration.role,
+                session,
+                registration.created_at.as_deref(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    responses.sort_by(|left, right| left.role.cmp(&right.role));
+    Ok(responses)
+}
+
+fn agent_registration_response(
+    role: &str,
+    session: &SessionRecord,
+    created_at: Option<&str>,
+) -> AgentRegistrationResponse {
+    let status = normalized_status(&session.status);
+    AgentRegistrationResponse {
+        role: normalize_role(role),
+        session_id: session.id.clone(),
+        friendly_name: session.cached_display_name(),
+        provider: Some(non_empty_or(session.provider.clone(), "claude")),
+        status: status.to_owned(),
+        activity_state: fallback_activity_state(status),
+        created_at: created_at
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(now_rfc3339),
+    }
 }
 
 fn session_object_mut<'a>(
@@ -1428,6 +1932,8 @@ fn is_legacy_codex_app_record(value: &Value) -> bool {
 struct AgentRegistrationRecord {
     role: String,
     session_id: String,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2215,6 +2721,7 @@ mod tests {
             agent_registrations: vec![AgentRegistrationRecord {
                 role: "Reviewer".to_owned(),
                 session_id: "child001".to_owned(),
+                created_at: None,
             }],
             adoption_proposals: vec![AdoptionProposalRecord {
                 id: "proposal1".to_owned(),
@@ -2270,10 +2777,12 @@ mod tests {
                 AgentRegistrationRecord {
                     role: "Stale Role".to_owned(),
                     session_id: "dead001".to_owned(),
+                    created_at: None,
                 },
                 AgentRegistrationRecord {
                     role: "Restorable Role".to_owned(),
                     session_id: "restore1".to_owned(),
+                    created_at: None,
                 },
             ],
             adoption_proposals: Vec::new(),

@@ -17,7 +17,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{
@@ -38,7 +38,9 @@ use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ClearSessionRequest, ClientSessionResponse,
     ContextMonitorOutcome, ContextMonitorRequest, CoreClearOutcome, CoreRestoreOutcome,
     CoreRetireOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
     SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
+    SetMaintainerRequest,
 };
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
@@ -95,6 +97,16 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/restore", post(restore_session))
         .route("/sessions/{session_id}/clear", post(clear_session))
         .route("/sessions/{session_id}/handoff", post(schedule_handoff))
+        .route(
+            "/sessions/{session_id}/maintainer",
+            put(set_maintainer).delete(clear_maintainer),
+        )
+        .route(
+            "/sessions/{session_id}/registry",
+            post(register_agent_role).delete(unregister_agent_role),
+        )
+        .route("/registry", get(list_agent_registry))
+        .route("/registry/{role}", get(lookup_agent_registry))
         .route("/sessions/{session_id}/output", get(session_output))
         .route("/client/sessions", get(list_client_sessions))
         .route("/client/sessions/{session_id}", get(get_client_session))
@@ -786,6 +798,151 @@ async fn schedule_handoff(
     match result {
         HandoffOutcome::Recorded(result) => Ok(Json(serde_json::to_value(result)?)),
         HandoffOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
+    }
+}
+
+async fn set_maintainer(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SetMaintainerRequest>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/maintainer"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state
+        .session_store
+        .set_maintainer_session(&session_id, payload)?
+    {
+        MaintainerMutationOutcome::Updated(session) => Ok(Json(SessionResponse::from(session))),
+        MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+    }
+}
+
+async fn clear_maintainer(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SetMaintainerRequest>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/maintainer"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state
+        .session_store
+        .clear_maintainer_session(&session_id, payload)?
+    {
+        MaintainerMutationOutcome::Updated(session) => Ok(Json(SessionResponse::from(session))),
+        MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+    }
+}
+
+async fn list_agent_registry(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let registrations = state.session_store.list_agent_registrations()?;
+    Ok(Json(json!({ "registrations": registrations })))
+}
+
+async fn lookup_agent_registry(
+    State(state): State<Arc<AppState>>,
+    Path(role): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(registration) = state.session_store.lookup_agent_registration(&role)? else {
+        return Err(ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: "Role not registered".to_owned(),
+        });
+    };
+    Ok(Json(serde_json::to_value(registration)?))
+}
+
+async fn register_agent_role(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<RoleRegistrationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/registry"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    registry_mutation_response(
+        state
+            .session_store
+            .register_agent_role(&session_id, payload)?,
+    )
+}
+
+async fn unregister_agent_role(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<RoleRegistrationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/registry"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    registry_mutation_response(
+        state
+            .session_store
+            .unregister_agent_role(&session_id, payload)?,
+    )
+}
+
+fn registry_mutation_response(outcome: RegistryMutationOutcome) -> Result<Json<Value>, ApiError> {
+    match outcome {
+        RegistryMutationOutcome::Registered(registration) => {
+            Ok(Json(serde_json::to_value(registration)?))
+        }
+        RegistryMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        RegistryMutationOutcome::RoleNotRegistered => Err(ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: "Role not registered".to_owned(),
+        }),
+        RegistryMutationOutcome::RoleNotOwned => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Role is not owned by this session".to_owned(),
+        }),
+        RegistryMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+        RegistryMutationOutcome::Conflict(detail) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }),
     }
 }
 
