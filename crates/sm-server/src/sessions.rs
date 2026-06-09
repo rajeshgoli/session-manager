@@ -1494,6 +1494,14 @@ pub struct SendCoreInputRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SendCoreInputBatchRequest {
+    #[serde(flatten)]
+    pub input: SendCoreInputRequest,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentStatusRequest {
     #[serde(default)]
     pub text: Option<String>,
@@ -1564,6 +1572,32 @@ pub struct CoreInputResult {
     pub delivery_mode: String,
     pub notify_after_seconds: Option<u64>,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreInputBatchResult {
+    pub identifier: String,
+    pub status: String,
+    pub delivery_kind: String,
+    pub session_id: Option<String>,
+    pub target_name: Option<String>,
+    pub provider: Option<String>,
+    pub bootstrapped: bool,
+    pub queue_position: Option<u64>,
+    pub estimated_delivery: Option<String>,
+    pub email_username: Option<String>,
+    pub email_address: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreInputBatchResponse {
+    pub ok: bool,
+    pub requested_count: usize,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub delivery_mode: String,
+    pub results: Vec<CoreInputBatchResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
