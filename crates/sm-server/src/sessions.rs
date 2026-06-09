@@ -1045,6 +1045,7 @@ impl SessionStore {
         &self,
         session_id: &str,
         request: TaskCompleteRequest,
+        runtime: Option<&TmuxRuntime>,
     ) -> Result<TaskCompleteOutcome> {
         if request.requester_session_id.trim() != session_id {
             return Ok(TaskCompleteOutcome::Error(
@@ -1093,7 +1094,36 @@ impl SessionStore {
             let text =
                 format!("[sm task-complete] agent {session_id}({friendly}) completed its task.");
             if let Some(queue) = &self.queue_store {
-                queue.enqueue_message(&em_session_id, &text, "important", Some("task_complete"))?;
+                let message_id = queue.enqueue_message(
+                    &em_session_id,
+                    &text,
+                    "important",
+                    Some("task_complete"),
+                )?;
+                if let Some(runtime) = runtime {
+                    if let Some(parent_session) = raw_session_object(&state, &em_session_id) {
+                        let parent_node =
+                            json_text(parent_session.get("node")).unwrap_or_else(default_node);
+                        if is_primary_node(&parent_node) {
+                            let drain = drain_pending_runtime_messages_raw(
+                                self,
+                                &mut state,
+                                &em_session_id,
+                                runtime,
+                                queue,
+                                Some("important"),
+                                Some(&message_id),
+                            )?;
+                            if drain
+                                .delivered_message_ids
+                                .iter()
+                                .any(|delivered_id| delivered_id == &message_id)
+                            {
+                                clear_agent_task_completed_raw(&mut state, &em_session_id)?;
+                            }
+                        }
+                    }
+                }
             }
             push_retained_message_raw(
                 &mut state,
@@ -1742,6 +1772,14 @@ fn active_parent_wake_parent_raw(state: &Value, child_session_id: &str) -> Resul
                 .unwrap_or(true)
         })
         .and_then(|entry| json_text(entry.get("parent_session_id"))))
+}
+
+fn clear_agent_task_completed_raw(state: &mut Value, session_id: &str) -> Result<()> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    if let Some(session) = session_object_mut(sessions, session_id) {
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+    }
+    Ok(())
 }
 
 fn deactivate_parent_wake_raw(state: &mut Value, child_session_id: &str) -> Result<()> {

@@ -661,7 +661,15 @@ async fn task_complete(
         &format!("/sessions/{session_id}/task-complete"),
     )?;
     ensure_core_writes_enabled(&state)?;
-    match state.session_store.task_complete(&session_id, payload)? {
+    let runtime = state
+        .config
+        .rust_core
+        .runtime_enabled
+        .then(|| TmuxRuntime::from_config(&state.config.rust_core));
+    match state
+        .session_store
+        .task_complete(&session_id, payload, runtime.as_ref())?
+    {
         TaskCompleteOutcome::Completed(result) => Ok(Json(serde_json::to_value(result)?)),
         TaskCompleteOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
     }

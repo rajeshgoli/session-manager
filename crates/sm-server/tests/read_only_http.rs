@@ -3138,6 +3138,264 @@ async fn runtime_core_retire_delivers_stop_notify_side_effects() {
 }
 
 #[tokio::test]
+async fn runtime_core_task_complete_wakes_parent_runtime() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-task-complete-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimetaskparent",
+            "name": "runtime-task-parent",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "task parent initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimetaskchild",
+            "name": "runtime-task-child",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "parent_session_id": "runtimetaskparent",
+            "initial_message": "task child initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimetaskchild",
+        "runtime:task child initial",
+    )
+    .await;
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "runtimetaskparent")
+        .unwrap()["agent_task_completed_at"] = json!("2026-06-09T00:01:00Z");
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&raw_state).unwrap(),
+    )
+    .unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimetaskchild/task-complete",
+        json!({ "requester_session_id": "runtimetaskchild" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["em_notified"], true);
+
+    let notification =
+        "[sm task-complete] agent runtimetaskchild(runtime-task-child) completed its task.";
+    wait_for_output_contains(app.clone(), "runtimetaskparent", notification).await;
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let queued: (i64, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'runtimetaskparent'
+              AND message_category = 'task_complete'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        queued,
+        (1, "important".to_owned(), Some("task_complete".to_owned()))
+    );
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let parent = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "runtimetaskparent")
+        .unwrap();
+    assert_eq!(parent["agent_task_completed_at"], Value::Null);
+    let child = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "runtimetaskchild")
+        .unwrap();
+    assert!(child["agent_task_completed_at"].is_string());
+    assert_eq!(
+        raw_state["retained_pending_messages"][0]["text"],
+        notification
+    );
+
+    let remote_parent_log = unique_temp_path();
+    let child_log = unique_temp_path();
+    let remote_state = json!({
+        "sessions": [
+            {
+                "id": "remotetaskparent",
+                "name": "remote-task-parent",
+                "friendly_name": "remote-parent",
+                "working_dir": working_dir.display().to_string(),
+                "tmux_session": "remote-task-parent",
+                "log_file": remote_parent_log.display().to_string(),
+                "status": "running",
+                "node": "macbook",
+                "created_at": "2026-06-09T00:00:00Z",
+                "last_activity": "2026-06-09T00:00:00Z",
+                "agent_task_completed_at": "2026-06-09T00:01:00Z"
+            },
+            {
+                "id": "remotetaskchild",
+                "name": "remote-task-child",
+                "friendly_name": "remote-child",
+                "working_dir": working_dir.display().to_string(),
+                "tmux_session": "remote-task-child",
+                "log_file": child_log.display().to_string(),
+                "status": "running",
+                "node": "primary",
+                "parent_session_id": "remotetaskparent",
+                "created_at": "2026-06-09T00:00:00Z",
+                "last_activity": "2026-06-09T00:00:00Z"
+            }
+        ],
+        "retained_pending_messages": [],
+        "retained_remind_registrations": [],
+        "retained_parent_wake_registrations": [],
+        "retained_stop_notify_states": []
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&remote_state).unwrap(),
+    )
+    .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/remotetaskchild/task-complete",
+        json!({ "requester_session_id": "remotetaskchild" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["em_notified"], true);
+    let remote_queued: (i64, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'remotetaskparent'
+              AND message_category = 'task_complete'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        remote_queued,
+        (0, "important".to_owned(), Some("task_complete".to_owned()))
+    );
+    let remote_raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let remote_parent = remote_raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "remotetaskparent")
+        .unwrap();
+    assert!(remote_parent["agent_task_completed_at"].is_string());
+
+    let missing_parent_child_log = unique_temp_path();
+    let missing_parent_state = json!({
+        "sessions": [
+            {
+                "id": "missingparentchild",
+                "name": "missing-parent-child",
+                "friendly_name": "missing-parent-child",
+                "working_dir": working_dir.display().to_string(),
+                "tmux_session": "missing-parent-child",
+                "log_file": missing_parent_child_log.display().to_string(),
+                "status": "running",
+                "node": "primary",
+                "parent_session_id": "deletedparent",
+                "created_at": "2026-06-09T00:00:00Z",
+                "last_activity": "2026-06-09T00:00:00Z"
+            }
+        ],
+        "retained_pending_messages": [],
+        "retained_remind_registrations": [],
+        "retained_parent_wake_registrations": [],
+        "retained_stop_notify_states": []
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&missing_parent_state).unwrap(),
+    )
+    .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/missingparentchild/task-complete",
+        json!({ "requester_session_id": "missingparentchild" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["em_notified"], true);
+    let missing_parent_queued: (i64, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'deletedparent'
+              AND message_category = 'task_complete'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        missing_parent_queued,
+        (0, "important".to_owned(), Some("task_complete".to_owned()))
+    );
+    let missing_parent_raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let missing_parent_child = missing_parent_raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "missingparentchild")
+        .unwrap();
+    assert!(missing_parent_child["agent_task_completed_at"].is_string());
+}
+
+#[tokio::test]
 async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
     if !tmux_available() {
         return;
