@@ -585,78 +585,12 @@ impl SessionStore {
             ));
         }
         session.insert(
-            "last_handoff_path".to_owned(),
+            "pending_handoff_path".to_owned(),
             Value::String(request.file_path.clone()),
         );
         self.write_raw_json_value(&state)?;
         Ok(HandoffOutcome::Recorded(HandoffResult {
             status: "recorded".to_owned(),
-        }))
-    }
-
-    pub fn execute_handoff_with_runtime(
-        &self,
-        session_id: &str,
-        request: HandoffRequest,
-        runtime: &TmuxRuntime,
-    ) -> Result<HandoffOutcome> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        if request.requester_session_id.trim() != session_id {
-            return Ok(HandoffOutcome::Error(
-                "sm handoff is self-directed only - requester must equal target session".to_owned(),
-            ));
-        }
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(HandoffOutcome::Error(format!(
-                "Session {session_id} not found"
-            )));
-        };
-        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-        if provider == "codex-app" {
-            return Ok(HandoffOutcome::Error(
-                "sm handoff is not supported for codex-app sessions".to_owned(),
-            ));
-        }
-        let node = json_text(session.get("node")).unwrap_or_else(default_node);
-        ensure_runtime_local_node(&node)?;
-        let tmux_session = json_text(session.get("tmux_session"))
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-        let session_socket_name = json_text(session.get("tmux_socket_name"));
-        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let clear_command = if matches!(provider.as_str(), "codex" | "codex-fork") {
-            "/new"
-        } else {
-            "/clear"
-        };
-        let prompt = format!(
-            "Read {} and continue from where you left off.",
-            request.file_path
-        );
-        let wake_completed =
-            json_text(session.get("completion_status")).is_some_and(|value| value == "completed");
-        let delivered = session_runtime.clear_session(
-            &tmux_session,
-            clear_command,
-            Some(&prompt),
-            wake_completed,
-        )?;
-        if !delivered {
-            return Ok(HandoffOutcome::Error(
-                "tmux session is not running".to_owned(),
-            ));
-        }
-
-        let now = now_rfc3339();
-        reset_session_after_clear(session, &now);
-        session.insert(
-            "last_handoff_path".to_owned(),
-            Value::String(request.file_path.clone()),
-        );
-        self.write_raw_json_value(&state)?;
-        Ok(HandoffOutcome::Executed(HandoffResult {
-            status: "executed".to_owned(),
         }))
     }
 
@@ -1113,7 +1047,6 @@ pub struct HandoffResult {
 #[derive(Debug, Clone)]
 pub enum HandoffOutcome {
     Recorded(HandoffResult),
-    Executed(HandoffResult),
     Error(String),
 }
 
