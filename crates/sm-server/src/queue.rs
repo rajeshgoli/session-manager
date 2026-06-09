@@ -105,6 +105,41 @@ impl RetainedQueueStore {
         })
     }
 
+    pub fn pending_messages_for_target_by_mode(
+        &self,
+        target_session_id: &str,
+        delivery_mode: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingMessage>> {
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare(
+                r#"
+                SELECT id, target_session_id, text, delivery_mode
+                FROM message_queue
+                WHERE target_session_id = ?1
+                    AND delivery_mode = ?2
+                    AND delivered_at IS NULL
+                ORDER BY queued_at ASC, id ASC
+                LIMIT ?3
+                "#,
+            )?;
+            let rows = statement
+                .query_map(
+                    params![target_session_id, delivery_mode, limit.max(1) as i64],
+                    |row| {
+                        Ok(PendingMessage {
+                            id: row.get(0)?,
+                            target_session_id: row.get(1)?,
+                            text: row.get(2)?,
+                            delivery_mode: row.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     pub fn mark_delivered(&self, message_id: &str) -> Result<()> {
         self.with_connection(|conn| {
             conn.execute(

@@ -292,16 +292,33 @@ impl SessionStore {
             return Ok(None);
         }
 
-        if should_persist_runtime_send(&request.delivery_mode) {
+        let delivery_mode = normalized_delivery_mode(&request.delivery_mode);
+        if should_persist_runtime_send(&delivery_mode) {
             if let Some(queue) = &self.queue_store {
-                let message_id = queue.enqueue_message(
-                    session_id,
-                    &request.text,
-                    &request.delivery_mode,
-                    None,
-                )?;
-                let drain =
-                    drain_pending_runtime_messages_raw(&mut state, session_id, runtime, queue)?;
+                let message_id =
+                    queue.enqueue_message(session_id, &request.text, &delivery_mode, None)?;
+                let drain = if delivery_mode == "urgent" {
+                    deliver_urgent_runtime_message_raw(
+                        &mut state,
+                        session_id,
+                        runtime,
+                        queue,
+                        &message_id,
+                        &request.text,
+                    )?
+                } else {
+                    drain_pending_runtime_messages_raw(
+                        &mut state,
+                        session_id,
+                        runtime,
+                        queue,
+                        if delivery_mode == "important" {
+                            Some("important")
+                        } else {
+                            None
+                        },
+                    )?
+                };
                 self.write_raw_json_value(&state)?;
                 let delivered = drain
                     .delivered_message_ids
@@ -1671,9 +1688,13 @@ struct QueueDrainResult {
 
 fn should_persist_runtime_send(delivery_mode: &str) -> bool {
     matches!(
-        delivery_mode.trim().to_ascii_lowercase().as_str(),
+        normalized_delivery_mode(delivery_mode).as_str(),
         "sequential" | "important" | "urgent"
     )
+}
+
+fn normalized_delivery_mode(delivery_mode: &str) -> String {
+    delivery_mode.trim().to_ascii_lowercase()
 }
 
 fn runtime_session_status_raw(state: &mut Value, session_id: &str) -> Result<Option<String>> {
@@ -1727,11 +1748,18 @@ fn drain_pending_runtime_messages_raw(
     session_id: &str,
     runtime: &TmuxRuntime,
     queue: &RetainedQueueStore,
+    delivery_mode_filter: Option<&str>,
 ) -> Result<QueueDrainResult> {
     let mut status =
         runtime_session_status_raw(state, session_id)?.unwrap_or_else(|| "stopped".to_owned());
     let mut delivered_message_ids = Vec::new();
-    for message in queue.pending_messages_for_target(session_id, 10)? {
+    let messages = match delivery_mode_filter {
+        Some(delivery_mode) => {
+            queue.pending_messages_for_target_by_mode(session_id, delivery_mode, 10)?
+        }
+        None => queue.pending_messages_for_target(session_id, 10)?,
+    };
+    for message in messages {
         let (next_status, delivered) =
             deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?;
         status = next_status;
@@ -1740,6 +1768,27 @@ fn drain_pending_runtime_messages_raw(
         }
         queue.mark_delivered(&message.id)?;
         delivered_message_ids.push(message.id);
+    }
+    Ok(QueueDrainResult {
+        status,
+        delivered_message_ids,
+    })
+}
+
+fn deliver_urgent_runtime_message_raw(
+    state: &mut Value,
+    session_id: &str,
+    runtime: &TmuxRuntime,
+    queue: &RetainedQueueStore,
+    message_id: &str,
+    text: &str,
+) -> Result<QueueDrainResult> {
+    let (status, delivered) =
+        deliver_runtime_text_to_session_raw(state, session_id, text, runtime)?;
+    let mut delivered_message_ids = Vec::new();
+    if delivered {
+        queue.mark_delivered(message_id)?;
+        delivered_message_ids.push(message_id.to_owned());
     }
     Ok(QueueDrainResult {
         status,

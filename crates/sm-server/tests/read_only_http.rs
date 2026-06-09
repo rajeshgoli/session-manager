@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use sm_server::config::RustShadowConfig;
+use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
         AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig, RustCoreConfig,
@@ -2468,6 +2469,120 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], true);
     wait_for_output_contains(app, "runtimecore", "runtime:restored runtime message").await;
+}
+
+#[tokio::test]
+async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-priority-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimepriority",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "priority initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(app.clone(), "runtimepriority", "runtime:priority initial").await;
+
+    let queue = RetainedQueueStore::new(queue_db_path.clone());
+    for index in 0..12 {
+        queue
+            .enqueue_message(
+                "runtimepriority",
+                &format!("stale sequential backlog {index}"),
+                "sequential",
+                None,
+            )
+            .unwrap();
+    }
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimepriority/input",
+        json!({
+            "text": "important priority message",
+            "delivery_mode": "important"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimepriority",
+        "runtime:important priority message",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimepriority/input",
+        json!({
+            "text": "urgent priority message",
+            "delivery_mode": "urgent"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimepriority",
+        "runtime:urgent priority message",
+    )
+    .await;
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let delivered_priority_count: i64 = queue_conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM message_queue
+            WHERE target_session_id = 'runtimepriority'
+                AND text IN ('important priority message', 'urgent priority message')
+                AND delivered_at IS NOT NULL
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered_priority_count, 2);
+    let delivered_backlog_count: i64 = queue_conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM message_queue
+            WHERE target_session_id = 'runtimepriority'
+                AND text LIKE 'stale sequential backlog%'
+                AND delivered_at IS NOT NULL
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered_backlog_count, 0);
 }
 
 #[tokio::test]
