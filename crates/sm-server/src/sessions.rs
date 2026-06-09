@@ -162,6 +162,7 @@ impl SessionStore {
             working_dir: expand_home(&record.working_dir).display().to_string(),
             log_file,
             initial_message: request.initial_message.clone(),
+            model: request.model.clone(),
         })?;
         sessions.push(serde_json::to_value(&record)?);
         if let Err(error) = self.write_raw_json_value(&state) {
@@ -512,6 +513,7 @@ impl SessionStore {
             tmux_socket_name: tmux_socket_name.map(ToOwned::to_owned),
             node,
             provider,
+            model: optional_trimmed(request.model.as_deref()),
             log_file: Some(log_file.display().to_string()),
             provider_resume_id: None,
             transcript_path: None,
@@ -571,6 +573,8 @@ pub struct CreateCoreSessionRequest {
     pub node: Option<String>,
     #[serde(default, alias = "prompt")]
     pub initial_message: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub wait: Option<u64>,
 }
@@ -949,6 +953,8 @@ pub struct SessionRecord {
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
     pub log_file: Option<String>,
     #[serde(default)]
     pub provider_resume_id: Option<String>,
@@ -1133,6 +1139,7 @@ pub struct SessionResponse {
     tmux_socket_name: Option<String>,
     node: String,
     provider: Option<String>,
+    model: Option<String>,
     provider_resume_id: Option<String>,
     forked_from_session_id: Option<String>,
     forked_from_provider_resume_id: Option<String>,
@@ -1182,6 +1189,7 @@ impl From<SessionRecord> for SessionResponse {
             tmux_socket_name: session.tmux_socket_name,
             node: non_empty_or(session.node, "primary"),
             provider: Some(non_empty_or(session.provider, "claude")),
+            model: session.model,
             provider_resume_id: session.provider_resume_id,
             forked_from_session_id: session.forked_from_session_id,
             forked_from_provider_resume_id: session.forked_from_provider_resume_id,
@@ -1294,6 +1302,13 @@ fn non_empty_or(value: String, fallback: &str) -> String {
     }
 }
 
+fn optional_trimmed(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn has_text(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
 }
@@ -1403,6 +1418,7 @@ mod tests {
             tmux_socket_name: None,
             node: "primary".to_owned(),
             provider: "claude".to_owned(),
+            model: None,
             log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
             transcript_path: None,

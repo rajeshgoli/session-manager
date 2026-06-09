@@ -36,6 +36,7 @@ pub struct TmuxSessionSpec {
     pub working_dir: String,
     pub log_file: PathBuf,
     pub initial_message: Option<String>,
+    pub model: Option<String>,
 }
 
 impl TmuxRuntime {
@@ -121,6 +122,14 @@ impl TmuxRuntime {
         }
 
         let mut command = self.command.clone();
+        if let Some(model) = spec
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            command = format!("{command} --model {}", shell_quote(model));
+        }
         if prompt_mode == "argv" {
             if let Some(initial_message) = spec
                 .initial_message
@@ -171,7 +180,7 @@ impl TmuxRuntime {
         Ok(true)
     }
 
-    fn session_exists(&self, tmux_session: &str) -> Result<bool> {
+    pub fn session_exists(&self, tmux_session: &str) -> Result<bool> {
         let output = self
             .tmux_command(["has-session", "-t", tmux_session])
             .stdout(Stdio::null())
