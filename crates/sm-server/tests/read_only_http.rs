@@ -2773,6 +2773,50 @@ async fn runtime_core_materializes_send_delivery_side_effects() {
         .unwrap();
     assert_eq!(followup_count, 1);
 
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimechild/input",
+        json!({
+            "text": "stale sender still reaches target",
+            "delivery_mode": "sequential",
+            "sender_session_id": "missing-runtime-sender",
+            "from_sm_send": true,
+            "notify_on_delivery": true,
+            "notify_after_seconds": 1,
+            "notify_on_stop": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimechild",
+        "runtime:stale sender still reaches target",
+    )
+    .await;
+    let stale_sender_row: (Option<String>, i64, Option<i64>, i64) = queue_conn
+        .query_row(
+            r#"
+            SELECT sender_session_id, notify_on_delivery, notify_after_seconds, notify_on_stop
+            FROM message_queue
+            WHERE target_session_id = 'runtimechild'
+              AND text = 'stale sender still reaches target'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(stale_sender_row, (None, 0, None, 0));
+    let stale_sender_notification_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'missing-runtime-sender'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_sender_notification_count, 0);
+
     let remind: (i64, i64, Option<String>, i64) = queue_conn
         .query_row(
             "SELECT soft_threshold_seconds, hard_threshold_seconds, cancel_on_reply_session_id, is_active FROM remind_registrations WHERE target_session_id = 'runtimechild'",

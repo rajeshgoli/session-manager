@@ -1884,7 +1884,9 @@ fn queue_metadata_for_send_request(
     request: &SendCoreInputRequest,
     sender_name: Option<String>,
 ) -> QueueMessageMetadata {
-    let sender_session_id = optional_trimmed(request.sender_session_id.as_deref());
+    let sender_session_id = optional_trimmed(request.sender_session_id.as_deref())
+        .filter(|sender_id| raw_session_object(state, sender_id).is_some());
+    let has_sender = sender_session_id.is_some();
     let notify_on_stop = request.notify_on_stop
         && sender_session_id.as_deref().is_some_and(|sender_id| {
             sender_id != target_session_id
@@ -1896,8 +1898,8 @@ fn queue_metadata_for_send_request(
         sender_name,
         from_sm_send: request.from_sm_send,
         timeout_seconds: request.timeout_seconds,
-        notify_on_delivery: request.notify_on_delivery,
-        notify_after_seconds: request.notify_after_seconds,
+        notify_on_delivery: request.notify_on_delivery && has_sender,
+        notify_after_seconds: has_sender.then_some(request.notify_after_seconds).flatten(),
         notify_on_stop,
         remind_soft_threshold: request.remind_soft_threshold,
         remind_hard_threshold: request.remind_hard_threshold,
@@ -2095,6 +2097,25 @@ fn complete_runtime_message_delivery_raw(
     queue: &RetainedQueueStore,
     message: &PendingMessage,
 ) -> Result<()> {
+    let sanitized_message;
+    let message = if message
+        .sender_session_id
+        .as_deref()
+        .is_some_and(|sender_id| raw_session_object(state, sender_id).is_none())
+    {
+        sanitized_message = PendingMessage {
+            sender_session_id: None,
+            sender_name: None,
+            notify_on_delivery: false,
+            notify_after_seconds: None,
+            notify_on_stop: false,
+            ..message.clone()
+        };
+        &sanitized_message
+    } else {
+        message
+    };
+
     queue.mark_delivered_and_apply_side_effects(message)?;
 
     if message.notify_on_delivery {
