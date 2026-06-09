@@ -3138,6 +3138,106 @@ async fn runtime_core_retire_delivers_stop_notify_side_effects() {
 }
 
 #[tokio::test]
+async fn runtime_core_task_complete_wakes_parent_runtime() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-task-complete-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimetaskparent",
+            "name": "runtime-task-parent",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "task parent initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimetaskchild",
+            "name": "runtime-task-child",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "parent_session_id": "runtimetaskparent",
+            "initial_message": "task child initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimetaskchild",
+        "runtime:task child initial",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimetaskchild/task-complete",
+        json!({ "requester_session_id": "runtimetaskchild" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["em_notified"], true);
+
+    let notification =
+        "[sm task-complete] agent runtimetaskchild(runtime-task-child) completed its task.";
+    wait_for_output_contains(app.clone(), "runtimetaskparent", notification).await;
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let queued: (i64, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'runtimetaskparent'
+              AND message_category = 'task_complete'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        queued,
+        (1, "important".to_owned(), Some("task_complete".to_owned()))
+    );
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "runtimetaskchild")
+        .unwrap();
+    assert!(child["agent_task_completed_at"].is_string());
+    assert_eq!(
+        raw_state["retained_pending_messages"][0]["text"],
+        notification
+    );
+}
+
+#[tokio::test]
 async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
     if !tmux_available() {
         return;

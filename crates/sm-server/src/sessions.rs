@@ -1045,6 +1045,7 @@ impl SessionStore {
         &self,
         session_id: &str,
         request: TaskCompleteRequest,
+        runtime: Option<&TmuxRuntime>,
     ) -> Result<TaskCompleteOutcome> {
         if request.requester_session_id.trim() != session_id {
             return Ok(TaskCompleteOutcome::Error(
@@ -1093,7 +1094,25 @@ impl SessionStore {
             let text =
                 format!("[sm task-complete] agent {session_id}({friendly}) completed its task.");
             if let Some(queue) = &self.queue_store {
-                queue.enqueue_message(&em_session_id, &text, "important", Some("task_complete"))?;
+                let message_id = queue.enqueue_message(
+                    &em_session_id,
+                    &text,
+                    "important",
+                    Some("task_complete"),
+                )?;
+                if let Some(runtime) = runtime {
+                    if raw_session_object(&state, &em_session_id).is_some() {
+                        drain_pending_runtime_messages_raw(
+                            self,
+                            &mut state,
+                            &em_session_id,
+                            runtime,
+                            queue,
+                            Some("important"),
+                            Some(&message_id),
+                        )?;
+                    }
+                }
             }
             push_retained_message_raw(
                 &mut state,
