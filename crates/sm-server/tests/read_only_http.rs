@@ -9,6 +9,7 @@ use base64::{
 };
 use futures_util::{future::join, StreamExt as _};
 use hmac::{Hmac, Mac};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -872,7 +873,9 @@ async fn session_output_tails_fixture_log_file() {
 
 #[tokio::test]
 async fn fixture_core_writes_are_disabled_by_default() {
-    let app = router(AppState::new(AppConfig::default()));
+    let state_file = write_session_fixture();
+    let queue_db_path = state_file.with_extension("message_queue.db");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
 
     let (status, payload) = post_json(
         app,
@@ -890,6 +893,10 @@ async fn fixture_core_writes_are_disabled_by_default() {
     assert_eq!(
         payload,
         json!({ "detail": "Rust core writes are disabled" })
+    );
+    assert!(
+        !queue_db_path.exists(),
+        "disabled Rust core writes must not create the retained queue DB"
     );
 }
 
@@ -1477,6 +1484,22 @@ async fn fixture_completion_endpoints_preserve_python_compatible_state() {
         state["retained_pending_messages"][0]["delivery_mode"],
         "important"
     );
+    let queue_conn = Connection::open(state_file.with_extension("message_queue.db")).unwrap();
+    let queued_message: (String, String, String) = queue_conn
+        .query_row(
+            "SELECT target_session_id, text, delivery_mode FROM message_queue WHERE message_category = 'task_complete'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        queued_message,
+        (
+            "em001".to_owned(),
+            "[sm task-complete] agent child001(worker-1) completed its task.".to_owned(),
+            "important".to_owned()
+        )
+    );
 
     let state_file = write_completion_fixture();
     let app = router(AppState::new(AppConfig {
@@ -1622,6 +1645,15 @@ async fn fixture_notify_on_stop_preserves_authorization_and_state_contract() {
             .len(),
         1
     );
+    let queue_conn = Connection::open(state_file.with_extension("message_queue.db")).unwrap();
+    let stop_notify: (String, String, i64) = queue_conn
+        .query_row(
+            "SELECT sender_session_id, sender_name, delay_seconds FROM rust_stop_notify_states WHERE session_id = 'child001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stop_notify, ("em001".to_owned(), "em".to_owned(), 8));
 }
 
 #[tokio::test]
@@ -2155,6 +2187,15 @@ async fn fixture_core_spawn_auto_arms_em_stop_notify_for_retained_children() {
     assert_eq!(stop_notify["sender_session_id"], "em001");
     assert_eq!(stop_notify["sender_name"], "em");
     assert_eq!(stop_notify["delay_seconds"], 8);
+    let queue_conn = Connection::open(state_file.with_extension("message_queue.db")).unwrap();
+    let db_stop_notify: (String, String, i64) = queue_conn
+        .query_row(
+            "SELECT sender_session_id, sender_name, delay_seconds FROM rust_stop_notify_states WHERE session_id = 'spawnchild'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(db_stop_notify, ("em001".to_owned(), "em".to_owned(), 8));
 
     let (status, payload) = post_json(
         app.clone(),

@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub external_access: ExternalAccessConfig,
     pub mobile_terminal: MobileTerminalConfig,
     pub tmux: TmuxConfig,
+    pub sm_send: SmSendConfig,
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
 }
@@ -138,6 +139,24 @@ pub struct TmuxConfig {
     pub socket_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SmSendConfig {
+    #[serde(default = "default_message_queue_db_path")]
+    pub db_path: String,
+}
+
+impl Default for SmSendConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_message_queue_db_path(),
+        }
+    }
+}
+
+fn default_message_queue_db_path() -> String {
+    "~/.local/share/claude-sessions/message_queue.db".to_owned()
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
@@ -185,6 +204,8 @@ struct RawConfig {
     #[serde(default)]
     tmux: TmuxConfig,
     #[serde(default)]
+    sm_send: SmSendConfig,
+    #[serde(default)]
     timeouts: RawTimeoutsConfig,
     #[serde(default)]
     rust_shadow: RustShadowConfig,
@@ -224,6 +245,7 @@ impl From<RawConfig> for AppConfig {
             external_access: raw.external_access,
             mobile_terminal: raw.mobile_terminal,
             tmux: raw.tmux,
+            sm_send: raw.sm_send,
             rust_shadow: raw.rust_shadow,
             rust_core,
         }
@@ -468,5 +490,19 @@ mod tests {
             trimmed(&config.external_access.ssh_proxy_command).as_deref(),
             Some("cloudflared access ssh --hostname %h")
         );
+    }
+
+    #[test]
+    fn raw_config_reads_python_sm_send_db_path() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+sm_send:
+  db_path: /tmp/custom-message-queue.db
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
     }
 }
