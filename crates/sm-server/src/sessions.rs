@@ -1105,7 +1105,7 @@ impl SessionStore {
                         .and_then(|session| json_text(session.get("node")))
                         .unwrap_or_else(default_node);
                     if is_primary_node(&parent_node) {
-                        drain_pending_runtime_messages_raw(
+                        let drain = drain_pending_runtime_messages_raw(
                             self,
                             &mut state,
                             &em_session_id,
@@ -1114,6 +1114,13 @@ impl SessionStore {
                             Some("important"),
                             Some(&message_id),
                         )?;
+                        if drain
+                            .delivered_message_ids
+                            .iter()
+                            .any(|delivered_id| delivered_id == &message_id)
+                        {
+                            clear_agent_task_completed_raw(&mut state, &em_session_id)?;
+                        }
                     }
                 }
             }
@@ -1764,6 +1771,14 @@ fn active_parent_wake_parent_raw(state: &Value, child_session_id: &str) -> Resul
                 .unwrap_or(true)
         })
         .and_then(|entry| json_text(entry.get("parent_session_id"))))
+}
+
+fn clear_agent_task_completed_raw(state: &mut Value, session_id: &str) -> Result<()> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    if let Some(session) = session_object_mut(sessions, session_id) {
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+    }
+    Ok(())
 }
 
 fn deactivate_parent_wake_raw(state: &mut Value, child_session_id: &str) -> Result<()> {

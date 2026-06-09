@@ -3191,6 +3191,19 @@ async fn runtime_core_task_complete_wakes_parent_runtime() {
         "runtime:task child initial",
     )
     .await;
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "runtimetaskparent")
+        .unwrap()["agent_task_completed_at"] = json!("2026-06-09T00:01:00Z");
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&raw_state).unwrap(),
+    )
+    .unwrap();
 
     let (status, payload) = post_json(
         app.clone(),
@@ -3224,6 +3237,13 @@ async fn runtime_core_task_complete_wakes_parent_runtime() {
         (1, "important".to_owned(), Some("task_complete".to_owned()))
     );
     let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let parent = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "runtimetaskparent")
+        .unwrap();
+    assert_eq!(parent["agent_task_completed_at"], Value::Null);
     let child = raw_state["sessions"]
         .as_array()
         .unwrap()
@@ -3250,7 +3270,8 @@ async fn runtime_core_task_complete_wakes_parent_runtime() {
                 "status": "running",
                 "node": "macbook",
                 "created_at": "2026-06-09T00:00:00Z",
-                "last_activity": "2026-06-09T00:00:00Z"
+                "last_activity": "2026-06-09T00:00:00Z",
+                "agent_task_completed_at": "2026-06-09T00:01:00Z"
             },
             {
                 "id": "remotetaskchild",
@@ -3301,6 +3322,15 @@ async fn runtime_core_task_complete_wakes_parent_runtime() {
         remote_queued,
         (0, "important".to_owned(), Some("task_complete".to_owned()))
     );
+    let remote_raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let remote_parent = remote_raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "remotetaskparent")
+        .unwrap();
+    assert!(remote_parent["agent_task_completed_at"].is_string());
 }
 
 #[tokio::test]
