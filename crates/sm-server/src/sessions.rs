@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
 use crate::queue::{
     followup_notification_text, PendingMessage, QueueMessageMetadata, RetainedQueueStore,
@@ -1248,6 +1248,99 @@ impl SessionStore {
         }))
     }
 
+    pub fn register_subagent_start(
+        &self,
+        session_id: &str,
+        request: SubagentStartRequest,
+    ) -> Result<SubagentStartOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let now = now_python_naive_iso();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(SubagentStartOutcome::NotFound);
+        };
+        let subagent = json!({
+            "agent_id": request.agent_id,
+            "agent_type": request.agent_type,
+            "parent_session_id": session_id,
+            "transcript_path": request.transcript_path,
+            "started_at": now,
+            "stopped_at": null,
+            "status": "running",
+            "summary": null
+        });
+        let response = subagent_response_from_value(&subagent)?;
+        ensure_subagents_array_mut(session).push(subagent);
+        self.write_raw_json_value(&state)?;
+        Ok(SubagentStartOutcome::Registered(response))
+    }
+
+    pub fn register_subagent_stop(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        request: SubagentStopRequest,
+    ) -> Result<SubagentStopOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let now = now_python_naive_iso();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(SubagentStopOutcome::SessionNotFound);
+        };
+        let subagents = ensure_subagents_array_mut(session);
+        let Some(subagent) = subagents
+            .iter_mut()
+            .find(|subagent| subagent.get("agent_id").and_then(Value::as_str) == Some(agent_id))
+        else {
+            return Ok(SubagentStopOutcome::SubagentNotFound(agent_id.to_owned()));
+        };
+        if let Some(subagent) = subagent.as_object_mut() {
+            subagent.insert("stopped_at".to_owned(), Value::String(now));
+            subagent.insert("status".to_owned(), Value::String("completed".to_owned()));
+            if let Some(transcript_path) = request.transcript_path {
+                subagent.insert("transcript_path".to_owned(), Value::String(transcript_path));
+            }
+            if let Some(summary) = request.summary {
+                subagent.insert("summary".to_owned(), Value::String(summary));
+            }
+        }
+        let summary = subagent
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.write_raw_json_value(&state)?;
+        Ok(SubagentStopOutcome::Stopped(SubagentStopResult {
+            session_id: session_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            status: "stopped".to_owned(),
+            summary,
+        }))
+    }
+
+    pub fn list_subagents(&self, session_id: &str) -> Result<Option<SubagentListResponse>> {
+        let state = self.load_raw_json_value()?;
+        let Some(session) = raw_session_object(&state, session_id) else {
+            return Ok(None);
+        };
+        let subagents = session
+            .get("subagents")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(subagent_response_from_value)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(SubagentListResponse {
+            session_id: session_id.to_owned(),
+            subagents,
+        }))
+    }
+
     fn load_snapshot(&self) -> Result<StateSnapshot> {
         let state_file = self.readable_state_file();
         if !state_file.exists() {
@@ -1553,6 +1646,22 @@ pub struct ArmStopNotifyRequest {
     pub delay_seconds: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubagentStartRequest {
+    pub agent_id: String,
+    pub agent_type: String,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubagentStopRequest {
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRegistrationResponse {
     pub role: String,
@@ -1598,6 +1707,31 @@ pub struct CoreInputBatchResponse {
     pub failure_count: usize,
     pub delivery_mode: String,
     pub results: Vec<CoreInputBatchResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubagentResponse {
+    pub agent_id: String,
+    pub agent_type: String,
+    pub parent_session_id: String,
+    pub started_at: String,
+    pub stopped_at: Option<String>,
+    pub status: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubagentStopResult {
+    pub session_id: String,
+    pub agent_id: String,
+    pub status: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubagentListResponse {
+    pub session_id: String,
+    pub subagents: Vec<SubagentResponse>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1737,6 +1871,17 @@ pub enum ArmStopNotifyOutcome {
     UnknownSender(String),
 }
 
+pub enum SubagentStartOutcome {
+    Registered(SubagentResponse),
+    NotFound,
+}
+
+pub enum SubagentStopOutcome {
+    Stopped(SubagentStopResult),
+    SessionNotFound,
+    SubagentNotFound(String),
+}
+
 fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read session state {}", path.display()))?;
@@ -1768,6 +1913,16 @@ fn ensure_sessions_array_mut(value: &mut Value) -> Result<&mut Vec<Value>> {
         anyhow::bail!("session state field 'sessions' is not an array");
     }
     Ok(sessions.as_array_mut().expect("array checked above"))
+}
+
+fn ensure_subagents_array_mut(session: &mut Map<String, Value>) -> &mut Vec<Value> {
+    let subagents = session
+        .entry("subagents".to_owned())
+        .or_insert_with(|| json!([]));
+    if !subagents.is_array() {
+        *subagents = json!([]);
+    }
+    subagents.as_array_mut().expect("array value set above")
 }
 
 fn ensure_agent_registrations_array_mut(value: &mut Value) -> Result<&mut Vec<Value>> {
@@ -2878,6 +3033,18 @@ fn json_text(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn subagent_response_from_value(value: &Value) -> Result<SubagentResponse> {
+    Ok(SubagentResponse {
+        agent_id: json_text(value.get("agent_id")).unwrap_or_default(),
+        agent_type: json_text(value.get("agent_type")).unwrap_or_else(|| "unknown".to_owned()),
+        parent_session_id: json_text(value.get("parent_session_id")).unwrap_or_default(),
+        started_at: json_text(value.get("started_at")).unwrap_or_default(),
+        stopped_at: json_text(value.get("stopped_at")),
+        status: json_text(value.get("status")).unwrap_or_else(|| "running".to_owned()),
+        summary: json_text(value.get("summary")),
+    })
+}
+
 fn append_log_line(path: &Path, line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -2948,6 +3115,16 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn now_python_naive_iso() -> String {
+    let now_utc = OffsetDateTime::now_utc();
+    let local = OffsetDateTime::now_local().unwrap_or(now_utc);
+    local
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
+        ))
+        .unwrap_or_else(|_| "1970-01-01T00:00:00.000000".to_owned())
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
