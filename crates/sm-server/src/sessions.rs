@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
 use crate::queue::{
     followup_notification_text, PendingMessage, QueueMessageMetadata, RetainedQueueStore,
@@ -1255,7 +1255,7 @@ impl SessionStore {
     ) -> Result<SubagentStartOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let now = now_rfc3339();
+        let now = now_python_naive_iso();
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(SubagentStartOutcome::NotFound);
@@ -1284,7 +1284,7 @@ impl SessionStore {
     ) -> Result<SubagentStopOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let now = now_rfc3339();
+        let now = now_python_naive_iso();
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(SubagentStopOutcome::SessionNotFound);
@@ -3110,6 +3110,16 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn now_python_naive_iso() -> String {
+    let now_utc = OffsetDateTime::now_utc();
+    let local = OffsetDateTime::now_local().unwrap_or(now_utc);
+    local
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
+        ))
+        .unwrap_or_else(|_| "1970-01-01T00:00:00.000000".to_owned())
 }
 
 pub fn expand_home(path: &str) -> PathBuf {

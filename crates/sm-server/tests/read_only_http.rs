@@ -1554,10 +1554,7 @@ async fn fixture_subagent_endpoints_round_trip_python_state_shape() {
     assert_eq!(payload["status"], "running");
     assert_eq!(payload["stopped_at"], Value::Null);
     assert_eq!(payload["summary"], Value::Null);
-    assert!(payload["started_at"]
-        .as_str()
-        .unwrap_or_default()
-        .contains('T'));
+    assert_python_naive_timestamp(payload["started_at"].as_str().unwrap_or_default());
 
     let (status, payload) = post_json(
         app.clone(),
@@ -1592,10 +1589,7 @@ async fn fixture_subagent_endpoints_round_trip_python_state_shape() {
     assert_eq!(subagents[0]["agent_id"], "agent456789");
     assert_eq!(subagents[0]["status"], "completed");
     assert_eq!(subagents[0]["summary"], "Finished useful work");
-    assert!(subagents[0]["stopped_at"]
-        .as_str()
-        .unwrap_or_default()
-        .contains('T'));
+    assert_python_naive_timestamp(subagents[0]["stopped_at"].as_str().unwrap_or_default());
 
     let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let session = raw_state["sessions"]
@@ -1611,6 +1605,8 @@ async fn fixture_subagent_endpoints_round_trip_python_state_shape() {
     assert_eq!(stored["transcript_path"], "/tmp/agent456789.jsonl");
     assert_eq!(stored["status"], "completed");
     assert_eq!(stored["summary"], "Finished useful work");
+    assert_python_naive_timestamp(stored["started_at"].as_str().unwrap_or_default());
+    assert_python_naive_timestamp(stored["stopped_at"].as_str().unwrap_or_default());
 }
 
 #[tokio::test]
@@ -4966,6 +4962,22 @@ fn config_with_state_file_and_queue(state_file: &PathBuf) -> AppConfig {
 
 fn queue_db_path_for_state_file(state_file: &PathBuf) -> PathBuf {
     state_file.with_extension("message_queue.db")
+}
+
+fn assert_python_naive_timestamp(value: &str) {
+    assert!(
+        value.contains('T'),
+        "timestamp should use ISO separator: {value}"
+    );
+    assert!(!value.ends_with('Z'), "timestamp should be naive: {value}");
+    assert!(
+        value.len() > 10,
+        "timestamp should include a date and time: {value}"
+    );
+    assert!(
+        !value[10..].contains('+') && !value[10..].contains('-'),
+        "timestamp should not include an offset: {value}"
+    );
 }
 
 fn config_with_state_file_and_auth(state_file: &PathBuf) -> AppConfig {
