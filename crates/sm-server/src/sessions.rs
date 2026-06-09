@@ -1101,7 +1101,10 @@ impl SessionStore {
                     Some("task_complete"),
                 )?;
                 if let Some(runtime) = runtime {
-                    if raw_session_object(&state, &em_session_id).is_some() {
+                    let parent_node = raw_session_object(&state, &em_session_id)
+                        .and_then(|session| json_text(session.get("node")))
+                        .unwrap_or_else(default_node);
+                    if is_primary_node(&parent_node) {
                         drain_pending_runtime_messages_raw(
                             self,
                             &mut state,

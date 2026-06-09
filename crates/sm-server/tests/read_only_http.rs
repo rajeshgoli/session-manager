@@ -3235,6 +3235,72 @@ async fn runtime_core_task_complete_wakes_parent_runtime() {
         raw_state["retained_pending_messages"][0]["text"],
         notification
     );
+
+    let remote_parent_log = unique_temp_path();
+    let child_log = unique_temp_path();
+    let remote_state = json!({
+        "sessions": [
+            {
+                "id": "remotetaskparent",
+                "name": "remote-task-parent",
+                "friendly_name": "remote-parent",
+                "working_dir": working_dir.display().to_string(),
+                "tmux_session": "remote-task-parent",
+                "log_file": remote_parent_log.display().to_string(),
+                "status": "running",
+                "node": "macbook",
+                "created_at": "2026-06-09T00:00:00Z",
+                "last_activity": "2026-06-09T00:00:00Z"
+            },
+            {
+                "id": "remotetaskchild",
+                "name": "remote-task-child",
+                "friendly_name": "remote-child",
+                "working_dir": working_dir.display().to_string(),
+                "tmux_session": "remote-task-child",
+                "log_file": child_log.display().to_string(),
+                "status": "running",
+                "node": "primary",
+                "parent_session_id": "remotetaskparent",
+                "created_at": "2026-06-09T00:00:00Z",
+                "last_activity": "2026-06-09T00:00:00Z"
+            }
+        ],
+        "retained_pending_messages": [],
+        "retained_remind_registrations": [],
+        "retained_parent_wake_registrations": [],
+        "retained_stop_notify_states": []
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&remote_state).unwrap(),
+    )
+    .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/remotetaskchild/task-complete",
+        json!({ "requester_session_id": "remotetaskchild" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["em_notified"], true);
+    let remote_queued: (i64, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'remotetaskparent'
+              AND message_category = 'task_complete'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        remote_queued,
+        (0, "important".to_owned(), Some("task_complete".to_owned()))
+    );
 }
 
 #[tokio::test]
