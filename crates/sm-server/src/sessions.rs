@@ -306,12 +306,25 @@ impl SessionStore {
         let (queued_text, sender_name) = format_send_input_text_raw(&state, &request);
         if should_persist_runtime_send(&delivery_mode) {
             if let Some(queue) = &self.queue_store {
+                let metadata =
+                    queue_metadata_for_send_request(&state, session_id, &request, sender_name);
+                let has_delivery_side_effects = metadata.has_delivery_side_effects();
                 let message_id = queue.enqueue_message_with_metadata(
                     session_id,
                     &queued_text,
                     &delivery_mode,
-                    queue_metadata_for_send_request(&state, session_id, &request, sender_name),
+                    metadata,
                 )?;
+                if has_delivery_side_effects {
+                    return Ok(Some(CoreInputResult {
+                        ok: true,
+                        session_id: session_id.to_owned(),
+                        delivered: false,
+                        delivery_mode: request.delivery_mode,
+                        notify_after_seconds: request.notify_after_seconds,
+                        status: initial_status,
+                    }));
+                }
                 let drain = if delivery_mode == "urgent" {
                     deliver_urgent_runtime_message_raw(
                         &mut state,
@@ -1918,6 +1931,10 @@ fn drain_pending_runtime_messages_raw(
 
         let mut should_continue = true;
         for message in messages {
+            if message.has_delivery_side_effects {
+                should_continue = false;
+                break;
+            }
             let (next_status, delivered) =
                 if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
                     deliver_urgent_runtime_text_to_session_raw(

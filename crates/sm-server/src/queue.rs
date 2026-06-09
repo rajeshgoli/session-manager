@@ -18,6 +18,7 @@ pub struct PendingMessage {
     pub target_session_id: String,
     pub text: String,
     pub delivery_mode: String,
+    pub has_delivery_side_effects: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,6 +36,32 @@ pub struct QueueMessageMetadata {
     pub parent_session_id: Option<String>,
     pub message_category: Option<String>,
     pub response_relay_source: Option<String>,
+}
+
+impl QueueMessageMetadata {
+    pub fn has_delivery_side_effects(&self) -> bool {
+        self.sender_session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || self.from_sm_send
+            || self.notify_on_delivery
+            || self.notify_after_seconds.is_some()
+            || self.notify_on_stop
+            || self.remind_soft_threshold.is_some()
+            || self.remind_hard_threshold.is_some()
+            || self
+                .remind_cancel_on_reply_session_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .response_relay_source
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
 }
 
 impl RetainedQueueStore {
@@ -143,7 +170,28 @@ impl RetainedQueueStore {
             expire_pending_messages_for_target(conn, target_session_id)?;
             let mut statement = conn.prepare(
                 r#"
-                SELECT id, target_session_id, text, delivery_mode
+                SELECT id, target_session_id, text, delivery_mode,
+                    CASE WHEN
+                        (sender_session_id IS NOT NULL AND trim(sender_session_id) != '')
+                        OR from_sm_send != 0
+                        OR notify_on_delivery != 0
+                        OR notify_after_seconds IS NOT NULL
+                        OR notify_on_stop != 0
+                        OR remind_soft_threshold IS NOT NULL
+                        OR remind_hard_threshold IS NOT NULL
+                        OR (
+                            remind_cancel_on_reply_session_id IS NOT NULL
+                            AND trim(remind_cancel_on_reply_session_id) != ''
+                        )
+                        OR (
+                            parent_session_id IS NOT NULL
+                            AND trim(parent_session_id) != ''
+                        )
+                        OR (
+                            response_relay_source IS NOT NULL
+                            AND trim(response_relay_source) != ''
+                        )
+                    THEN 1 ELSE 0 END AS has_delivery_side_effects
                 FROM message_queue
                 WHERE target_session_id = ?1 AND delivered_at IS NULL
                 ORDER BY queued_at ASC, id ASC
@@ -157,6 +205,7 @@ impl RetainedQueueStore {
                         target_session_id: row.get(1)?,
                         text: row.get(2)?,
                         delivery_mode: row.get(3)?,
+                        has_delivery_side_effects: row.get::<_, i64>(4)? != 0,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -174,7 +223,28 @@ impl RetainedQueueStore {
             expire_pending_messages_for_target(conn, target_session_id)?;
             let mut statement = conn.prepare(
                 r#"
-                SELECT id, target_session_id, text, delivery_mode
+                SELECT id, target_session_id, text, delivery_mode,
+                    CASE WHEN
+                        (sender_session_id IS NOT NULL AND trim(sender_session_id) != '')
+                        OR from_sm_send != 0
+                        OR notify_on_delivery != 0
+                        OR notify_after_seconds IS NOT NULL
+                        OR notify_on_stop != 0
+                        OR remind_soft_threshold IS NOT NULL
+                        OR remind_hard_threshold IS NOT NULL
+                        OR (
+                            remind_cancel_on_reply_session_id IS NOT NULL
+                            AND trim(remind_cancel_on_reply_session_id) != ''
+                        )
+                        OR (
+                            parent_session_id IS NOT NULL
+                            AND trim(parent_session_id) != ''
+                        )
+                        OR (
+                            response_relay_source IS NOT NULL
+                            AND trim(response_relay_source) != ''
+                        )
+                    THEN 1 ELSE 0 END AS has_delivery_side_effects
                 FROM message_queue
                 WHERE target_session_id = ?1
                     AND delivery_mode = ?2
@@ -192,6 +262,7 @@ impl RetainedQueueStore {
                             target_session_id: row.get(1)?,
                             text: row.get(2)?,
                             delivery_mode: row.get(3)?,
+                            has_delivery_side_effects: row.get::<_, i64>(4)? != 0,
                         })
                     },
                 )?
