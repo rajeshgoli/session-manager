@@ -41,7 +41,8 @@ use crate::sessions::{
     CoreRetireOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
     MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
     SendCoreInputBatchRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, TaskCompleteOutcome, TaskCompleteRequest,
+    SessionsEnvelope, SetMaintainerRequest, SubagentStartOutcome, SubagentStartRequest,
+    SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest,
     TurnCompleteOutcome,
 };
 
@@ -103,6 +104,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/sessions/{session_id}/context-monitor",
             post(set_context_monitor),
+        )
+        .route(
+            "/sessions/{session_id}/subagents",
+            get(list_subagents).post(register_subagent_start),
+        )
+        .route(
+            "/sessions/{session_id}/subagents/{agent_id}/stop",
+            post(register_subagent_stop),
         )
         .route("/sessions/{session_id}/input", post(send_session_input))
         .route("/sessions/{session_id}/kill", post(retire_session))
@@ -1062,6 +1071,68 @@ async fn set_context_monitor(
     }
 }
 
+async fn register_subagent_start(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SubagentStartRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/subagents"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state
+        .session_store
+        .register_subagent_start(&session_id, payload)?
+    {
+        SubagentStartOutcome::Registered(result) => Ok(Json(serde_json::to_value(result)?)),
+        SubagentStartOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+    }
+}
+
+async fn register_subagent_stop(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, agent_id)): Path<(String, String)>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SubagentStopRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/subagents/{agent_id}/stop"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state
+        .session_store
+        .register_subagent_stop(&session_id, &agent_id, payload)?
+    {
+        SubagentStopOutcome::Stopped(result) => Ok(Json(serde_json::to_value(result)?)),
+        SubagentStopOutcome::SessionNotFound => Err(ApiError::NotFound("Session not found")),
+        SubagentStopOutcome::SubagentNotFound(agent_id) => Err(ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("Subagent {agent_id} not found"),
+        }),
+    }
+}
+
+async fn list_subagents(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(result) = state.session_store.list_subagents(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    Ok(Json(serde_json::to_value(result)?))
+}
+
 async fn schedule_handoff(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -1559,6 +1630,26 @@ fn shadow_predict_session_read(
             session_id: session_id.to_owned(),
             output,
         })?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/subagents"))
+    {
+        let Some(response) = state.session_store.list_subagents(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        let body = serde_json::to_vec(&response)?;
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
             body_sha256: Some(sha256_hex(&body)),

@@ -1512,6 +1512,108 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
 }
 
 #[tokio::test]
+async fn fixture_subagent_endpoints_round_trip_python_state_shape() {
+    let state_file = write_session_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/missing/subagents",
+        json!({
+            "agent_id": "agent-missing",
+            "agent_type": "engineer"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Session not found");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/subagents").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "session_id": "run12345", "subagents": [] })
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/run12345/subagents",
+        json!({
+            "agent_id": "agent456789",
+            "agent_type": "engineer",
+            "transcript_path": "/tmp/agent456789.jsonl"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["agent_id"], "agent456789");
+    assert_eq!(payload["agent_type"], "engineer");
+    assert_eq!(payload["parent_session_id"], "run12345");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["stopped_at"], Value::Null);
+    assert_eq!(payload["summary"], Value::Null);
+    assert!(payload["started_at"]
+        .as_str()
+        .unwrap_or_default()
+        .contains('T'));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/run12345/subagents/not-there/stop",
+        json!({ "summary": "ignored" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Subagent not-there not found");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/run12345/subagents/agent456789/stop",
+        json!({ "summary": "Finished useful work" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "session_id": "run12345",
+            "agent_id": "agent456789",
+            "status": "stopped",
+            "summary": "Finished useful work"
+        })
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/subagents").await;
+    assert_eq!(status, StatusCode::OK);
+    let subagents = payload["subagents"].as_array().unwrap();
+    assert_eq!(subagents.len(), 1);
+    assert_eq!(subagents[0]["agent_id"], "agent456789");
+    assert_eq!(subagents[0]["status"], "completed");
+    assert_eq!(subagents[0]["summary"], "Finished useful work");
+    assert!(subagents[0]["stopped_at"]
+        .as_str()
+        .unwrap_or_default()
+        .contains('T'));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    let stored = &session["subagents"][0];
+    assert_eq!(stored["agent_id"], "agent456789");
+    assert_eq!(stored["agent_type"], "engineer");
+    assert_eq!(stored["parent_session_id"], "run12345");
+    assert_eq!(stored["transcript_path"], "/tmp/agent456789.jsonl");
+    assert_eq!(stored["status"], "completed");
+    assert_eq!(stored["summary"], "Finished useful work");
+}
+
+#[tokio::test]
 async fn fixture_completion_endpoints_preserve_python_compatible_state() {
     let state_file = write_completion_fixture();
     let queue_db_path = queue_db_path_for_state_file(&state_file);

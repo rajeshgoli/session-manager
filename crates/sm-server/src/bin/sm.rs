@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     process, thread,
@@ -59,6 +59,11 @@ enum Command {
     Review(ReviewArgs),
     #[command(name = "request-codex-review")]
     RequestCodexReview(RequestCodexReviewArgs),
+    #[command(name = "subagent-start")]
+    SubagentStart(EmptyArgs),
+    #[command(name = "subagent-stop")]
+    SubagentStop(EmptyArgs),
+    Subagents(SessionIdArgs),
     Claude(ProviderLaunchArgs),
     Codex(ProviderLaunchArgs),
     #[command(name = "codex-app")]
@@ -652,6 +657,9 @@ fn run() -> Result<()> {
         }
         Command::Roster(_) => print_roster(&client)?,
         Command::Wait(args) => wait_for_session(&client, &args.session_id, args.seconds)?,
+        Command::SubagentStart(_) => run_subagent_start(&client)?,
+        Command::SubagentStop(_) => run_subagent_stop(&client)?,
+        Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())
@@ -694,6 +702,98 @@ fn print_batch_send_result(payload: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_subagent_start(client: &ApiClient) -> Result<()> {
+    let Some(session_id) = optional_current_session_id() else {
+        let mut ignored = String::new();
+        io::stdin().read_to_string(&mut ignored)?;
+        return Ok(());
+    };
+    let payload = read_json_stdin()?;
+    let agent_id = json_value_string(&payload, "agent_id")
+        .ok_or_else(|| anyhow!("Missing agent_id in hook payload"))?;
+    let agent_type = json_value_string(&payload, "agent_type")
+        .or_else(|| json_value_string(&payload, "subagent_type"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let transcript_path = json_value_string(&payload, "agent_transcript_path");
+    client.post_json(
+        &format!("/sessions/{}/subagents", encode_path_segment(&session_id)),
+        json!({
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "transcript_path": transcript_path
+        }),
+    )?;
+    Ok(())
+}
+
+fn run_subagent_stop(client: &ApiClient) -> Result<()> {
+    let Some(session_id) = optional_current_session_id() else {
+        let mut ignored = String::new();
+        io::stdin().read_to_string(&mut ignored)?;
+        return Ok(());
+    };
+    let payload = read_json_stdin()?;
+    let agent_id = json_value_string(&payload, "agent_id")
+        .ok_or_else(|| anyhow!("Missing agent_id in hook payload"))?;
+    let summary = json_value_string(&payload, "summary");
+    client.post_json(
+        &format!(
+            "/sessions/{}/subagents/{}/stop",
+            encode_path_segment(&session_id),
+            encode_path_segment(&agent_id)
+        ),
+        json!({ "summary": summary }),
+    )?;
+    Ok(())
+}
+
+fn print_subagents(client: &ApiClient, session_id: &str) -> Result<()> {
+    let session = client.get_json(&format!("/sessions/{}", encode_path_segment(session_id)))?;
+    let payload = client.get_json(&format!(
+        "/sessions/{}/subagents",
+        encode_path_segment(session_id)
+    ))?;
+    let name = session["friendly_name"]
+        .as_str()
+        .or_else(|| session["name"].as_str())
+        .unwrap_or(session_id);
+    let subagents = payload["subagents"].as_array().cloned().unwrap_or_default();
+    if subagents.is_empty() {
+        println!("{name} has no subagents");
+        return Ok(());
+    }
+    println!("{name} ({session_id}) subagents:");
+    for subagent in subagents {
+        let agent_id = subagent["agent_id"].as_str().unwrap_or("unknown");
+        let short_id = agent_id.chars().take(6).collect::<String>();
+        let agent_type = subagent["agent_type"].as_str().unwrap_or("unknown");
+        let status = subagent["status"].as_str().unwrap_or("unknown");
+        let started_at = subagent["started_at"].as_str().unwrap_or("");
+        println!("  {agent_type} ({short_id}) | {status} | {started_at}");
+        if let Some(summary) = subagent["summary"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+        {
+            println!("     {summary}");
+        }
+    }
+    Ok(())
+}
+
+fn read_json_stdin() -> Result<Value> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    serde_json::from_str(&input).with_context(|| "Failed to parse hook payload")
+}
+
+fn json_value_string(value: &Value, key: &str) -> Option<String> {
+    value[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn split_send_targets(raw_value: &str) -> Vec<String> {
