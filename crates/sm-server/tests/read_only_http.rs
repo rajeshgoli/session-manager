@@ -2313,6 +2313,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
         return;
     }
     let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
     let log_dir = unique_temp_path();
     let working_dir = unique_temp_path();
     fs::create_dir_all(&working_dir).unwrap();
@@ -2328,6 +2329,11 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(&state_file)
+                .display()
+                .to_string(),
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -2389,6 +2395,15 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(payload["delivered"], true);
 
     wait_for_output_contains(app.clone(), "runtimecore", "runtime:second runtime message").await;
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let delivered_at: Option<String> = queue_conn
+        .query_row(
+            "SELECT delivered_at FROM message_queue WHERE target_session_id = 'runtimecore' AND text = 'second runtime message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(delivered_at.is_some());
 
     let long_runtime_message = format!("{}chunked-runtime-tail", "x".repeat(500));
     let (status, payload) = post_json(
@@ -2944,6 +2959,15 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], false);
     assert_eq!(payload["status"], "stopped");
+    let queue_conn = Connection::open(queue_db_path_for_state_file(&state_file)).unwrap();
+    let pending: (String, Option<String>) = queue_conn
+        .query_row(
+            "SELECT text, delivered_at FROM message_queue WHERE target_session_id = 'runtimemissingsend'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, ("after external kill".to_owned(), None));
 
     let (status, payload) = get_json(app.clone(), "/sessions/runtimemissingsend").await;
     assert_eq!(status, StatusCode::OK);
@@ -3172,6 +3196,11 @@ async fn runtime_core_fails_create_when_stdin_prompt_cannot_be_delivered() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(&state_file)
+                .display()
+                .to_string(),
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -3708,6 +3737,11 @@ fn runtime_app_with_command(
     router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(state_file)
+                .display()
+                .to_string(),
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,

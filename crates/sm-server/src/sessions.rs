@@ -287,30 +287,40 @@ impl SessionStore {
     ) -> Result<Option<CoreInputResult>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
+
+        if runtime_session_status_raw(&mut state, session_id)?.is_none() {
             return Ok(None);
-        };
-        let node = json_text(session.get("node")).unwrap_or_else(default_node);
-        ensure_runtime_local_node(&node)?;
-        let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        let tmux_session = json_text(session.get("tmux_session"))
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-        let session_socket_name = json_text(session.get("tmux_socket_name"));
-        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let mut delivered = false;
-        if normalized_status(&status) != "stopped" {
-            delivered = session_runtime.send_input(&tmux_session, &request.text)?;
-            let now = now_rfc3339();
-            if delivered {
-                session.insert("last_activity".to_owned(), Value::String(now));
-            } else {
-                status = "stopped".to_owned();
-                session.insert("status".to_owned(), Value::String(status.clone()));
-                session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-                session.insert("last_activity".to_owned(), Value::String(now));
+        }
+
+        if should_persist_runtime_send(&request.delivery_mode) {
+            if let Some(queue) = &self.queue_store {
+                let message_id = queue.enqueue_message(
+                    session_id,
+                    &request.text,
+                    &request.delivery_mode,
+                    None,
+                )?;
+                let drain =
+                    drain_pending_runtime_messages_raw(&mut state, session_id, runtime, queue)?;
+                self.write_raw_json_value(&state)?;
+                let delivered = drain
+                    .delivered_message_ids
+                    .iter()
+                    .any(|id| id == &message_id)
+                    || queue.message_delivered(&message_id)?;
+                return Ok(Some(CoreInputResult {
+                    ok: true,
+                    session_id: session_id.to_owned(),
+                    delivered,
+                    delivery_mode: request.delivery_mode,
+                    notify_after_seconds: request.notify_after_seconds,
+                    status: drain.status,
+                }));
             }
         }
+
+        let (status, delivered) =
+            deliver_runtime_text_to_session_raw(&mut state, session_id, &request.text, runtime)?;
         self.write_raw_json_value(&state)?;
         Ok(Some(CoreInputResult {
             ok: true,
@@ -1651,6 +1661,90 @@ fn push_retained_message_raw(
         "created_at": now_rfc3339(),
     }));
     Ok(())
+}
+
+#[derive(Debug)]
+struct QueueDrainResult {
+    status: String,
+    delivered_message_ids: Vec<String>,
+}
+
+fn should_persist_runtime_send(delivery_mode: &str) -> bool {
+    matches!(
+        delivery_mode.trim().to_ascii_lowercase().as_str(),
+        "sequential" | "important" | "urgent"
+    )
+}
+
+fn runtime_session_status_raw(state: &mut Value, session_id: &str) -> Result<Option<String>> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let Some(session) = session_object_mut(sessions, session_id) else {
+        return Ok(None);
+    };
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let _tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    Ok(Some(
+        json_text(session.get("status")).unwrap_or_else(|| "running".to_owned()),
+    ))
+}
+
+fn deliver_runtime_text_to_session_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<(String, bool)> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let session = session_object_mut(sessions, session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    let session_socket_name = json_text(session.get("tmux_socket_name"));
+    let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+    let mut delivered = false;
+    if normalized_status(&status) != "stopped" {
+        delivered = session_runtime.send_input(&tmux_session, text)?;
+        let now = now_rfc3339();
+        if delivered {
+            session.insert("last_activity".to_owned(), Value::String(now));
+        } else {
+            status = "stopped".to_owned();
+            session.insert("status".to_owned(), Value::String(status.clone()));
+            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+            session.insert("last_activity".to_owned(), Value::String(now));
+        }
+    }
+    Ok((status, delivered))
+}
+
+fn drain_pending_runtime_messages_raw(
+    state: &mut Value,
+    session_id: &str,
+    runtime: &TmuxRuntime,
+    queue: &RetainedQueueStore,
+) -> Result<QueueDrainResult> {
+    let mut status =
+        runtime_session_status_raw(state, session_id)?.unwrap_or_else(|| "stopped".to_owned());
+    let mut delivered_message_ids = Vec::new();
+    for message in queue.pending_messages_for_target(session_id, 10)? {
+        let (next_status, delivered) =
+            deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?;
+        status = next_status;
+        if !delivered {
+            break;
+        }
+        queue.mark_delivered(&message.id)?;
+        delivered_message_ids.push(message.id);
+    }
+    Ok(QueueDrainResult {
+        status,
+        delivered_message_ids,
+    })
 }
 
 fn upsert_stop_notify_raw(

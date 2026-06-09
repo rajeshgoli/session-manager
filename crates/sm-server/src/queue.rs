@@ -9,6 +9,14 @@ pub struct RetainedQueueStore {
     db_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMessage {
+    pub id: String,
+    pub target_session_id: String,
+    pub text: String,
+    pub delivery_mode: String,
+}
+
 impl RetainedQueueStore {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
@@ -64,6 +72,66 @@ impl RetainedQueueStore {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn pending_messages_for_target(
+        &self,
+        target_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingMessage>> {
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare(
+                r#"
+                SELECT id, target_session_id, text, delivery_mode
+                FROM message_queue
+                WHERE target_session_id = ?1 AND delivered_at IS NULL
+                ORDER BY queued_at ASC, id ASC
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = statement
+                .query_map(params![target_session_id, limit.max(1) as i64], |row| {
+                    Ok(PendingMessage {
+                        id: row.get(0)?,
+                        target_session_id: row.get(1)?,
+                        text: row.get(2)?,
+                        delivery_mode: row.get(3)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn mark_delivered(&self, message_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                UPDATE message_queue
+                SET delivered_at = ?2
+                WHERE id = ?1 AND delivered_at IS NULL
+                "#,
+                params![message_id, now_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn message_delivered(&self, message_id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT delivered_at IS NOT NULL
+                FROM message_queue
+                WHERE id = ?1
+                "#,
+                params![message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(0) != 0)
             .map_err(Into::into)
         })
     }
@@ -369,6 +437,15 @@ mod tests {
                 "task_complete".to_owned()
             )
         );
+        let pending = store.pending_messages_for_target("child001", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, message_id);
+        store.mark_delivered(&message_id).unwrap();
+        assert!(store.message_delivered(&message_id).unwrap());
+        assert!(store
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
         let active: i64 = conn
             .query_row(
                 "SELECT is_active FROM parent_wake_registrations WHERE child_session_id = 'child001'",
