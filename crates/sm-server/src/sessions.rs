@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::queue::RetainedQueueStore;
+use crate::queue::{QueueMessageMetadata, RetainedQueueStore};
 use crate::runtime::{TmuxRuntime, TmuxSessionSpec};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -303,10 +303,15 @@ impl SessionStore {
         }
 
         let delivery_mode = normalized_delivery_mode(&request.delivery_mode);
+        let (queued_text, sender_name) = format_send_input_text_raw(&state, &request);
         if should_persist_runtime_send(&delivery_mode) {
             if let Some(queue) = &self.queue_store {
-                let message_id =
-                    queue.enqueue_message(session_id, &request.text, &delivery_mode, None)?;
+                let message_id = queue.enqueue_message_with_metadata(
+                    session_id,
+                    &queued_text,
+                    &delivery_mode,
+                    queue_metadata_for_send_request(&state, session_id, &request, sender_name),
+                )?;
                 let drain = if delivery_mode == "urgent" {
                     deliver_urgent_runtime_message_raw(
                         &mut state,
@@ -314,7 +319,7 @@ impl SessionStore {
                         runtime,
                         queue,
                         &message_id,
-                        &request.text,
+                        &queued_text,
                     )?
                 } else {
                     drain_pending_runtime_messages_raw(
@@ -348,7 +353,7 @@ impl SessionStore {
         }
 
         let (status, delivered) =
-            deliver_runtime_text_to_session_raw(&mut state, session_id, &request.text, runtime)?;
+            deliver_runtime_text_to_session_raw(&mut state, session_id, &queued_text, runtime)?;
         self.write_raw_json_value(&state)?;
         Ok(Some(CoreInputResult {
             ok: true,
@@ -1362,7 +1367,25 @@ pub struct SendCoreInputRequest {
     #[serde(default = "default_delivery_mode")]
     pub delivery_mode: String,
     #[serde(default)]
+    pub sender_session_id: Option<String>,
+    #[serde(default)]
+    pub from_sm_send: bool,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub notify_on_delivery: bool,
+    #[serde(default)]
     pub notify_after_seconds: Option<u64>,
+    #[serde(default)]
+    pub notify_on_stop: bool,
+    #[serde(default)]
+    pub remind_soft_threshold: Option<u64>,
+    #[serde(default)]
+    pub remind_hard_threshold: Option<u64>,
+    #[serde(default)]
+    pub remind_cancel_on_reply_session_id: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1706,6 +1729,86 @@ fn should_persist_runtime_send(delivery_mode: &str) -> bool {
 
 fn normalized_delivery_mode(delivery_mode: &str) -> String {
     delivery_mode.trim().to_ascii_lowercase()
+}
+
+fn format_send_input_text_raw(
+    state: &Value,
+    request: &SendCoreInputRequest,
+) -> (String, Option<String>) {
+    let Some(sender_session_id) = optional_trimmed(request.sender_session_id.as_deref()) else {
+        return (request.text.clone(), None);
+    };
+    let Some(sessions) = state.get("sessions").and_then(Value::as_array) else {
+        return (request.text.clone(), None);
+    };
+    let Some(sender) = session_object(sessions, &sender_session_id) else {
+        return (request.text.clone(), None);
+    };
+    let sender_name = raw_session_display_name(sender, &sender_session_id);
+    (
+        format!(
+            "[Input from: {sender_name} ({}) via sm send]\n{}",
+            short_session_id(&sender_session_id),
+            request.text
+        ),
+        Some(sender_name),
+    )
+}
+
+fn queue_metadata_for_send_request(
+    state: &Value,
+    target_session_id: &str,
+    request: &SendCoreInputRequest,
+    sender_name: Option<String>,
+) -> QueueMessageMetadata {
+    let sender_session_id = optional_trimmed(request.sender_session_id.as_deref());
+    let notify_on_stop = request.notify_on_stop
+        && sender_session_id.as_deref().is_some_and(|sender_id| {
+            sender_id != target_session_id
+                && raw_session_is_em(state, sender_id)
+                && raw_session_provider(state, target_session_id).as_deref() != Some("codex-fork")
+        });
+    QueueMessageMetadata {
+        sender_session_id,
+        sender_name,
+        from_sm_send: request.from_sm_send,
+        timeout_seconds: request.timeout_seconds,
+        notify_on_delivery: request.notify_on_delivery,
+        notify_after_seconds: request.notify_after_seconds,
+        notify_on_stop,
+        remind_soft_threshold: request.remind_soft_threshold,
+        remind_hard_threshold: request.remind_hard_threshold,
+        remind_cancel_on_reply_session_id: request.remind_cancel_on_reply_session_id.clone(),
+        parent_session_id: request.parent_session_id.clone(),
+        message_category: None,
+        response_relay_source: None,
+    }
+}
+
+fn raw_session_display_name(session: &Map<String, Value>, fallback_id: &str) -> String {
+    json_text(session.get("friendly_name"))
+        .or_else(|| json_text(session.get("name")))
+        .unwrap_or_else(|| fallback_id.to_owned())
+}
+
+fn raw_session_is_em(state: &Value, session_id: &str) -> bool {
+    raw_session_object(state, session_id)
+        .and_then(|session| session.get("is_em"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn raw_session_provider(state: &Value, session_id: &str) -> Option<String> {
+    raw_session_object(state, session_id).and_then(|session| json_text(session.get("provider")))
+}
+
+fn raw_session_object<'a>(state: &'a Value, session_id: &str) -> Option<&'a Map<String, Value>> {
+    let sessions = state.get("sessions").and_then(Value::as_array)?;
+    session_object(sessions, session_id)
+}
+
+fn short_session_id(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
 }
 
 fn runtime_session_status_raw(state: &mut Value, session_id: &str) -> Result<Option<String>> {

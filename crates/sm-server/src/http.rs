@@ -446,7 +446,16 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
             let request = SendCoreInputRequest {
                 text: notification,
                 delivery_mode: "sequential".to_owned(),
+                sender_session_id: None,
+                from_sm_send: false,
+                timeout_seconds: None,
+                notify_on_delivery: false,
                 notify_after_seconds: None,
+                notify_on_stop: false,
+                remind_soft_threshold: None,
+                remind_hard_threshold: None,
+                remind_cancel_on_reply_session_id: None,
+                parent_session_id: None,
             };
             let _ = if state.config.rust_core.runtime_enabled {
                 let runtime = TmuxRuntime::from_config(&state.config.rust_core);

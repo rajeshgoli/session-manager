@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use time::{
-    format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime,
+    format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
     PrimitiveDateTime,
 };
 
@@ -18,6 +18,23 @@ pub struct PendingMessage {
     pub target_session_id: String,
     pub text: String,
     pub delivery_mode: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueMessageMetadata {
+    pub sender_session_id: Option<String>,
+    pub sender_name: Option<String>,
+    pub from_sm_send: bool,
+    pub timeout_seconds: Option<u64>,
+    pub notify_on_delivery: bool,
+    pub notify_after_seconds: Option<u64>,
+    pub notify_on_stop: bool,
+    pub remind_soft_threshold: Option<u64>,
+    pub remind_hard_threshold: Option<u64>,
+    pub remind_cancel_on_reply_session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub message_category: Option<String>,
+    pub response_relay_source: Option<String>,
 }
 
 impl RetainedQueueStore {
@@ -40,22 +57,60 @@ impl RetainedQueueStore {
         delivery_mode: &str,
         message_category: Option<&str>,
     ) -> Result<String> {
+        self.enqueue_message_with_metadata(
+            target_session_id,
+            text,
+            delivery_mode,
+            QueueMessageMetadata {
+                message_category: message_category.map(ToOwned::to_owned),
+                ..QueueMessageMetadata::default()
+            },
+        )
+    }
+
+    pub fn enqueue_message_with_metadata(
+        &self,
+        target_session_id: &str,
+        text: &str,
+        delivery_mode: &str,
+        metadata: QueueMessageMetadata,
+    ) -> Result<String> {
         self.with_connection(|conn| {
             let id = generate_record_id("msg");
+            let timeout_at = timeout_at_rfc3339(metadata.timeout_seconds)?;
+            let response_relay_source = metadata
+                .response_relay_source
+                .or_else(|| metadata.from_sm_send.then(|| "sm-send".to_owned()));
             conn.execute(
                 r#"
                 INSERT INTO message_queue
-                    (id, target_session_id, text, delivery_mode, from_sm_send, queued_at, message_category)
+                    (id, target_session_id, sender_session_id, sender_name, text,
+                     delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery,
+                     notify_after_seconds, notify_on_stop, remind_soft_threshold,
+                     remind_hard_threshold, remind_cancel_on_reply_session_id, parent_session_id,
+                     message_category, response_relay_source)
                 VALUES
-                    (?1, ?2, ?3, ?4, 0, ?5, ?6)
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                 "#,
                 params![
                     id,
                     target_session_id,
+                    metadata.sender_session_id,
+                    metadata.sender_name,
                     text,
                     delivery_mode,
+                    metadata.from_sm_send,
                     now_rfc3339(),
-                    message_category
+                    timeout_at,
+                    metadata.notify_on_delivery,
+                    metadata.notify_after_seconds.map(u64_to_i64).transpose()?,
+                    metadata.notify_on_stop,
+                    metadata.remind_soft_threshold.map(u64_to_i64).transpose()?,
+                    metadata.remind_hard_threshold.map(u64_to_i64).transpose()?,
+                    metadata.remind_cancel_on_reply_session_id,
+                    metadata.parent_session_id,
+                    metadata.message_category,
+                    response_relay_source,
                 ],
             )?;
             Ok(id)
@@ -478,6 +533,18 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn timeout_at_rfc3339(timeout_seconds: Option<u64>) -> Result<Option<String>> {
+    let Some(timeout_seconds) = timeout_seconds.filter(|seconds| *seconds > 0) else {
+        return Ok(None);
+    };
+    let timeout_at = OffsetDateTime::now_utc() + Duration::seconds(u64_to_i64(timeout_seconds)?);
+    Ok(Some(timeout_at.format(&Rfc3339)?))
+}
+
+fn u64_to_i64(value: u64) -> Result<i64> {
+    i64::try_from(value).context("queue metadata seconds value is too large")
 }
 
 #[cfg(test)]

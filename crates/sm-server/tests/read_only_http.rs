@@ -3166,26 +3166,124 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimesender",
+            "name": "runtime-sender",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "sender initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let sender = raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "runtimesender")
+        .unwrap();
+    sender["is_em"] = Value::Bool(true);
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&raw_state).unwrap(),
+    )
+    .unwrap();
     assert!(tmux_kill_session(&tmux_socket, &tmux_session));
 
     let (status, payload) = post_json(
         app.clone(),
         "/sessions/runtimemissingsend/input",
-        json!({ "text": "after external kill" }),
+        json!({
+            "text": "after external kill",
+            "sender_session_id": "runtimesender",
+            "delivery_mode": "sequential",
+            "from_sm_send": true,
+            "timeout_seconds": 60,
+            "notify_on_delivery": true,
+            "notify_after_seconds": 7,
+            "notify_on_stop": true,
+            "remind_soft_threshold": 11,
+            "remind_hard_threshold": 17,
+            "remind_cancel_on_reply_session_id": "runtimesender",
+            "parent_session_id": "runtimeparent"
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], false);
     assert_eq!(payload["status"], "stopped");
     let queue_conn = Connection::open(queue_db_path_for_state_file(&state_file)).unwrap();
-    let pending: (String, Option<String>) = queue_conn
+    let pending: (
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = queue_conn
         .query_row(
-            "SELECT text, delivered_at FROM message_queue WHERE target_session_id = 'runtimemissingsend'",
+            r#"
+            SELECT text, sender_session_id, sender_name, from_sm_send, timeout_at,
+                   notify_on_delivery, notify_after_seconds, notify_on_stop,
+                   remind_soft_threshold, remind_hard_threshold,
+                   remind_cancel_on_reply_session_id, parent_session_id,
+                   response_relay_source, delivered_at
+            FROM message_queue
+            WHERE target_session_id = 'runtimemissingsend'
+            "#,
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            },
         )
         .unwrap();
-    assert_eq!(pending, ("after external kill".to_owned(), None));
+    let timeout_at = pending.4.clone();
+    assert!(timeout_at.is_some());
+    assert_eq!(
+        pending.0,
+        "[Input from: runtime-sender (runtimes) via sm send]\nafter external kill"
+    );
+    assert_eq!(pending.1.as_deref(), Some("runtimesender"));
+    assert_eq!(pending.2.as_deref(), Some("runtime-sender"));
+    assert_eq!(pending.3, 1);
+    assert_eq!(pending.4, timeout_at);
+    assert_eq!(pending.5, 1);
+    assert_eq!(pending.6, 7);
+    assert_eq!(pending.7, 1);
+    assert_eq!(pending.8, Some(11));
+    assert_eq!(pending.9, Some(17));
+    assert_eq!(pending.10.as_deref(), Some("runtimesender"));
+    assert_eq!(pending.11.as_deref(), Some("runtimeparent"));
+    assert_eq!(pending.12.as_deref(), Some("sm-send"));
+    assert_eq!(pending.13, None);
 
     let (status, payload) = get_json(app.clone(), "/sessions/runtimemissingsend").await;
     assert_eq!(status, StatusCode::OK);
