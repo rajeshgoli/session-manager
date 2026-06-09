@@ -1754,6 +1754,43 @@ fn deliver_runtime_text_to_session_raw(
     Ok((status, delivered))
 }
 
+fn deliver_urgent_runtime_text_to_session_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<(String, bool)> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let session = session_object_mut(sessions, session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+    let session_socket_name = json_text(session.get("tmux_socket_name"));
+    let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+    let mut delivered = false;
+    if normalized_status(&status) != "stopped" {
+        delivered = session_runtime.send_urgent_input(
+            &tmux_session,
+            text,
+            provider.eq_ignore_ascii_case("claude"),
+        )?;
+        let now = now_rfc3339();
+        if delivered {
+            session.insert("last_activity".to_owned(), Value::String(now));
+        } else {
+            status = "stopped".to_owned();
+            session.insert("status".to_owned(), Value::String(status.clone()));
+            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+            session.insert("last_activity".to_owned(), Value::String(now));
+        }
+    }
+    Ok((status, delivered))
+}
+
 fn drain_pending_runtime_messages_raw(
     state: &mut Value,
     session_id: &str,
@@ -1814,7 +1851,7 @@ fn deliver_urgent_runtime_message_raw(
     text: &str,
 ) -> Result<QueueDrainResult> {
     let (status, delivered) =
-        deliver_runtime_text_to_session_raw(state, session_id, text, runtime)?;
+        deliver_urgent_runtime_text_to_session_raw(state, session_id, text, runtime)?;
     let mut delivered_message_ids = Vec::new();
     if delivered {
         queue.mark_delivered(message_id)?;

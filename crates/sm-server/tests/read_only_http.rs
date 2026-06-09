@@ -2576,12 +2576,7 @@ async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], true);
-    wait_for_output_contains(
-        app.clone(),
-        "runtimepriority",
-        "runtime:urgent priority message",
-    )
-    .await;
+    wait_for_output_contains(app.clone(), "runtimepriority", "urgent priority message").await;
 
     let queue_conn = Connection::open(&queue_db_path).unwrap();
     let delivered_priority_count: i64 = queue_conn
