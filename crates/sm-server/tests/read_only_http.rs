@@ -3331,6 +3331,68 @@ async fn runtime_core_task_complete_wakes_parent_runtime() {
         .find(|session| session["id"] == "remotetaskparent")
         .unwrap();
     assert!(remote_parent["agent_task_completed_at"].is_string());
+
+    let missing_parent_child_log = unique_temp_path();
+    let missing_parent_state = json!({
+        "sessions": [
+            {
+                "id": "missingparentchild",
+                "name": "missing-parent-child",
+                "friendly_name": "missing-parent-child",
+                "working_dir": working_dir.display().to_string(),
+                "tmux_session": "missing-parent-child",
+                "log_file": missing_parent_child_log.display().to_string(),
+                "status": "running",
+                "node": "primary",
+                "parent_session_id": "deletedparent",
+                "created_at": "2026-06-09T00:00:00Z",
+                "last_activity": "2026-06-09T00:00:00Z"
+            }
+        ],
+        "retained_pending_messages": [],
+        "retained_remind_registrations": [],
+        "retained_parent_wake_registrations": [],
+        "retained_stop_notify_states": []
+    });
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&missing_parent_state).unwrap(),
+    )
+    .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/missingparentchild/task-complete",
+        json!({ "requester_session_id": "missingparentchild" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["em_notified"], true);
+    let missing_parent_queued: (i64, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'deletedparent'
+              AND message_category = 'task_complete'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        missing_parent_queued,
+        (0, "important".to_owned(), Some("task_complete".to_owned()))
+    );
+    let missing_parent_raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let missing_parent_child = missing_parent_raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "missingparentchild")
+        .unwrap();
+    assert!(missing_parent_child["agent_task_completed_at"].is_string());
 }
 
 #[tokio::test]

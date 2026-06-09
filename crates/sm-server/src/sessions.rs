@@ -1101,25 +1101,26 @@ impl SessionStore {
                     Some("task_complete"),
                 )?;
                 if let Some(runtime) = runtime {
-                    let parent_node = raw_session_object(&state, &em_session_id)
-                        .and_then(|session| json_text(session.get("node")))
-                        .unwrap_or_else(default_node);
-                    if is_primary_node(&parent_node) {
-                        let drain = drain_pending_runtime_messages_raw(
-                            self,
-                            &mut state,
-                            &em_session_id,
-                            runtime,
-                            queue,
-                            Some("important"),
-                            Some(&message_id),
-                        )?;
-                        if drain
-                            .delivered_message_ids
-                            .iter()
-                            .any(|delivered_id| delivered_id == &message_id)
-                        {
-                            clear_agent_task_completed_raw(&mut state, &em_session_id)?;
+                    if let Some(parent_session) = raw_session_object(&state, &em_session_id) {
+                        let parent_node =
+                            json_text(parent_session.get("node")).unwrap_or_else(default_node);
+                        if is_primary_node(&parent_node) {
+                            let drain = drain_pending_runtime_messages_raw(
+                                self,
+                                &mut state,
+                                &em_session_id,
+                                runtime,
+                                queue,
+                                Some("important"),
+                                Some(&message_id),
+                            )?;
+                            if drain
+                                .delivered_message_ids
+                                .iter()
+                                .any(|delivered_id| delivered_id == &message_id)
+                            {
+                                clear_agent_task_completed_raw(&mut state, &em_session_id)?;
+                            }
                         }
                     }
                 }
