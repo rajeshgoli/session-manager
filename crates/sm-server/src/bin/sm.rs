@@ -553,10 +553,64 @@ fn run() -> Result<()> {
         Command::ContextMonitor(args) => {
             run_context_monitor(&client, args)?;
         }
+        Command::Maintainer(args) => {
+            let session_id = current_session_id()?;
+            let body = json!({ "requester_session_id": session_id });
+            if args.clear {
+                client.delete_json(&format!("/sessions/{session_id}/maintainer"), body)?;
+                println!("Maintainer alias cleared");
+            } else {
+                client.put_json(&format!("/sessions/{session_id}/maintainer"), body)?;
+                println!("Maintainer alias registered: maintainer -> {session_id}");
+            }
+        }
+        Command::Register(args) => {
+            let session_id = current_session_id()?;
+            if args.session_id.is_some() {
+                bail!("sm register is self-directed; pass only the role");
+            }
+            let role = required_positional(args.role, "role")?;
+            let payload = client.post_json(
+                &format!("/sessions/{session_id}/registry"),
+                json!({ "requester_session_id": session_id, "role": role }),
+            )?;
+            let role_name = payload["role"].as_str().unwrap_or(&role);
+            let target_session = payload["session_id"].as_str().unwrap_or(&session_id);
+            println!("Registered: {role_name} -> {target_session}");
+        }
+        Command::Unregister(args) => {
+            let session_id = current_session_id()?;
+            if args.session_id.is_some() {
+                bail!("sm unregister is self-directed; pass only the role");
+            }
+            let role = required_positional(args.role, "role")?;
+            let payload = client.delete_json(
+                &format!("/sessions/{session_id}/registry"),
+                json!({ "requester_session_id": session_id, "role": role }),
+            )?;
+            let role_name = payload["role"].as_str().unwrap_or(&role);
+            println!("Unregistered: {role_name}");
+        }
+        Command::Lookup(args) => {
+            let identifier = required_positional(args.role, "role")?;
+            if let Some(session_id) = lookup_identifier(&client, &identifier)? {
+                println!("{session_id}");
+            } else {
+                bail!("Role not registered");
+            }
+        }
+        Command::Roster(_) => print_roster(&client)?,
         Command::Wait(args) => wait_for_session(&client, &args.session_id, args.seconds)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())
+}
+
+fn required_positional(value: Option<String>, label: &str) -> Result<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{label} is required"))
 }
 
 fn print_output(client: &ApiClient, session_id: &str, lines: usize) -> Result<()> {
@@ -633,6 +687,168 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
         }
     }
     Ok(())
+}
+
+fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
+    let registry_path = format!("/registry/{}", encode_path_segment(identifier));
+    let response = client.request("GET", &registry_path, None)?;
+    if (200..300).contains(&response.status) {
+        let payload = response.into_json()?;
+        if let Some(session_id) = payload["session_id"].as_str() {
+            return Ok(Some(session_id.to_owned()));
+        }
+        bail!("Role lookup returned no session ID");
+    }
+    if response.status != 404 {
+        return Err(response.into_status_error());
+    }
+
+    let session_path = format!("/sessions/{}", encode_path_segment(identifier));
+    let response = client.request("GET", &session_path, None)?;
+    if (200..300).contains(&response.status) {
+        let payload = response.into_json()?;
+        if let Some(session_id) = payload["id"].as_str() {
+            return Ok(Some(session_id.to_owned()));
+        }
+    } else if response.status != 404 {
+        return Err(response.into_status_error());
+    }
+
+    let payload = client.get_json("/sessions")?;
+    let sessions = payload["sessions"].as_array().cloned().unwrap_or_default();
+    let exact_matches = sessions
+        .iter()
+        .filter(|session| {
+            session["aliases"].as_array().is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .any(|alias| alias.as_str() == Some(identifier))
+            }) || session["friendly_name"].as_str() == Some(identifier)
+                || session["name"].as_str() == Some(identifier)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact_matches.len() == 1 {
+        return Ok(exact_matches[0]["id"].as_str().map(ToOwned::to_owned));
+    }
+    if exact_matches.len() > 1 {
+        return bail_ambiguous_lookup(identifier, &exact_matches);
+    }
+
+    let needle = identifier.to_ascii_lowercase();
+    let matches = sessions
+        .iter()
+        .filter(|session| {
+            ["friendly_name", "name"].iter().any(|field| {
+                session[*field]
+                    .as_str()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches[0]["id"].as_str().map(ToOwned::to_owned)),
+        count if count > 1 => bail_ambiguous_lookup(identifier, &matches),
+        _ => Ok(None),
+    }
+}
+
+fn bail_ambiguous_lookup(identifier: &str, matches: &[Value]) -> Result<Option<String>> {
+    let labels = matches
+        .iter()
+        .take(5)
+        .map(|session| {
+            let id = session["id"].as_str().unwrap_or("unknown");
+            let name = session["friendly_name"]
+                .as_str()
+                .or_else(|| session["name"].as_str())
+                .unwrap_or(id);
+            format!("{name} ({id})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if matches.len() > 5 {
+        format!(", +{} more", matches.len() - 5)
+    } else {
+        String::new()
+    };
+    bail!("Multiple sessions match '{identifier}': {labels}{suffix}");
+}
+
+fn print_roster(client: &ApiClient) -> Result<()> {
+    let payload = client.get_json("/registry")?;
+    let registrations = payload["registrations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if registrations.is_empty() {
+        println!("No registered roles or humans.");
+        return Ok(());
+    }
+
+    println!("Agents");
+    let rows = registrations
+        .iter()
+        .map(|entry| {
+            vec![
+                json_string(entry, "role"),
+                json_string(entry, "session_id"),
+                json_string(entry, "friendly_name"),
+                json_string(entry, "provider"),
+                entry["activity_state"]
+                    .as_str()
+                    .or_else(|| entry["status"].as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["Role", "Session ID", "Name", "Provider", "State"], &rows);
+    Ok(())
+}
+
+fn json_string(value: &Value, key: &str) -> String {
+    value[key].as_str().unwrap_or("").to_owned()
+}
+
+fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    let widths = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            rows.iter()
+                .map(|row| row.get(index).map(String::len).unwrap_or(0))
+                .fold(header.len(), usize::max)
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| format!("{header:<width$}", width = widths[index]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    println!(
+        "{}",
+        widths
+            .iter()
+            .map(|width| "-".repeat(*width))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    for row in rows {
+        println!(
+            "{}",
+            row.iter()
+                .enumerate()
+                .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
 }
 
 fn attach_session(client: &ApiClient, session_id: &str) -> Result<()> {
@@ -763,6 +979,16 @@ impl ApiClient {
         response.into_json()
     }
 
+    fn put_json(&self, path: &str, body: Value) -> Result<Value> {
+        let response = self.request("PUT", path, Some(body))?;
+        response.into_json()
+    }
+
+    fn delete_json(&self, path: &str, body: Value) -> Result<Value> {
+        let response = self.request("DELETE", path, Some(body))?;
+        response.into_json()
+    }
+
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<ApiResponse> {
         if self.scheme == "https" {
             return self.request_https(method, path, body);
@@ -810,6 +1036,17 @@ impl ApiClient {
                 .header("Accept", "application/json")
                 .header("Content-Type", "application/json")
                 .send(body_bytes.as_slice()),
+            "PUT" => agent
+                .put(&url)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .send(body_bytes.as_slice()),
+            "DELETE" => agent
+                .delete(&url)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .force_send_body()
+                .send(body_bytes.as_slice()),
             _ => bail!("unsupported HTTP method {method}"),
         }
         .with_context(|| format!("failed to request {url}"))?;
@@ -822,11 +1059,27 @@ impl ApiClient {
 impl ApiResponse {
     fn into_json(self) -> Result<Value> {
         if !(200..300).contains(&self.status) {
-            bail!("HTTP {}: {}", self.status, self.body);
+            return Err(self.into_status_error());
         }
         serde_json::from_str(&self.body)
             .with_context(|| format!("response body was not JSON: {}", self.body))
     }
+
+    fn into_status_error(self) -> anyhow::Error {
+        anyhow!("HTTP {}: {}", self.status, self.body)
+    }
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16)> {
