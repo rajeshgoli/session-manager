@@ -1107,6 +1107,84 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
 }
 
 #[tokio::test]
+async fn fixture_core_input_batch_reports_per_recipient_results() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    for (id, name) in [
+        ("batchfixturea", "batch-fixture-a"),
+        ("batchfixtureb", "batch-fixture-b"),
+    ] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/sessions",
+            json!({
+                "id": id,
+                "name": name,
+                "working_dir": "/repo",
+                "provider": "claude"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["id"], id);
+    }
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/input-batch",
+        json!({
+            "recipients": ["batchfixturea, batchfixtureb", "missingbatch", "batchfixturea"],
+            "text": "fixture batch payload",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["requested_count"], 3);
+    assert_eq!(payload["success_count"], 2);
+    assert_eq!(payload["failure_count"], 1);
+    assert_eq!(payload["delivery_mode"], "sequential");
+    let results = payload["results"].as_array().unwrap();
+    assert_eq!(results[0]["identifier"], "batchfixturea");
+    assert_eq!(results[0]["status"], "delivered");
+    assert_eq!(results[0]["delivery_kind"], "session");
+    assert_eq!(results[0]["session_id"], "batchfixturea");
+    assert_eq!(results[0]["target_name"], "batch-fixture-a");
+    assert_eq!(results[1]["identifier"], "batchfixtureb");
+    assert_eq!(results[1]["status"], "delivered");
+    assert_eq!(results[2]["identifier"], "missingbatch");
+    assert_eq!(results[2]["status"], "failed");
+    assert_eq!(results[2]["delivery_kind"], "none");
+    assert_eq!(results[2]["detail"], "Session 'missingbatch' not found");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/batchfixturea/output?lines=5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("fixture batch payload"));
+    let (status, payload) = get_json(app, "/sessions/batchfixtureb/output?lines=5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("fixture batch payload"));
+}
+
+#[tokio::test]
 async fn fixture_core_session_graph_endpoints_round_trip_state() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();
@@ -2674,6 +2752,82 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
     assert_eq!(pending.11, None);
     assert_eq!(pending.12.as_deref(), Some("sm-send"));
     assert!(pending.13.is_some());
+}
+
+#[tokio::test]
+async fn runtime_core_input_batch_delivers_to_multiple_sessions() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-input-batch-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    for (id, prompt) in [
+        ("runtimebatcha", "runtime batch a initial"),
+        ("runtimebatchb", "runtime batch b initial"),
+    ] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/sessions",
+            json!({
+                "id": id,
+                "working_dir": working_dir.display().to_string(),
+                "provider": "claude",
+                "initial_message": prompt
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["id"], id);
+        wait_for_output_contains(app.clone(), id, &format!("runtime:{prompt}")).await;
+    }
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/input-batch",
+        json!({
+            "recipients": ["runtimebatcha,runtimebatchb", "missingruntimebatch"],
+            "text": "runtime batch payload",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["requested_count"], 3);
+    assert_eq!(payload["success_count"], 2);
+    assert_eq!(payload["failure_count"], 1);
+    let results = payload["results"].as_array().unwrap();
+    assert_eq!(results[0]["identifier"], "runtimebatcha");
+    assert_eq!(results[0]["status"], "delivered");
+    assert_eq!(results[0]["delivery_kind"], "session");
+    assert_eq!(results[1]["identifier"], "runtimebatchb");
+    assert_eq!(results[1]["status"], "delivered");
+    assert_eq!(results[2]["identifier"], "missingruntimebatch");
+    assert_eq!(results[2]["status"], "failed");
+    assert_eq!(
+        results[2]["detail"],
+        "Session 'missingruntimebatch' not found"
+    );
+    wait_for_output_contains(
+        app.clone(),
+        "runtimebatcha",
+        "runtime:runtime batch payload",
+    )
+    .await;
+    wait_for_output_contains(app, "runtimebatchb", "runtime:runtime batch payload").await;
 }
 
 #[tokio::test]

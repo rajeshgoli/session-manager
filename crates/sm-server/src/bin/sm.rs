@@ -444,22 +444,44 @@ fn run() -> Result<()> {
             if text.trim().is_empty() {
                 bail!("send text is required");
             }
-            let payload = client.post_json(
-                &format!("/sessions/{}/input", args.session_id),
-                json!({
-                    "text": text,
-                    "delivery_mode": if args.urgent { "urgent" } else { "sequential" },
-                    "notify_after_seconds": args.wait
-                }),
-            )?;
-            println!(
-                "{}",
-                if payload["delivered"].as_bool().unwrap_or(false) {
-                    "delivered"
-                } else {
-                    "not delivered"
+            let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
+            let targets = split_send_targets(&args.session_id);
+            if targets.len() > 1 {
+                let payload = client.post_json(
+                    "/sessions/input-batch",
+                    json!({
+                        "recipients": targets,
+                        "text": text,
+                        "delivery_mode": delivery_mode,
+                        "notify_after_seconds": args.wait
+                    }),
+                )?;
+                print_batch_send_result(&payload)?;
+                if payload["failure_count"].as_u64().unwrap_or(0) > 0 {
+                    bail!("one or more sends failed");
                 }
-            );
+            } else {
+                let target = targets
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or(args.session_id.as_str());
+                let payload = client.post_json(
+                    &format!("/sessions/{target}/input"),
+                    json!({
+                        "text": text,
+                        "delivery_mode": delivery_mode,
+                        "notify_after_seconds": args.wait
+                    }),
+                )?;
+                println!(
+                    "{}",
+                    if payload["delivered"].as_bool().unwrap_or(false) {
+                        "delivered"
+                    } else {
+                        "not delivered"
+                    }
+                );
+            }
         }
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
         Command::Tail(args) => print_output(&client, &args.session_id, args.lines)?,
@@ -661,6 +683,43 @@ fn print_output(client: &ApiClient, session_id: &str, lines: usize) -> Result<()
         print!("{output}");
     }
     Ok(())
+}
+
+fn print_batch_send_result(payload: &Value) -> Result<()> {
+    let Some(results) = payload["results"].as_array() else {
+        bail!("batch send response missing results");
+    };
+    for item in results {
+        let identifier = item["identifier"].as_str().unwrap_or("<unknown>");
+        let status = item["status"].as_str().unwrap_or("failed");
+        let session_id = item["session_id"].as_str().unwrap_or(identifier);
+        let target_name = item["target_name"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(session_id);
+        match status {
+            "delivered" => println!("Input sent to {target_name} ({session_id})"),
+            "queued" => println!("Input queued for {target_name} ({session_id})"),
+            _ => {
+                let detail = item["detail"].as_str().unwrap_or("Failed to send input");
+                eprintln!("Error: {identifier}: {detail}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn split_send_targets(raw_value: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for part in raw_value.split(',') {
+        let identifier = part.trim();
+        if identifier.is_empty() || !seen.insert(identifier.to_owned()) {
+            continue;
+        }
+        identifiers.push(identifier.to_owned());
+    }
+    identifiers
 }
 
 fn wait_for_session(client: &ApiClient, session_id: &str, seconds: u64) -> Result<()> {

@@ -37,9 +37,10 @@ use crate::runtime::TmuxRuntime;
 use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
     ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
-    CoreClearOutcome, CoreRestoreOutcome, CoreRetireOutcome, CreateCoreSessionRequest,
-    HandoffOutcome, HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome,
-    RoleRegistrationRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
+    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
+    CoreRetireOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
     SessionsEnvelope, SetMaintainerRequest, TaskCompleteOutcome, TaskCompleteRequest,
     TurnCompleteOutcome,
 };
@@ -77,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/context-monitor", get(get_context_monitor_status))
         .route("/sessions/{session_id}", get(get_session))
@@ -625,6 +627,173 @@ async fn send_session_input(
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(serde_json::to_value(result)?))
+}
+
+async fn send_session_input_batch(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SendCoreInputBatchRequest>,
+) -> Result<Json<CoreInputBatchResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/sessions/input-batch",
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    if payload.input.text.trim().is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "text is required".to_owned(),
+        });
+    }
+    let recipients = unique_identifiers(&payload.recipients);
+    if recipients.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "At least one recipient is required".to_owned(),
+        });
+    }
+
+    let runtime = state
+        .config
+        .rust_core
+        .runtime_enabled
+        .then(|| TmuxRuntime::from_config(&state.config.rust_core));
+    let mut results = Vec::with_capacity(recipients.len());
+    for identifier in recipients {
+        results.push(send_session_input_batch_one(
+            &state,
+            runtime.as_ref(),
+            &identifier,
+            payload.input.clone(),
+        )?);
+    }
+    let success_count = results
+        .iter()
+        .filter(|result| matches!(result.status.as_str(), "delivered" | "queued" | "emailed"))
+        .count();
+    let failure_count = results.len().saturating_sub(success_count);
+
+    Ok(Json(CoreInputBatchResponse {
+        ok: failure_count == 0,
+        requested_count: results.len(),
+        success_count,
+        failure_count,
+        delivery_mode: payload.input.delivery_mode,
+        results,
+    }))
+}
+
+fn send_session_input_batch_one(
+    state: &AppState,
+    runtime: Option<&TmuxRuntime>,
+    identifier: &str,
+    payload: SendCoreInputRequest,
+) -> Result<CoreInputBatchResult, ApiError> {
+    let Some(session) = state.session_store.get_session(identifier)? else {
+        return Ok(failed_batch_result(
+            identifier,
+            None,
+            None,
+            None,
+            format!("Session '{identifier}' not found"),
+        ));
+    };
+    if runtime.is_some() && !is_primary_node(&session.node) {
+        return Ok(failed_batch_result(
+            identifier,
+            Some(session.id.clone()),
+            session_target_name(&session),
+            Some(session.provider.clone()),
+            format!("Rust runtime does not support remote node {}", session.node),
+        ));
+    }
+
+    let outcome = if let Some(runtime) = runtime {
+        state
+            .session_store
+            .send_core_input_with_runtime(&session.id, payload, runtime)?
+    } else {
+        state.session_store.send_core_input(&session.id, payload)?
+    };
+    let Some(outcome) = outcome else {
+        return Ok(failed_batch_result(
+            identifier,
+            None,
+            None,
+            None,
+            "Session not found".to_owned(),
+        ));
+    };
+    let status = if outcome.delivered {
+        "delivered".to_owned()
+    } else {
+        "queued".to_owned()
+    };
+    Ok(CoreInputBatchResult {
+        identifier: identifier.to_owned(),
+        status: status.clone(),
+        delivery_kind: "session".to_owned(),
+        session_id: Some(outcome.session_id),
+        target_name: session_target_name(&session),
+        provider: Some(session.provider),
+        bootstrapped: false,
+        queue_position: None,
+        estimated_delivery: (status == "queued").then(|| "deferred".to_owned()),
+        email_username: None,
+        email_address: None,
+        detail: None,
+    })
+}
+
+fn session_target_name(session: &SessionRecord) -> Option<String> {
+    session
+        .friendly_name
+        .as_deref()
+        .or(Some(session.name.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn failed_batch_result(
+    identifier: &str,
+    session_id: Option<String>,
+    target_name: Option<String>,
+    provider: Option<String>,
+    detail: String,
+) -> CoreInputBatchResult {
+    CoreInputBatchResult {
+        identifier: identifier.to_owned(),
+        status: "failed".to_owned(),
+        delivery_kind: "none".to_owned(),
+        session_id,
+        target_name,
+        provider,
+        bootstrapped: false,
+        queue_position: None,
+        estimated_delivery: None,
+        email_username: None,
+        email_address: None,
+        detail: Some(detail),
+    }
+}
+
+fn unique_identifiers(values: &[String]) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        for part in value.split(',') {
+            let identifier = part.trim();
+            if identifier.is_empty() || !seen.insert(identifier.to_owned()) {
+                continue;
+            }
+            identifiers.push(identifier.to_owned());
+        }
+    }
+    identifiers
 }
 
 async fn set_agent_status(
