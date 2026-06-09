@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -19,6 +19,7 @@ const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct TmuxRuntime {
     socket_name: Option<String>,
+    tmux_binary: String,
     command: String,
     prompt_mode: String,
     start_settle_ms: u64,
@@ -48,6 +49,7 @@ impl TmuxRuntime {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
+            tmux_binary: "tmux".to_owned(),
             command: config
                 .runtime_command
                 .as_deref()
@@ -159,16 +161,59 @@ impl TmuxRuntime {
         Ok(())
     }
 
+    pub fn restore_session(
+        &self,
+        spec: &TmuxSessionSpec,
+        provider: &str,
+        resume_id: Option<&str>,
+    ) -> Result<()> {
+        let mut runtime = self.clone();
+        if let Some(resume_id) = resume_id.map(str::trim).filter(|value| !value.is_empty()) {
+            runtime.command = match provider {
+                "claude" => format!("{} --resume {}", runtime.command, shell_quote(resume_id)),
+                "codex" | "codex-fork" => {
+                    format!("{} resume {}", runtime.command, shell_quote(resume_id))
+                }
+                _ => runtime.command,
+            };
+        }
+        let mut spec = spec.clone();
+        spec.initial_message = None;
+        runtime.create_session(&spec)
+    }
+
     pub fn send_input(&self, tmux_session: &str, text: &str) -> Result<bool> {
         if !self.session_exists(tmux_session)? {
             return Ok(false);
         }
-        self.exit_copy_mode_if_needed(tmux_session);
-        for chunk in split_send_text_chunks(text, self.send_keys_max_chunk_chars) {
-            self.run_tmux(["send-keys", "-t", tmux_session, "-l", "--", chunk])?;
+        self.send_text_then_enter(tmux_session, text)?;
+        Ok(true)
+    }
+
+    pub fn clear_session(
+        &self,
+        tmux_session: &str,
+        clear_command: &str,
+        prompt: Option<&str>,
+        wake_completed: bool,
+    ) -> Result<bool> {
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
         }
-        thread::sleep(self.compute_settle_delay(text));
-        self.run_tmux(["send-keys", "-t", tmux_session, "Enter"])?;
+        if wake_completed {
+            self.send_key(tmux_session, "Enter")?;
+            let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(3.0));
+        }
+
+        self.send_key(tmux_session, "Escape")?;
+        let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(3.0));
+
+        self.send_text_then_enter(tmux_session, clear_command)?;
+        let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(5.0));
+
+        if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
+            self.send_text_then_enter(tmux_session, prompt)?;
+        }
         Ok(true)
     }
 
@@ -219,6 +264,50 @@ impl TmuxRuntime {
         }
     }
 
+    fn send_text_then_enter(&self, tmux_session: &str, text: &str) -> Result<()> {
+        self.exit_copy_mode_if_needed(tmux_session);
+        for chunk in split_send_text_chunks(text, self.send_keys_max_chunk_chars) {
+            self.run_tmux(["send-keys", "-t", tmux_session, "-l", "--", chunk])?;
+        }
+        thread::sleep(self.compute_settle_delay(text));
+        self.send_key(tmux_session, "Enter")
+    }
+
+    fn send_key(&self, tmux_session: &str, key: &str) -> Result<()> {
+        self.run_tmux(["send-keys", "-t", tmux_session, key])
+    }
+
+    fn wait_for_prompt(&self, tmux_session: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.capture_pane_last_line(tmux_session).as_deref() == Some(">") {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn capture_pane_last_line(&self, tmux_session: &str) -> Option<String> {
+        let output = self
+            .tmux_command(["capture-pane", "-p", "-t", tmux_session])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches('\n')
+            .split('\n')
+            .last()
+            .map(str::trim)
+            .map(ToOwned::to_owned)
+    }
+
     fn run_tmux<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<()> {
         let output = self
             .tmux_command(args)
@@ -234,7 +323,7 @@ impl TmuxRuntime {
     }
 
     fn tmux_command<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Command {
-        let mut command = Command::new("tmux");
+        let mut command = Command::new(&self.tmux_binary);
         if let Some(socket_name) = &self.socket_name {
             command.arg("-L").arg(socket_name);
         }
@@ -356,6 +445,7 @@ fn managed_session_command(command: &str, session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn split_send_text_chunks_prefers_newline_after_half_chunk() {
@@ -388,5 +478,84 @@ mod tests {
         assert!(command.contains("unset CLAUDECODE"));
         assert!(command.contains("export ENABLE_TOOL_SEARCH=false"));
         assert!(command.ends_with("; claude"));
+    }
+
+    #[test]
+    fn clear_session_interrupts_waits_and_prompts_before_success() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert!(runtime
+            .clear_session("sm-test", "/clear", Some("fresh task"), true)
+            .unwrap());
+
+        let log = fs::read_to_string(log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        let wake_enter = position_after(&lines, "send-keys -t sm-test Enter", 0);
+        let escape = position_after(&lines, "send-keys -t sm-test Escape", wake_enter + 1);
+        let clear_text = position_after(&lines, "send-keys -t sm-test -l -- /clear", escape + 1);
+        let clear_enter = position_after(&lines, "send-keys -t sm-test Enter", clear_text + 1);
+        let post_clear_wait = position_after(&lines, "capture-pane -p -t sm-test", clear_enter + 1);
+        let prompt_text = position_after(
+            &lines,
+            "send-keys -t sm-test -l -- fresh task",
+            post_clear_wait + 1,
+        );
+        let prompt_enter = position_after(&lines, "send-keys -t sm-test Enter", prompt_text + 1);
+
+        assert!(wake_enter < escape);
+        assert!(escape < clear_text);
+        assert!(clear_text < clear_enter);
+        assert!(clear_enter < post_clear_wait);
+        assert!(post_clear_wait < prompt_text);
+        assert!(prompt_text < prompt_enter);
+    }
+
+    fn fake_tmux_binary() -> (PathBuf, PathBuf, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sm-runtime-fake-tmux-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let tmux_binary = temp_dir.join("tmux");
+        let log_path = temp_dir.join("tmux.log");
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  has-session) exit 0 ;;
+  display-message) echo 0; exit 0 ;;
+  capture-pane) printf 'ready\n>\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        (tmux_binary, log_path, temp_dir)
+    }
+
+    fn position_after(lines: &[&str], needle: &str, start: usize) -> usize {
+        lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(index, line)| line.contains(needle).then_some(index))
+            .unwrap_or_else(|| panic!("missing {needle:?} after line {start}; log: {lines:?}"))
     }
 }

@@ -170,13 +170,22 @@ def test_manifest_covers_rust_core_fixture_lifecycle_cli_checks():
     required_ids = {
         "cli.rust_core_spawn_fixture",
         "cli.rust_core_spawn_child_inherits_parent_fixture",
+        "cli.rust_core_me_fixture",
+        "cli.rust_core_all_fixture",
+        "cli.rust_core_children_fixture",
+        "cli.rust_core_children_target_fixture",
+        "cli.rust_core_context_monitor_enable_child_fixture",
+        "cli.rust_core_context_monitor_status_fixture",
         "cli.rust_core_status_fixture",
         "cli.rust_core_send_fixture",
         "cli.rust_core_send_urgent_fixture",
         "cli.rust_core_send_wait_fixture",
         "cli.rust_core_output_fixture",
+        "cli.rust_core_clear_child_fixture",
         "cli.rust_core_tail_fixture",
         "cli.rust_core_retire_fixture",
+        "cli.rust_core_restore_fixture",
+        "cli.rust_core_retire_restored_fixture",
         "cli.rust_core_wait_retired_fixture",
     }
 
