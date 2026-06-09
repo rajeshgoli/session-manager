@@ -913,6 +913,158 @@ impl SessionStore {
         }
     }
 
+    pub fn task_complete(
+        &self,
+        session_id: &str,
+        request: TaskCompleteRequest,
+    ) -> Result<TaskCompleteOutcome> {
+        if request.requester_session_id.trim() != session_id {
+            return Ok(TaskCompleteOutcome::Error(
+                "sm task-complete is self-directed only — requester must equal target session"
+                    .to_owned(),
+            ));
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
+            return Ok(TaskCompleteOutcome::Error(format!(
+                "Session {session_id} not found"
+            )));
+        };
+
+        let em_session_id = active_parent_wake_parent_raw(&state, session_id)?
+            .or_else(|| session.parent_session_id.clone());
+        deactivate_remind_raw(&mut state, session_id)?;
+        deactivate_parent_wake_raw(&mut state, session_id)?;
+
+        let completed_at = now_rfc3339();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let session_object = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session disappeared during task-complete"))?;
+        session_object.insert(
+            "agent_task_completed_at".to_owned(),
+            Value::String(completed_at.clone()),
+        );
+
+        let mut em_notified = false;
+        if let Some(em_session_id) = em_session_id {
+            let friendly = session
+                .cached_display_name()
+                .unwrap_or_else(|| non_empty_or(session.name.clone(), &session.id));
+            push_retained_message_raw(
+                &mut state,
+                &em_session_id,
+                &format!("[sm task-complete] agent {session_id}({friendly}) completed its task."),
+                "important",
+                Some("task_complete"),
+            )?;
+            em_notified = true;
+        }
+
+        self.write_raw_json_value(&state)?;
+        Ok(TaskCompleteOutcome::Completed(TaskCompleteResult {
+            status: "completed".to_owned(),
+            session_id: session_id.to_owned(),
+            em_notified,
+            agent_task_completed_at: completed_at,
+        }))
+    }
+
+    pub fn turn_complete(
+        &self,
+        session_id: &str,
+        request: TaskCompleteRequest,
+    ) -> Result<TurnCompleteOutcome> {
+        if request.requester_session_id.trim() != session_id {
+            return Ok(TurnCompleteOutcome::Error(
+                "sm turn-complete is self-directed only — requester must equal target session"
+                    .to_owned(),
+            ));
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if !sessions.iter().any(|session| session.id == session_id) {
+            return Ok(TurnCompleteOutcome::Error(format!(
+                "Session {session_id} not found"
+            )));
+        }
+
+        deactivate_remind_raw(&mut state, session_id)?;
+        self.write_raw_json_value(&state)?;
+        Ok(TurnCompleteOutcome::Completed(TurnCompleteResult {
+            status: "turn_completed".to_owned(),
+            session_id: session_id.to_owned(),
+        }))
+    }
+
+    pub fn arm_stop_notify(
+        &self,
+        session_id: &str,
+        request: ArmStopNotifyRequest,
+    ) -> Result<ArmStopNotifyOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let Some(target) = sessions.iter().find(|session| session.id == session_id) else {
+            return Ok(ArmStopNotifyOutcome::NotFound);
+        };
+
+        let requester = sessions
+            .iter()
+            .find(|session| session.id == request.requester_session_id);
+        if !requester.is_some_and(|session| session.is_em) {
+            return Ok(ArmStopNotifyOutcome::Forbidden(
+                "Only EM sessions (is_em=True) may arm stop notifications".to_owned(),
+            ));
+        }
+
+        if target.parent_session_id.as_deref() != Some(request.requester_session_id.as_str()) {
+            return Ok(ArmStopNotifyOutcome::Forbidden(
+                "Cannot arm stop notify — not the parent of target session".to_owned(),
+            ));
+        }
+
+        let Some(sender) = sessions
+            .iter()
+            .find(|session| session.id == request.sender_session_id)
+        else {
+            return Ok(ArmStopNotifyOutcome::UnknownSender(
+                request.sender_session_id,
+            ));
+        };
+
+        if target.provider == "codex-fork" {
+            return Ok(ArmStopNotifyOutcome::Suppressed(ArmStopNotifyResult {
+                status: "suppressed".to_owned(),
+                session_id: session_id.to_owned(),
+                sender_session_id: request.sender_session_id,
+                reason: Some("notify_on_stop disabled for codex-fork sessions".to_owned()),
+            }));
+        }
+
+        let sender_name = sender
+            .cached_display_name()
+            .unwrap_or_else(|| non_empty_or(sender.name.clone(), &sender.id));
+        upsert_stop_notify_raw(
+            &mut state,
+            session_id,
+            &request.sender_session_id,
+            &sender_name,
+            request.delay_seconds.max(0),
+        )?;
+        self.write_raw_json_value(&state)?;
+        Ok(ArmStopNotifyOutcome::Armed(ArmStopNotifyResult {
+            status: "ok".to_owned(),
+            session_id: session_id.to_owned(),
+            sender_session_id: request.sender_session_id,
+            reason: None,
+        }))
+    }
+
     fn load_snapshot(&self) -> Result<StateSnapshot> {
         let state_file = self.readable_state_file();
         if !state_file.exists() {
@@ -1179,6 +1331,19 @@ pub struct RoleRegistrationRequest {
     pub role: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskCompleteRequest {
+    pub requester_session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArmStopNotifyRequest {
+    pub sender_session_id: String,
+    pub requester_session_id: String,
+    #[serde(default)]
+    pub delay_seconds: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRegistrationResponse {
     pub role: String,
@@ -1293,6 +1458,50 @@ pub enum MaintainerMutationOutcome {
     BadRequest(String),
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskCompleteResult {
+    pub status: String,
+    pub session_id: String,
+    pub em_notified: bool,
+    pub agent_task_completed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum TaskCompleteOutcome {
+    Completed(TaskCompleteResult),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnCompleteResult {
+    pub status: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum TurnCompleteOutcome {
+    Completed(TurnCompleteResult),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArmStopNotifyResult {
+    pub status: String,
+    pub session_id: String,
+    pub sender_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ArmStopNotifyOutcome {
+    Armed(ArmStopNotifyResult),
+    Suppressed(ArmStopNotifyResult),
+    NotFound,
+    Forbidden(String),
+    UnknownSender(String),
+}
+
 fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read session state {}", path.display()))?;
@@ -1335,6 +1544,104 @@ fn ensure_agent_registrations_array_mut(value: &mut Value) -> Result<&mut Vec<Va
         anyhow::bail!("session state field 'agent_registrations' is not an array");
     }
     Ok(registrations.as_array_mut().expect("array checked above"))
+}
+
+fn ensure_array_field_mut<'a>(value: &'a mut Value, field: &str) -> Result<&'a mut Vec<Value>> {
+    let object = ensure_object_mut(value)?;
+    let entries = object.entry(field.to_owned()).or_insert_with(|| json!([]));
+    if !entries.is_array() {
+        anyhow::bail!("session state field '{field}' is not an array");
+    }
+    Ok(entries.as_array_mut().expect("array checked above"))
+}
+
+fn active_parent_wake_parent_raw(state: &Value, child_session_id: &str) -> Result<Option<String>> {
+    Ok(state
+        .get("retained_parent_wake_registrations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.get("child_session_id").and_then(Value::as_str) == Some(child_session_id)
+        })
+        .find(|entry| {
+            entry
+                .get("is_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .and_then(|entry| json_text(entry.get("parent_session_id"))))
+}
+
+fn deactivate_parent_wake_raw(state: &mut Value, child_session_id: &str) -> Result<()> {
+    let registrations = ensure_array_field_mut(state, "retained_parent_wake_registrations")?;
+    for entry in registrations.iter_mut().filter(|entry| {
+        entry.get("child_session_id").and_then(Value::as_str) == Some(child_session_id)
+    }) {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("is_active".to_owned(), Value::Bool(false));
+            object.insert("cancelled_at".to_owned(), Value::String(now_rfc3339()));
+        }
+    }
+    Ok(())
+}
+
+fn deactivate_remind_raw(state: &mut Value, session_id: &str) -> Result<()> {
+    let registrations = ensure_array_field_mut(state, "retained_remind_registrations")?;
+    for entry in registrations.iter_mut().filter(|entry| {
+        entry.get("session_id").and_then(Value::as_str) == Some(session_id)
+            || entry.get("target_session_id").and_then(Value::as_str) == Some(session_id)
+    }) {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("is_active".to_owned(), Value::Bool(false));
+            object.insert("cancelled_at".to_owned(), Value::String(now_rfc3339()));
+        }
+    }
+    Ok(())
+}
+
+fn push_retained_message_raw(
+    state: &mut Value,
+    target_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    message_category: Option<&str>,
+) -> Result<()> {
+    let messages = ensure_array_field_mut(state, "retained_pending_messages")?;
+    messages.push(json!({
+        "target_session_id": target_session_id,
+        "text": text,
+        "delivery_mode": delivery_mode,
+        "message_category": message_category,
+        "created_at": now_rfc3339(),
+    }));
+    Ok(())
+}
+
+fn upsert_stop_notify_raw(
+    state: &mut Value,
+    session_id: &str,
+    sender_session_id: &str,
+    sender_name: &str,
+    delay_seconds: i64,
+) -> Result<()> {
+    let entries = ensure_array_field_mut(state, "retained_stop_notify_states")?;
+    let record = json!({
+        "session_id": session_id,
+        "sender_session_id": sender_session_id,
+        "sender_name": sender_name,
+        "delay_seconds": delay_seconds,
+        "armed_at": now_rfc3339(),
+    });
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|entry| entry.get("session_id").and_then(Value::as_str) == Some(session_id))
+    {
+        *existing = record;
+    } else {
+        entries.push(record);
+    }
+    Ok(())
 }
 
 fn raw_registration_record(value: &Value) -> Option<AgentRegistrationRecord> {

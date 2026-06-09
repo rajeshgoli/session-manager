@@ -1415,6 +1415,216 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
 }
 
 #[tokio::test]
+async fn fixture_completion_endpoints_preserve_python_compatible_state() {
+    let state_file = write_completion_fixture();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/task-complete",
+        json!({ "requester_session_id": "other001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["error"].as_str().unwrap().contains("self-directed"));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/task-complete",
+        json!({ "requester_session_id": "child001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "completed");
+    assert_eq!(payload["session_id"], "child001");
+    assert_eq!(payload["em_notified"], true);
+    assert!(payload["agent_task_completed_at"].is_string());
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "child001")
+        .unwrap();
+    assert!(child["agent_task_completed_at"].is_string());
+    assert_eq!(
+        state["retained_remind_registrations"][0]["is_active"],
+        false
+    );
+    assert_eq!(
+        state["retained_parent_wake_registrations"][0]["is_active"],
+        false
+    );
+    assert_eq!(
+        state["retained_pending_messages"][0]["text"],
+        "[sm task-complete] agent child001(worker-1) completed its task."
+    );
+    assert_eq!(
+        state["retained_pending_messages"][0]["target_session_id"],
+        "em001"
+    );
+    assert_eq!(
+        state["retained_pending_messages"][0]["delivery_mode"],
+        "important"
+    );
+
+    let state_file = write_completion_fixture();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/turn-complete",
+        json!({ "requester_session_id": "child001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "status": "turn_completed", "session_id": "child001" })
+    );
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "child001")
+        .unwrap();
+    assert_eq!(child["agent_task_completed_at"], Value::Null);
+    assert_eq!(
+        state["retained_remind_registrations"][0]["is_active"],
+        false
+    );
+    assert_eq!(
+        state["retained_parent_wake_registrations"][0]["is_active"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn fixture_notify_on_stop_preserves_authorization_and_state_contract() {
+    let state_file = write_completion_fixture();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/missing/notify-on-stop",
+        json!({ "sender_session_id": "em001", "requester_session_id": "em001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Session not found");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/notify-on-stop",
+        json!({ "sender_session_id": "child001", "requester_session_id": "child001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Only EM sessions (is_em=True) may arm stop notifications"
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/notify-on-stop",
+        json!({ "sender_session_id": "em002", "requester_session_id": "em002" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Cannot arm stop notify — not the parent of target session"
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/notify-on-stop",
+        json!({ "sender_session_id": "missing", "requester_session_id": "em001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "sender_session_id \"missing\" not found");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/fork001/notify-on-stop",
+        json!({ "sender_session_id": "em001", "requester_session_id": "em001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "suppressed");
+    assert_eq!(
+        payload["reason"],
+        "notify_on_stop disabled for codex-fork sessions"
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/notify-on-stop",
+        json!({
+            "sender_session_id": "em001",
+            "requester_session_id": "em001",
+            "delay_seconds": 8
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "status": "ok", "session_id": "child001", "sender_session_id": "em001" })
+    );
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(
+        state["retained_stop_notify_states"][0]["session_id"],
+        "child001"
+    );
+    assert_eq!(
+        state["retained_stop_notify_states"][0]["sender_session_id"],
+        "em001"
+    );
+    assert_eq!(state["retained_stop_notify_states"][0]["sender_name"], "em");
+    assert_eq!(state["retained_stop_notify_states"][0]["delay_seconds"], 8);
+    assert_eq!(
+        state["retained_stop_notify_states"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn fixture_registry_and_maintainer_endpoints_round_trip_state() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();
@@ -1902,6 +2112,71 @@ async fn fixture_core_spawn_endpoint_inherits_parent_fields() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["parent_session_id"], "parentfixture");
     assert_eq!(payload["working_dir"], parent_dir.display().to_string());
+}
+
+#[tokio::test]
+async fn fixture_core_spawn_auto_arms_em_stop_notify_for_retained_children() {
+    let state_file = write_completion_fixture();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "spawnchild",
+            "parent_session_id": "em001",
+            "prompt": "spawn child prompt",
+            "name": "spawn-child",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "spawnchild");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stop_notify = state["retained_stop_notify_states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["session_id"] == "spawnchild")
+        .unwrap();
+    assert_eq!(stop_notify["sender_session_id"], "em001");
+    assert_eq!(stop_notify["sender_name"], "em");
+    assert_eq!(stop_notify["delay_seconds"], 8);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/spawn",
+        json!({
+            "id": "spawnfork",
+            "parent_session_id": "em001",
+            "prompt": "spawn codex fork prompt",
+            "name": "spawn-fork",
+            "provider": "codex-fork"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "spawnfork");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert!(state["retained_stop_notify_states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["session_id"] != "spawnfork"));
 }
 
 #[tokio::test]
@@ -3209,6 +3484,85 @@ fn write_session_fixture() -> PathBuf {
                     "stopped_at": "2026-06-01T00:02:00"
                 }
             ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn write_completion_fixture() -> PathBuf {
+    let path = unique_temp_path();
+    fs::write(
+        &path,
+        json!({
+            "sessions": [
+                {
+                    "id": "em001",
+                    "name": "claude-em001",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-em001",
+                    "log_file": "/tmp/em001.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "friendly_name": "em",
+                    "is_em": true
+                },
+                {
+                    "id": "em002",
+                    "name": "claude-em002",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-em002",
+                    "log_file": "/tmp/em002.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "friendly_name": "other-em",
+                    "is_em": true
+                },
+                {
+                    "id": "child001",
+                    "name": "claude-child001",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-child001",
+                    "log_file": "/tmp/child001.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "friendly_name": "worker-1",
+                    "parent_session_id": "em001",
+                    "agent_task_completed_at": null
+                },
+                {
+                    "id": "fork001",
+                    "name": "codex-fork-fork001",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-fork-fork001",
+                    "log_file": "/tmp/fork001.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "provider": "codex-fork",
+                    "parent_session_id": "em001"
+                }
+            ],
+            "retained_remind_registrations": [
+                {
+                    "session_id": "child001",
+                    "is_active": true
+                }
+            ],
+            "retained_parent_wake_registrations": [
+                {
+                    "child_session_id": "child001",
+                    "parent_session_id": "em001",
+                    "period_seconds": 600,
+                    "is_active": true
+                }
+            ],
+            "retained_pending_messages": [],
+            "retained_stop_notify_states": []
         })
         .to_string(),
     )
