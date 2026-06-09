@@ -288,8 +288,18 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
 
-        if runtime_session_status_raw(&mut state, session_id)?.is_none() {
+        let Some(initial_status) = runtime_session_status_raw(&mut state, session_id)? else {
             return Ok(None);
+        };
+        if normalized_status(&initial_status) == "stopped" {
+            return Ok(Some(CoreInputResult {
+                ok: true,
+                session_id: session_id.to_owned(),
+                delivered: false,
+                delivery_mode: request.delivery_mode,
+                notify_after_seconds: request.notify_after_seconds,
+                status: initial_status,
+            }));
         }
 
         let delivery_mode = normalized_delivery_mode(&request.delivery_mode);

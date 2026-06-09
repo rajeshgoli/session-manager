@@ -3154,6 +3154,52 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
 }
 
 #[tokio::test]
+async fn runtime_core_does_not_queue_sends_to_already_stopped_sessions() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "runtimestopped",
+                    "name": "runtime-stopped",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-runtimestopped",
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": "/tmp/runtimestopped.log",
+                    "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "stopped_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let log_dir = unique_temp_path();
+    let app = runtime_app(&state_file, &log_dir, "sm-rust-test-stopped-send");
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions/runtimestopped/input",
+        json!({
+            "text": "do not retain for stopped session",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], false);
+    assert_eq!(payload["status"], "stopped");
+    assert!(!queue_db_path_for_state_file(&state_file).exists());
+}
+
+#[tokio::test]
 async fn runtime_core_rejects_unsupported_provider() {
     if !tmux_available() {
         return;
