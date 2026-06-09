@@ -1542,8 +1542,7 @@ async fn fixture_subagent_endpoints_round_trip_python_state_shape() {
         "/sessions/run12345/subagents",
         json!({
             "agent_id": "agent456789",
-            "agent_type": "engineer",
-            "transcript_path": "/tmp/agent456789.jsonl"
+            "agent_type": "engineer"
         }),
     )
     .await;
@@ -1568,7 +1567,10 @@ async fn fixture_subagent_endpoints_round_trip_python_state_shape() {
     let (status, payload) = post_json(
         app.clone(),
         "/sessions/run12345/subagents/agent456789/stop",
-        json!({ "summary": "Finished useful work" }),
+        json!({
+            "summary": "Finished useful work",
+            "transcript_path": "/tmp/agent456789.jsonl"
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

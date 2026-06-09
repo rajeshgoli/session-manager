@@ -737,14 +737,18 @@ fn run_subagent_stop(client: &ApiClient) -> Result<()> {
     let payload = read_json_stdin()?;
     let agent_id = json_value_string(&payload, "agent_id")
         .ok_or_else(|| anyhow!("Missing agent_id in hook payload"))?;
-    let summary = json_value_string(&payload, "summary");
+    let transcript_path = json_value_string(&payload, "agent_transcript_path");
+    let summary = subagent_stop_summary(&payload);
     client.post_json(
         &format!(
             "/sessions/{}/subagents/{}/stop",
             encode_path_segment(&session_id),
             encode_path_segment(&agent_id)
         ),
-        json!({ "summary": summary }),
+        json!({
+            "summary": summary,
+            "transcript_path": transcript_path
+        }),
     )?;
     Ok(())
 }
@@ -794,6 +798,11 @@ fn json_value_string(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn subagent_stop_summary(payload: &Value) -> Option<String> {
+    json_value_string(payload, "last_assistant_message")
+        .or_else(|| json_value_string(payload, "summary"))
 }
 
 fn split_send_targets(raw_value: &str) -> Vec<String> {
@@ -1601,6 +1610,25 @@ mod tests {
         assert_eq!(payload["notify_after_seconds"], 7);
         assert_eq!(payload["from_sm_send"], true);
         assert_eq!(payload["sender_session_id"], "sender001");
+    }
+
+    #[test]
+    fn subagent_stop_summary_prefers_current_hook_field() {
+        let payload = json!({
+            "last_assistant_message": "done from hook",
+            "summary": "legacy summary"
+        });
+
+        assert_eq!(
+            subagent_stop_summary(&payload).as_deref(),
+            Some("done from hook")
+        );
+
+        let legacy_payload = json!({ "summary": "legacy summary" });
+        assert_eq!(
+            subagent_stop_summary(&legacy_payload).as_deref(),
+            Some("legacy summary")
+        );
     }
 
     fn write_temp_config(content: &str) -> PathBuf {

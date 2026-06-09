@@ -1299,6 +1299,9 @@ impl SessionStore {
         if let Some(subagent) = subagent.as_object_mut() {
             subagent.insert("stopped_at".to_owned(), Value::String(now));
             subagent.insert("status".to_owned(), Value::String("completed".to_owned()));
+            if let Some(transcript_path) = request.transcript_path {
+                subagent.insert("transcript_path".to_owned(), Value::String(transcript_path));
+            }
             if let Some(summary) = request.summary {
                 subagent.insert("summary".to_owned(), Value::String(summary));
             }
@@ -1655,6 +1658,8 @@ pub struct SubagentStartRequest {
 pub struct SubagentStopRequest {
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
