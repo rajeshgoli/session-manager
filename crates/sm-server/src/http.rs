@@ -35,9 +35,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::config::{trimmed, AppConfig};
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
-    expand_home, is_primary_node, AgentStatusRequest, ClientSessionResponse, CoreRetireOutcome,
-    CreateCoreSessionRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope,
+    expand_home, is_primary_node, AgentStatusRequest, ClearSessionRequest, ClientSessionResponse,
+    ContextMonitorOutcome, ContextMonitorRequest, CoreClearOutcome, CoreRestoreOutcome,
+    CoreRetireOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
 };
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
@@ -71,13 +72,29 @@ pub fn router(state: AppState) -> Router {
         .route("/__shadow/http", post(shadow_http))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/spawn", post(spawn_session))
+        .route("/sessions/context-monitor", get(get_context_monitor_status))
         .route("/sessions/{session_id}", get(get_session))
+        .route(
+            "/sessions/{parent_session_id}/children",
+            get(list_children_sessions),
+        )
+        .route(
+            "/sessions/{session_id}/attach-descriptor",
+            get(get_attach_descriptor),
+        )
         .route(
             "/sessions/{session_id}/agent-status",
             post(set_agent_status),
         )
+        .route(
+            "/sessions/{session_id}/context-monitor",
+            post(set_context_monitor),
+        )
         .route("/sessions/{session_id}/input", post(send_session_input))
         .route("/sessions/{session_id}/kill", post(retire_session))
+        .route("/sessions/{session_id}/restore", post(restore_session))
+        .route("/sessions/{session_id}/clear", post(clear_session))
+        .route("/sessions/{session_id}/handoff", post(schedule_handoff))
         .route("/sessions/{session_id}/output", get(session_output))
         .route("/client/sessions", get(list_client_sessions))
         .route("/client/sessions/{session_id}", get(get_client_session))
@@ -227,6 +244,25 @@ async fn list_sessions(
         .map(SessionResponse::from)
         .collect::<Vec<_>>();
     Ok(Json(SessionsEnvelope::from(sessions)))
+}
+
+async fn list_children_sessions(
+    State(state): State<Arc<AppState>>,
+    Path(parent_session_id): Path<String>,
+    Query(query): Query<ListChildrenQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let children = state.session_store.list_children(
+        &parent_session_id,
+        query.recursive,
+        query.status.as_deref(),
+        query.include_terminated,
+    )?;
+    Ok(Json(json!({
+        "parent_session_id": parent_session_id,
+        "children": children,
+    })))
 }
 
 async fn create_session(
@@ -493,6 +529,28 @@ async fn get_client_session(
     Ok(Json(ClientSessionResponse::from(session)))
 }
 
+async fn get_attach_descriptor(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    Ok(Json(attach_descriptor_response(session)))
+}
+
+async fn get_context_monitor_status(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    Ok(Json(json!({
+        "monitored": state.session_store.list_context_monitors()?,
+    })))
+}
+
 async fn send_session_input(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -591,6 +649,150 @@ async fn retire_session(
             status: StatusCode::BAD_REQUEST,
             detail: format!("Rust runtime does not support remote node {node}"),
         }),
+    }
+}
+
+async fn restore_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/restore"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let outcome = if state.config.rust_core.runtime_enabled {
+        ensure_core_runtime_session_node_supported(&state, &session_id)?;
+        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        state
+            .session_store
+            .restore_core_session_with_runtime(&session_id, &runtime)?
+    } else {
+        state.session_store.restore_core_session(&session_id)?
+    };
+    let Some(outcome) = outcome else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    match outcome {
+        CoreRestoreOutcome::Restored(session) => Ok(Json(SessionResponse::from(session))),
+        CoreRestoreOutcome::NotStopped => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is not stopped".to_owned(),
+        }),
+        CoreRestoreOutcome::UnsupportedNode(node) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Rust runtime does not support remote node {node}"),
+        }),
+        CoreRestoreOutcome::UnsupportedProvider(provider) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Rust runtime does not support provider {provider}"),
+        }),
+    }
+}
+
+async fn clear_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<ClearSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/clear"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let result = if state.config.rust_core.runtime_enabled {
+        ensure_core_runtime_session_node_supported(&state, &session_id)?;
+        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        state
+            .session_store
+            .clear_core_session_with_runtime(&session_id, payload, &runtime)?
+    } else {
+        state
+            .session_store
+            .clear_core_session(&session_id, payload)?
+    };
+    match result {
+        CoreClearOutcome::Cleared(result) => Ok(Json(serde_json::to_value(result)?)),
+        CoreClearOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        CoreClearOutcome::Unauthorized(detail) => Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail,
+        }),
+    }
+}
+
+async fn set_context_monitor(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<ContextMonitorRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/context-monitor"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state
+        .session_store
+        .set_context_monitor(&session_id, payload)?
+    {
+        ContextMonitorOutcome::Updated(result) => Ok(Json(serde_json::to_value(result)?)),
+        ContextMonitorOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        ContextMonitorOutcome::MissingNotifyTarget => Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "notify_session_id required when enabling".to_owned(),
+        }),
+        ContextMonitorOutcome::NotifyTargetNotFound(notify_session_id) => Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: format!("notify_session_id {notify_session_id:?} not found"),
+        }),
+        ContextMonitorOutcome::Unauthorized => Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cannot configure context monitor - not your session or child session"
+                .to_owned(),
+        }),
+    }
+}
+
+async fn schedule_handoff(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<HandoffRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/handoff"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let result = if state.config.rust_core.runtime_enabled {
+        ensure_core_runtime_session_node_supported(&state, &session_id)?;
+        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        state
+            .session_store
+            .execute_handoff_with_runtime(&session_id, payload, &runtime)?
+    } else {
+        state.session_store.schedule_handoff(&session_id, payload)?
+    };
+    match result {
+        HandoffOutcome::Recorded(result) | HandoffOutcome::Executed(result) => {
+            Ok(Json(serde_json::to_value(result)?))
+        }
+        HandoffOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
     }
 }
 
@@ -831,6 +1033,58 @@ fn shadow_predict_session_read(
         return Ok(None);
     }
 
+    if path == "/sessions/context-monitor" {
+        let body = serde_json::to_vec(&json!({
+            "monitored": state.session_store.list_context_monitors()?,
+        }))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    if let Some(parent_session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/children"))
+    {
+        let children = state.session_store.list_children(
+            parent_session_id,
+            query_bool(query_string, "recursive"),
+            query_value(query_string, "status"),
+            query_bool(query_string, "include_terminated"),
+        )?;
+        let body = serde_json::to_vec(&json!({
+            "parent_session_id": parent_session_id,
+            "children": children,
+        }))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/attach-descriptor"))
+    {
+        let Some(session) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        let body = serde_json::to_vec(&attach_descriptor_response(session))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
     if let Some(session_id) = path
         .strip_prefix("/client/sessions/")
         .filter(|value| !value.contains('/'))
@@ -928,14 +1182,47 @@ fn shadow_client_bootstrap_response(config: &AppConfig) -> ClientBootstrapRespon
     }
 }
 
+fn attach_descriptor_payload(session: SessionRecord) -> Value {
+    let provider = session.provider.clone();
+    let is_stopped = matches!(
+        session.status.trim().to_ascii_lowercase().as_str(),
+        "stopped" | "killed"
+    );
+    let has_tmux_session = !session.tmux_session.trim().is_empty();
+    let (attach_supported, message) = if is_stopped {
+        (false, Some("Session is stopped".to_owned()))
+    } else if provider == "codex-app" {
+        (
+            false,
+            Some("Attach not supported for Codex app sessions".to_owned()),
+        )
+    } else if !has_tmux_session {
+        (false, Some("Session has no tmux session".to_owned()))
+    } else {
+        (true, None)
+    };
+    json!({
+        "session_id": session.id,
+        "provider": provider,
+        "attach_supported": attach_supported,
+        "tmux_session": session.tmux_session,
+        "tmux_socket_name": session.tmux_socket_name,
+        "runtime_id": null,
+        "lifecycle_state": session.status,
+        "message": message,
+    })
+}
+
+fn attach_descriptor_response(session: SessionRecord) -> Value {
+    json!({
+        "attach": attach_descriptor_payload(session),
+    })
+}
+
 fn is_static_sessions_path(path: &str) -> bool {
     matches!(
         path,
-        "/sessions/context-monitor"
-            | "/sessions/create"
-            | "/sessions/input-batch"
-            | "/sessions/spawn"
-            | "/sessions/review"
+        "/sessions/create" | "/sessions/input-batch" | "/sessions/spawn" | "/sessions/review"
     )
 }
 
@@ -1438,6 +1725,16 @@ struct HealthCheck {
 struct ListSessionsQuery {
     #[serde(default)]
     include_stopped: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListChildrenQuery {
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    include_terminated: bool,
 }
 
 #[derive(Debug, Deserialize)]

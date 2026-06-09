@@ -41,7 +41,7 @@ enum Command {
     Restore(SessionIdArgs),
     Attach(SessionIdArgs),
     Output(OutputArgs),
-    Clear(SessionIdArgs),
+    Clear(ClearArgs),
     Handoff(HandoffArgs),
     #[command(name = "context-monitor")]
     ContextMonitor(ContextMonitorArgs),
@@ -125,13 +125,26 @@ struct NewArgs {
 
 #[derive(Args)]
 struct ChildrenArgs {
+    session_id: Option<String>,
     #[arg(long)]
     recursive: bool,
+    #[arg(long)]
+    terminated: bool,
+    #[arg(long, value_parser = ["running", "completed", "error", "all"])]
+    status: Option<String>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
 struct SessionIdArgs {
     session_id: String,
+}
+
+#[derive(Args)]
+struct ClearArgs {
+    session_id: String,
+    prompt: Vec<String>,
 }
 
 #[derive(Args)]
@@ -163,8 +176,8 @@ struct ContextMonitorArgs {
 
 #[derive(Subcommand)]
 enum ContextMonitorCommand {
-    Enable,
-    Disable,
+    Enable { target: Option<String> },
+    Disable { target: Option<String> },
     Status,
 }
 
@@ -328,6 +341,49 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::Me(_) => {
+            let session_id = current_session_id()?;
+            let session = client.get_json(&format!("/sessions/{session_id}"))?;
+            println!("{}", format_session_line(&session, true));
+        }
+        Command::Who(_) => {
+            let session_id = current_session_id()?;
+            let current = client.get_json(&format!("/sessions/{session_id}"))?;
+            let working_dir = current["working_dir"].as_str().unwrap_or_default();
+            let payload = client.get_json("/sessions")?;
+            let sessions = payload["sessions"].as_array().cloned().unwrap_or_default();
+            let mut found = false;
+            for session in sessions {
+                if session["id"].as_str() == Some(session_id.as_str()) {
+                    continue;
+                }
+                if session["working_dir"].as_str() != Some(working_dir) {
+                    continue;
+                }
+                if !matches!(
+                    session["status"].as_str().unwrap_or_default(),
+                    "running" | "waiting_permission" | "idle"
+                ) {
+                    continue;
+                }
+                println!("{}", format_session_line(&session, false));
+                found = true;
+            }
+            if !found {
+                process::exit(1);
+            }
+        }
+        Command::All(_) => {
+            let payload = client.get_json("/sessions")?;
+            let sessions = payload["sessions"].as_array().cloned().unwrap_or_default();
+            if sessions.is_empty() {
+                println!("No active sessions");
+                process::exit(1);
+            }
+            for session in sessions {
+                println!("{}", format_session_line(&session, true));
+            }
+        }
         Command::Spawn(args) => {
             let prompt = args.prompt.join(" ");
             let parent_session_id = optional_current_session_id();
@@ -403,10 +459,99 @@ fn run() -> Result<()> {
         }
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
         Command::Tail(args) => print_output(&client, &args.session_id, args.lines)?,
+        Command::Children(args) => {
+            let parent_session_id = match args.session_id {
+                Some(target) => {
+                    let session = client.get_json(&format!("/sessions/{target}"))?;
+                    session["id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("session response missing id"))?
+                        .to_owned()
+                }
+                None => current_session_id()?,
+            };
+            let mut query = Vec::new();
+            if args.recursive {
+                query.push("recursive=true".to_owned());
+            }
+            if args.terminated {
+                query.push("include_terminated=true".to_owned());
+            }
+            if let Some(status) = args.status {
+                query.push(format!("status={status}"));
+            }
+            let path = if query.is_empty() {
+                format!("/sessions/{parent_session_id}/children")
+            } else {
+                format!("/sessions/{parent_session_id}/children?{}", query.join("&"))
+            };
+            let payload = client.get_json(&path)?;
+            let children = payload["children"].as_array().cloned().unwrap_or_default();
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&children)?);
+            } else if children.is_empty() {
+                println!("No child sessions");
+            } else {
+                for child in children {
+                    println!("{}", format_child_line(&child));
+                }
+            }
+        }
         Command::Retire(args) => {
             let payload =
                 client.post_json(&format!("/sessions/{}/kill", args.session_id), json!({}))?;
             println!("{}", payload["status"].as_str().unwrap_or("stopped"));
+        }
+        Command::Restore(args) => {
+            let payload =
+                client.post_json(&format!("/sessions/{}/restore", args.session_id), json!({}))?;
+            println!(
+                "Session restored: {}",
+                payload["id"].as_str().unwrap_or(&args.session_id)
+            );
+        }
+        Command::Attach(args) => attach_session(&client, &args.session_id)?,
+        Command::Clear(args) => {
+            let requester_session_id = optional_current_session_id();
+            ensure_clear_authorized(&client, &args.session_id, requester_session_id.as_deref())?;
+            let prompt = args.prompt.join(" ");
+            let prompt = (!prompt.trim().is_empty()).then_some(prompt);
+            let payload = client.post_json(
+                &format!("/sessions/{}/clear", args.session_id),
+                json!({
+                    "prompt": prompt,
+                    "requester_session_id": requester_session_id
+                }),
+            )?;
+            println!(
+                "{} {}",
+                payload["status"].as_str().unwrap_or("cleared"),
+                payload["session_id"].as_str().unwrap_or(&args.session_id)
+            );
+        }
+        Command::Handoff(args) => {
+            let session_id = current_session_id()?;
+            let file_path = args.file_path.unwrap_or_else(|| "HANDOFF.md".to_owned());
+            let absolute = fs::canonicalize(&file_path)
+                .with_context(|| format!("File not found: {file_path}"))?;
+            let payload = client.post_json(
+                &format!("/sessions/{session_id}/handoff"),
+                json!({
+                    "requester_session_id": session_id,
+                    "file_path": absolute.display().to_string()
+                }),
+            )?;
+            if let Some(error) = payload["error"].as_str() {
+                bail!("{error}");
+            }
+            match payload["status"].as_str() {
+                Some("executed") => println!("Handoff executed"),
+                Some("recorded") => println!("Handoff recorded"),
+                _ => println!("Handoff scheduled - will execute after current turn completes"),
+            }
+        }
+        Command::ContextMonitor(args) => {
+            run_context_monitor(&client, args)?;
         }
         Command::Wait(args) => wait_for_session(&client, &args.session_id, args.seconds)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
@@ -436,6 +581,149 @@ fn wait_for_session(client: &ApiClient, session_id: &str, seconds: u64) -> Resul
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<()> {
+    match args.command.unwrap_or(ContextMonitorCommand::Status) {
+        ContextMonitorCommand::Status => {
+            let payload = client.get_json("/sessions/context-monitor")?;
+            let monitored = payload["monitored"].as_array().cloned().unwrap_or_default();
+            if monitored.is_empty() {
+                println!("No sessions currently registered for context monitoring.");
+                return Ok(());
+            }
+            println!("{:<12} {:<24} Notify Target", "Session", "Name");
+            println!("{}", "-".repeat(52));
+            for entry in monitored {
+                let session_id = entry["session_id"].as_str().unwrap_or("unknown");
+                let name = entry["friendly_name"].as_str().unwrap_or("");
+                let notify = entry["notify_session_id"].as_str().unwrap_or("(none)");
+                println!("{session_id:<12} {name:<24} {notify}");
+            }
+        }
+        ContextMonitorCommand::Enable { target } => {
+            let requester = current_session_id()?;
+            let target = target.unwrap_or_else(|| requester.clone());
+            client.post_json(
+                &format!("/sessions/{target}/context-monitor"),
+                json!({
+                    "enabled": true,
+                    "requester_session_id": requester,
+                    "notify_session_id": requester
+                }),
+            )?;
+            if target == requester {
+                println!("Context monitoring enabled - notifications -> self ({requester})");
+            } else {
+                println!("Context monitoring enabled for {target} - notifications -> {requester}");
+            }
+        }
+        ContextMonitorCommand::Disable { target } => {
+            let requester = current_session_id()?;
+            let target = target.unwrap_or_else(|| requester.clone());
+            client.post_json(
+                &format!("/sessions/{target}/context-monitor"),
+                json!({
+                    "enabled": false,
+                    "requester_session_id": requester,
+                    "notify_session_id": null
+                }),
+            )?;
+            println!("Context monitoring disabled for {target}");
+        }
+    }
+    Ok(())
+}
+
+fn attach_session(client: &ApiClient, session_id: &str) -> Result<()> {
+    let response = client.get_json(&format!("/sessions/{session_id}/attach-descriptor"))?;
+    let descriptor = response.get("attach").unwrap_or(&response);
+    if descriptor["attach_supported"].as_bool() == Some(false) {
+        let message = descriptor["message"]
+            .as_str()
+            .unwrap_or("Attach not supported for this session");
+        bail!("{message}");
+    }
+    let tmux_session = descriptor["tmux_session"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Session has no tmux session"))?;
+    let mut command = process::Command::new("tmux");
+    if let Some(socket_name) = descriptor["tmux_socket_name"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    {
+        command.arg("-L").arg(socket_name);
+    }
+    let status = command
+        .arg("attach")
+        .arg("-t")
+        .arg(tmux_session)
+        .status()
+        .with_context(|| "failed to run tmux attach")?;
+    if !status.success() {
+        bail!("tmux attach exited with {status}");
+    }
+    Ok(())
+}
+
+fn ensure_clear_authorized(
+    client: &ApiClient,
+    target_session_id: &str,
+    requester_session_id: Option<&str>,
+) -> Result<()> {
+    let session = client.get_json(&format!("/sessions/{target_session_id}"))?;
+    let parent_id = session["parent_session_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(requester_session_id) = requester_session_id {
+        if parent_id != Some(requester_session_id) {
+            bail!(
+                "Not authorized. You can only clear your child sessions.\nTarget session parent: {}",
+                parent_id.unwrap_or("none")
+            );
+        }
+    } else if parent_id.is_none() {
+        bail!("Can only clear child sessions. Target session has no parent.");
+    }
+    Ok(())
+}
+
+fn format_session_line(session: &Value, show_working_dir: bool) -> String {
+    let id = session["id"].as_str().unwrap_or("unknown");
+    let name = session["friendly_name"]
+        .as_str()
+        .or_else(|| session["name"].as_str())
+        .unwrap_or(id);
+    let provider = session["provider"].as_str().unwrap_or("claude");
+    let status = session["activity_state"]
+        .as_str()
+        .or_else(|| session["status"].as_str())
+        .unwrap_or("unknown");
+    let mut line = format!("{name} ({id}) | {provider} | {status}");
+    if show_working_dir {
+        if let Some(working_dir) = session["working_dir"].as_str() {
+            line.push_str(" | ");
+            line.push_str(working_dir);
+        }
+    }
+    line
+}
+
+fn format_child_line(child: &Value) -> String {
+    let id = child["id"].as_str().unwrap_or("unknown");
+    let name = child["friendly_name"]
+        .as_str()
+        .or_else(|| child["name"].as_str())
+        .unwrap_or(id);
+    let provider = child["provider"].as_str().unwrap_or("claude");
+    let status = child["completion_status"]
+        .as_str()
+        .or_else(|| child["activity_state"].as_str())
+        .or_else(|| child["status"].as_str())
+        .unwrap_or("unknown");
+    format!("{name} ({id}) | {provider} | {status}")
 }
 
 impl ApiClient {

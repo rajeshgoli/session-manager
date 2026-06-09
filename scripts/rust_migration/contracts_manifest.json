@@ -920,6 +920,81 @@
       "source": "https://github.com/rajeshgoli/session-manager/issues/795"
     },
     {
+      "id": "cli.rust_core_me_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "me"],
+      "env": {"SESSION_MANAGER_ID": "{session_id}"},
+      "expected_exit": [0],
+      "expected_output_contains_all": ["{session_id}", "{session_name}", "{working_dir}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:session_name", "fixture:working_dir", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
+      "id": "cli.rust_core_all_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "all"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["{session_id}", "{session_name}", "{child_session_id}", "{child_session_name}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:session_name", "fixture:child_session_id", "fixture:child_session_name", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
+      "id": "cli.rust_core_children_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "children"],
+      "env": {"SESSION_MANAGER_ID": "{session_id}"},
+      "expected_exit": [0],
+      "expected_output_contains_all": ["{child_session_id}", "{child_session_name}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:child_session_id", "fixture:child_session_name", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
+      "id": "cli.rust_core_children_target_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "children", "{session_id}", "--json"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["{child_session_id}", "{child_session_name}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:child_session_id", "fixture:child_session_name", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
+      "id": "cli.rust_core_context_monitor_enable_child_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "context-monitor", "enable", "{child_session_id}"],
+      "env": {"SESSION_MANAGER_ID": "{session_id}"},
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Context monitoring enabled", "{child_session_id}", "{session_id}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:child_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
+      "id": "cli.rust_core_context_monitor_status_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "context-monitor", "status"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["{child_session_id}", "{session_id}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:child_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
       "id": "cli.rust_core_status_fixture",
       "surface": "cli",
       "classification": "retained",
@@ -969,6 +1044,19 @@
       "source": "https://github.com/rajeshgoli/session-manager/issues/791"
     },
     {
+      "id": "cli.rust_core_clear_child_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "clear", "{child_session_id}", "{clear_prompt_text}"],
+      "env": {"SESSION_MANAGER_ID": "{session_id}"},
+      "expected_exit": [0],
+      "expected_output_contains_all": ["cleared", "{child_session_id}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:child_session_id", "fixture:clear_prompt_text", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
       "id": "cli.rust_core_tail_fixture",
       "surface": "cli",
       "classification": "retained",
@@ -991,6 +1079,49 @@
       "expected_output_contains_any": ["killed"],
       "preconditions": ["sm_cli", "fixture:base_url", "session_id", "mutating_opt_in"],
       "source": "https://github.com/rajeshgoli/session-manager/issues/791"
+    },
+    {
+      "id": "http.attach_descriptor_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/sessions/{session_id}/attach-descriptor",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/attach", "type": "object"},
+        {"path": "/attach/session_id", "equals": "{session_id}"},
+        {"path": "/attach/attach_supported", "type": "boolean"},
+        {"path": "/attach/provider", "type": "string"},
+        {"path": "/attach/lifecycle_state", "type": "string"}
+      ],
+      "preconditions": ["live_server", "session_id"],
+      "source": "specs/762_stage2_artifacts/route_manifest.md:GET /sessions/{session_id}/attach-descriptor"
+    },
+    {
+      "id": "cli.rust_core_restore_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "restore", "{session_id}"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Session restored", "{session_id}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
+    },
+    {
+      "id": "cli.rust_core_retire_restored_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "retire", "{session_id}"],
+      "expected_exit": [0],
+      "expected_output_contains_any": ["killed"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/797"
     },
     {
       "id": "cli.rust_core_wait_retired_fixture",

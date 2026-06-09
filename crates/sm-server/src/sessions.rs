@@ -61,6 +61,49 @@ impl SessionStore {
             .collect())
     }
 
+    pub fn list_children(
+        &self,
+        parent_session_id: &str,
+        recursive: bool,
+        status_filter: Option<&str>,
+        include_terminated: bool,
+    ) -> Result<Vec<ChildSessionResponse>> {
+        let all_sessions = self.load_snapshot()?.into_sessions();
+        let mut children = if recursive {
+            let mut descendants = Vec::new();
+            let mut visited = BTreeSet::new();
+            collect_descendants_preorder(
+                &all_sessions,
+                parent_session_id,
+                &mut visited,
+                &mut descendants,
+            );
+            descendants
+        } else {
+            direct_children(&all_sessions, parent_session_id)
+        };
+
+        let status_filter = status_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "all");
+        if let Some(status_filter) = status_filter {
+            children.retain(|session| match status_filter {
+                "running" => normalized_status(&session.status) == "running",
+                "completed" => session.completion_status.as_deref() == Some("completed"),
+                "error" => session.completion_status.as_deref() == Some("error"),
+                _ => true,
+            });
+        }
+        if !include_terminated {
+            children.retain(|session| session.completion_status.as_deref() != Some("killed"));
+        }
+
+        Ok(children
+            .into_iter()
+            .map(ChildSessionResponse::from)
+            .collect())
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -97,6 +140,23 @@ impl SessionStore {
             }
         };
         Ok(Some(output))
+    }
+
+    pub fn list_context_monitors(&self) -> Result<Vec<ContextMonitorStatus>> {
+        Ok(self
+            .load_snapshot()?
+            .into_sessions()
+            .into_iter()
+            .filter(|session| session.context_monitor_enabled)
+            .map(|session| {
+                let friendly_name = session.cached_display_name();
+                ContextMonitorStatus {
+                    session_id: session.id,
+                    friendly_name,
+                    notify_session_id: session.context_monitor_notify,
+                }
+            })
+            .collect())
     }
 
     pub fn create_core_session(
@@ -252,6 +312,354 @@ impl SessionStore {
         }))
     }
 
+    pub fn clear_core_session(
+        &self,
+        session_id: &str,
+        request: ClearSessionRequest,
+    ) -> Result<CoreClearOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(CoreClearOutcome::NotFound);
+        };
+        if let Some(message) =
+            clear_authorization_error(session, request.requester_session_id.as_deref())
+        {
+            return Ok(CoreClearOutcome::Unauthorized(message));
+        }
+        let now = now_rfc3339();
+        reset_session_after_clear(session, &now);
+        if let Some(log_file) = json_text(session.get("log_file")) {
+            append_log_line(&expand_home(&log_file), "[sm-rust] fixture context cleared")?;
+            if let Some(prompt) = request
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                append_log_line(&expand_home(&log_file), prompt)?;
+            }
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(CoreClearOutcome::Cleared(CoreClearResult {
+            status: "cleared".to_owned(),
+            session_id: session_id.to_owned(),
+        }))
+    }
+
+    pub fn clear_core_session_with_runtime(
+        &self,
+        session_id: &str,
+        request: ClearSessionRequest,
+        runtime: &TmuxRuntime,
+    ) -> Result<CoreClearOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(CoreClearOutcome::NotFound);
+        };
+        if let Some(message) =
+            clear_authorization_error(session, request.requester_session_id.as_deref())
+        {
+            return Ok(CoreClearOutcome::Unauthorized(message));
+        }
+        let node = json_text(session.get("node")).unwrap_or_else(default_node);
+        ensure_runtime_local_node(&node)?;
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+        let clear_command = if matches!(provider.as_str(), "codex" | "codex-fork") {
+            "/new"
+        } else {
+            "/clear"
+        };
+        let prompt = request
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let wake_completed =
+            json_text(session.get("completion_status")).is_some_and(|value| value == "completed");
+        let delivered = session_runtime.clear_session(
+            &tmux_session,
+            clear_command,
+            prompt.as_deref(),
+            wake_completed,
+        )?;
+        if !delivered {
+            return Err(anyhow::anyhow!("tmux session is not running"));
+        }
+        let now = now_rfc3339();
+        reset_session_after_clear(session, &now);
+        self.write_raw_json_value(&state)?;
+        Ok(CoreClearOutcome::Cleared(CoreClearResult {
+            status: "cleared".to_owned(),
+            session_id: session_id.to_owned(),
+        }))
+    }
+
+    pub fn restore_core_session(&self, session_id: &str) -> Result<Option<CoreRestoreOutcome>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
+        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+        if normalized_status(&status) != "stopped" {
+            return Ok(Some(CoreRestoreOutcome::NotStopped));
+        }
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("running".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        session.insert("completion_status".to_owned(), Value::Null);
+        session.insert("completion_message".to_owned(), Value::Null);
+        session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        session.insert("last_activity".to_owned(), Value::String(now));
+        if let Some(log_file) = json_text(session.get("log_file")) {
+            append_log_line(
+                &expand_home(&log_file),
+                "[sm-rust] fixture session restored",
+            )?;
+        }
+        let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+        self.write_raw_json_value(&state)?;
+        Ok(Some(CoreRestoreOutcome::Restored(restored)))
+    }
+
+    pub fn restore_core_session_with_runtime(
+        &self,
+        session_id: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<Option<CoreRestoreOutcome>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
+        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+        if normalized_status(&status) != "stopped" {
+            return Ok(Some(CoreRestoreOutcome::NotStopped));
+        }
+        let record = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+        if !is_primary_node(&record.node) {
+            return Ok(Some(CoreRestoreOutcome::UnsupportedNode(record.node)));
+        }
+        if record.provider != "claude" {
+            return Ok(Some(CoreRestoreOutcome::UnsupportedProvider(
+                record.provider,
+            )));
+        }
+        let Some(log_file) = record
+            .log_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(expand_home)
+        else {
+            return Err(anyhow::anyhow!("session {session_id} missing log_file"));
+        };
+        let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
+        if session_runtime.session_exists(&record.tmux_session)? {
+            let _ = session_runtime.kill_session(&record.tmux_session)?;
+        }
+        let spec = TmuxSessionSpec {
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            working_dir: expand_home(&record.working_dir).display().to_string(),
+            log_file,
+            initial_message: None,
+            model: record.model.clone(),
+        };
+        session_runtime.restore_session(
+            &spec,
+            &record.provider,
+            record.provider_resume_id.as_deref(),
+        )?;
+
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("running".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        session.insert("completion_status".to_owned(), Value::Null);
+        session.insert("completion_message".to_owned(), Value::Null);
+        session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        session.insert("last_activity".to_owned(), Value::String(now));
+        if let Some(socket_name) = session_runtime.socket_name() {
+            session.insert(
+                "tmux_socket_name".to_owned(),
+                Value::String(socket_name.to_owned()),
+            );
+        }
+        let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+        self.write_raw_json_value(&state)?;
+        Ok(Some(CoreRestoreOutcome::Restored(restored)))
+    }
+
+    pub fn set_context_monitor(
+        &self,
+        session_id: &str,
+        request: ContextMonitorRequest,
+    ) -> Result<ContextMonitorOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let requester_session_id = request.requester_session_id.trim();
+        if requester_session_id.is_empty() {
+            return Ok(ContextMonitorOutcome::Unauthorized);
+        }
+        let notify_session_id = request
+            .notify_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if request.enabled && notify_session_id.is_none() {
+            return Ok(ContextMonitorOutcome::MissingNotifyTarget);
+        }
+        if request.enabled {
+            let notify_session_id = notify_session_id.as_deref().unwrap_or_default();
+            if session_object(sessions, notify_session_id).is_none() {
+                return Ok(ContextMonitorOutcome::NotifyTargetNotFound(
+                    notify_session_id.to_owned(),
+                ));
+            }
+        }
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(ContextMonitorOutcome::NotFound);
+        };
+        let is_self = requester_session_id == session_id;
+        let is_parent =
+            json_text(session.get("parent_session_id")).as_deref() == Some(requester_session_id);
+        if !is_self && !is_parent {
+            return Ok(ContextMonitorOutcome::Unauthorized);
+        }
+        session.insert(
+            "context_monitor_enabled".to_owned(),
+            Value::Bool(request.enabled),
+        );
+        if request.enabled {
+            session.insert(
+                "context_monitor_notify".to_owned(),
+                Value::String(notify_session_id.unwrap()),
+            );
+        } else {
+            session.insert("context_monitor_notify".to_owned(), Value::Null);
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(ContextMonitorOutcome::Updated(ContextMonitorResult {
+            status: "ok".to_owned(),
+            enabled: request.enabled,
+        }))
+    }
+
+    pub fn schedule_handoff(
+        &self,
+        session_id: &str,
+        request: HandoffRequest,
+    ) -> Result<HandoffOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        if request.requester_session_id.trim() != session_id {
+            return Ok(HandoffOutcome::Error(
+                "sm handoff is self-directed only - requester must equal target session".to_owned(),
+            ));
+        }
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(HandoffOutcome::Error(format!(
+                "Session {session_id} not found"
+            )));
+        };
+        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+        if provider == "codex-app" {
+            return Ok(HandoffOutcome::Error(
+                "sm handoff is not supported for codex-app sessions".to_owned(),
+            ));
+        }
+        session.insert(
+            "last_handoff_path".to_owned(),
+            Value::String(request.file_path.clone()),
+        );
+        self.write_raw_json_value(&state)?;
+        Ok(HandoffOutcome::Recorded(HandoffResult {
+            status: "recorded".to_owned(),
+        }))
+    }
+
+    pub fn execute_handoff_with_runtime(
+        &self,
+        session_id: &str,
+        request: HandoffRequest,
+        runtime: &TmuxRuntime,
+    ) -> Result<HandoffOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        if request.requester_session_id.trim() != session_id {
+            return Ok(HandoffOutcome::Error(
+                "sm handoff is self-directed only - requester must equal target session".to_owned(),
+            ));
+        }
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(HandoffOutcome::Error(format!(
+                "Session {session_id} not found"
+            )));
+        };
+        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+        if provider == "codex-app" {
+            return Ok(HandoffOutcome::Error(
+                "sm handoff is not supported for codex-app sessions".to_owned(),
+            ));
+        }
+        let node = json_text(session.get("node")).unwrap_or_else(default_node);
+        ensure_runtime_local_node(&node)?;
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let clear_command = if matches!(provider.as_str(), "codex" | "codex-fork") {
+            "/new"
+        } else {
+            "/clear"
+        };
+        let prompt = format!(
+            "Read {} and continue from where you left off.",
+            request.file_path
+        );
+        let wake_completed =
+            json_text(session.get("completion_status")).is_some_and(|value| value == "completed");
+        let delivered = session_runtime.clear_session(
+            &tmux_session,
+            clear_command,
+            Some(&prompt),
+            wake_completed,
+        )?;
+        if !delivered {
+            return Ok(HandoffOutcome::Error(
+                "tmux session is not running".to_owned(),
+            ));
+        }
+
+        let now = now_rfc3339();
+        reset_session_after_clear(session, &now);
+        session.insert(
+            "last_handoff_path".to_owned(),
+            Value::String(request.file_path.clone()),
+        );
+        self.write_raw_json_value(&state)?;
+        Ok(HandoffOutcome::Executed(HandoffResult {
+            status: "executed".to_owned(),
+        }))
+    }
+
     pub fn retire_core_session(
         &self,
         session_id: &str,
@@ -273,6 +681,7 @@ impl SessionStore {
         }
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        mark_session_killed(session, &now);
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
         if let Some(log_file) = json_text(session.get("log_file")) {
@@ -317,6 +726,7 @@ impl SessionStore {
         let _ = session_runtime.kill_session(&tmux_session)?;
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        mark_session_killed(session, &now);
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
         self.write_raw_json_value(&state)?;
@@ -540,17 +950,21 @@ impl SessionStore {
             agent_status_text: None,
             agent_status_at: None,
             agent_task_completed_at: None,
+            completion_status: None,
+            completion_message: None,
             completed_at: None,
             stopped_at: None,
             is_em: false,
             role: None,
             status: "running".to_owned(),
+            spawned_at: Some(now.clone()),
             created_at: now.clone(),
             last_activity: now,
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
             context_monitor_enabled: false,
+            context_monitor_notify: None,
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
         })
@@ -594,6 +1008,28 @@ pub struct AgentStatusRequest {
     pub text: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClearSessionRequest {
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub requester_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextMonitorRequest {
+    pub enabled: bool,
+    pub requester_session_id: String,
+    #[serde(default)]
+    pub notify_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HandoffRequest {
+    pub requester_session_id: String,
+    pub file_path: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreInputResult {
     pub ok: bool,
@@ -620,10 +1056,65 @@ pub enum CoreRetireOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CoreClearResult {
+    pub status: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum CoreClearOutcome {
+    Cleared(CoreClearResult),
+    NotFound,
+    Unauthorized(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum CoreRestoreOutcome {
+    Restored(SessionRecord),
+    NotStopped,
+    UnsupportedNode(String),
+    UnsupportedProvider(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentStatusResult {
     pub status: String,
     pub session_id: String,
     pub agent_status_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextMonitorStatus {
+    pub session_id: String,
+    pub friendly_name: Option<String>,
+    pub notify_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextMonitorResult {
+    pub status: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ContextMonitorOutcome {
+    Updated(ContextMonitorResult),
+    NotFound,
+    MissingNotifyTarget,
+    NotifyTargetNotFound(String),
+    Unauthorized,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffResult {
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum HandoffOutcome {
+    Recorded(HandoffResult),
+    Executed(HandoffResult),
+    Error(String),
 }
 
 fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
@@ -660,6 +1151,83 @@ fn session_object_mut<'a>(
             None
         }
     })
+}
+
+fn session_object<'a>(sessions: &'a [Value], session_id: &str) -> Option<&'a Map<String, Value>> {
+    sessions.iter().find_map(|value| {
+        if value.get("id").and_then(Value::as_str) == Some(session_id) {
+            value.as_object()
+        } else {
+            None
+        }
+    })
+}
+
+fn direct_children(sessions: &[SessionRecord], parent_session_id: &str) -> Vec<SessionRecord> {
+    sessions
+        .iter()
+        .filter(|session| session.parent_session_id.as_deref() == Some(parent_session_id))
+        .cloned()
+        .collect()
+}
+
+fn collect_descendants_preorder(
+    sessions: &[SessionRecord],
+    parent_session_id: &str,
+    visited: &mut BTreeSet<String>,
+    descendants: &mut Vec<SessionRecord>,
+) {
+    for child in direct_children(sessions, parent_session_id) {
+        if !visited.insert(child.id.clone()) {
+            continue;
+        }
+        let child_id = child.id.clone();
+        descendants.push(child);
+        collect_descendants_preorder(sessions, &child_id, visited, descendants);
+    }
+}
+
+fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
+    session.insert("agent_status_text".to_owned(), Value::Null);
+    session.insert("agent_status_at".to_owned(), Value::Null);
+    session.insert("agent_task_completed_at".to_owned(), Value::Null);
+    session.insert("completion_status".to_owned(), Value::Null);
+    session.insert("completion_message".to_owned(), Value::Null);
+    session.insert("completed_at".to_owned(), Value::Null);
+    session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
+}
+
+fn mark_session_killed(session: &mut Map<String, Value>, now: &str) {
+    session.insert(
+        "completion_status".to_owned(),
+        Value::String("killed".to_owned()),
+    );
+    session.insert(
+        "completion_message".to_owned(),
+        Value::String("Terminated via sm kill".to_owned()),
+    );
+    session.insert("completed_at".to_owned(), Value::String(now.to_owned()));
+}
+
+fn clear_authorization_error(
+    session: &Map<String, Value>,
+    requester_session_id: Option<&str>,
+) -> Option<String> {
+    let parent_id = json_text(session.get("parent_session_id"));
+    let requester_session_id = requester_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(requester_session_id) = requester_session_id {
+        if parent_id.as_deref() != Some(requester_session_id) {
+            return Some(format!(
+                "Not authorized. You can only clear your child sessions. Target session parent: {}",
+                parent_id.as_deref().unwrap_or("none")
+            ));
+        }
+    } else if parent_id.is_none() {
+        return Some("Can only clear child sessions. Target session has no parent.".to_owned());
+    }
+    None
 }
 
 fn json_text(value: Option<&Value>) -> Option<String> {
@@ -1007,6 +1575,10 @@ pub struct SessionRecord {
     #[serde(default)]
     pub agent_task_completed_at: Option<String>,
     #[serde(default)]
+    pub completion_status: Option<String>,
+    #[serde(default)]
+    pub completion_message: Option<String>,
+    #[serde(default)]
     pub completed_at: Option<String>,
     #[serde(default)]
     pub stopped_at: Option<String>,
@@ -1016,6 +1588,8 @@ pub struct SessionRecord {
     pub role: Option<String>,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub spawned_at: Option<String>,
     pub created_at: String,
     pub last_activity: String,
     #[serde(default)]
@@ -1026,6 +1600,8 @@ pub struct SessionRecord {
     pub tokens_used: i64,
     #[serde(default)]
     pub context_monitor_enabled: bool,
+    #[serde(default)]
+    pub context_monitor_notify: Option<String>,
     #[serde(skip)]
     pub aliases: Vec<String>,
     #[serde(skip)]
@@ -1218,6 +1794,55 @@ impl From<SessionRecord> for SessionResponse {
             pending_adoption_proposals: session.pending_adoption_proposals,
             aliases: session.aliases,
             is_maintainer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChildSessionResponse {
+    id: String,
+    name: String,
+    friendly_name: Option<String>,
+    status: String,
+    activity_state: String,
+    completion_status: Option<String>,
+    completion_message: Option<String>,
+    last_activity: String,
+    spawned_at: Option<String>,
+    completed_at: Option<String>,
+    tmux_session: String,
+    tmux_socket_name: Option<String>,
+    agent_status_text: Option<String>,
+    agent_status_at: Option<String>,
+    provider: String,
+    activity_projection: Option<Value>,
+}
+
+impl From<SessionRecord> for ChildSessionResponse {
+    fn from(session: SessionRecord) -> Self {
+        let status = normalized_status(&session.status).to_owned();
+        let friendly_name = session.cached_display_name();
+        let spawned_at = session
+            .spawned_at
+            .clone()
+            .or(Some(session.created_at.clone()));
+        Self {
+            id: session.id,
+            name: session.name,
+            friendly_name,
+            status: status.clone(),
+            activity_state: fallback_activity_state(&status),
+            completion_status: session.completion_status,
+            completion_message: session.completion_message,
+            last_activity: session.last_activity,
+            spawned_at,
+            completed_at: session.completed_at,
+            tmux_session: session.tmux_session,
+            tmux_socket_name: session.tmux_socket_name,
+            agent_status_text: session.agent_status_text,
+            agent_status_at: session.agent_status_at,
+            provider: non_empty_or(session.provider, "claude"),
+            activity_projection: None,
         }
     }
 }
@@ -1445,17 +2070,21 @@ mod tests {
             agent_status_text: None,
             agent_status_at: None,
             agent_task_completed_at: None,
+            completion_status: None,
+            completion_message: None,
             completed_at: None,
             stopped_at: None,
             is_em: false,
             role: None,
             status: status.to_owned(),
+            spawned_at: Some("2026-06-01T00:00:00".to_owned()),
             created_at: "2026-06-01T00:00:00".to_owned(),
             last_activity: "2026-06-01T00:01:00".to_owned(),
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
             context_monitor_enabled: false,
+            context_monitor_notify: None,
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
         }

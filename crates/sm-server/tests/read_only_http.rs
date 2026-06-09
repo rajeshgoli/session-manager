@@ -461,9 +461,9 @@ async fn shadow_http_does_not_treat_static_sessions_route_as_session_id() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["support_status"], "unsupported");
-    assert_eq!(payload["comparison"], "not_compared");
-    assert_eq!(payload["predicted_status"], Value::Null);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "body_mismatch");
+    assert_eq!(payload["predicted_status"], 200);
 }
 
 #[tokio::test]
@@ -1060,6 +1060,360 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
 }
 
 #[tokio::test]
+async fn fixture_core_session_graph_endpoints_round_trip_state() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "graphparent",
+            "name": "graph-parent",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "graphchild",
+            "name": "graph-child",
+            "parent_session_id": "graphparent",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "graphgrandchild",
+            "name": "graph-grandchild",
+            "parent_session_id": "graphchild",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "graphgreatgrandchild",
+            "name": "graph-great-grandchild",
+            "parent_session_id": "graphgrandchild",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphparent/children").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["parent_session_id"], "graphparent");
+    assert_eq!(payload["children"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["children"][0]["id"], "graphchild");
+    assert_eq!(payload["children"][0]["friendly_name"], "graph-child");
+
+    let (status, payload) =
+        get_json(app.clone(), "/sessions/graphparent/children?recursive=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let child_ids = payload["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|child| child["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_ids,
+        vec!["graphchild", "graphgrandchild", "graphgreatgrandchild"]
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphchild/attach-descriptor").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["attach"]["attach_supported"], true);
+    assert_eq!(payload["attach"]["tmux_session"], "sm-rust-graphchild");
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "graphcodexapp",
+            "name": "graph-codex-app",
+            "provider": "codex-app"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) =
+        get_json(app.clone(), "/sessions/graphcodexapp/attach-descriptor").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["attach"]["attach_supported"], false);
+    assert_eq!(
+        payload["attach"]["message"],
+        "Attach not supported for Codex app sessions"
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/graphchild/context-monitor",
+        json!({
+            "enabled": true,
+            "requester_session_id": "graphparent",
+            "notify_session_id": "graphparent"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok", "enabled": true }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/context-monitor").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["monitored"][0]["session_id"], "graphchild");
+    assert_eq!(payload["monitored"][0]["notify_session_id"], "graphparent");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/graphchild/agent-status",
+        json!({ "text": "old task state" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["agent_status_text"], "old task state");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/graphparent/clear",
+        json!({ "prompt": "root reset denied" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Can only clear child sessions. Target session has no parent."
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/graphchild/clear",
+        json!({
+            "prompt": "sibling reset denied",
+            "requester_session_id": "graphgrandchild"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "Not authorized. You can only clear your child sessions. Target session parent: graphparent"
+    );
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child_entry = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "graphchild")
+        .unwrap();
+    child_entry["completion_status"] = json!("completed");
+    child_entry["completion_message"] = json!("stale completed message");
+    child_entry["completed_at"] = json!("2026-06-01T00:02:00Z");
+    child_entry["agent_task_completed_at"] = json!("2026-06-01T00:03:00Z");
+    fs::write(&state_file, state.to_string()).unwrap();
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/sessions/graphparent/children?status=completed",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["children"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["children"][0]["completion_status"], "completed");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/graphchild/clear",
+        json!({ "prompt": "new task after clear" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "status": "cleared", "session_id": "graphchild" })
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphchild").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["agent_status_text"], Value::Null);
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphparent/children").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["children"][0]["completion_status"], Value::Null);
+    assert_eq!(payload["children"][0]["completion_message"], Value::Null);
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/sessions/graphparent/children?status=completed",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["children"].as_array().unwrap().len(), 0);
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphchild/output?lines=5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("new task after clear"));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/graphchild/handoff",
+        json!({
+            "requester_session_id": "graphchild",
+            "file_path": "/tmp/handoff.md"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "recorded" }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphchild").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["last_handoff_path"], "/tmp/handoff.md");
+
+    let (status, payload) = post_json(app.clone(), "/sessions/graphchild/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphparent/children").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|child| child["id"] != "graphchild"));
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/sessions/graphparent/children?include_terminated=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let graphchild = payload["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["id"] == "graphchild")
+        .unwrap();
+    assert_eq!(graphchild["completion_status"], "killed");
+    assert_eq!(graphchild["completion_message"], "Terminated via sm kill");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/graphchild/attach-descriptor").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["attach"]["attach_supported"], false);
+    assert_eq!(payload["attach"]["message"], "Session is stopped");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "graphchild")
+        .unwrap()
+        .clone();
+    let mut state = state;
+    let sessions = state["sessions"].as_array_mut().unwrap();
+    let child_entry = sessions
+        .iter_mut()
+        .find(|session| session["id"] == "graphchild")
+        .unwrap();
+    child_entry["completion_status"] = json!("killed");
+    child_entry["completion_message"] = json!("stale killed message");
+    child_entry["completed_at"] = json!("2026-06-01T00:02:00Z");
+    child_entry["agent_task_completed_at"] = json!("2026-06-01T00:03:00Z");
+    assert_ne!(child, *child_entry);
+    fs::write(&state_file, state.to_string()).unwrap();
+
+    let (status, payload) = post_json(app.clone(), "/sessions/graphchild/restore", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "graphchild");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["stopped_at"], Value::Null);
+    assert_eq!(payload["completion_status"], Value::Null);
+    assert_eq!(payload["completion_message"], Value::Null);
+    assert_eq!(payload["completed_at"], Value::Null);
+    assert_eq!(payload["agent_task_completed_at"], Value::Null);
+
+    let (status, payload) = post_json(app, "/sessions/graphchild/restore", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(payload, json!({ "detail": "Session is not stopped" }));
+}
+
+#[tokio::test]
+async fn shadow_attach_descriptor_reuses_real_attach_support_rules() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let expected_body = serde_json::to_vec(&json!({
+        "attach": {
+            "session_id": "stop1234",
+            "provider": "claude",
+            "attach_supported": false,
+            "tmux_session": "claude-stop1234",
+            "tmux_socket_name": null,
+            "runtime_id": null,
+            "lifecycle_state": "stopped",
+            "message": "Session is stopped"
+        }
+    }))
+    .unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/stop1234/attach-descriptor",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&expected_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["body_sha256_match"], true);
+}
+
+#[tokio::test]
 async fn fixture_core_spawn_endpoint_inherits_parent_fields() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();
@@ -1380,10 +1734,107 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "killed");
 
-    let (status, payload) = get_json(app, "/sessions/runtimecore").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/runtimecore").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "stopped");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimecore/restore", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "runtimecore");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["completion_status"], Value::Null);
+    assert!(tmux_session_exists(&tmux_socket, &tmux_session));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimecore/input",
+        json!({
+            "text": "restored runtime message",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(app, "runtimecore", "runtime:restored runtime message").await;
+}
+
+#[tokio::test]
+async fn runtime_core_handoff_executes_clear_and_prompt() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-handoff-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket);
+    let app = runtime_app_with_command(
+        &state_file,
+        &log_dir,
+        _tmux_guard.0.as_str(),
+        r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do printf "runtime:%s\n>\n" "$line"; done' runtime-sh"#,
+    );
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimehandoff",
+            "name": "runtime-handoff",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "initial handoff prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimehandoff",
+        "runtime:initial handoff prompt",
+    )
+    .await;
+
+    let handoff_path = unique_temp_path();
+    fs::write(&handoff_path, "handoff body").unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimehandoff/handoff",
+        json!({
+            "requester_session_id": "runtimehandoff",
+            "file_path": handoff_path.display().to_string()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "executed");
+    wait_for_output_contains(
+        app.clone(),
+        "runtimehandoff",
+        &format!(
+            "runtime:Read {} and continue from where you left off.",
+            handoff_path.display()
+        ),
+    )
+    .await;
+
+    let (status, payload) = get_json(app, "/sessions/runtimehandoff").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["last_handoff_path"],
+        handoff_path.display().to_string()
+    );
 }
 
 #[tokio::test]
@@ -1734,9 +2185,18 @@ async fn runtime_core_expands_bare_home_working_dir_for_tmux() {
         Some(home_path.as_path())
     );
 
-    let (status, payload) = post_json(app, "/sessions/runtimehome/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimehome/kill", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "killed");
+
+    let (status, payload) = post_json(app, "/sessions/runtimehome/restore", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "runtimehome");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(
+        tmux_pane_current_path(&tmux_socket, &tmux_session).as_deref(),
+        Some(home_path.as_path())
+    );
 }
 
 #[tokio::test]
