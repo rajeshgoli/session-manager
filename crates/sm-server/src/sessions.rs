@@ -16,6 +16,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::queue::{
     followup_notification_text, PendingMessage, QueueMessageMetadata, RetainedQueueStore,
+    StopNotifyState,
 };
 use crate::runtime::{TmuxRuntime, TmuxSessionSpec};
 
@@ -394,6 +395,22 @@ impl SessionStore {
             )?;
             self.write_raw_json_value(&state)?;
         }
+        Ok(())
+    }
+
+    pub fn enqueue_runtime_stop_notification_for_session(
+        &self,
+        session_id: &str,
+        text: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let Some(queue) = &self.queue_store else {
+            return Ok(());
+        };
+        enqueue_stop_notification_raw(self, &mut state, Some(runtime), queue, session_id, text)?;
+        self.write_raw_json_value(&state)?;
         Ok(())
     }
 
@@ -890,26 +907,31 @@ impl SessionStore {
     ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(CoreRetireOutcome::NotFound);
-        };
-        if let Some(requester_session_id) = requester_session_id {
-            if !requester_session_id.is_empty()
-                && json_text(session.get("parent_session_id")).as_deref()
-                    != Some(requester_session_id)
-            {
-                return Ok(CoreRetireOutcome::NotChild);
+        let recipient_name = {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(CoreRetireOutcome::NotFound);
+            };
+            if let Some(requester_session_id) = requester_session_id {
+                if !requester_session_id.is_empty()
+                    && json_text(session.get("parent_session_id")).as_deref()
+                        != Some(requester_session_id)
+                {
+                    return Ok(CoreRetireOutcome::NotChild);
+                }
             }
-        }
-        let now = now_rfc3339();
-        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-        mark_session_killed(session, &now);
-        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-        session.insert("last_activity".to_owned(), Value::String(now));
-        if let Some(log_file) = json_text(session.get("log_file")) {
-            append_log_line(&expand_home(&log_file), "[sm-rust] fixture session retired")?;
-        }
+            let recipient_name = raw_session_display_name(session, session_id);
+            let now = now_rfc3339();
+            session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+            mark_session_killed(session, &now);
+            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+            session.insert("last_activity".to_owned(), Value::String(now));
+            if let Some(log_file) = json_text(session.get("log_file")) {
+                append_log_line(&expand_home(&log_file), "[sm-rust] fixture session retired")?;
+            }
+            recipient_name
+        };
+        complete_stop_notify_after_stop_raw(self, &mut state, None, session_id, &recipient_name)?;
         self.write_raw_json_value(&state)?;
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
             ok: true,
@@ -926,32 +948,46 @@ impl SessionStore {
     ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(CoreRetireOutcome::NotFound);
-        };
-        if let Some(requester_session_id) = requester_session_id {
-            if !requester_session_id.is_empty()
-                && json_text(session.get("parent_session_id")).as_deref()
-                    != Some(requester_session_id)
-            {
-                return Ok(CoreRetireOutcome::NotChild);
+        let (node, tmux_session, session_socket_name, recipient_name) = {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(CoreRetireOutcome::NotFound);
+            };
+            if let Some(requester_session_id) = requester_session_id {
+                if !requester_session_id.is_empty()
+                    && json_text(session.get("parent_session_id")).as_deref()
+                        != Some(requester_session_id)
+                {
+                    return Ok(CoreRetireOutcome::NotChild);
+                }
             }
-        }
-        let node = json_text(session.get("node")).unwrap_or_else(default_node);
+            let node = json_text(session.get("node")).unwrap_or_else(default_node);
+            let tmux_session = json_text(session.get("tmux_session"))
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+            let session_socket_name = json_text(session.get("tmux_socket_name"));
+            let recipient_name = raw_session_display_name(session, session_id);
+            (node, tmux_session, session_socket_name, recipient_name)
+        };
         if !is_primary_node(&node) {
             return Ok(CoreRetireOutcome::UnsupportedNode(node));
         }
-        let tmux_session = json_text(session.get("tmux_session"))
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-        let session_socket_name = json_text(session.get("tmux_socket_name"));
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
         let _ = session_runtime.kill_session(&tmux_session)?;
         let now = now_rfc3339();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
         mark_session_killed(session, &now);
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
+        complete_stop_notify_after_stop_raw(
+            self,
+            &mut state,
+            Some(runtime),
+            session_id,
+            &recipient_name,
+        )?;
         self.write_raw_json_value(&state)?;
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
             ok: true,
@@ -1728,6 +1764,30 @@ fn deactivate_remind_raw(state: &mut Value, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn stop_notify_state_raw(state: &Value, session_id: &str) -> Option<StopNotifyState> {
+    state
+        .get("retained_stop_notify_states")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|entry| entry.get("session_id").and_then(Value::as_str) == Some(session_id))
+        .map(|entry| StopNotifyState {
+            session_id: session_id.to_owned(),
+            sender_session_id: json_text(entry.get("sender_session_id")).unwrap_or_default(),
+            sender_name: json_text(entry.get("sender_name")).unwrap_or_default(),
+            delay_seconds: entry
+                .get("delay_seconds")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        })
+        .filter(|entry| !entry.sender_session_id.is_empty())
+}
+
+fn clear_stop_notify_raw(state: &mut Value, session_id: &str) -> Result<()> {
+    let entries = ensure_array_field_mut(state, "retained_stop_notify_states")?;
+    entries.retain(|entry| entry.get("session_id").and_then(Value::as_str) != Some(session_id));
+    Ok(())
+}
+
 fn push_retained_message_raw(
     state: &mut Value,
     target_session_id: &str,
@@ -2219,6 +2279,126 @@ fn schedule_runtime_followup_notification(
             }
         });
     }
+}
+
+fn complete_stop_notify_after_stop_raw(
+    store: &SessionStore,
+    state: &mut Value,
+    runtime: Option<&TmuxRuntime>,
+    session_id: &str,
+    recipient_name: &str,
+) -> Result<()> {
+    let queue = store.queue_store.as_ref();
+    let stop_notify = match queue {
+        Some(queue) => queue.stop_notify_state(session_id)?,
+        None => stop_notify_state_raw(state, session_id),
+    };
+    let Some(stop_notify) = stop_notify else {
+        return Ok(());
+    };
+
+    if let Some(queue) = queue {
+        queue.clear_stop_notify(session_id)?;
+    }
+    clear_stop_notify_raw(state, session_id)?;
+
+    if raw_session_object(state, &stop_notify.sender_session_id).is_none() {
+        return Ok(());
+    }
+
+    let text = runtime_stop_notification_text(recipient_name, session_id);
+    if stop_notify.delay_seconds > 0 {
+        if let Some(runtime) = runtime {
+            schedule_runtime_stop_notification(
+                store.clone(),
+                runtime.clone(),
+                stop_notify.sender_session_id,
+                text,
+                stop_notify.delay_seconds as u64,
+            );
+            return Ok(());
+        }
+    }
+
+    if let Some(queue) = queue {
+        enqueue_stop_notification_raw(
+            store,
+            state,
+            runtime,
+            queue,
+            &stop_notify.sender_session_id,
+            &text,
+        )?;
+    } else {
+        push_retained_message_raw(
+            state,
+            &stop_notify.sender_session_id,
+            &text,
+            "important",
+            Some("stop_notify"),
+        )?;
+    }
+    Ok(())
+}
+
+fn enqueue_stop_notification_raw(
+    store: &SessionStore,
+    state: &mut Value,
+    runtime: Option<&TmuxRuntime>,
+    queue: &RetainedQueueStore,
+    sender_session_id: &str,
+    text: &str,
+) -> Result<()> {
+    if raw_session_object(state, sender_session_id).is_none() {
+        return Ok(());
+    }
+    queue.enqueue_message(sender_session_id, text, "important", Some("stop_notify"))?;
+    push_retained_message_raw(
+        state,
+        sender_session_id,
+        text,
+        "important",
+        Some("stop_notify"),
+    )?;
+    if let Some(runtime) = runtime {
+        drain_pending_runtime_messages_raw(
+            store,
+            state,
+            sender_session_id,
+            runtime,
+            queue,
+            Some("important"),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn schedule_runtime_stop_notification(
+    store: SessionStore,
+    runtime: TmuxRuntime,
+    sender_session_id: String,
+    text: String,
+    delay_seconds: u64,
+) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+            let _ = store.enqueue_runtime_stop_notification_for_session(
+                &sender_session_id,
+                &text,
+                &runtime,
+            );
+        });
+    }
+}
+
+fn runtime_stop_notification_text(recipient_name: &str, recipient_session_id: &str) -> String {
+    format!(
+        "[sm] {} ({}) completed (Stop hook fired)",
+        recipient_name,
+        short_session_id(recipient_session_id)
+    )
 }
 
 fn deliver_urgent_runtime_message_raw(

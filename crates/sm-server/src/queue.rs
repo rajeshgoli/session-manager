@@ -33,6 +33,14 @@ pub struct PendingMessage {
     pub response_relay_source: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopNotifyState {
+    pub session_id: String,
+    pub sender_session_id: String,
+    pub sender_name: String,
+    pub delay_seconds: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueMessageMetadata {
     pub sender_session_id: Option<String>,
@@ -415,6 +423,39 @@ impl RetainedQueueStore {
                 sender_session_id,
                 sender_name,
                 delay_seconds,
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn stop_notify_state(&self, session_id: &str) -> Result<Option<StopNotifyState>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT session_id, sender_session_id, COALESCE(sender_name, ''), delay_seconds
+                FROM rust_stop_notify_states
+                WHERE session_id = ?1
+                "#,
+                params![session_id],
+                |row| {
+                    Ok(StopNotifyState {
+                        session_id: row.get(0)?,
+                        sender_session_id: row.get(1)?,
+                        sender_name: row.get(2)?,
+                        delay_seconds: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn clear_stop_notify(&self, session_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM rust_stop_notify_states WHERE session_id = ?1",
+                params![session_id],
             )?;
             Ok(())
         })
