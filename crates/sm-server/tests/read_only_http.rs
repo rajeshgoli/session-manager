@@ -2472,7 +2472,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
 }
 
 #[tokio::test]
-async fn runtime_core_keeps_side_effect_queue_rows_pending() {
+async fn runtime_core_delivers_sm_send_metadata_rows() {
     if !tmux_available() {
         return;
     }
@@ -2496,10 +2496,10 @@ async fn runtime_core_keeps_side_effect_queue_rows_pending() {
         app.clone(),
         "/sessions",
         json!({
-            "id": "runtimesideeffects",
+            "id": "runtimesmsend",
             "working_dir": working_dir.display().to_string(),
             "provider": "claude",
-            "initial_message": "side effect initial"
+            "initial_message": "sm send initial"
         }),
     )
     .await;
@@ -2531,35 +2531,29 @@ async fn runtime_core_keeps_side_effect_queue_rows_pending() {
         serde_json::to_string_pretty(&raw_state).unwrap(),
     )
     .unwrap();
-    wait_for_output_contains(
-        app.clone(),
-        "runtimesideeffects",
-        "runtime:side effect initial",
-    )
-    .await;
+    wait_for_output_contains(app.clone(), "runtimesmsend", "runtime:sm send initial").await;
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/runtimesideeffects/input",
+        "/sessions/runtimesmsend/input",
         json!({
-            "text": "side effect delivery should wait",
+            "text": "ordinary sm send metadata delivered",
             "sender_session_id": "runtimesender",
             "delivery_mode": "sequential",
             "from_sm_send": true,
-            "timeout_seconds": 60,
-            "notify_on_delivery": true,
-            "notify_after_seconds": 5,
-            "notify_on_stop": true,
-            "remind_soft_threshold": 11,
-            "remind_hard_threshold": 17,
-            "remind_cancel_on_reply_session_id": "runtimesender",
-            "parent_session_id": "runtimeparent"
+            "timeout_seconds": 60
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["delivered"], false);
+    assert_eq!(payload["delivered"], true);
     assert_eq!(payload["status"], "running");
+    wait_for_output_contains(
+        app.clone(),
+        "runtimesmsend",
+        "runtime:ordinary sm send metadata delivered",
+    )
+    .await;
 
     let queue_conn = Connection::open(&queue_db_path).unwrap();
     let pending: (
@@ -2569,7 +2563,7 @@ async fn runtime_core_keeps_side_effect_queue_rows_pending() {
         i64,
         Option<String>,
         i64,
-        i64,
+        Option<i64>,
         i64,
         Option<i64>,
         Option<i64>,
@@ -2586,7 +2580,7 @@ async fn runtime_core_keeps_side_effect_queue_rows_pending() {
                    remind_cancel_on_reply_session_id, parent_session_id,
                    response_relay_source, delivered_at
             FROM message_queue
-            WHERE target_session_id = 'runtimesideeffects'
+            WHERE target_session_id = 'runtimesmsend'
             "#,
             [],
             |row| {
@@ -2613,21 +2607,87 @@ async fn runtime_core_keeps_side_effect_queue_rows_pending() {
     assert!(timeout_at.is_some());
     assert_eq!(
         pending.0,
-        "[Input from: runtime-sender (runtimes) via sm send]\nside effect delivery should wait"
+        "[Input from: runtime-sender (runtimes) via sm send]\nordinary sm send metadata delivered"
     );
     assert_eq!(pending.1.as_deref(), Some("runtimesender"));
     assert_eq!(pending.2.as_deref(), Some("runtime-sender"));
     assert_eq!(pending.3, 1);
     assert_eq!(pending.4, timeout_at);
-    assert_eq!(pending.5, 1);
-    assert_eq!(pending.6, 5);
-    assert_eq!(pending.7, 1);
-    assert_eq!(pending.8, Some(11));
-    assert_eq!(pending.9, Some(17));
-    assert_eq!(pending.10.as_deref(), Some("runtimesender"));
-    assert_eq!(pending.11.as_deref(), Some("runtimeparent"));
+    assert_eq!(pending.5, 0);
+    assert_eq!(pending.6, None);
+    assert_eq!(pending.7, 0);
+    assert_eq!(pending.8, None);
+    assert_eq!(pending.9, None);
+    assert_eq!(pending.10, None);
+    assert_eq!(pending.11, None);
     assert_eq!(pending.12.as_deref(), Some("sm-send"));
-    assert_eq!(pending.13, None);
+    assert!(pending.13.is_some());
+}
+
+#[tokio::test]
+async fn runtime_core_rejects_unimplemented_send_side_effect_options() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-side-effects-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimesideeffects",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "side effect initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimesideeffects",
+        "runtime:side effect initial",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimesideeffects/input",
+        json!({
+            "text": "side effect delivery should be rejected",
+            "delivery_mode": "sequential",
+            "notify_on_delivery": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        payload["detail"],
+        "Rust runtime send delivery side effects are not implemented"
+    );
+
+    RetainedQueueStore::new(queue_db_path.clone())
+        .ensure_schema()
+        .unwrap();
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let row_count: i64 = queue_conn
+        .query_row("SELECT COUNT(*) FROM message_queue", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(row_count, 0);
 
     let (status, output) =
         get_json(app.clone(), "/sessions/runtimesideeffects/output?lines=20").await;
@@ -2635,7 +2695,7 @@ async fn runtime_core_keeps_side_effect_queue_rows_pending() {
     assert!(!output["output"]
         .as_str()
         .unwrap_or_default()
-        .contains("side effect delivery should wait"));
+        .contains("side effect delivery should be rejected"));
 }
 
 #[tokio::test]

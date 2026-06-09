@@ -614,6 +614,15 @@ async fn send_session_input(
     }
     let result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
+        if runtime_send_side_effects_requested(&payload) {
+            if state.session_store.get_session(&session_id)?.is_none() {
+                return Err(ApiError::NotFound("Session not found"));
+            }
+            return Err(ApiError::Status {
+                status: StatusCode::NOT_IMPLEMENTED,
+                detail: "Rust runtime send delivery side effects are not implemented".to_owned(),
+            });
+        }
         let runtime = TmuxRuntime::from_config(&state.config.rust_core);
         state
             .session_store
@@ -625,6 +634,22 @@ async fn send_session_input(
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(serde_json::to_value(result)?))
+}
+
+fn runtime_send_side_effects_requested(payload: &SendCoreInputRequest) -> bool {
+    payload.notify_on_delivery
+        || payload.notify_after_seconds.is_some()
+        || payload.notify_on_stop
+        || payload.remind_soft_threshold.is_some()
+        || payload.remind_hard_threshold.is_some()
+        || payload
+            .remind_cancel_on_reply_session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || payload
+            .parent_session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 async fn set_agent_status(

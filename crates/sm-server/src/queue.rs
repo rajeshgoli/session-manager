@@ -40,11 +40,7 @@ pub struct QueueMessageMetadata {
 
 impl QueueMessageMetadata {
     pub fn has_delivery_side_effects(&self) -> bool {
-        self.sender_session_id
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-            || self.from_sm_send
-            || self.notify_on_delivery
+        self.notify_on_delivery
             || self.notify_after_seconds.is_some()
             || self.notify_on_stop
             || self.remind_soft_threshold.is_some()
@@ -55,10 +51,6 @@ impl QueueMessageMetadata {
                 .is_some_and(|value| !value.trim().is_empty())
             || self
                 .parent_session_id
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || self
-                .response_relay_source
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
     }
@@ -172,9 +164,7 @@ impl RetainedQueueStore {
                 r#"
                 SELECT id, target_session_id, text, delivery_mode,
                     CASE WHEN
-                        (sender_session_id IS NOT NULL AND trim(sender_session_id) != '')
-                        OR from_sm_send != 0
-                        OR notify_on_delivery != 0
+                        notify_on_delivery != 0
                         OR notify_after_seconds IS NOT NULL
                         OR notify_on_stop != 0
                         OR remind_soft_threshold IS NOT NULL
@@ -186,10 +176,6 @@ impl RetainedQueueStore {
                         OR (
                             parent_session_id IS NOT NULL
                             AND trim(parent_session_id) != ''
-                        )
-                        OR (
-                            response_relay_source IS NOT NULL
-                            AND trim(response_relay_source) != ''
                         )
                     THEN 1 ELSE 0 END AS has_delivery_side_effects
                 FROM message_queue
@@ -225,9 +211,7 @@ impl RetainedQueueStore {
                 r#"
                 SELECT id, target_session_id, text, delivery_mode,
                     CASE WHEN
-                        (sender_session_id IS NOT NULL AND trim(sender_session_id) != '')
-                        OR from_sm_send != 0
-                        OR notify_on_delivery != 0
+                        notify_on_delivery != 0
                         OR notify_after_seconds IS NOT NULL
                         OR notify_on_stop != 0
                         OR remind_soft_threshold IS NOT NULL
@@ -239,10 +223,6 @@ impl RetainedQueueStore {
                         OR (
                             parent_session_id IS NOT NULL
                             AND trim(parent_session_id) != ''
-                        )
-                        OR (
-                            response_relay_source IS NOT NULL
-                            AND trim(response_relay_source) != ''
                         )
                     THEN 1 ELSE 0 END AS has_delivery_side_effects
                 FROM message_queue
