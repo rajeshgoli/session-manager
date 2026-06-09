@@ -329,6 +329,7 @@ impl SessionStore {
                 };
                 let drain = if delivery_mode == "urgent" {
                     deliver_urgent_runtime_message_raw(
+                        self,
                         &mut state,
                         session_id,
                         runtime,
@@ -337,6 +338,7 @@ impl SessionStore {
                     )?
                 } else {
                     drain_pending_runtime_messages_raw(
+                        self,
                         &mut state,
                         session_id,
                         runtime,
@@ -377,6 +379,22 @@ impl SessionStore {
             notify_after_seconds: request.notify_after_seconds,
             status,
         }))
+    }
+
+    pub fn drain_runtime_pending_messages_for_session(
+        &self,
+        session_id: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if let Some(queue) = &self.queue_store {
+            drain_pending_runtime_messages_raw(
+                self, &mut state, session_id, runtime, queue, None, None,
+            )?;
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(())
     }
 
     pub fn clear_core_session(
@@ -2010,6 +2028,7 @@ fn deliver_urgent_runtime_text_to_session_raw(
 }
 
 fn drain_pending_runtime_messages_raw(
+    store: &SessionStore,
     state: &mut Value,
     session_id: &str,
     runtime: &TmuxRuntime,
@@ -2049,7 +2068,7 @@ fn drain_pending_runtime_messages_raw(
                 should_continue = false;
                 break;
             }
-            complete_runtime_message_delivery_raw(state, queue, &message)?;
+            complete_runtime_message_delivery_raw(store, state, runtime, queue, &message)?;
             let delivered_target =
                 stop_after_message_id.is_some_and(|target_id| target_id == message.id);
             delivered_message_ids.push(message.id);
@@ -2070,7 +2089,9 @@ fn drain_pending_runtime_messages_raw(
 }
 
 fn complete_runtime_message_delivery_raw(
+    store: &SessionStore,
     state: &mut Value,
+    runtime: &TmuxRuntime,
     queue: &RetainedQueueStore,
     message: &PendingMessage,
 ) -> Result<()> {
@@ -2116,7 +2137,26 @@ fn complete_runtime_message_delivery_raw(
         }
     }
 
-    schedule_runtime_followup_notification(queue.clone(), message.clone());
+    if message.notify_on_delivery {
+        if let Some(sender_session_id) = message.sender_session_id.as_deref() {
+            drain_pending_runtime_messages_raw(
+                store,
+                state,
+                sender_session_id,
+                runtime,
+                queue,
+                Some("sequential"),
+                None,
+            )?;
+        }
+    }
+
+    schedule_runtime_followup_notification(
+        store.clone(),
+        runtime.clone(),
+        queue.clone(),
+        message.clone(),
+    );
     Ok(())
 }
 
@@ -2128,7 +2168,12 @@ fn runtime_delivery_notification_text(message: &PendingMessage) -> String {
     )
 }
 
-fn schedule_runtime_followup_notification(queue: RetainedQueueStore, message: PendingMessage) {
+fn schedule_runtime_followup_notification(
+    store: SessionStore,
+    runtime: TmuxRuntime,
+    queue: RetainedQueueStore,
+    message: PendingMessage,
+) {
     let Some(sender_session_id) = message.sender_session_id.clone() else {
         return;
     };
@@ -2144,12 +2189,19 @@ fn schedule_runtime_followup_notification(queue: RetainedQueueStore, message: Pe
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
-            let _ = queue.enqueue_message(&sender_session_id, &text, "sequential", None);
+            if queue
+                .enqueue_message(&sender_session_id, &text, "sequential", None)
+                .is_ok()
+            {
+                let _ =
+                    store.drain_runtime_pending_messages_for_session(&sender_session_id, &runtime);
+            }
         });
     }
 }
 
 fn deliver_urgent_runtime_message_raw(
+    store: &SessionStore,
     state: &mut Value,
     session_id: &str,
     runtime: &TmuxRuntime,
@@ -2160,7 +2212,7 @@ fn deliver_urgent_runtime_message_raw(
         deliver_urgent_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?;
     let mut delivered_message_ids = Vec::new();
     if delivered {
-        complete_runtime_message_delivery_raw(state, queue, message)?;
+        complete_runtime_message_delivery_raw(store, state, runtime, queue, message)?;
         delivered_message_ids.push(message.id.clone());
     }
     Ok(QueueDrainResult {

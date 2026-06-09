@@ -2705,6 +2705,12 @@ async fn runtime_core_materializes_send_delivery_side_effects() {
         "runtime:side effect delivery should be materialized",
     )
     .await;
+    wait_for_output_contains(
+        app.clone(),
+        "runtimeem",
+        "[sm] Message delivered to runtimechild",
+    )
+    .await;
 
     let queue_conn = Connection::open(&queue_db_path).unwrap();
     let original: (
@@ -2752,6 +2758,12 @@ async fn runtime_core_materializes_send_delivery_side_effects() {
     assert_eq!(delivery_notification_count, 1);
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
+    wait_for_output_contains(
+        app.clone(),
+        "runtimeem",
+        "[sm] Reminder: 1s since your message to runtimechild was delivered",
+    )
+    .await;
     let followup_count: i64 = queue_conn
         .query_row(
             "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimeem' AND text LIKE '[sm] Reminder: 1s since%'",
