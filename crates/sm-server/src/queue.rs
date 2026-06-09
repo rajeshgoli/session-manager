@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{
+    format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime,
+    PrimitiveDateTime,
+};
 
 #[derive(Debug, Clone)]
 pub struct RetainedQueueStore {
@@ -82,6 +85,7 @@ impl RetainedQueueStore {
         limit: usize,
     ) -> Result<Vec<PendingMessage>> {
         self.with_connection(|conn| {
+            expire_pending_messages_for_target(conn, target_session_id)?;
             let mut statement = conn.prepare(
                 r#"
                 SELECT id, target_session_id, text, delivery_mode
@@ -112,6 +116,7 @@ impl RetainedQueueStore {
         limit: usize,
     ) -> Result<Vec<PendingMessage>> {
         self.with_connection(|conn| {
+            expire_pending_messages_for_target(conn, target_session_id)?;
             let mut statement = conn.prepare(
                 r#"
                 SELECT id, target_session_id, text, delivery_mode
@@ -385,6 +390,71 @@ fn init_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn expire_pending_messages_for_target(conn: &Connection, target_session_id: &str) -> Result<()> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT id, timeout_at
+        FROM message_queue
+        WHERE target_session_id = ?1
+            AND delivered_at IS NULL
+            AND timeout_at IS NOT NULL
+        "#,
+    )?;
+    let rows = statement
+        .query_map(params![target_session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let now_utc = OffsetDateTime::now_utc();
+    let now_local = local_now_naive(now_utc);
+    for (id, timeout_at) in rows {
+        if timeout_is_expired(&timeout_at, now_utc, now_local) {
+            conn.execute(
+                "DELETE FROM message_queue WHERE id = ?1 AND delivered_at IS NULL",
+                params![id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn timeout_is_expired(
+    timeout_at: &str,
+    now_utc: OffsetDateTime,
+    now_local: PrimitiveDateTime,
+) -> bool {
+    let timeout_at = timeout_at.trim();
+    if timeout_at.is_empty() {
+        return false;
+    }
+    if let Ok(parsed) = OffsetDateTime::parse(timeout_at, &Rfc3339) {
+        return parsed <= now_utc;
+    }
+    if let Some(parsed) = parse_python_naive_datetime(timeout_at) {
+        return parsed <= now_local;
+    }
+    false
+}
+
+fn parse_python_naive_datetime(value: &str) -> Option<PrimitiveDateTime> {
+    PrimitiveDateTime::parse(
+        value,
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]"),
+    )
+    .or_else(|_| {
+        PrimitiveDateTime::parse(
+            value,
+            format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"),
+        )
+    })
+    .ok()
+}
+
+fn local_now_naive(now_utc: OffsetDateTime) -> PrimitiveDateTime {
+    let local = OffsetDateTime::now_local().unwrap_or(now_utc);
+    PrimitiveDateTime::new(local.date(), local.time())
+}
+
 fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement
@@ -418,6 +488,7 @@ mod tests {
         env,
         sync::atomic::{AtomicU64, Ordering},
     };
+    use time::Duration;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -499,6 +570,60 @@ mod tests {
         assert_eq!(stop_notify, ("em002".to_owned(), "other-em".to_owned(), 0));
     }
 
+    #[test]
+    fn pending_messages_skip_and_delete_expired_timeouts() {
+        let db_path = unique_temp_path("queue-expiry");
+        let store = RetainedQueueStore::new(db_path.clone());
+        store.ensure_schema().unwrap();
+        let now_utc = OffsetDateTime::now_utc();
+        let now_local = local_now_naive(now_utc);
+        let expired_naive = python_naive_timestamp(now_local - Duration::seconds(5));
+        let future_naive = python_naive_timestamp(now_local + Duration::minutes(5));
+        let expired_rfc3339 = (now_utc - Duration::seconds(5)).format(&Rfc3339).unwrap();
+        let queued_at = now_rfc3339();
+        let conn = Connection::open(&db_path).unwrap();
+        for (id, text, timeout_at) in [
+            (
+                "expired-naive",
+                "expired naive",
+                Some(expired_naive.as_str()),
+            ),
+            (
+                "expired-rfc3339",
+                "expired rfc3339",
+                Some(expired_rfc3339.as_str()),
+            ),
+            ("future-naive", "future naive", Some(future_naive.as_str())),
+            ("no-timeout", "no timeout", None),
+        ] {
+            conn.execute(
+                r#"
+                INSERT INTO message_queue
+                    (id, target_session_id, text, delivery_mode, from_sm_send, queued_at, timeout_at)
+                VALUES
+                    (?1, 'child001', ?2, 'sequential', 1, ?3, ?4)
+                "#,
+                params![id, text, queued_at, timeout_at],
+            )
+            .unwrap();
+        }
+
+        let pending = store.pending_messages_for_target("child001", 10).unwrap();
+        let pending_texts = pending
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(pending_texts, vec!["future naive", "no timeout"]);
+        let expired_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_queue WHERE id IN ('expired-naive', 'expired-rfc3339')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired_count, 0);
+    }
+
     fn unique_temp_path(label: &str) -> PathBuf {
         let mut path = env::temp_dir();
         path.push(format!(
@@ -507,5 +632,13 @@ mod tests {
             TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         path
+    }
+
+    fn python_naive_timestamp(value: PrimitiveDateTime) -> String {
+        value
+            .format(format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
+            ))
+            .unwrap()
     }
 }
