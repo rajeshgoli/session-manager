@@ -792,6 +792,7 @@ impl SessionStore {
         }
 
         remove_raw_registration(&mut state, &normalized_role)?;
+        forget_role_last_session_raw(&mut state, &normalized_role)?;
         sync_maintainer_alias_raw(&mut state)?;
         self.write_raw_json_value(&state)?;
         Ok(RegistryMutationOutcome::Registered(response))
@@ -1429,6 +1430,20 @@ fn remember_role_last_session_raw(state: &mut Value, role: &str, session_id: &st
     last.as_object_mut()
         .expect("object value set above")
         .insert(role.to_owned(), Value::String(session_id.to_owned()));
+    Ok(())
+}
+
+fn forget_role_last_session_raw(state: &mut Value, role: &str) -> Result<()> {
+    let normalized_role = normalize_role(role);
+    if normalized_role.is_empty() {
+        return Ok(());
+    }
+    if let Some(last) = ensure_object_mut(state)?
+        .get_mut("agent_role_last_session_ids")
+        .and_then(Value::as_object_mut)
+    {
+        last.remove(&normalized_role);
+    }
     Ok(())
 }
 

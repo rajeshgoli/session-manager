@@ -1702,6 +1702,75 @@ async fn fixture_registry_clears_stale_legacy_maintainer_without_registration() 
 }
 
 #[tokio::test]
+async fn fixture_registry_clear_removes_recovered_maintainer_history() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "maintainer1",
+                    "name": "claude-maintainer1",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-maintainer1",
+                    "log_file": "/tmp/maintainer1.log",
+                    "status": "running",
+                    "provider": "claude",
+                    "friendly_name": "maintainer",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ],
+            "maintainer_session_id": null,
+            "agent_role_last_session_ids": {
+                "maintainer": "maintainer1"
+            },
+            "agent_registrations": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/registry").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["registrations"][0]["role"], "maintainer");
+    assert_eq!(payload["registrations"][0]["session_id"], "maintainer1");
+
+    let (status, payload) = delete_json(
+        app.clone(),
+        "/sessions/maintainer1/maintainer",
+        json!({ "requester_session_id": "maintainer1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["aliases"], json!([]));
+    assert_eq!(payload["is_maintainer"], false);
+
+    let (status, payload) = get_json(app.clone(), "/registry").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "registrations": [] }));
+    let (status, payload) = get_json(app, "/registry/maintainer").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Role not registered" }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(raw_state["maintainer_session_id"], Value::Null);
+    assert!(raw_state["agent_role_last_session_ids"]
+        .as_object()
+        .is_some_and(|last| !last.contains_key("maintainer")));
+}
+
+#[tokio::test]
 async fn shadow_attach_descriptor_reuses_real_attach_support_rules() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
