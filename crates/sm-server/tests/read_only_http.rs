@@ -1642,6 +1642,71 @@ async fn fixture_notify_on_stop_preserves_authorization_and_state_contract() {
 }
 
 #[tokio::test]
+async fn fixture_retire_honors_delayed_stop_notify_without_runtime() {
+    let state_file = write_completion_fixture();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/notify-on-stop",
+        json!({
+            "sender_session_id": "em001",
+            "requester_session_id": "em001",
+            "delay_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+
+    let (status, payload) = post_json(app.clone(), "/sessions/child001/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let immediate_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'em001' AND message_category = 'stop_notify'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(immediate_count, 0);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let delayed: (String, String, Option<String>) = queue_conn
+        .query_row(
+            r#"
+            SELECT text, delivery_mode, message_category
+            FROM message_queue
+            WHERE target_session_id = 'em001' AND message_category = 'stop_notify'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        delayed,
+        (
+            "[sm] worker-1 (child001) completed (Stop hook fired)".to_owned(),
+            "important".to_owned(),
+            Some("stop_notify".to_owned())
+        )
+    );
+    let remaining_stop_notify_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM rust_stop_notify_states WHERE session_id = 'child001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_stop_notify_count, 0);
+}
+
+#[tokio::test]
 async fn fixture_registry_and_maintainer_endpoints_round_trip_state() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();
@@ -2858,6 +2923,218 @@ async fn runtime_core_materializes_send_delivery_side_effects() {
         raw_state["retained_parent_wake_registrations"][0]["parent_session_id"],
         "runtimeem"
     );
+}
+
+#[tokio::test]
+async fn runtime_core_retire_delivers_stop_notify_side_effects() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-stop-notify-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimestopem",
+            "name": "runtime-stop-em",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "stop em initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimestopchild",
+            "name": "runtime-stop-child",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "parent_session_id": "runtimestopem",
+            "initial_message": "stop child initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let em = raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "runtimestopem")
+        .unwrap();
+    em["is_em"] = Value::Bool(true);
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&raw_state).unwrap(),
+    )
+    .unwrap();
+    wait_for_output_contains(
+        app.clone(),
+        "runtimestopchild",
+        "runtime:stop child initial",
+    )
+    .await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimestopchild/notify-on-stop",
+        json!({
+            "sender_session_id": "runtimestopem",
+            "requester_session_id": "runtimestopem",
+            "delay_seconds": 0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimestopchild/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    wait_for_output_contains(
+        app.clone(),
+        "runtimestopem",
+        "[sm] runtime-stop-child (runtimes) completed (Stop hook fired)",
+    )
+    .await;
+
+    let queue_conn = Connection::open(&queue_db_path).unwrap();
+    let notification: (i64, String, String) = queue_conn
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, delivery_mode, COALESCE(message_category, '')
+            FROM message_queue
+            WHERE target_session_id = 'runtimestopem'
+              AND text LIKE '[sm] runtime-stop-child%'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        notification,
+        (1, "important".to_owned(), "stop_notify".to_owned())
+    );
+    let remaining_stop_notify_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM rust_stop_notify_states WHERE session_id = 'runtimestopchild'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_stop_notify_count, 0);
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert!(raw_state["retained_stop_notify_states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["session_id"] != "runtimestopchild"));
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimegoneem",
+            "name": "runtime-gone-em",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "gone em initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimeghostchild",
+            "name": "runtime-ghost-child",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "parent_session_id": "runtimegoneem",
+            "initial_message": "ghost child initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let sessions = raw_state["sessions"].as_array_mut().unwrap();
+    let gone_em = sessions
+        .iter_mut()
+        .find(|session| session["id"] == "runtimegoneem")
+        .unwrap();
+    gone_em["is_em"] = Value::Bool(true);
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&raw_state).unwrap(),
+    )
+    .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimeghostchild/notify-on-stop",
+        json!({
+            "sender_session_id": "runtimegoneem",
+            "requester_session_id": "runtimegoneem",
+            "delay_seconds": 0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|session| session["id"] != "runtimegoneem");
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&raw_state).unwrap(),
+    )
+    .unwrap();
+
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimeghostchild/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    let stale_sender_notification_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimegoneem'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_sender_notification_count, 0);
+    let remaining_ghost_stop_notify_count: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM rust_stop_notify_states WHERE session_id = 'runtimeghostchild'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_ghost_stop_notify_count, 0);
 }
 
 #[tokio::test]
