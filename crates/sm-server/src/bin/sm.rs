@@ -446,16 +446,10 @@ fn run() -> Result<()> {
             }
             let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
             let targets = split_send_targets(&args.session_id);
+            let mut payload = send_input_payload(text, delivery_mode, args.wait);
             if targets.len() > 1 {
-                let payload = client.post_json(
-                    "/sessions/input-batch",
-                    json!({
-                        "recipients": targets,
-                        "text": text,
-                        "delivery_mode": delivery_mode,
-                        "notify_after_seconds": args.wait
-                    }),
-                )?;
+                payload["recipients"] = json!(targets);
+                let payload = client.post_json("/sessions/input-batch", payload)?;
                 print_batch_send_result(&payload)?;
                 if payload["failure_count"].as_u64().unwrap_or(0) > 0 {
                     bail!("one or more sends failed");
@@ -465,14 +459,7 @@ fn run() -> Result<()> {
                     .first()
                     .map(String::as_str)
                     .unwrap_or(args.session_id.as_str());
-                let payload = client.post_json(
-                    &format!("/sessions/{target}/input"),
-                    json!({
-                        "text": text,
-                        "delivery_mode": delivery_mode,
-                        "notify_after_seconds": args.wait
-                    }),
-                )?;
+                let payload = client.post_json(&format!("/sessions/{target}/input"), payload)?;
                 println!(
                     "{}",
                     if payload["delivered"].as_bool().unwrap_or(false) {
@@ -720,6 +707,19 @@ fn split_send_targets(raw_value: &str) -> Vec<String> {
         identifiers.push(identifier.to_owned());
     }
     identifiers
+}
+
+fn send_input_payload(text: String, delivery_mode: &str, wait: Option<u64>) -> Value {
+    let mut payload = json!({
+        "text": text,
+        "delivery_mode": delivery_mode,
+        "notify_after_seconds": wait,
+        "from_sm_send": true
+    });
+    if let Some(sender_session_id) = optional_current_session_id() {
+        payload["sender_session_id"] = json!(sender_session_id);
+    }
+    payload
 }
 
 fn wait_for_session(client: &ApiClient, session_id: &str, seconds: u64) -> Result<()> {
@@ -1486,6 +1486,21 @@ mod tests {
         assert_eq!(https.host, "sm.example.test");
         assert_eq!(https.port, 443);
         assert_eq!(https.path_prefix, "/client");
+    }
+
+    #[test]
+    fn send_input_payload_includes_sm_send_sender_metadata() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "sender001");
+
+        let payload = send_input_payload("hello".to_owned(), "sequential", Some(7));
+
+        assert_eq!(payload["text"], "hello");
+        assert_eq!(payload["delivery_mode"], "sequential");
+        assert_eq!(payload["notify_after_seconds"], 7);
+        assert_eq!(payload["from_sm_send"], true);
+        assert_eq!(payload["sender_session_id"], "sender001");
     }
 
     fn write_temp_config(content: &str) -> PathBuf {
