@@ -2522,6 +2522,35 @@ async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
         app.clone(),
         "/sessions/runtimepriority/input",
         json!({
+            "text": "sequential after large backlog",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimepriority",
+        "runtime:sequential after large backlog",
+    )
+    .await;
+
+    for index in 0..12 {
+        queue
+            .enqueue_message(
+                "runtimepriority",
+                &format!("second stale sequential backlog {index}"),
+                "sequential",
+                None,
+            )
+            .unwrap();
+    }
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimepriority/input",
+        json!({
             "text": "important priority message",
             "delivery_mode": "important"
         }),
@@ -2561,21 +2590,25 @@ async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
             SELECT COUNT(*)
             FROM message_queue
             WHERE target_session_id = 'runtimepriority'
-                AND text IN ('important priority message', 'urgent priority message')
+                AND text IN (
+                    'sequential after large backlog',
+                    'important priority message',
+                    'urgent priority message'
+                )
                 AND delivered_at IS NOT NULL
             "#,
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(delivered_priority_count, 2);
+    assert_eq!(delivered_priority_count, 3);
     let delivered_backlog_count: i64 = queue_conn
         .query_row(
             r#"
             SELECT COUNT(*)
             FROM message_queue
             WHERE target_session_id = 'runtimepriority'
-                AND text LIKE 'stale sequential backlog%'
+                AND text LIKE 'second stale sequential backlog%'
                 AND delivered_at IS NOT NULL
             "#,
             [],

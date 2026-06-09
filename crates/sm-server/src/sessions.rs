@@ -317,6 +317,7 @@ impl SessionStore {
                         } else {
                             None
                         },
+                        Some(&message_id),
                     )?
                 };
                 self.write_raw_json_value(&state)?;
@@ -1749,25 +1750,44 @@ fn drain_pending_runtime_messages_raw(
     runtime: &TmuxRuntime,
     queue: &RetainedQueueStore,
     delivery_mode_filter: Option<&str>,
+    stop_after_message_id: Option<&str>,
 ) -> Result<QueueDrainResult> {
     let mut status =
         runtime_session_status_raw(state, session_id)?.unwrap_or_else(|| "stopped".to_owned());
     let mut delivered_message_ids = Vec::new();
-    let messages = match delivery_mode_filter {
-        Some(delivery_mode) => {
-            queue.pending_messages_for_target_by_mode(session_id, delivery_mode, 10)?
-        }
-        None => queue.pending_messages_for_target(session_id, 10)?,
-    };
-    for message in messages {
-        let (next_status, delivered) =
-            deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?;
-        status = next_status;
-        if !delivered {
+    loop {
+        let messages = match delivery_mode_filter {
+            Some(delivery_mode) => {
+                queue.pending_messages_for_target_by_mode(session_id, delivery_mode, 10)?
+            }
+            None => queue.pending_messages_for_target(session_id, 10)?,
+        };
+        if messages.is_empty() {
             break;
         }
-        queue.mark_delivered(&message.id)?;
-        delivered_message_ids.push(message.id);
+
+        let mut should_continue = true;
+        for message in messages {
+            let (next_status, delivered) =
+                deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?;
+            status = next_status;
+            if !delivered {
+                should_continue = false;
+                break;
+            }
+            queue.mark_delivered(&message.id)?;
+            let delivered_target =
+                stop_after_message_id.is_some_and(|target_id| target_id == message.id);
+            delivered_message_ids.push(message.id);
+            if delivered_target {
+                should_continue = false;
+                break;
+            }
+        }
+
+        if !should_continue {
+            break;
+        }
     }
     Ok(QueueDrainResult {
         status,
