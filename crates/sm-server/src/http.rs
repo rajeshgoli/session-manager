@@ -58,26 +58,13 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let state_file = expand_home(&config.paths.state_file);
-        let queue_db_path = queue_db_path_for_config(&config, &state_file);
+        let queue_db_path = expand_home(&config.sm_send.db_path);
         let session_store = SessionStore::new_with_queue(state_file, queue_db_path);
         Self {
             config,
             session_store,
         }
     }
-}
-
-fn queue_db_path_for_config(
-    config: &AppConfig,
-    state_file: &std::path::Path,
-) -> std::path::PathBuf {
-    let configured = expand_home(&config.sm_send.db_path);
-    let default_queue = expand_home("~/.local/share/claude-sessions/message_queue.db");
-    let default_state = expand_home("~/.local/share/claude-sessions/sessions.json");
-    if configured == default_queue && state_file != default_state {
-        return state_file.with_extension("message_queue.db");
-    }
-    configured
 }
 
 pub fn router(state: AppState) -> Router {
