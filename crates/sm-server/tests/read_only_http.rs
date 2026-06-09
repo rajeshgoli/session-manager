@@ -1125,6 +1125,7 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
     for (id, name) in [
         ("batchfixturea", "batch-fixture-a"),
         ("batchfixtureb", "batch-fixture-b"),
+        ("batchstopped", "batch-stopped"),
     ] {
         let (status, payload) = post_json(
             app.clone(),
@@ -1140,12 +1141,15 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["id"], id);
     }
+    let (status, payload) = post_json(app.clone(), "/sessions/batchstopped/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
 
     let (status, payload) = post_json(
         app.clone(),
         "/sessions/input-batch",
         json!({
-            "recipients": ["batchfixturea, batchfixtureb", "missingbatch", "batchfixturea"],
+            "recipients": ["batchfixturea, batchfixtureb", "batchstopped", "missingbatch", "batchfixturea"],
             "text": "fixture batch payload",
             "delivery_mode": "sequential"
         }),
@@ -1153,9 +1157,9 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["ok"], false);
-    assert_eq!(payload["requested_count"], 3);
+    assert_eq!(payload["requested_count"], 4);
     assert_eq!(payload["success_count"], 2);
-    assert_eq!(payload["failure_count"], 1);
+    assert_eq!(payload["failure_count"], 2);
     assert_eq!(payload["delivery_mode"], "sequential");
     let results = payload["results"].as_array().unwrap();
     assert_eq!(results[0]["identifier"], "batchfixturea");
@@ -1165,10 +1169,14 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
     assert_eq!(results[0]["target_name"], "batch-fixture-a");
     assert_eq!(results[1]["identifier"], "batchfixtureb");
     assert_eq!(results[1]["status"], "delivered");
-    assert_eq!(results[2]["identifier"], "missingbatch");
+    assert_eq!(results[2]["identifier"], "batchstopped");
     assert_eq!(results[2]["status"], "failed");
     assert_eq!(results[2]["delivery_kind"], "none");
-    assert_eq!(results[2]["detail"], "Session 'missingbatch' not found");
+    assert_eq!(results[2]["detail"], "Session batchstopped is stopped");
+    assert_eq!(results[3]["identifier"], "missingbatch");
+    assert_eq!(results[3]["status"], "failed");
+    assert_eq!(results[3]["delivery_kind"], "none");
+    assert_eq!(results[3]["detail"], "Session 'missingbatch' not found");
 
     let (status, payload) = get_json(app.clone(), "/sessions/batchfixturea/output?lines=5").await;
     assert_eq!(status, StatusCode::OK);

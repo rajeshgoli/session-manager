@@ -727,6 +727,15 @@ fn send_session_input_batch_one(
             "Session not found".to_owned(),
         ));
     };
+    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "killed") {
+        return Ok(failed_batch_result(
+            identifier,
+            Some(outcome.session_id),
+            session_target_name(&session),
+            Some(session.provider),
+            format!("Session {identifier} is stopped"),
+        ));
+    }
     let status = if outcome.delivered {
         "delivered".to_owned()
     } else {
