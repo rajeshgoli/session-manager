@@ -995,6 +995,32 @@
       "source": "https://github.com/rajeshgoli/session-manager/issues/797"
     },
     {
+      "id": "cli.rust_core_task_complete_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "task-complete"],
+      "env": {"SESSION_MANAGER_ID": "{child_session_id}"},
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Task complete", "Remind cancelled"],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:child_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/803"
+    },
+    {
+      "id": "cli.rust_core_turn_complete_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "turn-complete"],
+      "env": {"SESSION_MANAGER_ID": "{child_session_id}"},
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Turn complete", "Remind cancelled"],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:child_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/803"
+    },
+    {
       "id": "cli.rust_core_status_fixture",
       "surface": "cli",
       "classification": "retained",
@@ -1174,6 +1200,59 @@
       ],
       "preconditions": ["live_server", "session_id"],
       "source": "specs/762_stage2_artifacts/route_manifest.md:GET /sessions/{session_id}/attach-descriptor"
+    },
+    {
+      "id": "http.rust_core_task_complete_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/sessions/{child_session_id}/task-complete",
+      "body": {"requester_session_id": "{child_session_id}"},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/status", "equals": "completed"},
+        {"path": "/session_id", "equals": "{child_session_id}"},
+        {"path": "/agent_task_completed_at", "type": "string"}
+      ],
+      "preconditions": ["live_server", "fixture:child_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/803"
+    },
+    {
+      "id": "http.rust_core_turn_complete_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/sessions/{child_session_id}/turn-complete",
+      "body": {"requester_session_id": "{child_session_id}"},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/status", "equals": "turn_completed"},
+        {"path": "/session_id", "equals": "{child_session_id}"}
+      ],
+      "preconditions": ["live_server", "fixture:child_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/803"
+    },
+    {
+      "id": "http.rust_core_notify_on_stop_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/sessions/{child_session_id}/notify-on-stop",
+      "body": {"sender_session_id": "{em_session_id}", "requester_session_id": "{em_session_id}", "delay_seconds": 0},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/status", "equals": "ok"},
+        {"path": "/session_id", "equals": "{child_session_id}"},
+        {"path": "/sender_session_id", "equals": "{em_session_id}"}
+      ],
+      "preconditions": ["live_server", "fixture:em_session_id", "fixture:child_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/803"
     },
     {
       "id": "cli.rust_core_restore_fixture",

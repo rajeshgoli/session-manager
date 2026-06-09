@@ -43,6 +43,10 @@ enum Command {
     Output(OutputArgs),
     Clear(ClearArgs),
     Handoff(HandoffArgs),
+    #[command(name = "task-complete")]
+    TaskComplete(EmptyArgs),
+    #[command(name = "turn-complete")]
+    TurnComplete(EmptyArgs),
     #[command(name = "context-monitor")]
     ContextMonitor(ContextMonitorArgs),
     Email(EmailArgs),
@@ -549,6 +553,44 @@ fn run() -> Result<()> {
                 Some("recorded") => println!("Handoff recorded"),
                 _ => println!("Handoff scheduled - will execute after current turn completes"),
             }
+        }
+        Command::TaskComplete(_) => {
+            let Some(session_id) = optional_current_session_id() else {
+                eprintln!(
+                    "Error: SESSION_MANAGER_ID not set. sm task-complete can only be called from within a session."
+                );
+                process::exit(2);
+            };
+            let payload = client.post_json(
+                &format!("/sessions/{session_id}/task-complete"),
+                json!({ "requester_session_id": session_id }),
+            )?;
+            if payload["error"].as_str().is_some() {
+                bail!("Failed to mark task complete");
+            }
+            if payload["em_notified"].as_bool().unwrap_or(false) {
+                println!("Task complete. Remind cancelled. EM notified.");
+            } else {
+                println!(
+                    "Task complete. Remind cancelled. (No EM registered - no notification sent.)"
+                );
+            }
+        }
+        Command::TurnComplete(_) => {
+            let Some(session_id) = optional_current_session_id() else {
+                eprintln!(
+                    "Error: SESSION_MANAGER_ID not set. sm turn-complete can only be called from within a session."
+                );
+                process::exit(2);
+            };
+            let payload = client.post_json(
+                &format!("/sessions/{session_id}/turn-complete"),
+                json!({ "requester_session_id": session_id }),
+            )?;
+            if payload["error"].as_str().is_some() {
+                bail!("Failed to mark turn complete");
+            }
+            println!("Turn complete. Remind cancelled until new work is assigned.");
         }
         Command::ContextMonitor(args) => {
             run_context_monitor(&client, args)?;

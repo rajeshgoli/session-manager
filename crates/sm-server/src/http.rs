@@ -35,17 +35,19 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::config::{trimmed, AppConfig};
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
-    expand_home, is_primary_node, AgentStatusRequest, ClearSessionRequest, ClientSessionResponse,
-    ContextMonitorOutcome, ContextMonitorRequest, CoreClearOutcome, CoreRestoreOutcome,
-    CoreRetireOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
-    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
-    SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest,
+    expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
+    ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
+    CoreClearOutcome, CoreRestoreOutcome, CoreRetireOutcome, CreateCoreSessionRequest,
+    HandoffOutcome, HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome,
+    RoleRegistrationRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
+    SessionsEnvelope, SetMaintainerRequest, TaskCompleteOutcome, TaskCompleteRequest,
+    TurnCompleteOutcome,
 };
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
+const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -87,6 +89,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/sessions/{session_id}/agent-status",
             post(set_agent_status),
+        )
+        .route("/sessions/{session_id}/task-complete", post(task_complete))
+        .route("/sessions/{session_id}/turn-complete", post(turn_complete))
+        .route(
+            "/sessions/{session_id}/notify-on-stop",
+            post(arm_stop_notify),
         )
         .route(
             "/sessions/{session_id}/context-monitor",
@@ -365,6 +373,16 @@ async fn spawn_session(
             .session_store
             .create_core_session(create_payload, log_dir)?
     };
+    if parent.is_em && child.provider != "codex-fork" {
+        let _ = state.session_store.arm_stop_notify(
+            &child.id,
+            ArmStopNotifyRequest {
+                sender_session_id: parent.id.clone(),
+                requester_session_id: parent.id.clone(),
+                delay_seconds: EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
+            },
+        )?;
+    }
     if let Some(wait_seconds) = wait_seconds {
         spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
     }
@@ -616,6 +634,76 @@ async fn set_agent_status(
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(serde_json::to_value(result)?))
+}
+
+async fn task_complete(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<TaskCompleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/task-complete"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state.session_store.task_complete(&session_id, payload)? {
+        TaskCompleteOutcome::Completed(result) => Ok(Json(serde_json::to_value(result)?)),
+        TaskCompleteOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
+    }
+}
+
+async fn turn_complete(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<TaskCompleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/turn-complete"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state.session_store.turn_complete(&session_id, payload)? {
+        TurnCompleteOutcome::Completed(result) => Ok(Json(serde_json::to_value(result)?)),
+        TurnCompleteOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
+    }
+}
+
+async fn arm_stop_notify(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<ArmStopNotifyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/notify-on-stop"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    match state.session_store.arm_stop_notify(&session_id, payload)? {
+        ArmStopNotifyOutcome::Armed(result) | ArmStopNotifyOutcome::Suppressed(result) => {
+            Ok(Json(serde_json::to_value(result)?))
+        }
+        ArmStopNotifyOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        ArmStopNotifyOutcome::Forbidden(detail) => Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail,
+        }),
+        ArmStopNotifyOutcome::UnknownSender(sender_session_id) => Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: format!("sender_session_id {sender_session_id:?} not found"),
+        }),
+    }
 }
 
 async fn retire_session(
