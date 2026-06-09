@@ -57,7 +57,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
-        let session_store = SessionStore::new(expand_home(&config.paths.state_file));
+        let state_file = expand_home(&config.paths.state_file);
+        let queue_db_path = expand_home(&config.sm_send.db_path);
+        let session_store = SessionStore::new_with_queue(state_file, queue_db_path);
         Self {
             config,
             session_store,

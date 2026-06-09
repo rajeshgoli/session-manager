@@ -13,6 +13,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use crate::queue::RetainedQueueStore;
 use crate::runtime::{TmuxRuntime, TmuxSessionSpec};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -27,6 +28,7 @@ pub struct SessionStore {
     state_file: PathBuf,
     legacy_state_file: Option<PathBuf>,
     write_lock: Arc<Mutex<()>>,
+    queue_store: Option<RetainedQueueStore>,
 }
 
 impl SessionStore {
@@ -40,7 +42,14 @@ impl SessionStore {
             state_file,
             legacy_state_file,
             write_lock: Arc::new(Mutex::new(())),
+            queue_store: None,
         }
+    }
+
+    pub fn new_with_queue(state_file: PathBuf, queue_db_path: PathBuf) -> Self {
+        let mut store = Self::new(state_file);
+        store.queue_store = Some(RetainedQueueStore::new(queue_db_path));
+        store
     }
 
     #[cfg(test)]
@@ -49,6 +58,7 @@ impl SessionStore {
             state_file,
             legacy_state_file: Some(legacy_state_file),
             write_lock: Arc::new(Mutex::new(())),
+            queue_store: None,
         }
     }
 
@@ -934,8 +944,17 @@ impl SessionStore {
             )));
         };
 
-        let em_session_id = active_parent_wake_parent_raw(&state, session_id)?
+        let queue_parent = match &self.queue_store {
+            Some(queue) => queue.active_parent_wake_parent(session_id)?,
+            None => None,
+        };
+        let em_session_id = queue_parent
+            .or(active_parent_wake_parent_raw(&state, session_id)?)
             .or_else(|| session.parent_session_id.clone());
+        if let Some(queue) = &self.queue_store {
+            queue.cancel_remind(session_id)?;
+            queue.cancel_parent_wake(session_id)?;
+        }
         deactivate_remind_raw(&mut state, session_id)?;
         deactivate_parent_wake_raw(&mut state, session_id)?;
 
@@ -953,10 +972,15 @@ impl SessionStore {
             let friendly = session
                 .cached_display_name()
                 .unwrap_or_else(|| non_empty_or(session.name.clone(), &session.id));
+            let text =
+                format!("[sm task-complete] agent {session_id}({friendly}) completed its task.");
+            if let Some(queue) = &self.queue_store {
+                queue.enqueue_message(&em_session_id, &text, "important", Some("task_complete"))?;
+            }
             push_retained_message_raw(
                 &mut state,
                 &em_session_id,
-                &format!("[sm task-complete] agent {session_id}({friendly}) completed its task."),
+                &text,
                 "important",
                 Some("task_complete"),
             )?;
@@ -993,6 +1017,9 @@ impl SessionStore {
             )));
         }
 
+        if let Some(queue) = &self.queue_store {
+            queue.cancel_remind(session_id)?;
+        }
         deactivate_remind_raw(&mut state, session_id)?;
         self.write_raw_json_value(&state)?;
         Ok(TurnCompleteOutcome::Completed(TurnCompleteResult {
@@ -1049,6 +1076,14 @@ impl SessionStore {
         let sender_name = sender
             .cached_display_name()
             .unwrap_or_else(|| non_empty_or(sender.name.clone(), &sender.id));
+        if let Some(queue) = &self.queue_store {
+            queue.upsert_stop_notify(
+                session_id,
+                &request.sender_session_id,
+                &sender_name,
+                request.delay_seconds.max(0),
+            )?;
+        }
         upsert_stop_notify_raw(
             &mut state,
             session_id,
