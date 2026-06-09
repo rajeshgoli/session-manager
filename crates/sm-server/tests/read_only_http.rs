@@ -2517,20 +2517,6 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let mut raw_state: Value =
-        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let sender = raw_state["sessions"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|session| session["id"] == "runtimesender")
-        .unwrap();
-    sender["is_em"] = Value::Bool(true);
-    fs::write(
-        &state_file,
-        serde_json::to_string_pretty(&raw_state).unwrap(),
-    )
-    .unwrap();
     wait_for_output_contains(app.clone(), "runtimesmsend", "runtime:sm send initial").await;
 
     let (status, payload) = post_json(
@@ -2541,7 +2527,8 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
             "sender_session_id": "runtimesender",
             "delivery_mode": "sequential",
             "from_sm_send": true,
-            "timeout_seconds": 60
+            "timeout_seconds": 60,
+            "notify_on_stop": true
         }),
     )
     .await;

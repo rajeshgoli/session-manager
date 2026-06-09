@@ -378,6 +378,19 @@ impl SessionStore {
         }))
     }
 
+    pub fn runtime_send_delivery_side_effects_requested(
+        &self,
+        session_id: &str,
+        request: &SendCoreInputRequest,
+    ) -> Result<Option<bool>> {
+        let state = self.load_raw_json_value()?;
+        if raw_session_object(&state, session_id).is_none() {
+            return Ok(None);
+        }
+        let metadata = queue_metadata_for_send_request(&state, session_id, request, None);
+        Ok(Some(metadata.has_delivery_side_effects()))
+    }
+
     pub fn clear_core_session(
         &self,
         session_id: &str,
