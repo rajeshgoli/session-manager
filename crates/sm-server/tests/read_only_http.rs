@@ -2614,6 +2614,81 @@ async fn runtime_core_priority_sends_bypass_sequential_queue_backlog() {
 }
 
 #[tokio::test]
+async fn runtime_core_replays_retained_urgent_rows_with_interrupt_semantics() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-retained-urgent-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimeurgentreplay",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "urgent replay initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimeurgentreplay",
+        "runtime:urgent replay initial",
+    )
+    .await;
+
+    let queue = RetainedQueueStore::new(queue_db_path.clone());
+    let urgent_id = queue
+        .enqueue_message(
+            "runtimeurgentreplay",
+            "retained urgent replay",
+            "urgent",
+            None,
+        )
+        .unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimeurgentreplay/input",
+        json!({
+            "text": "sequential trigger after retained urgent",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    let payload = wait_for_output_contains(
+        app.clone(),
+        "runtimeurgentreplay",
+        "sequential trigger after retained urgent",
+    )
+    .await;
+    let output = payload["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("runtime:\u{2}\u{1b}retained urgent replay"),
+        "retained urgent row was not replayed through the interrupt path: {output:?}",
+    );
+    assert!(queue.message_delivered(&urgent_id).unwrap());
+}
+
+#[tokio::test]
 async fn runtime_core_handoff_records_without_interrupting_active_turn() {
     if !tmux_available() {
         return;

@@ -1816,7 +1816,16 @@ fn drain_pending_runtime_messages_raw(
         let mut should_continue = true;
         for message in messages {
             let (next_status, delivered) =
-                deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?;
+                if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
+                    deliver_urgent_runtime_text_to_session_raw(
+                        state,
+                        session_id,
+                        &message.text,
+                        runtime,
+                    )?
+                } else {
+                    deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?
+                };
             status = next_status;
             if !delivered {
                 should_continue = false;
