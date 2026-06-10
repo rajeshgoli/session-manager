@@ -32,7 +32,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::config::{trimmed, AppConfig};
+use crate::config::{trimmed, AppConfig, PublicNodeConfig};
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
@@ -78,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
+        .route("/nodes", get(list_nodes))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
@@ -555,6 +556,14 @@ async fn list_client_sessions(
         .map(ClientSessionResponse::from)
         .collect::<Vec<_>>();
     Ok(Json(SessionsEnvelope::from(sessions)))
+}
+
+async fn list_nodes(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<NodesListResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    Ok(Json(nodes_list_response(&state.config)))
 }
 
 async fn get_session(
@@ -1505,6 +1514,7 @@ fn shadow_predict_read(
             &state.config,
         ))?),
         "/events/state" => Some(serde_json::to_vec(&event_state_payload())?),
+        "/nodes" => Some(serde_json::to_vec(&nodes_list_response(&state.config))?),
         "/sessions" => {
             let include_stopped = query_bool(query_string, "include_stopped");
             let sessions = state
@@ -1788,6 +1798,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
     }
     path == "/events"
         || path == "/events/state"
+        || path == "/nodes"
         || path == "/sessions"
         || path == "/client/sessions"
         || path.starts_with("/sessions/")
@@ -2349,6 +2360,19 @@ impl From<SessionRecord> for SpawnSessionResponse {
 struct SessionOutputResponse {
     session_id: String,
     output: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NodesListResponse {
+    default: String,
+    nodes: Vec<PublicNodeConfig>,
+}
+
+fn nodes_list_response(config: &AppConfig) -> NodesListResponse {
+    NodesListResponse {
+        default: config.nodes.default_node.clone(),
+        nodes: config.nodes.redacted_nodes(),
+    }
 }
 
 #[derive(Serialize)]

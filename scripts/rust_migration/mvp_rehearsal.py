@@ -38,6 +38,7 @@ CORE_READ_CHECK_IDS = (
     "http.events_sse_hello",
     "http.sessions",
     "http.client_sessions",
+    "http.nodes_list",
     "http.api_sessions_absent",
     "http.public_watch_operational_data_denied",
     "http.scheduler_remind_retired",
@@ -47,7 +48,6 @@ CORE_READ_CHECK_IDS = (
 
 MVP_GAP_PROBE_CHECK_IDS = (
     "http.client_analytics_summary",
-    "http.nodes_list",
     "http.queue_jobs_list",
     "http.codex_review_requests_list",
 )
@@ -70,6 +70,7 @@ SHADOW_COMPARE_PATHS = (
     "/client/bootstrap",
     "/sessions",
     "/client/sessions",
+    "/nodes",
     "/events/state",
 )
 
