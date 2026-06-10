@@ -310,7 +310,7 @@ async fn create_session(
     let session = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&payload)?;
         ensure_core_runtime_request_node_supported(&state, &payload)?;
-        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
             .create_core_session_with_runtime(payload, log_dir, &runtime)?
@@ -377,7 +377,7 @@ async fn spawn_session(
     let child = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&create_payload)?;
         ensure_core_runtime_request_node_supported(&state, &create_payload)?;
-        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
             .create_core_session_with_runtime(create_payload, log_dir, &runtime)?
@@ -469,7 +469,7 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
                 parent_session_id: None,
             };
             let _ = if state.config.rust_core.runtime_enabled {
-                let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+                let runtime = TmuxRuntime::from_app_config(&state.config);
                 state.session_store.send_core_input_with_runtime(
                     &parent_session_id,
                     request,
@@ -496,7 +496,7 @@ fn runtime_child_session_exited(state: &AppState, child: &SessionRecord) -> bool
     if !state.config.rust_core.runtime_enabled {
         return false;
     }
-    let runtime = TmuxRuntime::from_config(&state.config.rust_core)
+    let runtime = TmuxRuntime::from_app_config(&state.config)
         .for_socket_name(child.tmux_socket_name.as_deref());
     matches!(runtime.session_exists(&child.tmux_session), Ok(false))
 }
@@ -625,7 +625,7 @@ async fn send_session_input(
     }
     let result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
-        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
             .send_core_input_with_runtime(&session_id, payload, &runtime)?
@@ -669,7 +669,7 @@ async fn send_session_input_batch(
         .config
         .rust_core
         .runtime_enabled
-        .then(|| TmuxRuntime::from_config(&state.config.rust_core));
+        .then(|| TmuxRuntime::from_app_config(&state.config));
     let mut results = Vec::with_capacity(recipients.len());
     for identifier in recipients {
         results.push(send_session_input_batch_one(
@@ -852,7 +852,7 @@ async fn task_complete(
         .config
         .rust_core
         .runtime_enabled
-        .then(|| TmuxRuntime::from_config(&state.config.rust_core));
+        .then(|| TmuxRuntime::from_app_config(&state.config));
     match state
         .session_store
         .task_complete(&session_id, payload, runtime.as_ref())?
@@ -932,7 +932,7 @@ async fn retire_session(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let outcome = if state.config.rust_core.runtime_enabled {
-        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        let runtime = TmuxRuntime::from_app_config(&state.config);
         state.session_store.retire_core_session_with_runtime(
             &session_id,
             requester_session_id,
@@ -973,7 +973,7 @@ async fn restore_session(
     ensure_core_writes_enabled(&state)?;
     let outcome = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
-        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
             .restore_core_session_with_runtime(&session_id, &runtime)?
@@ -997,6 +997,10 @@ async fn restore_session(
             status: StatusCode::BAD_REQUEST,
             detail: format!("Rust runtime does not support provider {provider}"),
         }),
+        CoreRestoreOutcome::MissingProviderResumeId(provider) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!("Cannot restore {provider} session without provider_resume_id"),
+        }),
     }
 }
 
@@ -1016,7 +1020,7 @@ async fn clear_session(
     ensure_core_writes_enabled(&state)?;
     let result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
-        let runtime = TmuxRuntime::from_config(&state.config.rust_core);
+        let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
             .clear_core_session_with_runtime(&session_id, payload, &runtime)?
@@ -1937,7 +1941,7 @@ fn ensure_core_runtime_provider_supported(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("claude");
-    if provider == "claude" {
+    if matches!(provider, "claude" | "codex-fork") {
         return Ok(());
     }
     Err(ApiError::Status {

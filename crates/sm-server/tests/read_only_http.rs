@@ -17,11 +17,13 @@ use sm_server::config::RustShadowConfig;
 use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
-        AppConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig, RustCoreConfig,
-        SmSendConfig,
+        AppConfig, CodexForkLaunchConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig,
+        RustCoreConfig, SmSendConfig,
     },
     http::{router, AppState},
 };
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     net::SocketAddr,
@@ -4537,6 +4539,304 @@ async fn runtime_core_rejects_unsupported_provider() {
 }
 
 #[tokio::test]
+async fn runtime_core_lifecycle_uses_codex_fork_launch_config() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::create_dir_all(&working_dir).unwrap();
+    let codex_bin_dir = working_dir.join("codex fork bin");
+    fs::create_dir_all(&codex_bin_dir).unwrap();
+    let codex_binary = codex_bin_dir.join("fake-codex-fork");
+    fs::write(
+        &codex_binary,
+        r#"#!/bin/sh
+event_stream=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--event-stream" ]; then
+    event_stream="$arg"
+  fi
+  previous="$arg"
+done
+if [ -n "$event_stream" ]; then
+  printf '{"event_type":"thread/started","payload":{"thread":{"id":"provider-thread-123"}}}\n' >> "$event_stream"
+  printf '{"event_type":"turn_started","payload":{}}\n' >> "$event_stream"
+fi
+sleep 0.2
+printf 'argv:%s\n' "$*"
+printf 'ids:%s:%s:%s\n' "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH"
+if [ -n "$event_stream" ]; then
+  printf '{"event_type":"turn_complete","payload":{}}\n' >> "$event_stream"
+fi
+while true; do sleep 1; done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&codex_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&codex_binary, permissions).unwrap();
+    }
+    let (event_path, control_path) = codex_fork_artifact_paths(&log_dir, "runtimefork");
+    fs::write(&event_path, "stale event").unwrap();
+    fs::write(&control_path, "stale control").unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-fork-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path.display().to_string(),
+        },
+        codex_fork: CodexForkLaunchConfig {
+            command: codex_binary.display().to_string(),
+            args: vec![
+                "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                "-c".to_owned(),
+                "check_for_update_on_startup=false".to_owned(),
+            ],
+            default_model: Some("gpt-default".to_owned()),
+            event_schema_version: 7,
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket.clone()),
+            runtime_prompt_mode: Some("argv".to_owned()),
+            runtime_start_settle_ms: Some(100),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimefork",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex-fork",
+            "initial_message": "hello from codex fork"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["provider"], "codex-fork");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["tmux_socket_name"], tmux_socket);
+    assert_eq!(payload["provider_resume_id"], "provider-thread-123");
+    assert!(payload["tmux_session"]
+        .as_str()
+        .unwrap()
+        .contains("codex-fork"));
+    let event_text = fs::read_to_string(&event_path).unwrap();
+    assert!(!event_text.contains("stale event"));
+    assert!(event_text.contains("provider-thread-123"));
+    assert!(
+        !control_path.exists(),
+        "Rust runtime should remove stale codex-fork control sockets before launch"
+    );
+
+    let output = wait_for_output_contains(app.clone(), "runtimefork", "--event-stream").await;
+    let output_text = output["output"].as_str().unwrap();
+    assert!(output_text.contains("--dangerously-bypass-approvals-and-sandbox"));
+    assert!(output_text.contains("-c check_for_update_on_startup=false"));
+    assert!(output_text.contains(&event_path.display().to_string()));
+    assert!(output_text.contains("--event-schema-version 7"));
+    assert!(output_text.contains(&control_path.display().to_string()));
+    assert!(output_text.contains("--model gpt-default"));
+    assert!(output_text.contains("-- hello from codex fork"));
+    assert!(output_text.contains("ids:runtimefork:runtimefork:false"));
+    let mut lifecycle_status = String::new();
+    for _ in 0..30 {
+        let (_, session) = get_json(app.clone(), "/sessions/runtimefork").await;
+        lifecycle_status = session["status"].as_str().unwrap().to_owned();
+        if session["status"] == "idle" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(lifecycle_status, "idle");
+
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimefork/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+    fs::write(&event_path, "stale event after stop").unwrap();
+    fs::write(&control_path, "stale control after stop").unwrap();
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["sessions"][0]["provider_resume_id"] = Value::Null;
+    fs::write(&state_file, state.to_string()).unwrap();
+
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimefork/restore", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        payload,
+        json!({ "detail": "Cannot restore codex-fork session without provider_resume_id" })
+    );
+    assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["sessions"][0]["provider_resume_id"] = json!("provider-thread-123");
+    fs::write(&state_file, state.to_string()).unwrap();
+
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimefork/restore", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["provider"], "codex-fork");
+    assert_eq!(payload["status"], "running");
+    assert!(tmux_session_exists(&tmux_socket, &tmux_session));
+    let restore_event_text = wait_for_file_contains(&event_path, "provider-thread-123").await;
+    assert!(!restore_event_text.contains("stale event after stop"));
+    assert!(
+        !control_path.exists(),
+        "Rust runtime should remove stale codex-fork control sockets before restore"
+    );
+    let mut restored_text = String::new();
+    for _ in 0..30 {
+        let output = wait_for_output_contains(app.clone(), "runtimefork", "--event-stream").await;
+        restored_text = output["output"].as_str().unwrap().to_owned();
+        if restored_text
+            .matches("ids:runtimefork:runtimefork:false")
+            .count()
+            >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        restored_text
+            .matches("ids:runtimefork:runtimefork:false")
+            .count()
+            >= 2,
+        "restore should launch a second codex-fork process; output={restored_text:?}"
+    );
+    assert!(restored_text.contains("--dangerously-bypass-approvals-and-sandbox"));
+    assert!(restored_text.contains("resume provider-thread-123"));
+    assert!(restored_text.contains("--event-schema-version 7"));
+    assert!(restored_text.contains("--model gpt-default"));
+}
+
+#[tokio::test]
+async fn runtime_core_codex_fork_sanitizes_artifact_paths() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::create_dir_all(&working_dir).unwrap();
+    let codex_binary = working_dir.join("fake-codex-fork");
+    fs::write(
+        &codex_binary,
+        r#"#!/bin/sh
+event_stream=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--event-stream" ]; then
+    event_stream="$arg"
+  fi
+  previous="$arg"
+done
+if [ -n "$event_stream" ]; then
+  printf '{"event_type":"thread/started","payload":{"thread_id":"safe-provider-thread"}}\n' >> "$event_stream"
+fi
+sleep 0.2
+printf 'argv:%s\n' "$*"
+while true; do sleep 1; done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&codex_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&codex_binary, permissions).unwrap();
+    }
+    let raw_session_id = "../runtimefork";
+    let (event_path, control_path) = codex_fork_artifact_paths(&log_dir, raw_session_id);
+    let unsafe_event_path = log_dir.join("../runtimefork.codex-fork.events.jsonl");
+    let tmux_socket = format!(
+        "sm-rust-test-codex-fork-safe-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_fork: CodexForkLaunchConfig {
+            command: codex_binary.display().to_string(),
+            args: vec![
+                "-c".to_owned(),
+                "check_for_update_on_startup=false".to_owned(),
+            ],
+            default_model: None,
+            event_schema_version: 2,
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket),
+            runtime_prompt_mode: Some("argv".to_owned()),
+            runtime_start_settle_ms: Some(100),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": raw_session_id,
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex-fork"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], raw_session_id);
+    let log_file = core_log_file_path(&log_dir, raw_session_id);
+    let output_text = wait_for_file_contains(&log_file, "--event-stream").await;
+    assert!(output_text.contains(&event_path.display().to_string()));
+    assert!(output_text.contains(&control_path.display().to_string()));
+    assert!(
+        !output_text.contains("../runtimefork.codex-fork.events.jsonl"),
+        "codex-fork artifact path must not include caller-controlled path separators"
+    );
+    assert!(
+        !unsafe_event_path.exists(),
+        "codex-fork launch must not create artifacts outside the configured log directory"
+    );
+}
+
+#[tokio::test]
 async fn runtime_core_rejects_remote_node_create_before_local_tmux_launch() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();
@@ -5283,6 +5583,60 @@ async fn wait_for_output_contains(app: axum::Router, session_id: &str, needle: &
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("timed out waiting for output containing {needle:?}");
+}
+
+async fn wait_for_file_contains(path: &PathBuf, needle: &str) -> String {
+    for _ in 0..30 {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "timed out waiting for {} to contain {needle:?}",
+        path.display()
+    );
+}
+
+fn core_log_file_path(log_dir: &PathBuf, session_id: &str) -> PathBuf {
+    log_dir.join(format!("{}.log", safe_session_basename(session_id)))
+}
+
+fn codex_fork_artifact_paths(log_dir: &PathBuf, session_id: &str) -> (PathBuf, PathBuf) {
+    let basename = safe_session_basename(session_id);
+    (
+        log_dir.join(format!("{basename}.codex-fork.events.jsonl")),
+        log_dir.join(format!("{basename}.codex-fork.control.sock")),
+    )
+}
+
+fn safe_session_basename(session_id: &str) -> String {
+    format!(
+        "{}-{}",
+        sanitize_path_component(session_id),
+        stable_session_id_hash(session_id)
+    )
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let mut safe = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect::<String>();
+    if safe.is_empty() {
+        safe = "session".to_owned();
+    }
+    safe
+}
+
+fn stable_session_id_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hash = String::with_capacity(12);
+    for byte in &digest[..6] {
+        hash.push_str(&format!("{byte:02x}"));
+    }
+    hash
 }
 
 fn tmux_available() -> bool {
