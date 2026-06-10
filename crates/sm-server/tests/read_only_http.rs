@@ -197,6 +197,132 @@ async fn detailed_health_has_required_top_level_fields() {
 }
 
 #[tokio::test]
+async fn nodes_list_defaults_to_implicit_primary_node() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = get_json(app, "/nodes").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["default"], "primary");
+    assert_eq!(
+        payload["nodes"],
+        json!([
+            {
+                "id": "primary",
+                "primary": true,
+                "ssh": null,
+                "api_url": null,
+                "hook_base_url": null,
+                "projects_root": null,
+                "log_dir": null
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn nodes_list_preserves_configured_metadata_and_redacts_secrets() {
+    let config_path = unique_temp_path();
+    let local_env_path = unique_temp_path();
+    fs::write(
+        &config_path,
+        r#"
+nodes:
+  default: macbook
+  restore_inventory_cache_seconds: 42
+  registry:
+    macbook:
+      ssh: macbook.local
+      ssh_proxy_command: "cloudflared access ssh --hostname macbook.example.com"
+      control_path: "~/Library/Caches/sm/macbook.sock"
+      api_url: "http://macbook.local:8420"
+      hook_base_url: "https://macbook.example.com/hooks"
+      hook_secret: "secret-hook-value"
+      node_token: "secret-node-token"
+      projects_root: "/Users/rajesh/projects"
+      log_dir: "/tmp/sm-node"
+    worker:
+      ssh: " worker.example.com "
+    empty-value: "not a mapping"
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&local_env_path)).unwrap();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = get_json(app, "/nodes").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["default"], "macbook");
+    let nodes = payload["nodes"].as_array().unwrap();
+    let ids = nodes
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["empty-value", "macbook", "primary", "worker"]);
+
+    let macbook = nodes.iter().find(|entry| entry["id"] == "macbook").unwrap();
+    assert_eq!(macbook["primary"], false);
+    assert_eq!(macbook["ssh"], "macbook.local");
+    assert_eq!(macbook["api_url"], "http://macbook.local:8420");
+    assert_eq!(
+        macbook["hook_base_url"],
+        "https://macbook.example.com/hooks"
+    );
+    assert_eq!(macbook["projects_root"], "/Users/rajesh/projects");
+    assert_eq!(macbook["log_dir"], "/tmp/sm-node");
+
+    let worker = nodes.iter().find(|entry| entry["id"] == "worker").unwrap();
+    assert_eq!(worker["ssh"], "worker.example.com");
+
+    let empty_value = nodes
+        .iter()
+        .find(|entry| entry["id"] == "empty-value")
+        .unwrap();
+    assert_eq!(empty_value["ssh"], Value::Null);
+    assert_eq!(empty_value["api_url"], Value::Null);
+
+    let serialized = payload.to_string();
+    assert!(!serialized.contains("secret-hook-value"));
+    assert!(!serialized.contains("secret-node-token"));
+    assert!(!serialized.contains("cloudflared access ssh"));
+    assert!(!serialized.contains("macbook.sock"));
+}
+
+#[tokio::test]
+async fn nodes_list_falls_back_to_primary_when_default_is_unknown() {
+    let config_path = unique_temp_path();
+    let local_env_path = unique_temp_path();
+    fs::write(
+        &config_path,
+        r#"
+nodes:
+  default: missing-node
+  registry:
+    remote:
+      ssh: remote.example.com
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&local_env_path)).unwrap();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = get_json(app, "/nodes").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["default"], "primary");
+    let ids = payload["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["primary", "remote"]);
+}
+
+#[tokio::test]
 async fn auth_session_reports_disabled_bypass_when_google_auth_not_requested() {
     let app = router(AppState::new(AppConfig::default()));
 
@@ -234,6 +360,38 @@ async fn shadow_http_reports_match_for_stable_read_only_route() {
             "python_response": {
                 "status": 200,
                 "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["body_sha256_match"], true);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_match_for_nodes_list() {
+    let app = router(AppState::new(AppConfig::default()));
+    let python_body = br#"{"default":"primary","nodes":[{"id":"primary","primary":true,"ssh":null,"api_url":null,"hook_base_url":null,"projects_root":null,"log_dir":null}]}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/nodes",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
             }
         }),
     )

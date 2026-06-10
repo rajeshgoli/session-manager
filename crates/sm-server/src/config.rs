@@ -1,7 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, env, fs, path::Path};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,7 @@ pub struct AppConfig {
     pub claude: ProviderLaunchConfig,
     pub codex: ProviderLaunchConfig,
     pub codex_fork: CodexForkLaunchConfig,
+    pub nodes: NodesConfig,
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
 }
@@ -35,6 +37,7 @@ impl Default for AppConfig {
             ),
             codex: ProviderLaunchConfig::new("codex".to_owned(), Vec::new(), None),
             codex_fork: CodexForkLaunchConfig::default(),
+            nodes: NodesConfig::default(),
             rust_shadow: RustShadowConfig::default(),
             rust_core: RustCoreConfig::default(),
         }
@@ -178,6 +181,81 @@ impl Default for SmSendConfig {
     }
 }
 
+const PRIMARY_NODE: &str = "primary";
+
+#[derive(Debug, Clone)]
+pub struct NodesConfig {
+    pub default_node: String,
+    pub registry: BTreeMap<String, NodeConfig>,
+    pub restore_inventory_cache_seconds: f64,
+}
+
+impl Default for NodesConfig {
+    fn default() -> Self {
+        let mut registry = BTreeMap::new();
+        registry.insert(
+            PRIMARY_NODE.to_owned(),
+            NodeConfig::new(PRIMARY_NODE.to_owned()),
+        );
+        Self {
+            default_node: PRIMARY_NODE.to_owned(),
+            registry,
+            restore_inventory_cache_seconds: 10.0,
+        }
+    }
+}
+
+impl NodesConfig {
+    pub fn redacted_nodes(&self) -> Vec<PublicNodeConfig> {
+        self.registry
+            .values()
+            .map(|node| PublicNodeConfig {
+                id: node.id.clone(),
+                primary: node.id == PRIMARY_NODE,
+                ssh: node.ssh.clone(),
+                api_url: node.api_url.clone(),
+                hook_base_url: node.hook_base_url.clone(),
+                projects_root: node.projects_root.clone(),
+                log_dir: node.log_dir.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NodeConfig {
+    pub id: String,
+    pub ssh: Option<String>,
+    pub ssh_proxy_command: Option<String>,
+    pub control_path: Option<String>,
+    pub api_url: Option<String>,
+    pub hook_base_url: Option<String>,
+    pub hook_secret: Option<String>,
+    pub node_token: Option<String>,
+    pub projects_root: Option<String>,
+    pub log_dir: Option<String>,
+}
+
+impl NodeConfig {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicNodeConfig {
+    pub id: String,
+    pub primary: bool,
+    pub ssh: Option<String>,
+    pub api_url: Option<String>,
+    pub hook_base_url: Option<String>,
+    pub projects_root: Option<String>,
+    pub log_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderLaunchConfig {
     pub command: String,
@@ -279,6 +357,8 @@ struct RawConfig {
     #[serde(default)]
     codex_fork: RawCodexForkLaunchConfig,
     #[serde(default)]
+    nodes: YamlValue,
+    #[serde(default)]
     timeouts: RawTimeoutsConfig,
     #[serde(default)]
     rust_shadow: RustShadowConfig,
@@ -325,6 +405,7 @@ impl From<RawConfig> for AppConfig {
             claude,
             codex,
             codex_fork,
+            nodes: nodes_config_from_yaml(raw.nodes),
             rust_shadow: raw.rust_shadow,
             rust_core,
         }
@@ -435,6 +516,95 @@ fn codex_fork_managed_args(args: Vec<String>) -> Vec<String> {
         ]);
     }
     managed_args
+}
+
+fn nodes_config_from_yaml(value: YamlValue) -> NodesConfig {
+    let mut config = NodesConfig::default();
+    let Some(root) = value.as_mapping() else {
+        return config;
+    };
+
+    if let Some(seconds) = yaml_mapping_get(root, "restore_inventory_cache_seconds")
+        .and_then(yaml_f64)
+        .filter(|value| value.is_finite())
+    {
+        config.restore_inventory_cache_seconds = seconds;
+    }
+
+    if let Some(registry) = yaml_mapping_get(root, "registry").and_then(YamlValue::as_mapping) {
+        for (raw_id, raw_value) in registry {
+            let Some(node_id) = yaml_clean_optional(raw_id) else {
+                continue;
+            };
+            let mut node = NodeConfig::new(node_id.clone());
+            if let Some(value) = raw_value.as_mapping() {
+                node.ssh = yaml_mapping_get(value, "ssh").and_then(yaml_clean_optional);
+                node.ssh_proxy_command =
+                    yaml_mapping_get(value, "ssh_proxy_command").and_then(yaml_clean_optional);
+                node.control_path = yaml_mapping_get(value, "control_path")
+                    .and_then(yaml_clean_optional)
+                    .map(expand_user_path);
+                node.api_url = yaml_mapping_get(value, "api_url").and_then(yaml_clean_optional);
+                node.hook_base_url =
+                    yaml_mapping_get(value, "hook_base_url").and_then(yaml_clean_optional);
+                node.hook_secret =
+                    yaml_mapping_get(value, "hook_secret").and_then(yaml_clean_optional);
+                node.node_token =
+                    yaml_mapping_get(value, "node_token").and_then(yaml_clean_optional);
+                node.projects_root =
+                    yaml_mapping_get(value, "projects_root").and_then(yaml_clean_optional);
+                node.log_dir = yaml_mapping_get(value, "log_dir").and_then(yaml_clean_optional);
+            }
+            config.registry.insert(node_id, node);
+        }
+    }
+
+    let requested_default = yaml_mapping_get(root, "default")
+        .and_then(yaml_clean_optional)
+        .unwrap_or_else(|| PRIMARY_NODE.to_owned());
+    config.default_node = if config.registry.contains_key(&requested_default) {
+        requested_default
+    } else {
+        PRIMARY_NODE.to_owned()
+    };
+
+    config
+}
+
+fn yaml_mapping_get<'a>(mapping: &'a YamlMapping, key: &str) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(key.to_owned()))
+}
+
+fn yaml_clean_optional(value: &YamlValue) -> Option<String> {
+    let text = match value {
+        YamlValue::Null => return None,
+        YamlValue::Bool(value) => value.to_string(),
+        YamlValue::Number(value) => value.to_string(),
+        YamlValue::String(value) => value.clone(),
+        _ => serde_yaml::to_string(value).ok()?,
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn yaml_f64(value: &YamlValue) -> Option<f64> {
+    match value {
+        YamlValue::Number(value) => value.as_f64(),
+        YamlValue::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn expand_user_path(value: String) -> String {
+    if value == "~" {
+        return env::var("HOME").unwrap_or(value);
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    value
 }
 
 pub fn trimmed(value: &Option<String>) -> Option<String> {
