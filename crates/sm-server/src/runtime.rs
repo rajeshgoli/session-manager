@@ -1,5 +1,7 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -7,8 +9,9 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 
-use crate::config::RustCoreConfig;
+use crate::config::{AppConfig, RustCoreConfig};
 
 const DEFAULT_SEND_KEYS_SETTLE_MS: f64 = 300.0;
 const DEFAULT_SEND_KEYS_SETTLE_MAX_MS: f64 = 900.0;
@@ -20,7 +23,12 @@ const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 4096;
 pub struct TmuxRuntime {
     socket_name: Option<String>,
     tmux_binary: String,
-    command: String,
+    claude_command: String,
+    claude_args: Vec<String>,
+    codex_fork_command: String,
+    codex_fork_args: Vec<String>,
+    codex_fork_default_model: Option<String>,
+    codex_fork_event_schema_version: u32,
     prompt_mode: String,
     start_settle_ms: u64,
     send_keys_settle_ms: f64,
@@ -36,8 +44,15 @@ pub struct TmuxSessionSpec {
     pub tmux_session: String,
     pub working_dir: String,
     pub log_file: PathBuf,
+    pub provider: String,
     pub initial_message: Option<String>,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexForkRuntimeArtifacts {
+    pub event_stream_path: PathBuf,
+    pub control_socket_path: PathBuf,
 }
 
 impl TmuxRuntime {
@@ -50,13 +65,21 @@ impl TmuxRuntime {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
             tmux_binary: "tmux".to_owned(),
-            command: config
+            claude_command: config
                 .runtime_command
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("claude")
                 .to_owned(),
+            claude_args: Vec::new(),
+            codex_fork_command: "codex".to_owned(),
+            codex_fork_args: vec![
+                "-c".to_owned(),
+                "check_for_update_on_startup=false".to_owned(),
+            ],
+            codex_fork_default_model: None,
+            codex_fork_event_schema_version: 2,
             prompt_mode: config
                 .runtime_prompt_mode
                 .as_deref()
@@ -88,6 +111,26 @@ impl TmuxRuntime {
         }
     }
 
+    pub fn from_app_config(config: &AppConfig) -> Self {
+        let mut runtime = Self::from_config(&config.rust_core);
+        if config
+            .rust_core
+            .runtime_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            runtime.claude_command = config.claude.command.clone();
+            runtime.claude_args = config.claude.args.clone();
+        }
+        runtime.codex_fork_command = config.codex_fork.command.clone();
+        runtime.codex_fork_args = config.codex_fork.args.clone();
+        runtime.codex_fork_default_model = config.codex_fork.default_model.clone();
+        runtime.codex_fork_event_schema_version = config.codex_fork.event_schema_version;
+        runtime
+    }
+
     pub fn socket_name(&self) -> Option<&str> {
         self.socket_name.as_deref()
     }
@@ -99,6 +142,20 @@ impl TmuxRuntime {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
         runtime
+    }
+
+    pub fn codex_fork_runtime_artifacts(
+        &self,
+        spec: &TmuxSessionSpec,
+    ) -> Result<Option<CodexForkRuntimeArtifacts>> {
+        if spec.provider != "codex-fork" {
+            return Ok(None);
+        }
+        let (event_stream_path, control_socket_path) = codex_fork_artifact_paths(spec)?;
+        Ok(Some(CodexForkRuntimeArtifacts {
+            event_stream_path,
+            control_socket_path,
+        }))
     }
 
     pub fn create_session(&self, spec: &TmuxSessionSpec) -> Result<()> {
@@ -123,25 +180,7 @@ impl TmuxRuntime {
             bail!("unsupported runtime prompt mode: {}", self.prompt_mode);
         }
 
-        let mut command = self.command.clone();
-        if let Some(model) = spec
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            command = format!("{command} --model {}", shell_quote(model));
-        }
-        if prompt_mode == "argv" {
-            if let Some(initial_message) = spec
-                .initial_message
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                command = format!("{command} -- {}", shell_quote(initial_message));
-            }
-        }
+        let mut command = self.launch_command(spec, &prompt_mode)?;
         command = managed_session_command(&command, &spec.session_id);
 
         self.run_tmux([
@@ -169,12 +208,26 @@ impl TmuxRuntime {
     ) -> Result<()> {
         let mut runtime = self.clone();
         if let Some(resume_id) = resume_id.map(str::trim).filter(|value| !value.is_empty()) {
-            runtime.command = match provider {
-                "claude" => format!("{} --resume {}", runtime.command, shell_quote(resume_id)),
-                "codex" | "codex-fork" => {
-                    format!("{} resume {}", runtime.command, shell_quote(resume_id))
+            match provider {
+                "claude" => {
+                    runtime.claude_command = format!(
+                        "{} --resume {}",
+                        runtime.claude_command,
+                        shell_quote(resume_id)
+                    );
                 }
-                _ => runtime.command,
+                "codex-fork" => {
+                    runtime.codex_fork_args =
+                        prepend_arg_pair("resume", resume_id, &runtime.codex_fork_args);
+                }
+                "codex" => {
+                    runtime.claude_command = format!(
+                        "{} resume {}",
+                        runtime.claude_command,
+                        shell_quote(resume_id)
+                    );
+                }
+                _ => {}
             };
         }
         let mut spec = spec.clone();
@@ -350,6 +403,58 @@ impl TmuxRuntime {
         command
     }
 
+    fn launch_command(&self, spec: &TmuxSessionSpec, prompt_mode: &str) -> Result<String> {
+        let mut parts = match spec.provider.as_str() {
+            "claude" => command_parts(&self.claude_command, &self.claude_args),
+            "codex-fork" => self.codex_fork_command_parts(spec)?,
+            provider => bail!("Rust runtime does not support provider {provider}"),
+        };
+        let model = spec
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                (spec.provider == "codex-fork")
+                    .then_some(self.codex_fork_default_model.as_deref())
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            });
+        if let Some(model) = model {
+            parts.push("--model".to_owned());
+            parts.push(shell_quote(model));
+        }
+        if prompt_mode == "argv" {
+            if let Some(initial_message) = spec
+                .initial_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                parts.push("--".to_owned());
+                parts.push(shell_quote(initial_message));
+            }
+        }
+        Ok(parts.join(" "))
+    }
+
+    fn codex_fork_command_parts(&self, spec: &TmuxSessionSpec) -> Result<Vec<String>> {
+        validate_launch_command(&self.codex_fork_command, Path::new(&spec.working_dir))?;
+        let (event_stream_path, control_socket_path) = codex_fork_artifact_paths(spec)?;
+        prepare_codex_fork_runtime_artifacts(&event_stream_path, &control_socket_path)?;
+        let mut parts = executable_command_parts(&self.codex_fork_command, &self.codex_fork_args);
+        parts.extend([
+            "--event-stream".to_owned(),
+            shell_quote_path(&event_stream_path),
+            "--event-schema-version".to_owned(),
+            shell_quote(&self.codex_fork_event_schema_version.to_string()),
+            "--control-socket".to_owned(),
+            shell_quote_path(&control_socket_path),
+        ]);
+        Ok(parts)
+    }
+
     fn attach_session_log(&self, spec: &TmuxSessionSpec, prompt_mode: &str) -> Result<()> {
         let pipe_command = format!("cat >> {}", shell_quote_path(&spec.log_file));
         self.run_tmux([
@@ -448,6 +553,159 @@ fn shell_quote(value: &str) -> String {
         return "''".to_owned();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn command_parts(command: &str, args: &[String]) -> Vec<String> {
+    let mut parts = vec![command.to_owned()];
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
+    parts
+}
+
+fn executable_command_parts(command: &str, args: &[String]) -> Vec<String> {
+    let mut parts = vec![shell_quote(command)];
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
+    parts
+}
+
+fn prepend_arg_pair(command: &str, value: &str, args: &[String]) -> Vec<String> {
+    let mut prefixed = vec![command.to_owned(), value.to_owned()];
+    prefixed.extend(args.iter().cloned());
+    prefixed
+}
+
+fn codex_fork_artifact_paths(spec: &TmuxSessionSpec) -> Result<(PathBuf, PathBuf)> {
+    let artifact_dir = spec
+        .log_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("runtime session missing log directory"))?;
+    let artifact_basename = safe_session_artifact_basename(&spec.session_id);
+    Ok((
+        artifact_dir.join(format!("{artifact_basename}.codex-fork.events.jsonl")),
+        artifact_dir.join(format!("{artifact_basename}.codex-fork.control.sock")),
+    ))
+}
+
+fn prepare_codex_fork_runtime_artifacts(event_path: &Path, control_path: &Path) -> Result<()> {
+    let parent = event_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("codex-fork event stream path missing parent"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create codex-fork artifact dir {}",
+            parent.display()
+        )
+    })?;
+    remove_file_if_exists(event_path)?;
+    remove_file_if_exists(control_path)?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn validate_launch_command(command: &str, working_dir: &Path) -> Result<()> {
+    let command = command.trim();
+    if command.is_empty() {
+        bail!("Launch command is empty");
+    }
+    if command.starts_with('~') || command.contains('/') {
+        let candidate = expand_launch_path(command, working_dir);
+        if !candidate.exists() {
+            bail!("Launch command does not exist: {}", candidate.display());
+        }
+        if !candidate.is_file() {
+            bail!("Launch command is not a file: {}", candidate.display());
+        }
+        if !is_executable_file(&candidate) {
+            bail!("Launch command is not executable: {}", candidate.display());
+        }
+        return Ok(());
+    }
+    if find_in_path(command).is_none() {
+        bail!("Launch command not found on PATH: {command}");
+    }
+    Ok(())
+}
+
+fn expand_launch_path(command: &str, working_dir: &Path) -> PathBuf {
+    let path = if command == "~" {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(command))
+    } else if let Some(rest) = command.strip_prefix("~/") {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(rest)
+    } else {
+        PathBuf::from(command)
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        working_dir.join(path)
+    }
+}
+
+fn find_in_path(command: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(command))
+        .find(|path| path.is_file() && is_executable_file(path))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn safe_session_artifact_basename(session_id: &str) -> String {
+    format!(
+        "{}-{}",
+        sanitize_path_component(session_id),
+        stable_session_id_hash(session_id)
+    )
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let mut safe = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect::<String>();
+    if safe.is_empty() {
+        safe = "session".to_owned();
+    }
+    safe
+}
+
+fn stable_session_id_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hash = String::with_capacity(12);
+    for byte in &digest[..6] {
+        hash.push(hex_char(byte >> 4));
+        hash.push(hex_char(byte & 0x0f));
+    }
+    hash
+}
+
+fn hex_char(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + (value - 10)),
+        _ => unreachable!("hex nibble out of range"),
+    }
 }
 
 fn managed_session_command(command: &str, session_id: &str) -> String {

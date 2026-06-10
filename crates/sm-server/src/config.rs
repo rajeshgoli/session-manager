@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub paths: PathsConfig,
     pub google_auth: GoogleAuthConfig,
@@ -12,8 +12,33 @@ pub struct AppConfig {
     pub mobile_terminal: MobileTerminalConfig,
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
+    pub claude: ProviderLaunchConfig,
+    pub codex: ProviderLaunchConfig,
+    pub codex_fork: CodexForkLaunchConfig,
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            paths: PathsConfig::default(),
+            google_auth: GoogleAuthConfig::default(),
+            external_access: ExternalAccessConfig::default(),
+            mobile_terminal: MobileTerminalConfig::default(),
+            tmux: TmuxConfig::default(),
+            sm_send: SmSendConfig::default(),
+            claude: ProviderLaunchConfig::new(
+                "claude".to_owned(),
+                Vec::new(),
+                Some("sonnet".to_owned()),
+            ),
+            codex: ProviderLaunchConfig::new("codex".to_owned(), Vec::new(), None),
+            codex_fork: CodexForkLaunchConfig::default(),
+            rust_shadow: RustShadowConfig::default(),
+            rust_core: RustCoreConfig::default(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -153,6 +178,48 @@ impl Default for SmSendConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderLaunchConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub default_model: Option<String>,
+}
+
+impl ProviderLaunchConfig {
+    fn new(command: String, args: Vec<String>, default_model: Option<String>) -> Self {
+        Self {
+            command,
+            args,
+            default_model,
+        }
+    }
+}
+
+impl Default for ProviderLaunchConfig {
+    fn default() -> Self {
+        Self::new("claude".to_owned(), Vec::new(), Some("sonnet".to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexForkLaunchConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub default_model: Option<String>,
+    pub event_schema_version: u32,
+}
+
+impl Default for CodexForkLaunchConfig {
+    fn default() -> Self {
+        Self {
+            command: "codex".to_owned(),
+            args: codex_fork_managed_args(Vec::new()),
+            default_model: None,
+            event_schema_version: 2,
+        }
+    }
+}
+
 fn default_message_queue_db_path() -> String {
     "~/.local/share/claude-sessions/message_queue.db".to_owned()
 }
@@ -206,6 +273,12 @@ struct RawConfig {
     #[serde(default)]
     sm_send: SmSendConfig,
     #[serde(default)]
+    claude: RawProviderLaunchConfig,
+    #[serde(default)]
+    codex: RawProviderLaunchConfig,
+    #[serde(default)]
+    codex_fork: RawCodexForkLaunchConfig,
+    #[serde(default)]
     timeouts: RawTimeoutsConfig,
     #[serde(default)]
     rust_shadow: RustShadowConfig,
@@ -216,6 +289,9 @@ struct RawConfig {
 impl From<RawConfig> for AppConfig {
     fn from(raw: RawConfig) -> Self {
         let mut rust_core = raw.rust_core;
+        let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new());
+        let codex = provider_launch_config(raw.codex, "codex", None, Vec::new());
+        let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
         if trimmed(&rust_core.tmux_socket_name).is_none() {
             rust_core.tmux_socket_name = trimmed(&raw.tmux.socket_name);
         }
@@ -246,6 +322,9 @@ impl From<RawConfig> for AppConfig {
             mobile_terminal: raw.mobile_terminal,
             tmux: raw.tmux,
             sm_send: raw.sm_send,
+            claude,
+            codex,
+            codex_fork,
             rust_shadow: raw.rust_shadow,
             rust_core,
         }
@@ -256,6 +335,24 @@ impl From<RawConfig> for AppConfig {
 struct RawAuthConfig {
     #[serde(default)]
     google: GoogleAuthConfig,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct RawProviderLaunchConfig {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    default_model: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct RawCodexForkLaunchConfig {
+    #[serde(flatten)]
+    provider: RawProviderLaunchConfig,
+    #[serde(default)]
+    event_schema_version: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -276,6 +373,68 @@ struct RawTmuxTimeoutsConfig {
     send_keys_settle_per_extra_line: Option<f64>,
     #[serde(default)]
     send_keys_max_chunk_chars: Option<usize>,
+}
+
+fn provider_launch_config(
+    raw: RawProviderLaunchConfig,
+    default_command: &str,
+    default_model: Option<&str>,
+    default_args: Vec<String>,
+) -> ProviderLaunchConfig {
+    ProviderLaunchConfig::new(
+        raw.command
+            .as_ref()
+            .and_then(|value| trimmed(&Some(value.clone())))
+            .unwrap_or_else(|| default_command.to_owned()),
+        raw.args
+            .unwrap_or(default_args)
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect(),
+        raw.default_model
+            .as_ref()
+            .and_then(|value| trimmed(&Some(value.clone())))
+            .or_else(|| default_model.map(ToOwned::to_owned)),
+    )
+}
+
+fn codex_fork_launch_config(
+    raw: RawCodexForkLaunchConfig,
+    codex: &ProviderLaunchConfig,
+) -> CodexForkLaunchConfig {
+    let command = raw
+        .provider
+        .command
+        .as_ref()
+        .and_then(|value| trimmed(&Some(value.clone())))
+        .unwrap_or_else(|| codex.command.clone());
+    let args = raw.provider.args.unwrap_or_else(|| codex.args.clone());
+    let default_model = raw
+        .provider
+        .default_model
+        .as_ref()
+        .and_then(|value| trimmed(&Some(value.clone())))
+        .or_else(|| codex.default_model.clone());
+    CodexForkLaunchConfig {
+        command,
+        args: codex_fork_managed_args(args),
+        default_model,
+        event_schema_version: raw.event_schema_version.unwrap_or(2),
+    }
+}
+
+fn codex_fork_managed_args(args: Vec<String>) -> Vec<String> {
+    let mut managed_args = args;
+    if !managed_args.iter().any(|arg| {
+        arg.replace(' ', "")
+            .contains("check_for_update_on_startup=false")
+    }) {
+        managed_args.extend([
+            "-c".to_owned(),
+            "check_for_update_on_startup=false".to_owned(),
+        ]);
+    }
+    managed_args
 }
 
 pub fn trimmed(value: &Option<String>) -> Option<String> {
@@ -504,5 +663,57 @@ sm_send:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
+    }
+
+    #[test]
+    fn raw_config_reads_codex_fork_launch_config_with_codex_fallbacks() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+codex:
+  command: "/opt/bin/codex"
+  args:
+    - "--dangerously-bypass-approvals-and-sandbox"
+  default_model: "gpt-5"
+codex_fork:
+  event_schema_version: 7
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.codex_fork.command, "/opt/bin/codex");
+        assert_eq!(
+            config.codex_fork.args,
+            vec![
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                "check_for_update_on_startup=false"
+            ]
+        );
+        assert_eq!(config.codex_fork.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(config.codex_fork.event_schema_version, 7);
+    }
+
+    #[test]
+    fn raw_config_does_not_duplicate_codex_fork_startup_update_disable_arg() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+codex:
+  command: "codex"
+  args:
+    - "-c"
+    - "check_for_update_on_startup=false"
+codex_fork:
+  command: "/opt/bin/codex-fork"
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.codex_fork.command, "/opt/bin/codex-fork");
+        assert_eq!(
+            config.codex_fork.args,
+            vec!["-c", "check_for_update_on_startup=false"]
+        );
     }
 }

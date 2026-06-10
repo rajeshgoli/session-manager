@@ -5,7 +5,8 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -25,6 +26,8 @@ const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json"
 const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
 const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
 const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
+const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
+const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -217,7 +220,7 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
-        let record = self.build_core_session_record(
+        let mut record = self.build_core_session_record(
             sessions,
             &request,
             log_dir.as_deref(),
@@ -230,18 +233,43 @@ impl SessionStore {
             .as_deref()
             .map(expand_home)
             .ok_or_else(|| anyhow::anyhow!("runtime session missing log file"))?;
-        runtime.create_session(&TmuxSessionSpec {
+        let spec = TmuxSessionSpec {
             session_id: record.id.clone(),
             tmux_session: record.tmux_session.clone(),
             working_dir: expand_home(&record.working_dir).display().to_string(),
             log_file,
+            provider: record.provider.clone(),
             initial_message: request.initial_message.clone(),
             model: request.model.clone(),
-        })?;
+        };
+        let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
+        runtime.create_session(&spec)?;
+        if let Some(artifacts) = &codex_fork_artifacts {
+            match wait_for_codex_fork_provider_resume_id(
+                &artifacts.event_stream_path,
+                CODEX_FORK_THREAD_STARTED_TIMEOUT,
+            ) {
+                Ok(provider_resume_id) => {
+                    record.provider_resume_id = Some(provider_resume_id);
+                }
+                Err(error) => {
+                    let _ = runtime.kill_session(&record.tmux_session);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "codex-fork session {} did not publish a provider resume id",
+                            record.id
+                        )
+                    });
+                }
+            }
+        }
         sessions.push(serde_json::to_value(&record)?);
         if let Err(error) = self.write_raw_json_value(&state) {
             let _ = runtime.kill_session(&record.tmux_session);
             return Err(error);
+        }
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor(record.id.clone(), artifacts.event_stream_path)?;
         }
         Ok(record)
     }
@@ -561,8 +589,20 @@ impl SessionStore {
         if !is_primary_node(&record.node) {
             return Ok(Some(CoreRestoreOutcome::UnsupportedNode(record.node)));
         }
-        if record.provider != "claude" {
+        if !matches!(record.provider.as_str(), "claude" | "codex-fork") {
             return Ok(Some(CoreRestoreOutcome::UnsupportedProvider(
+                record.provider,
+            )));
+        }
+        if record.provider == "codex-fork"
+            && record
+                .provider_resume_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            return Ok(Some(CoreRestoreOutcome::MissingProviderResumeId(
                 record.provider,
             )));
         }
@@ -584,9 +624,11 @@ impl SessionStore {
             tmux_session: record.tmux_session.clone(),
             working_dir: expand_home(&record.working_dir).display().to_string(),
             log_file,
+            provider: record.provider.clone(),
             initial_message: None,
             model: record.model.clone(),
         };
+        let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
         session_runtime.restore_session(
             &spec,
             &record.provider,
@@ -609,6 +651,9 @@ impl SessionStore {
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor(restored.id.clone(), artifacts.event_stream_path)?;
+        }
         Ok(Some(CoreRestoreOutcome::Restored(restored)))
     }
 
@@ -1416,6 +1461,128 @@ impl SessionStore {
             .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
     }
 
+    fn start_codex_fork_event_monitor(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+    ) -> Result<()> {
+        let store = self.clone();
+        let thread_session_id = format!(
+            "{}-{}",
+            sanitize_path_component(&session_id),
+            stable_session_id_hash(&session_id)
+        );
+        thread::Builder::new()
+            .name(format!("sm-codex-fork-events-{thread_session_id}"))
+            .spawn(move || store.monitor_codex_fork_event_stream(session_id, event_stream_path))
+            .with_context(|| "failed to start codex-fork event monitor")?;
+        Ok(())
+    }
+
+    fn monitor_codex_fork_event_stream(&self, session_id: String, event_stream_path: PathBuf) {
+        let mut offset = 0;
+        let mut buffer = String::new();
+        loop {
+            match self.codex_fork_monitor_should_continue(&session_id) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return,
+            }
+
+            if let Ok(chunk) = read_file_from_offset(&event_stream_path, &mut offset) {
+                for line in split_complete_event_lines(&mut buffer, &chunk) {
+                    let _ = self.apply_codex_fork_event_line(&session_id, &line);
+                }
+            }
+            thread::sleep(CODEX_FORK_EVENT_MONITOR_POLL);
+        }
+    }
+
+    fn codex_fork_monitor_should_continue(&self, session_id: &str) -> Result<bool> {
+        let state = self.load_raw_json_value()?;
+        let Some(sessions) = state.get("sessions").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+        let Some(session) = sessions.iter().find(|session| {
+            session.get("id").and_then(Value::as_str) == Some(session_id)
+                || session
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .is_some_and(|aliases| {
+                        aliases
+                            .iter()
+                            .any(|alias| alias.as_str() == Some(session_id))
+                    })
+        }) else {
+            return Ok(false);
+        };
+        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+        if provider != "codex-fork" {
+            return Ok(false);
+        }
+        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+        Ok(normalized_status(&status) != "stopped")
+    }
+
+    fn apply_codex_fork_event_line(&self, session_id: &str, line: &str) -> Result<()> {
+        let raw = line.trim();
+        if raw.is_empty() {
+            return Ok(());
+        }
+        let Ok(event) = serde_json::from_str::<Value>(raw) else {
+            return Ok(());
+        };
+        let Some(event) = event.as_object() else {
+            return Ok(());
+        };
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(());
+        };
+        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+        if provider != "codex-fork" {
+            return Ok(());
+        }
+        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+        if normalized_status(&status) == "stopped" {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
+            if json_text(session.get("provider_resume_id")).as_deref()
+                != Some(provider_resume_id.as_str())
+            {
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id),
+                );
+                changed = true;
+            }
+        }
+
+        if let Some(next_status) = codex_fork_status_for_event(event) {
+            if status != next_status {
+                session.insert("status".to_owned(), Value::String(next_status.to_owned()));
+            }
+            let now = now_rfc3339();
+            session.insert("last_activity".to_owned(), Value::String(now.clone()));
+            if next_status == "stopped" {
+                session.insert("stopped_at".to_owned(), Value::String(now));
+            } else {
+                session.insert("stopped_at".to_owned(), Value::Null);
+            }
+            changed = true;
+        }
+
+        if changed {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(())
+    }
+
     fn build_core_session_record(
         &self,
         sessions: &[Value],
@@ -1534,6 +1701,205 @@ impl SessionStore {
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
         })
+    }
+}
+
+fn wait_for_codex_fork_provider_resume_id(
+    event_stream_path: &Path,
+    timeout: Duration,
+) -> Result<String> {
+    let started = Instant::now();
+    loop {
+        if let Ok(content) = fs::read_to_string(event_stream_path) {
+            for line in content.lines() {
+                let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                let Some(event) = event.as_object() else {
+                    continue;
+                };
+                if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
+                    return Ok(provider_resume_id);
+                }
+            }
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "timed out waiting for codex-fork thread_started event in {}",
+                event_stream_path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn read_file_from_offset(path: &Path, offset: &mut u64) -> Result<String> {
+    let mut file = match fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to open {}", path.display()))
+        }
+    };
+    let len = file.metadata()?.len();
+    if *offset > len {
+        *offset = 0;
+    }
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut chunk = String::new();
+    file.read_to_string(&mut chunk)?;
+    *offset = file.stream_position()?;
+    Ok(chunk)
+}
+
+fn split_complete_event_lines(buffer: &mut String, chunk: &str) -> Vec<String> {
+    if chunk.is_empty() {
+        return Vec::new();
+    }
+    buffer.push_str(chunk);
+    let mut lines = Vec::new();
+    while let Some(index) = buffer.find('\n') {
+        let line = buffer[..index].to_owned();
+        buffer.drain(..=index);
+        lines.push(line);
+    }
+    lines
+}
+
+fn codex_fork_provider_resume_id(event: &Map<String, Value>) -> Option<String> {
+    extract_codex_fork_thread_started(event).or_else(|| {
+        event
+            .get("session_id")
+            .and_then(non_unknown_json_text)
+            .or_else(|| {
+                codex_fork_payload(event)
+                    .and_then(|payload| payload.get("session_id"))
+                    .and_then(non_unknown_json_text)
+            })
+    })
+}
+
+fn extract_codex_fork_thread_started(event: &Map<String, Value>) -> Option<String> {
+    let raw_event_type = codex_fork_event_type(event)?;
+    let normalized_event_type = normalize_codex_fork_event_type(&raw_event_type.replace('/', "_"));
+    if raw_event_type != "thread/started"
+        && raw_event_type != "thread_started"
+        && normalized_event_type != "thread_started"
+    {
+        return None;
+    }
+    let payload = codex_fork_payload(event)?;
+    let thread_payload = payload
+        .get("thread")
+        .and_then(Value::as_object)
+        .unwrap_or(payload);
+    thread_payload
+        .get("id")
+        .and_then(non_unknown_json_text)
+        .or_else(|| {
+            thread_payload
+                .get("thread_id")
+                .and_then(non_unknown_json_text)
+        })
+        .or_else(|| payload.get("thread_id").and_then(non_unknown_json_text))
+        .or_else(|| payload.get("session_id").and_then(non_unknown_json_text))
+}
+
+fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static str> {
+    let event_type = normalize_codex_fork_event_type(codex_fork_event_type(event)?.as_str());
+    match event_type.as_str() {
+        "turn_started" => Some("running"),
+        "turn_complete" => Some("idle"),
+        "turn_aborted" => {
+            let reason = codex_fork_payload(event)
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_ascii_lowercase);
+            if reason.as_deref() == Some("interrupted") {
+                Some("running")
+            } else {
+                Some("idle")
+            }
+        }
+        "approval_request"
+        | "user_input_request"
+        | "approval_resolved"
+        | "user_input_resolved"
+        | "turn_delta"
+        | "turn_diff"
+        | "item_started"
+        | "item_completed"
+        | "agent_message"
+        | "exec_command_end" => Some("running"),
+        "error" | "shutdown" => Some("stopped"),
+        "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
+        other if other.ends_with("_begin") || other.ends_with("_delta") => Some("running"),
+        _ => None,
+    }
+}
+
+fn codex_fork_event_type(event: &Map<String, Value>) -> Option<String> {
+    event
+        .get("event_type")
+        .or_else(|| event.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn codex_fork_payload(event: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    event.get("payload").and_then(Value::as_object)
+}
+
+fn non_unknown_json_text(value: &Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    if text.is_empty()
+        || matches!(
+            text.to_ascii_lowercase().as_str(),
+            "unknown" | "none" | "null"
+        )
+    {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+fn normalize_codex_fork_event_type(event_type: &str) -> String {
+    let mut snake = String::new();
+    let mut previous_is_separator = true;
+    for ch in event_type.trim().chars() {
+        if ch == '/' || ch == '-' || ch == ' ' {
+            if !previous_is_separator {
+                snake.push('_');
+                previous_is_separator = true;
+            }
+            continue;
+        }
+        if ch.is_ascii_uppercase() {
+            if !previous_is_separator && !snake.ends_with('_') {
+                snake.push('_');
+            }
+            snake.push(ch.to_ascii_lowercase());
+            previous_is_separator = false;
+        } else {
+            snake.push(ch);
+            previous_is_separator = ch == '_';
+        }
+    }
+    let normalized = snake.trim_matches('_');
+    match normalized {
+        "task_started" => "turn_started".to_owned(),
+        "task_complete" | "turn_completed" => "turn_complete".to_owned(),
+        "exec_approval_request" | "patch_approval_request" | "request_approval" => {
+            "approval_request".to_owned()
+        }
+        "request_user_input" => "user_input_request".to_owned(),
+        "approval_decision" | "approval_submitted" => "approval_resolved".to_owned(),
+        "user_input_submitted" | "user_input_response" => "user_input_resolved".to_owned(),
+        "runtime_error" | "fatal_error" => "error".to_owned(),
+        _ => normalized.to_owned(),
     }
 }
 
@@ -1768,6 +2134,7 @@ pub enum CoreRestoreOutcome {
     NotStopped,
     UnsupportedNode(String),
     UnsupportedProvider(String),
+    MissingProviderResumeId(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
