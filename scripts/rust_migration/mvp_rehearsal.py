@@ -141,30 +141,54 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
                         "detail": preflight["detail"],
                     }
                 )
-                rust_process = _start_rust_sidecar(args, output_dir)
                 rust_log_path = output_dir / "rust-sidecar.log"
-                start_step = {
-                    "name": "rust_sidecar_start",
-                    "status": "passed",
-                    "pid": rust_process.pid,
-                    "log_path": str(rust_log_path),
-                }
-                report["steps"].append(start_step)
-                rust_health = _wait_for_sidecar_health(
-                    rust_process,
-                    args.rust_base_url,
-                    timeout_seconds=args.startup_timeout,
-                    request_timeout=args.timeout,
-                    log_path=rust_log_path,
-                )
-                sidecar_exited = rust_health.pop("process_exited", False)
-                if sidecar_exited:
-                    start_step["status"] = "failed"
-                    start_step["exit_code"] = rust_health.get("exit_code")
-                    start_step["detail"] = rust_health["detail"]
-                    _add_blocker(report, "rust_sidecar_start", rust_health["detail"])
+                start_step: dict[str, Any] = {"name": "rust_sidecar_start"}
+                start_failed = False
+                try:
+                    rust_process = _start_rust_sidecar(args, output_dir)
+                except OSError as exc:
+                    start_failed = True
+                    detail = f"failed to start sidecar: {exc}"
+                    start_step.update(
+                        {
+                            "status": "failed",
+                            "detail": detail,
+                            "log_path": str(rust_log_path),
+                        }
+                    )
+                    report["steps"].append(start_step)
+                    _add_blocker(report, "rust_sidecar_start", detail)
+                    rust_process = None
+                if rust_process is None:
+                    rust_health: dict[str, Any] = {
+                        "status": "failed",
+                        "detail": start_step["detail"],
+                    }
+                    sidecar_exited = False
+                else:
+                    start_step.update(
+                        {
+                            "status": "passed",
+                            "pid": rust_process.pid,
+                            "log_path": str(rust_log_path),
+                        }
+                    )
+                    report["steps"].append(start_step)
+                    rust_health = _wait_for_sidecar_health(
+                        rust_process,
+                        args.rust_base_url,
+                        timeout_seconds=args.startup_timeout,
+                        request_timeout=args.timeout,
+                        log_path=rust_log_path,
+                    )
+                    sidecar_exited = rust_health.pop("process_exited", False)
+                    if sidecar_exited:
+                        start_step["status"] = "failed"
+                        start_step["exit_code"] = rust_health.get("exit_code")
+                        start_step["detail"] = rust_health["detail"]
+                        _add_blocker(report, "rust_sidecar_start", rust_health["detail"])
                 report["steps"].append({"name": "rust_sidecar_health", **rust_health})
-                if rust_health["status"] != "passed" and not sidecar_exited:
+                if rust_health["status"] != "passed" and not sidecar_exited and not start_failed:
                     _add_blocker(report, "rust_sidecar_health", rust_health["detail"])
                 else:
                     rust_ready = rust_health["status"] == "passed"
