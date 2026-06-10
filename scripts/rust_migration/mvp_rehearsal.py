@@ -116,21 +116,29 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
                 _add_blocker(report, "rust_sidecar_reuse_health", rust_health["detail"])
         else:
             rust_process = _start_rust_sidecar(args, output_dir)
-            report["steps"].append(
-                {
-                    "name": "rust_sidecar_start",
-                    "status": "passed",
-                    "pid": rust_process.pid,
-                    "log_path": str(output_dir / "rust-sidecar.log"),
-                }
-            )
-            rust_health = _wait_for_health(
+            rust_log_path = output_dir / "rust-sidecar.log"
+            start_step = {
+                "name": "rust_sidecar_start",
+                "status": "passed",
+                "pid": rust_process.pid,
+                "log_path": str(rust_log_path),
+            }
+            report["steps"].append(start_step)
+            rust_health = _wait_for_sidecar_health(
+                rust_process,
                 args.rust_base_url,
                 timeout_seconds=args.startup_timeout,
                 request_timeout=args.timeout,
+                log_path=rust_log_path,
             )
+            sidecar_exited = rust_health.pop("process_exited", False)
+            if sidecar_exited:
+                start_step["status"] = "failed"
+                start_step["exit_code"] = rust_health.get("exit_code")
+                start_step["detail"] = rust_health["detail"]
+                _add_blocker(report, "rust_sidecar_start", rust_health["detail"])
             report["steps"].append({"name": "rust_sidecar_health", **rust_health})
-            if rust_health["status"] != "passed":
+            if rust_health["status"] != "passed" and not sidecar_exited:
                 _add_blocker(report, "rust_sidecar_health", rust_health["detail"])
 
         if not args.skip_smoke:
@@ -302,6 +310,46 @@ def _wait_for_health(
     deadline = time.monotonic() + timeout_seconds
     last_detail = "not attempted"
     while time.monotonic() < deadline:
+        result = _probe_health(base_url, request_timeout)
+        if result["status"] == "passed":
+            return result
+        last_detail = result["detail"]
+        time.sleep(0.5)
+    return {
+        "status": "failed",
+        "elapsed_ms": round(timeout_seconds * 1000, 3),
+        "detail": f"timed out waiting for health: {last_detail}",
+    }
+
+
+def _wait_for_sidecar_health(
+    process: subprocess.Popen[str],
+    base_url: str,
+    *,
+    timeout_seconds: float,
+    request_timeout: float,
+    log_path: Path,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_detail = "not attempted"
+    started_at = time.perf_counter()
+    while time.monotonic() < deadline:
+        exit_code = process.poll()
+        if exit_code is not None:
+            detail = (
+                f"sidecar exited with code {exit_code} before health; "
+                f"last health error: {last_detail}"
+            )
+            log_tail = _tail_file(log_path)
+            if log_tail:
+                detail = f"{detail}; log tail: {log_tail}"
+            return {
+                "status": "failed",
+                "process_exited": True,
+                "exit_code": exit_code,
+                "elapsed_ms": _elapsed_ms(started_at),
+                "detail": detail,
+            }
         result = _probe_health(base_url, request_timeout)
         if result["status"] == "passed":
             return result
@@ -529,6 +577,13 @@ def _tail_text(value: str | bytes, max_chars: int = 4000) -> str:
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
     return value[-max_chars:]
+
+
+def _tail_file(path: Path, max_chars: int = 4000) -> str:
+    try:
+        return path.read_text(errors="replace")[-max_chars:]
+    except FileNotFoundError:
+        return ""
 
 
 def _elapsed_ms(started_at: float) -> float:
