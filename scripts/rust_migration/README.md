@@ -179,3 +179,54 @@ Current Rust shadow support is intentionally side-effect-free:
 For a cutover trial, run shadow mode for the agreed observation window and treat
 unexplained mismatches on retained core surfaces as blockers before Rust becomes
 the writer.
+
+## MVP Sidecar Rehearsal
+
+The MVP rehearsal gate starts Rust as a sidecar, keeps Python authoritative, and
+produces a single JSON report with pass/fail steps, blockers, shadow-read
+comparisons, and baseline artifacts. It is the quickest way to answer whether
+the current Rust core is cutover-shaped enough for the next MVP slice.
+
+Live rehearsal against the current local config:
+
+```bash
+python -m scripts.rust_migration.mvp_rehearsal
+```
+
+By default this:
+
+- checks Python `/health` on `http://127.0.0.1:8420`;
+- starts Rust `sm-server` on `http://127.0.0.1:8421` with `config.yaml`;
+- runs `scripts/rust-mvp-smoke.sh` for isolated mutating runtime coverage;
+- runs core read/retired-surface contracts against Rust;
+- probes retained MVP gaps such as `/nodes`, `/queue-jobs`, and
+  `/codex-review-requests`;
+- posts shadow-style read comparisons to Rust `POST /__shadow/http`;
+- writes Python and Rust baseline JSON under the report directory.
+
+Reports are written under `.local/rust-mvp-rehearsals/<timestamp>/` unless
+`--output-dir` is supplied. `.local/` is ignored; do not commit host-local
+reports.
+
+Useful variants:
+
+```bash
+# Reuse an already-running Rust sidecar.
+python -m scripts.rust_migration.mvp_rehearsal --reuse-rust-sidecar
+
+# Validate the harness itself with the synthetic read-only fixture.
+python -m scripts.rust_migration.mvp_rehearsal \
+  --config scripts/rust_migration/fixtures/read_only/config.yaml \
+  --skip-python-health \
+  --skip-smoke \
+  --skip-baseline \
+  --skip-shadow \
+  --core-only
+
+# Produce a report even when known MVP gaps remain.
+python -m scripts.rust_migration.mvp_rehearsal --allow-blockers
+```
+
+Exit code is non-zero when blockers are present unless `--allow-blockers` is
+used. A blocked report is expected while retained MVP gap probes are still
+unimplemented; use the blocker list to choose the next Rust slice.
