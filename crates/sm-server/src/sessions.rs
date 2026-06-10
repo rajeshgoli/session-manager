@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
@@ -28,6 +30,7 @@ const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
 const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
+const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -2639,7 +2642,14 @@ fn deliver_runtime_text_to_session_raw(
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
     let mut delivered = false;
     if normalized_status(&status) != "stopped" {
-        delivered = session_runtime.send_input(&tmux_session, text)?;
+        match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
+            Some(true) => {
+                delivered = true;
+            }
+            _ => {
+                delivered = session_runtime.send_input(&tmux_session, text)?;
+            }
+        }
         let now = now_rfc3339();
         if delivered {
             session.insert("last_activity".to_owned(), Value::String(now));
@@ -2672,11 +2682,18 @@ fn deliver_urgent_runtime_text_to_session_raw(
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
     let mut delivered = false;
     if normalized_status(&status) != "stopped" {
-        delivered = session_runtime.send_urgent_input(
-            &tmux_session,
-            text,
-            provider.eq_ignore_ascii_case("claude"),
-        )?;
+        match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
+            Some(true) => {
+                delivered = true;
+            }
+            _ => {
+                delivered = session_runtime.send_urgent_input(
+                    &tmux_session,
+                    text,
+                    provider.eq_ignore_ascii_case("claude"),
+                )?;
+            }
+        }
         let now = now_rfc3339();
         if delivered {
             session.insert("last_activity".to_owned(), Value::String(now));
@@ -2688,6 +2705,209 @@ fn deliver_urgent_runtime_text_to_session_raw(
         }
     }
     Ok((status, delivered))
+}
+
+fn deliver_codex_fork_control_text_to_session_raw(
+    session_id: &str,
+    session: &mut Map<String, Value>,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<Option<bool>> {
+    let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+    if !provider.eq_ignore_ascii_case("codex-fork") {
+        return Ok(None);
+    }
+
+    let result = codex_fork_control_socket_path_for_session_raw(session_id, session, runtime)
+        .and_then(|control_socket_path| codex_fork_submit_message(&control_socket_path, text));
+    match result {
+        Ok(()) => {
+            clear_codex_fork_control_degraded_raw(session);
+            Ok(Some(true))
+        }
+        Err(error) => {
+            mark_codex_fork_control_degraded_raw(session, &error.to_string());
+            Ok(Some(false))
+        }
+    }
+}
+
+fn codex_fork_control_socket_path_for_session_raw(
+    session_id: &str,
+    session: &Map<String, Value>,
+    runtime: &TmuxRuntime,
+) -> Result<PathBuf> {
+    let tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    let working_dir = json_text(session.get("working_dir"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing working_dir"))?;
+    let log_file = json_text(session.get("log_file"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing log_file"))?;
+    let spec = TmuxSessionSpec {
+        session_id: session_id.to_owned(),
+        tmux_session,
+        working_dir: expand_home(&working_dir).display().to_string(),
+        log_file: expand_home(&log_file),
+        provider: "codex-fork".to_owned(),
+        initial_message: None,
+        model: json_text(session.get("model")),
+    };
+    let artifacts = runtime
+        .codex_fork_runtime_artifacts(&spec)?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} is not a codex-fork session"))?;
+    Ok(artifacts.control_socket_path)
+}
+
+fn codex_fork_submit_message(control_socket_path: &Path, text: &str) -> Result<()> {
+    if !control_socket_path.exists() {
+        return Err(anyhow::anyhow!(
+            "control socket not found: {}",
+            control_socket_path.display()
+        ));
+    }
+
+    let mut epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+    let mut response =
+        codex_fork_send_control_command(control_socket_path, "submit_message", &epoch, text)?;
+    if !codex_fork_response_ok(&response)
+        && codex_fork_error_code(&response).as_deref() == Some("stale_epoch")
+    {
+        epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+        response =
+            codex_fork_send_control_command(control_socket_path, "submit_message", &epoch, text)?;
+    }
+    ensure_codex_fork_response_ok(&response, "control command failed")
+}
+
+fn codex_fork_refresh_control_epoch(control_socket_path: &Path) -> Result<String> {
+    let request = json!({
+        "request_id": codex_fork_control_request_id(),
+        "command": "get_epoch",
+    });
+    let response = codex_fork_control_roundtrip(control_socket_path, &request)
+        .with_context(|| "failed to read control epoch")?;
+    ensure_codex_fork_response_ok(&response, "failed to fetch epoch")?;
+    codex_fork_response_epoch(&response)
+        .ok_or_else(|| anyhow::anyhow!("control epoch missing from response"))
+}
+
+fn codex_fork_send_control_command(
+    control_socket_path: &Path,
+    command: &str,
+    expected_epoch: &str,
+    message: &str,
+) -> Result<Value> {
+    let request = json!({
+        "request_id": codex_fork_control_request_id(),
+        "expected_epoch": expected_epoch,
+        "command": command,
+        "message": message,
+    });
+    codex_fork_control_roundtrip(control_socket_path, &request)
+        .with_context(|| "control command failed")
+}
+
+#[cfg(unix)]
+fn codex_fork_control_roundtrip(control_socket_path: &Path, request: &Value) -> Result<Value> {
+    let mut stream = UnixStream::connect(control_socket_path).with_context(|| {
+        format!(
+            "failed to connect control socket {}",
+            control_socket_path.display()
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(CODEX_FORK_CONTROL_TIMEOUT))
+        .with_context(|| "failed to set control socket read timeout")?;
+    stream
+        .set_write_timeout(Some(CODEX_FORK_CONTROL_TIMEOUT))
+        .with_context(|| "failed to set control socket write timeout")?;
+    let mut raw_request = serde_json::to_string(request)?;
+    raw_request.push('\n');
+    stream
+        .write_all(raw_request.as_bytes())
+        .with_context(|| "failed to write control socket request")?;
+    stream
+        .flush()
+        .with_context(|| "failed to flush control socket request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut raw_response = String::new();
+    reader
+        .read_line(&mut raw_response)
+        .with_context(|| "failed to read control socket response")?;
+    if raw_response.is_empty() {
+        return Err(anyhow::anyhow!("control socket closed without response"));
+    }
+    serde_json::from_str(&raw_response).with_context(|| "control socket returned invalid JSON")
+}
+
+#[cfg(not(unix))]
+fn codex_fork_control_roundtrip(_control_socket_path: &Path, _request: &Value) -> Result<Value> {
+    Err(anyhow::anyhow!(
+        "codex-fork control sockets are only supported on Unix"
+    ))
+}
+
+fn ensure_codex_fork_response_ok(response: &Value, default_message: &str) -> Result<()> {
+    if codex_fork_response_ok(response) {
+        return Ok(());
+    }
+    let code = codex_fork_error_code(response).unwrap_or_else(|| "unknown_error".to_owned());
+    let message = codex_fork_error_message(response).unwrap_or_else(|| default_message.to_owned());
+    Err(anyhow::anyhow!("{code}: {message}"))
+}
+
+fn codex_fork_response_ok(response: &Value) -> bool {
+    response.get("ok").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn codex_fork_response_epoch(response: &Value) -> Option<String> {
+    response
+        .get("result")
+        .and_then(Value::as_object)
+        .and_then(|result| json_text(result.get("epoch")))
+        .or_else(|| json_text(response.get("epoch")))
+}
+
+fn codex_fork_error_code(response: &Value) -> Option<String> {
+    response
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| json_text(error.get("code")))
+}
+
+fn codex_fork_error_message(response: &Value) -> Option<String> {
+    response
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| json_text(error.get("message")))
+}
+
+fn codex_fork_control_request_id() -> String {
+    let counter = STATE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("rust-{}-{counter}", std::process::id())
+}
+
+fn mark_codex_fork_control_degraded_raw(session: &mut Map<String, Value>, reason: &str) {
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "unknown_control_error"
+    } else {
+        reason
+    };
+    session.insert(
+        "error_message".to_owned(),
+        Value::String(format!("codex_fork_control_degraded: {reason}")),
+    );
+}
+
+fn clear_codex_fork_control_degraded_raw(session: &mut Map<String, Value>) {
+    let is_degraded_error = json_text(session.get("error_message"))
+        .as_deref()
+        .is_some_and(|message| message.starts_with("codex_fork_control_degraded:"));
+    if is_degraded_error {
+        session.insert("error_message".to_owned(), Value::Null);
+    }
 }
 
 fn drain_pending_runtime_messages_raw(
