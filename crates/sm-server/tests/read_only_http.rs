@@ -24,12 +24,19 @@ use sm_server::{
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
     net::SocketAddr,
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
@@ -4545,7 +4552,7 @@ async fn runtime_core_lifecycle_uses_codex_fork_launch_config() {
     }
     let state_file = unique_temp_path();
     let queue_db_path = queue_db_path_for_state_file(&state_file);
-    let log_dir = unique_temp_path();
+    let log_dir = unique_short_temp_dir("smrf");
     let working_dir = unique_temp_path();
     fs::create_dir_all(&log_dir).unwrap();
     fs::create_dir_all(&working_dir).unwrap();
@@ -4673,12 +4680,87 @@ while true; do sleep 1; done
     }
     assert_eq!(lifecycle_status, "idle");
 
+    #[cfg(unix)]
+    {
+        let control_requests =
+            spawn_codex_fork_control_socket(control_path.clone(), "epoch-runtimefork");
+        let (status, payload) = post_json(
+            app.clone(),
+            "/sessions/runtimefork/input",
+            json!({
+                "text": "control socket message",
+                "delivery_mode": "direct"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["delivered"], true);
+
+        let epoch_request = control_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("codex-fork get_epoch request");
+        assert_eq!(epoch_request["command"], "get_epoch");
+        let submit_request = control_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("codex-fork submit_message request");
+        assert_eq!(submit_request["command"], "submit_message");
+        assert_eq!(submit_request["expected_epoch"], "epoch-runtimefork");
+        assert_eq!(submit_request["message"], "control socket message");
+
+        let stale_requests = spawn_codex_fork_stale_epoch_control_socket(
+            control_path.clone(),
+            "epoch-runtimefork-stale",
+            "epoch-runtimefork-fresh",
+        );
+        let (status, payload) = post_json(
+            app.clone(),
+            "/sessions/runtimefork/input",
+            json!({
+                "text": "control socket retry message",
+                "delivery_mode": "direct"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["delivered"], true);
+
+        let first_epoch_request = stale_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first codex-fork get_epoch request");
+        assert_eq!(first_epoch_request["command"], "get_epoch");
+        let stale_submit_request = stale_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale codex-fork submit_message request");
+        assert_eq!(stale_submit_request["command"], "submit_message");
+        assert_eq!(
+            stale_submit_request["expected_epoch"],
+            "epoch-runtimefork-stale"
+        );
+        let refresh_epoch_request = stale_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("refreshed codex-fork get_epoch request");
+        assert_eq!(refresh_epoch_request["command"], "get_epoch");
+        let retry_submit_request = stale_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retried codex-fork submit_message request");
+        assert_eq!(retry_submit_request["command"], "submit_message");
+        assert_eq!(
+            retry_submit_request["expected_epoch"],
+            "epoch-runtimefork-fresh"
+        );
+        assert_eq!(
+            retry_submit_request["message"],
+            "control socket retry message"
+        );
+    }
+
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
     let (status, payload) = post_json(app.clone(), "/sessions/runtimefork/kill", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "killed");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
     fs::write(&event_path, "stale event after stop").unwrap();
+    let _ = fs::remove_file(&control_path);
     fs::write(&control_path, "stale control after stop").unwrap();
 
     let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
@@ -5525,6 +5607,16 @@ fn unique_temp_path() -> PathBuf {
     ))
 }
 
+fn unique_short_temp_dir(prefix: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    PathBuf::from(format!(
+        "/tmp/{}-{}-{}",
+        prefix,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> axum::Router {
     runtime_app_with_command(
         state_file,
@@ -5597,6 +5689,118 @@ async fn wait_for_file_contains(path: &PathBuf, needle: &str) -> String {
         "timed out waiting for {} to contain {needle:?}",
         path.display()
     );
+}
+
+#[cfg(unix)]
+fn spawn_codex_fork_control_socket(path: PathBuf, epoch: &'static str) -> mpsc::Receiver<Value> {
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw_request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut raw_request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&raw_request).unwrap();
+            sender.send(request.clone()).unwrap();
+            let response = match request.get("command").and_then(Value::as_str) {
+                Some("get_epoch") => json!({
+                    "ok": true,
+                    "epoch": epoch,
+                    "result": { "epoch": epoch }
+                }),
+                Some("submit_message") => json!({
+                    "ok": true,
+                    "epoch": epoch,
+                    "result": {}
+                }),
+                Some(command) => json!({
+                    "ok": false,
+                    "error": {
+                        "code": "unknown_command",
+                        "message": format!("unknown command {command}")
+                    }
+                }),
+                None => json!({
+                    "ok": false,
+                    "error": {
+                        "code": "missing_command",
+                        "message": "missing command"
+                    }
+                }),
+            };
+            let mut raw_response = serde_json::to_string(&response).unwrap();
+            raw_response.push('\n');
+            stream.write_all(raw_response.as_bytes()).unwrap();
+        }
+    });
+    receiver
+}
+
+#[cfg(unix)]
+fn spawn_codex_fork_stale_epoch_control_socket(
+    path: PathBuf,
+    stale_epoch: &'static str,
+    fresh_epoch: &'static str,
+) -> mpsc::Receiver<Value> {
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for index in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw_request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut raw_request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&raw_request).unwrap();
+            sender.send(request.clone()).unwrap();
+            let response = match (index, request.get("command").and_then(Value::as_str)) {
+                (0, Some("get_epoch")) => json!({
+                    "ok": true,
+                    "epoch": stale_epoch,
+                    "result": { "epoch": stale_epoch }
+                }),
+                (1, Some("submit_message")) => json!({
+                    "ok": false,
+                    "error": {
+                        "code": "stale_epoch",
+                        "message": "stale epoch"
+                    }
+                }),
+                (2, Some("get_epoch")) => json!({
+                    "ok": true,
+                    "epoch": fresh_epoch,
+                    "result": { "epoch": fresh_epoch }
+                }),
+                (3, Some("submit_message")) => json!({
+                    "ok": true,
+                    "epoch": fresh_epoch,
+                    "result": {}
+                }),
+                (_, Some(command)) => json!({
+                    "ok": false,
+                    "error": {
+                        "code": "unexpected_command",
+                        "message": format!("unexpected command {command}")
+                    }
+                }),
+                (_, None) => json!({
+                    "ok": false,
+                    "error": {
+                        "code": "missing_command",
+                        "message": "missing command"
+                    }
+                }),
+            };
+            let mut raw_response = serde_json::to_string(&response).unwrap();
+            raw_response.push('\n');
+            stream.write_all(raw_response.as_bytes()).unwrap();
+        }
+    });
+    receiver
 }
 
 fn core_log_file_path(log_dir: &PathBuf, session_id: &str) -> PathBuf {
