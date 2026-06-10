@@ -649,13 +649,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--core-only", action="store_true")
     parser.add_argument("--allow-blockers", action="store_true")
     parser.add_argument("--shadow-secret", default=None)
-    parser.add_argument("--baseline-repetitions", type=int, default=3)
+    parser.add_argument("--baseline-repetitions", type=_positive_int, default=3)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--startup-timeout", type=float, default=60.0)
     parser.add_argument("--smoke-timeout", type=float, default=120.0)
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--sm-binary", default="sm")
     return parser
+
+
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
