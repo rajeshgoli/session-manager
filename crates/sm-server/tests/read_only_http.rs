@@ -17,9 +17,9 @@ use sm_server::config::RustShadowConfig;
 use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
-        AppConfig, CodexForkLaunchConfig, ExternalAccessConfig, GoogleAuthConfig,
-        MobileAnalyticsConfig, MobileTerminalConfig, PathsConfig, QueueRunnerConfig,
-        RustCoreConfig, SmSendConfig,
+        AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig,
+        ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
+        PathsConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig,
     },
     http::{router, AppState},
 };
@@ -129,6 +129,72 @@ async fn json_request_with_headers_and_peer(
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn post_multipart_with_host_and_peer(
+    app: axum::Router,
+    uri: &str,
+    host: &str,
+    body: Vec<u8>,
+    boundary: &str,
+    headers: &[(&str, String)],
+    peer_addr: Option<SocketAddr>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("host", host)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        );
+    for (name, value) in headers {
+        builder = builder.header(*name, value);
+    }
+    let mut request = builder.body(Body::from(body)).unwrap();
+    if let Some(peer_addr) = peer_addr {
+        request.extensions_mut().insert(ConnectInfo(peer_addr));
+    }
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, headers, body.to_vec())
+}
+
+fn multipart_app_upload(
+    boundary: &str,
+    file_bytes: &[u8],
+    version_code: Option<&str>,
+    version_name: Option<&str>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"app-debug.apk\"\r\nContent-Type: application/vnd.android.package-archive\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(file_bytes);
+    body.extend_from_slice(b"\r\n");
+    if let Some(version_code) = version_code {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"version_code\"\r\n\r\n{version_code}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    if let Some(version_name) = version_name {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"version_name\"\r\n\r\n{version_name}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
 }
 
 async fn get_json_with_host(app: axum::Router, uri: &str, host: &str) -> (StatusCode, Value) {
@@ -572,6 +638,515 @@ async fn client_analytics_summary_rejects_public_host_without_auth() {
         payload["login_url"],
         "/auth/google/login?next=%2Fclient%2Fanalytics%2Fsummary"
     );
+}
+
+#[tokio::test]
+async fn client_request_status_prompts_live_sessions() {
+    let state_file = unique_temp_path();
+    let first_log = unique_temp_path();
+    let second_log = unique_temp_path();
+    let codex_app_log = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "mobileone",
+                    "name": "claude-mobileone",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-mobileone",
+                    "log_file": first_log.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "mobiletwo",
+                    "name": "claude-mobiletwo",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-mobiletwo",
+                    "log_file": second_log.display().to_string(),
+                    "status": "waiting_permission",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "mobilecodexapp",
+                    "name": "codex-app-mobile",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-app-mobile",
+                    "provider": "codex-app",
+                    "log_file": codex_app_log.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "mobilestopped",
+                    "name": "claude-mobilestopped",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-mobilestopped",
+                    "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(app, "/client/request-status", json!({})).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "requested");
+    assert_eq!(
+        payload["prompt"],
+        "[sm] user requests status, please update now using sm status"
+    );
+    assert_eq!(payload["targeted_count"], 3);
+    assert_eq!(payload["delivered_count"], 2);
+    assert_eq!(payload["queued_count"], 0);
+    assert_eq!(payload["failed_count"], 1);
+    assert_eq!(
+        payload["targeted_session_ids"],
+        json!(["mobileone", "mobiletwo", "mobilecodexapp"])
+    );
+    let first_output = fs::read_to_string(first_log).unwrap();
+    assert!(first_output.contains("[sm] user requests status"));
+    let second_output = fs::read_to_string(second_log).unwrap();
+    assert!(second_output.contains("[sm] user requests status"));
+    let codex_app_output = fs::read_to_string(codex_app_log).unwrap_or_default();
+    assert!(!codex_app_output.contains("[sm] user requests status"));
+}
+
+#[tokio::test]
+async fn client_bug_report_persists_sqlite_row_and_debug_state() {
+    let state_file = write_session_fixture();
+    let bug_db = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        bug_reports: BugReportsConfig {
+            db_path: bug_db.display().to_string(),
+            max_reports: 30,
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/client/bug-reports",
+        json!({
+            "report_text": "mobile bug report",
+            "include_debug_state": true,
+            "selected_session_id": "run12345",
+            "client_state": {"route": "/watch/", "screen": "sessions"},
+            "app_version": "0.3.0",
+            "artifact_hash": "deadbeef"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "submitted");
+    assert_eq!(payload["maintainer_notified"], false);
+    let bug_id = payload["bug_id"].as_str().unwrap();
+    assert!(bug_id.starts_with("BR-"));
+    let conn = Connection::open(&bug_db).unwrap();
+    let row: (
+        String,
+        Option<String>,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+    ) = conn
+        .query_row(
+            r#"
+            SELECT report_text, reported_by, route, app_version, include_debug_state,
+                   client_state_json, server_state_json, maintainer_delivery_result
+            FROM bug_reports
+            WHERE id = ?
+            "#,
+            [bug_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, "mobile bug report");
+    assert_eq!(row.1, None);
+    assert_eq!(row.2, "/watch/");
+    assert_eq!(row.3, "0.3.0");
+    assert_eq!(row.4, 1);
+    assert!(row.5.contains("\"screen\":\"sessions\""));
+    assert!(row.6.contains("\"selected_session\""));
+    assert_eq!(row.7.as_deref(), Some("maintainer_not_found"));
+}
+
+#[tokio::test]
+async fn client_bug_report_notifies_registered_maintainer() {
+    let state_file = unique_temp_path();
+    let maintainer_log = unique_temp_path();
+    let selected_log = unique_temp_path();
+    let bug_db = unique_temp_path();
+    fs::write(&maintainer_log, "").unwrap();
+    fs::write(&selected_log, "").unwrap();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "maint01",
+                    "name": "claude-maint01",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-maint01",
+                    "tmux_socket_name": null,
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": maintainer_log.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "maintainer"
+                },
+                {
+                    "id": "run12345",
+                    "name": "claude-run12345",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-run12345",
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": selected_log.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ],
+            "agent_registrations": [
+                {
+                    "role": "maintainer",
+                    "session_id": "maint01",
+                    "created_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        bug_reports: BugReportsConfig {
+            db_path: bug_db.display().to_string(),
+            max_reports: 30,
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/client/bug-reports",
+        json!({
+            "report_text": "important   mobile\nfailure",
+            "include_debug_state": false,
+            "selected_session_id": "run12345"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["maintainer_notified"], true);
+    let bug_id = payload["bug_id"].as_str().unwrap();
+    let maintainer_output = fs::read_to_string(&maintainer_log).unwrap();
+    assert!(maintainer_output.contains(&format!("[app bug] {bug_id}")));
+    assert!(maintainer_output.contains("report: important mobile failure"));
+    assert!(maintainer_output.contains("session: run12345"));
+    assert!(maintainer_output.contains(&format!("db: {}", bug_db.display())));
+    let conn = Connection::open(&bug_db).unwrap();
+    let delivery_result: String = conn
+        .query_row(
+            "SELECT maintainer_delivery_result FROM bug_reports WHERE id = ?",
+            [bug_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivery_result, "delivered");
+}
+
+#[tokio::test]
+async fn client_bug_report_enforces_auth_and_payload_bounds() {
+    let state_file = write_session_fixture();
+    let bug_db = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        bug_reports: BugReportsConfig {
+            db_path: bug_db.display().to_string(),
+            max_reports: 30,
+        },
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            client_id: Some("web-client-id".to_owned()),
+            android_client_id: Some("android-client-id".to_owned()),
+            client_secret: Some("web-client-secret".to_owned()),
+            redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+            allowlist_emails: vec!["rajesh@example.com".to_owned()],
+            session_cookie_secret: Some("session-cookie-secret".to_owned()),
+            ..GoogleAuthConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/client/bug-reports",
+        json!({ "report_text": "public unauth" }),
+        &[("host", "sm.example.com")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+
+    let token = device_access_token("session-cookie-secret", "rajesh@example.com", "Rajesh");
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/client/bug-reports",
+        json!({
+            "report_text": "ok",
+            "include_debug_state": true,
+            "client_state": {"blob": "x".repeat(100_001)}
+        }),
+        &[
+            ("host", "sm.example.com"),
+            ("authorization", &format!("Bearer {token}")),
+        ],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("client_state exceeds"));
+}
+
+#[tokio::test]
+async fn app_artifact_upload_metadata_and_downloads_are_auth_gated() {
+    let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts");
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        app_artifacts: AppArtifactsConfig {
+            root_dir: artifact_root.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let boundary = "sm-rust-boundary";
+    let body = multipart_app_upload(boundary, b"apk-bytes", Some("7"), Some("0.1.7"));
+
+    let (status, _headers, response_body) = post_multipart_with_host_and_peer(
+        app.clone(),
+        "/deploy/session-manager-android",
+        "localhost",
+        body,
+        boundary,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: Value = serde_json::from_slice(&response_body).unwrap();
+    let artifact_hash = Sha256::digest(b"apk-bytes")
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        payload,
+        json!({
+            "ok": true,
+            "app": "session-manager-android",
+            "size_bytes": 9,
+            "download_url": "/apps/session-manager-android/latest.apk",
+            "artifact_hash": artifact_hash
+        })
+    );
+    let app_dir = artifact_root.join("session-manager-android");
+    assert_eq!(fs::read(app_dir.join("latest.apk")).unwrap(), b"apk-bytes");
+    assert_eq!(
+        fs::read(app_dir.join(format!("{artifact_hash}.apk"))).unwrap(),
+        b"apk-bytes"
+    );
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(app_dir.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(metadata["artifact_hash"], artifact_hash);
+    assert_eq!(metadata["uploaded_by"], "local_bypass");
+    assert_eq!(metadata["version_code"], 7);
+    assert_eq!(metadata["version_name"], "0.1.7");
+
+    let (status, headers, body) =
+        get_response(app.clone(), "/apps/session-manager-android/latest.apk").await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(
+        headers
+            .get("location")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("/apps/session-manager-android/{artifact_hash}.apk").as_str())
+    );
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    assert!(body.is_empty());
+
+    let (status, headers, body) = get_response(
+        app.clone(),
+        &format!("/apps/session-manager-android/{artifact_hash}.apk"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"apk-bytes");
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=31536000, immutable")
+    );
+    assert_eq!(
+        headers
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"session-manager-android.apk\"")
+    );
+
+    let (status, metadata_payload) =
+        get_json(app.clone(), "/apps/session-manager-android/meta.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(metadata_payload["artifact_hash"], artifact_hash);
+
+    let (status, headers, _) = get_response(app, "/apk").await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(
+        headers
+            .get("location")
+            .and_then(|value| value.to_str().ok()),
+        Some("/apps/session-manager-android/latest.apk")
+    );
+    let _ = fs::remove_dir_all(artifact_root);
+}
+
+#[tokio::test]
+async fn app_artifact_upload_rejects_encoded_whitespace_app_name() {
+    let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts-invalid");
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        app_artifacts: AppArtifactsConfig {
+            root_dir: artifact_root.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let boundary = "sm-rust-boundary-invalid";
+    let body = multipart_app_upload(boundary, b"apk-bytes", None, None);
+
+    let (status, _headers, response_body) = post_multipart_with_host_and_peer(
+        app,
+        "/deploy/session-manager-android%20",
+        "localhost",
+        body,
+        boundary,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let payload: Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(payload["detail"], "Invalid app name");
+    assert!(!artifact_root.join("session-manager-android ").exists());
+    let _ = fs::remove_dir_all(artifact_root);
+}
+
+#[tokio::test]
+async fn app_artifacts_reject_public_unauthenticated_access_when_auth_enabled() {
+    let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts-auth");
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        app_artifacts: AppArtifactsConfig {
+            root_dir: artifact_root.display().to_string(),
+        },
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            client_id: Some("web-client-id".to_owned()),
+            android_client_id: Some("android-client-id".to_owned()),
+            client_secret: Some("web-client-secret".to_owned()),
+            redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+            allowlist_emails: vec!["rajesh@example.com".to_owned()],
+            session_cookie_secret: Some("session-cookie-secret".to_owned()),
+            ..GoogleAuthConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json_with_host(
+        app.clone(),
+        "/apps/session-manager-android/meta.json",
+        "sm.example.com",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+
+    let boundary = "sm-rust-boundary-denied";
+    let body = multipart_app_upload(boundary, b"apk-bytes", None, None);
+    let (status, _headers, body) = post_multipart_with_host_and_peer(
+        app,
+        "/deploy/session-manager-android",
+        "sm.example.com",
+        body,
+        boundary,
+        &[],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["detail"], "Authentication required");
+    let _ = fs::remove_dir_all(artifact_root);
 }
 
 #[tokio::test]
@@ -1171,6 +1746,75 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
         .as_str()
         .unwrap()
         .contains("never performs retained write side effects"));
+}
+
+#[tokio::test]
+async fn shadow_http_classifies_native_mobile_writes_without_side_effects() {
+    let app = router(AppState::new(AppConfig::default()));
+    for path in [
+        "/client/request-status",
+        "/client/bug-reports",
+        "/deploy/session-manager-android",
+    ] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/__shadow/http",
+            json!({
+                "schema_version": 1,
+                "request": {
+                    "method": "POST",
+                    "path": path,
+                    "query_string": "",
+                    "headers": {},
+                    "body_sha256": sha256_hex(b"{}")
+                },
+                "python_response": {
+                    "status": 200,
+                    "body_sha256": sha256_hex(b"{\"status\":\"python-owned\"}")
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            payload["support_status"], "unsupported_retained_write",
+            "{path}"
+        );
+        assert_eq!(payload["comparison"], "not_compared", "{path}");
+        assert_eq!(payload["would_write"], false, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn shadow_http_preserves_python_auth_denial_for_app_artifact_reads() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    for path in ["/apk", "/apps/session-manager-android/meta.json"] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/__shadow/http",
+            json!({
+                "schema_version": 1,
+                "request": {
+                    "method": "GET",
+                    "path": path,
+                    "query_string": "",
+                    "headers": {}
+                },
+                "python_response": {
+                    "status": 401,
+                    "body_sha256": sha256_hex(b"{\"detail\":\"Authentication required\"}")
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(payload["support_status"], "python_auth_denial", "{path}");
+        assert_eq!(payload["comparison"], "status_match", "{path}");
+        assert_eq!(payload["would_write"], false, "{path}");
+    }
 }
 
 #[tokio::test]

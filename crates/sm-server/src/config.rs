@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 pub struct AppConfig {
     pub paths: PathsConfig,
     pub mobile_analytics: MobileAnalyticsConfig,
+    pub app_artifacts: AppArtifactsConfig,
+    pub bug_reports: BugReportsConfig,
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
     pub mobile_terminal: MobileTerminalConfig,
@@ -32,6 +34,8 @@ impl Default for AppConfig {
         Self {
             paths: PathsConfig::default(),
             mobile_analytics: MobileAnalyticsConfig::default(),
+            app_artifacts: AppArtifactsConfig::default(),
+            bug_reports: BugReportsConfig::default(),
             google_auth: GoogleAuthConfig::default(),
             external_access: ExternalAccessConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
@@ -113,6 +117,60 @@ impl Default for PathsConfig {
 
 fn default_state_file() -> String {
     "~/.local/share/claude-sessions/sessions.json".to_owned()
+}
+
+fn default_app_artifacts_dir() -> String {
+    repo_data_path("apps")
+}
+
+fn default_bug_reports_db_path() -> String {
+    repo_data_path("bug_reports.db")
+}
+
+fn repo_data_path(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."))
+        .join("data")
+        .join(name)
+        .display()
+        .to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppArtifactsConfig {
+    #[serde(default = "default_app_artifacts_dir")]
+    pub root_dir: String,
+}
+
+impl Default for AppArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            root_dir: default_app_artifacts_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BugReportsConfig {
+    #[serde(default = "default_bug_reports_db_path")]
+    pub db_path: String,
+    #[serde(default = "default_bug_reports_max_reports")]
+    pub max_reports: usize,
+}
+
+impl Default for BugReportsConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_bug_reports_db_path(),
+            max_reports: default_bug_reports_max_reports(),
+        }
+    }
+}
+
+fn default_bug_reports_max_reports() -> usize {
+    30
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -424,6 +482,8 @@ struct RawConfig {
     #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
     #[serde(default)]
+    bug_reports: RawBugReportsConfig,
+    #[serde(default)]
     tmux: TmuxConfig,
     #[serde(default)]
     sm_send: SmSendConfig,
@@ -490,6 +550,13 @@ impl From<RawConfig> for AppConfig {
                 message_queue_db: paths.message_queue_db,
                 server_log_file: paths.server_log_file,
             },
+            app_artifacts: AppArtifactsConfig {
+                root_dir: paths.app_artifacts_dir,
+            },
+            bug_reports: BugReportsConfig {
+                db_path: paths.bug_reports_db,
+                max_reports: raw.bug_reports.max_reports,
+            },
             google_auth: raw.auth.google,
             external_access: raw.external_access,
             mobile_terminal: raw.mobile_terminal,
@@ -514,6 +581,10 @@ struct RawPathsConfig {
     message_queue_db: String,
     #[serde(default = "default_server_log_file")]
     server_log_file: String,
+    #[serde(default = "default_app_artifacts_dir")]
+    app_artifacts_dir: String,
+    #[serde(default = "default_bug_reports_db_path")]
+    bug_reports_db: String,
 }
 
 impl Default for RawPathsConfig {
@@ -522,6 +593,22 @@ impl Default for RawPathsConfig {
             state_file: default_state_file(),
             message_queue_db: default_message_queue_db_path(),
             server_log_file: default_server_log_file(),
+            app_artifacts_dir: default_app_artifacts_dir(),
+            bug_reports_db: default_bug_reports_db_path(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBugReportsConfig {
+    #[serde(default = "default_bug_reports_max_reports")]
+    max_reports: usize,
+}
+
+impl Default for RawBugReportsConfig {
+    fn default() -> Self {
+        Self {
+            max_reports: default_bug_reports_max_reports(),
         }
     }
 }
@@ -947,6 +1034,24 @@ sm_send:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
+    }
+
+    #[test]
+    fn raw_config_defaults_mobile_state_paths_to_repo_data_dir() {
+        let config = AppConfig::from(RawConfig::default());
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+
+        assert_eq!(
+            PathBuf::from(config.app_artifacts.root_dir),
+            repo_root.join("data/apps")
+        );
+        assert_eq!(
+            PathBuf::from(config.bug_reports.db_path),
+            repo_root.join("data/bug_reports.db")
+        );
     }
 
     #[test]

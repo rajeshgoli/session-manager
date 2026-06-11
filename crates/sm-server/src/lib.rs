@@ -1,3 +1,5 @@
+pub mod app_artifacts;
+pub mod bug_reports;
 pub mod config;
 pub mod http;
 pub mod mobile_analytics;

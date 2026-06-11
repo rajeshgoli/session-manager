@@ -1,16 +1,19 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
+    fs,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use axum::{
-    body::to_bytes,
-    extract::{ConnectInfo, Path, Query, Request, State},
+    body::{to_bytes, Body},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::{
-        header::{AUTHORIZATION, COOKIE, HOST},
+        header::{
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+        },
         HeaderMap, StatusCode,
     },
     response::{
@@ -32,6 +35,11 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use crate::app_artifacts::{
+    hashed_path, read_metadata, store_artifact, valid_app_name, valid_artifact_hash,
+    APP_ARTIFACT_MAX_SIZE_BYTES,
+};
+use crate::bug_reports::{BugReportStore, CreateBugReport};
 use crate::config::{trimmed, AppConfig, PublicNodeConfig};
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::queue::{
@@ -55,6 +63,10 @@ const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
 const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
+const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
+const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
+const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
+const BUG_REPORT_MAX_SERVER_STATE_CHARS: usize = 200_000;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -81,6 +93,16 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/session", get(auth_session))
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/analytics/summary", get(client_analytics_summary))
+        .route("/client/request-status", post(client_request_status))
+        .route("/client/bug-reports", post(submit_client_bug_report))
+        .route("/deploy/{app_name}", post(deploy_app_artifact))
+        .route("/apps/{app_name}/latest.apk", get(get_latest_app_artifact))
+        .route("/apps/{app_name}/meta.json", get(get_app_artifact_metadata))
+        .route(
+            "/apps/{app_name}/{artifact_file}",
+            get(get_hashed_app_artifact),
+        )
+        .route("/apk", get(get_legacy_apk_download))
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
@@ -141,6 +163,9 @@ pub fn router(state: AppState) -> Router {
         .route("/client/sessions", get(list_client_sessions))
         .route("/client/sessions/{session_id}", get(get_client_session))
         .fallback(not_found)
+        .layer(DefaultBodyLimit::max(
+            APP_ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024,
+        ))
         .with_state(Arc::new(state))
 }
 
@@ -228,6 +253,457 @@ async fn client_analytics_summary(
         &state.config,
         &state.session_store,
     )?))
+}
+
+async fn client_request_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<ClientRequestStatusResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/client/request-status",
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let sessions = state.session_store.list_sessions(false)?;
+    let runtime = state
+        .config
+        .rust_core
+        .runtime_enabled
+        .then(|| TmuxRuntime::from_app_config(&state.config));
+    let mut delivered_count = 0;
+    let mut queued_count = 0;
+    let mut failed_count = 0;
+    let mut targeted_session_ids = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        targeted_session_ids.push(session.id.clone());
+        if session.provider == "codex-app" {
+            failed_count += 1;
+            continue;
+        }
+        let payload = SendCoreInputRequest {
+            text: REQUEST_STATUS_PROMPT.to_owned(),
+            delivery_mode: "important".to_owned(),
+            sender_session_id: None,
+            from_sm_send: false,
+            timeout_seconds: None,
+            notify_on_delivery: false,
+            notify_after_seconds: None,
+            notify_on_stop: false,
+            remind_soft_threshold: None,
+            remind_hard_threshold: None,
+            remind_cancel_on_reply_session_id: None,
+            parent_session_id: None,
+        };
+        let outcome = if let Some(runtime) = runtime.as_ref() {
+            if !is_primary_node(&session.node) {
+                failed_count += 1;
+                continue;
+            }
+            state
+                .session_store
+                .send_core_input_with_runtime(&session.id, payload, runtime)?
+        } else {
+            state.session_store.send_core_input(&session.id, payload)?
+        };
+        match outcome {
+            Some(result) if result.delivered => delivered_count += 1,
+            Some(result) if !matches!(result.status.as_str(), "stopped" | "killed") => {
+                queued_count += 1
+            }
+            _ => failed_count += 1,
+        }
+    }
+    Ok(Json(ClientRequestStatusResponse {
+        status: "requested",
+        prompt: REQUEST_STATUS_PROMPT,
+        targeted_count: targeted_session_ids.len(),
+        delivered_count,
+        queued_count,
+        failed_count,
+        targeted_session_ids,
+    }))
+}
+
+async fn submit_client_bug_report(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<ClientBugReportRequest>,
+) -> Result<Json<ClientBugReportResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/client/bug-reports",
+    )?;
+    let actor_email = request_actor_email_from_parts(&state.config, &headers, Some(peer_addr));
+    if actor_email.is_none() && state.config.google_auth.requested() {
+        return Err(ApiError::Auth {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required",
+            login_url: None,
+        });
+    }
+    let report_text = payload.report_text.trim().to_owned();
+    if report_text.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "report_text is required".to_owned(),
+        });
+    }
+    if report_text.chars().count() > BUG_REPORT_MAX_TEXT_CHARS {
+        return Err(ApiError::Status {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            detail: format!("report_text exceeds {BUG_REPORT_MAX_TEXT_CHARS} characters"),
+        });
+    }
+    let route = payload
+        .client_state
+        .as_ref()
+        .and_then(|value| value.get("route"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let client_state = if payload.include_debug_state {
+        validate_json_payload_size(
+            "client_state",
+            payload.client_state.clone(),
+            BUG_REPORT_MAX_CLIENT_STATE_CHARS,
+        )?
+    } else {
+        None
+    };
+    let server_state = if payload.include_debug_state {
+        validate_json_payload_size(
+            "server_state",
+            Some(bug_report_server_state(
+                &state,
+                payload.selected_session_id.as_deref(),
+            )?),
+            BUG_REPORT_MAX_SERVER_STATE_CHARS,
+        )?
+    } else {
+        None
+    };
+    let bug_report_db_path = expand_home(&state.config.bug_reports.db_path);
+    let store = BugReportStore::new(
+        bug_report_db_path.clone(),
+        state.config.bug_reports.max_reports,
+    );
+    let created = store.create_report(CreateBugReport {
+        report_text: report_text.clone(),
+        reported_by: actor_email,
+        selected_session_id: payload.selected_session_id.clone(),
+        route,
+        app_version: payload.app_version,
+        artifact_hash: payload.artifact_hash,
+        include_debug_state: payload.include_debug_state,
+        client_state,
+        server_state,
+    })?;
+    let (maintainer_notified, delivery_result) = notify_maintainer_of_bug_report(
+        &state,
+        &created.id,
+        &report_text,
+        &payload.selected_session_id,
+        &bug_report_db_path,
+    )
+    .unwrap_or_else(|error| (false, format!("failed:{}", error_name(&error))));
+    store.update_delivery_result(&created.id, &delivery_result)?;
+    Ok(Json(ClientBugReportResponse {
+        status: "submitted",
+        bug_id: created.id,
+        maintainer_notified,
+    }))
+}
+
+fn notify_maintainer_of_bug_report(
+    state: &AppState,
+    bug_id: &str,
+    report_text: &str,
+    selected_session_id: &Option<String>,
+    db_path: &std::path::Path,
+) -> Result<(bool, String), ApiError> {
+    let Some(maintainer) = state
+        .session_store
+        .lookup_agent_registration("maintainer")?
+    else {
+        return Ok((false, "maintainer_not_found".to_owned()));
+    };
+    let Some(maintainer_session) = state.session_store.get_session(&maintainer.session_id)? else {
+        return Ok((false, "maintainer_not_found".to_owned()));
+    };
+    if state.config.rust_core.runtime_enabled && !is_primary_node(&maintainer_session.node) {
+        return Ok((
+            false,
+            format!("unsupported_remote_node:{}", maintainer_session.node),
+        ));
+    }
+    let selected = selected_session_id.as_deref().unwrap_or("-");
+    let message = format!(
+        "[app bug] {bug_id}\nreport: {}\nsession: {selected}\ndb: {}",
+        bug_report_summary(report_text),
+        db_path.display()
+    );
+    let payload = SendCoreInputRequest {
+        text: message,
+        delivery_mode: "important".to_owned(),
+        sender_session_id: None,
+        from_sm_send: false,
+        timeout_seconds: None,
+        notify_on_delivery: false,
+        notify_after_seconds: None,
+        notify_on_stop: false,
+        remind_soft_threshold: None,
+        remind_hard_threshold: None,
+        remind_cancel_on_reply_session_id: None,
+        parent_session_id: None,
+    };
+    let outcome = if state.config.rust_core.runtime_enabled {
+        let runtime = TmuxRuntime::from_app_config(&state.config);
+        state.session_store.send_core_input_with_runtime(
+            &maintainer.session_id,
+            payload,
+            &runtime,
+        )?
+    } else {
+        state
+            .session_store
+            .send_core_input(&maintainer.session_id, payload)?
+    };
+    let Some(outcome) = outcome else {
+        return Ok((false, "maintainer_not_found".to_owned()));
+    };
+    if outcome.delivered {
+        return Ok((true, "delivered".to_owned()));
+    }
+    if matches!(outcome.status.as_str(), "stopped" | "killed") {
+        return Ok((false, outcome.status));
+    }
+    Ok((true, "queued".to_owned()))
+}
+
+fn bug_report_summary(report_text: &str) -> String {
+    let mut summary = report_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.chars().count() > 160 {
+        summary = summary.chars().take(157).collect::<String>();
+        summary.push_str("...");
+    }
+    summary
+}
+
+fn error_name(error: &ApiError) -> &'static str {
+    match error {
+        ApiError::Internal(_) => "internal",
+        ApiError::NotFound(_) => "not_found",
+        ApiError::Status { .. } => "status",
+        ApiError::Auth { .. } => "auth",
+    }
+}
+
+async fn deploy_app_artifact(
+    State(state): State<Arc<AppState>>,
+    Path(app_name): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<AppArtifactDeployResponse>, ApiError> {
+    if !valid_app_name(&app_name) {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Invalid app name".to_owned(),
+        });
+    }
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/deploy/{app_name}"),
+    )?;
+    let Some(actor_email) =
+        request_actor_email_from_parts(&state.config, &headers, Some(peer_addr))
+    else {
+        return Err(ApiError::Auth {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required",
+            login_url: None,
+        });
+    };
+
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut version_code: Option<i64> = None;
+    let mut version_name: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Expected multipart form upload: {error}"),
+        })?
+    {
+        let name = field.name().unwrap_or("").to_owned();
+        match name.as_str() {
+            "file" => {
+                let bytes = field.bytes().await.map_err(|error| ApiError::Status {
+                    status: StatusCode::BAD_REQUEST,
+                    detail: format!("Failed to read multipart file: {error}"),
+                })?;
+                if bytes.len() > APP_ARTIFACT_MAX_SIZE_BYTES {
+                    return Err(ApiError::Status {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        detail: "Artifact exceeds 100 MB limit".to_owned(),
+                    });
+                }
+                file_bytes = Some(bytes.to_vec());
+            }
+            "version_code" => {
+                let value = field.text().await.unwrap_or_default();
+                let value = value.trim();
+                if !value.is_empty() {
+                    version_code = Some(value.parse().map_err(|_| ApiError::Status {
+                        status: StatusCode::BAD_REQUEST,
+                        detail: "version_code must be an integer".to_owned(),
+                    })?);
+                }
+            }
+            "version_name" => {
+                let value = field.text().await.unwrap_or_default();
+                let value = value.trim();
+                if !value.is_empty() {
+                    version_name = Some(value.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(file_bytes) = file_bytes else {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Missing multipart field 'file'".to_owned(),
+        });
+    };
+    if file_bytes.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Uploaded artifact is empty".to_owned(),
+        });
+    }
+
+    let root = expand_home(&state.config.app_artifacts.root_dir);
+    let stored = store_artifact(
+        &root,
+        &app_name,
+        &file_bytes,
+        Some(actor_email),
+        version_code,
+        version_name,
+    )
+    .map_err(|error| ApiError::Status {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: format!("Failed to store artifact: {error}"),
+    })?;
+    Ok(Json(AppArtifactDeployResponse {
+        ok: true,
+        app: app_name.clone(),
+        size_bytes: stored.size_bytes,
+        download_url: format!("/apps/{app_name}/latest.apk"),
+        artifact_hash: stored.artifact_hash,
+    }))
+}
+
+async fn get_latest_app_artifact(
+    State(state): State<Arc<AppState>>,
+    Path(app_name): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    if !valid_app_name(&app_name) {
+        return Err(ApiError::NotFound("Artifact not found"));
+    }
+    let root = expand_home(&state.config.app_artifacts.root_dir);
+    let metadata =
+        read_metadata(&root, &app_name).map_err(|_| ApiError::NotFound("Artifact not found"))?;
+    if !valid_artifact_hash(&metadata.artifact_hash) {
+        return Err(ApiError::NotFound("Artifact not found"));
+    }
+    Ok((
+        StatusCode::FOUND,
+        [
+            (
+                LOCATION,
+                format!("/apps/{app_name}/{}.apk", metadata.artifact_hash),
+            ),
+            (CACHE_CONTROL, "no-cache".to_owned()),
+        ],
+    )
+        .into_response())
+}
+
+async fn get_hashed_app_artifact(
+    State(state): State<Arc<AppState>>,
+    Path((app_name, artifact_file)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(artifact_hash) = artifact_file.strip_suffix(".apk") else {
+        return Err(ApiError::NotFound("Artifact not found"));
+    };
+    if !valid_app_name(&app_name) || !valid_artifact_hash(artifact_hash) {
+        return Err(ApiError::NotFound("Artifact not found"));
+    }
+    let root = expand_home(&state.config.app_artifacts.root_dir);
+    let path = hashed_path(&root, &app_name, artifact_hash);
+    let bytes = fs::read(&path).map_err(|_| ApiError::NotFound("Artifact not found"))?;
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                CONTENT_TYPE,
+                "application/vnd.android.package-archive".to_owned(),
+            ),
+            (
+                CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_owned(),
+            ),
+            (
+                CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{app_name}.apk\""),
+            ),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+async fn get_app_artifact_metadata(
+    State(state): State<Arc<AppState>>,
+    Path(app_name): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    if !valid_app_name(&app_name) {
+        return Err(ApiError::NotFound("Artifact metadata not found"));
+    }
+    let root = expand_home(&state.config.app_artifacts.root_dir);
+    let metadata = read_metadata(&root, &app_name)
+        .map_err(|_| ApiError::NotFound("Artifact metadata not found"))?;
+    Ok(Json(serde_json::to_value(metadata)?))
+}
+
+async fn get_legacy_apk_download(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    Ok((
+        StatusCode::FOUND,
+        [(LOCATION, "/apps/session-manager-android/latest.apk")],
+    )
+        .into_response())
 }
 
 async fn events_state(
@@ -1885,6 +2361,12 @@ fn is_static_sessions_path(path: &str) -> bool {
 }
 
 fn is_retained_write_surface(method: &str, path: &str) -> bool {
+    if method == "POST" && (path == "/client/request-status" || path == "/client/bug-reports") {
+        return true;
+    }
+    if method == "POST" && path.starts_with("/deploy/") {
+        return true;
+    }
     if method == "POST" && (path == "/sessions" || path == "/sessions/input-batch") {
         return true;
     }
@@ -1916,12 +2398,14 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
     }
     path == "/events"
         || path == "/events/state"
+        || path == "/apk"
         || path == "/client/analytics/summary"
         || path == "/codex-review-requests"
         || path == "/queue-jobs"
         || path == "/nodes"
         || path == "/sessions"
         || path == "/client/sessions"
+        || path.starts_with("/apps/")
         || path.starts_with("/sessions/")
         || path.starts_with("/client/sessions/")
 }
@@ -2194,6 +2678,77 @@ fn authenticated_user(headers: &HeaderMap, config: &AppConfig) -> Option<Authent
     browser_session_user(headers, config)
 }
 
+fn request_actor_email_from_parts(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> Option<String> {
+    if let Some(user) = authenticated_user(headers, config) {
+        return Some(user.email.trim().to_ascii_lowercase());
+    }
+    if is_local_bypass_request(headers, peer_addr, config) {
+        return Some("local_bypass".to_owned());
+    }
+    None
+}
+
+fn validate_json_payload_size(
+    field_name: &str,
+    payload: Option<Value>,
+    max_chars: usize,
+) -> Result<Option<Value>, ApiError> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let raw = serde_json::to_string(&payload).map_err(|_| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: format!("{field_name} must be JSON serializable"),
+    })?;
+    if raw.chars().count() > max_chars {
+        return Err(ApiError::Status {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            detail: format!("{field_name} exceeds {max_chars} serialized characters"),
+        });
+    }
+    Ok(Some(payload))
+}
+
+fn bug_report_server_state(
+    state: &AppState,
+    selected_session_id: Option<&str>,
+) -> Result<Value, ApiError> {
+    let sessions = state
+        .session_store
+        .list_sessions(false)?
+        .into_iter()
+        .map(SessionResponse::from)
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_session = if let Some(session_id) = selected_session_id {
+        match state.session_store.get_session(session_id)? {
+            Some(session) => json!({
+                "found": true,
+                "session": ClientSessionResponse::from(session),
+            }),
+            None => json!({
+                "id": session_id,
+                "found": false,
+            }),
+        }
+    } else {
+        Value::Null
+    };
+    Ok(json!({
+        "captured_at": now_rfc3339(),
+        "bootstrap": client_bootstrap_response(&state.config),
+        "health": {
+            "status": "healthy",
+        },
+        "sessions": sessions,
+        "selected_session": selected_session,
+    }))
+}
+
 fn device_auth_user(headers: &HeaderMap, config: &AppConfig) -> Option<AuthenticatedUser> {
     let token = request_bearer_token(headers)?;
     let secret = trimmed(&config.google_auth.session_cookie_secret)?;
@@ -2432,6 +2987,52 @@ struct SessionOutputQuery {
 struct KillSessionRequest {
     #[serde(default)]
     requester_session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientRequestStatusResponse {
+    status: &'static str,
+    prompt: &'static str,
+    targeted_count: usize,
+    delivered_count: usize,
+    queued_count: usize,
+    failed_count: usize,
+    targeted_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientBugReportRequest {
+    report_text: String,
+    #[serde(default = "default_true")]
+    include_debug_state: bool,
+    #[serde(default)]
+    selected_session_id: Option<String>,
+    #[serde(default)]
+    client_state: Option<Value>,
+    #[serde(default)]
+    app_version: Option<String>,
+    #[serde(default)]
+    artifact_hash: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+struct ClientBugReportResponse {
+    status: &'static str,
+    bug_id: String,
+    maintainer_notified: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AppArtifactDeployResponse {
+    ok: bool,
+    app: String,
+    size_bytes: u64,
+    download_url: String,
+    artifact_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
