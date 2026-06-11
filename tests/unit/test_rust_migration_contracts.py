@@ -258,6 +258,41 @@ def test_manifest_covers_retained_codex_read_http_surfaces():
     )
 
 
+def test_manifest_covers_implemented_detail_http_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    required_ids = {
+        "http.queue_job_detail",
+        "http.codex_review_request_detail",
+    }
+
+    missing = required_ids - set(checks)
+    assert not missing
+    for check_id in required_ids:
+        check = checks[check_id]
+        assert check.classification == "retained"
+        assert check.target == "python_and_rust"
+        assert check.safety == "read_only"
+        assert check.method == "GET"
+        assert check.expected_status == (200,)
+
+    queue_job = checks["http.queue_job_detail"]
+    assert queue_job.path == "/queue-jobs/{queue_job_id}"
+    assert "fixture:queue_job_id" in queue_job.preconditions
+    assert any(
+        expectation.path == "/id" and expectation.equals == "{queue_job_id}"
+        for expectation in queue_job.expected_json
+    )
+
+    codex_review = checks["http.codex_review_request_detail"]
+    assert codex_review.path == "/codex-review-requests/{codex_review_request_id}"
+    assert "fixture:codex_review_request_id" in codex_review.preconditions
+    assert any(
+        expectation.path == "/id" and expectation.equals == "{codex_review_request_id}"
+        for expectation in codex_review.expected_json
+    )
+
+
 def test_manifest_covers_native_mobile_support_http_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
