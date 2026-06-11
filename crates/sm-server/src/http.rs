@@ -34,7 +34,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{trimmed, AppConfig, PublicNodeConfig};
 use crate::mobile_analytics::build_mobile_analytics_summary;
-use crate::queue::{CodexReviewRequestFilters, CodexReviewRequestRegistration, RetainedQueueStore};
+use crate::queue::{
+    CodexReviewRequestFilters, CodexReviewRequestRegistration, QueueJobFilters, QueueJobRecord,
+    RetainedQueueStore,
+};
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
@@ -81,6 +84,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
+        .route("/queue-jobs", get(list_queue_jobs))
         .route("/codex-review-requests", get(list_codex_review_requests))
         .route("/nodes", get(list_nodes))
         .route("/sessions", get(list_sessions).post(create_session))
@@ -618,6 +622,50 @@ async fn list_codex_review_requests(
         requests.push(codex_review_request_response(&state, registration)?);
     }
     Ok(Json(json!({ "requests": requests })))
+}
+
+async fn list_queue_jobs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListQueueJobsQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let notify_session_id = if let Some(notify_target) = query
+        .notify_target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let Some(session) = resolve_session_or_registry_role(&state, notify_target)? else {
+            return Err(ApiError::NotFound("Notify target not found"));
+        };
+        Some(session.id)
+    } else {
+        None
+    };
+
+    let queue_state_dir = state.config.queue_runner_state_dir();
+    let queue_db_path = expand_home(&queue_state_dir.to_string_lossy()).join("queue_runner.db");
+    let jobs = RetainedQueueStore::list_queue_jobs_from_path(
+        &queue_db_path,
+        QueueJobFilters {
+            notify_session_id,
+            job_type: query
+                .job_type
+                .as_ref()
+                .and_then(|value| trimmed(&Some(value.clone()))),
+            state: query
+                .state
+                .as_ref()
+                .and_then(|value| trimmed(&Some(value.clone()))),
+            include_terminal: query.include_terminal,
+        },
+    )?;
+    let mut response_jobs = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        response_jobs.push(queue_job_response(&state, job)?);
+    }
+    Ok(Json(json!({ "jobs": response_jobs })))
 }
 
 fn resolve_session_or_registry_role(
@@ -1591,6 +1639,13 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
+        "/queue-jobs" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         "/client/bootstrap" => Some(serde_json::to_vec(&shadow_client_bootstrap_response(
             &state.config,
         ))?),
@@ -1881,6 +1936,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/events/state"
         || path == "/client/analytics/summary"
         || path == "/codex-review-requests"
+        || path == "/queue-jobs"
         || path == "/nodes"
         || path == "/sessions"
         || path == "/client/sessions"
@@ -2374,6 +2430,18 @@ struct ListCodexReviewRequestsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListQueueJobsQuery {
+    #[serde(default)]
+    notify_target: Option<String>,
+    #[serde(default, rename = "type")]
+    job_type: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    include_terminal: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct SessionOutputQuery {
     lines: Option<usize>,
 }
@@ -2514,6 +2582,46 @@ fn codex_review_request_response(
         "last_error": registration.last_error,
         "state": registration.state,
         "is_active": registration.is_active,
+    }))
+}
+
+fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, ApiError> {
+    let requester_name = match job.requester_session_id.as_deref() {
+        Some(session_id) => state
+            .session_store
+            .get_session(session_id)?
+            .map(session_display_name),
+        None => None,
+    };
+    let notify_name = match job.notify_session_id.as_deref() {
+        Some(session_id) => state
+            .session_store
+            .get_session(session_id)?
+            .map(session_display_name)
+            .or_else(|| Some(session_id.to_owned())),
+        None => None,
+    };
+    Ok(json!({
+        "id": job.id,
+        "type": job.job_type,
+        "label": job.label,
+        "requester_session_id": job.requester_session_id,
+        "requester_name": requester_name,
+        "notify_session_id": job.notify_session_id,
+        "notify_name": notify_name,
+        "cwd": job.cwd,
+        "argv": job.argv,
+        "script_path": job.script_path,
+        "timeout_seconds": job.timeout_seconds,
+        "state": job.state,
+        "holding_reason": job.holding_reason,
+        "queued_at": job.queued_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "pid": job.pid,
+        "process_group_id": job.process_group_id,
+        "exit_code": job.exit_code,
+        "log_path": job.log_path,
     }))
 }
 

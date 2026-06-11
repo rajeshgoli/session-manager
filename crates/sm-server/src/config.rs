@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, env, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -18,6 +22,7 @@ pub struct AppConfig {
     pub codex: ProviderLaunchConfig,
     pub codex_fork: CodexForkLaunchConfig,
     pub nodes: NodesConfig,
+    pub queue_runner: QueueRunnerConfig,
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
 }
@@ -40,6 +45,7 @@ impl Default for AppConfig {
             codex: ProviderLaunchConfig::new("codex".to_owned(), Vec::new(), None),
             codex_fork: CodexForkLaunchConfig::default(),
             nodes: NodesConfig::default(),
+            queue_runner: QueueRunnerConfig::default(),
             rust_shadow: RustShadowConfig::default(),
             rust_core: RustCoreConfig::default(),
         }
@@ -81,6 +87,13 @@ impl AppConfig {
         }
 
         Ok(config)
+    }
+
+    pub fn queue_runner_state_dir(&self) -> PathBuf {
+        if !self.queue_runner.configured && self.paths.state_file != default_state_file() {
+            return queue_runner_state_dir_for_state_file(&self.paths.state_file);
+        }
+        PathBuf::from(&self.queue_runner.state_dir)
     }
 }
 
@@ -325,6 +338,45 @@ fn default_server_log_file() -> String {
     "/tmp/session-manager.log".to_owned()
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueRunnerConfig {
+    #[serde(default = "default_queue_runner_state_dir")]
+    pub state_dir: String,
+    #[serde(skip)]
+    pub configured: bool,
+}
+
+impl Default for QueueRunnerConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: default_queue_runner_state_dir(),
+            configured: false,
+        }
+    }
+}
+
+fn default_queue_runner_state_dir() -> String {
+    "~/.local/share/claude-sessions/queue-runner".to_owned()
+}
+
+fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
+    if state_file == default_state_file() {
+        return QueueRunnerConfig::default();
+    }
+    QueueRunnerConfig {
+        state_dir: queue_runner_state_dir_for_state_file(state_file)
+            .to_string_lossy()
+            .into_owned(),
+        configured: false,
+    }
+}
+
+fn queue_runner_state_dir_for_state_file(state_file: &str) -> PathBuf {
+    let state_file = Path::new(state_file);
+    let parent = state_file.parent().unwrap_or_else(|| Path::new("."));
+    parent.join("queue-runner")
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
@@ -382,6 +434,8 @@ struct RawConfig {
     #[serde(default)]
     nodes: YamlValue,
     #[serde(default)]
+    queue_runner: Option<QueueRunnerConfig>,
+    #[serde(default)]
     timeouts: RawTimeoutsConfig,
     #[serde(default)]
     rust_shadow: RustShadowConfig,
@@ -393,6 +447,13 @@ impl From<RawConfig> for AppConfig {
     fn from(raw: RawConfig) -> Self {
         let mut rust_core = raw.rust_core;
         let paths = raw.paths;
+        let queue_runner = raw
+            .queue_runner
+            .map(|mut config| {
+                config.configured = true;
+                config
+            })
+            .unwrap_or_else(|| queue_runner_config_for_state_file(&paths.state_file));
         let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new());
         let codex = provider_launch_config(raw.codex, "codex", None, Vec::new());
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
@@ -436,6 +497,7 @@ impl From<RawConfig> for AppConfig {
             codex,
             codex_fork,
             nodes: nodes_config_from_yaml(raw.nodes),
+            queue_runner,
             rust_shadow: raw.rust_shadow,
             rust_core,
         }
@@ -883,6 +945,37 @@ sm_send:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
+    }
+
+    #[test]
+    fn raw_config_reads_queue_runner_state_dir() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+queue_runner:
+  state_dir: /tmp/custom-queue-runner
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.queue_runner.state_dir, "/tmp/custom-queue-runner");
+    }
+
+    #[test]
+    fn raw_config_derives_queue_runner_state_dir_from_custom_state_file() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+paths:
+  state_file: /tmp/sm-fixture/sessions.json
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            config.queue_runner.state_dir,
+            "/tmp/sm-fixture/queue-runner"
+        );
     }
 
     #[test]

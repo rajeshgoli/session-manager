@@ -41,6 +41,7 @@ CORE_READ_CHECK_IDS = (
     "http.client_sessions",
     "http.nodes_list",
     "http.codex_review_requests_list",
+    "http.queue_jobs_list",
     "http.api_sessions_absent",
     "http.public_watch_operational_data_denied",
     "http.scheduler_remind_retired",
@@ -48,9 +49,7 @@ CORE_READ_CHECK_IDS = (
     "http.queue_policy_runs_retired",
 )
 
-MVP_GAP_PROBE_CHECK_IDS = (
-    "http.queue_jobs_list",
-)
+MVP_GAP_PROBE_CHECK_IDS = ()
 
 BASELINE_CHECK_IDS = (
     "http.health",
