@@ -383,14 +383,15 @@ async fn submit_client_bug_report(
     } else {
         None
     };
+    let bug_report_db_path = expand_home(&state.config.bug_reports.db_path);
     let store = BugReportStore::new(
-        expand_home(&state.config.bug_reports.db_path),
+        bug_report_db_path.clone(),
         state.config.bug_reports.max_reports,
     );
     let created = store.create_report(CreateBugReport {
-        report_text,
+        report_text: report_text.clone(),
         reported_by: actor_email,
-        selected_session_id: payload.selected_session_id,
+        selected_session_id: payload.selected_session_id.clone(),
         route,
         app_version: payload.app_version,
         artifact_hash: payload.artifact_hash,
@@ -398,12 +399,104 @@ async fn submit_client_bug_report(
         client_state,
         server_state,
     })?;
-    store.update_delivery_result(&created.id, "not_attempted")?;
+    let (maintainer_notified, delivery_result) = notify_maintainer_of_bug_report(
+        &state,
+        &created.id,
+        &report_text,
+        &payload.selected_session_id,
+        &bug_report_db_path,
+    )
+    .unwrap_or_else(|error| (false, format!("failed:{}", error_name(&error))));
+    store.update_delivery_result(&created.id, &delivery_result)?;
     Ok(Json(ClientBugReportResponse {
         status: "submitted",
         bug_id: created.id,
-        maintainer_notified: false,
+        maintainer_notified,
     }))
+}
+
+fn notify_maintainer_of_bug_report(
+    state: &AppState,
+    bug_id: &str,
+    report_text: &str,
+    selected_session_id: &Option<String>,
+    db_path: &std::path::Path,
+) -> Result<(bool, String), ApiError> {
+    let Some(maintainer) = state
+        .session_store
+        .lookup_agent_registration("maintainer")?
+    else {
+        return Ok((false, "maintainer_not_found".to_owned()));
+    };
+    let Some(maintainer_session) = state.session_store.get_session(&maintainer.session_id)? else {
+        return Ok((false, "maintainer_not_found".to_owned()));
+    };
+    if state.config.rust_core.runtime_enabled && !is_primary_node(&maintainer_session.node) {
+        return Ok((
+            false,
+            format!("unsupported_remote_node:{}", maintainer_session.node),
+        ));
+    }
+    let selected = selected_session_id.as_deref().unwrap_or("-");
+    let message = format!(
+        "[app bug] {bug_id}\nreport: {}\nsession: {selected}\ndb: {}",
+        bug_report_summary(report_text),
+        db_path.display()
+    );
+    let payload = SendCoreInputRequest {
+        text: message,
+        delivery_mode: "important".to_owned(),
+        sender_session_id: None,
+        from_sm_send: false,
+        timeout_seconds: None,
+        notify_on_delivery: false,
+        notify_after_seconds: None,
+        notify_on_stop: false,
+        remind_soft_threshold: None,
+        remind_hard_threshold: None,
+        remind_cancel_on_reply_session_id: None,
+        parent_session_id: None,
+    };
+    let outcome = if state.config.rust_core.runtime_enabled {
+        let runtime = TmuxRuntime::from_app_config(&state.config);
+        state.session_store.send_core_input_with_runtime(
+            &maintainer.session_id,
+            payload,
+            &runtime,
+        )?
+    } else {
+        state
+            .session_store
+            .send_core_input(&maintainer.session_id, payload)?
+    };
+    let Some(outcome) = outcome else {
+        return Ok((false, "maintainer_not_found".to_owned()));
+    };
+    if outcome.delivered {
+        return Ok((true, "delivered".to_owned()));
+    }
+    if matches!(outcome.status.as_str(), "stopped" | "killed") {
+        return Ok((false, outcome.status));
+    }
+    Ok((true, "queued".to_owned()))
+}
+
+fn bug_report_summary(report_text: &str) -> String {
+    let mut summary = report_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.chars().count() > 160 {
+        summary = summary.chars().take(157).collect::<String>();
+        summary.push_str("...");
+    }
+    summary
+}
+
+fn error_name(error: &ApiError) -> &'static str {
+    match error {
+        ApiError::Internal(_) => "internal",
+        ApiError::NotFound(_) => "not_found",
+        ApiError::Status { .. } => "status",
+        ApiError::Auth { .. } => "auth",
+    }
 }
 
 async fn deploy_app_artifact(

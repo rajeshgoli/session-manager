@@ -744,11 +744,20 @@ async fn client_bug_report_persists_sqlite_row_and_debug_state() {
     let bug_id = payload["bug_id"].as_str().unwrap();
     assert!(bug_id.starts_with("BR-"));
     let conn = Connection::open(&bug_db).unwrap();
-    let row: (String, Option<String>, String, String, i64, String, String) = conn
+    let row: (
+        String,
+        Option<String>,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+    ) = conn
         .query_row(
             r#"
             SELECT report_text, reported_by, route, app_version, include_debug_state,
-                   client_state_json, server_state_json
+                   client_state_json, server_state_json, maintainer_delivery_result
             FROM bug_reports
             WHERE id = ?
             "#,
@@ -762,6 +771,7 @@ async fn client_bug_report_persists_sqlite_row_and_debug_state() {
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -773,6 +783,98 @@ async fn client_bug_report_persists_sqlite_row_and_debug_state() {
     assert_eq!(row.4, 1);
     assert!(row.5.contains("\"screen\":\"sessions\""));
     assert!(row.6.contains("\"selected_session\""));
+    assert_eq!(row.7.as_deref(), Some("maintainer_not_found"));
+}
+
+#[tokio::test]
+async fn client_bug_report_notifies_registered_maintainer() {
+    let state_file = unique_temp_path();
+    let maintainer_log = unique_temp_path();
+    let selected_log = unique_temp_path();
+    let bug_db = unique_temp_path();
+    fs::write(&maintainer_log, "").unwrap();
+    fs::write(&selected_log, "").unwrap();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "maint01",
+                    "name": "claude-maint01",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-maint01",
+                    "tmux_socket_name": null,
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": maintainer_log.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "maintainer"
+                },
+                {
+                    "id": "run12345",
+                    "name": "claude-run12345",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-run12345",
+                    "node": "primary",
+                    "provider": "claude",
+                    "log_file": selected_log.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ],
+            "agent_registrations": [
+                {
+                    "role": "maintainer",
+                    "session_id": "maint01",
+                    "created_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        bug_reports: BugReportsConfig {
+            db_path: bug_db.display().to_string(),
+            max_reports: 30,
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/client/bug-reports",
+        json!({
+            "report_text": "important   mobile\nfailure",
+            "include_debug_state": false,
+            "selected_session_id": "run12345"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["maintainer_notified"], true);
+    let bug_id = payload["bug_id"].as_str().unwrap();
+    let maintainer_output = fs::read_to_string(&maintainer_log).unwrap();
+    assert!(maintainer_output.contains(&format!("[app bug] {bug_id}")));
+    assert!(maintainer_output.contains("report: important mobile failure"));
+    assert!(maintainer_output.contains("session: run12345"));
+    assert!(maintainer_output.contains(&format!("db: {}", bug_db.display())));
+    let conn = Connection::open(&bug_db).unwrap();
+    let delivery_result: String = conn
+        .query_row(
+            "SELECT maintainer_delivery_result FROM bug_reports WHERE id = ?",
+            [bug_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivery_result, "delivered");
 }
 
 #[tokio::test]
