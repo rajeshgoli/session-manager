@@ -67,6 +67,7 @@ use crate::app_artifacts::{
     APP_ARTIFACT_MAX_SIZE_BYTES,
 };
 use crate::bug_reports::{BugReportStore, CreateBugReport};
+use crate::codex_activity::{list_codex_activity_actions_from_path, CodexActivityActionsResponse};
 use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
 use crate::codex_requests::{list_codex_pending_requests_from_path, CodexPendingRequestsResponse};
 use crate::config::{
@@ -339,6 +340,10 @@ pub fn router(state: AppState) -> Router {
         .route("/registry/{role}", get(lookup_agent_registry))
         .route("/sessions/{session_id}/output", get(session_output))
         .route("/sessions/{session_id}/tool-calls", get(session_tool_calls))
+        .route(
+            "/sessions/{session_id}/activity-actions",
+            get(session_activity_actions),
+        )
         .route(
             "/sessions/{session_id}/codex-events",
             get(session_codex_events),
@@ -3791,6 +3796,34 @@ async fn session_tool_calls(
     }))
 }
 
+async fn session_activity_actions(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    uri: Uri,
+    request: Request,
+) -> Result<Json<CodexActivityActionsResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let query = SessionActivityActionsQuery::parse(uri.query().unwrap_or(""))?;
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    if session.provider != "codex-app" {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "activity actions supported only for provider=codex-app".to_owned(),
+        });
+    }
+    if !state.config.codex_rollout.enable_observability_projection {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "codex activity projection disabled by rollout flag".to_owned(),
+        });
+    }
+    let db_path = expand_home(&state.config.codex_observability.db_path);
+    let response = list_codex_activity_actions_from_path(&db_path, &session_id, query.limit)?;
+    Ok(Json(response))
+}
+
 async fn session_codex_events(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -4256,6 +4289,53 @@ fn shadow_predict_session_read(
                 support_status: "implemented_read",
             }));
         };
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/activity-actions"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
+        if SessionActivityActionsQuery::parse(query_string).is_err() {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+        let Some(session) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        if session.provider != "codex-app" {
+            let body = serde_json::to_vec(
+                &json!({ "detail": "activity actions supported only for provider=codex-app" }),
+            )?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        }
+        if !state.config.codex_rollout.enable_observability_projection {
+            let body = serde_json::to_vec(
+                &json!({ "detail": "codex activity projection disabled by rollout flag" }),
+            )?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        }
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
             body_sha256: None,
@@ -6531,6 +6611,33 @@ impl SessionCodexEventsQuery {
             }
         };
         Ok(Self { since_seq, limit })
+    }
+}
+
+struct SessionActivityActionsQuery {
+    limit: usize,
+}
+
+impl SessionActivityActionsQuery {
+    fn parse(query_string: &str) -> Result<Self, ApiError> {
+        let limit_value = decoded_last_query_value(query_string, "limit")?;
+        let limit = match limit_value.as_deref() {
+            None => 20,
+            Some(value) => {
+                let parsed = value.parse::<i64>().map_err(|_| ApiError::Status {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    detail: "limit must be between 1 and 200".to_owned(),
+                })?;
+                if !(1..=200).contains(&parsed) {
+                    return Err(ApiError::Status {
+                        status: StatusCode::UNPROCESSABLE_ENTITY,
+                        detail: "limit must be between 1 and 200".to_owned(),
+                    });
+                }
+                parsed as usize
+            }
+        };
+        Ok(Self { limit })
     }
 }
 
