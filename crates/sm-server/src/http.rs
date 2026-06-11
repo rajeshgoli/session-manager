@@ -68,6 +68,7 @@ use crate::app_artifacts::{
 };
 use crate::bug_reports::{BugReportStore, CreateBugReport};
 use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
+use crate::codex_requests::{list_codex_pending_requests_from_path, CodexPendingRequestsResponse};
 use crate::config::{
     trimmed, AppConfig, MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PublicNodeConfig,
 };
@@ -341,6 +342,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/sessions/{session_id}/codex-events",
             get(session_codex_events),
+        )
+        .route(
+            "/sessions/{session_id}/codex-pending-requests",
+            get(session_codex_pending_requests),
         )
         .route("/client/sessions", get(list_client_sessions))
         .route(
@@ -3815,6 +3820,35 @@ async fn session_codex_events(
     Ok(Json(response))
 }
 
+async fn session_codex_pending_requests(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    uri: Uri,
+    request: Request,
+) -> Result<Json<CodexPendingRequestsResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let query = SessionCodexPendingRequestsQuery::parse(uri.query().unwrap_or(""))?;
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    if session.provider != "codex-app" {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "codex requests supported only for provider=codex-app".to_owned(),
+        });
+    }
+    if !state.config.codex_rollout.enable_structured_requests {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "codex structured requests disabled by rollout flag".to_owned(),
+        });
+    }
+    let db_path = expand_home(&state.config.codex_requests.db_path);
+    let response =
+        list_codex_pending_requests_from_path(&db_path, &session_id, query.include_orphaned)?;
+    Ok(Json(response))
+}
+
 async fn shadow_http(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -4262,6 +4296,53 @@ fn shadow_predict_session_read(
         if !state.config.codex_rollout.enable_durable_events {
             let body = serde_json::to_vec(
                 &json!({ "detail": "codex durable events disabled by rollout flag" }),
+            )?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        }
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/codex-pending-requests"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
+        if SessionCodexPendingRequestsQuery::parse(query_string).is_err() {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+        let Some(session) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        if session.provider != "codex-app" {
+            let body = serde_json::to_vec(
+                &json!({ "detail": "codex requests supported only for provider=codex-app" }),
+            )?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        }
+        if !state.config.codex_rollout.enable_structured_requests {
+            let body = serde_json::to_vec(
+                &json!({ "detail": "codex structured requests disabled by rollout flag" }),
             )?;
             return Ok(Some(ShadowPrediction {
                 status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
@@ -6450,6 +6531,32 @@ impl SessionCodexEventsQuery {
             }
         };
         Ok(Self { since_seq, limit })
+    }
+}
+
+struct SessionCodexPendingRequestsQuery {
+    include_orphaned: bool,
+}
+
+impl SessionCodexPendingRequestsQuery {
+    fn parse(query_string: &str) -> Result<Self, ApiError> {
+        let include_orphaned =
+            match decoded_last_query_value(query_string, "include_orphaned")?.as_deref() {
+                None => false,
+                Some(value) => parse_python_bool_query(value).ok_or_else(|| ApiError::Status {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    detail: "include_orphaned must be a boolean".to_owned(),
+                })?,
+            };
+        Ok(Self { include_orphaned })
+    }
+}
+
+fn parse_python_bool_query(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" | "t" | "y" => Some(true),
+        "false" | "0" | "off" | "no" | "f" | "n" => Some(false),
+        _ => None,
     }
 }
 
