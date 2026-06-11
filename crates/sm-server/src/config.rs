@@ -164,6 +164,18 @@ fn default_mobile_terminal_max_attaches_global() -> usize {
     4
 }
 
+fn default_mobile_terminal_initial_resize_wait_seconds() -> f64 {
+    2.0
+}
+
+fn default_mobile_terminal_history_preload_lines() -> usize {
+    4000
+}
+
+fn default_mobile_terminal_max_attach_seconds() -> u64 {
+    3600
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailConfig {
     #[serde(default = "default_email_bridge_config")]
@@ -296,6 +308,12 @@ pub struct MobileTerminalConfig {
     pub max_concurrent_attaches_per_session: usize,
     #[serde(default = "default_mobile_terminal_max_attaches_global")]
     pub max_concurrent_attaches_global: usize,
+    #[serde(default = "default_mobile_terminal_initial_resize_wait_seconds")]
+    pub initial_resize_wait_seconds: f64,
+    #[serde(default = "default_mobile_terminal_history_preload_lines")]
+    pub history_preload_lines: usize,
+    #[serde(default = "default_mobile_terminal_max_attach_seconds")]
+    pub max_attach_seconds: u64,
 }
 
 impl Default for MobileTerminalConfig {
@@ -312,6 +330,9 @@ impl Default for MobileTerminalConfig {
             max_concurrent_attaches_per_user: default_mobile_terminal_max_attaches_per_user(),
             max_concurrent_attaches_per_session: default_mobile_terminal_max_attaches_per_session(),
             max_concurrent_attaches_global: default_mobile_terminal_max_attaches_global(),
+            initial_resize_wait_seconds: default_mobile_terminal_initial_resize_wait_seconds(),
+            history_preload_lines: default_mobile_terminal_history_preload_lines(),
+            max_attach_seconds: default_mobile_terminal_max_attach_seconds(),
         }
     }
 }
@@ -1161,6 +1182,9 @@ mobile_terminal:
   max_concurrent_attaches_per_user: 2
   max_concurrent_attaches_per_session: 3
   max_concurrent_attaches_global: 8
+  initial_resize_wait_seconds: 1.5
+  history_preload_lines: 1234
+  max_attach_seconds: 600
   allowed_users:
     local_bypass:
       email: local@example.com
@@ -1192,6 +1216,9 @@ mobile_terminal:
             3
         );
         assert_eq!(config.mobile_terminal.max_concurrent_attaches_global, 8);
+        assert_eq!(config.mobile_terminal.initial_resize_wait_seconds, 1.5);
+        assert_eq!(config.mobile_terminal.history_preload_lines, 1234);
+        assert_eq!(config.mobile_terminal.max_attach_seconds, 600);
         let user = config
             .mobile_terminal
             .allowed_users
