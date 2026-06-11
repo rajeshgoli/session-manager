@@ -451,6 +451,36 @@
       "source": "specs/762_stage2_artifacts/external_client_manifest.md:26"
     },
     {
+      "id": "http.codex_events",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/sessions/{codex_app_session_id}/codex-events?limit=5",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/events", "type": "array"}
+      ],
+      "preconditions": ["live_server", "fixture:codex_app_session_id"],
+      "source": "specs/762_stage2_artifacts/route_manifest.md:69"
+    },
+    {
+      "id": "http.codex_activity_actions",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/sessions/{codex_app_session_id}/activity-actions?limit=5",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/actions", "type": "array"}
+      ],
+      "preconditions": ["live_server", "fixture:codex_app_session_id"],
+      "source": "specs/762_stage2_artifacts/route_manifest.md:70"
+    },
+    {
       "id": "http.codex_pending_requests",
       "surface": "http",
       "classification": "retained",
