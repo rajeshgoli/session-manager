@@ -1705,6 +1705,13 @@ async fn create_mobile_attach_ticket(
     cleanup_mobile_terminal_tickets(&mut tickets, now.unix_timestamp());
     tickets
         .retain(|_, ticket| !(ticket.user_id == user_id && ticket.device_key_id == device_key_id));
+    let active = state
+        .mobile_terminal_active_attaches
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal active attach store is unavailable".to_owned(),
+        })?;
     let max_global = clamp_usize(
         state.config.mobile_terminal.max_concurrent_attaches_global,
         1,
@@ -1729,7 +1736,7 @@ async fn create_mobile_attach_ticket(
         16,
         1,
     );
-    if tickets.len() >= max_global {
+    if tickets.len() + active.len() >= max_global {
         return Err(ApiError::Status {
             status: StatusCode::TOO_MANY_REQUESTS,
             detail: "Too many active mobile attaches".to_owned(),
@@ -1739,6 +1746,10 @@ async fn create_mobile_attach_ticket(
         .values()
         .filter(|ticket| ticket.user_id == user_id)
         .count()
+        + active
+            .values()
+            .filter(|attach| attach.user_id == user_id)
+            .count()
         >= max_user
     {
         return Err(ApiError::Status {
@@ -1750,6 +1761,10 @@ async fn create_mobile_attach_ticket(
         .values()
         .filter(|ticket| ticket.session_id == session.id)
         .count()
+        + active
+            .values()
+            .filter(|attach| attach.session_id == session.id)
+            .count()
         >= max_session
     {
         return Err(ApiError::Status {
@@ -1757,6 +1772,7 @@ async fn create_mobile_attach_ticket(
             detail: "Session already has an active mobile attach".to_owned(),
         });
     }
+    drop(active);
 
     tickets.insert(
         ticket_id.clone(),
@@ -5155,6 +5171,37 @@ mod tests {
         let tickets = state.mobile_terminal_tickets.lock().unwrap();
         assert_eq!(tickets.len(), 1);
         assert!(tickets.contains_key(second_body["ticket_id"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_rejects_active_attach_quota_at_mint_time() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .insert(
+                "existing".to_owned(),
+                MobileTerminalActiveAttach {
+                    user_id: "local_bypass".to_owned(),
+                    session_id: "fork1001".to_owned(),
+                    provider: "codex-fork".to_owned(),
+                    device_key_id: "test-device".to_owned(),
+                    started_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                },
+            );
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(attach_ticket_request(&signing_key, "nonce-1"))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["detail"], "Too many active mobile attaches for user");
+        assert!(state.mobile_terminal_tickets.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
