@@ -1894,6 +1894,83 @@ async fn auth_session_reports_disabled_bypass_when_google_auth_not_requested() {
 }
 
 #[tokio::test]
+async fn device_google_auth_route_preserves_validation_and_config_errors() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/device/google")
+                .header("content-type", "application/json")
+                .body(Body::from(b"{}".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        String::from_utf8_lossy(&body).contains("id_token"),
+        "body={}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, payload) = post_json(
+        app,
+        "/auth/device/google",
+        json!({"id_token": "google-id-token"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(payload["detail"], "Google auth is not configured");
+}
+
+#[tokio::test]
+async fn tmux_client_hook_preserves_local_only_and_event_validation() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/tmux-client?event=unsupported",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(payload["detail"], "unsupported tmux client event");
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/tmux-client?event=client-session-changed&session=tmux-test",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["tmux_client_event_version"], 0);
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/hooks/tmux-client?event=client-session-changed",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "tmux client hooks must originate locally"
+    );
+}
+
+#[tokio::test]
 async fn shadow_http_reports_match_for_stable_read_only_route() {
     let app = router(AppState::new(AppConfig::default()));
     let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
