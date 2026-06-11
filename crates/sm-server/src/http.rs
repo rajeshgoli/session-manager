@@ -277,6 +277,10 @@ async fn client_request_status(
     let mut targeted_session_ids = Vec::with_capacity(sessions.len());
     for session in sessions {
         targeted_session_ids.push(session.id.clone());
+        if session.provider == "codex-app" {
+            failed_count += 1;
+            continue;
+        }
         let payload = SendCoreInputRequest {
             text: REQUEST_STATUS_PROMPT.to_owned(),
             delivery_mode: "important".to_owned(),

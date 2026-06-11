@@ -32,7 +32,6 @@ pub struct StoredArtifact {
 }
 
 pub fn valid_app_name(value: &str) -> bool {
-    let value = value.trim();
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
         return false;
@@ -158,7 +157,9 @@ mod tests {
     fn app_names_match_python_managed_artifact_contract() {
         assert!(valid_app_name("session-manager-android"));
         assert!(valid_app_name("app1"));
-        for name in ["", ".", "..", "foo.bar", "_bad", "-bad", "Bad", "bad_name"] {
+        for name in [
+            "", ".", "..", "foo.bar", "_bad", "-bad", "Bad", "bad_name", "app ", " app", "app\t",
+        ] {
             assert!(!valid_app_name(name), "{name}");
         }
     }

@@ -645,6 +645,7 @@ async fn client_request_status_prompts_live_sessions() {
     let state_file = unique_temp_path();
     let first_log = unique_temp_path();
     let second_log = unique_temp_path();
+    let codex_app_log = unique_temp_path();
     fs::write(
         &state_file,
         json!({
@@ -666,6 +667,17 @@ async fn client_request_status_prompts_live_sessions() {
                     "tmux_session": "claude-mobiletwo",
                     "log_file": second_log.display().to_string(),
                     "status": "waiting_permission",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                },
+                {
+                    "id": "mobilecodexapp",
+                    "name": "codex-app-mobile",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-app-mobile",
+                    "provider": "codex-app",
+                    "log_file": codex_app_log.display().to_string(),
+                    "status": "running",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00"
                 },
@@ -695,18 +707,20 @@ async fn client_request_status_prompts_live_sessions() {
         payload["prompt"],
         "[sm] user requests status, please update now using sm status"
     );
-    assert_eq!(payload["targeted_count"], 2);
+    assert_eq!(payload["targeted_count"], 3);
     assert_eq!(payload["delivered_count"], 2);
     assert_eq!(payload["queued_count"], 0);
-    assert_eq!(payload["failed_count"], 0);
+    assert_eq!(payload["failed_count"], 1);
     assert_eq!(
         payload["targeted_session_ids"],
-        json!(["mobileone", "mobiletwo"])
+        json!(["mobileone", "mobiletwo", "mobilecodexapp"])
     );
     let first_output = fs::read_to_string(first_log).unwrap();
     assert!(first_output.contains("[sm] user requests status"));
     let second_output = fs::read_to_string(second_log).unwrap();
     assert!(second_output.contains("[sm] user requests status"));
+    let codex_app_output = fs::read_to_string(codex_app_log).unwrap_or_default();
+    assert!(!codex_app_output.contains("[sm] user requests status"));
 }
 
 #[tokio::test]
@@ -1038,6 +1052,41 @@ async fn app_artifact_upload_metadata_and_downloads_are_auth_gated() {
             .and_then(|value| value.to_str().ok()),
         Some("/apps/session-manager-android/latest.apk")
     );
+    let _ = fs::remove_dir_all(artifact_root);
+}
+
+#[tokio::test]
+async fn app_artifact_upload_rejects_encoded_whitespace_app_name() {
+    let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts-invalid");
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        app_artifacts: AppArtifactsConfig {
+            root_dir: artifact_root.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let boundary = "sm-rust-boundary-invalid";
+    let body = multipart_app_upload(boundary, b"apk-bytes", None, None);
+
+    let (status, _headers, response_body) = post_multipart_with_host_and_peer(
+        app,
+        "/deploy/session-manager-android%20",
+        "localhost",
+        body,
+        boundary,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let payload: Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(payload["detail"], "Invalid app name");
+    assert!(!artifact_root.join("session-manager-android ").exists());
     let _ = fs::remove_dir_all(artifact_root);
 }
 
