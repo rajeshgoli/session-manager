@@ -56,6 +56,10 @@ enum Command {
     Lookup(LookupArgs),
     Roster(EmptyArgs),
     Queue(QueueArgs),
+    #[command(name = "list-devices")]
+    ListDevices(ListDevicesArgs),
+    #[command(name = "remove-device")]
+    RemoveDevice(RemoveDeviceArgs),
     Review(ReviewArgs),
     #[command(name = "request-codex-review")]
     RequestCodexReview(RequestCodexReviewArgs),
@@ -265,6 +269,19 @@ struct QueueStatusArgs {
 #[derive(Args)]
 struct QueueCancelArgs {
     job_id: String,
+}
+
+#[derive(Args)]
+struct ListDevicesArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct RemoveDeviceArgs {
+    device_id: String,
+    #[arg(long = "user-id")]
+    user_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -704,6 +721,8 @@ fn run() -> Result<()> {
             }
         }
         Command::Roster(_) => print_roster(&client)?,
+        Command::ListDevices(args) => run_list_devices(&client, args)?,
+        Command::RemoveDevice(args) => run_remove_device(&client, args)?,
         Command::Wait(args) => wait_for_session(&client, &args.session_id, args.seconds)?,
         Command::SubagentStart(_) => run_subagent_start(&client)?,
         Command::SubagentStop(_) => run_subagent_stop(&client)?,
@@ -789,6 +808,81 @@ fn run_email(client: &ApiClient, args: EmailArgs) -> Result<()> {
         .unwrap_or_else(|| "recipient".to_owned());
     println!("Email sent to {to_summary}");
     Ok(())
+}
+
+fn run_list_devices(client: &ApiClient, args: ListDevicesArgs) -> Result<()> {
+    let payload = client.get_json("/client/mobile-terminal/devices")?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    print_mobile_devices(&payload)
+}
+
+fn run_remove_device(client: &ApiClient, args: RemoveDeviceArgs) -> Result<()> {
+    let device_id = args.device_id.trim();
+    if device_id.is_empty() {
+        bail!("device id is required");
+    }
+    let mut path = format!(
+        "/client/mobile-terminal/devices/{}",
+        encode_path_segment(device_id)
+    );
+    if let Some(user_id) = args
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        path.push_str("?user_id=");
+        path.push_str(&encode_query_component(user_id));
+    }
+    let payload = client.request("DELETE", &path, None)?.into_json()?;
+    let response_device_id = payload["device_key_id"].as_str().unwrap_or(device_id);
+    let user_id = payload["user_id"].as_str().unwrap_or("unknown-user");
+    let pending = payload["pending_tickets_revoked"].as_u64().unwrap_or(0);
+    let active = payload["active_attaches_terminated"].as_u64().unwrap_or(0);
+    let runtime_note = if payload["runtime_only"].as_bool().unwrap_or(false) {
+        " runtime-only"
+    } else {
+        ""
+    };
+    if payload["already_revoked"].as_bool().unwrap_or(false) {
+        println!("Device already revoked{runtime_note}: {response_device_id} ({user_id})");
+    } else {
+        println!("Device revoked{runtime_note}: {response_device_id} ({user_id})");
+    }
+    if pending > 0 || active > 0 {
+        println!("Cleared {pending} pending ticket(s); terminated {active} active attach(es)");
+    }
+    Ok(())
+}
+
+fn print_mobile_devices(payload: &Value) -> Result<()> {
+    let devices = payload["devices"]
+        .as_array()
+        .ok_or_else(|| anyhow!("device inventory response missing devices"))?;
+    if devices.is_empty() {
+        println!("No mobile terminal devices");
+        return Ok(());
+    }
+    for device in devices {
+        println!("{}", format_mobile_device_line(device));
+    }
+    Ok(())
+}
+
+fn format_mobile_device_line(device: &Value) -> String {
+    let device_id = device["device_key_id"].as_str().unwrap_or("unknown-device");
+    let user_id = device["user_id"].as_str().unwrap_or("unknown-user");
+    let state = if device["revoked"].as_bool().unwrap_or(false) {
+        "revoked"
+    } else if device["enabled"].as_bool().unwrap_or(false) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    format!("{device_id} {user_id} {state}")
 }
 
 fn split_email_targets(raw_value: &str) -> Vec<String> {
@@ -1633,6 +1727,10 @@ fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
+fn encode_query_component(value: &str) -> String {
+    encode_path_segment(value)
+}
+
 fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16)> {
     let default_port = default_port.to_string();
     let (host, port) = authority
@@ -1974,6 +2072,57 @@ mod tests {
         assert_eq!(args.message.as_deref(), Some("hello from rust"));
         assert_eq!(args.subject.as_deref(), Some("Status"));
         assert_eq!(args.cc.as_deref(), Some("carol,dave"));
+    }
+
+    #[test]
+    fn device_management_cli_parses_retained_commands() {
+        let list_cli = Cli::try_parse_from(["sm", "list-devices", "--json"]).unwrap();
+        let Command::ListDevices(list_args) = list_cli.command else {
+            panic!("expected list-devices command");
+        };
+        assert!(list_args.json);
+
+        let remove_cli = Cli::try_parse_from([
+            "sm",
+            "remove-device",
+            "android-1",
+            "--user-id",
+            "local_bypass",
+        ])
+        .unwrap();
+        let Command::RemoveDevice(remove_args) = remove_cli.command else {
+            panic!("expected remove-device command");
+        };
+        assert_eq!(remove_args.device_id, "android-1");
+        assert_eq!(remove_args.user_id.as_deref(), Some("local_bypass"));
+    }
+
+    #[test]
+    fn mobile_device_lines_show_state_without_key_material() {
+        let enabled = json!({
+            "user_id": "local_bypass",
+            "device_key_id": "android-1",
+            "enabled": true,
+            "revoked": false,
+            "public_key": "should-not-be-printed",
+        });
+        let revoked = json!({
+            "user_id": "local_bypass",
+            "device_key_id": "android-1",
+            "enabled": true,
+            "revoked": true,
+            "public_key": "should-not-be-printed",
+        });
+
+        assert_eq!(
+            format_mobile_device_line(&enabled),
+            "android-1 local_bypass enabled"
+        );
+        assert_eq!(
+            format_mobile_device_line(&revoked),
+            "android-1 local_bypass revoked"
+        );
+        assert!(!format_mobile_device_line(&enabled).contains("should-not-be-printed"));
     }
 
     #[test]
