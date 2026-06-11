@@ -199,8 +199,7 @@ By default this:
 - starts Rust `sm-server` on `http://127.0.0.1:8421` with `config.yaml`;
 - runs `scripts/rust-mvp-smoke.sh` for isolated mutating runtime coverage;
 - runs core read/retired-surface contracts against Rust;
-- probes retained MVP gaps such as `/nodes`, `/queue-jobs`, and
-  `/codex-review-requests`;
+- probes retained MVP gaps when any remain;
 - posts shadow-style read comparisons to Rust `POST /__shadow/http`;
 - writes Python and Rust baseline JSON under the report directory.
 

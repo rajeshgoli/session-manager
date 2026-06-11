@@ -1,2 +1,5 @@
 paths:
   state_file: "scripts/rust_migration/fixtures/read_only/sessions.json"
+
+queue_runner:
+  state_dir: "scripts/rust_migration/fixtures/read_only/queue-runner"

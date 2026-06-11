@@ -18,7 +18,7 @@ use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
         AppConfig, CodexForkLaunchConfig, ExternalAccessConfig, GoogleAuthConfig,
-        MobileAnalyticsConfig, PathsConfig, RustCoreConfig, SmSendConfig,
+        MobileAnalyticsConfig, PathsConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig,
     },
     http::{router, AppState},
 };
@@ -745,6 +745,249 @@ async fn codex_review_requests_rejects_public_host_without_auth() {
     assert_eq!(
         payload["login_url"],
         "/auth/google/login?next=%2Fcodex-review-requests"
+    );
+}
+
+#[tokio::test]
+async fn queue_jobs_missing_db_returns_empty_jobs() {
+    let state_file = unique_temp_path();
+    let queue_state_dir = state_file.with_extension("missing-queue-runner");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/queue-jobs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "jobs": [] }));
+}
+
+#[tokio::test]
+async fn queue_jobs_lists_rows_with_filters_and_session_names() {
+    let state_file = unique_temp_path();
+    let queue_state_dir = state_file.with_extension("queue-runner");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "requester1",
+                    "name": "codex-fork-requester1",
+                    "working_dir": "/repo/requester",
+                    "tmux_session": "codex-fork-requester1",
+                    "log_file": "/tmp/requester1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "provider": "codex-fork",
+                    "friendly_name": "stale requester",
+                    "friendly_name_updated_at_ns": 10,
+                    "native_title": "native requester",
+                    "native_title_updated_at_ns": 20
+                },
+                {
+                    "id": "notify1",
+                    "name": "codex-fork-notify1",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify1",
+                    "log_file": "/tmp/notify1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "native_title": "native notify"
+                },
+                {
+                    "id": "notify2",
+                    "name": "codex-fork-notify2",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify2",
+                    "log_file": "/tmp/notify2.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }
+            ],
+            "agent_registrations": [
+                {
+                    "role": "reviewer",
+                    "session_id": "notify1",
+                    "created_at": "2026-06-01T00:02:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_queue_jobs_fixture_db(&queue_state_dir);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs").await;
+    assert_eq!(status, StatusCode::OK);
+    let jobs = payload["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0]["id"], "job-pending");
+    assert_eq!(jobs[0]["type"], "tests");
+    assert_eq!(jobs[0]["requester_name"], "native requester");
+    assert_eq!(jobs[0]["notify_name"], "reviewer");
+    assert_eq!(jobs[0]["argv"], json!(["cargo", "test"]));
+    assert_eq!(jobs[0]["script_path"], Value::Null);
+    assert_eq!(jobs[0]["holding_reason"], "memory");
+    assert_eq!(jobs[1]["id"], "job-running");
+    assert_eq!(jobs[1]["notify_name"], "codex-fork-notify2");
+    assert_eq!(jobs[1]["script_path"], "/tmp/run-perf.sh");
+    assert_eq!(jobs[1]["pid"], 4242);
+
+    let (status, payload) =
+        get_json(app.clone(), "/queue-jobs?notify_target=notify1&type=tests").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["jobs"][0]["id"], "job-pending");
+
+    let (status, payload) =
+        get_json(app.clone(), "/queue-jobs?notify_target=reviewer&type=tests").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["jobs"][0]["id"], "job-pending");
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs?state=done").await;
+    assert_eq!(status, StatusCode::OK);
+    let failed_job = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "job-failed")
+        .unwrap();
+    assert_eq!(failed_job["requester_session_id"], "missing-requester");
+    assert_eq!(failed_job["requester_name"], Value::Null);
+    let done_ids = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(done_ids, vec!["job-succeeded", "job-failed"]);
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs?state=succeeded").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["jobs"][0]["id"], "job-succeeded");
+
+    let (status, payload) = get_json(app, "/queue-jobs?include_terminal=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let all_ids = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        all_ids,
+        vec!["job-pending", "job-running", "job-succeeded", "job-failed"]
+    );
+}
+
+#[tokio::test]
+async fn queue_jobs_uses_custom_state_file_relative_dir_by_default() {
+    let base_dir = unique_temp_path().with_extension("queue-job-state-dir");
+    fs::create_dir_all(&base_dir).unwrap();
+    let state_file = base_dir.join("sessions.json");
+    let config_file = base_dir.join("config.yaml");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    fs::write(
+        &config_file,
+        format!("paths:\n  state_file: \"{}\"\n", state_file.display()),
+    )
+    .unwrap();
+    create_queue_jobs_fixture_db(&base_dir.join("queue-runner"));
+    let app = router(AppState::new(
+        AppConfig::load_from_path(&config_file).unwrap(),
+    ));
+
+    let (status, payload) = get_json(app, "/queue-jobs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let jobs = payload["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0]["id"], "job-pending");
+    assert_eq!(jobs[1]["id"], "job-running");
+}
+
+#[tokio::test]
+async fn queue_jobs_derives_state_dir_for_direct_custom_state_config() {
+    let base_dir = unique_temp_path().with_extension("queue-job-direct-state-dir");
+    fs::create_dir_all(&base_dir).unwrap();
+    let state_file = base_dir.join("sessions.json");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_queue_jobs_fixture_db(&base_dir.join("queue-runner"));
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/queue-jobs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let jobs = payload["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0]["id"], "job-pending");
+    assert_eq!(jobs[1]["id"], "job-running");
+}
+
+#[tokio::test]
+async fn queue_jobs_unknown_notify_target_returns_404() {
+    let state_file = unique_temp_path();
+    let queue_state_dir = state_file.with_extension("queue-runner-empty");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_queue_jobs_fixture_db(&queue_state_dir);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/queue-jobs?notify_target=missing").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Notify target not found");
+}
+
+#[tokio::test]
+async fn queue_jobs_rejects_public_host_without_auth() {
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) = get_json_with_host(app, "/queue-jobs", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+    assert_eq!(
+        payload["login_url"],
+        "/auth/google/login?next=%2Fqueue-jobs"
     );
 }
 
@@ -5993,6 +6236,75 @@ fn create_codex_review_request_fixture_db(path: &PathBuf) {
              45, 900, NULL,
              NULL, '2026-06-01T00:03:30', 'pull_review', 'R_kw123',
              'https://example.com/review/R_kw123', NULL, NULL, 'completed', 1)
+        "#,
+        [],
+    )
+    .unwrap();
+}
+
+fn create_queue_jobs_fixture_db(state_dir: &PathBuf) {
+    fs::create_dir_all(state_dir).unwrap();
+    let conn = Connection::open(state_dir.join("queue_runner.db")).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE queue_jobs (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            label TEXT NOT NULL,
+            requester_session_id TEXT,
+            notify_session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            argv_json TEXT,
+            script_path TEXT,
+            env_json TEXT NOT NULL,
+            timeout_seconds INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            holding_reason TEXT,
+            queued_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            pid INTEGER,
+            process_group_id INTEGER,
+            exit_code INTEGER,
+            log_path TEXT,
+            exit_code_path TEXT,
+            wrapper_path TEXT,
+            queued_notified_at TEXT,
+            started_notified_at TEXT,
+            completion_notified_at TEXT
+        );
+        "#,
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO queue_jobs
+            (id, type, label, requester_session_id, notify_session_id, cwd,
+             argv_json, script_path, env_json, timeout_seconds, state,
+             holding_reason, queued_at, started_at, finished_at, pid,
+             process_group_id, exit_code, log_path, exit_code_path, wrapper_path,
+             queued_notified_at, started_notified_at, completion_notified_at)
+        VALUES
+            ('job-pending', 'tests', 'cargo tests', 'requester1', 'notify1', '/repo',
+             '["cargo","test"]', NULL, '{}', 900, 'pending',
+             'memory', '2026-06-01T00:00:00', NULL, NULL, NULL,
+             NULL, NULL, '/tmp/job-pending.log', NULL, NULL,
+             NULL, NULL, NULL),
+            ('job-running', 'perf', 'perf run', NULL, 'notify2', '/repo/perf',
+             NULL, '/tmp/run-perf.sh', '{}', 2700, 'running',
+             NULL, '2026-06-01T00:01:00', '2026-06-01T00:01:30', NULL, 4242,
+             4242, NULL, '/tmp/job-running.log', NULL, NULL,
+             NULL, NULL, NULL),
+            ('job-succeeded', 'tests', 'done tests', 'requester1', 'notify1', '/repo',
+             '["true"]', NULL, '{}', 900, 'succeeded',
+             NULL, '2026-06-01T00:02:00', '2026-06-01T00:02:10', '2026-06-01T00:02:20', 4343,
+             4343, 0, '/tmp/job-succeeded.log', NULL, NULL,
+             NULL, NULL, NULL),
+            ('job-failed', 'background', 'failed background', 'missing-requester', 'notify2', '/repo/bg',
+             NULL, '/tmp/fail.sh', '{}', 3600, 'failed',
+             NULL, '2026-06-01T00:03:00', '2026-06-01T00:03:10', '2026-06-01T00:03:20', 4444,
+             4444, 2, '/tmp/job-failed.log', NULL, NULL,
+             NULL, NULL, NULL)
         "#,
         [],
     )

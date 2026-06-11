@@ -53,6 +53,36 @@ pub struct CodexReviewRequestRegistration {
     pub is_active: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct QueueJobFilters {
+    pub notify_session_id: Option<String>,
+    pub job_type: Option<String>,
+    pub state: Option<String>,
+    pub include_terminal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueJobRecord {
+    pub id: String,
+    pub job_type: String,
+    pub label: String,
+    pub requester_session_id: Option<String>,
+    pub notify_session_id: Option<String>,
+    pub cwd: String,
+    pub argv: Option<Vec<String>>,
+    pub script_path: Option<String>,
+    pub timeout_seconds: i64,
+    pub state: String,
+    pub holding_reason: Option<String>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub pid: Option<i64>,
+    pub process_group_id: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub log_path: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingMessage {
     pub id: String,
@@ -138,6 +168,20 @@ impl RetainedQueueStore {
             Err(_) => return Ok(Vec::new()),
         };
         list_codex_review_requests_conn(&conn, filters)
+    }
+
+    pub fn list_queue_jobs_from_path(
+        db_path: &Path,
+        filters: QueueJobFilters,
+    ) -> Result<Vec<QueueJobRecord>> {
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(_) => return Ok(Vec::new()),
+        };
+        list_queue_jobs_conn(&conn, filters)
     }
 
     pub fn ensure_schema(&self) -> Result<()> {
@@ -898,6 +942,97 @@ fn list_codex_review_requests_conn(
             last_error: row.get(21)?,
             state: row.get(22)?,
             is_active: row.get::<_, Option<i64>>(23)?.unwrap_or(1) != 0,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn list_queue_jobs_conn(
+    conn: &Connection,
+    filters: QueueJobFilters,
+) -> Result<Vec<QueueJobRecord>> {
+    let mut where_clauses = Vec::new();
+    let mut values = Vec::<SqlValue>::new();
+    if let Some(value) = filters.notify_session_id {
+        where_clauses.push("notify_session_id = ?");
+        values.push(value.into());
+    }
+    if let Some(value) = filters.job_type {
+        where_clauses.push("type = ?");
+        values.push(value.into());
+    }
+    if let Some(value) = filters.state {
+        if value == "done" {
+            where_clauses
+                .push("state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced')");
+        } else {
+            where_clauses.push("state = ?");
+            values.push(value.into());
+        }
+    } else if !filters.include_terminal {
+        where_clauses.push("state IN ('pending', 'running')");
+    }
+
+    let mut query = r#"
+        SELECT id, type, label, requester_session_id, notify_session_id, cwd,
+               argv_json, script_path, timeout_seconds, state, holding_reason,
+               queued_at, started_at, finished_at, pid, process_group_id,
+               exit_code, log_path
+        FROM queue_jobs
+    "#
+    .to_owned();
+    if !where_clauses.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&where_clauses.join(" AND "));
+    }
+    query.push_str(" ORDER BY queued_at");
+
+    let mut statement = match conn.prepare(&query) {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table") =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+        let argv_json: Option<String> = row.get(6)?;
+        let argv = match argv_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(raw) => Some(serde_json::from_str::<Vec<String>>(raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?),
+            None => None,
+        };
+        Ok(QueueJobRecord {
+            id: row.get(0)?,
+            job_type: row.get(1)?,
+            label: row.get(2)?,
+            requester_session_id: row.get(3)?,
+            notify_session_id: row
+                .get::<_, Option<String>>(4)?
+                .filter(|value| !value.is_empty()),
+            cwd: row.get(5)?,
+            argv,
+            script_path: row.get(7)?,
+            timeout_seconds: row.get(8)?,
+            state: row.get(9)?,
+            holding_reason: row.get(10)?,
+            queued_at: row.get(11)?,
+            started_at: row.get(12)?,
+            finished_at: row.get(13)?,
+            pid: row.get(14)?,
+            process_group_id: row.get(15)?,
+            exit_code: row.get(16)?,
+            log_path: row.get(17)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
