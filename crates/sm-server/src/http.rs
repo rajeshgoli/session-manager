@@ -3885,27 +3885,27 @@ fn shadow_predict_read(
         return Ok(None);
     }
 
-    if let Some(job_id) = path.strip_prefix("/queue-jobs/") {
+    if let Some(job_id) = path
+        .strip_prefix("/queue-jobs/")
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
         let queue_state_dir = state.config.queue_runner_state_dir();
         let queue_db_path = expand_home(&queue_state_dir.to_string_lossy()).join("queue_runner.db");
-        let (status, body) =
-            match RetainedQueueStore::get_queue_job_from_path(&queue_db_path, job_id)? {
-                Some(job) => (
-                    StatusCode::OK,
-                    serde_json::to_vec(&queue_job_response(state, job).map_err(|error| {
-                        anyhow::anyhow!("queue job response failed: {error:?}")
-                    })?)?,
-                ),
-                None => (
-                    StatusCode::NOT_FOUND,
-                    serde_json::to_vec(&json!({ "detail": "Queue job not found" }))?,
-                ),
-            };
-        return Ok(Some(ShadowPrediction {
-            status: status.as_u16(),
-            body_sha256: Some(sha256_hex(&body)),
-            support_status: "implemented_read",
-        }));
+        return match RetainedQueueStore::get_queue_job_from_path(&queue_db_path, job_id)? {
+            Some(_) => Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            })),
+            None => {
+                let body = serde_json::to_vec(&json!({ "detail": "Queue job not found" }))?;
+                Ok(Some(ShadowPrediction {
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                    body_sha256: Some(sha256_hex(&body)),
+                    support_status: "implemented_read",
+                }))
+            }
+        };
     }
 
     let body = match path {
