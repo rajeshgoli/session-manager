@@ -24,7 +24,7 @@ use axum::{
             AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE,
             HOST, LOCATION, UPGRADE,
         },
-        HeaderMap, StatusCode,
+        HeaderMap, StatusCode, Uri,
     },
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -442,14 +442,16 @@ async fn client_analytics_summary(
 async fn client_request_status(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<ClientRequestStatusResponse>, ApiError> {
+    let request_target = request_target_from_uri(&uri);
     ensure_public_edge_assertion_from_parts(
         &state,
         &headers,
         Some(peer_addr),
         "POST",
-        "/client/request-status",
+        &request_target,
     )?;
     ensure_session_allowed_from_parts(
         &state.config,
@@ -521,15 +523,17 @@ async fn client_request_status(
 async fn submit_client_bug_report(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
     headers: HeaderMap,
     Json(payload): Json<ClientBugReportRequest>,
 ) -> Result<Json<ClientBugReportResponse>, ApiError> {
+    let request_target = request_target_from_uri(&uri);
     ensure_public_edge_assertion_from_parts(
         &state,
         &headers,
         Some(peer_addr),
         "POST",
-        "/client/bug-reports",
+        &request_target,
     )?;
     ensure_session_allowed_from_parts(
         &state.config,
@@ -4888,11 +4892,7 @@ fn ensure_public_edge_assertion_for_request(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|value| value.0);
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str().to_owned())
-        .unwrap_or_else(|| request.uri().path().to_owned());
+    let path = request_target_from_uri(request.uri());
     ensure_public_edge_assertion_from_parts(
         state,
         request.headers(),
@@ -4900,6 +4900,12 @@ fn ensure_public_edge_assertion_for_request(
         request.method().as_str(),
         &path,
     )
+}
+
+fn request_target_from_uri(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| uri.path().to_owned())
 }
 
 fn ensure_public_edge_assertion_from_parts(
@@ -7022,6 +7028,103 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["detail"], "Expired public edge assertion");
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_fails_closed_when_enabled_without_secret() {
+        let mut config = public_edge_config();
+        config.public_edge.assertion_secret = None;
+        let app = router(AppState::new(config));
+
+        let response = app
+            .oneshot(public_request(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["detail"],
+            "Public edge assertion is enabled but incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_binds_post_request_status_query_target() {
+        let app = router(AppState::new(public_edge_config()));
+        let target = "/client/request-status?source=mobile";
+        let mut signed_full_target = public_request(Method::POST, target, Body::empty());
+        add_public_edge_headers(
+            &mut signed_full_target,
+            "edge-secret",
+            "POST",
+            target,
+            "edge-nonce-full-target",
+        );
+
+        let response = app.clone().oneshot(signed_full_target).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["detail"], "Rust core writes are disabled");
+
+        let mut signed_bare_path = public_request(Method::POST, target, Body::empty());
+        add_public_edge_headers(
+            &mut signed_bare_path,
+            "edge-secret",
+            "POST",
+            "/client/request-status",
+            "edge-nonce-bare-path",
+        );
+
+        let response = app.oneshot(signed_bare_path).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["detail"], "Invalid public edge assertion");
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_binds_post_bug_report_query_target() {
+        let app = router(AppState::new(public_edge_config()));
+        let target = "/client/bug-reports?source=mobile";
+        let mut signed_full_target =
+            public_request(Method::POST, target, Body::from(r#"{"report_text":"   "}"#));
+        signed_full_target
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        add_public_edge_headers(
+            &mut signed_full_target,
+            "edge-secret",
+            "POST",
+            target,
+            "edge-nonce-bug-full-target",
+        );
+
+        let response = app.clone().oneshot(signed_full_target).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["detail"], "report_text is required");
+
+        let mut signed_bare_path =
+            public_request(Method::POST, target, Body::from(r#"{"report_text":"   "}"#));
+        signed_bare_path
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        add_public_edge_headers(
+            &mut signed_bare_path,
+            "edge-secret",
+            "POST",
+            "/client/bug-reports",
+            "edge-nonce-bug-bare-path",
+        );
+
+        let response = app.oneshot(signed_bare_path).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["detail"], "Invalid public edge assertion");
     }
 
     #[tokio::test]
