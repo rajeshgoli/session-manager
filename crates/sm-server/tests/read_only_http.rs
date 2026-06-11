@@ -17,7 +17,7 @@ use sm_server::config::RustShadowConfig;
 use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
-        AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig,
+        AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig, EmailConfig,
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
         PathsConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig,
     },
@@ -29,8 +29,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
-    net::SocketAddr,
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener},
     path::PathBuf,
     process::Command,
     sync::{
@@ -949,6 +949,235 @@ async fn client_bug_report_enforces_auth_and_payload_bounds() {
         .as_str()
         .unwrap()
         .contains("client_state exceeds"));
+}
+
+#[tokio::test]
+async fn human_lookup_lists_capabilities_without_email_addresses() {
+    let state_file = write_session_fixture();
+    let bridge_config = write_email_bridge_config(None, None);
+    let app = router(AppState::new(config_with_state_file_and_email(
+        &state_file,
+        &bridge_config,
+        false,
+    )));
+
+    let (status, payload) = get_json(app.clone(), "/humans").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["humans"][0]["recipient"], "operator");
+    assert_eq!(payload["humans"][0]["available_channels"], json!(["email"]));
+    assert_eq!(payload["humans"][0]["email_use"], "fallback_only");
+    assert!(
+        !serde_json::to_string(&payload)
+            .unwrap()
+            .contains("operator@example.com"),
+        "human listing must not expose private email addresses"
+    );
+
+    let (status, payload) = get_json(app, "/humans/owner").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["recipient"], "operator");
+    assert!(
+        !serde_json::to_string(&payload)
+            .unwrap()
+            .contains("operator@example.com"),
+        "human lookup must not expose private email addresses"
+    );
+}
+
+#[tokio::test]
+async fn registered_email_send_posts_resend_payload_with_routing_footer() {
+    let (resend_url, request_rx) = spawn_resend_server(200, r#"{"id":"email_123"}"#);
+    let state_file = write_session_fixture();
+    let bridge_config = write_email_bridge_config(Some(&resend_url), None);
+    let app = router(AppState::new(config_with_state_file_and_email(
+        &state_file,
+        &bridge_config,
+        false,
+    )));
+
+    let (status, payload) = post_json(
+        app,
+        "/email/send",
+        json!({
+            "requester_session_id": "run12345",
+            "recipients": ["teammate"],
+            "subject": "Status",
+            "body_text": "hello from rust"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["message_id"], "email_123");
+    assert_eq!(payload["to"][0]["username"], "teammate");
+    assert_eq!(payload["to"][0]["email"], "teammate@example.com");
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(request["path"], "/emails");
+    assert_eq!(request["authorization"], "Bearer test-api-key");
+    assert_eq!(request["body"]["to"], json!(["teammate@example.com"]));
+    assert_eq!(request["body"]["reply_to"], "reply@example.com");
+    assert!(request["body"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("SM: Runner Native run12345 claude"));
+    assert_eq!(request["body"]["headers"]["X-SM-Session-ID"], "run12345");
+}
+
+#[tokio::test]
+async fn explicit_human_email_is_required_for_human_recipients() {
+    let state_file = write_session_fixture();
+    let bridge_config = write_email_bridge_config(None, None);
+    let app = router(AppState::new(config_with_state_file_and_email(
+        &state_file,
+        &bridge_config,
+        false,
+    )));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/email/send",
+        json!({
+            "requester_session_id": "run12345",
+            "recipients": ["owner"],
+            "subject": "Status",
+            "body_text": "hello"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("must use explicit human email delivery"));
+
+    let (resend_url, request_rx) = spawn_resend_server(200, r#"{"id":"human_123"}"#);
+    fs::write(&bridge_config, email_bridge_yaml(Some(&resend_url), None)).unwrap();
+    let (status, payload) = post_json(
+        app,
+        "/humans/operator/email",
+        json!({
+            "requester_session_id": "run12345",
+            "text": "human fallback body"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "sent");
+    assert_eq!(payload["recipient"], "operator");
+    assert_eq!(payload["to"], json!([{ "username": "operator" }]));
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(request["body"]["to"], json!(["operator@example.com"]));
+    assert_eq!(request["body"]["subject"], "human fallback body");
+}
+
+#[tokio::test]
+async fn inbound_email_requires_worker_proof_and_delivers_to_session() {
+    let state_file = write_session_fixture();
+    let bridge_config = write_email_bridge_config(None, Some("worker-secret"));
+    let app = router(AppState::new(config_with_state_file_and_email(
+        &state_file,
+        &bridge_config,
+        true,
+    )));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/api/email-inbound",
+        json!({
+            "from_address": "operator@example.com",
+            "body": "reply\n\n--\nSM: Runner run12345 claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Invalid email worker secret");
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/api/email-inbound",
+        json!({
+            "from_address": "intruder@example.com",
+            "body": "reply\n\n--\nSM: Runner run12345 claude"
+        }),
+        &[("x-email-worker-secret", "worker-secret")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(payload["detail"], "Inbound sender is not authorized");
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/api/email-inbound",
+        json!({
+            "from_address": "operator@example.com",
+            "body": "no routing footer"
+        }),
+        &[("x-email-worker-secret", "worker-secret")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ignored");
+    assert_eq!(payload["reason"], "missing_routing_footer");
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/api/email-inbound",
+        json!({
+            "from_address": "operator@example.com",
+            "raw_email": concat!(
+                "Subject: Re: status\r\n",
+                "Content-Type: multipart/alternative; boundary=\"sm-reply-boundary\"\r\n",
+                "\r\n",
+                "--sm-reply-boundary\r\n",
+                "Content-Type: text/html; charset=utf-8\r\n",
+                "\r\n",
+                "<p>html fallback should not be delivered</p>\r\n",
+                "--sm-reply-boundary\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "Content-Transfer-Encoding: quoted-printable\r\n",
+                "\r\n",
+                "Here=20is=20the=20reply=0A=0A--=0ASM:=20Runner=20run12345=20claude\r\n",
+                "--sm-reply-boundary--\r\n",
+            )
+        }),
+        &[("x-email-worker-secret", "worker-secret")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "sent");
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(payload["restored"], false);
+    assert_eq!(payload["delivery_result"], "delivered");
+
+    let (_status, output) = get_json(app.clone(), "/sessions/run12345/output?lines=5").await;
+    assert!(output["output"]
+        .as_str()
+        .unwrap()
+        .contains("{sm email from operator@example.com subj: Re: status}\nHere is the reply"));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/api/email-inbound",
+        json!({
+            "from_address": "operator@example.com",
+            "raw_email": "Subject: Re: parsed fallback\r\n\r\n",
+            "body": "Parsed fallback body\n\n--\nSM: Runner run12345 claude"
+        }),
+        &[("x-email-worker-secret", "worker-secret")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "sent");
+    assert_eq!(payload["session_id"], "run12345");
+
+    let (_status, output) = get_json(app, "/sessions/run12345/output?lines=10").await;
+    assert!(output["output"].as_str().unwrap().contains(
+        "{sm email from operator@example.com subj: Re: parsed fallback}\nParsed fallback body"
+    ));
 }
 
 #[tokio::test]
@@ -6920,6 +7149,26 @@ fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
     }
 }
 
+fn config_with_state_file_and_email(
+    state_file: &PathBuf,
+    bridge_config: &PathBuf,
+    fixture_writes_enabled: bool,
+) -> AppConfig {
+    AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        email: EmailConfig {
+            bridge_config: bridge_config.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled,
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }
+}
+
 fn config_with_state_file_and_queue(state_file: &PathBuf) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
@@ -7336,6 +7585,105 @@ fn write_registry_fixture() -> PathBuf {
     )
     .unwrap();
     path
+}
+
+fn write_email_bridge_config(api_base_url: Option<&str>, worker_secret: Option<&str>) -> PathBuf {
+    let path = unique_temp_path();
+    fs::write(&path, email_bridge_yaml(api_base_url, worker_secret)).unwrap();
+    path
+}
+
+fn email_bridge_yaml(api_base_url: Option<&str>, worker_secret: Option<&str>) -> String {
+    let api_base_url = api_base_url.unwrap_or("http://127.0.0.1:9");
+    let worker_secret_yaml = worker_secret
+        .map(|secret| format!("  worker_secret: \"{secret}\"\n"))
+        .unwrap_or_default();
+    format!(
+        r#"resend:
+  api_key: "test-api-key"
+  domain: "example.com"
+  reply_address: "reply@example.com"
+  api_base_url: "{api_base_url}"
+humans:
+  operator:
+    display_name: "Human operator"
+    aliases: ["owner"]
+    default_channel: "email"
+    channels:
+      email:
+        enabled: true
+        address: "operator@example.com"
+        use: "fallback_only"
+users:
+  operator:
+    email: "operator@example.com"
+    name: "Human operator"
+    aliases: ["owner"]
+  teammate:
+    email: "teammate@example.com"
+    name: "Team Mate"
+    aliases: ["tm"]
+email_bridge:
+  authorized_senders: ["operator@example.com"]
+{worker_secret_yaml}  worker_secret_header: "x-email-worker-secret"
+  session_id_header: "x-email-session-id"
+  webhook_path: "/api/email-inbound"
+"#
+    )
+}
+
+fn spawn_resend_server(
+    status: u16,
+    response_body: &'static str,
+) -> (String, mpsc::Receiver<Value>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_owned();
+        let mut authorization = String::new();
+        let mut content_length = 0_usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.eq_ignore_ascii_case("authorization") {
+                    authorization = value.trim().to_owned();
+                }
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+        }
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        let body_json: Value = serde_json::from_slice(&body).unwrap();
+        sender
+            .send(json!({
+                "path": path,
+                "authorization": authorization,
+                "body": body_json,
+            }))
+            .unwrap();
+        let response = format!(
+            "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (format!("http://{address}"), receiver)
 }
 
 fn unique_temp_path() -> PathBuf {

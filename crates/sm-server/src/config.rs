@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub paths: PathsConfig,
+    pub email: EmailConfig,
     pub mobile_analytics: MobileAnalyticsConfig,
     pub app_artifacts: AppArtifactsConfig,
     pub bug_reports: BugReportsConfig,
@@ -33,6 +34,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             paths: PathsConfig::default(),
+            email: EmailConfig::default(),
             mobile_analytics: MobileAnalyticsConfig::default(),
             app_artifacts: AppArtifactsConfig::default(),
             bug_reports: BugReportsConfig::default(),
@@ -136,6 +138,24 @@ fn repo_data_path(name: &str) -> String {
         .join(name)
         .display()
         .to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmailConfig {
+    #[serde(default = "default_email_bridge_config")]
+    pub bridge_config: String,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            bridge_config: default_email_bridge_config(),
+        }
+    }
+}
+
+fn default_email_bridge_config() -> String {
+    "config/email_send.yaml".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -476,6 +496,8 @@ struct RawConfig {
     #[serde(default)]
     paths: RawPathsConfig,
     #[serde(default)]
+    email: EmailConfig,
+    #[serde(default)]
     auth: RawAuthConfig,
     #[serde(default)]
     external_access: ExternalAccessConfig,
@@ -546,6 +568,7 @@ impl From<RawConfig> for AppConfig {
             paths: PathsConfig {
                 state_file: paths.state_file,
             },
+            email: raw.email,
             mobile_analytics: MobileAnalyticsConfig {
                 message_queue_db: paths.message_queue_db,
                 server_log_file: paths.server_log_file,

@@ -41,6 +41,11 @@ use crate::app_artifacts::{
 };
 use crate::bug_reports::{BugReportStore, CreateBugReport};
 use crate::config::{trimmed, AppConfig, PublicNodeConfig};
+use crate::email::{
+    extract_reply_message_body, extract_routed_session_id, extract_subject_from_raw_email,
+    extract_text_from_raw_email, normalize_explicit_session_id, EmailBridge,
+    HumanRecipientResponse, SendAgentEmailRequest, DEFAULT_EMAIL_WEBHOOK_PATH,
+};
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, QueueJobFilters, QueueJobRecord,
@@ -87,7 +92,11 @@ impl AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let inbound_email_alias = EmailBridge::load(&state.config)
+        .ok()
+        .map(|bridge| bridge.webhook_path())
+        .unwrap_or_else(|| DEFAULT_EMAIL_WEBHOOK_PATH.to_owned());
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
@@ -109,6 +118,11 @@ pub fn router(state: AppState) -> Router {
         .route("/queue-jobs", get(list_queue_jobs))
         .route("/codex-review-requests", get(list_codex_review_requests))
         .route("/nodes", get(list_nodes))
+        .route("/humans", get(list_humans))
+        .route("/humans/{identifier}", get(get_human))
+        .route("/humans/{identifier}/email", post(send_human_email))
+        .route("/email/send", post(send_registered_email))
+        .route(DEFAULT_EMAIL_WEBHOOK_PATH, post(inbound_email_webhook))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
@@ -162,11 +176,14 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/output", get(session_output))
         .route("/client/sessions", get(list_client_sessions))
         .route("/client/sessions/{session_id}", get(get_client_session))
-        .fallback(not_found)
-        .layer(DefaultBodyLimit::max(
-            APP_ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024,
-        ))
-        .with_state(Arc::new(state))
+        .fallback(not_found);
+    if inbound_email_alias != DEFAULT_EMAIL_WEBHOOK_PATH {
+        app = app.route(&inbound_email_alias, post(inbound_email_webhook));
+    }
+    app.layer(DefaultBodyLimit::max(
+        APP_ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024,
+    ))
+    .with_state(Arc::new(state))
 }
 
 async fn health() -> Json<Value> {
@@ -421,6 +438,344 @@ async fn submit_client_bug_report(
     }))
 }
 
+async fn list_humans(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let bridge = email_bridge(&state.config)?;
+    let humans = bridge
+        .list_humans()
+        .into_iter()
+        .map(HumanRecipientResponse::from)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "humans": humans })))
+}
+
+async fn get_human(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+    request: Request,
+) -> Result<Json<HumanRecipientResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let bridge = email_bridge(&state.config)?;
+    let Some(human) = bridge
+        .lookup_human(&identifier)
+        .map_err(email_config_error)?
+    else {
+        return Err(ApiError::NotFound("Human recipient not configured"));
+    };
+    Ok(Json(HumanRecipientResponse::from(human)))
+}
+
+async fn send_human_email(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<HumanDeliveryRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/humans/{identifier}/email"),
+    )?;
+    let bridge = email_bridge_or_503(&state.config)?;
+    let Some(human) = bridge
+        .lookup_human(&identifier)
+        .map_err(email_config_error)?
+    else {
+        return Err(ApiError::NotFound("Human recipient not configured"));
+    };
+    if human.channel("email").is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!(
+                "Human recipient \"{}\" has no enabled email channel",
+                human.name
+            ),
+        });
+    }
+    let Some(resolved_email_user) = bridge
+        .lookup_human_email_user(&human.name)
+        .map_err(email_config_error)?
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!(
+                "Human recipient \"{}\" has no resolved email address",
+                human.name
+            ),
+        });
+    };
+    let sender_session_id = required_sender_session_id(payload.requester_session_id.as_deref())?;
+    let sender_session = state
+        .session_store
+        .get_session(&sender_session_id)?
+        .ok_or(ApiError::NotFound("Sender session not found"))?;
+    let sent = bridge
+        .send_agent_email(SendAgentEmailRequest {
+            sender_session_id: sender_session.id.clone(),
+            sender_name: session_display_name(sender_session.clone()),
+            sender_provider: sender_session.provider,
+            to_users: vec![resolved_email_user],
+            cc_users: Vec::new(),
+            subject: payload.subject,
+            body_text: payload.text,
+            body_html: String::new(),
+            body_markdown: payload.body_markdown,
+            auto_subject: payload.auto_subject,
+        })
+        .map_err(email_send_error)?;
+    Ok(Json(json!({
+        "status": "sent",
+        "recipient": human.name,
+        "channel": "email",
+        "subject": sent.subject,
+        "to": [{"username": human.name}],
+    })))
+}
+
+async fn send_registered_email(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SendEmailRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/email/send")?;
+    let bridge = email_bridge_or_503(&state.config)?;
+    let sender_session_id = required_sender_session_id(payload.requester_session_id.as_deref())?;
+    let sender_session = state
+        .session_store
+        .get_session(&sender_session_id)?
+        .ok_or(ApiError::NotFound("Sender session not found"))?;
+    let recipients = unique_identifiers(&payload.recipients);
+    let cc = unique_identifiers(&payload.cc);
+    if recipients.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "At least one email recipient is required".to_owned(),
+        });
+    }
+    for identifier in recipients.iter().chain(cc.iter()) {
+        if let Some(human) = bridge
+            .lookup_human(identifier)
+            .map_err(email_config_error)?
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!(
+                    "Human recipient \"{}\" must use explicit human email delivery; generic email routing is not allowed",
+                    human.name
+                ),
+            });
+        }
+    }
+    let to_users = bridge
+        .resolve_users(&recipients)
+        .map_err(email_lookup_error)?;
+    let cc_users = if cc.is_empty() {
+        Vec::new()
+    } else {
+        bridge.resolve_users(&cc).map_err(email_lookup_error)?
+    };
+    let sent = bridge
+        .send_agent_email(SendAgentEmailRequest {
+            sender_session_id: sender_session.id.clone(),
+            sender_name: session_display_name(sender_session.clone()),
+            sender_provider: sender_session.provider,
+            to_users,
+            cc_users,
+            subject: payload.subject,
+            body_text: payload.body_text.unwrap_or_default(),
+            body_html: payload.body_html.unwrap_or_default(),
+            body_markdown: payload.body_markdown,
+            auto_subject: payload.auto_subject,
+        })
+        .map_err(email_send_error)?;
+    Ok(Json(serde_json::to_value(sent)?))
+}
+
+async fn inbound_email_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<InboundEmailRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let bridge = email_bridge_or_503(&state.config)?;
+    let configured_secret = bridge.worker_secret().ok_or_else(|| ApiError::Status {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        detail: "Email worker secret is required".to_owned(),
+    })?;
+    let provided_secret = headers
+        .get(bridge.worker_secret_header())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if provided_secret != configured_secret {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Invalid email worker secret".to_owned(),
+        });
+    }
+    if !bridge.is_authorized_sender(&payload.from_address) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Inbound sender is not authorized".to_owned(),
+        });
+    }
+    ensure_core_writes_enabled(&state)?;
+
+    let parsed_body = payload.body.unwrap_or_default();
+    let raw_email = payload.raw_email.as_deref().unwrap_or("").trim();
+    let (mut raw_body, subject) = if raw_email.is_empty() {
+        (parsed_body.clone(), None)
+    } else {
+        (
+            extract_text_from_raw_email(raw_email),
+            extract_subject_from_raw_email(raw_email),
+        )
+    };
+    if !parsed_body.trim().is_empty()
+        && (raw_body.trim().is_empty()
+            || (extract_routed_session_id(&raw_body).is_none()
+                && extract_routed_session_id(&parsed_body).is_some()))
+    {
+        raw_body = parsed_body;
+    }
+    let raw_body = raw_body.trim().to_owned();
+    if raw_body.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "body or raw_email is required".to_owned(),
+        });
+    }
+
+    let trusted_session_id = headers
+        .get(bridge.session_id_header())
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_explicit_session_id);
+    let session_id = trusted_session_id
+        .or_else(|| {
+            payload
+                .session_id
+                .as_deref()
+                .and_then(normalize_explicit_session_id)
+        })
+        .or_else(|| extract_routed_session_id(&raw_body));
+    let Some(session_id) = session_id else {
+        return Ok(Json(json!({
+            "status": "ignored",
+            "reason": "missing_routing_footer",
+        })));
+    };
+    let reply_body = extract_reply_message_body(&raw_body);
+    if reply_body.trim().is_empty() {
+        return Ok(Json(json!({
+            "status": "ignored",
+            "session_id": session_id,
+            "reason": "empty_reply_body",
+        })));
+    }
+    let mut body = format!("{{sm email from {}}}", payload.from_address.trim());
+    if let Some(subject) = subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body = format!(
+            "{{sm email from {} subj: {subject}}}",
+            payload.from_address.trim()
+        );
+    }
+    body.push('\n');
+    body.push_str(&reply_body);
+
+    let Some(mut session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    let mut restored = false;
+    if matches!(session.status.as_str(), "stopped" | "killed") {
+        let outcome = if state.config.rust_core.runtime_enabled {
+            let runtime = TmuxRuntime::from_app_config(&state.config);
+            state
+                .session_store
+                .restore_core_session_with_runtime(&session_id, &runtime)?
+        } else {
+            state.session_store.restore_core_session(&session_id)?
+        };
+        match outcome {
+            Some(CoreRestoreOutcome::Restored(restored_session)) => {
+                session = restored_session;
+                restored = true;
+            }
+            Some(CoreRestoreOutcome::NotStopped) => {}
+            Some(CoreRestoreOutcome::UnsupportedNode(node)) => {
+                return Err(ApiError::Status {
+                    status: StatusCode::BAD_REQUEST,
+                    detail: format!("Rust runtime does not support remote node {node}"),
+                })
+            }
+            Some(CoreRestoreOutcome::UnsupportedProvider(provider)) => {
+                return Err(ApiError::Status {
+                    status: StatusCode::BAD_REQUEST,
+                    detail: format!("Rust runtime does not support provider {provider}"),
+                })
+            }
+            Some(CoreRestoreOutcome::MissingProviderResumeId(provider)) => {
+                return Err(ApiError::Status {
+                    status: StatusCode::CONFLICT,
+                    detail: format!("Cannot restore {provider} session without provider_resume_id"),
+                })
+            }
+            None => return Err(ApiError::NotFound("Session not found")),
+        }
+    }
+    let input = SendCoreInputRequest {
+        text: body,
+        delivery_mode: "sequential".to_owned(),
+        sender_session_id: None,
+        from_sm_send: false,
+        timeout_seconds: None,
+        notify_on_delivery: false,
+        notify_after_seconds: None,
+        notify_on_stop: false,
+        remind_soft_threshold: None,
+        remind_hard_threshold: None,
+        remind_cancel_on_reply_session_id: None,
+        parent_session_id: None,
+    };
+    let outcome = if state.config.rust_core.runtime_enabled {
+        if !is_primary_node(&session.node) {
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!("Rust runtime does not support remote node {}", session.node),
+            });
+        }
+        let runtime = TmuxRuntime::from_app_config(&state.config);
+        state
+            .session_store
+            .send_core_input_with_runtime(&session_id, input, &runtime)?
+    } else {
+        state.session_store.send_core_input(&session_id, input)?
+    };
+    let Some(outcome) = outcome else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "killed") {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Failed to deliver inbound email to session".to_owned(),
+        });
+    }
+    Ok(Json(json!({
+        "status": "sent",
+        "session_id": session_id,
+        "restored": restored,
+        "delivery_result": if outcome.delivered { "delivered" } else { "queued" },
+    })))
+}
+
 fn notify_maintainer_of_bug_report(
     state: &AppState,
     bug_id: &str,
@@ -503,6 +858,61 @@ fn error_name(error: &ApiError) -> &'static str {
         ApiError::Status { .. } => "status",
         ApiError::Auth { .. } => "auth",
     }
+}
+
+fn email_bridge(config: &AppConfig) -> Result<EmailBridge, ApiError> {
+    EmailBridge::load(config).map_err(email_config_error)
+}
+
+fn email_bridge_or_503(config: &AppConfig) -> Result<EmailBridge, ApiError> {
+    let bridge = EmailBridge::load(config).map_err(email_config_error)?;
+    if !bridge.bridge_is_available() {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Email bridge is unavailable".to_owned(),
+        });
+    }
+    Ok(bridge)
+}
+
+fn email_config_error(error: anyhow::Error) -> ApiError {
+    ApiError::Status {
+        status: StatusCode::CONFLICT,
+        detail: error.to_string(),
+    }
+}
+
+fn email_lookup_error(error: anyhow::Error) -> ApiError {
+    ApiError::Status {
+        status: StatusCode::NOT_FOUND,
+        detail: error.to_string(),
+    }
+}
+
+fn email_send_error(error: anyhow::Error) -> ApiError {
+    let detail = error.to_string();
+    let status = if detail.contains("Email body is required")
+        || detail.contains("Email subject is required")
+        || detail.contains("Managed sender session is required")
+    {
+        StatusCode::BAD_REQUEST
+    } else if detail.contains("No registered email user found") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    ApiError::Status { status, detail }
+}
+
+fn required_sender_session_id(value: Option<&str>) -> Result<String, ApiError> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Managed sender session is required for email delivery".to_owned(),
+        })
 }
 
 async fn deploy_app_artifact(
@@ -3024,6 +3434,49 @@ struct ClientBugReportResponse {
     status: &'static str,
     bug_id: String,
     maintainer_notified: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendEmailRequest {
+    #[serde(default)]
+    requester_session_id: Option<String>,
+    recipients: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body_text: Option<String>,
+    #[serde(default)]
+    body_html: Option<String>,
+    #[serde(default)]
+    body_markdown: bool,
+    #[serde(default)]
+    auto_subject: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HumanDeliveryRequest {
+    #[serde(default)]
+    requester_session_id: Option<String>,
+    text: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body_markdown: bool,
+    #[serde(default = "default_true")]
+    auto_subject: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct InboundEmailRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    raw_email: Option<String>,
+    from_address: String,
 }
 
 #[derive(Debug, Serialize)]
