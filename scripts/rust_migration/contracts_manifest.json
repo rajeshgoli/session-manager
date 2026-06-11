@@ -184,6 +184,21 @@
       "source": "specs/762_stage5_artifacts/gate_matrix.md:72"
     },
     {
+      "id": "http.queue_job_detail",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/queue-jobs/{queue_job_id}",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/id", "equals": "{queue_job_id}"}
+      ],
+      "preconditions": ["live_server", "fixture:queue_job_id"],
+      "source": "specs/762_stage2_artifacts/route_manifest.md:137"
+    },
+    {
       "id": "http.codex_review_requests_list",
       "surface": "http",
       "classification": "retained",
@@ -197,6 +212,21 @@
       ],
       "preconditions": ["live_server"],
       "source": "specs/762_stage5_artifacts/gate_matrix.md:72"
+    },
+    {
+      "id": "http.codex_review_request_detail",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/codex-review-requests/{codex_review_request_id}",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/id", "equals": "{codex_review_request_id}"}
+      ],
+      "preconditions": ["live_server", "fixture:codex_review_request_id"],
+      "source": "specs/762_stage2_artifacts/route_manifest.md:145"
     },
     {
       "id": "http.api_sessions_absent",
