@@ -92,6 +92,7 @@ use crate::sessions::{
     SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest,
     TurnCompleteOutcome,
 };
+use crate::tool_usage::{list_recent_tool_calls_from_path, ToolCallRow};
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
@@ -333,6 +334,7 @@ pub fn router(state: AppState) -> Router {
         .route("/registry", get(list_agent_registry))
         .route("/registry/{role}", get(lookup_agent_registry))
         .route("/sessions/{session_id}/output", get(session_output))
+        .route("/sessions/{session_id}/tool-calls", get(session_tool_calls))
         .route("/client/sessions", get(list_client_sessions))
         .route(
             "/client/sessions/{session_id}/attach-ticket",
@@ -3745,6 +3747,36 @@ async fn session_output(
     Ok(Json(SessionOutputResponse { session_id, output }))
 }
 
+async fn session_tool_calls(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SessionToolCallsQuery>,
+    request: Request,
+) -> Result<Json<ToolCallsResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    let Some(limit) = query.validated_limit() else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "limit must be between 1 and 100".to_owned(),
+        });
+    };
+    if session.provider == "codex-fork" {
+        return Ok(Json(ToolCallsResponse {
+            session_id,
+            tool_calls: Vec::new(),
+        }));
+    }
+    let db_path = expand_home(&state.config.tool_logging.db_path);
+    let tool_calls = list_recent_tool_calls_from_path(&db_path, &session_id, limit)?;
+    Ok(Json(ToolCallsResponse {
+        session_id,
+        tool_calls,
+    }))
+}
+
 async fn shadow_http(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -4136,6 +4168,26 @@ fn shadow_predict_session_read(
             status: StatusCode::OK.as_u16(),
             body_sha256: Some(sha256_hex(&body)),
             support_status: "implemented_read",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/tool-calls"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
+        let Some(_) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
         }));
     }
 
@@ -6215,6 +6267,26 @@ struct SessionOutputQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct SessionToolCallsQuery {
+    #[serde(default = "default_tool_calls_limit")]
+    limit: i64,
+}
+
+impl SessionToolCallsQuery {
+    fn validated_limit(&self) -> Option<usize> {
+        if (1..=100).contains(&self.limit) {
+            Some(self.limit as usize)
+        } else {
+            None
+        }
+    }
+}
+
+fn default_tool_calls_limit() -> i64 {
+    10
+}
+
+#[derive(Debug, Deserialize)]
 struct KillSessionRequest {
     #[serde(default)]
     requester_session_id: Option<String>,
@@ -6380,6 +6452,12 @@ impl From<SessionRecord> for SpawnSessionResponse {
 struct SessionOutputResponse {
     session_id: String,
     output: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ToolCallsResponse {
+    session_id: String,
+    tool_calls: Vec<ToolCallRow>,
 }
 
 #[derive(Serialize)]

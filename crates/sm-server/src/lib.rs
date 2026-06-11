@@ -7,3 +7,4 @@ pub mod mobile_analytics;
 pub mod queue;
 pub mod runtime;
 pub mod sessions;
+pub mod tool_usage;
