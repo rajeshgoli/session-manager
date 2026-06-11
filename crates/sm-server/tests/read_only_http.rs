@@ -18,8 +18,8 @@ use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
-        CodexObservabilityConfig, CodexRolloutConfig, EmailConfig, ExternalAccessConfig,
-        GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
+        CodexObservabilityConfig, CodexRequestsConfig, CodexRolloutConfig, EmailConfig,
+        ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
         MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
         RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
@@ -2295,6 +2295,117 @@ async fn shadow_http_uses_decoded_last_codex_events_query_value() {
     assert_eq!(payload["support_status"], "implemented_read_status_only");
     assert_eq!(payload["comparison"], "status_match");
     assert_eq!(payload["predicted_status"], 422);
+
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexpending/codex-pending-requests",
+                "query_string": "include_orphaned=%20true%20",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 422,
+                "body_sha256": sha256_hex(b"{}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 422);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_pending_requests_200_as_status_only() {
+    let state_file = write_codex_app_session_fixture("codexpending");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = br#"{"requests":[]}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexpending/codex-pending-requests",
+                "query_string": "include_orphaned=%74&include_orphaned=true",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["body_sha256"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_pending_requests_stable_failures() {
+    let state_file = write_codex_app_session_fixture("codexpending");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/missing/codex-pending-requests",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 404,
+                "body_sha256": sha256_hex(br#"{"detail":"Session not found"}"#)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["predicted_status"], 404);
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexpending/codex-pending-requests",
+                "query_string": "include_orphaned=maybe",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 422,
+                "body_sha256": sha256_hex(b"{}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 422);
 }
 
 #[tokio::test]
@@ -3687,6 +3798,126 @@ async fn session_codex_events_decodes_query_and_uses_last_duplicate_value() {
     let (status, payload) = get_json(app, "/sessions/codexapp1/codex-events?limit=2&limit=0").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(payload["detail"], "limit must be between 1 and 500");
+}
+
+#[tokio::test]
+async fn session_codex_pending_requests_reads_pending_and_optional_orphaned_rows() {
+    let state_file = write_codex_app_session_fixture("codexpending");
+    let requests_db = unique_temp_path();
+    create_codex_pending_requests_fixture_db(&requests_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_requests: CodexRequestsConfig {
+            db_path: requests_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) =
+        get_json(app.clone(), "/sessions/codexpending/codex-pending-requests").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "requests": [
+                {
+                    "request_id": "req-pending",
+                    "session_id": "codexpending",
+                    "thread_id": "thread-a",
+                    "turn_id": "turn-a",
+                    "item_id": "item-a",
+                    "request_type": "request_approval",
+                    "request_method": "item/commandExecution/requestApproval",
+                    "status": "pending",
+                    "requested_at": "2026-06-01T00:00:00+00:00",
+                    "expires_at": "2026-06-01T00:05:00+00:00",
+                    "resolved_payload": null,
+                    "resolved_at": null,
+                    "resolution_source": null,
+                    "error_code": null,
+                    "error_message": null
+                }
+            ]
+        })
+    );
+
+    let (status, payload) = get_json(
+        app,
+        "/sessions/codexpending/codex-pending-requests?include_orphaned=false&include_orphaned=%74",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let requests = payload["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["request_id"], "req-pending");
+    assert_eq!(requests[1]["request_id"], "req-orphaned");
+    assert_eq!(requests[1]["status"], "orphaned");
+    assert_eq!(requests[1]["resolution_source"], "policy");
+    assert_eq!(requests[1]["error_code"], "server_restarted");
+}
+
+#[tokio::test]
+async fn session_codex_pending_requests_handles_empty_and_gating_errors() {
+    let state_file = write_codex_app_session_fixture("codexpending");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) =
+        get_json(app.clone(), "/sessions/codexpending/codex-pending-requests").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "requests": [] }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/missing/codex-pending-requests").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Session not found");
+
+    let non_codex_state = write_session_fixture();
+    let non_codex_app = router(AppState::new(config_with_state_file(&non_codex_state)));
+    let (status, payload) =
+        get_json(non_codex_app, "/sessions/run12345/codex-pending-requests").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "codex requests supported only for provider=codex-app"
+    );
+
+    let disabled_app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_rollout: CodexRolloutConfig {
+            enable_structured_requests: false,
+            ..CodexRolloutConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+    let (status, payload) = get_json(
+        disabled_app,
+        "/sessions/codexpending/codex-pending-requests",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        payload["detail"],
+        "codex structured requests disabled by rollout flag"
+    );
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/sessions/codexpending/codex-pending-requests?include_orphaned=maybe",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "include_orphaned must be a boolean");
+
+    let (status, payload) = get_json(
+        app,
+        "/sessions/codexpending/codex-pending-requests?include_orphaned=%20true%20",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "include_orphaned must be a boolean");
 }
 
 #[tokio::test]
@@ -8436,6 +8667,66 @@ fn create_codex_events_retention_gap_fixture_db(path: &PathBuf) {
         VALUES
             ('retainedgap', 4, '2026-06-01T00:04:00+00:00', 'item_completed', 'turn-r', '{"tool_name":"Bash"}'),
             ('retainedgap', 5, '2026-06-01T00:05:00+00:00', 'turn_completed', 'turn-r', '{"ok":true}');
+        "#,
+    )
+    .unwrap();
+}
+
+fn create_codex_pending_requests_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_pending_requests (
+            request_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            process_generation TEXT NOT NULL,
+            rpc_request_id INTEGER,
+            thread_id TEXT,
+            turn_id TEXT,
+            item_id TEXT,
+            request_type TEXT NOT NULL,
+            request_method TEXT NOT NULL,
+            requested_at TEXT NOT NULL,
+            expires_at TEXT,
+            status TEXT NOT NULL,
+            request_payload_json TEXT,
+            resolved_payload_json TEXT,
+            resolved_at TEXT,
+            resolution_source TEXT,
+            error_code TEXT,
+            error_message TEXT
+        );
+        INSERT INTO codex_pending_requests
+            (request_id, session_id, process_generation, rpc_request_id, thread_id,
+             turn_id, item_id, request_type, request_method, requested_at, expires_at,
+             status, request_payload_json, resolved_payload_json, resolved_at,
+             resolution_source, error_code, error_message)
+        VALUES
+            ('req-pending', 'codexpending', 'gen-a', 7, 'thread-a',
+             'turn-a', 'item-a', 'request_approval', 'item/commandExecution/requestApproval',
+             '2026-06-01T00:00:00+00:00', '2026-06-01T00:05:00+00:00',
+             'pending', '{"turnId":"turn-a"}', NULL, NULL,
+             NULL, NULL, NULL),
+            ('req-orphaned', 'codexpending', 'gen-old', 8, 'thread-b',
+             'turn-b', 'item-b', 'request_user_input', 'item/tool/requestUserInput',
+             '2026-06-01T00:01:00+00:00', '2026-06-01T00:06:00+00:00',
+             'orphaned', '{"turnId":"turn-b"}', NULL, '2026-06-01T00:02:00+00:00',
+             'policy', 'server_restarted', 'server restarted before request resolution'),
+            ('req-resolved', 'codexpending', 'gen-a', 9, NULL,
+             NULL, NULL, 'request_approval', 'item/fileChange/requestApproval',
+             '2026-06-01T00:02:00+00:00', '2026-06-01T00:07:00+00:00',
+             'resolved', '{}', '{"decision":"accept"}', '2026-06-01T00:03:00+00:00',
+             'api', NULL, NULL),
+            ('req-expired', 'codexpending', 'gen-a', 10, NULL,
+             NULL, NULL, 'request_user_input', 'item/tool/requestUserInput',
+             '2026-06-01T00:03:00+00:00', '2026-06-01T00:08:00+00:00',
+             'expired', '{}', NULL, '2026-06-01T00:04:00+00:00',
+             'policy', 'request_expired', 'request expired before explicit response'),
+            ('req-other', 'othercodex', 'gen-a', 11, NULL,
+             NULL, NULL, 'request_approval', 'item/commandExecution/requestApproval',
+             '2026-06-01T00:04:00+00:00', '2026-06-01T00:09:00+00:00',
+             'pending', '{}', NULL, NULL,
+             NULL, NULL, NULL);
         "#,
     )
     .unwrap();
