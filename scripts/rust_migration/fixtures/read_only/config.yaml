@@ -1,5 +1,6 @@
 paths:
   state_file: "scripts/rust_migration/fixtures/read_only/sessions.json"
+  app_artifacts_dir: "scripts/rust_migration/fixtures/read_only/apps"
 
 queue_runner:
   state_dir: "scripts/rust_migration/fixtures/read_only/queue-runner"

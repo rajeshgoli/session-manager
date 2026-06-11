@@ -343,6 +343,21 @@ def test_manifest_covers_native_mobile_support_http_surfaces():
     assert "fixture:app_name" in app_metadata.preconditions
 
 
+def test_read_only_fixture_provides_app_artifact_metadata():
+    config_path = Path("scripts/rust_migration/fixtures/read_only/config.yaml")
+    metadata_path = Path(
+        "scripts/rust_migration/fixtures/read_only/apps/session-manager-android/meta.json"
+    )
+
+    assert "app_artifacts_dir: \"scripts/rust_migration/fixtures/read_only/apps\"" in (
+        config_path.read_text()
+    )
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["artifact_hash"] == "deadbeef"
+    assert metadata["size_bytes"] == 9
+    assert metadata["uploaded_by"] == "fixture@example.com"
+
+
 def test_python_target_does_not_run_rust_only_retirement_checks():
     manifest = ContractManifest.load()
     selected = checks_for_target(manifest.checks, target="python", include_mutating=False)
