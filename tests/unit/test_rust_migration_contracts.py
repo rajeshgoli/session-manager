@@ -219,6 +219,18 @@ def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
         for expectation in checks["http.session_detail_fixture"].expected_json
     )
     assert checks["http.client_session_detail_fixture"].expected_json
+    client_session_expectations = {
+        expectation.path: expectation
+        for expectation in checks["http.client_session_detail_fixture"].expected_json
+    }
+    assert (
+        client_session_expectations["/attach_descriptor/attach_supported"].value_type
+        == "boolean"
+    )
+    assert client_session_expectations["/termux_attach"].value_type == "null"
+    assert (
+        client_session_expectations["/mobile_terminal/supported"].equals is False
+    )
     assert checks["http.session_output_fixture"].expected_json
     assert any(
         expectation.path == "/tmux_client_event_version" and expectation.value_type == "number"

@@ -431,7 +431,7 @@
       "expected_json": [
         {"path": "/id", "equals": "{session_id}"},
         {"path": "/attach_descriptor", "type": "object"},
-        {"path": "/attach_descriptor/attach_supported", "equals": false},
+        {"path": "/attach_descriptor/attach_supported", "type": "boolean"},
         {"path": "/termux_attach", "type": "null"},
         {"path": "/mobile_terminal", "type": "object"},
         {"path": "/mobile_terminal/supported", "equals": false},
