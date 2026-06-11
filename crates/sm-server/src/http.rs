@@ -136,6 +136,7 @@ struct MobileTerminalActiveAttach {
     provider: String,
     device_key_id: String,
     started_at_unix: i64,
+    stop: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,6 +146,13 @@ struct MobileAttachTicketResponse {
     device_key_id: String,
     ws_url: String,
     expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MobileTerminalDisableResponse {
+    ok: bool,
+    disabled: bool,
+    active_attaches_terminated: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +173,7 @@ pub struct AppState {
     mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
     mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
+    mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
 }
 
@@ -181,6 +190,7 @@ impl AppState {
             mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
+            mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             mobile_terminal_secret,
         }
     }
@@ -200,6 +210,10 @@ pub fn router(state: AppState) -> Router {
         .route("/client/request-status", post(client_request_status))
         .route("/client/bug-reports", post(submit_client_bug_report))
         .route("/client/terminal", get(mobile_terminal_endpoint))
+        .route(
+            "/client/mobile-terminal/disable",
+            post(disable_mobile_terminal),
+        )
         .route("/deploy/{app_name}", post(deploy_app_artifact))
         .route("/apps/{app_name}/latest.apk", get(get_latest_app_artifact))
         .route("/apps/{app_name}/meta.json", get(get_app_artifact_metadata))
@@ -358,7 +372,10 @@ async fn auth_session(
 }
 
 async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBootstrapResponse> {
-    Json(client_bootstrap_response(&state.config))
+    Json(client_bootstrap_response(
+        &state.config,
+        mobile_terminal_runtime_disabled(&state),
+    ))
 }
 
 async fn client_analytics_summary(
@@ -1535,7 +1552,7 @@ async fn list_client_sessions(
         .session_store
         .list_sessions(false)?
         .into_iter()
-        .map(|session| client_session_value(&state.config, session, actor_email.as_deref(), None))
+        .map(|session| client_session_value(&state, session, actor_email.as_deref(), None))
         .collect::<Vec<_>>();
     Ok(Json(json!({ "sessions": sessions })))
 }
@@ -1667,7 +1684,7 @@ async fn get_client_session(
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(client_session_value(
-        &state.config,
+        &state,
         session,
         actor_email.as_deref(),
         None,
@@ -1695,6 +1712,7 @@ async fn create_mobile_attach_ticket(
         request.uri().path(),
         &format!("/client/sessions/{}/attach-ticket", session.id),
     );
+    ensure_mobile_terminal_ticket_runtime_enabled(&state)?;
     let MobileTerminalAuthorization {
         user_id,
         device_key_id,
@@ -1806,6 +1824,7 @@ async fn create_mobile_attach_ticket(
     }
     drop(active);
 
+    ensure_mobile_terminal_ticket_runtime_enabled(&state)?;
     tickets.insert(
         ticket_id.clone(),
         MobileTerminalTicket {
@@ -1834,6 +1853,64 @@ async fn create_mobile_attach_ticket(
                 .unwrap_or(OffsetDateTime::UNIX_EPOCH)
                 .to_string()
         }),
+    }))
+}
+
+async fn disable_mobile_terminal(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<MobileTerminalDisableResponse>, ApiError> {
+    let actor_email =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        })?;
+    let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to disable mobile terminal attach".to_owned(),
+        });
+    };
+    if !user_config.interactive_shell_access || !mobile_terminal_user_can_disable(user_config) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to disable mobile terminal attach".to_owned(),
+        });
+    }
+
+    state
+        .mobile_terminal_runtime_disabled
+        .store(true, Ordering::SeqCst);
+    state
+        .mobile_terminal_tickets
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal ticket store is unavailable".to_owned(),
+        })?
+        .clear();
+    let active_attaches = {
+        let mut active =
+            state
+                .mobile_terminal_active_attaches
+                .lock()
+                .map_err(|_| ApiError::Status {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    detail: "Mobile terminal active attach store is unavailable".to_owned(),
+                })?;
+        let active_attaches = active.values().cloned().collect::<Vec<_>>();
+        active.clear();
+        active_attaches
+    };
+    for active in &active_attaches {
+        active.stop.store(true, Ordering::SeqCst);
+    }
+
+    Ok(Json(MobileTerminalDisableResponse {
+        ok: true,
+        disabled: true,
+        active_attaches_terminated: active_attaches.len(),
     }))
 }
 
@@ -1890,7 +1967,7 @@ fn mobile_terminal_upgrade_required(
 }
 
 async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) {
-    if !state.config.mobile_terminal.enabled {
+    if !mobile_terminal_enabled(&state) {
         send_mobile_terminal_error(&mut socket, "mobile terminal attach is disabled").await;
         close_mobile_terminal_socket(&mut socket, 1008, "mobile_terminal_disabled").await;
         return;
@@ -1915,8 +1992,8 @@ async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) 
     };
 
     match consume_mobile_terminal_ticket(&state, &auth_frame) {
-        Ok((ticket, attach_id)) => {
-            run_mobile_terminal_bridge(socket, state, ticket, attach_id).await;
+        Ok((ticket, attach_id, stop)) => {
+            run_mobile_terminal_bridge(socket, state, ticket, attach_id, stop).await;
         }
         Err(error) => {
             let detail = api_error_detail(&error);
@@ -2001,8 +2078,9 @@ async fn run_mobile_terminal_bridge(
     state: Arc<AppState>,
     ticket: MobileTerminalTicket,
     attach_id: String,
+    stop: Arc<AtomicBool>,
 ) {
-    let _ = run_mobile_terminal_bridge_inner(socket, &state, &ticket).await;
+    let _ = run_mobile_terminal_bridge_inner(socket, &state, &ticket, stop).await;
     remove_mobile_terminal_active_attach(&state, &attach_id);
 }
 
@@ -2010,9 +2088,9 @@ async fn run_mobile_terminal_bridge_inner(
     mut socket: WebSocket,
     state: &AppState,
     ticket: &MobileTerminalTicket,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    if !mobile_terminal_active_attach_exists(state, ticket) || !state.config.mobile_terminal.enabled
-    {
+    if !mobile_terminal_active_attach_exists(state, ticket) || !mobile_terminal_enabled(state) {
         let _ = send_mobile_terminal_json(
             &mut socket,
             json!({
@@ -2034,7 +2112,7 @@ async fn run_mobile_terminal_bridge_inner(
 
     preload_mobile_terminal_scrollback(&mut socket, &state.config, ticket).await;
 
-    let pty = match start_mobile_terminal_attach_client(ticket, initial.rows, initial.cols) {
+    let pty = match start_mobile_terminal_attach_client(ticket, initial.rows, initial.cols, stop) {
         Ok(pty) => pty,
         Err(error) => {
             send_mobile_terminal_error(&mut socket, "failed to attach tmux session").await;
@@ -2082,6 +2160,22 @@ async fn run_mobile_terminal_bridge_inner(
     let mut close_reason = "mobile_terminal_detached".to_owned();
 
     loop {
+        if stop.load(Ordering::SeqCst) || !mobile_terminal_enabled(state) {
+            let _ = sender
+                .send(Message::Text(
+                    json!({
+                        "type": "exit",
+                        "code": 1008,
+                        "reason": "mobile_terminal_disabled",
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            close_code = 1008;
+            close_reason = "mobile_terminal_disabled".to_owned();
+            break;
+        }
         if let Some(frame) = pending_frames.pop() {
             if process_mobile_terminal_client_frame(
                 &mut sender,
@@ -2128,6 +2222,22 @@ async fn run_mobile_terminal_bridge_inner(
                         }
                     }
                     Some(MobileTerminalPtyEvent::Closed) | None => {
+                        if stop.load(Ordering::SeqCst) || !mobile_terminal_enabled(state) {
+                            let _ = sender
+                                .send(Message::Text(
+                                    json!({
+                                        "type": "exit",
+                                        "code": 1008,
+                                        "reason": "mobile_terminal_disabled",
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                            close_code = 1008;
+                            close_reason = "mobile_terminal_disabled".to_owned();
+                            break;
+                        }
                         let _ = sender
                             .send(Message::Text(
                                 json!({
@@ -2464,6 +2574,7 @@ fn start_mobile_terminal_attach_client(
     ticket: &MobileTerminalTicket,
     rows: u16,
     cols: u16,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<MobileTerminalPty> {
     let size = Winsize {
         ws_row: rows,
@@ -2488,7 +2599,7 @@ fn start_mobile_terminal_attach_client(
     Ok(MobileTerminalPty {
         master: Arc::new(pty.master),
         child,
-        stop: Arc::new(AtomicBool::new(false)),
+        stop,
     })
 }
 
@@ -2497,6 +2608,7 @@ fn start_mobile_terminal_attach_client(
     _ticket: &MobileTerminalTicket,
     _rows: u16,
     _cols: u16,
+    _stop: Arc<AtomicBool>,
 ) -> anyhow::Result<MobileTerminalPty> {
     anyhow::bail!("mobile terminal PTY bridge is only supported on Unix")
 }
@@ -3793,14 +3905,18 @@ fn shadow_predict_session_read(
     Ok(None)
 }
 
-fn client_bootstrap_response(config: &AppConfig) -> ClientBootstrapResponse {
+fn client_bootstrap_response(
+    config: &AppConfig,
+    mobile_terminal_runtime_disabled: bool,
+) -> ClientBootstrapResponse {
     let auth = &config.google_auth;
     let external = &config.external_access;
-    let mobile_terminal_ws_url = if config.mobile_terminal.enabled {
-        mobile_terminal_ws_url(config, None)
-    } else {
-        None
-    };
+    let mobile_terminal_ws_url =
+        if mobile_terminal_config_enabled(config, mobile_terminal_runtime_disabled) {
+            mobile_terminal_ws_url(config, None)
+        } else {
+            None
+        };
     let mobile_terminal_supported = mobile_terminal_ws_url.is_some();
 
     ClientBootstrapResponse {
@@ -3870,11 +3986,12 @@ fn attach_descriptor_response(session: SessionRecord) -> Value {
 }
 
 fn client_session_value(
-    config: &AppConfig,
+    state: &AppState,
     session: SessionRecord,
     actor_email: Option<&str>,
     route_prefix: Option<&str>,
 ) -> Value {
+    let config = &state.config;
     let mut value = serde_json::to_value(ClientSessionResponse::from(session.clone()))
         .unwrap_or_else(|_| json!({}));
     let attach_descriptor = attach_descriptor_payload(session.clone());
@@ -3886,6 +4003,7 @@ fn client_session_value(
         &attach_descriptor,
         actor_email,
         route_prefix,
+        mobile_terminal_runtime_disabled(state),
     );
     value["mobile_terminal"] = mobile_terminal.clone();
     value["primary_action"] = mobile_primary_action(&mobile_terminal, &attach_descriptor);
@@ -3930,8 +4048,9 @@ fn mobile_terminal_metadata(
     attach_descriptor: &Value,
     actor_email: Option<&str>,
     route_prefix: Option<&str>,
+    runtime_disabled: bool,
 ) -> Value {
-    if !config.mobile_terminal.enabled {
+    if !mobile_terminal_config_enabled(config, runtime_disabled) {
         return json!({
             "supported": false,
             "reason": "mobile terminal attach is disabled",
@@ -4189,6 +4308,36 @@ fn mobile_terminal_device_config<'a>(
     user_config.registered_device_keys.iter().find(|key| {
         key.enabled && key.id.trim() == device_key_id && !key.public_key.trim().is_empty()
     })
+}
+
+fn mobile_terminal_user_can_disable(user_config: &MobileTerminalUserConfig) -> bool {
+    user_config.mobile_terminal_owner
+        || user_config.can_disable_mobile_terminal
+        || user_config.owner
+}
+
+fn mobile_terminal_runtime_disabled(state: &AppState) -> bool {
+    state
+        .mobile_terminal_runtime_disabled
+        .load(Ordering::SeqCst)
+}
+
+fn mobile_terminal_config_enabled(config: &AppConfig, runtime_disabled: bool) -> bool {
+    config.mobile_terminal.enabled && !runtime_disabled
+}
+
+fn mobile_terminal_enabled(state: &AppState) -> bool {
+    mobile_terminal_config_enabled(&state.config, mobile_terminal_runtime_disabled(state))
+}
+
+fn ensure_mobile_terminal_ticket_runtime_enabled(state: &AppState) -> Result<(), ApiError> {
+    if mobile_terminal_runtime_disabled(state) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Mobile terminal attach is disabled".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn mobile_terminal_ws_url(config: &AppConfig, route_prefix: Option<&str>) -> Option<String> {
@@ -4458,8 +4607,8 @@ fn mobile_terminal_proof_nonce_key(
 fn consume_mobile_terminal_ticket(
     state: &AppState,
     frame: &MobileTerminalAuthFrame,
-) -> Result<(MobileTerminalTicket, String), ApiError> {
-    if !state.config.mobile_terminal.enabled {
+) -> Result<(MobileTerminalTicket, String, Arc<AtomicBool>), ApiError> {
+    if !mobile_terminal_enabled(state) {
         return Err(ApiError::Status {
             status: StatusCode::FORBIDDEN,
             detail: "mobile terminal attach is disabled".to_owned(),
@@ -4552,6 +4701,12 @@ fn consume_mobile_terminal_ticket(
     }
     validate_mobile_terminal_tmux_target(&ticket.tmux_session, ticket.tmux_socket_name.as_deref())?;
 
+    if !mobile_terminal_enabled(state) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "mobile terminal attach is disabled".to_owned(),
+        });
+    }
     let mut tickets = state
         .mobile_terminal_tickets
         .lock()
@@ -4590,6 +4745,7 @@ fn consume_mobile_terminal_ticket(
     enforce_mobile_terminal_active_limits(&state.config, active.values(), &current_ticket)?;
     let ticket = tickets.remove(&ticket_id).expect("ticket checked above");
     let attach_id = random_urlsafe_token(16);
+    let stop = Arc::new(AtomicBool::new(false));
     active.insert(
         attach_id.clone(),
         MobileTerminalActiveAttach {
@@ -4598,9 +4754,10 @@ fn consume_mobile_terminal_ticket(
             provider: ticket.provider.clone(),
             device_key_id: ticket.device_key_id.clone(),
             started_at_unix: now,
+            stop: stop.clone(),
         },
     );
-    Ok((ticket, attach_id))
+    Ok((ticket, attach_id, stop))
 }
 
 fn mobile_terminal_ticket_for_consume(
@@ -5184,7 +5341,10 @@ fn bug_report_server_state(
     };
     Ok(json!({
         "captured_at": now_rfc3339(),
-        "bootstrap": client_bootstrap_response(&state.config),
+        "bootstrap": client_bootstrap_response(
+            &state.config,
+            mobile_terminal_runtime_disabled(state),
+        ),
         "health": {
             "status": "healthy",
         },
@@ -6133,6 +6293,7 @@ mod tests {
                     provider: "codex-fork".to_owned(),
                     device_key_id: "test-device".to_owned(),
                     started_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                    stop: Arc::new(AtomicBool::new(false)),
                 },
             );
         let app = router(state.clone());
@@ -6408,17 +6569,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mobile_terminal_disable_requires_owner_authorization() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(local_request(
+                Method::POST,
+                "/client/mobile-terminal/disable",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["detail"],
+            "User is not allowed to disable mobile terminal attach"
+        );
+        assert!(!state
+            .mobile_terminal_runtime_disabled
+            .load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_disable_owner_terminates_active_attaches() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config
+            .mobile_terminal
+            .allowed_users
+            .get_mut("local_bypass")
+            .unwrap()
+            .mobile_terminal_owner = true;
+        let state = AppState::new(config);
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        assert!(state
+            .mobile_terminal_tickets
+            .lock()
+            .unwrap()
+            .contains_key(ticket["ticket_id"].as_str().unwrap()));
+        let stop = Arc::new(AtomicBool::new(false));
+        state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .insert(
+                "active-1".to_owned(),
+                MobileTerminalActiveAttach {
+                    user_id: "local_bypass".to_owned(),
+                    session_id: "fork1001".to_owned(),
+                    provider: "codex-fork".to_owned(),
+                    device_key_id: "test-device".to_owned(),
+                    started_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                    stop: stop.clone(),
+                },
+            );
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::POST,
+                "/client/mobile-terminal/disable",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "disabled": true,
+                "active_attaches_terminated": 1,
+            })
+        );
+        assert!(state
+            .mobile_terminal_runtime_disabled
+            .load(Ordering::SeqCst));
+        assert!(state.mobile_terminal_tickets.lock().unwrap().is_empty());
+        assert!(state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(stop.load(Ordering::SeqCst));
+
+        let sessions = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/sessions",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(sessions).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sessions"][0]["mobile_terminal"]["supported"], false);
+        assert_eq!(
+            body["sessions"][0]["mobile_terminal"]["reason"],
+            "mobile terminal attach is disabled"
+        );
+
+        let ticket_after_disable = app
+            .oneshot(attach_ticket_request(&signing_key, "ticket-nonce-2"))
+            .await
+            .unwrap();
+        let (status, body) = response_json(ticket_after_disable).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["detail"], "Mobile terminal attach is disabled");
+    }
+
+    #[tokio::test]
     async fn mobile_terminal_auth_consumes_ticket_and_tracks_active_attach() {
         let signing_key = SigningKey::random(&mut OsRng);
         let state = AppState::new(mobile_ticket_config(&signing_key));
         let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
         let frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
 
-        let (consumed_ticket, attach_id) = consume_mobile_terminal_ticket(&state, &frame).unwrap();
+        let (consumed_ticket, attach_id, stop) =
+            consume_mobile_terminal_ticket(&state, &frame).unwrap();
 
         assert_eq!(consumed_ticket.ticket_id, ticket["ticket_id"]);
         assert_eq!(consumed_ticket.session_id, "fork1001");
         assert_eq!(consumed_ticket.device_key_id, "test-device");
+        assert!(!stop.load(Ordering::SeqCst));
         assert!(!state
             .mobile_terminal_tickets
             .lock()
@@ -6524,6 +6805,7 @@ mod tests {
                     provider: "codex-fork".to_owned(),
                     device_key_id: "test-device".to_owned(),
                     started_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                    stop: Arc::new(AtomicBool::new(false)),
                 },
             );
 
