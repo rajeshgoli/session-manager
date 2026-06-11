@@ -120,11 +120,22 @@ fn default_state_file() -> String {
 }
 
 fn default_app_artifacts_dir() -> String {
-    "data/apps".to_owned()
+    repo_data_path("apps")
 }
 
 fn default_bug_reports_db_path() -> String {
-    "data/bug_reports.db".to_owned()
+    repo_data_path("bug_reports.db")
+}
+
+fn repo_data_path(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."))
+        .join("data")
+        .join(name)
+        .display()
+        .to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1023,6 +1034,24 @@ sm_send:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
+    }
+
+    #[test]
+    fn raw_config_defaults_mobile_state_paths_to_repo_data_dir() {
+        let config = AppConfig::from(RawConfig::default());
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+
+        assert_eq!(
+            PathBuf::from(config.app_artifacts.root_dir),
+            repo_root.join("data/apps")
+        );
+        assert_eq!(
+            PathBuf::from(config.bug_reports.db_path),
+            repo_root.join("data/bug_reports.db")
+        );
     }
 
     #[test]
