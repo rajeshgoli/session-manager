@@ -12,6 +12,7 @@ This bundle supports Stage 5 of [762_rust_migration_and_ruggedization.md](../762
 | [gate_matrix.md](gate_matrix.md) | Falsifiable value gate, compatibility/security/ops gates, and observability requirements. |
 | [implementation_workstreams.md](implementation_workstreams.md) | Epic split and sequencing for implementation tickets after this spec converges. |
 | [mvp_progress.md](mvp_progress.md) | Dated implementation snapshot for the Rust MVP track after merged PR #876. |
+| [resume_handoff.md](resume_handoff.md) | Current resume point, validation state, known fixtures, and next slices for the Rust port. |
 
 The owner has approved the cutover scope reductions in [cutover_scope.md](cutover_scope.md). Future breaking changes outside that artifact still require explicit owner approval.
 
