@@ -195,10 +195,17 @@ enum ContextMonitorCommand {
 #[derive(Args)]
 struct EmailArgs {
     recipient: Option<String>,
+    message: Option<String>,
     #[arg(long)]
     subject: Option<String>,
     #[arg(long)]
     body: Option<String>,
+    #[arg(long)]
+    text: Option<String>,
+    #[arg(long)]
+    html: Option<String>,
+    #[arg(long)]
+    cc: Option<String>,
 }
 
 #[derive(Args)]
@@ -649,6 +656,7 @@ fn run() -> Result<()> {
         Command::ContextMonitor(args) => {
             run_context_monitor(&client, args)?;
         }
+        Command::Email(args) => run_email(&client, args)?,
         Command::Maintainer(args) => {
             let session_id = current_session_id()?;
             let body = json!({ "requester_session_id": session_id });
@@ -710,6 +718,192 @@ fn required_positional(value: Option<String>, label: &str) -> Result<String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("{label} is required"))
+}
+
+fn run_email(client: &ApiClient, args: EmailArgs) -> Result<()> {
+    let requester_session_id = current_session_id()?;
+    let recipient_raw = required_positional(args.recipient, "recipient")?;
+    let recipients = split_email_targets(&recipient_raw);
+    if recipients.is_empty() {
+        bail!("at least one recipient is required");
+    }
+    let cc = split_email_targets(args.cc.as_deref().unwrap_or(""));
+    let body = email_body_from_args(args.message, args.body, args.text, args.html)?;
+    let subject = args.subject;
+
+    let mut human_match = None;
+    for target in recipients.iter().chain(cc.iter()) {
+        let human_response = client.request(
+            "GET",
+            &format!("/humans/{}", encode_path_segment(target)),
+            None,
+        )?;
+        if (200..300).contains(&human_response.status) {
+            human_match = Some((target.clone(), human_response.into_json()?));
+            break;
+        }
+        if human_response.status != 404 {
+            return Err(human_response.into_status_error());
+        }
+    }
+
+    if let Some((target, human)) = human_match {
+        if recipients.len() != 1 || !cc.is_empty() {
+            bail!("sm email to human recipients supports exactly one recipient and no --cc");
+        }
+        let Some(text) = body.text.clone() else {
+            bail!("sm email to human recipients supports plain text or markdown bodies only");
+        };
+        if body.html.is_some() {
+            bail!("sm email to human recipients supports plain text or markdown bodies only");
+        }
+        let canonical = human["recipient"].as_str().unwrap_or(&target);
+        let payload = client.post_json(
+            &format!("/humans/{}/email", encode_path_segment(canonical)),
+            json!({
+                "requester_session_id": requester_session_id,
+                "text": text,
+                "subject": subject,
+                "body_markdown": body.markdown,
+            }),
+        )?;
+        println!(
+            "Email sent to {}",
+            payload["recipient"].as_str().unwrap_or(canonical)
+        );
+        return Ok(());
+    }
+    let request_payload =
+        registered_email_payload(requester_session_id, recipients, cc, subject, body)?;
+    let payload = client.post_json("/email/send", request_payload)?;
+    let to_summary = payload["to"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["username"].as_str().or_else(|| item["email"].as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "recipient".to_owned());
+    println!("Email sent to {to_summary}");
+    Ok(())
+}
+
+fn split_email_targets(raw_value: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for part in raw_value.split(',') {
+        let identifier = part.trim();
+        if identifier.is_empty() || !seen.insert(identifier.to_owned()) {
+            continue;
+        }
+        identifiers.push(identifier.to_owned());
+    }
+    identifiers
+}
+
+fn registered_email_payload(
+    requester_session_id: String,
+    recipients: Vec<String>,
+    cc: Vec<String>,
+    subject: Option<String>,
+    body: EmailBody,
+) -> Result<Value> {
+    if subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        bail!("--subject is required for non-human registered email");
+    }
+    Ok(json!({
+        "requester_session_id": requester_session_id,
+        "recipients": recipients,
+        "cc": cc,
+        "subject": subject,
+        "body_text": body.text,
+        "body_html": body.html,
+        "body_markdown": body.markdown,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmailBody {
+    text: Option<String>,
+    html: Option<String>,
+    markdown: bool,
+}
+
+fn email_body_from_args(
+    message: Option<String>,
+    body: Option<String>,
+    text_file: Option<String>,
+    html_file: Option<String>,
+) -> Result<EmailBody> {
+    if message.is_some() && body.is_some() {
+        bail!("use either positional message or --body, not both");
+    }
+
+    let source_count = usize::from(message.is_some())
+        + usize::from(body.is_some())
+        + usize::from(text_file.is_some())
+        + usize::from(html_file.is_some());
+    if source_count > 1 {
+        bail!("Provide exactly one of positional message, --body, --text, --html, or stdin");
+    }
+
+    if let Some(body) = body
+        .or(message)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(EmailBody {
+            text: Some(body),
+            html: None,
+            markdown: false,
+        });
+    }
+    if let Some(text_file) = text_file {
+        let path = Path::new(&text_file);
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("failed to read email text file {}", path.display()))?;
+        let markdown = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "md" | "markdown"))
+            .unwrap_or(false);
+        return Ok(EmailBody {
+            text: Some(text),
+            html: None,
+            markdown,
+        });
+    }
+    if let Some(html_file) = html_file {
+        let path = Path::new(&html_file);
+        let html = fs::read_to_string(path)
+            .with_context(|| format!("failed to read email HTML file {}", path.display()))?;
+        return Ok(EmailBody {
+            text: None,
+            html: Some(html),
+            markdown: false,
+        });
+    }
+    if !io::stdin().is_terminal() {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        let input = input.trim().to_owned();
+        if !input.is_empty() {
+            return Ok(EmailBody {
+                text: Some(input),
+                html: None,
+                markdown: true,
+            });
+        }
+    }
+    bail!("Email body is required");
 }
 
 fn print_output(client: &ApiClient, session_id: &str, lines: usize) -> Result<()> {
@@ -1760,6 +1954,145 @@ mod tests {
     }
 
     #[test]
+    fn email_cli_accepts_positional_message_and_cc() {
+        let cli = Cli::try_parse_from([
+            "sm",
+            "email",
+            "alice,bob",
+            "hello from rust",
+            "--subject",
+            "Status",
+            "--cc",
+            "carol,dave",
+        ])
+        .unwrap();
+
+        let Command::Email(args) = cli.command else {
+            panic!("expected email command");
+        };
+        assert_eq!(args.recipient.as_deref(), Some("alice,bob"));
+        assert_eq!(args.message.as_deref(), Some("hello from rust"));
+        assert_eq!(args.subject.as_deref(), Some("Status"));
+        assert_eq!(args.cc.as_deref(), Some("carol,dave"));
+    }
+
+    #[test]
+    fn email_cli_accepts_file_backed_body_flags() {
+        let text_cli = Cli::try_parse_from([
+            "sm",
+            "email",
+            "alice",
+            "--subject",
+            "Status",
+            "--text",
+            "body.md",
+        ])
+        .unwrap();
+        let Command::Email(text_args) = text_cli.command else {
+            panic!("expected email command");
+        };
+        assert_eq!(text_args.text.as_deref(), Some("body.md"));
+
+        let html_cli = Cli::try_parse_from([
+            "sm",
+            "email",
+            "alice",
+            "--subject",
+            "Status",
+            "--html",
+            "body.html",
+        ])
+        .unwrap();
+        let Command::Email(html_args) = html_cli.command else {
+            panic!("expected email command");
+        };
+        assert_eq!(html_args.html.as_deref(), Some("body.html"));
+    }
+
+    #[test]
+    fn split_email_targets_dedupes_comma_lists() {
+        assert_eq!(
+            split_email_targets(" alice, bob ,,alice,carol "),
+            vec!["alice", "bob", "carol"]
+        );
+    }
+
+    #[test]
+    fn registered_email_payload_preserves_recipient_and_cc_lists() {
+        let payload = registered_email_payload(
+            "sender001".to_owned(),
+            vec!["alice".to_owned(), "bob".to_owned()],
+            vec!["carol".to_owned()],
+            Some("Status".to_owned()),
+            EmailBody {
+                text: Some("hello".to_owned()),
+                html: None,
+                markdown: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(payload["requester_session_id"], "sender001");
+        assert_eq!(payload["recipients"], json!(["alice", "bob"]));
+        assert_eq!(payload["cc"], json!(["carol"]));
+        assert_eq!(payload["subject"], "Status");
+        assert_eq!(payload["body_text"], "hello");
+        assert_eq!(payload["body_html"], Value::Null);
+        assert_eq!(payload["body_markdown"], false);
+    }
+
+    #[test]
+    fn registered_email_payload_preserves_html_body() {
+        let payload = registered_email_payload(
+            "sender001".to_owned(),
+            vec!["alice".to_owned()],
+            Vec::new(),
+            Some("Status".to_owned()),
+            EmailBody {
+                text: None,
+                html: Some("<p>hello</p>".to_owned()),
+                markdown: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(payload["body_text"], Value::Null);
+        assert_eq!(payload["body_html"], "<p>hello</p>");
+    }
+
+    #[test]
+    fn email_body_rejects_positional_message_with_body_flag() {
+        let error = email_body_from_args(
+            Some("positional".to_owned()),
+            Some("flag".to_owned()),
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("use either positional message or --body"));
+    }
+
+    #[test]
+    fn email_body_loads_text_and_html_files() {
+        let markdown_path = write_temp_file("sm-rust-email-body", ".md", "# Summary\n\n- one\n");
+        let markdown_body =
+            email_body_from_args(None, None, Some(markdown_path.display().to_string()), None)
+                .unwrap();
+        assert_eq!(markdown_body.text.as_deref(), Some("# Summary\n\n- one\n"));
+        assert_eq!(markdown_body.html, None);
+        assert!(markdown_body.markdown);
+
+        let html_path = write_temp_file("sm-rust-email-body", ".html", "<p>Summary</p>\n");
+        let html_body =
+            email_body_from_args(None, None, None, Some(html_path.display().to_string())).unwrap();
+        assert_eq!(html_body.text, None);
+        assert_eq!(html_body.html.as_deref(), Some("<p>Summary</p>\n"));
+        assert!(!html_body.markdown);
+    }
+
+    #[test]
     fn subagent_stop_summary_prefers_current_hook_field() {
         let payload = json!({
             "last_assistant_message": "done from hook",
@@ -1840,14 +2173,15 @@ mod tests {
     }
 
     fn write_temp_config(content: &str) -> PathBuf {
+        write_temp_file("sm-rust-client-config", ".yaml", content)
+    }
+
+    fn write_temp_file(prefix: &str, suffix: &str, content: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = env::temp_dir().join(format!(
-            "sm-rust-client-config-{}-{nonce}.yaml",
-            std::process::id()
-        ));
+        let path = env::temp_dir().join(format!("{prefix}-{}-{nonce}{suffix}", std::process::id()));
         fs::write(&path, content).unwrap();
         path
     }
