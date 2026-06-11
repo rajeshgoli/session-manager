@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub paths: PathsConfig,
+    pub mobile_analytics: MobileAnalyticsConfig,
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
     pub mobile_terminal: MobileTerminalConfig,
@@ -25,6 +26,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             paths: PathsConfig::default(),
+            mobile_analytics: MobileAnalyticsConfig::default(),
             google_auth: GoogleAuthConfig::default(),
             external_access: ExternalAccessConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
@@ -302,6 +304,27 @@ fn default_message_queue_db_path() -> String {
     "~/.local/share/claude-sessions/message_queue.db".to_owned()
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MobileAnalyticsConfig {
+    #[serde(default = "default_message_queue_db_path")]
+    pub message_queue_db: String,
+    #[serde(default = "default_server_log_file")]
+    pub server_log_file: String,
+}
+
+impl Default for MobileAnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            message_queue_db: default_message_queue_db_path(),
+            server_log_file: default_server_log_file(),
+        }
+    }
+}
+
+fn default_server_log_file() -> String {
+    "/tmp/session-manager.log".to_owned()
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
@@ -339,7 +362,7 @@ pub struct RustCoreConfig {
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
-    paths: PathsConfig,
+    paths: RawPathsConfig,
     #[serde(default)]
     auth: RawAuthConfig,
     #[serde(default)]
@@ -369,6 +392,7 @@ struct RawConfig {
 impl From<RawConfig> for AppConfig {
     fn from(raw: RawConfig) -> Self {
         let mut rust_core = raw.rust_core;
+        let paths = raw.paths;
         let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new());
         let codex = provider_launch_config(raw.codex, "codex", None, Vec::new());
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
@@ -396,7 +420,13 @@ impl From<RawConfig> for AppConfig {
             rust_core.send_keys_max_chunk_chars = tmux_timeouts.send_keys_max_chunk_chars;
         }
         Self {
-            paths: raw.paths,
+            paths: PathsConfig {
+                state_file: paths.state_file,
+            },
+            mobile_analytics: MobileAnalyticsConfig {
+                message_queue_db: paths.message_queue_db,
+                server_log_file: paths.server_log_file,
+            },
             google_auth: raw.auth.google,
             external_access: raw.external_access,
             mobile_terminal: raw.mobile_terminal,
@@ -408,6 +438,26 @@ impl From<RawConfig> for AppConfig {
             nodes: nodes_config_from_yaml(raw.nodes),
             rust_shadow: raw.rust_shadow,
             rust_core,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPathsConfig {
+    #[serde(default = "default_state_file")]
+    state_file: String,
+    #[serde(default = "default_message_queue_db_path")]
+    message_queue_db: String,
+    #[serde(default = "default_server_log_file")]
+    server_log_file: String,
+}
+
+impl Default for RawPathsConfig {
+    fn default() -> Self {
+        Self {
+            state_file: default_state_file(),
+            message_queue_db: default_message_queue_db_path(),
+            server_log_file: default_server_log_file(),
         }
     }
 }

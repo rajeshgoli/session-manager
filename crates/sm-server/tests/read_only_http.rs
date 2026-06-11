@@ -17,8 +17,8 @@ use sm_server::config::RustShadowConfig;
 use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
-        AppConfig, CodexForkLaunchConfig, ExternalAccessConfig, GoogleAuthConfig, PathsConfig,
-        RustCoreConfig, SmSendConfig,
+        AppConfig, CodexForkLaunchConfig, ExternalAccessConfig, GoogleAuthConfig,
+        MobileAnalyticsConfig, PathsConfig, RustCoreConfig, SmSendConfig,
     },
     http::{router, AppState},
 };
@@ -320,6 +320,255 @@ nodes:
         .map(|entry| entry["id"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["primary", "remote"]);
+}
+
+#[tokio::test]
+async fn client_analytics_summary_reports_live_metrics_from_state_queue_and_logs() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("analytics-message-queue.db");
+    let server_log = state_file.with_extension("analytics-server.log");
+    let now = time::OffsetDateTime::now_utc();
+    let session_a_created = now - time::Duration::hours(2);
+    let session_b_created = now - time::Duration::hours(1);
+    let send_a = now - time::Duration::minutes(90);
+    let send_b = now - time::Duration::minutes(30);
+    let send_previous = now - time::Duration::hours(25);
+    let track_send = now - time::Duration::minutes(15);
+    let restart = now - time::Duration::hours(2);
+    let spawn_current = now - time::Duration::minutes(80);
+    let spawn_previous = now - time::Duration::hours(26);
+    let self_heal = now - time::Duration::minutes(70);
+
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "analyticsa",
+                    "name": "claude-analyticsa",
+                    "working_dir": "/tmp/repo-a",
+                    "tmux_session": "claude-analyticsa",
+                    "log_file": "/tmp/analyticsa.log",
+                    "status": "running",
+                    "created_at": rfc3339(session_a_created),
+                    "last_activity": rfc3339(now),
+                    "provider": "claude",
+                    "tokens_used": 1200,
+                    "friendly_name": "agent-a"
+                },
+                {
+                    "id": "analyticsb",
+                    "name": "codex-fork-analyticsb",
+                    "working_dir": "/tmp/repo-b",
+                    "tmux_session": "codex-fork-analyticsb",
+                    "log_file": "/tmp/analyticsb.log",
+                    "status": "thinking",
+                    "created_at": rfc3339(session_b_created),
+                    "last_activity": rfc3339(now),
+                    "provider": "codex-fork",
+                    "tokens_used": 800,
+                    "friendly_name": "agent-b"
+                },
+                {
+                    "id": "analyticsstopped",
+                    "name": "claude-analyticsstopped",
+                    "working_dir": "/tmp/repo-c",
+                    "tmux_session": "claude-analyticsstopped",
+                    "log_file": "/tmp/analyticsstopped.log",
+                    "status": "stopped",
+                    "created_at": rfc3339(now - time::Duration::hours(5)),
+                    "last_activity": rfc3339(now),
+                    "stopped_at": rfc3339(now)
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    {
+        let conn = Connection::open(&queue_db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE message_queue (
+                id TEXT PRIMARY KEY,
+                target_session_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                delivery_mode TEXT DEFAULT 'sequential',
+                from_sm_send INTEGER DEFAULT 0,
+                queued_at TIMESTAMP NOT NULL,
+                message_category TEXT DEFAULT NULL
+            );
+            CREATE TABLE remind_registrations (
+                id TEXT PRIMARY KEY,
+                target_session_id TEXT NOT NULL UNIQUE,
+                soft_threshold_seconds INTEGER NOT NULL,
+                hard_threshold_seconds INTEGER NOT NULL,
+                registered_at TIMESTAMP NOT NULL,
+                last_reset_at TIMESTAMP NOT NULL,
+                soft_fired INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                cancel_on_reply_session_id TEXT
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO message_queue
+                (id, target_session_id, text, queued_at, message_category, from_sm_send)
+            VALUES
+                ('send-a', 'analyticsa', 'msg', ?1, NULL, 1),
+                ('send-b', 'analyticsa', 'msg', ?2, NULL, 1),
+                ('send-prev', 'analyticsb', 'msg', ?3, NULL, 1),
+                ('track-a', 'analyticsb', 'track', ?4, 'track_remind', 0)
+            "#,
+            (
+                rfc3339(send_a),
+                rfc3339(send_b),
+                rfc3339(send_previous),
+                rfc3339(track_send),
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO remind_registrations
+                (id, target_session_id, soft_threshold_seconds, hard_threshold_seconds,
+                 registered_at, last_reset_at, soft_fired, is_active, cancel_on_reply_session_id)
+            VALUES
+                ('track-active', 'analyticsa', 300, 600, ?1, ?1, 1, 1, 'owner-a'),
+                ('track-waiting', 'analyticsb', 300, 600, ?1, ?1, 0, 1, 'owner-b'),
+                ('track-unowned', 'ignored', 300, 600, ?1, ?1, 1, 1, NULL)
+            "#,
+            [rfc3339(now - time::Duration::hours(3))],
+        )
+        .unwrap();
+    }
+
+    fs::write(
+        &server_log,
+        [
+            format!(
+                "{} - __main__ - INFO - Starting Claude Session Manager...",
+                log_timestamp(restart)
+            ),
+            format!(
+                "{} - src.session_manager - INFO - Created session claude-analyticsa (id=analyticsa)",
+                log_timestamp(spawn_current)
+            ),
+            format!(
+                "{} - src.session_manager - INFO - Created session with CLI prompt should be ignored",
+                log_timestamp(now - time::Duration::minutes(75))
+            ),
+            format!(
+                "{} - src.session_manager - INFO - Created session codex-fork-old (id=old)",
+                log_timestamp(spawn_previous)
+            ),
+            format!(
+                "{} - src.infra_supervisor - WARNING - Recovered android attach sshd via launchctl",
+                log_timestamp(self_heal)
+            ),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        mobile_analytics: MobileAnalyticsConfig {
+            message_queue_db: queue_db.display().to_string(),
+            server_log_file: server_log.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/client/analytics/summary").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["window_hours"], 24);
+    assert!(payload["generated_at"].is_string());
+    assert_eq!(payload["kpis"]["active_sessions"]["value"], 2);
+    assert_eq!(payload["kpis"]["sends_24h"]["value"], 2);
+    assert_eq!(payload["kpis"]["sends_24h"]["delta_pct"], 100.0);
+    assert_eq!(payload["kpis"]["spawns_24h"]["value"], 1);
+    assert_eq!(payload["kpis"]["spawns_24h"]["delta_pct"], 0.0);
+    assert_eq!(payload["kpis"]["active_tracks"]["value"], 2);
+    assert_eq!(payload["kpis"]["overdue_tracks"]["value"], 1);
+    assert_eq!(payload["kpis"]["incidents_24h"]["value"], 2);
+    assert_eq!(payload["totals"]["tokens_live"], 2000);
+    assert_eq!(payload["totals"]["track_reminders_24h"], 1);
+    assert_eq!(payload["reliability"]["restart_count_24h"], 1);
+    assert_eq!(payload["reliability"]["self_heal_count_24h"], 1);
+    assert_eq!(
+        payload["state_distribution"],
+        json!([
+            {"key": "working", "label": "working", "count": 1},
+            {"key": "thinking", "label": "thinking", "count": 1},
+            {"key": "waiting", "label": "waiting", "count": 0},
+            {"key": "idle", "label": "idle", "count": 0}
+        ])
+    );
+    assert_eq!(
+        payload["provider_distribution"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(payload["repo_distribution"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["longest_running"][0]["id"], "analyticsa");
+    assert_eq!(payload["throughput"].as_array().unwrap().len(), 12);
+    assert_eq!(payload["health_checks"], json!([]));
+    assert_eq!(payload["attach_available"], true);
+}
+
+#[tokio::test]
+async fn client_analytics_summary_uses_zero_fallbacks_for_missing_telemetry_files() {
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        mobile_analytics: MobileAnalyticsConfig {
+            message_queue_db: state_file
+                .with_extension("missing-queue.db")
+                .display()
+                .to_string(),
+            server_log_file: state_file
+                .with_extension("missing.log")
+                .display()
+                .to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/client/analytics/summary").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["kpis"]["active_sessions"]["value"], 0);
+    assert_eq!(payload["kpis"]["sends_24h"]["value"], 0);
+    assert_eq!(payload["kpis"]["active_tracks"]["value"], 0);
+    assert_eq!(payload["reliability"]["restart_count_24h"], 0);
+    assert_eq!(payload["totals"]["tokens_live"], 0);
+    assert_eq!(payload["throughput"].as_array().unwrap().len(), 12);
+}
+
+#[tokio::test]
+async fn client_analytics_summary_rejects_public_host_without_auth() {
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) =
+        get_json_with_host(app, "/client/analytics/summary", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+    assert_eq!(
+        payload["login_url"],
+        "/auth/google/login?next=%2Fclient%2Fanalytics%2Fsummary"
+    );
 }
 
 #[tokio::test]
@@ -5504,6 +5753,23 @@ fn config_with_state_file_and_queue(state_file: &PathBuf) -> AppConfig {
 
 fn queue_db_path_for_state_file(state_file: &PathBuf) -> PathBuf {
     state_file.with_extension("message_queue.db")
+}
+
+fn rfc3339(value: time::OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+fn log_timestamp(value: time::OffsetDateTime) -> String {
+    format!(
+        "{},000",
+        value
+            .format(time::macros::format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second]"
+            ))
+            .unwrap()
+    )
 }
 
 fn assert_python_naive_timestamp(value: &str) {

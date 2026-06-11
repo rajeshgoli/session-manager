@@ -34,6 +34,7 @@ CORE_READ_CHECK_IDS = (
     "http.health_detailed",
     "http.auth_session",
     "http.client_bootstrap",
+    "http.client_analytics_summary",
     "http.events_state",
     "http.events_sse_hello",
     "http.sessions",
@@ -47,7 +48,6 @@ CORE_READ_CHECK_IDS = (
 )
 
 MVP_GAP_PROBE_CHECK_IDS = (
-    "http.client_analytics_summary",
     "http.queue_jobs_list",
     "http.codex_review_requests_list",
 )
