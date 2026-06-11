@@ -184,6 +184,17 @@ impl RetainedQueueStore {
         list_queue_jobs_conn(&conn, filters)
     }
 
+    pub fn get_queue_job_from_path(db_path: &Path, job_id: &str) -> Result<Option<QueueJobRecord>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(_) => return Ok(None),
+        };
+        get_queue_job_conn(&conn, job_id)
+    }
+
     pub fn ensure_schema(&self) -> Result<()> {
         self.with_connection(|_| Ok(()))
     }
@@ -996,46 +1007,77 @@ fn list_queue_jobs_conn(
         }
         Err(error) => return Err(error.into()),
     };
-    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
-        let argv_json: Option<String> = row.get(6)?;
-        let argv = match argv_json
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(raw) => Some(serde_json::from_str::<Vec<String>>(raw).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    6,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?),
-            None => None,
-        };
-        Ok(QueueJobRecord {
-            id: row.get(0)?,
-            job_type: row.get(1)?,
-            label: row.get(2)?,
-            requester_session_id: row.get(3)?,
-            notify_session_id: row
-                .get::<_, Option<String>>(4)?
-                .filter(|value| !value.is_empty()),
-            cwd: row.get(5)?,
-            argv,
-            script_path: row.get(7)?,
-            timeout_seconds: row.get(8)?,
-            state: row.get(9)?,
-            holding_reason: row.get(10)?,
-            queued_at: row.get(11)?,
-            started_at: row.get(12)?,
-            finished_at: row.get(13)?,
-            pid: row.get(14)?,
-            process_group_id: row.get(15)?,
-            exit_code: row.get(16)?,
-            log_path: row.get(17)?,
-        })
-    })?;
+    let rows = statement.query_map(
+        rusqlite::params_from_iter(values),
+        queue_job_record_from_row,
+    )?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJobRecord>> {
+    let mut statement = match conn.prepare(
+        r#"
+        SELECT id, type, label, requester_session_id, notify_session_id, cwd,
+               argv_json, script_path, timeout_seconds, state, holding_reason,
+               queued_at, started_at, finished_at, pid, process_group_id,
+               exit_code, log_path
+        FROM queue_jobs
+        WHERE id = ?1
+        LIMIT 1
+        "#,
+    ) {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table") =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    statement
+        .query_row(params![job_id], queue_job_record_from_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJobRecord> {
+    let argv_json: Option<String> = row.get(6)?;
+    let argv = match argv_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => Some(serde_json::from_str::<Vec<String>>(raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?),
+        None => None,
+    };
+    Ok(QueueJobRecord {
+        id: row.get(0)?,
+        job_type: row.get(1)?,
+        label: row.get(2)?,
+        requester_session_id: row.get(3)?,
+        notify_session_id: row
+            .get::<_, Option<String>>(4)?
+            .filter(|value| !value.is_empty()),
+        cwd: row.get(5)?,
+        argv,
+        script_path: row.get(7)?,
+        timeout_seconds: row.get(8)?,
+        state: row.get(9)?,
+        holding_reason: row.get(10)?,
+        queued_at: row.get(11)?,
+        started_at: row.get(12)?,
+        finished_at: row.get(13)?,
+        pid: row.get(14)?,
+        process_group_id: row.get(15)?,
+        exit_code: row.get(16)?,
+        log_path: row.get(17)?,
+    })
 }
 
 fn optional_sqlite_json_scalar(value: ValueRef<'_>) -> Option<JsonValue> {
