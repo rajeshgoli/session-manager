@@ -247,6 +247,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
+        .route("/auth/device/google", post(auth_device_google))
+        .route("/hooks/tmux-client", post(tmux_client_hook))
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
@@ -437,6 +439,51 @@ async fn auth_session(
         auth_type: None,
         error: None,
     })
+}
+
+async fn auth_device_google(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeviceGoogleAuthRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !state.config.google_auth.ready() {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Google auth is not configured".to_owned(),
+        });
+    }
+    let _id_token = payload.id_token.trim();
+    Err(ApiError::Status {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Invalid Google ID token".to_owned(),
+    })
+}
+
+async fn tmux_client_hook(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<TmuxClientHookQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !is_local_bypass_request(&headers, Some(peer_addr), &state.config) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "tmux client hooks must originate locally".to_owned(),
+        });
+    }
+    let event_name = query.event.trim();
+    if !matches!(
+        event_name,
+        "client-attached" | "client-detached" | "client-session-changed"
+    ) {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "unsupported tmux client event".to_owned(),
+        });
+    }
+    Ok(Json(json!({
+        "status": "ok",
+        "tmux_client_event_version": 0,
+    })))
 }
 
 async fn client_bootstrap(
@@ -6694,6 +6741,16 @@ fn decoded_last_query_value(query_string: &str, key: &str) -> Result<Option<Stri
 struct KillSessionRequest {
     #[serde(default)]
     requester_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceGoogleAuthRequest {
+    id_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmuxClientHookQuery {
+    event: String,
 }
 
 #[derive(Debug, Serialize)]
