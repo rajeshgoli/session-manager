@@ -203,6 +203,15 @@ By default this:
 - posts shadow-style read comparisons to Rust `POST /__shadow/http`;
 - writes Python and Rust baseline JSON under the report directory.
 
+The rehearsal uses exact body hashes only for stable sidecar-readable payloads.
+Live session list projections such as `/sessions` and `/client/sessions` include
+runtime-derived activity and attach metadata that the read-only sidecar does not
+own yet. `/nodes` includes live node-agent connectivity that the sidecar does
+not own yet. `/client/bootstrap` can advertise Python-only mobile-terminal
+attach support until Rust owns the terminal/ticket routes. The shadow summary
+treats those paths as status-only until Rust owns the corresponding runtime
+state.
+
 Reports are written under `.local/rust-mvp-rehearsals/<timestamp>/` unless
 `--output-dir` is supplied. `.local/` is ignored; do not commit host-local
 reports.
