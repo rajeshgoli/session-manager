@@ -1,7 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{
+    params,
+    types::{Value as SqlValue, ValueRef},
+    Connection, OpenFlags, OptionalExtension,
+};
+use serde_json::{Number as JsonNumber, Value as JsonValue};
 use time::{
     format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
     PrimitiveDateTime,
@@ -10,6 +15,42 @@ use time::{
 #[derive(Debug, Clone)]
 pub struct RetainedQueueStore {
     db_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexReviewRequestFilters {
+    pub notify_session_id: Option<String>,
+    pub repo: Option<String>,
+    pub pr_number: Option<i64>,
+    pub include_inactive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexReviewRequestRegistration {
+    pub id: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub requester_session_id: Option<String>,
+    pub notify_session_id: String,
+    pub steer: Option<String>,
+    pub requested_at: String,
+    pub latest_request_comment_id: Option<i64>,
+    pub latest_request_comment_url: Option<String>,
+    pub latest_request_posted_at: Option<String>,
+    pub attempt_count: i64,
+    pub next_retry_at: Option<String>,
+    pub poll_interval_seconds: i64,
+    pub retry_interval_seconds: i64,
+    pub pickup_detected_at: Option<String>,
+    pub pickup_source: Option<String>,
+    pub review_landed_at: Option<String>,
+    pub review_source: Option<String>,
+    pub review_comment_id: Option<JsonValue>,
+    pub review_url: Option<String>,
+    pub last_polled_at: Option<String>,
+    pub last_error: Option<String>,
+    pub state: String,
+    pub is_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +124,20 @@ impl RetainedQueueStore {
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    pub fn list_codex_review_requests_from_path(
+        db_path: &Path,
+        filters: CodexReviewRequestFilters,
+    ) -> Result<Vec<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(_) => return Ok(Vec::new()),
+        };
+        list_codex_review_requests_conn(&conn, filters)
     }
 
     pub fn ensure_schema(&self) -> Result<()> {
@@ -768,6 +823,98 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "INTEGER DEFAULT 0",
     )?;
     Ok(())
+}
+
+fn list_codex_review_requests_conn(
+    conn: &Connection,
+    filters: CodexReviewRequestFilters,
+) -> Result<Vec<CodexReviewRequestRegistration>> {
+    let mut where_clauses = Vec::new();
+    let mut values = Vec::<SqlValue>::new();
+    if let Some(value) = filters.notify_session_id {
+        where_clauses.push("notify_session_id = ?");
+        values.push(value.into());
+    }
+    if let Some(value) = filters.repo {
+        where_clauses.push("repo = ?");
+        values.push(value.into());
+    }
+    if let Some(value) = filters.pr_number {
+        where_clauses.push("pr_number = ?");
+        values.push(value.into());
+    }
+    if !filters.include_inactive {
+        where_clauses.push("is_active = 1");
+    }
+
+    let mut query = r#"
+        SELECT id, repo, pr_number, requester_session_id, notify_session_id, steer,
+               requested_at, latest_request_comment_id, latest_request_comment_url,
+               latest_request_posted_at, attempt_count, next_retry_at,
+               poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+               pickup_source, review_landed_at, review_source, review_comment_id,
+               review_url, last_polled_at, last_error, state, is_active
+        FROM codex_review_request_registrations
+    "#
+    .to_owned();
+    if !where_clauses.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&where_clauses.join(" AND "));
+    }
+    query.push_str(" ORDER BY requested_at");
+
+    let mut statement = match conn.prepare(&query) {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table") =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+        Ok(CodexReviewRequestRegistration {
+            id: row.get(0)?,
+            repo: row.get(1)?,
+            pr_number: row.get(2)?,
+            requester_session_id: row.get(3)?,
+            notify_session_id: row.get(4)?,
+            steer: row.get(5)?,
+            requested_at: row.get(6)?,
+            latest_request_comment_id: row.get(7)?,
+            latest_request_comment_url: row.get(8)?,
+            latest_request_posted_at: row.get(9)?,
+            attempt_count: row.get(10)?,
+            next_retry_at: row.get(11)?,
+            poll_interval_seconds: row.get(12)?,
+            retry_interval_seconds: row.get(13)?,
+            pickup_detected_at: row.get(14)?,
+            pickup_source: row.get(15)?,
+            review_landed_at: row.get(16)?,
+            review_source: row.get(17)?,
+            review_comment_id: optional_sqlite_json_scalar(row.get_ref(18)?),
+            review_url: row.get(19)?,
+            last_polled_at: row.get(20)?,
+            last_error: row.get(21)?,
+            state: row.get(22)?,
+            is_active: row.get::<_, Option<i64>>(23)?.unwrap_or(1) != 0,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn optional_sqlite_json_scalar(value: ValueRef<'_>) -> Option<JsonValue> {
+    match value {
+        ValueRef::Null => None,
+        ValueRef::Integer(value) => Some(JsonValue::Number(value.into())),
+        ValueRef::Real(value) => JsonNumber::from_f64(value).map(JsonValue::Number),
+        ValueRef::Text(value) => Some(JsonValue::String(
+            String::from_utf8_lossy(value).into_owned(),
+        )),
+        ValueRef::Blob(value) => Some(JsonValue::String(
+            String::from_utf8_lossy(value).into_owned(),
+        )),
+    }
 }
 
 fn expire_pending_messages_for_target(conn: &Connection, target_session_id: &str) -> Result<()> {

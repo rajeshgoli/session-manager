@@ -34,6 +34,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{trimmed, AppConfig, PublicNodeConfig};
 use crate::mobile_analytics::build_mobile_analytics_summary;
+use crate::queue::{CodexReviewRequestFilters, CodexReviewRequestRegistration, RetainedQueueStore};
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
@@ -80,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
+        .route("/codex-review-requests", get(list_codex_review_requests))
         .route("/nodes", get(list_nodes))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/input-batch", post(send_session_input_batch))
@@ -577,6 +579,58 @@ async fn list_nodes(
 ) -> Result<Json<NodesListResponse>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
     Ok(Json(nodes_list_response(&state.config)))
+}
+
+async fn list_codex_review_requests(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListCodexReviewRequestsQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let notify_session_id = if let Some(notify_target) = query
+        .notify_target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let Some(session) = resolve_session_or_registry_role(&state, notify_target)? else {
+            return Err(ApiError::NotFound("Notify target not found"));
+        };
+        Some(session.id)
+    } else {
+        None
+    };
+    let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let registrations = RetainedQueueStore::list_codex_review_requests_from_path(
+        &queue_db_path,
+        CodexReviewRequestFilters {
+            notify_session_id,
+            repo: query
+                .repo
+                .as_ref()
+                .and_then(|value| trimmed(&Some(value.clone()))),
+            pr_number: query.pr_number,
+            include_inactive: query.include_inactive,
+        },
+    )?;
+    let mut requests = Vec::with_capacity(registrations.len());
+    for registration in registrations {
+        requests.push(codex_review_request_response(&state, registration)?);
+    }
+    Ok(Json(json!({ "requests": requests })))
+}
+
+fn resolve_session_or_registry_role(
+    state: &AppState,
+    identifier: &str,
+) -> Result<Option<SessionRecord>, ApiError> {
+    if let Some(session) = state.session_store.get_session(identifier)? {
+        return Ok(Some(session));
+    }
+    let Some(registration) = state.session_store.lookup_agent_registration(identifier)? else {
+        return Ok(None);
+    };
+    Ok(state.session_store.get_session(&registration.session_id)?)
 }
 
 async fn get_session(
@@ -1530,6 +1584,13 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
+        "/codex-review-requests" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         "/client/bootstrap" => Some(serde_json::to_vec(&shadow_client_bootstrap_response(
             &state.config,
         ))?),
@@ -1819,6 +1880,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
     path == "/events"
         || path == "/events/state"
         || path == "/client/analytics/summary"
+        || path == "/codex-review-requests"
         || path == "/nodes"
         || path == "/sessions"
         || path == "/client/sessions"
@@ -2300,6 +2362,18 @@ struct ListChildrenQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListCodexReviewRequestsQuery {
+    #[serde(default)]
+    notify_target: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    pr_number: Option<i64>,
+    #[serde(default)]
+    include_inactive: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct SessionOutputQuery {
     lines: Option<usize>,
 }
@@ -2394,6 +2468,57 @@ fn nodes_list_response(config: &AppConfig) -> NodesListResponse {
         default: config.nodes.default_node.clone(),
         nodes: config.nodes.redacted_nodes(),
     }
+}
+
+fn codex_review_request_response(
+    state: &AppState,
+    registration: CodexReviewRequestRegistration,
+) -> Result<Value, ApiError> {
+    let requester_name = match registration.requester_session_id.as_deref() {
+        Some(session_id) => state
+            .session_store
+            .get_session(session_id)?
+            .map(session_display_name)
+            .or_else(|| Some(session_id.to_owned())),
+        None => None,
+    };
+    let notify_name = state
+        .session_store
+        .get_session(&registration.notify_session_id)?
+        .map(session_display_name)
+        .unwrap_or_else(|| registration.notify_session_id.clone());
+    Ok(json!({
+        "id": registration.id,
+        "repo": registration.repo,
+        "pr_number": registration.pr_number,
+        "requester_session_id": registration.requester_session_id,
+        "requester_name": requester_name,
+        "notify_session_id": registration.notify_session_id,
+        "notify_name": notify_name,
+        "steer": registration.steer,
+        "requested_at": registration.requested_at,
+        "latest_request_comment_id": registration.latest_request_comment_id,
+        "latest_request_comment_url": registration.latest_request_comment_url,
+        "latest_request_posted_at": registration.latest_request_posted_at,
+        "attempt_count": registration.attempt_count,
+        "next_retry_at": registration.next_retry_at,
+        "poll_interval_seconds": registration.poll_interval_seconds,
+        "retry_interval_seconds": registration.retry_interval_seconds,
+        "pickup_detected_at": registration.pickup_detected_at,
+        "pickup_source": registration.pickup_source,
+        "review_landed_at": registration.review_landed_at,
+        "review_source": registration.review_source,
+        "review_comment_id": registration.review_comment_id,
+        "review_url": registration.review_url,
+        "last_polled_at": registration.last_polled_at,
+        "last_error": registration.last_error,
+        "state": registration.state,
+        "is_active": registration.is_active,
+    }))
+}
+
+fn session_display_name(session: SessionRecord) -> String {
+    session.cached_display_name().unwrap_or(session.id)
 }
 
 #[derive(Serialize)]
