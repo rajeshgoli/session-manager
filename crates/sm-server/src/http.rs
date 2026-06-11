@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     fs,
     net::SocketAddr,
@@ -30,7 +30,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use base64::{
@@ -155,6 +155,38 @@ struct MobileTerminalDisableResponse {
     active_attaches_terminated: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct MobileTerminalDeviceSummary {
+    user_id: String,
+    device_key_id: String,
+    enabled: bool,
+    revoked: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MobileTerminalDeviceListResponse {
+    devices: Vec<MobileTerminalDeviceSummary>,
+    owner_view: bool,
+    runtime_only_revocations: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct MobileTerminalRevokeDeviceQuery {
+    user_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MobileTerminalRevokeDeviceResponse {
+    ok: bool,
+    revoked: bool,
+    user_id: String,
+    device_key_id: String,
+    already_revoked: bool,
+    pending_tickets_revoked: usize,
+    active_attaches_terminated: usize,
+    runtime_only: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct MobileTerminalAuthFrame {
     #[serde(rename = "type")]
@@ -173,6 +205,7 @@ pub struct AppState {
     mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
     mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
+    mobile_terminal_revoked_keys: Arc<Mutex<BTreeSet<(String, String)>>>,
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
 }
@@ -190,6 +223,7 @@ impl AppState {
             mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
+            mobile_terminal_revoked_keys: Arc::new(Mutex::new(BTreeSet::new())),
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             mobile_terminal_secret,
         }
@@ -213,6 +247,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/client/mobile-terminal/disable",
             post(disable_mobile_terminal),
+        )
+        .route(
+            "/client/mobile-terminal/devices",
+            get(list_mobile_terminal_devices),
+        )
+        .route(
+            "/client/mobile-terminal/devices/{device_key_id}",
+            delete(revoke_mobile_terminal_device),
         )
         .route("/deploy/{app_name}", post(deploy_app_artifact))
         .route("/apps/{app_name}/latest.apk", get(get_latest_app_artifact))
@@ -1722,7 +1764,7 @@ async fn create_mobile_attach_ticket(
         proof_nonce,
         proof_nonce_expires_at_unix,
     } = authorize_mobile_terminal_ticket_request(
-        &state.config,
+        &state,
         request.headers(),
         route_prefix.as_deref(),
         &session,
@@ -1911,6 +1953,126 @@ async fn disable_mobile_terminal(
         ok: true,
         disabled: true,
         active_attaches_terminated: active_attaches.len(),
+    }))
+}
+
+async fn list_mobile_terminal_devices(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<MobileTerminalDeviceListResponse>, ApiError> {
+    let actor_email =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        })?;
+    let Some((actor_user_id, user_config)) =
+        mobile_terminal_visible_user(&state.config, &actor_email)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
+        });
+    };
+    if !user_config.interactive_shell_access {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
+        });
+    }
+    let owner_view = mobile_terminal_user_can_disable(user_config);
+    let revoked_keys = state
+        .mobile_terminal_revoked_keys
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal revoked key store is unavailable".to_owned(),
+        })?
+        .clone();
+    let devices = state
+        .config
+        .mobile_terminal
+        .allowed_users
+        .iter()
+        .filter(|(user_id, _)| owner_view || user_id.as_str() == actor_user_id)
+        .flat_map(|(user_id, config)| {
+            let revoked_keys = revoked_keys.clone();
+            config.registered_device_keys.iter().filter_map(move |key| {
+                let device_key_id = key.id.trim();
+                if device_key_id.is_empty() {
+                    return None;
+                }
+                Some(MobileTerminalDeviceSummary {
+                    user_id: user_id.clone(),
+                    device_key_id: device_key_id.to_owned(),
+                    enabled: key.enabled && !key.public_key.trim().is_empty(),
+                    revoked: revoked_keys.contains(&(user_id.clone(), device_key_id.to_owned())),
+                })
+            })
+        })
+        .collect();
+
+    Ok(Json(MobileTerminalDeviceListResponse {
+        devices,
+        owner_view,
+        runtime_only_revocations: true,
+    }))
+}
+
+async fn revoke_mobile_terminal_device(
+    State(state): State<Arc<AppState>>,
+    Path(device_key_id): Path<String>,
+    Query(query): Query<MobileTerminalRevokeDeviceQuery>,
+    request: Request,
+) -> Result<Json<MobileTerminalRevokeDeviceResponse>, ApiError> {
+    let device_key_id = device_key_id.trim().to_owned();
+    if device_key_id.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Mobile terminal device id is required".to_owned(),
+        });
+    }
+    let actor_email =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        })?;
+    let Some((actor_user_id, user_config)) =
+        mobile_terminal_visible_user(&state.config, &actor_email)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
+        });
+    };
+    if !user_config.interactive_shell_access {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
+        });
+    }
+    let owner_view = mobile_terminal_user_can_disable(user_config);
+    let target_user_id = resolve_mobile_terminal_revoke_target(
+        &state.config,
+        actor_user_id,
+        owner_view,
+        &device_key_id,
+        query.user_id.as_deref(),
+    )?;
+    let (already_revoked, pending_tickets_revoked, active_stops) =
+        revoke_mobile_terminal_device_in_state(&state, &target_user_id, &device_key_id)?;
+    for stop in &active_stops {
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    Ok(Json(MobileTerminalRevokeDeviceResponse {
+        ok: true,
+        revoked: true,
+        user_id: target_user_id,
+        device_key_id,
+        already_revoked,
+        pending_tickets_revoked,
+        active_attaches_terminated: active_stops.len(),
+        runtime_only: true,
     }))
 }
 
@@ -3991,14 +4153,13 @@ fn client_session_value(
     actor_email: Option<&str>,
     route_prefix: Option<&str>,
 ) -> Value {
-    let config = &state.config;
     let mut value = serde_json::to_value(ClientSessionResponse::from(session.clone()))
         .unwrap_or_else(|_| json!({}));
     let attach_descriptor = attach_descriptor_payload(session.clone());
     value["attach_descriptor"] = attach_descriptor.clone();
     value["termux_attach"] = Value::Null;
     let mobile_terminal = mobile_terminal_metadata(
-        config,
+        state,
         &session,
         &attach_descriptor,
         actor_email,
@@ -4043,13 +4204,14 @@ fn mobile_primary_action(mobile_terminal: &Value, attach_descriptor: &Value) -> 
 }
 
 fn mobile_terminal_metadata(
-    config: &AppConfig,
+    state: &AppState,
     session: &SessionRecord,
     attach_descriptor: &Value,
     actor_email: Option<&str>,
     route_prefix: Option<&str>,
     runtime_disabled: bool,
 ) -> Value {
+    let config = &state.config;
     if !mobile_terminal_config_enabled(config, runtime_disabled) {
         return json!({
             "supported": false,
@@ -4068,7 +4230,7 @@ fn mobile_terminal_metadata(
             "reason": "authenticated mobile terminal user is required",
         });
     };
-    let Some((_user_id, user_config)) = mobile_terminal_visible_user(config, actor_email) else {
+    let Some((user_id, user_config)) = mobile_terminal_visible_user(config, actor_email) else {
         return json!({
             "supported": false,
             "reason": "mobile terminal user is not configured",
@@ -4080,7 +4242,7 @@ fn mobile_terminal_metadata(
             "reason": "interactive shell access is not enabled",
         });
     }
-    if !mobile_terminal_user_has_registered_device(user_config) {
+    if !mobile_terminal_user_has_available_registered_device(state, user_id, user_config) {
         return json!({
             "supported": false,
             "reason": "registered mobile device key is required",
@@ -4140,12 +4302,13 @@ struct MobileTerminalAuthorization {
 }
 
 fn authorize_mobile_terminal_ticket_request(
-    config: &AppConfig,
+    state: &AppState,
     headers: &HeaderMap,
     route_prefix: Option<&str>,
     session: &SessionRecord,
     actor_email: &str,
 ) -> Result<MobileTerminalAuthorization, ApiError> {
+    let config = &state.config;
     if !config.mobile_terminal.enabled {
         return Err(ApiError::Status {
             status: StatusCode::FORBIDDEN,
@@ -4235,7 +4398,9 @@ fn authorize_mobile_terminal_ticket_request(
         &timestamp,
         config.mobile_terminal.device_signature_max_skew_seconds,
     )?;
-    let Some(device_config) = mobile_terminal_device_config(user_config, &device_key_id) else {
+    let Some(device_config) =
+        mobile_terminal_device_config(state, user_id, user_config, &device_key_id)?
+    else {
         return Err(ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
             detail: "Device key is not registered".to_owned(),
@@ -4301,13 +4466,180 @@ fn mobile_terminal_user_has_registered_device(user_config: &MobileTerminalUserCo
         .any(|key| key.enabled && !key.id.trim().is_empty() && !key.public_key.trim().is_empty())
 }
 
+fn mobile_terminal_user_has_available_registered_device(
+    state: &AppState,
+    user_id: &str,
+    user_config: &MobileTerminalUserConfig,
+) -> bool {
+    let Ok(revoked_keys) = state.mobile_terminal_revoked_keys.lock() else {
+        return false;
+    };
+    user_config.registered_device_keys.iter().any(|key| {
+        let device_key_id = key.id.trim();
+        key.enabled
+            && !device_key_id.is_empty()
+            && !key.public_key.trim().is_empty()
+            && !revoked_keys.contains(&(user_id.to_owned(), device_key_id.to_owned()))
+    })
+}
+
 fn mobile_terminal_device_config<'a>(
+    state: &AppState,
+    user_id: &str,
     user_config: &'a MobileTerminalUserConfig,
     device_key_id: &str,
-) -> Option<&'a MobileTerminalDeviceKeyConfig> {
-    user_config.registered_device_keys.iter().find(|key| {
+) -> Result<Option<&'a MobileTerminalDeviceKeyConfig>, ApiError> {
+    if mobile_terminal_device_revoked(state, user_id, device_key_id)? {
+        return Ok(None);
+    }
+    Ok(user_config.registered_device_keys.iter().find(|key| {
         key.enabled && key.id.trim() == device_key_id && !key.public_key.trim().is_empty()
-    })
+    }))
+}
+
+fn mobile_terminal_device_revoked(
+    state: &AppState,
+    user_id: &str,
+    device_key_id: &str,
+) -> Result<bool, ApiError> {
+    Ok(state
+        .mobile_terminal_revoked_keys
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal revoked key store is unavailable".to_owned(),
+        })?
+        .contains(&(user_id.to_owned(), device_key_id.to_owned())))
+}
+
+fn mobile_terminal_user_device_exists(
+    config: &AppConfig,
+    user_id: &str,
+    device_key_id: &str,
+) -> bool {
+    config
+        .mobile_terminal
+        .allowed_users
+        .get(user_id)
+        .map(|user_config| {
+            user_config
+                .registered_device_keys
+                .iter()
+                .any(|key| key.id.trim() == device_key_id)
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_mobile_terminal_revoke_target(
+    config: &AppConfig,
+    actor_user_id: &str,
+    owner_view: bool,
+    device_key_id: &str,
+    requested_user_id: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(requested_user_id) = requested_user_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if requested_user_id != actor_user_id && !owner_view {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "User is not allowed to revoke this mobile terminal device".to_owned(),
+            });
+        }
+        if mobile_terminal_user_device_exists(config, requested_user_id, device_key_id) {
+            return Ok(requested_user_id.to_owned());
+        }
+        return Err(ApiError::NotFound("Mobile terminal device not found"));
+    }
+
+    if mobile_terminal_user_device_exists(config, actor_user_id, device_key_id) {
+        return Ok(actor_user_id.to_owned());
+    }
+    if !owner_view {
+        return Err(ApiError::NotFound("Mobile terminal device not found"));
+    }
+
+    let matches = config
+        .mobile_terminal
+        .allowed_users
+        .iter()
+        .filter(|(_, user_config)| {
+            user_config
+                .registered_device_keys
+                .iter()
+                .any(|key| key.id.trim() == device_key_id)
+        })
+        .map(|(user_id, _)| user_id.clone())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(ApiError::NotFound("Mobile terminal device not found")),
+        [user_id] => Ok(user_id.clone()),
+        _ => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Mobile terminal device id matches multiple users; specify user_id".to_owned(),
+        }),
+    }
+}
+
+fn revoke_mobile_terminal_device_in_state(
+    state: &AppState,
+    user_id: &str,
+    device_key_id: &str,
+) -> Result<(bool, usize, Vec<Arc<AtomicBool>>), ApiError> {
+    let already_revoked = {
+        let mut revoked =
+            state
+                .mobile_terminal_revoked_keys
+                .lock()
+                .map_err(|_| ApiError::Status {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    detail: "Mobile terminal revoked key store is unavailable".to_owned(),
+                })?;
+        !revoked.insert((user_id.to_owned(), device_key_id.to_owned()))
+    };
+
+    let pending_tickets_revoked = {
+        let mut tickets = state
+            .mobile_terminal_tickets
+            .lock()
+            .map_err(|_| ApiError::Status {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                detail: "Mobile terminal ticket store is unavailable".to_owned(),
+            })?;
+        let before = tickets.len();
+        tickets.retain(|_, ticket| {
+            !(ticket.user_id == user_id && ticket.device_key_id == device_key_id)
+        });
+        before - tickets.len()
+    };
+
+    let active_stops = {
+        let mut active =
+            state
+                .mobile_terminal_active_attaches
+                .lock()
+                .map_err(|_| ApiError::Status {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    detail: "Mobile terminal active attach store is unavailable".to_owned(),
+                })?;
+        let matches = active
+            .iter()
+            .filter(|(_, attach)| {
+                attach.user_id == user_id && attach.device_key_id == device_key_id
+            })
+            .map(|(attach_id, attach)| (attach_id.clone(), attach.stop.clone()))
+            .collect::<Vec<_>>();
+        for (attach_id, _) in &matches {
+            active.remove(attach_id);
+        }
+        matches
+            .into_iter()
+            .map(|(_, stop)| stop)
+            .collect::<Vec<_>>()
+    };
+
+    Ok((already_revoked, pending_tickets_revoked, active_stops))
 }
 
 fn mobile_terminal_user_can_disable(user_config: &MobileTerminalUserConfig) -> bool {
@@ -4653,7 +4985,9 @@ fn consume_mobile_terminal_ticket(
             detail: "User is no longer allowed to attach".to_owned(),
         });
     }
-    let Some(device_config) = mobile_terminal_device_config(user_config, &device_key_id) else {
+    let Some(device_config) =
+        mobile_terminal_device_config(state, &ticket.user_id, user_config, &device_key_id)?
+    else {
         return Err(ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
             detail: "Device key is no longer registered".to_owned(),
@@ -6684,6 +7018,162 @@ mod tests {
         let (status, body) = response_json(ticket_after_disable).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["detail"], "Mobile terminal attach is disabled");
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_devices_list_omits_public_key_material() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/mobile-terminal/devices",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["owner_view"], false);
+        assert_eq!(body["runtime_only_revocations"], true);
+        assert_eq!(body["devices"].as_array().unwrap().len(), 1);
+        let device = &body["devices"][0];
+        assert_eq!(device["user_id"], "local_bypass");
+        assert_eq!(device["device_key_id"], "test-device");
+        assert_eq!(device["enabled"], true);
+        assert_eq!(device["revoked"], false);
+        assert!(device.get("public_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_revoke_device_clears_tickets_and_stops_active_attach() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        assert!(state
+            .mobile_terminal_tickets
+            .lock()
+            .unwrap()
+            .contains_key(ticket["ticket_id"].as_str().unwrap()));
+        let stop = Arc::new(AtomicBool::new(false));
+        state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .insert(
+                "active-1".to_owned(),
+                MobileTerminalActiveAttach {
+                    user_id: "local_bypass".to_owned(),
+                    session_id: "fork1001".to_owned(),
+                    provider: "codex-fork".to_owned(),
+                    device_key_id: "test-device".to_owned(),
+                    started_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                    stop: stop.clone(),
+                },
+            );
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::DELETE,
+                "/client/mobile-terminal/devices/test-device",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "ok": true,
+                "revoked": true,
+                "user_id": "local_bypass",
+                "device_key_id": "test-device",
+                "already_revoked": false,
+                "pending_tickets_revoked": 1,
+                "active_attaches_terminated": 1,
+                "runtime_only": true,
+            })
+        );
+        assert!(state
+            .mobile_terminal_revoked_keys
+            .lock()
+            .unwrap()
+            .contains(&("local_bypass".to_owned(), "test-device".to_owned())));
+        assert!(state.mobile_terminal_tickets.lock().unwrap().is_empty());
+        assert!(state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(stop.load(Ordering::SeqCst));
+
+        let list_after_revoke = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/mobile-terminal/devices",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(list_after_revoke).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["devices"][0]["revoked"], true);
+
+        let sessions_after_revoke = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/sessions",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(sessions_after_revoke).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sessions"][0]["mobile_terminal"]["supported"], false);
+        assert_eq!(
+            body["sessions"][0]["mobile_terminal"]["reason"],
+            "registered mobile device key is required"
+        );
+
+        let ticket_after_revoke = app
+            .oneshot(attach_ticket_request(&signing_key, "ticket-nonce-2"))
+            .await
+            .unwrap();
+        let (status, body) = response_json(ticket_after_revoke).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["detail"], "Device key is not registered");
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_consume_rechecks_device_revocation_after_mint() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        state
+            .mobile_terminal_revoked_keys
+            .lock()
+            .unwrap()
+            .insert(("local_bypass".to_owned(), "test-device".to_owned()));
+        let frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
+
+        let error = consume_mobile_terminal_ticket(&state, &frame).unwrap_err();
+        let (status, detail) = api_error_status_detail(error);
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(detail, "Device key is no longer registered");
+        assert!(state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
