@@ -1,0 +1,8 @@
+{
+  "artifact_hash": "deadbeef",
+  "size_bytes": 9,
+  "uploaded_at": "2026-06-01T00:04:00+00:00",
+  "uploaded_by": "fixture@example.com",
+  "version_code": 1,
+  "version_name": "fixture"
+}
