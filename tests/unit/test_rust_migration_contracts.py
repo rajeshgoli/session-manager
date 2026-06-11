@@ -1,5 +1,7 @@
+import json
 import subprocess
 import urllib.error
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.rust_migration.baseline import (
@@ -268,6 +270,17 @@ def test_manifest_covers_retained_codex_read_http_surfaces():
         expectation.path == "/actions" and expectation.value_type == "array"
         for expectation in checks["http.codex_activity_actions"].expected_json
     )
+
+
+def test_read_only_fixture_provides_codex_app_session_for_retained_reads():
+    fixture_path = Path("scripts/rust_migration/fixtures/read_only/sessions.json")
+    fixture = json.loads(fixture_path.read_text())
+    sessions = {session["id"]: session for session in fixture["sessions"]}
+
+    codex_fixture = sessions["fixture-codex"]
+    assert codex_fixture["provider"] == "codex-app"
+    assert codex_fixture["status"] == "running"
+    assert codex_fixture["tmux_session"] == ""
 
 
 def test_manifest_covers_implemented_detail_http_surfaces():
