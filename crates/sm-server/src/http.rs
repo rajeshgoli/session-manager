@@ -272,6 +272,10 @@ pub fn router(state: AppState) -> Router {
         .route("/queue-jobs", get(list_queue_jobs))
         .route("/queue-jobs/{job_id}", get(get_queue_job))
         .route("/codex-review-requests", get(list_codex_review_requests))
+        .route(
+            "/codex-review-requests/{request_id}",
+            get(get_codex_review_request),
+        )
         .route("/nodes", get(list_nodes))
         .route("/humans", get(list_humans))
         .route("/humans/{identifier}", get(get_human))
@@ -1671,6 +1675,21 @@ async fn list_codex_review_requests(
         requests.push(codex_review_request_response(&state, registration)?);
     }
     Ok(Json(json!({ "requests": requests })))
+}
+
+async fn get_codex_review_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let Some(registration) =
+        RetainedQueueStore::get_codex_review_request_from_path(&queue_db_path, &request_id)?
+    else {
+        return Err(ApiError::NotFound("Codex review request not found"));
+    };
+    Ok(Json(codex_review_request_response(&state, registration)?))
 }
 
 async fn list_queue_jobs(
@@ -3889,6 +3908,32 @@ fn shadow_predict_read(
         return Ok(None);
     }
 
+    if let Some(request_id) = path
+        .strip_prefix("/codex-review-requests/")
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
+        let queue_db_path = expand_home(&state.config.sm_send.db_path);
+        return match RetainedQueueStore::get_codex_review_request_from_path(
+            &queue_db_path,
+            request_id,
+        )? {
+            Some(_) => Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            })),
+            None => {
+                let body =
+                    serde_json::to_vec(&json!({ "detail": "Codex review request not found" }))?;
+                Ok(Some(ShadowPrediction {
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                    body_sha256: Some(sha256_hex(&body)),
+                    support_status: "implemented_read",
+                }))
+            }
+        };
+    }
+
     if let Some(job_id) = path
         .strip_prefix("/queue-jobs/")
         .filter(|value| !value.is_empty() && !value.contains('/'))
@@ -5574,6 +5619,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/apk"
         || path == "/client/analytics/summary"
         || path == "/codex-review-requests"
+        || path.starts_with("/codex-review-requests/")
         || path == "/queue-jobs"
         || path.starts_with("/queue-jobs/")
         || path == "/nodes"

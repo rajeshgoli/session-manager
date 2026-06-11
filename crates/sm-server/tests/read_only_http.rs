@@ -1396,10 +1396,14 @@ async fn codex_review_requests_missing_db_returns_empty_requests() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/codex-review-requests").await;
+    let (status, payload) = get_json(app.clone(), "/codex-review-requests").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload, json!({ "requests": [] }));
+
+    let (status, payload) = get_json(app, "/codex-review-requests/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Codex review request not found");
 }
 
 #[tokio::test]
@@ -1484,6 +1488,21 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
     assert_eq!(requests[1]["id"], "active-new");
     assert_eq!(requests[1]["review_comment_id"], "R_kw123");
 
+    let (status, payload) = get_json(app.clone(), "/codex-review-requests/active-old").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "active-old");
+    assert_eq!(payload["repo"], "rajeshgoli/session-manager");
+    assert_eq!(payload["pr_number"], 830);
+    assert_eq!(payload["requester_name"], "native requester");
+    assert_eq!(payload["notify_name"], "reviewer");
+    assert_eq!(payload["latest_request_comment_id"], 111);
+    assert_eq!(payload["review_comment_id"], 222);
+    assert_eq!(payload["is_active"], true);
+
+    let (status, payload) = get_json(app.clone(), "/codex-review-requests/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Codex review request not found");
+
     let (status, payload) = get_json(
         app.clone(),
         "/codex-review-requests?repo=rajeshgoli/session-manager&pr_number=830&notify_target=notify1",
@@ -1506,7 +1525,8 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
     assert_eq!(payload["requests"].as_array().unwrap().len(), 1);
     assert_eq!(payload["requests"][0]["id"], "active-old");
 
-    let (status, payload) = get_json(app, "/codex-review-requests?include_inactive=true").await;
+    let (status, payload) =
+        get_json(app.clone(), "/codex-review-requests?include_inactive=true").await;
     assert_eq!(status, StatusCode::OK);
     let ids = payload["requests"]
         .as_array()
@@ -1515,6 +1535,12 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
         .map(|entry| entry["id"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["active-old", "inactive", "active-new"]);
+
+    let (status, payload) = get_json(app, "/codex-review-requests/inactive").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "inactive");
+    assert_eq!(payload["state"], "cancelled");
+    assert_eq!(payload["is_active"], false);
 }
 
 #[tokio::test]
@@ -1546,13 +1572,23 @@ async fn codex_review_requests_rejects_public_host_without_auth() {
     let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
 
     let (status, payload) =
-        get_json_with_host(app, "/codex-review-requests", "sm.example.com").await;
+        get_json_with_host(app.clone(), "/codex-review-requests", "sm.example.com").await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(payload["detail"], "Authentication required");
     assert_eq!(
         payload["login_url"],
         "/auth/google/login?next=%2Fcodex-review-requests"
+    );
+
+    let (status, payload) =
+        get_json_with_host(app, "/codex-review-requests/active-old", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+    assert_eq!(
+        payload["login_url"],
+        "/auth/google/login?next=%2Fcodex-review-requests%2Factive-old"
     );
 }
 
@@ -1951,6 +1987,95 @@ async fn shadow_http_treats_live_session_lists_as_status_only() {
     assert_eq!(payload["predicted_status"], 200);
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_review_request_detail_200_as_status_only() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-requests.db");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_codex_review_request_fixture_db(&queue_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = br#"{"id":"active-old","repo":"rajeshgoli/session-manager","pr_number":830,"requester_session_id":"requester1","requester_name":"requester1","notify_session_id":"notify1","notify_name":"notify1","steer":"focus nodes","requested_at":"2026-06-01T00:00:00","latest_request_comment_id":111,"latest_request_comment_url":"https://example.com/comment/111","latest_request_posted_at":"2026-06-01T00:00:01","attempt_count":2,"next_retry_at":"2026-06-01T00:10:00","poll_interval_seconds":30,"retry_interval_seconds":600,"pickup_detected_at":"2026-06-01T00:02:00","pickup_source":"issue_comment","review_landed_at":"2026-06-01T00:03:00","review_source":"pull_review","review_comment_id":222,"review_url":"https://example.com/review/222","last_polled_at":"2026-06-01T00:04:00","last_error":null,"state":"completed","is_active":true}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/codex-review-requests/active-old",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_review_request_detail_404() {
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: state_file
+                .with_extension("missing-codex-review.db")
+                .display()
+                .to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let python_body =
+        serde_json::to_vec(&json!({ "detail": "Codex review request not found" })).unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/codex-review-requests/missing",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 404,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["predicted_status"], 404);
+    assert_eq!(payload["body_sha256_match"], true);
 }
 
 #[tokio::test]
