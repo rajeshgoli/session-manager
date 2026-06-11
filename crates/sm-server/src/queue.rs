@@ -170,6 +170,20 @@ impl RetainedQueueStore {
         list_codex_review_requests_conn(&conn, filters)
     }
 
+    pub fn get_codex_review_request_from_path(
+        db_path: &Path,
+        request_id: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(_) => return Ok(None),
+        };
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
     pub fn list_queue_jobs_from_path(
         db_path: &Path,
         filters: QueueJobFilters,
@@ -927,35 +941,76 @@ fn list_codex_review_requests_conn(
         }
         Err(error) => return Err(error.into()),
     };
-    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
-        Ok(CodexReviewRequestRegistration {
-            id: row.get(0)?,
-            repo: row.get(1)?,
-            pr_number: row.get(2)?,
-            requester_session_id: row.get(3)?,
-            notify_session_id: row.get(4)?,
-            steer: row.get(5)?,
-            requested_at: row.get(6)?,
-            latest_request_comment_id: row.get(7)?,
-            latest_request_comment_url: row.get(8)?,
-            latest_request_posted_at: row.get(9)?,
-            attempt_count: row.get(10)?,
-            next_retry_at: row.get(11)?,
-            poll_interval_seconds: row.get(12)?,
-            retry_interval_seconds: row.get(13)?,
-            pickup_detected_at: row.get(14)?,
-            pickup_source: row.get(15)?,
-            review_landed_at: row.get(16)?,
-            review_source: row.get(17)?,
-            review_comment_id: optional_sqlite_json_scalar(row.get_ref(18)?),
-            review_url: row.get(19)?,
-            last_polled_at: row.get(20)?,
-            last_error: row.get(21)?,
-            state: row.get(22)?,
-            is_active: row.get::<_, Option<i64>>(23)?.unwrap_or(1) != 0,
-        })
-    })?;
+    let rows = statement.query_map(
+        rusqlite::params_from_iter(values),
+        codex_review_request_registration_from_row,
+    )?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn get_codex_review_request_conn(
+    conn: &Connection,
+    request_id: &str,
+) -> Result<Option<CodexReviewRequestRegistration>> {
+    let mut statement = match conn.prepare(
+        r#"
+        SELECT id, repo, pr_number, requester_session_id, notify_session_id, steer,
+               requested_at, latest_request_comment_id, latest_request_comment_url,
+               latest_request_posted_at, attempt_count, next_retry_at,
+               poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+               pickup_source, review_landed_at, review_source, review_comment_id,
+               review_url, last_polled_at, last_error, state, is_active
+        FROM codex_review_request_registrations
+        WHERE id = ?1
+        LIMIT 1
+        "#,
+    ) {
+        Ok(statement) => statement,
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table") =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    statement
+        .query_row(
+            params![request_id],
+            codex_review_request_registration_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn codex_review_request_registration_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CodexReviewRequestRegistration> {
+    Ok(CodexReviewRequestRegistration {
+        id: row.get(0)?,
+        repo: row.get(1)?,
+        pr_number: row.get(2)?,
+        requester_session_id: row.get(3)?,
+        notify_session_id: row.get(4)?,
+        steer: row.get(5)?,
+        requested_at: row.get(6)?,
+        latest_request_comment_id: row.get(7)?,
+        latest_request_comment_url: row.get(8)?,
+        latest_request_posted_at: row.get(9)?,
+        attempt_count: row.get(10)?,
+        next_retry_at: row.get(11)?,
+        poll_interval_seconds: row.get(12)?,
+        retry_interval_seconds: row.get(13)?,
+        pickup_detected_at: row.get(14)?,
+        pickup_source: row.get(15)?,
+        review_landed_at: row.get(16)?,
+        review_source: row.get(17)?,
+        review_comment_id: optional_sqlite_json_scalar(row.get_ref(18)?),
+        review_url: row.get(19)?,
+        last_polled_at: row.get(20)?,
+        last_error: row.get(21)?,
+        state: row.get(22)?,
+        is_active: row.get::<_, Option<i64>>(23)?.unwrap_or(1) != 0,
+    })
 }
 
 fn list_queue_jobs_conn(
