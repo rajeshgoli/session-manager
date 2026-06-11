@@ -140,6 +140,30 @@ fn repo_data_path(name: &str) -> String {
         .to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_mobile_terminal_ticket_ttl_seconds() -> u64 {
+    30
+}
+
+fn default_mobile_terminal_device_signature_max_skew_seconds() -> u64 {
+    60
+}
+
+fn default_mobile_terminal_max_attaches_per_user() -> usize {
+    1
+}
+
+fn default_mobile_terminal_max_attaches_per_session() -> usize {
+    1
+}
+
+fn default_mobile_terminal_max_attaches_global() -> usize {
+    4
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailConfig {
     #[serde(default = "default_email_bridge_config")]
@@ -200,6 +224,8 @@ pub struct GoogleAuthConfig {
     #[serde(default)]
     pub public_host: Option<String>,
     #[serde(default)]
+    pub public_path_prefix: Option<String>,
+    #[serde(default)]
     pub client_id: Option<String>,
     #[serde(default)]
     pub android_client_id: Option<String>,
@@ -237,6 +263,8 @@ pub struct ExternalAccessConfig {
     #[serde(default)]
     pub public_http_host: Option<String>,
     #[serde(default)]
+    pub public_http_path_prefix: Option<String>,
+    #[serde(default)]
     pub public_ssh_host: Option<String>,
     #[serde(default)]
     pub http_origin_url: Option<String>,
@@ -246,12 +274,68 @@ pub struct ExternalAccessConfig {
     pub ssh_proxy_command: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MobileTerminalConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub ws_url: Option<String>,
+    #[serde(default)]
+    pub public_path_prefix: Option<String>,
+    #[serde(default = "default_true")]
+    pub require_tls: bool,
+    #[serde(default)]
+    pub allowed_users: BTreeMap<String, MobileTerminalUserConfig>,
+    #[serde(default = "default_mobile_terminal_ticket_ttl_seconds")]
+    pub ticket_ttl_seconds: u64,
+    #[serde(default = "default_mobile_terminal_device_signature_max_skew_seconds")]
+    pub device_signature_max_skew_seconds: u64,
+    #[serde(default = "default_mobile_terminal_max_attaches_per_user")]
+    pub max_concurrent_attaches_per_user: usize,
+    #[serde(default = "default_mobile_terminal_max_attaches_per_session")]
+    pub max_concurrent_attaches_per_session: usize,
+    #[serde(default = "default_mobile_terminal_max_attaches_global")]
+    pub max_concurrent_attaches_global: usize,
+}
+
+impl Default for MobileTerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ws_url: None,
+            public_path_prefix: None,
+            require_tls: true,
+            allowed_users: BTreeMap::new(),
+            ticket_ttl_seconds: default_mobile_terminal_ticket_ttl_seconds(),
+            device_signature_max_skew_seconds:
+                default_mobile_terminal_device_signature_max_skew_seconds(),
+            max_concurrent_attaches_per_user: default_mobile_terminal_max_attaches_per_user(),
+            max_concurrent_attaches_per_session: default_mobile_terminal_max_attaches_per_session(),
+            max_concurrent_attaches_global: default_mobile_terminal_max_attaches_global(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MobileTerminalUserConfig {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub interactive_shell_access: bool,
+    #[serde(default)]
+    pub registered_device_keys: Vec<MobileTerminalDeviceKeyConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MobileTerminalDeviceKeyConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1057,6 +1141,66 @@ sm_send:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
+    }
+
+    #[test]
+    fn raw_config_reads_mobile_terminal_attach_contract_fields() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+external_access:
+  public_http_host: sm.example.com
+  public_http_path_prefix: /sm
+auth:
+  google:
+    public_path_prefix: /google-sm
+mobile_terminal:
+  enabled: true
+  require_tls: true
+  ticket_ttl_seconds: 45
+  device_signature_max_skew_seconds: 90
+  max_concurrent_attaches_per_user: 2
+  max_concurrent_attaches_per_session: 3
+  max_concurrent_attaches_global: 8
+  allowed_users:
+    local_bypass:
+      email: local@example.com
+      aliases:
+        - local-alias@example.com
+      interactive_shell_access: true
+      registered_device_keys:
+        - id: android-1
+          public_key: "-----BEGIN PUBLIC KEY-----\\nTEST\\n-----END PUBLIC KEY-----"
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(config.mobile_terminal.enabled);
+        assert_eq!(
+            trimmed(&config.external_access.public_http_path_prefix).as_deref(),
+            Some("/sm")
+        );
+        assert_eq!(
+            trimmed(&config.google_auth.public_path_prefix).as_deref(),
+            Some("/google-sm")
+        );
+        assert_eq!(config.mobile_terminal.ticket_ttl_seconds, 45);
+        assert_eq!(config.mobile_terminal.device_signature_max_skew_seconds, 90);
+        assert_eq!(config.mobile_terminal.max_concurrent_attaches_per_user, 2);
+        assert_eq!(
+            config.mobile_terminal.max_concurrent_attaches_per_session,
+            3
+        );
+        assert_eq!(config.mobile_terminal.max_concurrent_attaches_global, 8);
+        let user = config
+            .mobile_terminal
+            .allowed_users
+            .get("local_bypass")
+            .unwrap();
+        assert!(user.interactive_shell_access);
+        assert_eq!(user.aliases, vec!["local-alias@example.com"]);
+        assert_eq!(user.registered_device_keys[0].id, "android-1");
+        assert!(user.registered_device_keys[0].enabled);
     }
 
     #[test]
