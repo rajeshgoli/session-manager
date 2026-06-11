@@ -572,6 +572,183 @@ async fn client_analytics_summary_rejects_public_host_without_auth() {
 }
 
 #[tokio::test]
+async fn codex_review_requests_missing_db_returns_empty_requests() {
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: state_file
+                .with_extension("missing-codex-review.db")
+                .display()
+                .to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/codex-review-requests").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "requests": [] }));
+}
+
+#[tokio::test]
+async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-requests.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "requester1",
+                    "name": "codex-fork-requester1",
+                    "working_dir": "/repo/requester",
+                    "tmux_session": "codex-fork-requester1",
+                    "log_file": "/tmp/requester1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "provider": "codex-fork",
+                    "friendly_name": "stale requester",
+                    "friendly_name_updated_at_ns": 10,
+                    "native_title": "native requester",
+                    "native_title_updated_at_ns": 20
+                },
+                {
+                    "id": "notify1",
+                    "name": "codex-fork-notify1",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify1",
+                    "log_file": "/tmp/notify1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "native_title": "native notify"
+                },
+                {
+                    "id": "notify2",
+                    "name": "codex-fork-notify2",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify2",
+                    "log_file": "/tmp/notify2.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }
+            ],
+            "agent_registrations": [
+                {
+                    "role": "reviewer",
+                    "session_id": "notify1",
+                    "created_at": "2026-06-01T00:02:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_codex_review_request_fixture_db(&queue_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/codex-review-requests").await;
+    assert_eq!(status, StatusCode::OK);
+    let requests = payload["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["id"], "active-old");
+    assert_eq!(requests[0]["repo"], "rajeshgoli/session-manager");
+    assert_eq!(requests[0]["pr_number"], 830);
+    assert_eq!(requests[0]["requester_name"], "native requester");
+    assert_eq!(requests[0]["notify_name"], "reviewer");
+    assert_eq!(requests[0]["latest_request_comment_id"], 111);
+    assert_eq!(requests[0]["review_comment_id"], 222);
+    assert_eq!(requests[0]["is_active"], true);
+    assert_eq!(requests[1]["id"], "active-new");
+    assert_eq!(requests[1]["review_comment_id"], "R_kw123");
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/codex-review-requests?repo=rajeshgoli/session-manager&pr_number=830&notify_target=notify1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["requests"][0]["id"], "active-old");
+
+    let (status, payload) = get_json(app.clone(), "/registry/reviewer").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "notify1");
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/codex-review-requests?repo=rajeshgoli/session-manager&pr_number=830&notify_target=reviewer",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["requests"][0]["id"], "active-old");
+
+    let (status, payload) = get_json(app, "/codex-review-requests?include_inactive=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = payload["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["active-old", "inactive", "active-new"]);
+}
+
+#[tokio::test]
+async fn codex_review_requests_unknown_notify_target_returns_404() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-requests-empty.db");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_codex_review_request_fixture_db(&queue_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/codex-review-requests?notify_target=missing").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Notify target not found");
+}
+
+#[tokio::test]
+async fn codex_review_requests_rejects_public_host_without_auth() {
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+
+    let (status, payload) =
+        get_json_with_host(app, "/codex-review-requests", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+    assert_eq!(
+        payload["login_url"],
+        "/auth/google/login?next=%2Fcodex-review-requests"
+    );
+}
+
+#[tokio::test]
 async fn auth_session_reports_disabled_bypass_when_google_auth_not_requested() {
     let app = router(AppState::new(AppConfig::default()));
 
@@ -5753,6 +5930,73 @@ fn config_with_state_file_and_queue(state_file: &PathBuf) -> AppConfig {
 
 fn queue_db_path_for_state_file(state_file: &PathBuf) -> PathBuf {
     state_file.with_extension("message_queue.db")
+}
+
+fn create_codex_review_request_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_review_request_registrations (
+            id TEXT PRIMARY KEY,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            requester_session_id TEXT,
+            notify_session_id TEXT NOT NULL,
+            steer TEXT,
+            requested_at TIMESTAMP NOT NULL,
+            latest_request_comment_id INTEGER,
+            latest_request_comment_url TEXT,
+            latest_request_posted_at TIMESTAMP,
+            attempt_count INTEGER NOT NULL,
+            next_retry_at TIMESTAMP,
+            poll_interval_seconds INTEGER NOT NULL,
+            retry_interval_seconds INTEGER NOT NULL,
+            pickup_detected_at TIMESTAMP,
+            pickup_source TEXT,
+            review_landed_at TIMESTAMP,
+            review_source TEXT,
+            review_comment_id INTEGER,
+            review_url TEXT,
+            last_polled_at TIMESTAMP,
+            last_error TEXT,
+            state TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1
+        );
+        "#,
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO codex_review_request_registrations
+            (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+             requested_at, latest_request_comment_id, latest_request_comment_url,
+             latest_request_posted_at, attempt_count, next_retry_at,
+             poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+             pickup_source, review_landed_at, review_source, review_comment_id,
+             review_url, last_polled_at, last_error, state, is_active)
+        VALUES
+            ('active-old', 'rajeshgoli/session-manager', 830, 'requester1', 'notify1', 'focus nodes',
+             '2026-06-01T00:00:00', 111, 'https://example.com/comment/111',
+             '2026-06-01T00:00:01', 2, '2026-06-01T00:10:00',
+             30, 600, '2026-06-01T00:02:00',
+             'issue_comment', '2026-06-01T00:03:00', 'pull_review', 222,
+             'https://example.com/review/222', '2026-06-01T00:04:00', NULL, 'completed', 1),
+            ('inactive', 'rajeshgoli/session-manager', 831, NULL, 'notify1', NULL,
+             '2026-06-01T00:01:00', NULL, NULL,
+             NULL, 1, NULL,
+             30, 600, NULL,
+             NULL, NULL, NULL, NULL,
+             NULL, NULL, 'cancelled', 'cancelled', 0),
+            ('active-new', 'rajeshgoli/other', 7, NULL, 'notify2', NULL,
+             '2026-06-01T00:02:00', NULL, NULL,
+             NULL, 1, NULL,
+             45, 900, NULL,
+             NULL, '2026-06-01T00:03:30', 'pull_review', 'R_kw123',
+             'https://example.com/review/R_kw123', NULL, NULL, 'completed', 1)
+        "#,
+        [],
+    )
+    .unwrap();
 }
 
 fn rfc3339(value: time::OffsetDateTime) -> String {

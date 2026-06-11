@@ -4032,7 +4032,7 @@ impl SessionRecord {
         }
     }
 
-    fn cached_display_name(&self) -> Option<String> {
+    pub(crate) fn cached_display_name(&self) -> Option<String> {
         if let Some(alias) = self.aliases.first() {
             return Some(alias.clone());
         }
