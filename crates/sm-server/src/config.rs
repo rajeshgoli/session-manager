@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub bug_reports: BugReportsConfig,
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
+    pub public_edge: PublicEdgeConfig,
     pub mobile_terminal: MobileTerminalConfig,
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
@@ -40,6 +41,7 @@ impl Default for AppConfig {
             bug_reports: BugReportsConfig::default(),
             google_auth: GoogleAuthConfig::default(),
             external_access: ExternalAccessConfig::default(),
+            public_edge: PublicEdgeConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
             tmux: TmuxConfig::default(),
             sm_send: SmSendConfig::default(),
@@ -176,6 +178,10 @@ fn default_mobile_terminal_max_attach_seconds() -> u64 {
     3600
 }
 
+fn default_public_edge_assertion_max_skew_seconds() -> u64 {
+    60
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailConfig {
     #[serde(default = "default_email_bridge_config")]
@@ -284,6 +290,26 @@ pub struct ExternalAccessConfig {
     pub ssh_username: Option<String>,
     #[serde(default)]
     pub ssh_proxy_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicEdgeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub assertion_secret: Option<String>,
+    #[serde(default = "default_public_edge_assertion_max_skew_seconds")]
+    pub assertion_max_skew_seconds: u64,
+}
+
+impl Default for PublicEdgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            assertion_secret: None,
+            assertion_max_skew_seconds: default_public_edge_assertion_max_skew_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -613,6 +639,8 @@ struct RawConfig {
     #[serde(default)]
     external_access: ExternalAccessConfig,
     #[serde(default)]
+    public_edge: PublicEdgeConfig,
+    #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
     #[serde(default)]
     bug_reports: RawBugReportsConfig,
@@ -693,6 +721,7 @@ impl From<RawConfig> for AppConfig {
             },
             google_auth: raw.auth.google,
             external_access: raw.external_access,
+            public_edge: raw.public_edge,
             mobile_terminal: raw.mobile_terminal,
             tmux: raw.tmux,
             sm_send: raw.sm_send,
@@ -1234,6 +1263,27 @@ mobile_terminal:
         assert_eq!(user.aliases, vec!["local-alias@example.com"]);
         assert_eq!(user.registered_device_keys[0].id, "android-1");
         assert!(user.registered_device_keys[0].enabled);
+    }
+
+    #[test]
+    fn raw_config_reads_public_edge_assertion_contract_fields() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+public_edge:
+  enabled: true
+  assertion_secret: edge-secret
+  assertion_max_skew_seconds: 120
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(config.public_edge.enabled);
+        assert_eq!(
+            trimmed(&config.public_edge.assertion_secret).as_deref(),
+            Some("edge-secret")
+        );
+        assert_eq!(config.public_edge.assertion_max_skew_seconds, 120);
     }
 
     #[test]

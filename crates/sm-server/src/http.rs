@@ -205,6 +205,7 @@ pub struct AppState {
     mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
     mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
+    public_edge_assertion_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
     mobile_terminal_revoked_keys: Arc<Mutex<BTreeSet<(String, String)>>>,
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
@@ -223,6 +224,7 @@ impl AppState {
             mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
+            public_edge_assertion_nonces: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_revoked_keys: Arc::new(Mutex::new(BTreeSet::new())),
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             mobile_terminal_secret,
@@ -413,17 +415,22 @@ async fn auth_session(
     })
 }
 
-async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBootstrapResponse> {
-    Json(client_bootstrap_response(
+async fn client_bootstrap(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<ClientBootstrapResponse>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
+    Ok(Json(client_bootstrap_response(
         &state.config,
         mobile_terminal_runtime_disabled(&state),
-    ))
+    )))
 }
 
 async fn client_analytics_summary(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
     Ok(Json(build_mobile_analytics_summary(
         &state.config,
@@ -436,6 +443,13 @@ async fn client_request_status(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<ClientRequestStatusResponse>, ApiError> {
+    ensure_public_edge_assertion_from_parts(
+        &state,
+        &headers,
+        Some(peer_addr),
+        "POST",
+        "/client/request-status",
+    )?;
     ensure_session_allowed_from_parts(
         &state.config,
         &headers,
@@ -509,6 +523,13 @@ async fn submit_client_bug_report(
     headers: HeaderMap,
     Json(payload): Json<ClientBugReportRequest>,
 ) -> Result<Json<ClientBugReportResponse>, ApiError> {
+    ensure_public_edge_assertion_from_parts(
+        &state,
+        &headers,
+        Some(peer_addr),
+        "POST",
+        "/client/bug-reports",
+    )?;
     ensure_session_allowed_from_parts(
         &state.config,
         &headers,
@@ -1588,6 +1609,7 @@ async fn list_client_sessions(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
     let actor_email = request_actor_email(&state.config, &request);
     let sessions = state
@@ -1720,6 +1742,7 @@ async fn get_client_session(
     Path(session_id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
     let actor_email = request_actor_email(&state.config, &request);
     let Some(session) = state.session_store.get_session(&session_id)? else {
@@ -1738,6 +1761,7 @@ async fn create_mobile_attach_ticket(
     Path(session_id): Path<String>,
     request: Request,
 ) -> Result<Json<MobileAttachTicketResponse>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     let peer_addr = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -1902,6 +1926,7 @@ async fn disable_mobile_terminal(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<MobileTerminalDisableResponse>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     let actor_email =
         request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
@@ -1960,6 +1985,7 @@ async fn list_mobile_terminal_devices(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<MobileTerminalDeviceListResponse>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     let actor_email =
         request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
@@ -2024,6 +2050,7 @@ async fn revoke_mobile_terminal_device(
     Query(query): Query<MobileTerminalRevokeDeviceQuery>,
     request: Request,
 ) -> Result<Json<MobileTerminalRevokeDeviceResponse>, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     let device_key_id = device_key_id.trim().to_owned();
     if device_key_id.is_empty() {
         return Err(ApiError::Status {
@@ -2080,6 +2107,7 @@ async fn mobile_terminal_endpoint(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     let (mut parts, _body) = request.into_parts();
     let headers = parts.headers.clone();
     let peer_addr = parts
@@ -4814,6 +4842,180 @@ fn validate_mobile_terminal_timestamp(
     Ok((timestamp + max_skew).ceil() as i64)
 }
 
+fn ensure_public_edge_assertion_for_request(
+    state: &AppState,
+    request: &Request,
+) -> Result<(), ApiError> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    ensure_public_edge_assertion_from_parts(
+        state,
+        request.headers(),
+        peer_addr,
+        request.method().as_str(),
+        &path,
+    )
+}
+
+fn ensure_public_edge_assertion_from_parts(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    method: &str,
+    path: &str,
+) -> Result<(), ApiError> {
+    let config = &state.config.public_edge;
+    if !config.enabled {
+        return Ok(());
+    }
+    if is_local_bypass_request(headers, peer_addr, &state.config) {
+        return Ok(());
+    }
+    let Some(secret) = trimmed(&config.assertion_secret) else {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Public edge assertion is enabled but incomplete".to_owned(),
+        });
+    };
+    let Some(timestamp) = header_text(headers, "x-sm-edge-timestamp") else {
+        return Err(public_edge_assertion_required());
+    };
+    let Some(nonce) = header_text(headers, "x-sm-edge-nonce") else {
+        return Err(public_edge_assertion_required());
+    };
+    let Some(signature) = header_text(headers, "x-sm-edge-signature") else {
+        return Err(public_edge_assertion_required());
+    };
+    let expires_at_unix =
+        validate_public_edge_timestamp(&timestamp, config.assertion_max_skew_seconds)?;
+    verify_public_edge_assertion(&secret, method, path, &timestamp, &nonce, &signature)?;
+    record_public_edge_assertion_nonce(
+        state,
+        method,
+        path,
+        &nonce,
+        expires_at_unix,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )
+}
+
+fn public_edge_assertion_required() -> ApiError {
+    ApiError::Status {
+        status: StatusCode::FORBIDDEN,
+        detail: "Public edge assertion is required".to_owned(),
+    }
+}
+
+fn validate_public_edge_timestamp(timestamp: &str, max_skew_seconds: u64) -> Result<i64, ApiError> {
+    let Ok(timestamp) = timestamp.parse::<f64>() else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Invalid public edge timestamp".to_owned(),
+        });
+    };
+    if !timestamp.is_finite() {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Invalid public edge timestamp".to_owned(),
+        });
+    }
+    let max_skew = clamp_u64(max_skew_seconds, 5, 600, 60) as f64;
+    let now = OffsetDateTime::now_utc().unix_timestamp() as f64;
+    if (now - timestamp).abs() > max_skew {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Expired public edge assertion".to_owned(),
+        });
+    }
+    Ok((timestamp + max_skew).ceil() as i64)
+}
+
+fn public_edge_assertion_message(method: &str, path: &str, timestamp: &str, nonce: &str) -> String {
+    [
+        "SM-PUBLIC-EDGE-V1",
+        &method.to_ascii_uppercase(),
+        path,
+        timestamp,
+        nonce,
+    ]
+    .join("\n")
+}
+
+fn verify_public_edge_assertion(
+    secret: &str,
+    method: &str,
+    path: &str,
+    timestamp: &str,
+    nonce: &str,
+    signature: &str,
+) -> Result<(), ApiError> {
+    let signature = STANDARD
+        .decode(signature.trim())
+        .or_else(|_| URL_SAFE_NO_PAD.decode(signature.trim()))
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Invalid public edge assertion".to_owned(),
+        })?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Public edge assertion signer is unavailable".to_owned(),
+        })?;
+    mac.update(public_edge_assertion_message(method, path, timestamp, nonce).as_bytes());
+    let expected = mac.finalize().into_bytes();
+    if constant_time_eq(&signature, &expected) {
+        Ok(())
+    } else {
+        Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Invalid public edge assertion".to_owned(),
+        })
+    }
+}
+
+fn record_public_edge_assertion_nonce(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    nonce: &str,
+    expires_at_unix: i64,
+    now_unix: i64,
+) -> Result<(), ApiError> {
+    let key = public_edge_assertion_nonce_key(method, path, nonce);
+    let mut nonces = state
+        .public_edge_assertion_nonces
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Public edge assertion nonce store is unavailable".to_owned(),
+        })?;
+    nonces.retain(|_, expires_at| *expires_at > now_unix);
+    if nonces.contains_key(&key) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Public edge assertion nonce was already used".to_owned(),
+        });
+    }
+    nonces.insert(key, expires_at_unix.max(now_unix + 1));
+    Ok(())
+}
+
+fn public_edge_assertion_nonce_key(method: &str, path: &str, nonce: &str) -> String {
+    [
+        method.to_ascii_uppercase(),
+        path.to_owned(),
+        nonce.to_owned(),
+    ]
+    .join("\x1f")
+}
+
 fn mobile_terminal_ticket_message(
     method: &str,
     path: &str,
@@ -6371,6 +6573,62 @@ mod tests {
         request
     }
 
+    fn public_request(method: Method, uri: &str, body: Body) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(HOST, "sm.rajeshgo.li")
+            .body(body)
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 10], 4200))));
+        request
+    }
+
+    fn public_edge_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.public_edge.enabled = true;
+        config.public_edge.assertion_secret = Some("edge-secret".to_owned());
+        config
+    }
+
+    fn sign_public_edge_headers(
+        secret: &str,
+        method: &str,
+        path: &str,
+        timestamp: &str,
+        nonce: &str,
+    ) -> [(String, String); 3] {
+        let message = public_edge_assertion_message(method, path, timestamp, nonce);
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        [
+            ("x-sm-edge-timestamp".to_owned(), timestamp.to_owned()),
+            ("x-sm-edge-nonce".to_owned(), nonce.to_owned()),
+            (
+                "x-sm-edge-signature".to_owned(),
+                STANDARD.encode(mac.finalize().into_bytes()),
+            ),
+        ]
+    }
+
+    fn add_public_edge_headers(
+        request: &mut axum::http::Request<Body>,
+        secret: &str,
+        method: &str,
+        path: &str,
+        nonce: &str,
+    ) {
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp().to_string();
+        for (name, value) in sign_public_edge_headers(secret, method, path, &timestamp, nonce) {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+    }
+
     fn sign_ticket_headers(
         signing_key: &SigningKey,
         session_id: &str,
@@ -6585,6 +6843,146 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(body["ticket_secret"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_is_disabled_by_default() {
+        let app = router(AppState::new(AppConfig::default()));
+
+        let response = app
+            .oneshot(public_request(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["auth"]["session_endpoint"], "/auth/session");
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_allows_local_bypass_without_headers() {
+        let app = router(AppState::new(public_edge_config()));
+
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["auth"]["mode"], "browser_session_cookie");
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_rejects_public_native_routes_without_headers() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.public_edge = public_edge_config().public_edge;
+        let app = router(AppState::new(config));
+
+        for request in [
+            public_request(Method::GET, "/client/bootstrap", Body::empty()),
+            public_request(Method::GET, "/client/sessions", Body::empty()),
+            public_request(
+                Method::POST,
+                "/client/sessions/fork1001/attach-ticket",
+                Body::from("{}"),
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["detail"], "Public edge assertion is required");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_accepts_signed_bootstrap_and_rejects_replay() {
+        let app = router(AppState::new(public_edge_config()));
+        let mut first = public_request(Method::GET, "/client/bootstrap", Body::empty());
+        add_public_edge_headers(
+            &mut first,
+            "edge-secret",
+            "GET",
+            "/client/bootstrap",
+            "edge-nonce-1",
+        );
+        let mut replay = public_request(Method::GET, "/client/bootstrap", Body::empty());
+        add_public_edge_headers(
+            &mut replay,
+            "edge-secret",
+            "GET",
+            "/client/bootstrap",
+            "edge-nonce-1",
+        );
+
+        let first_response = app.clone().oneshot(first).await.unwrap();
+        let (first_status, first_body) = response_json(first_response).await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(
+            first_body["auth"]["device_auth_endpoint"],
+            "/auth/device/google"
+        );
+
+        let replay_response = app.oneshot(replay).await.unwrap();
+        let (replay_status, replay_body) = response_json(replay_response).await;
+        assert_eq!(replay_status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            replay_body["detail"],
+            "Public edge assertion nonce was already used"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_rejects_invalid_signature() {
+        let app = router(AppState::new(public_edge_config()));
+        let mut request = public_request(Method::GET, "/client/bootstrap", Body::empty());
+        add_public_edge_headers(
+            &mut request,
+            "wrong-secret",
+            "GET",
+            "/client/bootstrap",
+            "edge-nonce-1",
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["detail"], "Invalid public edge assertion");
+    }
+
+    #[tokio::test]
+    async fn public_edge_assertion_rejects_expired_timestamp() {
+        let app = router(AppState::new(public_edge_config()));
+        let mut request = public_request(Method::GET, "/client/bootstrap", Body::empty());
+        let expired_timestamp = (OffsetDateTime::now_utc().unix_timestamp() - 3600).to_string();
+        for (name, value) in sign_public_edge_headers(
+            "edge-secret",
+            "GET",
+            "/client/bootstrap",
+            &expired_timestamp,
+            "edge-nonce-1",
+        ) {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["detail"], "Expired public edge assertion");
     }
 
     #[tokio::test]
