@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub mobile_terminal: MobileTerminalConfig,
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
+    pub tool_logging: ToolLoggingConfig,
     pub claude: ProviderLaunchConfig,
     pub codex: ProviderLaunchConfig,
     pub codex_fork: CodexForkLaunchConfig,
@@ -45,6 +46,7 @@ impl Default for AppConfig {
             mobile_terminal: MobileTerminalConfig::default(),
             tmux: TmuxConfig::default(),
             sm_send: SmSendConfig::default(),
+            tool_logging: ToolLoggingConfig::default(),
             claude: ProviderLaunchConfig::new(
                 "claude".to_owned(),
                 Vec::new(),
@@ -556,6 +558,24 @@ fn default_server_log_file() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ToolLoggingConfig {
+    #[serde(default = "default_tool_usage_db_path")]
+    pub db_path: String,
+}
+
+impl Default for ToolLoggingConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_tool_usage_db_path(),
+        }
+    }
+}
+
+fn default_tool_usage_db_path() -> String {
+    "~/.local/share/claude-sessions/tool_usage.db".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct QueueRunnerConfig {
     #[serde(default = "default_queue_runner_state_dir")]
     pub state_dir: String,
@@ -649,6 +669,8 @@ struct RawConfig {
     #[serde(default)]
     sm_send: SmSendConfig,
     #[serde(default)]
+    tool_logging: ToolLoggingConfig,
+    #[serde(default)]
     claude: RawProviderLaunchConfig,
     #[serde(default)]
     codex: RawProviderLaunchConfig,
@@ -725,6 +747,7 @@ impl From<RawConfig> for AppConfig {
             mobile_terminal: raw.mobile_terminal,
             tmux: raw.tmux,
             sm_send: raw.sm_send,
+            tool_logging: raw.tool_logging,
             claude,
             codex,
             codex_fork,
@@ -1197,6 +1220,20 @@ sm_send:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
+    }
+
+    #[test]
+    fn raw_config_reads_tool_logging_db_path() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+tool_logging:
+  db_path: /tmp/custom-tool-usage.db
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.tool_logging.db_path, "/tmp/custom-tool-usage.db");
     }
 
     #[test]

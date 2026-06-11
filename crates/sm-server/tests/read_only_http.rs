@@ -20,7 +20,7 @@ use sm_server::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig, EmailConfig,
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
         MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
-        RustCoreConfig, SmSendConfig,
+        RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
     http::{router, AppState},
 };
@@ -2079,6 +2079,71 @@ async fn shadow_http_reports_codex_review_request_detail_404() {
 }
 
 #[tokio::test]
+async fn shadow_http_reports_tool_calls_200_as_status_only() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = br#"{"session_id":"run12345","tool_calls":[{"timestamp":"2026-06-01 00:02:00","tool_name":"Bash","hook_type":"PreToolUse"}]}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/run12345/tool-calls",
+                "query_string": "limit=10",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_tool_calls_404() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = serde_json::to_vec(&json!({ "detail": "Session not found" })).unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/missing/tool-calls",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 404,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["predicted_status"], 404);
+    assert_eq!(payload["body_sha256_match"], true);
+}
+
+#[tokio::test]
 async fn shadow_http_reports_queue_job_detail_404() {
     let state_file = unique_temp_path();
     fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
@@ -3103,6 +3168,74 @@ async fn session_output_tails_fixture_log_file() {
         payload["output"],
         "fixture log line 2\nfixture log line 3\n"
     );
+}
+
+#[tokio::test]
+async fn session_tool_calls_reads_pre_tool_use_rows() {
+    let state_file = write_session_fixture();
+    let tool_db = unique_temp_path();
+    create_tool_usage_fixture_db(&tool_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        tool_logging: ToolLoggingConfig {
+            db_path: tool_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/sessions/run12345/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(
+        payload["tool_calls"],
+        json!([
+            {
+                "timestamp": "2026-06-01 00:02:00",
+                "tool_name": "Bash",
+                "hook_type": "PreToolUse"
+            },
+            {
+                "timestamp": "2026-06-01 00:01:00",
+                "tool_name": "Read",
+                "hook_type": "PreToolUse"
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn session_tool_calls_handles_missing_db_and_invalid_limit() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        tool_logging: ToolLoggingConfig {
+            db_path: state_file
+                .with_extension("missing-tool-usage.db")
+                .display()
+                .to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/tool-calls").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "session_id": "run12345", "tool_calls": [] })
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/missing/tool-calls").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Session not found");
+
+    let (status, payload) = get_json(app, "/sessions/run12345/tool-calls?limit=0").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "limit must be between 1 and 100");
 }
 
 #[tokio::test]
@@ -7749,6 +7882,29 @@ fn create_queue_jobs_fixture_db(state_dir: &PathBuf) {
              NULL, NULL, NULL)
         "#,
         [],
+    )
+    .unwrap();
+}
+
+fn create_tool_usage_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE tool_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            session_id TEXT,
+            hook_type TEXT NOT NULL,
+            tool_name TEXT NOT NULL
+        );
+        INSERT INTO tool_usage (timestamp, session_id, hook_type, tool_name)
+        VALUES
+            ('2026-06-01 00:00:00', 'run12345', 'PreToolUse', 'Write'),
+            ('2026-06-01 00:01:00', 'run12345', 'PreToolUse', 'Read'),
+            ('2026-06-01 00:02:00', 'run12345', 'PreToolUse', 'Bash'),
+            ('2026-06-01 00:03:00', 'run12345', 'PostToolUse', 'Bash'),
+            ('2026-06-01 00:04:00', 'oldstate', 'PreToolUse', 'Glob');
+        "#,
     )
     .unwrap();
 }
