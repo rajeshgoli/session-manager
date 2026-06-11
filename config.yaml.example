@@ -163,6 +163,14 @@ external_access:
   ssh_username: "your-ssh-user"
   ssh_proxy_command: "cloudflared access ssh --hostname %h"
 
+# Optional public-edge assertion accepted by the Rust native-client routes.
+# Keep disabled unless a trusted edge proxy signs requests after proving the
+# device/node is allowed to reach the origin.
+public_edge:
+  enabled: false
+  assertion_secret: ""
+  assertion_max_skew_seconds: 60
+
 # Optional Android in-app HTTPS terminal attach. Disabled by default because it
 # exposes an interactive shell path; enable only for explicitly registered users
 # and app-generated device public keys.
