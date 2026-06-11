@@ -11,7 +11,9 @@ use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::{
-        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST, LOCATION},
+        header::{
+            AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+        },
         HeaderMap, StatusCode,
     },
     response::{
@@ -659,8 +661,18 @@ async fn get_hashed_app_artifact(
     Ok((
         StatusCode::OK,
         [
-            (CONTENT_TYPE, "application/vnd.android.package-archive"),
-            (CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (
+                CONTENT_TYPE,
+                "application/vnd.android.package-archive".to_owned(),
+            ),
+            (
+                CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_owned(),
+            ),
+            (
+                CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{app_name}.apk\""),
+            ),
         ],
         Body::from(bytes),
     )

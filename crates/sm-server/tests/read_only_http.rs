@@ -1038,6 +1038,12 @@ async fn app_artifact_upload_metadata_and_downloads_are_auth_gated() {
             .and_then(|value| value.to_str().ok()),
         Some("public, max-age=31536000, immutable")
     );
+    assert_eq!(
+        headers
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"session-manager-android.apk\"")
+    );
 
     let (status, metadata_payload) =
         get_json(app.clone(), "/apps/session-manager-android/meta.json").await;
