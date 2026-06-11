@@ -2145,6 +2145,92 @@ async fn shadow_http_reports_tool_calls_404() {
 }
 
 #[tokio::test]
+async fn shadow_http_reports_activity_actions_200_as_status_only() {
+    let state_file = write_codex_app_session_fixture("codexproj");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = br#"{"actions":[]}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexproj/activity-actions",
+                "query_string": "limit=%32&limit=3",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["body_sha256"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_activity_actions_stable_failures() {
+    let state_file = write_codex_app_session_fixture("codexproj");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/missing/activity-actions",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 404,
+                "body_sha256": sha256_hex(br#"{"detail":"Session not found"}"#)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["predicted_status"], 404);
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexproj/activity-actions",
+                "query_string": "limit=0",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 422,
+                "body_sha256": sha256_hex(b"{}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 422);
+}
+
+#[tokio::test]
 async fn shadow_http_reports_codex_events_200_as_status_only() {
     let state_file = write_codex_app_session_fixture("codexapp1");
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -3572,6 +3658,107 @@ async fn session_tool_calls_codex_fork_missing_observability_db_returns_empty_ro
         payload,
         json!({ "session_id": "forktools", "tool_calls": [] })
     );
+}
+
+#[tokio::test]
+async fn session_activity_actions_projects_codex_observability_rows() {
+    let state_file = write_codex_app_session_fixture("codexproj");
+    let observability_db = unique_temp_path();
+    create_codex_activity_fixture_db(&observability_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_observability: CodexObservabilityConfig {
+            db_path: observability_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(
+        app,
+        "/sessions/codexproj/activity-actions?limit=%32&limit=3",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["actions"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        payload["actions"][0],
+        json!({
+            "source_provider": "codex-app",
+            "action_kind": "command",
+            "summary_text": "Started: pytest -q",
+            "status": "running",
+            "started_at": "2026-02-21T10:00:00+00:00",
+            "ended_at": null,
+            "session_id": "codexproj",
+            "turn_id": "turn-1",
+            "item_id": "item-1"
+        })
+    );
+    assert_eq!(
+        payload["actions"][1]["summary_text"],
+        "Failed pytest -q: non-zero exit"
+    );
+    assert_eq!(
+        payload["actions"][1]["started_at"],
+        "2026-02-21T10:00:00+00:00"
+    );
+    assert_eq!(
+        payload["actions"][1]["ended_at"],
+        "2026-02-21T10:00:05+00:00"
+    );
+    assert_eq!(payload["actions"][2]["action_kind"], "approval");
+    assert_eq!(
+        payload["actions"][2]["summary_text"],
+        "Approval decision: accept"
+    );
+    assert_eq!(payload["actions"][2]["status"], "completed");
+}
+
+#[tokio::test]
+async fn session_activity_actions_handles_empty_and_gating_errors() {
+    let state_file = write_codex_app_session_fixture("codexproj");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/codexproj/activity-actions").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "actions": [] }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/missing/activity-actions").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Session not found");
+
+    let non_codex_state = write_session_fixture();
+    let non_codex_app = router(AppState::new(config_with_state_file(&non_codex_state)));
+    let (status, payload) = get_json(non_codex_app, "/sessions/run12345/activity-actions").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "activity actions supported only for provider=codex-app"
+    );
+
+    let disabled_app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_rollout: CodexRolloutConfig {
+            enable_observability_projection: false,
+            ..CodexRolloutConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+    let (status, payload) = get_json(disabled_app, "/sessions/codexproj/activity-actions").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        payload["detail"],
+        "codex activity projection disabled by rollout flag"
+    );
+
+    let (status, payload) = get_json(app, "/sessions/codexproj/activity-actions?limit=201").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "limit must be between 1 and 200");
 }
 
 #[tokio::test]
@@ -8751,6 +8938,62 @@ fn create_codex_observability_fixture_db(path: &PathBuf) {
             ('otherfork', '{"tool_name":"Ignore"}', '2026-06-01T00:04:00+00:00'),
             ('forktools', NULL, '2026-06-01T00:04:30+00:00'),
             ('forktools', '{"tool_name":"Edit"}', '2026-06-01T00:05:00+00:00');
+        "#,
+    )
+    .unwrap();
+}
+
+fn create_codex_activity_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_tool_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            thread_id TEXT,
+            turn_id TEXT,
+            item_id TEXT,
+            request_id TEXT,
+            event_type TEXT NOT NULL,
+            item_type TEXT,
+            phase TEXT,
+            command TEXT,
+            cwd TEXT,
+            exit_code INTEGER,
+            file_path TEXT,
+            diff_summary TEXT,
+            approval_decision TEXT,
+            latency_ms INTEGER,
+            final_status TEXT,
+            error_code TEXT,
+            error_message TEXT,
+            raw_payload_json TEXT,
+            provider TEXT NOT NULL DEFAULT 'codex-app',
+            schema_version INTEGER,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO codex_tool_events
+            (session_id, thread_id, turn_id, item_id, request_id, event_type,
+             item_type, phase, command, cwd, exit_code, file_path, diff_summary,
+             approval_decision, latency_ms, final_status, error_code, error_message,
+             raw_payload_json, provider, schema_version, created_at)
+        VALUES
+            ('codexproj', 'thread-1', 'turn-1', 'item-1', NULL, 'started',
+             'commandExecution', 'pre', 'pytest -q', '/repo', NULL, NULL, NULL,
+             NULL, NULL, NULL, NULL, NULL,
+             '{}', 'codex-app', 2, '2026-02-21T10:00:00+00:00'),
+            ('codexproj', 'thread-1', 'turn-1', 'item-1', NULL, 'failed',
+             'commandExecution', 'post', 'pytest -q', '/repo', 1, NULL, NULL,
+             NULL, 5000, 'failed', 'nonzero', 'non-zero exit',
+             '{}', 'codex-app', 2, '2026-02-21T10:00:05+00:00'),
+            ('codexproj', 'thread-2', 'turn-2', 'item-2', 'req-1', 'approval_decision',
+             'fileChange', 'post', NULL, '/repo', NULL, 'src/main.py', NULL,
+             'accept', NULL, NULL, NULL, NULL,
+             '{}', 'codex-app', 2, '2026-02-21T10:01:00+00:00'),
+            ('otherproj', 'thread-x', 'turn-x', 'item-x', NULL, 'started',
+             'commandExecution', 'pre', 'ignored', '/repo', NULL, NULL, NULL,
+             NULL, NULL, NULL, NULL, NULL,
+             '{}', 'codex-app', 2, '2026-02-21T10:02:00+00:00');
         "#,
     )
     .unwrap();

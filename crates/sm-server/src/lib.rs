@@ -1,5 +1,6 @@
 pub mod app_artifacts;
 pub mod bug_reports;
+pub mod codex_activity;
 pub mod codex_events;
 pub mod codex_requests;
 pub mod config;
