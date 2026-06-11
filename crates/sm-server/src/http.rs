@@ -33,6 +33,7 @@ use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::config::{trimmed, AppConfig, PublicNodeConfig};
+use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
@@ -75,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
         .route("/client/bootstrap", get(client_bootstrap))
+        .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
@@ -233,6 +235,17 @@ async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBoot
             preferred_action: "details",
         },
     })
+}
+
+async fn client_analytics_summary(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    Ok(Json(build_mobile_analytics_summary(
+        &state.config,
+        &state.session_store,
+    )?))
 }
 
 async fn events_state(
@@ -1510,6 +1523,13 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
+        "/client/analytics/summary" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         "/client/bootstrap" => Some(serde_json::to_vec(&shadow_client_bootstrap_response(
             &state.config,
         ))?),
@@ -1798,6 +1818,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
     }
     path == "/events"
         || path == "/events/state"
+        || path == "/client/analytics/summary"
         || path == "/nodes"
         || path == "/sessions"
         || path == "/client/sessions"
