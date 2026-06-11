@@ -1576,6 +1576,20 @@ async fn queue_jobs_missing_db_returns_empty_jobs() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload, json!({ "jobs": [] }));
+
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    }));
+    let (status, payload) = get_json(app, "/queue-jobs/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Queue job not found");
 }
 
 #[tokio::test]
@@ -1661,6 +1675,19 @@ async fn queue_jobs_lists_rows_with_filters_and_session_names() {
     assert_eq!(jobs[1]["notify_name"], "codex-fork-notify2");
     assert_eq!(jobs[1]["script_path"], "/tmp/run-perf.sh");
     assert_eq!(jobs[1]["pid"], 4242);
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/job-pending").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "job-pending");
+    assert_eq!(payload["type"], "tests");
+    assert_eq!(payload["requester_name"], "native requester");
+    assert_eq!(payload["notify_name"], "reviewer");
+    assert_eq!(payload["argv"], json!(["cargo", "test"]));
+    assert_eq!(payload["holding_reason"], "memory");
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Queue job not found");
 
     let (status, payload) =
         get_json(app.clone(), "/queue-jobs?notify_target=notify1&type=tests").await;
@@ -1797,6 +1824,17 @@ async fn queue_jobs_rejects_public_host_without_auth() {
         payload["login_url"],
         "/auth/google/login?next=%2Fqueue-jobs"
     );
+
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+    let (status, payload) =
+        get_json_with_host(app, "/queue-jobs/job-pending", "sm.example.com").await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+    assert_eq!(
+        payload["login_url"],
+        "/auth/google/login?next=%2Fqueue-jobs%2Fjob-pending"
+    );
 }
 
 #[tokio::test]
@@ -1913,6 +1951,51 @@ async fn shadow_http_treats_live_session_lists_as_status_only() {
     assert_eq!(payload["predicted_status"], 200);
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_queue_job_detail_404() {
+    let state_file = unique_temp_path();
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: state_file
+                .with_extension("missing-queue-runner")
+                .display()
+                .to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = serde_json::to_vec(&json!({ "detail": "Queue job not found" })).unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/queue-jobs/missing",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 404,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["predicted_status"], 404);
+    assert_eq!(payload["body_sha256_match"], true);
 }
 
 #[tokio::test]

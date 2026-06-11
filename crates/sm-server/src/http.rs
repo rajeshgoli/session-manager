@@ -270,6 +270,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
         .route("/queue-jobs", get(list_queue_jobs))
+        .route("/queue-jobs/{job_id}", get(get_queue_job))
         .route("/codex-review-requests", get(list_codex_review_requests))
         .route("/nodes", get(list_nodes))
         .route("/humans", get(list_humans))
@@ -1710,6 +1711,20 @@ async fn list_queue_jobs(
         response_jobs.push(queue_job_response(&state, job)?);
     }
     Ok(Json(json!({ "jobs": response_jobs })))
+}
+
+async fn get_queue_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let queue_state_dir = state.config.queue_runner_state_dir();
+    let queue_db_path = expand_home(&queue_state_dir.to_string_lossy()).join("queue_runner.db");
+    let Some(job) = RetainedQueueStore::get_queue_job_from_path(&queue_db_path, &job_id)? else {
+        return Err(ApiError::NotFound("Queue job not found"));
+    };
+    Ok(Json(queue_job_response(&state, job)?))
 }
 
 fn resolve_session_or_registry_role(
@@ -3870,6 +3885,29 @@ fn shadow_predict_read(
         return Ok(None);
     }
 
+    if let Some(job_id) = path.strip_prefix("/queue-jobs/") {
+        let queue_state_dir = state.config.queue_runner_state_dir();
+        let queue_db_path = expand_home(&queue_state_dir.to_string_lossy()).join("queue_runner.db");
+        let (status, body) =
+            match RetainedQueueStore::get_queue_job_from_path(&queue_db_path, job_id)? {
+                Some(job) => (
+                    StatusCode::OK,
+                    serde_json::to_vec(&queue_job_response(state, job).map_err(|error| {
+                        anyhow::anyhow!("queue job response failed: {error:?}")
+                    })?)?,
+                ),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    serde_json::to_vec(&json!({ "detail": "Queue job not found" }))?,
+                ),
+            };
+        return Ok(Some(ShadowPrediction {
+            status: status.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
     let body = match path {
         "/health" => Some(serde_json::to_vec(&json!({ "status": "healthy" }))?),
         "/health/detailed" => {
@@ -5531,6 +5569,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/analytics/summary"
         || path == "/codex-review-requests"
         || path == "/queue-jobs"
+        || path.starts_with("/queue-jobs/")
         || path == "/nodes"
         || path == "/sessions"
         || path == "/client/sessions"
