@@ -346,6 +346,12 @@ pub struct MobileTerminalUserConfig {
     #[serde(default)]
     pub interactive_shell_access: bool,
     #[serde(default)]
+    pub mobile_terminal_owner: bool,
+    #[serde(default)]
+    pub can_disable_mobile_terminal: bool,
+    #[serde(default)]
+    pub owner: bool,
+    #[serde(default)]
     pub registered_device_keys: Vec<MobileTerminalDeviceKeyConfig>,
 }
 
