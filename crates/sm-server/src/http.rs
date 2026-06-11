@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     fs,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -12,7 +12,8 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::{
         header::{
-            AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+            AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE,
+            HOST, LOCATION, UPGRADE,
         },
         HeaderMap, StatusCode,
     },
@@ -29,6 +30,11 @@ use base64::{
 };
 use futures_util::stream::{self, StreamExt};
 use hmac::{Hmac, Mac};
+use p256::{
+    ecdsa::{signature::Verifier, Signature, VerifyingKey},
+    pkcs8::DecodePublicKey,
+};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -40,7 +46,9 @@ use crate::app_artifacts::{
     APP_ARTIFACT_MAX_SIZE_BYTES,
 };
 use crate::bug_reports::{BugReportStore, CreateBugReport};
-use crate::config::{trimmed, AppConfig, PublicNodeConfig};
+use crate::config::{
+    trimmed, AppConfig, MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PublicNodeConfig,
+};
 use crate::email::{
     extract_reply_message_body, extract_routed_session_id, extract_subject_from_raw_email,
     extract_text_from_raw_email, normalize_explicit_session_id, EmailBridge,
@@ -73,10 +81,38 @@ const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
 const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
 const BUG_REPORT_MAX_SERVER_STATE_CHARS: usize = 200_000;
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct MobileTerminalTicket {
+    secret_hash: String,
+    user_id: String,
+    actor_email: String,
+    session_id: String,
+    provider: String,
+    node: String,
+    tmux_session: String,
+    tmux_socket_name: Option<String>,
+    device_key_id: String,
+    created_at_unix: i64,
+    expires_at_unix: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct MobileAttachTicketResponse {
+    ticket_id: String,
+    ticket_secret: String,
+    device_key_id: String,
+    ws_url: String,
+    expires_at: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
     session_store: SessionStore,
+    mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
+    mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
+    mobile_terminal_secret: [u8; 32],
 }
 
 impl AppState {
@@ -84,9 +120,14 @@ impl AppState {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let session_store = SessionStore::new_with_queue(state_file, queue_db_path);
+        let mut mobile_terminal_secret = [0u8; 32];
+        OsRng.fill_bytes(&mut mobile_terminal_secret);
         Self {
             config,
             session_store,
+            mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
+            mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
+            mobile_terminal_secret,
         }
     }
 }
@@ -104,6 +145,7 @@ pub fn router(state: AppState) -> Router {
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
         .route("/client/bug-reports", post(submit_client_bug_report))
+        .route("/client/terminal", get(mobile_terminal_upgrade_required))
         .route("/deploy/{app_name}", post(deploy_app_artifact))
         .route("/apps/{app_name}/latest.apk", get(get_latest_app_artifact))
         .route("/apps/{app_name}/meta.json", get(get_app_artifact_metadata))
@@ -175,6 +217,10 @@ pub fn router(state: AppState) -> Router {
         .route("/registry/{role}", get(lookup_agent_registry))
         .route("/sessions/{session_id}/output", get(session_output))
         .route("/client/sessions", get(list_client_sessions))
+        .route(
+            "/client/sessions/{session_id}/attach-ticket",
+            post(create_mobile_attach_ticket),
+        )
         .route("/client/sessions/{session_id}", get(get_client_session))
         .fallback(not_found);
     if inbound_email_alias != DEFAULT_EMAIL_WEBHOOK_PATH {
@@ -1567,6 +1613,188 @@ async fn get_client_session(
     Ok(Json(ClientSessionResponse::from(session)))
 }
 
+async fn create_mobile_attach_ticket(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<MobileAttachTicketResponse>, ApiError> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    let actor_email = request_actor_email_from_parts(&state.config, request.headers(), peer_addr)
+        .ok_or_else(|| ApiError::Status {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Authentication required".to_owned(),
+    })?;
+    let Some(session) = resolve_session_or_registry_role(&state, &session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    let route_prefix = mobile_terminal_request_path_prefix(
+        request.uri().path(),
+        &format!("/client/sessions/{}/attach-ticket", session.id),
+    );
+    let MobileTerminalAuthorization {
+        user_id,
+        device_key_id,
+        ws_url,
+        tmux_session,
+        tmux_socket_name,
+        proof_nonce,
+        proof_nonce_expires_at_unix,
+    } = authorize_mobile_terminal_ticket_request(
+        &state.config,
+        request.headers(),
+        route_prefix.as_deref(),
+        &session,
+        &actor_email,
+    )?;
+
+    let now = OffsetDateTime::now_utc();
+    record_mobile_terminal_proof_nonce(
+        &state,
+        &user_id,
+        &device_key_id,
+        &session.id,
+        &proof_nonce,
+        proof_nonce_expires_at_unix,
+        now.unix_timestamp(),
+    )?;
+    let ttl_seconds = clamp_u64(state.config.mobile_terminal.ticket_ttl_seconds, 5, 300, 30);
+    let expires_at = now + Duration::from_secs(ttl_seconds);
+    let ticket_id = format!("att_{}", random_urlsafe_token(18));
+    let ticket_secret = random_urlsafe_token(40);
+    let secret_hash = mobile_terminal_secret_hash(&state.mobile_terminal_secret, &ticket_secret)?;
+
+    let mut tickets = state
+        .mobile_terminal_tickets
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal ticket store is unavailable".to_owned(),
+        })?;
+    cleanup_mobile_terminal_tickets(&mut tickets, now.unix_timestamp());
+    tickets
+        .retain(|_, ticket| !(ticket.user_id == user_id && ticket.device_key_id == device_key_id));
+    let max_global = clamp_usize(
+        state.config.mobile_terminal.max_concurrent_attaches_global,
+        1,
+        64,
+        4,
+    );
+    let max_user = clamp_usize(
+        state
+            .config
+            .mobile_terminal
+            .max_concurrent_attaches_per_user,
+        1,
+        16,
+        1,
+    );
+    let max_session = clamp_usize(
+        state
+            .config
+            .mobile_terminal
+            .max_concurrent_attaches_per_session,
+        1,
+        16,
+        1,
+    );
+    if tickets.len() >= max_global {
+        return Err(ApiError::Status {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "Too many active mobile attaches".to_owned(),
+        });
+    }
+    if tickets
+        .values()
+        .filter(|ticket| ticket.user_id == user_id)
+        .count()
+        >= max_user
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "Too many active mobile attaches for user".to_owned(),
+        });
+    }
+    if tickets
+        .values()
+        .filter(|ticket| ticket.session_id == session.id)
+        .count()
+        >= max_session
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "Session already has an active mobile attach".to_owned(),
+        });
+    }
+
+    tickets.insert(
+        ticket_id.clone(),
+        MobileTerminalTicket {
+            secret_hash,
+            user_id,
+            actor_email,
+            session_id: session.id,
+            provider: session.provider,
+            node: session.node,
+            tmux_session,
+            tmux_socket_name,
+            device_key_id: device_key_id.clone(),
+            created_at_unix: now.unix_timestamp(),
+            expires_at_unix: expires_at.unix_timestamp(),
+        },
+    );
+
+    Ok(Json(MobileAttachTicketResponse {
+        ticket_id,
+        ticket_secret,
+        device_key_id,
+        ws_url,
+        expires_at: expires_at.format(&Rfc3339).unwrap_or_else(|_| {
+            OffsetDateTime::from_unix_timestamp(expires_at.unix_timestamp())
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+                .to_string()
+        }),
+    }))
+}
+
+async fn mobile_terminal_upgrade_required(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<impl IntoResponse, ApiError> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    let actor_email = request_actor_email_from_parts(&state.config, request.headers(), peer_addr)
+        .ok_or_else(|| ApiError::Status {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Authentication required".to_owned(),
+    })?;
+    let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to use mobile terminal attach".to_owned(),
+        });
+    };
+    if !user_config.interactive_shell_access {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to use mobile terminal attach".to_owned(),
+        });
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(UPGRADE, "websocket".parse().unwrap());
+    headers.insert(CONNECTION, "Upgrade".parse().unwrap());
+    Ok((
+        StatusCode::UPGRADE_REQUIRED,
+        headers,
+        Json(json!({ "detail": "mobile terminal requires a WebSocket upgrade" })),
+    ))
+}
+
 async fn get_attach_descriptor(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -2763,6 +2991,475 @@ fn attach_descriptor_response(session: SessionRecord) -> Value {
     })
 }
 
+struct MobileTerminalAuthorization {
+    user_id: String,
+    device_key_id: String,
+    ws_url: String,
+    tmux_session: String,
+    tmux_socket_name: Option<String>,
+    proof_nonce: String,
+    proof_nonce_expires_at_unix: i64,
+}
+
+fn authorize_mobile_terminal_ticket_request(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    route_prefix: Option<&str>,
+    session: &SessionRecord,
+    actor_email: &str,
+) -> Result<MobileTerminalAuthorization, ApiError> {
+    if !config.mobile_terminal.enabled {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Mobile terminal attach is disabled".to_owned(),
+        });
+    }
+    if matches!(
+        session.status.trim().to_ascii_lowercase().as_str(),
+        "stopped" | "killed"
+    ) {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is not running".to_owned(),
+        });
+    }
+    let Some(ws_url) = mobile_terminal_ws_url(config, route_prefix) else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "mobile terminal public HTTPS host is not configured".to_owned(),
+        });
+    };
+    let Some((user_id, user_config)) = mobile_terminal_visible_user(config, actor_email) else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "mobile terminal user is not configured".to_owned(),
+        });
+    };
+    if !user_config.interactive_shell_access {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "interactive shell access is not enabled".to_owned(),
+        });
+    }
+    if !mobile_terminal_user_has_registered_device(user_config) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "registered mobile device key is required".to_owned(),
+        });
+    }
+
+    let attach = attach_descriptor_payload(session.clone());
+    if attach
+        .get("attach_supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        != true
+    {
+        let detail = attach
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Attach not supported");
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: detail.to_owned(),
+        });
+    }
+    let tmux_session = attach
+        .get("tmux_session")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let tmux_socket_name = attach
+        .get("tmux_socket_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    validate_mobile_terminal_tmux_target(&tmux_session, tmux_socket_name.as_deref())?;
+
+    let device_key_id = header_text(headers, "x-sm-device-key-id");
+    let timestamp = header_text(headers, "x-sm-device-timestamp");
+    let nonce = header_text(headers, "x-sm-device-nonce");
+    let signature = header_text(headers, "x-sm-device-signature");
+    if device_key_id.is_none() || timestamp.is_none() || nonce.is_none() || signature.is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Device key proof is required".to_owned(),
+        });
+    }
+    let device_key_id = device_key_id.unwrap();
+    let timestamp = timestamp.unwrap();
+    let nonce = nonce.unwrap();
+    let signature = signature.unwrap();
+    let proof_nonce_expires_at_unix = validate_mobile_terminal_timestamp(
+        &timestamp,
+        config.mobile_terminal.device_signature_max_skew_seconds,
+    )?;
+    let Some(device_config) = mobile_terminal_device_config(user_config, &device_key_id) else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Device key is not registered".to_owned(),
+        });
+    };
+    let message = mobile_terminal_ticket_message(
+        "POST",
+        &mobile_terminal_attach_ticket_path(config, &session.id, route_prefix),
+        &session.id,
+        actor_email,
+        &device_key_id,
+        &timestamp,
+        &nonce,
+    );
+    verify_mobile_terminal_p256_signature(&device_config.public_key, &signature, &message)?;
+
+    Ok(MobileTerminalAuthorization {
+        user_id: user_id.to_owned(),
+        device_key_id,
+        ws_url,
+        tmux_session,
+        tmux_socket_name,
+        proof_nonce: nonce,
+        proof_nonce_expires_at_unix,
+    })
+}
+
+fn mobile_terminal_visible_user<'a>(
+    config: &'a AppConfig,
+    actor_email: &str,
+) -> Option<(&'a str, &'a MobileTerminalUserConfig)> {
+    let actor = actor_email.trim().to_ascii_lowercase();
+    if actor.is_empty() {
+        return None;
+    }
+    config
+        .mobile_terminal
+        .allowed_users
+        .iter()
+        .find_map(|(user_id, user_config)| {
+            let mut candidates = vec![user_id.trim().to_ascii_lowercase()];
+            if let Some(email) = trimmed(&user_config.email) {
+                candidates.push(email.to_ascii_lowercase());
+            }
+            candidates.extend(
+                user_config
+                    .aliases
+                    .iter()
+                    .map(|alias| alias.trim().to_ascii_lowercase())
+                    .filter(|alias| !alias.is_empty()),
+            );
+            candidates
+                .iter()
+                .any(|candidate| !candidate.is_empty() && candidate == &actor)
+                .then_some((user_id.as_str(), user_config))
+        })
+}
+
+fn mobile_terminal_user_has_registered_device(user_config: &MobileTerminalUserConfig) -> bool {
+    user_config
+        .registered_device_keys
+        .iter()
+        .any(|key| key.enabled && !key.id.trim().is_empty() && !key.public_key.trim().is_empty())
+}
+
+fn mobile_terminal_device_config<'a>(
+    user_config: &'a MobileTerminalUserConfig,
+    device_key_id: &str,
+) -> Option<&'a MobileTerminalDeviceKeyConfig> {
+    user_config.registered_device_keys.iter().find(|key| {
+        key.enabled && key.id.trim() == device_key_id && !key.public_key.trim().is_empty()
+    })
+}
+
+fn mobile_terminal_ws_url(config: &AppConfig, route_prefix: Option<&str>) -> Option<String> {
+    if let Some(configured) = trimmed(&config.mobile_terminal.ws_url) {
+        if config.mobile_terminal.require_tls
+            && !configured.to_ascii_lowercase().starts_with("wss://")
+        {
+            return None;
+        }
+        return Some(configured);
+    }
+    let host = trimmed(&config.external_access.public_http_host)
+        .or_else(|| trimmed(&config.google_auth.public_host))?;
+    let host_lower = host.to_ascii_lowercase();
+    let scheme = if !config.mobile_terminal.require_tls
+        && (host_lower.starts_with("localhost")
+            || host_lower.starts_with("127.0.0.1")
+            || host_lower.starts_with("testserver"))
+    {
+        "ws"
+    } else {
+        "wss"
+    };
+    let prefix = mobile_terminal_public_http_path_prefix(config, route_prefix);
+    Some(format!("{scheme}://{host}{prefix}/client/terminal"))
+}
+
+fn mobile_terminal_attach_ticket_path(
+    config: &AppConfig,
+    session_id: &str,
+    route_prefix: Option<&str>,
+) -> String {
+    let prefix = mobile_terminal_public_http_path_prefix(config, route_prefix);
+    format!("{prefix}/client/sessions/{session_id}/attach-ticket")
+}
+
+fn mobile_terminal_public_http_path_prefix(
+    config: &AppConfig,
+    route_prefix: Option<&str>,
+) -> String {
+    if let Some(route_prefix) = route_prefix {
+        return normalize_mobile_terminal_path_prefix(route_prefix);
+    }
+    if let Some(prefix) = trimmed(&config.mobile_terminal.public_path_prefix) {
+        return normalize_mobile_terminal_path_prefix(&prefix);
+    }
+    if let Some(prefix) = trimmed(&config.external_access.public_http_path_prefix) {
+        return normalize_mobile_terminal_path_prefix(&prefix);
+    }
+    if let Some(prefix) = trimmed(&config.google_auth.public_path_prefix) {
+        return normalize_mobile_terminal_path_prefix(&prefix);
+    }
+    String::new()
+}
+
+fn normalize_mobile_terminal_path_prefix(value: &str) -> String {
+    let mut prefix = value.trim().to_owned();
+    if prefix.is_empty() || prefix == "/" {
+        return String::new();
+    }
+    if !prefix.starts_with('/') {
+        prefix.insert(0, '/');
+    }
+    while prefix.ends_with('/') {
+        prefix.pop();
+    }
+    prefix
+}
+
+fn mobile_terminal_request_path_prefix(path: &str, route_suffix: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let suffix = route_suffix.trim_end_matches('/');
+    if path == suffix {
+        return None;
+    }
+    path.strip_suffix(suffix)
+        .map(normalize_mobile_terminal_path_prefix)
+        .filter(|prefix| !prefix.is_empty())
+}
+
+fn validate_mobile_terminal_tmux_target(
+    tmux_session: &str,
+    tmux_socket_name: Option<&str>,
+) -> Result<(), ApiError> {
+    if tmux_session.is_empty()
+        || !tmux_session
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '@' | '-'))
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Unsafe tmux session target".to_owned(),
+        });
+    }
+    if let Some(socket_name) = tmux_socket_name {
+        if !socket_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "Unsafe tmux socket target".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn validate_mobile_terminal_timestamp(
+    timestamp: &str,
+    max_skew_seconds: u64,
+) -> Result<i64, ApiError> {
+    let Ok(timestamp) = timestamp.parse::<f64>() else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Invalid device timestamp".to_owned(),
+        });
+    };
+    if !timestamp.is_finite() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Invalid device timestamp".to_owned(),
+        });
+    }
+    let max_skew = clamp_u64(max_skew_seconds, 5, 600, 60) as f64;
+    let now = OffsetDateTime::now_utc().unix_timestamp() as f64;
+    if (now - timestamp).abs() > max_skew {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Expired device signature".to_owned(),
+        });
+    }
+    Ok((timestamp + max_skew).ceil() as i64)
+}
+
+fn mobile_terminal_ticket_message(
+    method: &str,
+    path: &str,
+    session_id: &str,
+    actor_email: &str,
+    device_key_id: &str,
+    timestamp: &str,
+    nonce: &str,
+) -> String {
+    [
+        "SM-MOBILE-TERMINAL-TICKET-V1",
+        &method.to_ascii_uppercase(),
+        path,
+        session_id,
+        &actor_email.to_ascii_lowercase(),
+        device_key_id,
+        timestamp,
+        nonce,
+    ]
+    .join("\n")
+}
+
+fn verify_mobile_terminal_p256_signature(
+    public_key_text: &str,
+    signature_text: &str,
+    message: &str,
+) -> Result<(), ApiError> {
+    let signature = mobile_terminal_signature_bytes(signature_text)?;
+    let public_key = VerifyingKey::from_public_key_pem(public_key_text.trim()).map_err(|_| {
+        ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Invalid device public key".to_owned(),
+        }
+    })?;
+    let signature = Signature::from_der(&signature).map_err(|_| ApiError::Status {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Invalid device signature".to_owned(),
+    })?;
+    public_key
+        .verify(message.as_bytes(), &signature)
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Invalid device signature".to_owned(),
+        })
+}
+
+fn mobile_terminal_signature_bytes(signature_text: &str) -> Result<Vec<u8>, ApiError> {
+    let signature_text = signature_text.trim();
+    if signature_text.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Missing device signature".to_owned(),
+        });
+    }
+    STANDARD
+        .decode(signature_text)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(signature_text))
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Invalid device signature encoding".to_owned(),
+        })
+}
+
+fn random_urlsafe_token(bytes_len: usize) -> String {
+    let mut bytes = vec![0u8; bytes_len];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn mobile_terminal_secret_hash(secret: &[u8], ticket_secret: &str) -> Result<String, ApiError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).map_err(|_| ApiError::Status {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: "Mobile terminal ticket signer is unavailable".to_owned(),
+    })?;
+    mac.update(ticket_secret.as_bytes());
+    Ok(hex_lower(&mac.finalize().into_bytes()))
+}
+
+fn cleanup_mobile_terminal_tickets(
+    tickets: &mut BTreeMap<String, MobileTerminalTicket>,
+    now_unix: i64,
+) {
+    tickets.retain(|_, ticket| ticket.expires_at_unix > now_unix);
+}
+
+fn record_mobile_terminal_proof_nonce(
+    state: &AppState,
+    user_id: &str,
+    device_key_id: &str,
+    session_id: &str,
+    nonce: &str,
+    expires_at_unix: i64,
+    now_unix: i64,
+) -> Result<(), ApiError> {
+    let key = mobile_terminal_proof_nonce_key(user_id, device_key_id, session_id, nonce);
+    let mut nonces = state
+        .mobile_terminal_proof_nonces
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal proof nonce store is unavailable".to_owned(),
+        })?;
+    nonces.retain(|_, expires_at| *expires_at > now_unix);
+    if nonces.contains_key(&key) {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Device signature nonce was already used".to_owned(),
+        });
+    }
+    nonces.insert(key, expires_at_unix.max(now_unix + 1));
+    Ok(())
+}
+
+fn mobile_terminal_proof_nonce_key(
+    user_id: &str,
+    device_key_id: &str,
+    session_id: &str,
+    nonce: &str,
+) -> String {
+    [user_id, device_key_id, session_id, nonce].join("\u{1f}")
+}
+
+fn clamp_u64(value: u64, minimum: u64, maximum: u64, fallback: u64) -> u64 {
+    if value == 0 {
+        fallback.clamp(minimum, maximum)
+    } else {
+        value.clamp(minimum, maximum)
+    }
+}
+
+fn clamp_usize(value: usize, minimum: usize, maximum: usize, fallback: usize) -> usize {
+    if value == 0 {
+        fallback.clamp(minimum, maximum)
+    } else {
+        value.clamp(minimum, maximum)
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 fn is_static_sessions_path(path: &str) -> bool {
     matches!(
         path,
@@ -3762,4 +4459,442 @@ struct BootstrapExternalAccess {
 struct SessionOpenDefaults {
     preferred_action: &'static str,
     termux_package: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Method,
+    };
+    use p256::{
+        ecdsa::{signature::Signer, SigningKey},
+        pkcs8::{EncodePublicKey, LineEnding},
+    };
+    use std::{env, process};
+    use tower::ServiceExt;
+
+    fn write_session_state(session_id: &str, status: &str) -> String {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-mobile-ticket-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state_file = dir.join("sessions.json");
+        fs::write(
+            &state_file,
+            serde_json::to_string(&json!({
+                "sessions": [{
+                    "id": session_id,
+                    "name": format!("codex-fork-{session_id}"),
+                    "working_dir": "/repo",
+                    "tmux_session": format!("codex-fork-{session_id}"),
+                    "provider": "codex-fork",
+                    "status": status,
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        state_file.display().to_string()
+    }
+
+    fn mobile_ticket_config(signing_key: &SigningKey) -> AppConfig {
+        let public_key = signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = write_session_state("fork1001", "running");
+        config.mobile_terminal.enabled = true;
+        config.mobile_terminal.ws_url = Some("wss://sm.rajeshgo.li/client/terminal".to_owned());
+        config.mobile_terminal.allowed_users.insert(
+            "local_bypass".to_owned(),
+            MobileTerminalUserConfig {
+                interactive_shell_access: true,
+                registered_device_keys: vec![MobileTerminalDeviceKeyConfig {
+                    id: "test-device".to_owned(),
+                    public_key,
+                    enabled: true,
+                }],
+                ..MobileTerminalUserConfig::default()
+            },
+        );
+        config
+    }
+
+    fn local_request(method: Method, uri: &str, body: Body) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(HOST, "testserver")
+            .body(body)
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4200))));
+        request
+    }
+
+    fn sign_ticket_headers(
+        signing_key: &SigningKey,
+        session_id: &str,
+        path: &str,
+        timestamp: &str,
+        nonce: &str,
+    ) -> [(String, String); 4] {
+        let message = mobile_terminal_ticket_message(
+            "POST",
+            path,
+            session_id,
+            "local_bypass",
+            "test-device",
+            timestamp,
+            nonce,
+        );
+        let signature: Signature = signing_key.sign(message.as_bytes());
+        [
+            ("x-sm-device-key-id".to_owned(), "test-device".to_owned()),
+            ("x-sm-device-timestamp".to_owned(), timestamp.to_owned()),
+            ("x-sm-device-nonce".to_owned(), nonce.to_owned()),
+            (
+                "x-sm-device-signature".to_owned(),
+                STANDARD.encode(signature.to_der().as_bytes()),
+            ),
+        ]
+    }
+
+    fn attach_ticket_request(signing_key: &SigningKey, nonce: &str) -> axum::http::Request<Body> {
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let mut request = local_request(
+            Method::POST,
+            "/client/sessions/fork1001/attach-ticket",
+            Body::from("{}"),
+        );
+        for (name, value) in sign_ticket_headers(
+            signing_key,
+            "fork1001",
+            "/client/sessions/fork1001/attach-ticket",
+            &timestamp,
+            nonce,
+        ) {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+        request
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_requires_registered_device_signature() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let app = router(state);
+
+        let missing = app
+            .clone()
+            .oneshot(local_request(
+                Method::POST,
+                "/client/sessions/fork1001/attach-ticket",
+                Body::from("{}"),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(missing).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["detail"], "Device key proof is required");
+
+        let valid = app
+            .oneshot(attach_ticket_request(&signing_key, "nonce-1"))
+            .await
+            .unwrap();
+        let (status, body) = response_json(valid).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["ticket_id"].as_str().unwrap().starts_with("att_"));
+        assert!(body["ticket_secret"].as_str().unwrap().len() >= 40);
+        assert_eq!(body["device_key_id"], "test-device");
+        assert_eq!(body["ws_url"], "wss://sm.rajeshgo.li/client/terminal");
+        assert!(!body["ws_url"]
+            .as_str()
+            .unwrap()
+            .contains(body["ticket_secret"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_retry_replaces_pending_same_user_device_ticket() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let app = router(state.clone());
+
+        let first = app
+            .clone()
+            .oneshot(attach_ticket_request(&signing_key, "nonce-1"))
+            .await
+            .unwrap();
+        let (_, first_body) = response_json(first).await;
+        let second = app
+            .oneshot(attach_ticket_request(&signing_key, "nonce-2"))
+            .await
+            .unwrap();
+        let (_, second_body) = response_json(second).await;
+
+        assert_ne!(first_body["ticket_id"], second_body["ticket_id"]);
+        let tickets = state.mobile_terminal_tickets.lock().unwrap();
+        assert_eq!(tickets.len(), 1);
+        assert!(tickets.contains_key(second_body["ticket_id"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_rejects_reused_device_proof_nonce() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let app = router(state.clone());
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp().to_string();
+
+        let mut first = local_request(
+            Method::POST,
+            "/client/sessions/fork1001/attach-ticket",
+            Body::from("{}"),
+        );
+        let mut second = local_request(
+            Method::POST,
+            "/client/sessions/fork1001/attach-ticket",
+            Body::from("{}"),
+        );
+        for (name, value) in sign_ticket_headers(
+            &signing_key,
+            "fork1001",
+            "/client/sessions/fork1001/attach-ticket",
+            &timestamp,
+            "nonce-1",
+        ) {
+            let header_name = axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+            let header_value = axum::http::HeaderValue::from_str(&value).unwrap();
+            first
+                .headers_mut()
+                .insert(header_name.clone(), header_value.clone());
+            second.headers_mut().insert(header_name, header_value);
+        }
+
+        let first_response = app.clone().oneshot(first).await.unwrap();
+        let (first_status, _) = response_json(first_response).await;
+        assert_eq!(first_status, StatusCode::OK);
+
+        let second_response = app.oneshot(second).await.unwrap();
+        let (second_status, second_body) = response_json(second_response).await;
+        assert_eq!(second_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            second_body["detail"],
+            "Device signature nonce was already used"
+        );
+        assert_eq!(state.mobile_terminal_tickets.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_rejects_non_finite_device_timestamp() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+        let mut request = local_request(
+            Method::POST,
+            "/client/sessions/fork1001/attach-ticket",
+            Body::from("{}"),
+        );
+        for (name, value) in sign_ticket_headers(
+            &signing_key,
+            "fork1001",
+            "/client/sessions/fork1001/attach-ticket",
+            "NaN",
+            "nonce-1",
+        ) {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["detail"], "Invalid device timestamp");
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_signature_uses_external_public_path_prefix() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.external_access.public_http_path_prefix = Some("/sm".to_owned());
+        let app = router(AppState::new(config));
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let mut request = local_request(
+            Method::POST,
+            "/client/sessions/fork1001/attach-ticket",
+            Body::from("{}"),
+        );
+        for (name, value) in sign_ticket_headers(
+            &signing_key,
+            "fork1001",
+            "/sm/client/sessions/fork1001/attach-ticket",
+            &timestamp,
+            "nonce-1",
+        ) {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["ticket_id"].as_str().unwrap().starts_with("att_"));
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_signature_uses_google_auth_public_path_prefix() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.google_auth.public_path_prefix = Some("/sm".to_owned());
+        let app = router(AppState::new(config));
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let mut request = local_request(
+            Method::POST,
+            "/client/sessions/fork1001/attach-ticket",
+            Body::from("{}"),
+        );
+        for (name, value) in sign_ticket_headers(
+            &signing_key,
+            "fork1001",
+            "/sm/client/sessions/fork1001/attach-ticket",
+            &timestamp,
+            "nonce-1",
+        ) {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["ticket_id"].as_str().unwrap().starts_with("att_"));
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_routes_do_not_advertise_unimplemented_bridge() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/sessions",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let session = &body["sessions"][0];
+        assert_eq!(session["mobile_terminal"]["supported"], false);
+        assert_eq!(session["primary_action"]["type"], "details");
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_plain_http_route_reports_upgrade_required() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/terminal",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(UPGRADE)
+                .and_then(|value| value.to_str().ok()),
+            Some("websocket")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Upgrade")
+        );
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            body,
+            json!({ "detail": "mobile terminal requires a WebSocket upgrade" })
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_plain_http_route_requires_authentication() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.google_auth.enabled = true;
+        config.google_auth.public_host = Some("sm.rajeshgo.li".to_owned());
+        let app = router(AppState::new(config));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri("/client/terminal")
+                    .header(HOST, "sm.rajeshgo.li")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["detail"], "Authentication required");
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_plain_http_route_requires_terminal_user() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config
+            .mobile_terminal
+            .allowed_users
+            .get_mut("local_bypass")
+            .unwrap()
+            .interactive_shell_access = false;
+        let app = router(AppState::new(config));
+
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/terminal",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["detail"],
+            "User is not allowed to use mobile terminal attach"
+        );
+    }
 }
