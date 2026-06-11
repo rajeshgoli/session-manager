@@ -92,7 +92,9 @@ use crate::sessions::{
     SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest,
     TurnCompleteOutcome,
 };
-use crate::tool_usage::{list_recent_tool_calls_from_path, ToolCallRow};
+use crate::tool_usage::{
+    list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path, ToolCallRow,
+};
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
@@ -3764,9 +3766,11 @@ async fn session_tool_calls(
         });
     };
     if session.provider == "codex-fork" {
+        let db_path = expand_home(&state.config.codex_observability.db_path);
+        let tool_calls = list_recent_codex_fork_tool_calls_from_path(&db_path, &session_id, limit)?;
         return Ok(Json(ToolCallsResponse {
             session_id,
-            tool_calls: Vec::new(),
+            tool_calls,
         }));
     }
     let db_path = expand_home(&state.config.tool_logging.db_path);

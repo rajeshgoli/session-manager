@@ -17,10 +17,11 @@ use sm_server::config::RustShadowConfig;
 use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
-        AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig, EmailConfig,
-        ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
-        MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
-        RustCoreConfig, SmSendConfig, ToolLoggingConfig,
+        AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig,
+        CodexObservabilityConfig, EmailConfig, ExternalAccessConfig, GoogleAuthConfig,
+        MobileAnalyticsConfig, MobileTerminalConfig, MobileTerminalDeviceKeyConfig,
+        MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig,
+        ToolLoggingConfig,
     },
     http::{router, AppState},
 };
@@ -3203,6 +3204,109 @@ async fn session_tool_calls_reads_pre_tool_use_rows() {
                 "hook_type": "PreToolUse"
             }
         ])
+    );
+}
+
+#[tokio::test]
+async fn session_tool_calls_projects_codex_fork_observability_rows() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "forktools",
+                    "name": "codex-fork-forktools",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-fork-forktools",
+                    "tmux_socket_name": null,
+                    "node": "primary",
+                    "provider": "codex-fork",
+                    "log_file": "/tmp/forktools.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let observability_db = unique_temp_path();
+    create_codex_observability_fixture_db(&observability_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_observability: CodexObservabilityConfig {
+            db_path: observability_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/sessions/forktools/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "forktools");
+    assert_eq!(
+        payload["tool_calls"],
+        json!([
+            {
+                "timestamp": "2026-06-01T00:03:00+00:00",
+                "tool_name": "Bash",
+                "hook_type": "CodexForkToolCall"
+            },
+            {
+                "timestamp": "2026-06-01T00:05:00+00:00",
+                "tool_name": "Edit",
+                "hook_type": "CodexForkToolCall"
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn session_tool_calls_codex_fork_missing_observability_db_returns_empty_rows() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "forktools",
+                    "name": "codex-fork-forktools",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-fork-forktools",
+                    "provider": "codex-fork",
+                    "log_file": "/tmp/forktools.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_observability: CodexObservabilityConfig {
+            db_path: state_file
+                .with_extension("missing-codex-observability.db")
+                .display()
+                .to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/sessions/forktools/tool-calls").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "session_id": "forktools", "tool_calls": [] })
     );
 }
 
@@ -7904,6 +8008,30 @@ fn create_tool_usage_fixture_db(path: &PathBuf) {
             ('2026-06-01 00:02:00', 'run12345', 'PreToolUse', 'Bash'),
             ('2026-06-01 00:03:00', 'run12345', 'PostToolUse', 'Bash'),
             ('2026-06-01 00:04:00', 'oldstate', 'PreToolUse', 'Glob');
+        "#,
+    )
+    .unwrap();
+}
+
+fn create_codex_observability_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_tool_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            raw_payload_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO codex_tool_events (session_id, raw_payload_json, created_at)
+        VALUES
+            ('forktools', '{"tool_name":"Read"}', '2026-06-01T00:00:00+00:00'),
+            ('forktools', '{"event_type":"no-tool"}', '2026-06-01T00:01:00+00:00'),
+            ('forktools', 'not-json', '2026-06-01T00:02:00+00:00'),
+            ('forktools', '{"tool_name":"Bash"}', '2026-06-01T00:03:00+00:00'),
+            ('otherfork', '{"tool_name":"Ignore"}', '2026-06-01T00:04:00+00:00'),
+            ('forktools', NULL, '2026-06-01T00:04:30+00:00'),
+            ('forktools', '{"tool_name":"Edit"}', '2026-06-01T00:05:00+00:00');
         "#,
     )
     .unwrap();

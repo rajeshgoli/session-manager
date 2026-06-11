@@ -23,6 +23,7 @@ pub struct AppConfig {
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
     pub tool_logging: ToolLoggingConfig,
+    pub codex_observability: CodexObservabilityConfig,
     pub claude: ProviderLaunchConfig,
     pub codex: ProviderLaunchConfig,
     pub codex_fork: CodexForkLaunchConfig,
@@ -47,6 +48,7 @@ impl Default for AppConfig {
             tmux: TmuxConfig::default(),
             sm_send: SmSendConfig::default(),
             tool_logging: ToolLoggingConfig::default(),
+            codex_observability: CodexObservabilityConfig::default(),
             claude: ProviderLaunchConfig::new(
                 "claude".to_owned(),
                 Vec::new(),
@@ -575,6 +577,23 @@ fn default_tool_usage_db_path() -> String {
     "~/.local/share/claude-sessions/tool_usage.db".to_owned()
 }
 
+#[derive(Debug, Clone)]
+pub struct CodexObservabilityConfig {
+    pub db_path: String,
+}
+
+impl Default for CodexObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_codex_observability_db_path(),
+        }
+    }
+}
+
+fn default_codex_observability_db_path() -> String {
+    "~/.local/share/claude-sessions/codex_observability.db".to_owned()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueueRunnerConfig {
     #[serde(default = "default_queue_runner_state_dir")]
@@ -612,6 +631,20 @@ fn queue_runner_state_dir_for_state_file(state_file: &str) -> PathBuf {
     let state_file = Path::new(state_file);
     let parent = state_file.parent().unwrap_or_else(|| Path::new("."));
     parent.join("queue-runner")
+}
+
+fn codex_observability_config_for_state_file(state_file: &str) -> CodexObservabilityConfig {
+    if state_file == default_state_file() {
+        return CodexObservabilityConfig::default();
+    }
+    let state_file = Path::new(state_file);
+    let parent = state_file.parent().unwrap_or_else(|| Path::new("."));
+    CodexObservabilityConfig {
+        db_path: parent
+            .join("codex_observability.db")
+            .to_string_lossy()
+            .into_owned(),
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -671,6 +704,8 @@ struct RawConfig {
     #[serde(default)]
     tool_logging: ToolLoggingConfig,
     #[serde(default)]
+    codex_observability: Option<RawCodexObservabilityConfig>,
+    #[serde(default)]
     claude: RawProviderLaunchConfig,
     #[serde(default)]
     codex: RawProviderLaunchConfig,
@@ -699,6 +734,8 @@ impl From<RawConfig> for AppConfig {
                 config
             })
             .unwrap_or_else(|| queue_runner_config_for_state_file(&paths.state_file));
+        let codex_observability =
+            codex_observability_config(raw.codex_observability, &paths.state_file);
         let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new());
         let codex = provider_launch_config(raw.codex, "codex", None, Vec::new());
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
@@ -748,6 +785,7 @@ impl From<RawConfig> for AppConfig {
             tmux: raw.tmux,
             sm_send: raw.sm_send,
             tool_logging: raw.tool_logging,
+            codex_observability,
             claude,
             codex,
             codex_fork,
@@ -824,6 +862,12 @@ struct RawCodexForkLaunchConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawCodexObservabilityConfig {
+    #[serde(default)]
+    db_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawTimeoutsConfig {
     #[serde(default)]
     tmux: RawTmuxTimeoutsConfig,
@@ -889,6 +933,19 @@ fn codex_fork_launch_config(
         default_model,
         event_schema_version: raw.event_schema_version.unwrap_or(2),
     }
+}
+
+fn codex_observability_config(
+    raw: Option<RawCodexObservabilityConfig>,
+    state_file: &str,
+) -> CodexObservabilityConfig {
+    let mut config = codex_observability_config_for_state_file(state_file);
+    if let Some(raw) = raw {
+        if let Some(db_path) = raw.db_path {
+            config.db_path = db_path;
+        }
+    }
+    config
 }
 
 fn codex_fork_managed_args(args: Vec<String>) -> Vec<String> {
@@ -1234,6 +1291,59 @@ tool_logging:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.tool_logging.db_path, "/tmp/custom-tool-usage.db");
+    }
+
+    #[test]
+    fn raw_config_reads_codex_observability_db_path() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+codex_observability:
+  db_path: /tmp/custom-codex-observability.db
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            config.codex_observability.db_path,
+            "/tmp/custom-codex-observability.db"
+        );
+    }
+
+    #[test]
+    fn raw_config_derives_codex_observability_db_path_from_custom_state_file() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+paths:
+  state_file: /tmp/sm-fixture/sessions.json
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            config.codex_observability.db_path,
+            "/tmp/sm-fixture/codex_observability.db"
+        );
+    }
+
+    #[test]
+    fn raw_config_keeps_codex_observability_state_sibling_when_section_omits_db_path() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+paths:
+  state_file: /tmp/sm-fixture/sessions.json
+codex_observability:
+  retention_max_age_days: 7
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            config.codex_observability.db_path,
+            "/tmp/sm-fixture/codex_observability.db"
+        );
     }
 
     #[test]
