@@ -9,7 +9,10 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
+    extract::{
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo, DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, Request, State,
+    },
     http::{
         header::{
             AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE,
@@ -40,6 +43,7 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::time::timeout;
 
 use crate::app_artifacts::{
     hashed_path, read_metadata, store_artifact, valid_app_name, valid_artifact_hash,
@@ -80,10 +84,12 @@ const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update no
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
 const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
 const BUG_REPORT_MAX_SERVER_STATE_CHARS: usize = 200_000;
+const MOBILE_TERMINAL_UNIMPLEMENTED_CLOSE_CODE: u16 = 1011;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct MobileTerminalTicket {
+    ticket_id: String,
     secret_hash: String,
     user_id: String,
     actor_email: String,
@@ -97,6 +103,16 @@ struct MobileTerminalTicket {
     expires_at_unix: i64,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct MobileTerminalActiveAttach {
+    user_id: String,
+    session_id: String,
+    provider: String,
+    device_key_id: String,
+    started_at_unix: i64,
+}
+
 #[derive(Debug, Serialize)]
 struct MobileAttachTicketResponse {
     ticket_id: String,
@@ -106,11 +122,23 @@ struct MobileAttachTicketResponse {
     expires_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct MobileTerminalAuthFrame {
+    #[serde(rename = "type")]
+    frame_type: Option<String>,
+    ticket_id: Option<String>,
+    ticket_secret: Option<String>,
+    device_key_id: Option<String>,
+    nonce: Option<String>,
+    signature: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
     session_store: SessionStore,
     mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
+    mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
     mobile_terminal_secret: [u8; 32],
 }
@@ -126,6 +154,7 @@ impl AppState {
             config,
             session_store,
             mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
+            mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_secret,
         }
@@ -145,7 +174,7 @@ pub fn router(state: AppState) -> Router {
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
         .route("/client/bug-reports", post(submit_client_bug_report))
-        .route("/client/terminal", get(mobile_terminal_upgrade_required))
+        .route("/client/terminal", get(mobile_terminal_endpoint))
         .route("/deploy/{app_name}", post(deploy_app_artifact))
         .route("/apps/{app_name}/latest.apk", get(get_latest_app_artifact))
         .route("/apps/{app_name}/meta.json", get(get_app_artifact_metadata))
@@ -1732,6 +1761,7 @@ async fn create_mobile_attach_ticket(
     tickets.insert(
         ticket_id.clone(),
         MobileTerminalTicket {
+            ticket_id: ticket_id.clone(),
             secret_hash,
             user_id,
             actor_email,
@@ -1759,19 +1789,34 @@ async fn create_mobile_attach_ticket(
     }))
 }
 
-async fn mobile_terminal_upgrade_required(
+async fn mobile_terminal_endpoint(
     State(state): State<Arc<AppState>>,
     request: Request,
-) -> Result<impl IntoResponse, ApiError> {
-    let peer_addr = request
-        .extensions()
+) -> Result<Response, ApiError> {
+    let (mut parts, _body) = request.into_parts();
+    let headers = parts.headers.clone();
+    let peer_addr = parts
+        .extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|value| value.0);
-    let actor_email = request_actor_email_from_parts(&state.config, request.headers(), peer_addr)
+    if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+        return Ok(ws
+            .on_upgrade(move |socket| mobile_terminal_websocket(socket, state))
+            .into_response());
+    }
+    mobile_terminal_upgrade_required(&state, &headers, peer_addr)
+}
+
+fn mobile_terminal_upgrade_required(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> Result<Response, ApiError> {
+    let actor_email = request_actor_email_from_parts(&state.config, headers, peer_addr)
         .ok_or_else(|| ApiError::Status {
-        status: StatusCode::UNAUTHORIZED,
-        detail: "Authentication required".to_owned(),
-    })?;
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        })?;
     let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
     else {
         return Err(ApiError::Status {
@@ -1792,7 +1837,112 @@ async fn mobile_terminal_upgrade_required(
         StatusCode::UPGRADE_REQUIRED,
         headers,
         Json(json!({ "detail": "mobile terminal requires a WebSocket upgrade" })),
-    ))
+    )
+        .into_response())
+}
+
+async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) {
+    if !state.config.mobile_terminal.enabled {
+        send_mobile_terminal_error(&mut socket, "mobile terminal attach is disabled").await;
+        close_mobile_terminal_socket(&mut socket, 1008, "mobile_terminal_disabled").await;
+        return;
+    }
+
+    let auth_timeout = Duration::from_secs(clamp_u64(3, 1, 30, 3));
+    let auth_frame = match timeout(auth_timeout, socket.recv()).await {
+        Ok(Some(Ok(message))) => match parse_mobile_terminal_auth_message(message) {
+            Ok(frame) => frame,
+            Err(detail) => {
+                send_mobile_terminal_error(&mut socket, detail).await;
+                close_mobile_terminal_socket(&mut socket, 1008, detail).await;
+                return;
+            }
+        },
+        Ok(Some(Err(_))) | Ok(None) => return,
+        Err(_) => {
+            send_mobile_terminal_error(&mut socket, "terminal auth timed out").await;
+            close_mobile_terminal_socket(&mut socket, 1008, "terminal_auth_timed_out").await;
+            return;
+        }
+    };
+
+    match consume_mobile_terminal_ticket(&state, &auth_frame) {
+        Ok((_ticket, attach_id)) => {
+            send_mobile_terminal_error(&mut socket, "mobile terminal bridge is not implemented")
+                .await;
+            let _ = send_mobile_terminal_json(
+                &mut socket,
+                json!({
+                    "type": "exit",
+                    "code": MOBILE_TERMINAL_UNIMPLEMENTED_CLOSE_CODE,
+                    "reason": "mobile_terminal_bridge_unimplemented",
+                }),
+            )
+            .await;
+            remove_mobile_terminal_active_attach(&state, &attach_id);
+            close_mobile_terminal_socket(
+                &mut socket,
+                MOBILE_TERMINAL_UNIMPLEMENTED_CLOSE_CODE,
+                "mobile_terminal_bridge_unimplemented",
+            )
+            .await;
+        }
+        Err(error) => {
+            let detail = api_error_detail(&error);
+            send_mobile_terminal_error(&mut socket, &detail).await;
+            close_mobile_terminal_socket(&mut socket, 1008, &detail).await;
+        }
+    }
+}
+
+fn parse_mobile_terminal_auth_message(
+    message: Message,
+) -> Result<MobileTerminalAuthFrame, &'static str> {
+    let text = match message {
+        Message::Text(text) => text.to_string(),
+        Message::Binary(bytes) => {
+            String::from_utf8(bytes.to_vec()).map_err(|_| "Invalid terminal auth frame")?
+        }
+        Message::Close(_) => return Err("Invalid terminal auth frame"),
+        _ => return Err("First terminal frame must be auth"),
+    };
+    let frame: MobileTerminalAuthFrame =
+        serde_json::from_str(&text).map_err(|_| "Invalid terminal auth frame")?;
+    if frame.frame_type.as_deref().map(str::trim) != Some("auth") {
+        return Err("First terminal frame must be auth");
+    }
+    Ok(frame)
+}
+
+async fn send_mobile_terminal_error(socket: &mut WebSocket, message: &str) {
+    let _ = send_mobile_terminal_json(
+        socket,
+        json!({
+            "type": "error",
+            "message": message,
+        }),
+    )
+    .await;
+}
+
+async fn send_mobile_terminal_json(socket: &mut WebSocket, payload: Value) -> Result<(), ()> {
+    let text = match serde_json::to_string(&payload) {
+        Ok(text) => text,
+        Err(_) => return Err(()),
+    };
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn close_mobile_terminal_socket(socket: &mut WebSocket, code: u16, reason: &str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.to_owned().into(),
+        })))
+        .await;
 }
 
 async fn get_attach_descriptor(
@@ -3436,6 +3586,316 @@ fn mobile_terminal_proof_nonce_key(
     [user_id, device_key_id, session_id, nonce].join("\u{1f}")
 }
 
+fn consume_mobile_terminal_ticket(
+    state: &AppState,
+    frame: &MobileTerminalAuthFrame,
+) -> Result<(MobileTerminalTicket, String), ApiError> {
+    if !state.config.mobile_terminal.enabled {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "mobile terminal attach is disabled".to_owned(),
+        });
+    }
+    let ticket_id = nonempty_frame_field(&frame.ticket_id);
+    let ticket_secret = nonempty_frame_field(&frame.ticket_secret);
+    let device_key_id = nonempty_frame_field(&frame.device_key_id);
+    let nonce = nonempty_frame_field(&frame.nonce);
+    let signature = nonempty_frame_field(&frame.signature);
+    if ticket_id.is_none()
+        || ticket_secret.is_none()
+        || device_key_id.is_none()
+        || nonce.is_none()
+        || signature.is_none()
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Invalid terminal auth frame".to_owned(),
+        });
+    }
+    let ticket_id = ticket_id.unwrap();
+    let ticket_secret = ticket_secret.unwrap();
+    let device_key_id = device_key_id.unwrap();
+    let nonce = nonce.unwrap();
+    let signature = signature.unwrap();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+
+    let ticket =
+        mobile_terminal_ticket_for_consume(state, &ticket_id, &ticket_secret, &device_key_id, now)?;
+    let Some((user_id, user_config)) =
+        mobile_terminal_visible_user(&state.config, &ticket.actor_email)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is no longer allowed to attach".to_owned(),
+        });
+    };
+    if user_id != ticket.user_id {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is no longer allowed to attach".to_owned(),
+        });
+    }
+    let Some(device_config) = mobile_terminal_device_config(user_config, &device_key_id) else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Device key is no longer registered".to_owned(),
+        });
+    };
+    let message = mobile_terminal_ws_message(
+        &ticket.ticket_id,
+        &ticket.session_id,
+        &ticket.actor_email,
+        &device_key_id,
+        &nonce,
+    );
+    verify_mobile_terminal_p256_signature(&device_config.public_key, &signature, &message)?;
+
+    let Some(session) = state.session_store.get_session(&ticket.session_id)? else {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is no longer attachable".to_owned(),
+        });
+    };
+    if matches!(
+        session.status.trim().to_ascii_lowercase().as_str(),
+        "stopped" | "killed"
+    ) {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is no longer attachable".to_owned(),
+        });
+    }
+    let attach = attach_descriptor_payload(session);
+    if attach
+        .get("attach_supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        != true
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: attach
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Session is no longer attachable")
+                .to_owned(),
+        });
+    }
+    validate_mobile_terminal_tmux_target(&ticket.tmux_session, ticket.tmux_socket_name.as_deref())?;
+
+    let mut tickets = state
+        .mobile_terminal_tickets
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal ticket store is unavailable".to_owned(),
+        })?;
+    let Some(current_ticket) = tickets.get(&ticket_id).cloned() else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Attach ticket is invalid or expired".to_owned(),
+        });
+    };
+    validate_mobile_terminal_ticket_secret(
+        state,
+        &current_ticket,
+        &ticket_id,
+        &ticket_secret,
+        &device_key_id,
+    )?;
+    if current_ticket.expires_at_unix <= now {
+        tickets.remove(&ticket_id);
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Attach ticket is expired or consumed".to_owned(),
+        });
+    }
+    let mut active =
+        state
+            .mobile_terminal_active_attaches
+            .lock()
+            .map_err(|_| ApiError::Status {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                detail: "Mobile terminal active attach store is unavailable".to_owned(),
+            })?;
+    enforce_mobile_terminal_active_limits(&state.config, active.values(), &current_ticket)?;
+    let ticket = tickets.remove(&ticket_id).expect("ticket checked above");
+    let attach_id = random_urlsafe_token(16);
+    active.insert(
+        attach_id.clone(),
+        MobileTerminalActiveAttach {
+            user_id: ticket.user_id.clone(),
+            session_id: ticket.session_id.clone(),
+            provider: ticket.provider.clone(),
+            device_key_id: ticket.device_key_id.clone(),
+            started_at_unix: now,
+        },
+    );
+    Ok((ticket, attach_id))
+}
+
+fn mobile_terminal_ticket_for_consume(
+    state: &AppState,
+    ticket_id: &str,
+    ticket_secret: &str,
+    device_key_id: &str,
+    now_unix: i64,
+) -> Result<MobileTerminalTicket, ApiError> {
+    let mut tickets = state
+        .mobile_terminal_tickets
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal ticket store is unavailable".to_owned(),
+        })?;
+    let Some(ticket) = tickets.get(ticket_id).cloned() else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Attach ticket is invalid or expired".to_owned(),
+        });
+    };
+    validate_mobile_terminal_ticket_secret(
+        state,
+        &ticket,
+        ticket_id,
+        ticket_secret,
+        device_key_id,
+    )?;
+    if ticket.expires_at_unix <= now_unix {
+        tickets.remove(ticket_id);
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Attach ticket is expired or consumed".to_owned(),
+        });
+    }
+    Ok(ticket)
+}
+
+fn validate_mobile_terminal_ticket_secret(
+    state: &AppState,
+    ticket: &MobileTerminalTicket,
+    ticket_id: &str,
+    ticket_secret: &str,
+    device_key_id: &str,
+) -> Result<(), ApiError> {
+    if ticket.ticket_id != ticket_id {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Attach ticket is invalid or expired".to_owned(),
+        });
+    }
+    if ticket.device_key_id != device_key_id {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Attach ticket device mismatch".to_owned(),
+        });
+    }
+    let expected = mobile_terminal_secret_hash(&state.mobile_terminal_secret, ticket_secret)?;
+    if !constant_time_eq(ticket.secret_hash.as_bytes(), expected.as_bytes()) {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Attach ticket secret mismatch".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn enforce_mobile_terminal_active_limits<'a>(
+    config: &AppConfig,
+    active: impl Iterator<Item = &'a MobileTerminalActiveAttach>,
+    ticket: &MobileTerminalTicket,
+) -> Result<(), ApiError> {
+    let active = active.collect::<Vec<_>>();
+    let max_global = clamp_usize(
+        config.mobile_terminal.max_concurrent_attaches_global,
+        1,
+        64,
+        4,
+    );
+    let max_user = clamp_usize(
+        config.mobile_terminal.max_concurrent_attaches_per_user,
+        1,
+        16,
+        1,
+    );
+    let max_session = clamp_usize(
+        config.mobile_terminal.max_concurrent_attaches_per_session,
+        1,
+        16,
+        1,
+    );
+    if active.len() >= max_global {
+        return Err(ApiError::Status {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "Too many active mobile attaches".to_owned(),
+        });
+    }
+    if active
+        .iter()
+        .filter(|item| item.user_id == ticket.user_id)
+        .count()
+        >= max_user
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "Too many active mobile attaches for user".to_owned(),
+        });
+    }
+    if active
+        .iter()
+        .filter(|item| item.session_id == ticket.session_id)
+        .count()
+        >= max_session
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "Session already has an active mobile attach".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn remove_mobile_terminal_active_attach(state: &AppState, attach_id: &str) {
+    if let Ok(mut active) = state.mobile_terminal_active_attaches.lock() {
+        active.remove(attach_id);
+    }
+}
+
+fn nonempty_frame_field(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn mobile_terminal_ws_message(
+    ticket_id: &str,
+    session_id: &str,
+    actor_email: &str,
+    device_key_id: &str,
+    nonce: &str,
+) -> String {
+    [
+        "SM-MOBILE-TERMINAL-WS-V1",
+        ticket_id,
+        session_id,
+        &actor_email.to_ascii_lowercase(),
+        device_key_id,
+        nonce,
+    ]
+    .join("\n")
+}
+
+fn api_error_detail(error: &ApiError) -> String {
+    match error {
+        ApiError::Status { detail, .. } => detail.clone(),
+        ApiError::NotFound(detail) => (*detail).to_owned(),
+        ApiError::Auth { detail, .. } => (*detail).to_owned(),
+        ApiError::Internal(error) => error.to_string(),
+    }
+}
+
 fn clamp_u64(value: u64, minimum: u64, maximum: u64, fallback: u64) -> u64 {
     if value == 0 {
         fallback.clamp(minimum, maximum)
@@ -4596,6 +5056,48 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
+    async fn mint_mobile_attach_ticket(
+        state: &AppState,
+        signing_key: &SigningKey,
+        nonce: &str,
+    ) -> Value {
+        let response = router(state.clone())
+            .oneshot(attach_ticket_request(signing_key, nonce))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    fn signed_mobile_terminal_auth_frame(
+        signing_key: &SigningKey,
+        ticket: &Value,
+        nonce: &str,
+    ) -> MobileTerminalAuthFrame {
+        let ticket_id = ticket["ticket_id"].as_str().unwrap();
+        let message =
+            mobile_terminal_ws_message(ticket_id, "fork1001", "local_bypass", "test-device", nonce);
+        let signature: Signature = signing_key.sign(message.as_bytes());
+        MobileTerminalAuthFrame {
+            frame_type: Some("auth".to_owned()),
+            ticket_id: Some(ticket_id.to_owned()),
+            ticket_secret: Some(ticket["ticket_secret"].as_str().unwrap().to_owned()),
+            device_key_id: Some("test-device".to_owned()),
+            nonce: Some(nonce.to_owned()),
+            signature: Some(STANDARD.encode(signature.to_der().as_bytes())),
+        }
+    }
+
+    fn api_error_status_detail(error: ApiError) -> (StatusCode, String) {
+        match error {
+            ApiError::Status { status, detail } => (status, detail),
+            ApiError::NotFound(detail) => (StatusCode::NOT_FOUND, detail.to_owned()),
+            ApiError::Auth { status, detail, .. } => (status, detail.to_owned()),
+            ApiError::Internal(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn mobile_attach_ticket_requires_registered_device_signature() {
         let signing_key = SigningKey::random(&mut OsRng);
@@ -4896,5 +5398,137 @@ mod tests {
             body["detail"],
             "User is not allowed to use mobile terminal attach"
         );
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_auth_consumes_ticket_and_tracks_active_attach() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        let frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
+
+        let (consumed_ticket, attach_id) = consume_mobile_terminal_ticket(&state, &frame).unwrap();
+
+        assert_eq!(consumed_ticket.ticket_id, ticket["ticket_id"]);
+        assert_eq!(consumed_ticket.session_id, "fork1001");
+        assert_eq!(consumed_ticket.device_key_id, "test-device");
+        assert!(!state
+            .mobile_terminal_tickets
+            .lock()
+            .unwrap()
+            .contains_key(ticket["ticket_id"].as_str().unwrap()));
+        {
+            let active = state.mobile_terminal_active_attaches.lock().unwrap();
+            let attach = active.get(&attach_id).unwrap();
+            assert_eq!(attach.user_id, "local_bypass");
+            assert_eq!(attach.session_id, "fork1001");
+            assert_eq!(attach.provider, "codex-fork");
+            assert_eq!(attach.device_key_id, "test-device");
+        }
+
+        remove_mobile_terminal_active_attach(&state, &attach_id);
+        assert!(state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        let replay = consume_mobile_terminal_ticket(&state, &frame).unwrap_err();
+        let (status, detail) = api_error_status_detail(replay);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(detail, "Attach ticket is invalid or expired");
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_auth_rejects_secret_mismatch_without_consuming_ticket() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        let mut frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
+        frame.ticket_secret = Some("wrong-secret".to_owned());
+
+        let error = consume_mobile_terminal_ticket(&state, &frame).unwrap_err();
+        let (status, detail) = api_error_status_detail(error);
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(detail, "Attach ticket secret mismatch");
+        assert!(state
+            .mobile_terminal_tickets
+            .lock()
+            .unwrap()
+            .contains_key(ticket["ticket_id"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_auth_rejects_device_mismatch_without_consuming_ticket() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        let mut frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
+        frame.device_key_id = Some("other-device".to_owned());
+
+        let error = consume_mobile_terminal_ticket(&state, &frame).unwrap_err();
+        let (status, detail) = api_error_status_detail(error);
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(detail, "Attach ticket device mismatch");
+        assert!(state
+            .mobile_terminal_tickets
+            .lock()
+            .unwrap()
+            .contains_key(ticket["ticket_id"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_auth_rejects_invalid_signature_without_consuming_ticket() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        let mut frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
+        frame.nonce = Some("tampered-nonce".to_owned());
+
+        let error = consume_mobile_terminal_ticket(&state, &frame).unwrap_err();
+        let (status, detail) = api_error_status_detail(error);
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(detail, "Invalid device signature");
+        assert!(state
+            .mobile_terminal_tickets
+            .lock()
+            .unwrap()
+            .contains_key(ticket["ticket_id"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_auth_rechecks_active_limits_without_consuming_ticket() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+        let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
+        let frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
+        state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .insert(
+                "existing".to_owned(),
+                MobileTerminalActiveAttach {
+                    user_id: "local_bypass".to_owned(),
+                    session_id: "fork1001".to_owned(),
+                    provider: "codex-fork".to_owned(),
+                    device_key_id: "test-device".to_owned(),
+                    started_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                },
+            );
+
+        let error = consume_mobile_terminal_ticket(&state, &frame).unwrap_err();
+        let (status, detail) = api_error_status_detail(error);
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(detail, "Too many active mobile attaches for user");
+        assert!(state
+            .mobile_terminal_tickets
+            .lock()
+            .unwrap()
+            .contains_key(ticket["ticket_id"].as_str().unwrap()));
     }
 }
