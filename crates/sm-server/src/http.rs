@@ -67,6 +67,7 @@ use crate::app_artifacts::{
     APP_ARTIFACT_MAX_SIZE_BYTES,
 };
 use crate::bug_reports::{BugReportStore, CreateBugReport};
+use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
 use crate::config::{
     trimmed, AppConfig, MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PublicNodeConfig,
 };
@@ -337,6 +338,10 @@ pub fn router(state: AppState) -> Router {
         .route("/registry/{role}", get(lookup_agent_registry))
         .route("/sessions/{session_id}/output", get(session_output))
         .route("/sessions/{session_id}/tool-calls", get(session_tool_calls))
+        .route(
+            "/sessions/{session_id}/codex-events",
+            get(session_codex_events),
+        )
         .route("/client/sessions", get(list_client_sessions))
         .route(
             "/client/sessions/{session_id}/attach-ticket",
@@ -3781,6 +3786,35 @@ async fn session_tool_calls(
     }))
 }
 
+async fn session_codex_events(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    uri: Uri,
+    request: Request,
+) -> Result<Json<CodexEventsResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let query = SessionCodexEventsQuery::parse(uri.query().unwrap_or(""))?;
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    if session.provider != "codex-app" {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "codex-events supported only for provider=codex-app".to_owned(),
+        });
+    }
+    if !state.config.codex_rollout.enable_durable_events {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "codex durable events disabled by rollout flag".to_owned(),
+        });
+    }
+    let db_path = expand_home(&state.config.codex_events.db_path);
+    let response =
+        list_codex_events_from_path(&db_path, &session_id, query.since_seq, query.limit)?;
+    Ok(Json(response))
+}
+
 async fn shadow_http(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -4188,6 +4222,53 @@ fn shadow_predict_session_read(
                 support_status: "implemented_read",
             }));
         };
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/codex-events"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
+        if SessionCodexEventsQuery::parse(query_string).is_err() {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+        let Some(session) = state.session_store.get_session(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        if session.provider != "codex-app" {
+            let body = serde_json::to_vec(
+                &json!({ "detail": "codex-events supported only for provider=codex-app" }),
+            )?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        }
+        if !state.config.codex_rollout.enable_durable_events {
+            let body = serde_json::to_vec(
+                &json!({ "detail": "codex durable events disabled by rollout flag" }),
+            )?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        }
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
             body_sha256: None,
@@ -6168,6 +6249,41 @@ fn percent_encode_path(path: &str) -> String {
     encoded
 }
 
+fn percent_decode_query_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let high = hex_value(bytes[index + 1])?;
+                let low = hex_value(bytes[index + 2])?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => return None,
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn is_local_bypass_request(
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
@@ -6288,6 +6404,76 @@ impl SessionToolCallsQuery {
 
 fn default_tool_calls_limit() -> i64 {
     10
+}
+
+#[derive(Debug)]
+struct SessionCodexEventsQuery {
+    since_seq: Option<i64>,
+    limit: usize,
+}
+
+impl SessionCodexEventsQuery {
+    fn parse(query_string: &str) -> Result<Self, ApiError> {
+        let since_seq_value = decoded_last_query_value(query_string, "since_seq")?;
+        let limit_value = decoded_last_query_value(query_string, "limit")?;
+        let since_seq = match since_seq_value.as_deref() {
+            None => None,
+            Some(value) => {
+                let parsed = value.parse::<i64>().map_err(|_| ApiError::Status {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    detail: "since_seq must be >= 0 and less than 9223372036854775807".to_owned(),
+                })?;
+                if !(0..i64::MAX).contains(&parsed) {
+                    return Err(ApiError::Status {
+                        status: StatusCode::UNPROCESSABLE_ENTITY,
+                        detail: "since_seq must be >= 0 and less than 9223372036854775807"
+                            .to_owned(),
+                    });
+                }
+                Some(parsed)
+            }
+        };
+        let limit = match limit_value.as_deref() {
+            None => 200,
+            Some(value) => {
+                let parsed = value.parse::<i64>().map_err(|_| ApiError::Status {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    detail: "limit must be between 1 and 500".to_owned(),
+                })?;
+                if !(1..=500).contains(&parsed) {
+                    return Err(ApiError::Status {
+                        status: StatusCode::UNPROCESSABLE_ENTITY,
+                        detail: "limit must be between 1 and 500".to_owned(),
+                    });
+                }
+                parsed as usize
+            }
+        };
+        Ok(Self { since_seq, limit })
+    }
+}
+
+fn decoded_last_query_value(query_string: &str, key: &str) -> Result<Option<String>, ApiError> {
+    let mut value = None;
+    for part in query_string.split('&') {
+        let (raw_name, raw_value) = part.split_once('=').unwrap_or((part, ""));
+        let Some(name) = percent_decode_query_component(raw_name) else {
+            return Err(ApiError::Status {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                detail: "invalid query encoding".to_owned(),
+            });
+        };
+        if name == key {
+            let Some(decoded_value) = percent_decode_query_component(raw_value) else {
+                return Err(ApiError::Status {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    detail: "invalid query encoding".to_owned(),
+                });
+            };
+            value = Some(decoded_value);
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize)]

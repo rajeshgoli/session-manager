@@ -17,11 +17,11 @@ use sm_server::config::RustShadowConfig;
 use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
-        AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig,
-        CodexObservabilityConfig, EmailConfig, ExternalAccessConfig, GoogleAuthConfig,
-        MobileAnalyticsConfig, MobileTerminalConfig, MobileTerminalDeviceKeyConfig,
-        MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig,
-        ToolLoggingConfig,
+        AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
+        CodexObservabilityConfig, CodexRolloutConfig, EmailConfig, ExternalAccessConfig,
+        GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
+        MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
+        RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
     http::{router, AppState},
 };
@@ -2145,6 +2145,159 @@ async fn shadow_http_reports_tool_calls_404() {
 }
 
 #[tokio::test]
+async fn shadow_http_reports_codex_events_200_as_status_only() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = br#"{"events":[{"session_id":"codexapp1","seq":1,"timestamp":"2026-06-01T00:01:00+00:00","event_type":"turn_started","turn_id":"turn-a","payload_preview":{"message":"start"},"persisted":true}],"earliest_seq":1,"latest_seq":1,"next_seq":2,"history_gap":false,"gap_reason":null}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexapp1/codex-events",
+                "query_string": "limit=200",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_events_404() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = serde_json::to_vec(&json!({ "detail": "Session not found" })).unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/missing/codex-events",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 404,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["predicted_status"], 404);
+    assert_eq!(payload["body_sha256_match"], true);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_events_invalid_query_as_status_only_422() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = br#"{"detail":[{"type":"greater_than_equal","loc":["query","limit"],"msg":"Input should be greater than or equal to 1","input":"0","ctx":{"ge":1}}]}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexapp1/codex-events",
+                "query_string": "limit=0",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 422,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 422);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_uses_decoded_last_codex_events_query_value() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let python_body = br#"{"events":[],"earliest_seq":null,"latest_seq":null,"next_seq":1,"history_gap":false,"gap_reason":null}"#;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexapp1/codex-events",
+                "query_string": "limit=0&limit=%32",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/codexapp1/codex-events",
+                "query_string": "limit=2&limit=0",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 422,
+                "body_sha256": sha256_hex(b"{}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 422);
+}
+
+#[tokio::test]
 async fn shadow_http_reports_queue_job_detail_404() {
     let state_file = unique_temp_path();
     fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
@@ -3308,6 +3461,232 @@ async fn session_tool_calls_codex_fork_missing_observability_db_returns_empty_ro
         payload,
         json!({ "session_id": "forktools", "tool_calls": [] })
     );
+}
+
+#[tokio::test]
+async fn session_codex_events_reads_recent_events_with_python_cursor_shape() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let events_db = unique_temp_path();
+    create_codex_events_fixture_db(&events_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_events: CodexEventsConfig {
+            db_path: events_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/sessions/codexapp1/codex-events?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["earliest_seq"], 1);
+    assert_eq!(payload["latest_seq"], 4);
+    assert_eq!(payload["next_seq"], 5);
+    assert_eq!(payload["history_gap"], false);
+    assert_eq!(payload["gap_reason"], Value::Null);
+    assert_eq!(
+        payload["events"],
+        json!([
+            {
+                "session_id": "codexapp1",
+                "seq": 3,
+                "timestamp": "2026-06-01T00:03:00+00:00",
+                "event_type": "item_completed",
+                "turn_id": "turn-a",
+                "payload_preview": {"raw": "not-json"},
+                "persisted": true
+            },
+            {
+                "session_id": "codexapp1",
+                "seq": 4,
+                "timestamp": "2026-06-01T00:04:00+00:00",
+                "event_type": "turn_completed",
+                "turn_id": null,
+                "payload_preview": null,
+                "persisted": true
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn session_codex_events_since_seq_reports_retention_gap() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let events_db = unique_temp_path();
+    create_codex_events_fixture_db(&events_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_events: CodexEventsConfig {
+            db_path: events_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) =
+        get_json(app, "/sessions/codexapp1/codex-events?since_seq=0&limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["history_gap"], false);
+    assert_eq!(payload["gap_reason"], Value::Null);
+    assert_eq!(payload["events"][0]["seq"], 1);
+    assert_eq!(payload["next_seq"], 3);
+
+    let state_file = write_codex_app_session_fixture("retainedgap");
+    let events_db = unique_temp_path();
+    create_codex_events_retention_gap_fixture_db(&events_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_events: CodexEventsConfig {
+            db_path: events_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let (status, payload) = get_json(app, "/sessions/retainedgap/codex-events?since_seq=1").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["earliest_seq"], 4);
+    assert_eq!(payload["latest_seq"], 5);
+    assert_eq!(payload["history_gap"], true);
+    assert_eq!(payload["gap_reason"], "retention");
+    assert_eq!(payload["events"][0]["seq"], 4);
+}
+
+#[tokio::test]
+async fn session_codex_events_handles_missing_db_session_and_provider_errors() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_events: CodexEventsConfig {
+            db_path: state_file
+                .with_extension("missing-codex-events.db")
+                .display()
+                .to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/codexapp1/codex-events").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "events": [],
+            "earliest_seq": null,
+            "latest_seq": null,
+            "next_seq": 1,
+            "history_gap": false,
+            "gap_reason": null
+        })
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/missing/codex-events").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Session not found");
+
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let (status, payload) = get_json(app, "/sessions/run12345/codex-events").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "codex-events supported only for provider=codex-app"
+    );
+
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_rollout: CodexRolloutConfig {
+            enable_durable_events: false,
+            ..CodexRolloutConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+    let (status, payload) = get_json(app, "/sessions/codexapp1/codex-events").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        payload["detail"],
+        "codex durable events disabled by rollout flag"
+    );
+}
+
+#[tokio::test]
+async fn session_codex_events_rejects_invalid_query_values_before_session_lookup() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    for (uri, detail) in [
+        (
+            "/sessions/codexapp1/codex-events?limit=0",
+            "limit must be between 1 and 500",
+        ),
+        (
+            "/sessions/codexapp1/codex-events?limit=abc",
+            "limit must be between 1 and 500",
+        ),
+        (
+            "/sessions/codexapp1/codex-events?since_seq=-1",
+            "since_seq must be >= 0 and less than 9223372036854775807",
+        ),
+        (
+            "/sessions/codexapp1/codex-events?since_seq=9223372036854775807",
+            "since_seq must be >= 0 and less than 9223372036854775807",
+        ),
+        (
+            "/sessions/missing/codex-events?limit=0",
+            "limit must be between 1 and 500",
+        ),
+    ] {
+        let (status, payload) = get_json(app.clone(), uri).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "uri={uri}");
+        assert_eq!(payload["detail"], detail, "uri={uri}");
+    }
+}
+
+#[tokio::test]
+async fn session_codex_events_decodes_query_and_uses_last_duplicate_value() {
+    let state_file = write_codex_app_session_fixture("codexapp1");
+    let events_db = unique_temp_path();
+    create_codex_events_fixture_db(&events_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_events: CodexEventsConfig {
+            db_path: events_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/sessions/codexapp1/codex-events?limit=%32&since_seq=%31",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["events"][0]["seq"], 2);
+    assert_eq!(payload["events"].as_array().unwrap().len(), 2);
+
+    let (status, payload) = get_json(
+        app.clone(),
+        "/sessions/codexapp1/codex-events?limit=0&limit=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["events"].as_array().unwrap().len(), 2);
+
+    let (status, payload) = get_json(app, "/sessions/codexapp1/codex-events?limit=2&limit=0").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "limit must be between 1 and 500");
 }
 
 #[tokio::test]
@@ -8013,6 +8392,55 @@ fn create_tool_usage_fixture_db(path: &PathBuf) {
     .unwrap();
 }
 
+fn create_codex_events_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_session_events (
+            session_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            turn_id TEXT,
+            payload_preview_json TEXT,
+            PRIMARY KEY (session_id, seq)
+        );
+        INSERT INTO codex_session_events
+            (session_id, seq, timestamp, event_type, turn_id, payload_preview_json)
+        VALUES
+            ('codexapp1', 1, '2026-06-01T00:01:00+00:00', 'turn_started', 'turn-a', '{"message":"start"}'),
+            ('codexapp1', 2, '2026-06-01T00:02:00+00:00', 'item_started', 'turn-a', '{"tool_name":"Read"}'),
+            ('codexapp1', 3, '2026-06-01T00:03:00+00:00', 'item_completed', 'turn-a', 'not-json'),
+            ('codexapp1', 4, '2026-06-01T00:04:00+00:00', 'turn_completed', NULL, NULL),
+            ('othercodex', 1, '2026-06-01T00:05:00+00:00', 'turn_started', 'turn-b', '{"ignored":true}');
+        "#,
+    )
+    .unwrap();
+}
+
+fn create_codex_events_retention_gap_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_session_events (
+            session_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            turn_id TEXT,
+            payload_preview_json TEXT,
+            PRIMARY KEY (session_id, seq)
+        );
+        INSERT INTO codex_session_events
+            (session_id, seq, timestamp, event_type, turn_id, payload_preview_json)
+        VALUES
+            ('retainedgap', 4, '2026-06-01T00:04:00+00:00', 'item_completed', 'turn-r', '{"tool_name":"Bash"}'),
+            ('retainedgap', 5, '2026-06-01T00:05:00+00:00', 'turn_completed', 'turn-r', '{"ok":true}');
+        "#,
+    )
+    .unwrap();
+}
+
 fn create_codex_observability_fixture_db(path: &PathBuf) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
@@ -8143,6 +8571,33 @@ fn write_session_fixture() -> PathBuf {
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",
                     "stopped_at": "2026-06-01T00:02:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn write_codex_app_session_fixture(session_id: &str) -> PathBuf {
+    let path = unique_temp_path();
+    fs::write(
+        &path,
+        json!({
+            "sessions": [
+                {
+                    "id": session_id,
+                    "name": format!("codex-app-{session_id}"),
+                    "working_dir": "/repo",
+                    "tmux_session": format!("codex-app-{session_id}"),
+                    "tmux_socket_name": null,
+                    "node": "primary",
+                    "provider": "codex-app",
+                    "log_file": format!("/tmp/{session_id}.log"),
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
                 }
             ]
         })
