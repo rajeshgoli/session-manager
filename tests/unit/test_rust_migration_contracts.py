@@ -226,6 +226,38 @@ def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
     )
 
 
+def test_manifest_covers_retained_codex_read_http_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    required_ids = {
+        "http.session_tool_calls",
+        "http.codex_events",
+        "http.codex_activity_actions",
+        "http.codex_pending_requests",
+    }
+
+    missing = required_ids - set(checks)
+    assert not missing
+    for check_id in required_ids:
+        check = checks[check_id]
+        assert check.classification == "retained"
+        assert check.target == "python_and_rust"
+        assert check.safety == "read_only"
+        assert check.method == "GET"
+
+    assert "fixture:codex_app_session_id" in checks["http.codex_events"].preconditions
+    assert "fixture:codex_app_session_id" in checks["http.codex_activity_actions"].preconditions
+    assert "fixture:codex_app_session_id" in checks["http.codex_pending_requests"].preconditions
+    assert any(
+        expectation.path == "/events" and expectation.value_type == "array"
+        for expectation in checks["http.codex_events"].expected_json
+    )
+    assert any(
+        expectation.path == "/actions" and expectation.value_type == "array"
+        for expectation in checks["http.codex_activity_actions"].expected_json
+    )
+
+
 def test_manifest_covers_native_mobile_support_http_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
