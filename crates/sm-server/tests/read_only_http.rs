@@ -1999,6 +1999,83 @@ async fn shadow_http_reports_queue_job_detail_404() {
 }
 
 #[tokio::test]
+async fn shadow_http_reports_queue_job_detail_200_as_status_only() {
+    let state_file = unique_temp_path();
+    let queue_state_dir = state_file.with_extension("queue-runner");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_queue_jobs_fixture_db(&queue_state_dir);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = br#"{"id":"job-pending","type":"tests","label":"cargo tests","requester_session_id":"requester1","requester_name":null,"notify_session_id":"notify1","notify_name":"notify1","cwd":"/repo","argv":["cargo","test"],"script_path":null,"env":{},"timeout_seconds":900,"state":"pending","holding_reason":"memory","queued_at":"2026-06-01T00:00:00","started_at":null,"finished_at":null,"pid":null,"process_group_id":null,"exit_code":null,"log_path":"/tmp/job-pending.log","exit_code_path":null,"wrapper_path":null,"queued_notified_at":null,"started_notified_at":null,"completion_notified_at":null}"#;
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/queue-jobs/job-pending",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_does_not_predict_malformed_queue_job_detail_paths() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    for path in ["/queue-jobs/", "/queue-jobs/job-pending/extra"] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/__shadow/http",
+            json!({
+                "schema_version": 1,
+                "request": {
+                    "method": "GET",
+                    "path": path,
+                    "query_string": "",
+                    "headers": {}
+                },
+                "python_response": {
+                    "status": 404,
+                    "body_sha256": sha256_hex(b"{\"detail\":\"Not Found\"}")
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["support_status"], "unsupported");
+        assert_eq!(payload["comparison"], "not_compared");
+        assert_eq!(payload["predicted_status"], Value::Null);
+        assert_eq!(payload["body_sha256_match"], Value::Null);
+    }
+}
+
+#[tokio::test]
 async fn shadow_http_reports_body_mismatch_for_stable_read_only_route() {
     let app = router(AppState::new(AppConfig::default()));
 
