@@ -33,15 +33,20 @@ pub struct StoredArtifact {
 
 pub fn valid_app_name(value: &str) -> bool {
     let value = value.trim();
-    !value.is_empty()
-        && value.len() <= 80
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    value.len() <= 80
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 pub fn valid_artifact_hash(value: &str) -> bool {
-    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 8
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 pub fn app_dir(root: &Path, app_name: &str) -> PathBuf {
@@ -143,4 +148,26 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_app_name, valid_artifact_hash};
+
+    #[test]
+    fn app_names_match_python_managed_artifact_contract() {
+        assert!(valid_app_name("session-manager-android"));
+        assert!(valid_app_name("app1"));
+        for name in ["", ".", "..", "foo.bar", "_bad", "-bad", "Bad", "bad_name"] {
+            assert!(!valid_app_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn artifact_hashes_match_python_lower_hex_contract() {
+        assert!(valid_artifact_hash("deadbeef"));
+        for hash in ["DEADBEEF", "deadbee", "deadbeef0", "zzzzzzzz"] {
+            assert!(!valid_artifact_hash(hash), "{hash}");
+        }
+    }
 }

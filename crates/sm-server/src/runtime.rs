@@ -456,25 +456,38 @@ impl TmuxRuntime {
     }
 
     fn attach_session_log(&self, spec: &TmuxSessionSpec, prompt_mode: &str) -> Result<()> {
+        let initial_stdin_prompt = (prompt_mode == "stdin")
+            .then(|| {
+                spec.initial_message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .flatten();
         let pipe_command = format!("cat >> {}", shell_quote_path(&spec.log_file));
-        self.run_tmux([
+        if let Err(error) = self.run_tmux([
             "pipe-pane",
             "-t",
             spec.tmux_session.as_str(),
             pipe_command.as_str(),
-        ])?;
+        ]) {
+            if initial_stdin_prompt.is_some() && is_tmux_session_gone_error(&error) {
+                bail!("tmux session exited before initial prompt could be delivered");
+            }
+            return Err(error);
+        }
 
-        if prompt_mode == "stdin" {
-            if let Some(initial_message) = spec
-                .initial_message
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                thread::sleep(Duration::from_millis(self.start_settle_ms));
-                if !self.send_input(&spec.tmux_session, initial_message)? {
+        if let Some(initial_message) = initial_stdin_prompt {
+            thread::sleep(Duration::from_millis(self.start_settle_ms));
+            match self.send_input(&spec.tmux_session, initial_message) {
+                Ok(true) => {}
+                Ok(false) => {
                     bail!("tmux session exited before initial prompt could be delivered");
                 }
+                Err(error) if is_tmux_session_gone_error(&error) => {
+                    bail!("tmux session exited before initial prompt could be delivered");
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -542,6 +555,11 @@ fn finite_nonnegative_or_default(value: Option<f64>, default: f64) -> f64 {
 
 fn duration_from_millis(millis: f64) -> Duration {
     Duration::from_secs_f64((millis.max(0.0)) / 1000.0)
+}
+
+fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("no server running") || message.contains("can't find session")
 }
 
 fn shell_quote_path(path: &Path) -> String {
