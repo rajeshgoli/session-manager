@@ -19,7 +19,8 @@ use sm_server::{
     config::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexForkLaunchConfig, EmailConfig,
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
-        PathsConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig,
+        MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
+        RustCoreConfig, SmSendConfig,
     },
     http::{router, AppState},
 };
@@ -2224,7 +2225,7 @@ async fn shadow_http_treats_auth_session_as_status_only() {
 }
 
 #[tokio::test]
-async fn shadow_http_treats_bootstrap_as_status_only_until_mobile_terminal_is_ported() {
+async fn shadow_http_treats_bootstrap_as_status_only_for_mobile_terminal_metadata() {
     let app = router(AppState::new(AppConfig {
         mobile_terminal: MobileTerminalConfig {
             enabled: true,
@@ -2381,7 +2382,7 @@ async fn auth_session_does_not_bypass_for_spoofed_localhost_host_from_remote_pee
 }
 
 #[tokio::test]
-async fn bootstrap_preserves_native_schema_without_termux_or_terminal_advertisement() {
+async fn bootstrap_preserves_native_schema_without_termux_or_terminal_when_disabled() {
     let app = router(AppState::new(AppConfig {
         google_auth: GoogleAuthConfig {
             client_id: Some("web-client-id".to_owned()),
@@ -2431,7 +2432,7 @@ async fn bootstrap_preserves_native_schema_without_termux_or_terminal_advertisem
 }
 
 #[tokio::test]
-async fn bootstrap_does_not_advertise_unimplemented_mobile_terminal() {
+async fn bootstrap_advertises_configured_mobile_terminal() {
     let app = router(AppState::new(AppConfig {
         google_auth: GoogleAuthConfig {
             client_id: Some("web-client-id".to_owned()),
@@ -2441,6 +2442,36 @@ async fn bootstrap_does_not_advertise_unimplemented_mobile_terminal() {
             public_http_host: Some("sm.example.com".to_owned()),
             ..ExternalAccessConfig::default()
         },
+        mobile_terminal: MobileTerminalConfig {
+            enabled: true,
+            ..MobileTerminalConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/client/bootstrap").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["external_access"]["mobile_terminal_supported"],
+        true
+    );
+    assert_eq!(
+        payload["external_access"]["mobile_terminal_ws_url"],
+        "wss://sm.example.com/client/terminal"
+    );
+    assert_eq!(
+        payload["session_open_defaults"],
+        json!({
+            "preferred_action": "mobile_terminal",
+            "termux_package": "com.termux"
+        })
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_does_not_advertise_mobile_terminal_without_public_ws_url() {
+    let app = router(AppState::new(AppConfig {
         mobile_terminal: MobileTerminalConfig {
             enabled: true,
             ..MobileTerminalConfig::default()
@@ -2598,7 +2629,7 @@ async fn sessions_can_include_stopped_sessions() {
 }
 
 #[tokio::test]
-async fn client_sessions_adds_read_only_mobile_metadata_without_termux() {
+async fn client_sessions_adds_attach_descriptor_without_termux_when_mobile_disabled() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
@@ -2607,19 +2638,65 @@ async fn client_sessions_adds_read_only_mobile_metadata_without_termux() {
     assert_eq!(status, StatusCode::OK);
     let first = &payload["sessions"][0];
     assert_eq!(first["id"], "run12345");
-    assert_eq!(first["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(first["attach_descriptor"]["attach_supported"], true);
     assert_eq!(
-        first["attach_descriptor"]["message"],
-        "attach tickets are not implemented in the Rust read-only scaffold"
+        first["attach_descriptor"]["tmux_session"],
+        "claude-run12345"
     );
+    assert_eq!(first["attach_descriptor"]["message"], Value::Null);
     assert_eq!(first["termux_attach"], Value::Null);
     assert_eq!(first["mobile_terminal"]["supported"], false);
+    assert_eq!(
+        first["mobile_terminal"]["reason"],
+        "mobile terminal attach is disabled"
+    );
     assert_eq!(first["primary_action"]["type"], "details");
     assert!(payload["sessions"]
         .as_array()
         .unwrap()
         .iter()
         .all(|session| session["id"] != "stop1234"));
+}
+
+#[tokio::test]
+async fn client_sessions_advertises_mobile_terminal_for_authorized_local_user() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_mobile_terminal(
+        &state_file,
+    )));
+
+    let (status, payload) = get_json_with_host_and_peer(
+        app,
+        "/client/sessions",
+        "localhost:8421",
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let first = &payload["sessions"][0];
+    assert_eq!(first["id"], "run12345");
+    assert_eq!(first["termux_attach"], Value::Null);
+    assert_eq!(
+        first["mobile_terminal"],
+        json!({
+            "supported": true,
+            "transport": "sm-https-tmux",
+            "ticket_endpoint": "/client/sessions/run12345/attach-ticket",
+            "ws_url": "wss://sm.example.com/client/terminal",
+            "tmux_session": "claude-run12345",
+            "tmux_socket_name": null,
+            "runtime_mode": "detached_runtime",
+            "requires_device_key": true
+        })
+    );
+    assert_eq!(
+        first["primary_action"],
+        json!({
+            "type": "mobile_terminal",
+            "label": "Attach"
+        })
+    );
 }
 
 #[tokio::test]
@@ -2656,10 +2733,58 @@ async fn client_session_detail_returns_mobile_metadata_for_one_session() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "run12345");
-    assert_eq!(payload["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(payload["attach_descriptor"]["attach_supported"], true);
     assert_eq!(payload["termux_attach"], Value::Null);
     assert_eq!(payload["mobile_terminal"]["supported"], false);
+    assert_eq!(
+        payload["mobile_terminal"]["reason"],
+        "mobile terminal attach is disabled"
+    );
     assert_eq!(payload["primary_action"]["type"], "details");
+}
+
+#[tokio::test]
+async fn client_session_detail_explains_mobile_terminal_auth_gap_without_actor() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_mobile_terminal(
+        &state_file,
+    )));
+
+    let (status, payload) = get_json(app, "/client/sessions/run12345").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "run12345");
+    assert_eq!(payload["attach_descriptor"]["attach_supported"], true);
+    assert_eq!(payload["mobile_terminal"]["supported"], false);
+    assert_eq!(
+        payload["mobile_terminal"]["reason"],
+        "authenticated mobile terminal user is required"
+    );
+    assert_eq!(payload["primary_action"]["type"], "details");
+}
+
+#[tokio::test]
+async fn client_session_detail_preserves_attach_unsupported_primary_action_reason() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/client/sessions/stop1234").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "stop1234");
+    assert_eq!(payload["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(
+        payload["attach_descriptor"]["message"],
+        "Session is stopped"
+    );
+    assert_eq!(
+        payload["primary_action"],
+        json!({
+            "type": "details",
+            "label": "View details",
+            "reason": "Session is stopped"
+        })
+    );
 }
 
 #[tokio::test]
@@ -7147,6 +7272,26 @@ fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
         },
         ..AppConfig::default()
     }
+}
+
+fn config_with_state_file_and_mobile_terminal(state_file: &PathBuf) -> AppConfig {
+    let mut config = config_with_state_file(state_file);
+    config.external_access.public_http_host = Some("sm.example.com".to_owned());
+    config.mobile_terminal.enabled = true;
+    config.mobile_terminal.allowed_users.insert(
+        "local_bypass".to_owned(),
+        MobileTerminalUserConfig {
+            interactive_shell_access: true,
+            registered_device_keys: vec![MobileTerminalDeviceKeyConfig {
+                id: "android-1".to_owned(),
+                public_key: "-----BEGIN PUBLIC KEY-----\nfixture\n-----END PUBLIC KEY-----"
+                    .to_owned(),
+                enabled: true,
+            }],
+            ..MobileTerminalUserConfig::default()
+        },
+    );
+    config
 }
 
 fn config_with_state_file_and_email(

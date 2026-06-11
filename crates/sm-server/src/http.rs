@@ -1528,15 +1528,16 @@ fn short_session_id(session_id: &str) -> String {
 async fn list_client_sessions(
     State(state): State<Arc<AppState>>,
     request: Request,
-) -> Result<Json<SessionsEnvelope<ClientSessionResponse>>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
+    let actor_email = request_actor_email(&state.config, &request);
     let sessions = state
         .session_store
         .list_sessions(false)?
         .into_iter()
-        .map(ClientSessionResponse::from)
+        .map(|session| client_session_value(&state.config, session, actor_email.as_deref(), None))
         .collect::<Vec<_>>();
-    Ok(Json(SessionsEnvelope::from(sessions)))
+    Ok(Json(json!({ "sessions": sessions })))
 }
 
 async fn list_nodes(
@@ -1659,12 +1660,18 @@ async fn get_client_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     request: Request,
-) -> Result<Json<ClientSessionResponse>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
+    let actor_email = request_actor_email(&state.config, &request);
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    Ok(Json(ClientSessionResponse::from(session)))
+    Ok(Json(client_session_value(
+        &state.config,
+        session,
+        actor_email.as_deref(),
+        None,
+    )))
 }
 
 async fn create_mobile_attach_ticket(
@@ -3702,7 +3709,7 @@ fn shadow_predict_session_read(
         .strip_prefix("/client/sessions/")
         .filter(|value| !value.contains('/'))
     {
-        let Some(session) = state.session_store.get_session(session_id)? else {
+        let Some(_session) = state.session_store.get_session(session_id)? else {
             let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
             return Ok(Some(ShadowPrediction {
                 status: StatusCode::NOT_FOUND.as_u16(),
@@ -3710,11 +3717,10 @@ fn shadow_predict_session_read(
                 support_status: "implemented_read",
             }));
         };
-        let body = serde_json::to_vec(&ClientSessionResponse::from(session))?;
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
-            body_sha256: Some(sha256_hex(&body)),
-            support_status: "implemented_read",
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
         }));
     }
 
@@ -3790,6 +3796,12 @@ fn shadow_predict_session_read(
 fn client_bootstrap_response(config: &AppConfig) -> ClientBootstrapResponse {
     let auth = &config.google_auth;
     let external = &config.external_access;
+    let mobile_terminal_ws_url = if config.mobile_terminal.enabled {
+        mobile_terminal_ws_url(config, None)
+    } else {
+        None
+    };
+    let mobile_terminal_supported = mobile_terminal_ws_url.is_some();
 
     ClientBootstrapResponse {
         auth: BootstrapAuth {
@@ -3806,11 +3818,15 @@ fn client_bootstrap_response(config: &AppConfig) -> ClientBootstrapResponse {
             public_ssh_host: trimmed(&external.public_ssh_host),
             ssh_username: trimmed(&external.ssh_username),
             termux_attach_supported: false,
-            mobile_terminal_supported: false,
-            mobile_terminal_ws_url: None,
+            mobile_terminal_supported,
+            mobile_terminal_ws_url,
         },
         session_open_defaults: SessionOpenDefaults {
-            preferred_action: "details",
+            preferred_action: if mobile_terminal_supported {
+                "mobile_terminal"
+            } else {
+                "details"
+            },
             termux_package: "com.termux",
         },
     }
@@ -3850,6 +3866,147 @@ fn attach_descriptor_payload(session: SessionRecord) -> Value {
 fn attach_descriptor_response(session: SessionRecord) -> Value {
     json!({
         "attach": attach_descriptor_payload(session),
+    })
+}
+
+fn client_session_value(
+    config: &AppConfig,
+    session: SessionRecord,
+    actor_email: Option<&str>,
+    route_prefix: Option<&str>,
+) -> Value {
+    let mut value = serde_json::to_value(ClientSessionResponse::from(session.clone()))
+        .unwrap_or_else(|_| json!({}));
+    let attach_descriptor = attach_descriptor_payload(session.clone());
+    value["attach_descriptor"] = attach_descriptor.clone();
+    value["termux_attach"] = Value::Null;
+    let mobile_terminal = mobile_terminal_metadata(
+        config,
+        &session,
+        &attach_descriptor,
+        actor_email,
+        route_prefix,
+    );
+    value["mobile_terminal"] = mobile_terminal.clone();
+    value["primary_action"] = mobile_primary_action(&mobile_terminal, &attach_descriptor);
+    value
+}
+
+fn mobile_primary_action(mobile_terminal: &Value, attach_descriptor: &Value) -> Value {
+    if mobile_terminal
+        .get("supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        json!({
+            "type": "mobile_terminal",
+            "label": "Attach",
+        })
+    } else if attach_descriptor
+        .get("attach_supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        != true
+    {
+        json!({
+            "type": "details",
+            "label": "View details",
+            "reason": attach_descriptor
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("attach not supported"),
+        })
+    } else {
+        json!({
+            "type": "details",
+            "label": "View details",
+        })
+    }
+}
+
+fn mobile_terminal_metadata(
+    config: &AppConfig,
+    session: &SessionRecord,
+    attach_descriptor: &Value,
+    actor_email: Option<&str>,
+    route_prefix: Option<&str>,
+) -> Value {
+    if !config.mobile_terminal.enabled {
+        return json!({
+            "supported": false,
+            "reason": "mobile terminal attach is disabled",
+        });
+    }
+    let Some(ws_url) = mobile_terminal_ws_url(config, route_prefix) else {
+        return json!({
+            "supported": false,
+            "reason": "mobile terminal public HTTPS host is not configured",
+        });
+    };
+    let Some(actor_email) = actor_email.map(str::trim).filter(|value| !value.is_empty()) else {
+        return json!({
+            "supported": false,
+            "reason": "authenticated mobile terminal user is required",
+        });
+    };
+    let Some((_user_id, user_config)) = mobile_terminal_visible_user(config, actor_email) else {
+        return json!({
+            "supported": false,
+            "reason": "mobile terminal user is not configured",
+        });
+    };
+    if !user_config.interactive_shell_access {
+        return json!({
+            "supported": false,
+            "reason": "interactive shell access is not enabled",
+        });
+    }
+    if !mobile_terminal_user_has_registered_device(user_config) {
+        return json!({
+            "supported": false,
+            "reason": "registered mobile device key is required",
+        });
+    }
+    if attach_descriptor
+        .get("attach_supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        != true
+    {
+        return json!({
+            "supported": false,
+            "reason": attach_descriptor
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Session is not attachable"),
+        });
+    }
+    let tmux_session = attach_descriptor
+        .get("tmux_session")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let tmux_socket_name = attach_descriptor
+        .get("tmux_socket_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Err(error) = validate_mobile_terminal_tmux_target(tmux_session, tmux_socket_name) {
+        return json!({
+            "supported": false,
+            "reason": api_error_detail(&error),
+        });
+    }
+
+    json!({
+        "supported": true,
+        "transport": "sm-https-tmux",
+        "ticket_endpoint": mobile_terminal_attach_ticket_path(config, &session.id, route_prefix),
+        "ws_url": ws_url,
+        "tmux_session": tmux_session,
+        "tmux_socket_name": tmux_socket_name,
+        "runtime_mode": "detached_runtime",
+        "requires_device_key": true,
     })
 }
 
@@ -4969,6 +5126,14 @@ fn request_actor_email_from_parts(
         return Some("local_bypass".to_owned());
     }
     None
+}
+
+fn request_actor_email(config: &AppConfig, request: &Request) -> Option<String> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    request_actor_email_from_parts(config, request.headers(), peer_addr)
 }
 
 fn validate_json_payload_size(
@@ -6120,7 +6285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mobile_terminal_routes_do_not_advertise_unimplemented_bridge() {
+    async fn mobile_terminal_routes_advertise_supported_bridge() {
         let signing_key = SigningKey::random(&mut OsRng);
         let app = router(AppState::new(mobile_ticket_config(&signing_key)));
 
@@ -6135,8 +6300,24 @@ mod tests {
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         let session = &body["sessions"][0];
-        assert_eq!(session["mobile_terminal"]["supported"], false);
-        assert_eq!(session["primary_action"]["type"], "details");
+        assert_eq!(session["mobile_terminal"]["supported"], true);
+        assert_eq!(session["mobile_terminal"]["transport"], "sm-https-tmux");
+        assert_eq!(
+            session["mobile_terminal"]["ticket_endpoint"],
+            "/client/sessions/fork1001/attach-ticket"
+        );
+        assert_eq!(
+            session["mobile_terminal"]["ws_url"],
+            "wss://sm.rajeshgo.li/client/terminal"
+        );
+        assert_eq!(
+            session["mobile_terminal"]["tmux_session"],
+            "codex-fork-fork1001"
+        );
+        assert_eq!(session["mobile_terminal"]["requires_device_key"], true);
+        assert_eq!(session["termux_attach"], Value::Null);
+        assert_eq!(session["primary_action"]["type"], "mobile_terminal");
+        assert_eq!(session["primary_action"]["label"], "Attach");
     }
 
     #[tokio::test]
