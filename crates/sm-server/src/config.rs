@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
     pub tool_logging: ToolLoggingConfig,
+    pub codex_rollout: CodexRolloutConfig,
+    pub codex_events: CodexEventsConfig,
     pub codex_observability: CodexObservabilityConfig,
     pub claude: ProviderLaunchConfig,
     pub codex: ProviderLaunchConfig,
@@ -48,6 +50,8 @@ impl Default for AppConfig {
             tmux: TmuxConfig::default(),
             sm_send: SmSendConfig::default(),
             tool_logging: ToolLoggingConfig::default(),
+            codex_rollout: CodexRolloutConfig::default(),
+            codex_events: CodexEventsConfig::default(),
             codex_observability: CodexObservabilityConfig::default(),
             claude: ProviderLaunchConfig::new(
                 "claude".to_owned(),
@@ -577,6 +581,85 @@ fn default_tool_usage_db_path() -> String {
     "~/.local/share/claude-sessions/tool_usage.db".to_owned()
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodexRolloutConfig {
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_rollout_bool"
+    )]
+    pub enable_durable_events: bool,
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_rollout_bool"
+    )]
+    pub enable_structured_requests: bool,
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_rollout_bool"
+    )]
+    pub enable_observability_projection: bool,
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_rollout_bool"
+    )]
+    pub enable_codex_tui: bool,
+}
+
+impl Default for CodexRolloutConfig {
+    fn default() -> Self {
+        Self {
+            enable_durable_events: true,
+            enable_structured_requests: true,
+            enable_observability_projection: true,
+            enable_codex_tui: true,
+        }
+    }
+}
+
+fn deserialize_rollout_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = YamlValue::deserialize(deserializer)?;
+    Ok(coerce_rollout_flag(Some(&value), true))
+}
+
+fn coerce_rollout_flag(value: Option<&YamlValue>, default: bool) -> bool {
+    match value {
+        None | Some(YamlValue::Null) => default,
+        Some(YamlValue::Bool(value)) => *value,
+        Some(YamlValue::Number(value)) => value
+            .as_i64()
+            .map(|value| value != 0)
+            .or_else(|| value.as_u64().map(|value| value != 0))
+            .or_else(|| value.as_f64().map(|value| value != 0.0))
+            .unwrap_or(default),
+        Some(YamlValue::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => default,
+        },
+        Some(_) => default,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexEventsConfig {
+    pub db_path: String,
+}
+
+impl Default for CodexEventsConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_codex_events_db_path(),
+        }
+    }
+}
+
+fn default_codex_events_db_path() -> String {
+    "~/.local/share/claude-sessions/codex_events.db".to_owned()
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexObservabilityConfig {
     pub db_path: String,
@@ -647,6 +730,20 @@ fn codex_observability_config_for_state_file(state_file: &str) -> CodexObservabi
     }
 }
 
+fn codex_events_config_for_state_file(state_file: &str) -> CodexEventsConfig {
+    if state_file == default_state_file() {
+        return CodexEventsConfig::default();
+    }
+    let state_file = Path::new(state_file);
+    let parent = state_file.parent().unwrap_or_else(|| Path::new("."));
+    CodexEventsConfig {
+        db_path: parent
+            .join("codex_events.db")
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
@@ -704,6 +801,10 @@ struct RawConfig {
     #[serde(default)]
     tool_logging: ToolLoggingConfig,
     #[serde(default)]
+    codex_rollout: CodexRolloutConfig,
+    #[serde(default)]
+    codex_events: Option<RawCodexEventsConfig>,
+    #[serde(default)]
     codex_observability: Option<RawCodexObservabilityConfig>,
     #[serde(default)]
     claude: RawProviderLaunchConfig,
@@ -736,6 +837,7 @@ impl From<RawConfig> for AppConfig {
             .unwrap_or_else(|| queue_runner_config_for_state_file(&paths.state_file));
         let codex_observability =
             codex_observability_config(raw.codex_observability, &paths.state_file);
+        let codex_events = codex_events_config(raw.codex_events, &paths.state_file);
         let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new());
         let codex = provider_launch_config(raw.codex, "codex", None, Vec::new());
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
@@ -785,6 +887,8 @@ impl From<RawConfig> for AppConfig {
             tmux: raw.tmux,
             sm_send: raw.sm_send,
             tool_logging: raw.tool_logging,
+            codex_rollout: raw.codex_rollout,
+            codex_events,
             codex_observability,
             claude,
             codex,
@@ -868,6 +972,12 @@ struct RawCodexObservabilityConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct RawCodexEventsConfig {
+    #[serde(default)]
+    db_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct RawTimeoutsConfig {
     #[serde(default)]
     tmux: RawTmuxTimeoutsConfig,
@@ -940,6 +1050,16 @@ fn codex_observability_config(
     state_file: &str,
 ) -> CodexObservabilityConfig {
     let mut config = codex_observability_config_for_state_file(state_file);
+    if let Some(raw) = raw {
+        if let Some(db_path) = raw.db_path {
+            config.db_path = db_path;
+        }
+    }
+    config
+}
+
+fn codex_events_config(raw: Option<RawCodexEventsConfig>, state_file: &str) -> CodexEventsConfig {
+    let mut config = codex_events_config_for_state_file(state_file);
     if let Some(raw) = raw {
         if let Some(db_path) = raw.db_path {
             config.db_path = db_path;
@@ -1307,6 +1427,59 @@ codex_observability:
         assert_eq!(
             config.codex_observability.db_path,
             "/tmp/custom-codex-observability.db"
+        );
+    }
+
+    #[test]
+    fn raw_config_reads_codex_events_db_path() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+codex_events:
+  db_path: /tmp/custom-codex-events.db
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.codex_events.db_path, "/tmp/custom-codex-events.db");
+    }
+
+    #[test]
+    fn raw_config_reads_codex_rollout_flags() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+codex_rollout:
+  enable_durable_events: "false"
+  enable_structured_requests: "off"
+  enable_observability_projection: 0
+  enable_codex_tui: "yes"
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(!config.codex_rollout.enable_durable_events);
+        assert!(!config.codex_rollout.enable_structured_requests);
+        assert!(!config.codex_rollout.enable_observability_projection);
+        assert!(config.codex_rollout.enable_codex_tui);
+    }
+
+    #[test]
+    fn raw_config_derives_codex_events_db_path_from_custom_state_file() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+paths:
+  state_file: /tmp/sm-fixture/sessions.json
+codex_events:
+  ring_size: 25
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            config.codex_events.db_path,
+            "/tmp/sm-fixture/codex_events.db"
         );
     }
 
