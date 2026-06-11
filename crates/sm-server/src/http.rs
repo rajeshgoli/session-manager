@@ -216,31 +216,7 @@ async fn auth_session(
 }
 
 async fn client_bootstrap(State(state): State<Arc<AppState>>) -> Json<ClientBootstrapResponse> {
-    let auth = &state.config.google_auth;
-    let external = &state.config.external_access;
-
-    Json(ClientBootstrapResponse {
-        auth: BootstrapAuth {
-            mode_name: "browser_session_cookie",
-            session_endpoint: "/auth/session",
-            login_endpoint: "/auth/google/login",
-            logout_endpoint: "/auth/logout",
-            device_auth_endpoint: "/auth/device/google",
-            device_auth_token_type: "Bearer",
-            google_server_client_id: trimmed(&auth.client_id),
-        },
-        external_access: BootstrapExternalAccess {
-            public_http_host: trimmed(&external.public_http_host),
-            public_ssh_host: trimmed(&external.public_ssh_host),
-            ssh_username: trimmed(&external.ssh_username),
-            termux_attach_supported: false,
-            mobile_terminal_supported: false,
-            mobile_terminal_ws_url: None,
-        },
-        session_open_defaults: SessionOpenDefaults {
-            preferred_action: "details",
-        },
-    })
+    Json(client_bootstrap_response(&state.config))
 }
 
 async fn client_analytics_summary(
@@ -1646,29 +1622,34 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
-        "/client/bootstrap" => Some(serde_json::to_vec(&shadow_client_bootstrap_response(
-            &state.config,
-        ))?),
+        "/client/bootstrap" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         "/events/state" => Some(serde_json::to_vec(&event_state_payload())?),
-        "/nodes" => Some(serde_json::to_vec(&nodes_list_response(&state.config))?),
+        "/nodes" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         "/sessions" => {
-            let include_stopped = query_bool(query_string, "include_stopped");
-            let sessions = state
-                .session_store
-                .list_sessions(include_stopped)?
-                .into_iter()
-                .map(SessionResponse::from)
-                .collect::<Vec<_>>();
-            Some(serde_json::to_vec(&SessionsEnvelope::from(sessions))?)
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
         }
         "/client/sessions" => {
-            let sessions = state
-                .session_store
-                .list_sessions(false)?
-                .into_iter()
-                .map(ClientSessionResponse::from)
-                .collect::<Vec<_>>();
-            Some(serde_json::to_vec(&SessionsEnvelope::from(sessions))?)
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
         }
         _ => return shadow_predict_session_read(state, path, query_string),
     };
@@ -1830,7 +1811,7 @@ fn shadow_predict_session_read(
     Ok(None)
 }
 
-fn shadow_client_bootstrap_response(config: &AppConfig) -> ClientBootstrapResponse {
+fn client_bootstrap_response(config: &AppConfig) -> ClientBootstrapResponse {
     let auth = &config.google_auth;
     let external = &config.external_access;
 
@@ -1854,6 +1835,7 @@ fn shadow_client_bootstrap_response(config: &AppConfig) -> ClientBootstrapRespon
         },
         session_open_defaults: SessionOpenDefaults {
             preferred_action: "details",
+            termux_package: "com.termux",
         },
     }
 }
@@ -2725,4 +2707,5 @@ struct BootstrapExternalAccess {
 #[derive(Serialize)]
 struct SessionOpenDefaults {
     preferred_action: &'static str,
+    termux_package: &'static str,
 }

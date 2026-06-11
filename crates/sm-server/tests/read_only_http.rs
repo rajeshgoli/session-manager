@@ -18,7 +18,8 @@ use sm_server::queue::RetainedQueueStore;
 use sm_server::{
     config::{
         AppConfig, CodexForkLaunchConfig, ExternalAccessConfig, GoogleAuthConfig,
-        MobileAnalyticsConfig, PathsConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig,
+        MobileAnalyticsConfig, MobileTerminalConfig, PathsConfig, QueueRunnerConfig,
+        RustCoreConfig, SmSendConfig,
     },
     http::{router, AppState},
 };
@@ -214,7 +215,8 @@ async fn nodes_list_defaults_to_implicit_primary_node() {
                 "api_url": null,
                 "hook_base_url": null,
                 "projects_root": null,
-                "log_dir": null
+                "log_dir": null,
+                "codex_fork_node_agent": false
             }
         ])
     );
@@ -272,6 +274,7 @@ nodes:
     );
     assert_eq!(macbook["projects_root"], "/Users/rajesh/projects");
     assert_eq!(macbook["log_dir"], "/tmp/sm-node");
+    assert_eq!(macbook["codex_fork_node_agent"], false);
 
     let worker = nodes.iter().find(|entry| entry["id"] == "worker").unwrap();
     assert_eq!(worker["ssh"], "worker.example.com");
@@ -1043,9 +1046,9 @@ async fn shadow_http_reports_match_for_stable_read_only_route() {
 }
 
 #[tokio::test]
-async fn shadow_http_reports_match_for_nodes_list() {
+async fn shadow_http_treats_nodes_as_status_only_until_node_agents_are_ported() {
     let app = router(AppState::new(AppConfig::default()));
-    let python_body = br#"{"default":"primary","nodes":[{"id":"primary","primary":true,"ssh":null,"api_url":null,"hook_base_url":null,"projects_root":null,"log_dir":null}]}"#;
+    let python_body = br#"{"default":"primary","nodes":[{"id":"primary","primary":true,"ssh":null,"api_url":null,"hook_base_url":null,"projects_root":null,"log_dir":null,"codex_fork_node_agent":true}]}"#;
 
     let (status, payload) = post_json(
         app,
@@ -1067,11 +1070,44 @@ async fn shadow_http_reports_match_for_nodes_list() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["support_status"], "implemented_read");
-    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
     assert_eq!(payload["would_write"], false);
     assert_eq!(payload["predicted_status"], 200);
-    assert_eq!(payload["body_sha256_match"], true);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_http_treats_live_session_lists_as_status_only() {
+    let app = router(AppState::new(config_with_state_file(
+        &write_session_fixture(),
+    )));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"sessions\":[{\"activity_state\":\"working\"}]}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
 }
 
 #[tokio::test]
@@ -1315,6 +1351,42 @@ async fn shadow_http_treats_auth_session_as_status_only() {
 }
 
 #[tokio::test]
+async fn shadow_http_treats_bootstrap_as_status_only_until_mobile_terminal_is_ported() {
+    let app = router(AppState::new(AppConfig {
+        mobile_terminal: MobileTerminalConfig {
+            enabled: true,
+            ..MobileTerminalConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/client/bootstrap",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"external_access\":{\"mobile_terminal_supported\":true}}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+}
+
+#[tokio::test]
 async fn shadow_http_does_not_treat_static_sessions_route_as_session_id() {
     let app = router(AppState::new(AppConfig::default()));
 
@@ -1475,13 +1547,52 @@ async fn bootstrap_preserves_native_schema_without_termux_or_terminal_advertisem
                 "mobile_terminal_ws_url": null
             },
             "session_open_defaults": {
-                "preferred_action": "details"
+                "preferred_action": "details",
+                "termux_package": "com.termux"
             }
         })
     );
     assert!(payload["external_access"]
         .get("ssh_proxy_command")
         .is_none());
+}
+
+#[tokio::test]
+async fn bootstrap_does_not_advertise_unimplemented_mobile_terminal() {
+    let app = router(AppState::new(AppConfig {
+        google_auth: GoogleAuthConfig {
+            client_id: Some("web-client-id".to_owned()),
+            ..GoogleAuthConfig::default()
+        },
+        external_access: ExternalAccessConfig {
+            public_http_host: Some("sm.example.com".to_owned()),
+            ..ExternalAccessConfig::default()
+        },
+        mobile_terminal: MobileTerminalConfig {
+            enabled: true,
+            ..MobileTerminalConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/client/bootstrap").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["external_access"]["mobile_terminal_supported"],
+        false
+    );
+    assert_eq!(
+        payload["external_access"]["mobile_terminal_ws_url"],
+        Value::Null
+    );
+    assert_eq!(
+        payload["session_open_defaults"],
+        json!({
+            "preferred_action": "details",
+            "termux_package": "com.termux"
+        })
+    );
 }
 
 #[tokio::test]
@@ -4868,7 +4979,15 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
 
     let (status, payload) = get_json(app.clone(), "/sessions/runtimechild").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["model"], "opus");
+    assert!(payload.get("model").is_none());
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let runtime_child = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "runtimechild")
+        .unwrap();
+    assert_eq!(runtime_child["model"], "opus");
 
     let (status, payload) = post_json(app.clone(), "/sessions/runtimechild/kill", json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -6358,6 +6477,7 @@ fn config_with_state_file_and_auth(state_file: &PathBuf) -> AppConfig {
             redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
             allowlist_emails: vec!["rajesh@example.com".to_owned()],
             session_cookie_secret: Some("session-cookie-secret".to_owned()),
+            ..GoogleAuthConfig::default()
         },
         ..AppConfig::default()
     }

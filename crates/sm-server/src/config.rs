@@ -232,6 +232,7 @@ impl NodesConfig {
                 hook_base_url: node.hook_base_url.clone(),
                 projects_root: node.projects_root.clone(),
                 log_dir: node.log_dir.clone(),
+                codex_fork_node_agent: false,
             })
             .collect()
     }
@@ -269,6 +270,7 @@ pub struct PublicNodeConfig {
     pub hook_base_url: Option<String>,
     pub projects_root: Option<String>,
     pub log_dir: Option<String>,
+    pub codex_fork_node_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
