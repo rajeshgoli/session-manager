@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
 base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }

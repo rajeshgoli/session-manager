@@ -332,6 +332,46 @@
       "source": "specs/762_stage5_artifacts/gate_matrix.md:74"
     },
     {
+      "id": "http.client_request_status",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/client/request-status",
+      "body": {},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/status", "equals": "requested"},
+        {"path": "/targeted_count", "type": "number"},
+        {"path": "/delivered_count", "type": "number"},
+        {"path": "/queued_count", "type": "number"},
+        {"path": "/failed_count", "type": "number"}
+      ],
+      "preconditions": ["live_server", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/837"
+    },
+    {
+      "id": "http.client_bug_report",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/client/bug-reports",
+      "body": {
+        "report_text": "Rust migration contract smoke bug report",
+        "include_debug_state": false
+      },
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/bug_id", "type": "string"},
+        {"path": "/maintainer_notified", "type": "boolean"}
+      ],
+      "preconditions": ["live_server", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/837"
+    },
+    {
       "id": "http.session_detail_fixture",
       "surface": "http",
       "classification": "retained",
