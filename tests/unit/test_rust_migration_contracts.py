@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -356,6 +357,21 @@ def test_read_only_fixture_provides_app_artifact_metadata():
     assert metadata["artifact_hash"] == "deadbeef"
     assert metadata["size_bytes"] == 9
     assert metadata["uploaded_by"] == "fixture@example.com"
+
+
+def test_read_only_fixture_provides_queue_job_detail_row():
+    db_path = Path(
+        "scripts/rust_migration/fixtures/read_only/queue-runner/queue_runner.db"
+    )
+    assert db_path.exists()
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, type, label, state FROM queue_jobs WHERE id = ?",
+            ("job-fixture",),
+        ).fetchone()
+
+    assert row == ("job-fixture", "tests", "fixture queue job", "pending")
 
 
 def test_python_target_does_not_run_rust_only_retirement_checks():
