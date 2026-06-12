@@ -4185,7 +4185,13 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
-        "/events/state" => Some(serde_json::to_vec(&event_state_payload())?),
+        "/events/state" => {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         "/nodes" => {
             return Ok(Some(ShadowPrediction {
                 status: StatusCode::OK.as_u16(),

@@ -2003,6 +2003,48 @@ async fn shadow_http_reports_match_for_stable_read_only_route() {
 }
 
 #[tokio::test]
+async fn shadow_http_treats_events_state_as_status_only() {
+    let app = router(AppState::new(AppConfig::default()));
+    let python_body = serde_json::to_vec(&json!({
+        "tmux_client_event_version": 42,
+        "last_tmux_client_event": {
+            "type": "tmux_client_event",
+            "event": "client-attached",
+            "tmux_session": "codex-fork-live",
+            "version": 42
+        }
+    }))
+    .unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/events/state",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
 async fn shadow_http_treats_nodes_as_status_only_until_node_agents_are_ported() {
     let app = router(AppState::new(AppConfig::default()));
     let python_body = br#"{"default":"primary","nodes":[{"id":"primary","primary":true,"ssh":null,"api_url":null,"hook_base_url":null,"projects_root":null,"log_dir":null,"codex_fork_node_agent":true}]}"#;
