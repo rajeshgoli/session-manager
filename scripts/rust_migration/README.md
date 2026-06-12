@@ -193,6 +193,30 @@ writes `state-backup-manifest.json` inside it. Missing optional stores remain
 warnings. Preflight blockers, top-level symlink stores, and pre-existing backup
 roots block execution. Directory copies do not follow symlink children.
 
+Verify an executed backup manifest without writing:
+
+```bash
+python -m scripts.rust_migration.state_restore \
+  --manifest /tmp/sm-rust-state-backup-20260612T000000Z/state-backup-manifest.json \
+  --fail-on-blockers
+```
+
+Rehearse restore only into a fresh disposable root after reviewing verification
+output:
+
+```bash
+python -m scripts.rust_migration.state_restore \
+  --manifest /tmp/sm-rust-state-backup-20260612T000000Z/state-backup-manifest.json \
+  --restore-dir /tmp/sm-rust-state-restore-rehearsal-$(date -u +%Y%m%dT%H%M%SZ) \
+  --execute-restore \
+  --fail-on-blockers
+```
+
+Restore rehearsal copies backup contents under `stores/<store_id>` in the
+restore root and writes `state-restore-report.json`. It never restores into
+live Session Manager paths. Existing restore roots, symlinks, unsafe roots, and
+restore roots nested inside the backup or source stores block execution.
+
 Plan the write-freeze and active-writer drain coverage without activating a
 freeze:
 

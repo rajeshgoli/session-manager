@@ -96,6 +96,13 @@ def test_state_backup_execute_copies_files_dirs_and_manifest(tmp_path):
     manifest = json.loads((backup_root / "state-backup-manifest.json").read_text())
     assert manifest["status"] == "copied"
     assert manifest["backup_root"] == str(backup_root)
+    entries = {entry["store_id"]: entry for entry in manifest["entries"]}
+    assert entries["sessions_state"]["backup_size_bytes"] == (
+        state_dir / "sessions.json"
+    ).stat().st_size
+    assert entries["sessions_state"]["backup_sha256"]
+    assert entries["log_dir"]["backup_file_count"] == 1
+    assert entries["log_dir"]["backup_size_bytes"] == len("log\n")
 
 
 def test_state_backup_blocks_missing_required_state(tmp_path):

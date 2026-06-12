@@ -9,6 +9,7 @@ the manifest into that directory.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 from datetime import datetime, timezone
@@ -245,8 +246,13 @@ def _execute_plan(report: dict[str, Any]) -> int:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if entry["kind"] == "file":
             shutil.copy2(source, destination)
+            entry["backup_size_bytes"] = destination.stat().st_size
+            entry["backup_sha256"] = _file_hash(destination)
         elif entry["kind"] == "dir":
             _copy_directory(source, destination, entry)
+            backup_size, backup_file_count = _dir_stats(destination)
+            entry["backup_size_bytes"] = backup_size
+            entry["backup_file_count"] = backup_file_count
         else:
             entry["blockers"].append(
                 _issue(entry["store_id"], "unsupported_kind", f"cannot copy kind {entry['kind']}")
@@ -289,6 +295,29 @@ def _copy_directory(source: Path, destination: Path, entry: dict[str, Any]) -> N
         if child.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(child, target)
+
+
+def _file_hash(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _dir_stats(path: Path) -> tuple[int, int]:
+    total_size = 0
+    file_count = 0
+    for child in path.rglob("*"):
+        if child.is_symlink():
+            continue
+        if child.is_file():
+            file_count += 1
+            total_size += child.stat().st_size
+    return total_size, file_count
 
 
 def _write_manifest(report: dict[str, Any]) -> None:
