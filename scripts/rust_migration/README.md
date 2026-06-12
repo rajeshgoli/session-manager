@@ -180,6 +180,21 @@ For a cutover trial, run shadow mode for the agreed observation window and treat
 unexplained mismatches on retained core surfaces as blockers before Rust becomes
 the writer.
 
+Summarize the ledger during or after the observation window:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.shadow_report \
+  --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
+  --fail-on-blockers
+```
+
+Use `--json` to produce automation-friendly output with route summaries,
+comparison counts, support-status counts, and a blocker list. Blockers include
+status/body mismatches, shadow transport errors, non-JSON shadow responses, and
+invalid ledger rows. `not_compared` rows are summarized but are not blockers by
+default because retained writes may be intentionally observed without Rust side
+effects before cutover.
+
 ## MVP Sidecar Rehearsal
 
 The MVP rehearsal gate starts Rust as a sidecar, keeps Python authoritative, and
