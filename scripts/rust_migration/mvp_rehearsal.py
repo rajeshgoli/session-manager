@@ -24,10 +24,12 @@ from urllib.parse import urlparse
 
 from .baseline import run_baseline
 from .contracts import ContractManifest, run_checks, summarize
+from .mutating_fixture import create_mutating_fixture_workspace
 
 
 PYTHON_BASE_URL = "http://127.0.0.1:8420"
 RUST_BASE_URL = "http://127.0.0.1:8421"
+DEFAULT_RUST_SM_BINARY = "target/debug/sm"
 
 CORE_READ_CHECK_IDS = (
     "http.health",
@@ -50,6 +52,39 @@ CORE_READ_CHECK_IDS = (
 )
 
 MVP_GAP_PROBE_CHECK_IDS = ()
+
+CORE_MUTATING_CHECK_IDS = (
+    "cli.rust_core_spawn_fixture",
+    "cli.rust_core_send_fixture",
+    "cli.rust_core_spawn_child_inherits_parent_fixture",
+    "cli.rust_core_me_fixture",
+    "cli.rust_core_all_fixture",
+    "cli.rust_core_children_fixture",
+    "cli.rust_core_children_target_fixture",
+    "cli.rust_core_context_monitor_enable_child_fixture",
+    "cli.rust_core_context_monitor_status_fixture",
+    "cli.rust_core_task_complete_fixture",
+    "cli.rust_core_turn_complete_fixture",
+    "cli.rust_core_status_fixture",
+    "cli.rust_core_send_urgent_fixture",
+    "cli.rust_core_send_wait_fixture",
+    "cli.rust_core_output_fixture",
+    "cli.rust_core_clear_child_fixture",
+    "cli.rust_core_tail_fixture",
+    "cli.rust_core_maintainer_fixture",
+    "cli.rust_core_register_fixture",
+    "cli.rust_core_lookup_fixture",
+    "cli.rust_core_roster_fixture",
+    "cli.rust_core_unregister_fixture",
+    "cli.rust_core_maintainer_clear_fixture",
+    "cli.rust_core_retire_fixture",
+    "http.rust_core_task_complete_fixture",
+    "http.rust_core_turn_complete_fixture",
+    "http.rust_core_notify_on_stop_fixture",
+    "cli.rust_core_restore_fixture",
+    "cli.rust_core_retire_restored_fixture",
+    "cli.rust_core_wait_retired_fixture",
+)
 
 BASELINE_CHECK_IDS = (
     "http.health",
@@ -94,6 +129,10 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             "skip_baseline": args.skip_baseline,
             "baseline_repetitions": args.baseline_repetitions,
             "skip_shadow": args.skip_shadow,
+            "skip_mutating_contracts": args.skip_mutating_contracts,
+            "mutating_rust_base_url": _mutating_rust_base_url(args),
+            "sm_binary": args.sm_binary,
+            "cargo": args.cargo,
             "output_dir": str(output_dir),
         },
         "steps": [],
@@ -218,11 +257,55 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             name="rust_core_sidecar_contracts",
             target="rust",
             base_url=args.rust_base_url,
+            sm_binary=args.sm_binary,
             check_ids=set(CORE_READ_CHECK_IDS),
             timeout_seconds=args.timeout,
         )
         report["steps"].append(core_contracts)
         _add_contract_blockers(report, core_contracts, blocker_kind="core_contract")
+
+        if args.skip_mutating_contracts:
+            report["steps"].append(
+                {
+                    "name": "rust_core_mutating_fixture_contracts",
+                    "status": "skipped",
+                    "detail": "mutating fixture contracts skipped by flag",
+                }
+            )
+        else:
+            cli_step = _ensure_rust_cli_available(args)
+            if cli_step is not None:
+                report["steps"].append(cli_step)
+                if cli_step["status"] != "passed":
+                    _add_blocker(report, "rust_cli_build", cli_step["detail"])
+                    report["steps"].append(
+                        {
+                            "name": "rust_core_mutating_fixture_contracts",
+                            "status": "skipped",
+                            "detail": "Rust CLI binary was not available",
+                        }
+                    )
+                    return _finalize_report(report, output_dir, started_at)
+
+            mutating_contracts = _run_mutating_contract_group(manifest, args, output_dir)
+            report["steps"].append(mutating_contracts)
+            for name, path in mutating_contracts.get("artifacts", {}).items():
+                report["artifacts"][f"mutating_{name}"] = path
+            _add_contract_blockers(
+                report,
+                mutating_contracts,
+                blocker_kind="mutating_core_contract",
+                include_skipped=True,
+            )
+            if mutating_contracts["status"] == "failed" and not any(
+                blocker["kind"] == "mutating_core_contract"
+                for blocker in report["blockers"]
+            ):
+                _add_blocker(
+                    report,
+                    "mutating_core_contract",
+                    mutating_contracts.get("detail", "mutating contract step failed"),
+                )
 
         if not args.core_only:
             gap_contracts = _run_contract_group(
@@ -230,6 +313,7 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
                 name="rust_mvp_gap_probes",
                 target="rust",
                 base_url=args.rust_base_url,
+                sm_binary=args.sm_binary,
                 check_ids=set(MVP_GAP_PROBE_CHECK_IDS),
                 timeout_seconds=args.timeout,
             )
@@ -316,8 +400,25 @@ def _resolve_output_dir(raw: Path | None) -> Path:
 def _start_rust_sidecar(
     args: argparse.Namespace, output_dir: Path
 ) -> subprocess.Popen[str]:
+    return _start_rust_sidecar_process(
+        cargo=args.cargo,
+        base_url=args.rust_base_url,
+        config=args.config,
+        local_env=args.local_env,
+        log_path=output_dir / "rust-sidecar.log",
+    )
+
+
+def _start_rust_sidecar_process(
+    *,
+    cargo: str,
+    base_url: str,
+    config: Path,
+    local_env: Path | None,
+    log_path: Path,
+) -> subprocess.Popen[str]:
     command = [
-        args.cargo,
+        cargo,
         "run",
         "-p",
         "sm-server",
@@ -325,15 +426,15 @@ def _start_rust_sidecar(
         "sm-server",
         "--",
         "--host",
-        _host_from_base_url(args.rust_base_url),
+        _host_from_base_url(base_url),
         "--port",
-        str(_port_from_base_url(args.rust_base_url)),
+        str(_port_from_base_url(base_url)),
         "--config",
-        str(args.config),
+        str(config),
     ]
-    if args.local_env:
-        command.extend(["--local-env", str(args.local_env)])
-    log_file = (output_dir / "rust-sidecar.log").open("w")
+    if local_env:
+        command.extend(["--local-env", str(local_env)])
+    log_file = log_path.open("w")
     try:
         return subprocess.Popen(
             command,
@@ -436,29 +537,161 @@ def _run_contract_group(
     name: str,
     target: str,
     base_url: str,
+    sm_binary: str,
     check_ids: set[str],
     timeout_seconds: float,
+    fixtures: dict[str, str] | None = None,
+    include_mutating: bool = False,
+    fail_on_skipped: bool = False,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     results = run_checks(
         manifest,
         target=target,
         base_url=base_url,
-        sm_binary="sm",
+        sm_binary=sm_binary,
         session_id=None,
-        fixtures={},
-        include_mutating=False,
+        fixtures=fixtures or {},
+        include_mutating=include_mutating,
         check_ids=check_ids,
         timeout_seconds=timeout_seconds,
     )
     summary = summarize(results)
+    failed = summary.get("failed", 0)
+    skipped = summary.get("skipped", 0)
     return {
         "name": name,
-        "status": "passed" if summary.get("failed", 0) == 0 else "failed",
+        "status": (
+            "passed"
+            if failed == 0 and (not fail_on_skipped or skipped == 0)
+            else "failed"
+        ),
         "elapsed_ms": _elapsed_ms(started_at),
         "summary": summary,
         "results": [result.to_dict() for result in results],
     }
+
+
+def _ensure_rust_cli_available(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.sm_binary != DEFAULT_RUST_SM_BINARY:
+        return None
+    if Path(args.sm_binary).exists():
+        return {
+            "name": "rust_cli_build",
+            "status": "passed",
+            "detail": f"{args.sm_binary} already exists",
+        }
+    step = _run_command(
+        [args.cargo, "build", "-p", "sm-server", "--bin", "sm"],
+        cwd=Path.cwd(),
+        timeout_seconds=args.smoke_timeout,
+    )
+    step["name"] = "rust_cli_build"
+    return step
+
+
+def _run_mutating_contract_group(
+    manifest: ContractManifest, args: argparse.Namespace, output_dir: Path
+) -> dict[str, Any]:
+    mutating_base_url = _mutating_rust_base_url(args)
+    step_name = "rust_core_mutating_fixture_contracts"
+    started_at = time.perf_counter()
+    try:
+        workspace = create_mutating_fixture_workspace(output_dir / "mutating-fixture")
+    except OSError as exc:
+        return {
+            "name": step_name,
+            "status": "failed",
+            "elapsed_ms": _elapsed_ms(started_at),
+            "detail": f"failed to create mutating fixture workspace: {exc}",
+            "summary": {"passed": 0, "failed": 1, "skipped": 0},
+            "results": [],
+            "artifacts": {},
+        }
+    log_path = output_dir / "rust-mutating-sidecar.log"
+    artifacts = {
+        "fixture_root": str(workspace.root),
+        "fixture_config": str(workspace.config_path),
+        "fixture_state": str(workspace.state_file),
+        "sidecar_log": str(log_path),
+    }
+    preflight = _probe_health(mutating_base_url, args.timeout)
+    if preflight["status"] == "passed":
+        return {
+            "name": step_name,
+            "status": "failed",
+            "elapsed_ms": _elapsed_ms(started_at),
+            "detail": (
+                f"{mutating_base_url} was already healthy before mutating sidecar "
+                "start; choose --mutating-rust-base-url with a free port"
+            ),
+            "summary": {"passed": 0, "failed": 1, "skipped": 0},
+            "results": [],
+            "artifacts": artifacts,
+        }
+
+    mutating_process: subprocess.Popen[str] | None = None
+    try:
+        try:
+            mutating_process = _start_rust_sidecar_process(
+                cargo=args.cargo,
+                base_url=mutating_base_url,
+                config=workspace.config_path,
+                local_env=None,
+                log_path=log_path,
+            )
+        except OSError as exc:
+            return {
+                "name": step_name,
+                "status": "failed",
+                "elapsed_ms": _elapsed_ms(started_at),
+                "detail": f"failed to start mutating sidecar: {exc}",
+                "summary": {"passed": 0, "failed": 1, "skipped": 0},
+                "results": [],
+                "artifacts": artifacts,
+            }
+
+        health = _wait_for_sidecar_health(
+            mutating_process,
+            mutating_base_url,
+            timeout_seconds=args.startup_timeout,
+            request_timeout=args.timeout,
+            log_path=log_path,
+        )
+        sidecar_exited = health.pop("process_exited", False)
+        if health["status"] != "passed":
+            detail = health["detail"]
+            if sidecar_exited and health.get("exit_code") is not None:
+                detail = f"{detail}; exit_code={health['exit_code']}"
+            return {
+                "name": step_name,
+                "status": "failed",
+                "elapsed_ms": _elapsed_ms(started_at),
+                "detail": detail,
+                "summary": {"passed": 0, "failed": 1, "skipped": 0},
+                "results": [],
+                "artifacts": artifacts,
+            }
+
+        fixtures = dict(workspace.fixtures)
+        fixtures["base_url"] = mutating_base_url
+        step = _run_contract_group(
+            manifest,
+            name=step_name,
+            target="rust",
+            base_url=mutating_base_url,
+            sm_binary=args.sm_binary,
+            check_ids=set(CORE_MUTATING_CHECK_IDS),
+            timeout_seconds=args.timeout,
+            fixtures=fixtures,
+            include_mutating=True,
+            fail_on_skipped=True,
+        )
+        step["artifacts"] = artifacts
+        return step
+    finally:
+        if mutating_process is not None:
+            _terminate_process_group(mutating_process)
 
 
 def _run_shadow_summary(
@@ -590,10 +823,16 @@ def _http_request(
 
 
 def _add_contract_blockers(
-    report: dict[str, Any], step: dict[str, Any], *, blocker_kind: str
+    report: dict[str, Any],
+    step: dict[str, Any],
+    *,
+    blocker_kind: str,
+    include_skipped: bool = False,
 ) -> None:
     for result in step.get("results", []):
-        if result["status"] != "failed":
+        if result["status"] != "failed" and not (
+            include_skipped and result["status"] == "skipped"
+        ):
             continue
         _add_blocker(
             report,
@@ -641,6 +880,21 @@ def _port_from_base_url(base_url: str) -> int:
     return 443 if parsed.scheme == "https" else 80
 
 
+def _mutating_rust_base_url(args: argparse.Namespace) -> str:
+    if args.mutating_rust_base_url:
+        return args.mutating_rust_base_url.rstrip("/")
+    return _default_mutating_rust_base_url(args.rust_base_url)
+
+
+def _default_mutating_rust_base_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{_port_from_base_url(base_url) + 1}"
+
+
 def _tail_text(value: str | bytes, max_chars: int = 4000) -> str:
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
@@ -662,6 +916,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python-base-url", default=PYTHON_BASE_URL)
     parser.add_argument("--rust-base-url", default=RUST_BASE_URL)
+    parser.add_argument(
+        "--mutating-rust-base-url",
+        default=None,
+        help="Fresh Rust sidecar URL for disposable mutating fixture checks; defaults to rust port + 1",
+    )
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     parser.add_argument("--local-env", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -670,6 +929,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--skip-shadow", action="store_true")
+    parser.add_argument("--skip-mutating-contracts", action="store_true")
     parser.add_argument("--core-only", action="store_true")
     parser.add_argument("--allow-blockers", action="store_true")
     parser.add_argument("--shadow-secret", default=None)
@@ -678,7 +938,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-timeout", type=float, default=60.0)
     parser.add_argument("--smoke-timeout", type=float, default=120.0)
     parser.add_argument("--cargo", default="cargo")
-    parser.add_argument("--sm-binary", default="sm")
+    parser.add_argument("--sm-binary", default=DEFAULT_RUST_SM_BINARY)
     return parser
 
 
