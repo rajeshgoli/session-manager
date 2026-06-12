@@ -1,6 +1,6 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-12 after PR #912, live shadow activation, and the fixture-filtered live contract pass.
+Status: handoff snapshot from 2026-06-12 after PR #932 and the state-gated MVP rehearsal passed.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,12 +11,12 @@ coverage in
 ## Current Repository State
 
 - Branch: `main`
-- Latest merged commit: `b17c1e2` (`Merge pull request #912`)
+- Latest merged commit: `14b54e7` (`Merge pull request #932`)
 - Open PRs at handoff: none
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
   and the local `config.yaml.shadow-backup-20260612T023248Z` created when
   enabling shadow mode.
-- Stale session-manager review agents from the overnight run and PR #912 were retired.
+- Stale session-manager review agents from the overnight run and PR #932 were retired.
 - Unrelated non-session-manager agents were left alone.
 - Live Python-authoritative Rust shadow mode is enabled in `config.yaml`, with
   Python serving on `:8420`, the Rust sidecar on `127.0.0.1:8421`, and the
@@ -59,7 +59,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #912.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #932.
 - PR #880 added fixture-gated manifest checks for already-implemented detail
   endpoints:
   - `GET /queue-jobs/{queue_job_id}`
@@ -88,24 +88,41 @@ Merged Rust slices cover:
 - PR #910 made Rust contract CLI checks default to `target/debug/sm`.
 - PR #912 added `--skip-fixture-checks` so broad live-state contract runs can
   skip synthetic fixture checks without suppressing ordinary live coverage.
+- PR #914 refreshed this handoff after live shadow activation.
+- PR #916 added shadow report coverage gates.
+- PR #918 wired shadow observation coverage gates into the planner.
+- PR #920 added mobile device CLI contract checks.
+- PR #922 added the Rust CLI cutover scope audit.
+- PR #924 added state ownership preflight.
+- PR #926 added the state backup plan/copy tool.
+- PR #928 added the freeze/drain plan ledger scaffold.
+- PR #930 added backup verification and restore rehearsal.
+- PR #932 made the MVP rehearsal run state preflight, backup, restore
+  verification, disposable restore, and freeze/drain evidence by default.
 - Current contract manifest size:
-  - `115` checks total
+  - `117` checks total
   - `68` `python_and_rust`
-  - `47` `rust_only`
+  - `49` `rust_only`
 
 ## Validation At Handoff
 
 The latest real-state MVP rehearsal is:
 
 ```bash
-.local/rust-mvp-rehearsals/20260612T013237Z-events-state-shadow/mvp-rehearsal-report.json
+.local/rust-mvp-rehearsals/20260612T051529Z-state-gated-reuse/mvp-rehearsal-report.json
 ```
 
 Observed results from that run:
 
 - overall status: passed with zero blockers;
-- Python health, fresh Rust sidecar start/health, and isolated runtime smoke
+- Python health, explicit Rust sidecar reuse health, and isolated runtime smoke
   passed;
+- state ownership gate passed:
+  - `17` stores checked;
+  - `13` existing stores copied into the backup;
+  - `13` backup entries verified;
+  - `13` backup entries restored into the disposable restore root;
+  - freeze/drain ledger plan written;
 - Rust read-only sidecar contracts: `17` passed, `0` failed, `0` skipped;
 - Rust mutating fixture contracts: `30` passed, `0` failed, `0` skipped;
 - gap probes: `0` failed;
@@ -119,11 +136,11 @@ shadow prediction status-only. The clean run now passes `/health`,
 `/health/detailed`, `/auth/session`, `/client/bootstrap`, `/sessions`,
 `/client/sessions`, `/nodes`, and `/events/state`.
 
-The same run measured the current Python process at `151.516 MiB` RSS and
-`64.3 MiB` physical footprint, while the Rust sidecar measured `17.422 MiB`
-RSS and `6.781 MiB` physical footprint.
+The same run measured the current Python process at `151.906 MiB` RSS and
+`64.8 MiB` physical footprint, while the Rust sidecar measured `21.516 MiB`
+RSS and `6.891 MiB` physical footprint.
 
-## Post-#912 Live Observation
+## Live Observation
 
 Live shadow mode is currently active. The most recent clean short-window report
 used:
@@ -154,7 +171,7 @@ The broad live Rust contract run now uses the fixture filter:
   --json
 ```
 
-Post-#912 result:
+Fixture-filtered live Rust contract result:
 
 - `71` passed;
 - `3` skipped because they are mutating checks without `--include-mutating`;
@@ -195,8 +212,11 @@ needed for final cutover evidence.
 3. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
    - Retained commands should be native Rust or intentionally routed.
    - Removed commands should be absent or explicitly retired.
-4. Implement final state ownership and migration tooling.
-   - Freeze or journal write admission before final backup.
+4. Complete final state ownership and migration tooling.
+   - Initial preflight, backup, restore, and freeze/drain evidence tools are
+     merged and exercised by the MVP rehearsal.
+   - Remaining work is the live write-admission freeze/journal gate before
+     final backup.
    - Prove rollback restores or accounts for every accepted write after the
      restore point.
 5. Complete public-edge deployment integration.
