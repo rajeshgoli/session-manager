@@ -23,6 +23,8 @@ from typing import Any, Iterable
 
 MANIFEST_PATH = Path(__file__).with_name("contracts_manifest.json")
 DEFAULT_TIMEOUT_SECONDS = 5.0
+DEFAULT_PYTHON_SM_BINARY = "sm"
+DEFAULT_RUST_SM_BINARY = "target/debug/sm"
 
 
 @dataclass(frozen=True)
@@ -567,7 +569,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--target", choices=("python", "rust"), default="python")
     parser.add_argument("--base-url", default=None)
-    parser.add_argument("--sm-binary", default="sm")
+    parser.add_argument(
+        "--sm-binary",
+        default=None,
+        help=(
+            "CLI binary for CLI checks. Defaults to 'sm' for --target python "
+            "and 'target/debug/sm' for --target rust."
+        ),
+    )
     parser.add_argument("--session-id", default=None)
     parser.add_argument(
         "--check-id",
@@ -593,12 +602,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     manifest = ContractManifest.load(args.manifest)
     fixtures = _parse_fixtures(args.fixture)
+    sm_binary = _resolve_sm_binary(args.target, args.sm_binary)
     try:
         results = run_checks(
             manifest,
             target=args.target,
             base_url=args.base_url,
-            sm_binary=args.sm_binary,
+            sm_binary=sm_binary,
             session_id=args.session_id,
             fixtures=fixtures,
             check_ids=set(args.check_id) if args.check_id else None,
@@ -627,6 +637,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{result.status.upper():7} {result.id}{elapsed}: {result.detail}")
         print(f"Summary: {summary}")
     return 1 if summary.get("failed", 0) else 0
+
+
+def _resolve_sm_binary(target: str, sm_binary: str | None) -> str:
+    if sm_binary:
+        return sm_binary
+    if target == "rust":
+        return DEFAULT_RUST_SM_BINARY
+    return DEFAULT_PYTHON_SM_BINARY
 
 
 def _parse_fixtures(raw_items: list[str]) -> dict[str, str]:

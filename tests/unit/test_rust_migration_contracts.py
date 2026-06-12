@@ -15,8 +15,10 @@ from scripts.rust_migration.contracts import (
     ContractCheck,
     ContractManifest,
     JsonExpectation,
+    _build_parser as _build_contracts_parser,
     _json_expectation_error,
     _parse_fixtures,
+    _resolve_sm_binary,
     _run_cli_check,
     _run_http_check,
     _render_template,
@@ -256,6 +258,15 @@ def test_mvp_rehearsal_defaults_to_rust_cli_binary():
     args = _build_parser().parse_args([])
 
     assert args.sm_binary == DEFAULT_RUST_SM_BINARY
+
+
+def test_contract_harness_resolves_target_specific_cli_defaults():
+    args = _build_contracts_parser().parse_args([])
+
+    assert args.sm_binary is None
+    assert _resolve_sm_binary("python", args.sm_binary) == "sm"
+    assert _resolve_sm_binary("rust", args.sm_binary) == "target/debug/sm"
+    assert _resolve_sm_binary("rust", "/tmp/custom-sm") == "/tmp/custom-sm"
 
 
 def test_mvp_rehearsal_does_not_build_custom_cli_binary():
