@@ -36,7 +36,10 @@ from scripts.rust_migration.mutating_fixture import (
 from scripts.rust_migration.mvp_rehearsal import (
     CORE_MUTATING_CHECK_IDS,
     DEFAULT_RUST_SM_BINARY,
+    READ_ONLY_FIXTURE_CHECK_IDS,
+    READ_ONLY_FIXTURE_VALUES,
     _build_parser,
+    _default_read_only_fixture_rust_base_url,
     _default_mutating_rust_base_url,
     _ensure_rust_cli_available,
     _run_contract_group,
@@ -272,6 +275,45 @@ def test_mvp_rehearsal_mutating_check_ids_match_manifest():
     assert set(CORE_MUTATING_CHECK_IDS) == expected
 
 
+def test_mvp_rehearsal_read_only_fixture_check_ids_are_retained_reads():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    expected = {
+        "http.session_detail_fixture",
+        "http.client_session_detail_fixture",
+        "http.session_output_fixture",
+        "http.attach_descriptor_fixture",
+        "http.codex_events",
+        "http.codex_activity_actions",
+        "http.codex_pending_requests",
+        "http.app_artifact_metadata",
+        "http.queue_jobs_list",
+        "http.queue_job_detail",
+    }
+
+    assert set(READ_ONLY_FIXTURE_CHECK_IDS) == expected
+    for check_id in READ_ONLY_FIXTURE_CHECK_IDS:
+        check = checks[check_id]
+        assert check.classification == "retained"
+        assert check.target == "python_and_rust"
+        assert check.safety == "read_only"
+        assert check.method == "GET"
+
+
+def test_mvp_rehearsal_read_only_fixture_values_cover_preconditions():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    for check_id in READ_ONLY_FIXTURE_CHECK_IDS:
+        check = checks[check_id]
+        for precondition in check.preconditions:
+            if precondition == "session_id":
+                assert READ_ONLY_FIXTURE_VALUES["session_id"] == "fixture001"
+            if precondition.startswith("fixture:"):
+                fixture_name = precondition.split(":", 1)[1]
+                assert READ_ONLY_FIXTURE_VALUES[fixture_name]
+
+
 def test_mvp_rehearsal_defaults_mutating_sidecar_to_next_port():
     assert (
         _default_mutating_rust_base_url("http://127.0.0.1:8421")
@@ -280,6 +322,17 @@ def test_mvp_rehearsal_defaults_mutating_sidecar_to_next_port():
     assert (
         _default_mutating_rust_base_url("https://sm.example.test")
         == "https://sm.example.test:444"
+    )
+
+
+def test_mvp_rehearsal_defaults_read_only_fixture_sidecar_to_second_next_port():
+    assert (
+        _default_read_only_fixture_rust_base_url("http://127.0.0.1:8421")
+        == "http://127.0.0.1:8423"
+    )
+    assert (
+        _default_read_only_fixture_rust_base_url("https://sm.example.test")
+        == "https://sm.example.test:445"
     )
 
 
@@ -338,6 +391,48 @@ def test_mvp_rehearsal_mutating_group_fails_on_skipped_checks():
 
     assert step["status"] == "failed"
     assert step["summary"]["skipped"] == 1
+
+
+def test_mvp_rehearsal_records_read_only_fixture_skip_step(tmp_path, monkeypatch):
+    monkeypatch.setenv("SM_CLIENT_CONFIG", str(tmp_path / "missing-client.yaml"))
+    args = _build_parser().parse_args(
+        [
+            "--skip-python-health",
+            "--skip-state-gate",
+            "--skip-smoke",
+            "--skip-baseline",
+            "--skip-shadow",
+            "--skip-read-only-fixture-contracts",
+            "--skip-mutating-contracts",
+            "--reuse-rust-sidecar",
+            "--output-dir",
+            str(tmp_path / "rehearsal"),
+        ]
+    )
+
+    with patch("scripts.rust_migration.mvp_rehearsal._probe_health") as probe:
+        probe.return_value = {
+            "status": "passed",
+            "elapsed_ms": 1.0,
+            "detail": "mock healthy",
+        }
+        with patch("scripts.rust_migration.mvp_rehearsal._run_contract_group") as run_group:
+            run_group.return_value = {
+                "name": "rust_core_sidecar_contracts",
+                "status": "passed",
+                "elapsed_ms": 1.0,
+                "summary": {"passed": 1, "failed": 0, "skipped": 0},
+                "results": [],
+            }
+            report = run_rehearsal(args)
+
+    step = next(
+        step
+        for step in report["steps"]
+        if step["name"] == "rust_read_only_fixture_contracts"
+    )
+    assert step["status"] == "skipped"
+    assert report["summary"]["status"] == "passed"
 
 
 def test_mvp_rehearsal_state_gate_copies_restores_and_records_plan(
