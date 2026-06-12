@@ -159,13 +159,19 @@ class CheckResult:
 
 
 def checks_for_target(
-    checks: Iterable[ContractCheck], target: str, include_mutating: bool
+    checks: Iterable[ContractCheck],
+    target: str,
+    include_mutating: bool,
+    *,
+    skip_fixture_checks: bool = False,
 ) -> list[ContractCheck]:
     selected: list[ContractCheck] = []
     for check in checks:
         if check.target == "rust_only" and target != "rust":
             continue
         if check.target == "python_only" and target != "python":
+            continue
+        if skip_fixture_checks and _is_fixture_check(check):
             continue
         if check.safety == "mutating" and not include_mutating:
             selected.append(check)
@@ -183,6 +189,7 @@ def run_checks(
     session_id: str | None,
     fixtures: dict[str, str] | None = None,
     include_mutating: bool,
+    skip_fixture_checks: bool = False,
     check_ids: set[str] | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> list[CheckResult]:
@@ -190,7 +197,12 @@ def run_checks(
     fixture_values = dict(fixtures or {})
     if session_id:
         fixture_values.setdefault("session_id", session_id)
-    selected_checks = checks_for_target(manifest.checks, target, include_mutating)
+    selected_checks = checks_for_target(
+        manifest.checks,
+        target,
+        include_mutating,
+        skip_fixture_checks=skip_fixture_checks,
+    )
     if check_ids is not None:
         known_ids = {check.id for check in selected_checks}
         unknown_ids = sorted(check_ids - known_ids)
@@ -235,6 +247,12 @@ def summarize(results: Iterable[CheckResult]) -> dict[str, int]:
     for result in results:
         summary[result.status] = summary.get(result.status, 0) + 1
     return summary
+
+
+def _is_fixture_check(check: ContractCheck) -> bool:
+    if check.id.endswith("_fixture") or "_fixture_" in check.id:
+        return True
+    return any(precondition.startswith("fixture:") for precondition in check.preconditions)
 
 
 def _skip_reason(
@@ -593,6 +611,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fixture value for manifest substitutions; repeatable",
     )
     parser.add_argument("--include-mutating", action="store_true")
+    parser.add_argument(
+        "--skip-fixture-checks",
+        action="store_true",
+        help=(
+            "Exclude synthetic fixture-bound checks for broad live-state runs. "
+            "Fixture checks still run by default."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--json", action="store_true", help="Emit JSON report")
     return parser
@@ -613,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
             fixtures=fixtures,
             check_ids=set(args.check_id) if args.check_id else None,
             include_mutating=args.include_mutating,
+            skip_fixture_checks=args.skip_fixture_checks,
             timeout_seconds=args.timeout,
         )
     except ValueError as exc:

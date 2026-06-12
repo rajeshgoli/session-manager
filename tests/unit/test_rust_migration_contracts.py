@@ -564,6 +564,75 @@ def test_mutating_checks_are_reported_as_skipped_without_opt_in():
     assert result_by_id["http.mobile_session_stop"].detail
 
 
+def test_skip_fixture_checks_excludes_synthetic_fixture_checks_only():
+    manifest = ContractManifest.load()
+    selected = checks_for_target(
+        manifest.checks,
+        target="rust",
+        include_mutating=False,
+        skip_fixture_checks=True,
+    )
+    ids = {check.id for check in selected}
+
+    assert "http.session_detail_fixture" not in ids
+    assert "http.session_output_fixture" not in ids
+    assert "http.queue_job_detail" not in ids
+    assert "http.health" in ids
+    assert "http.sessions" in ids
+    assert "http.session_tool_calls" in ids
+    assert "cli.what_retired" in ids
+
+
+def test_run_checks_skip_fixture_checks_allows_live_session_id_without_fixture_assertions():
+    manifest = ContractManifest(
+        schema_version=1,
+        source_spec="test",
+        artifacts=(),
+        checks=(
+            ContractCheck(
+                id="http.live",
+                surface="http",
+                classification="retained",
+                target="python_and_rust",
+                safety="read_only",
+                method="GET",
+                path="/health",
+                expected_status=(200,),
+                preconditions=("live_server",),
+                source="test",
+            ),
+            ContractCheck(
+                id="http.session_detail_fixture",
+                surface="http",
+                classification="retained",
+                target="python_and_rust",
+                safety="read_only",
+                method="GET",
+                path="/sessions/{session_id}",
+                expected_status=(200,),
+                preconditions=("live_server", "session_id"),
+                source="test",
+            ),
+        ),
+    )
+
+    with patch("scripts.rust_migration.contracts.urllib.request.urlopen") as urlopen:
+        response = urlopen.return_value.__enter__.return_value
+        response.status = 200
+        response.read.return_value = b"{}"
+        results = run_checks(
+            manifest,
+            target="rust",
+            base_url="http://127.0.0.1:8421",
+            sm_binary="target/debug/sm",
+            session_id="live-session",
+            include_mutating=False,
+            skip_fixture_checks=True,
+        )
+
+    assert [result.id for result in results] == ["http.live"]
+
+
 def test_existing_session_precondition_fails_for_stale_session_fixture():
     manifest = ContractManifest.load()
     not_found = urllib.error.HTTPError(

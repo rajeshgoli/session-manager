@@ -35,6 +35,17 @@ python -m scripts.rust_migration.contracts \
   --fixture codex_app_session_id=<codex-app-session-id>
 ```
 
+For broad live-state checks with a real session id, skip synthetic fixture
+contracts so fixture-specific names/output do not create false failures:
+
+```bash
+python -m scripts.rust_migration.contracts \
+  --target rust \
+  --base-url http://127.0.0.1:8421 \
+  --session-id <real-session-id> \
+  --skip-fixture-checks
+```
+
 Mutating checks never run unless `--include-mutating` is present. Use only
 disposable fixture sessions for checks such as retained mobile/API session stop.
 
