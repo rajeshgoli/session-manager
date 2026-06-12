@@ -152,6 +152,23 @@ rust_shadow:
   max_body_bytes: 65536
 ```
 
+Generate the non-destructive local plan before touching the running service:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.shadow_observation \
+  --config config.yaml \
+  --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
+  --fail-on-blockers
+```
+
+The planner checks that the Rust sidecar config and `cargo` are available,
+warns when Python is not healthy, blocks a fresh sidecar plan if the Rust port
+is already healthy, and prints the exact sidecar command, local Python
+`rust_shadow` config snippet, and ledger report command. It never edits
+`config.yaml`, restarts Session Manager, or starts a process. Use
+`--reuse-rust-sidecar` when intentionally observing against an already-running
+Rust sidecar.
+
 The ledger is JSONL. Each row includes method/path, redacted query metadata,
 Python status and body hash, Rust comparison result, Rust support status,
 latency, and any shadow transport error. Raw request and response bodies are not
