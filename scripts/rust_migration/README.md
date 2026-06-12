@@ -407,6 +407,9 @@ python -m scripts.rust_migration.mvp_rehearsal
 By default this:
 
 - checks Python `/health` on `http://127.0.0.1:8420`;
+- runs the state ownership gate: preflight, backup copy, backup verification,
+  disposable restore rehearsal, and freeze/drain plan ledger under the report
+  directory;
 - starts Rust `sm-server` on `http://127.0.0.1:8421` with `config.yaml`;
 - runs `scripts/rust-mvp-smoke.sh` for isolated mutating runtime coverage;
 - runs core read/retired-surface contracts against Rust;
@@ -425,7 +428,11 @@ state.
 
 Reports are written under `.local/rust-mvp-rehearsals/<timestamp>/` unless
 `--output-dir` is supplied. `.local/` is ignored; do not commit host-local
-reports.
+reports. The state gate writes detailed artifacts under
+`<report-dir>/state-gate/`, including `state-backup-manifest.json`,
+`state-restore-report.json`, and `freeze-drain-ledger.jsonl`. If this gate
+blocks, the rehearsal exits before Rust sidecar startup because the run cannot
+serve as cutover evidence.
 
 Useful variants:
 
@@ -437,6 +444,7 @@ python -m scripts.rust_migration.mvp_rehearsal --reuse-rust-sidecar
 python -m scripts.rust_migration.mvp_rehearsal \
   --config scripts/rust_migration/fixtures/read_only/config.yaml \
   --skip-python-health \
+  --skip-state-gate \
   --skip-smoke \
   --skip-baseline \
   --skip-shadow \
