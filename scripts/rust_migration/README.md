@@ -169,6 +169,22 @@ is already healthy, and prints the exact sidecar command, local Python
 `--reuse-rust-sidecar` when intentionally observing against an already-running
 Rust sidecar.
 
+After reviewing the planner output, prepare the local Python config with the
+dry-run-first activation helper:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.shadow_config \
+  --config config.yaml \
+  --endpoint http://127.0.0.1:8421/__shadow/http \
+  --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl
+```
+
+By default this only prints a unified diff. Re-run with `--write` after
+reviewing the diff to replace or append only the top-level `rust_shadow`
+section. A timestamped `.shadow-backup-*` copy is created before any write.
+The helper does not restart Session Manager or start Rust; restart Python
+deliberately after accepting the local config change.
+
 The ledger is JSONL. Each row includes method/path, redacted query metadata,
 Python status and body hash, Rust comparison result, Rust support status,
 latency, and any shadow transport error. Raw request and response bodies are not
