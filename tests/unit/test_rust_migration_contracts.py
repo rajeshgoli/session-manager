@@ -31,6 +31,14 @@ from scripts.rust_migration.mutating_fixture import (
     DEFAULT_SESSION_ID,
     create_mutating_fixture_workspace,
 )
+from scripts.rust_migration.mvp_rehearsal import (
+    CORE_MUTATING_CHECK_IDS,
+    DEFAULT_RUST_SM_BINARY,
+    _build_parser,
+    _default_mutating_rust_base_url,
+    _ensure_rust_cli_available,
+    _run_contract_group,
+)
 
 
 def test_manifest_preserves_mobile_kill_route_while_retiring_cli_alias():
@@ -220,6 +228,76 @@ def test_manifest_uses_dedicated_notify_child_for_stop_notification_fixture():
     assert "fixture:child_session_id" not in notify.preconditions
     expectations = {expectation.path: expectation for expectation in notify.expected_json}
     assert expectations["/session_id"].equals == "{notify_child_session_id}"
+
+
+def test_mvp_rehearsal_mutating_check_ids_match_manifest():
+    manifest = ContractManifest.load()
+    expected = {
+        check.id
+        for check in manifest.checks
+        if check.target == "rust_only" and check.safety == "mutating"
+    }
+
+    assert set(CORE_MUTATING_CHECK_IDS) == expected
+
+
+def test_mvp_rehearsal_defaults_mutating_sidecar_to_next_port():
+    assert (
+        _default_mutating_rust_base_url("http://127.0.0.1:8421")
+        == "http://127.0.0.1:8422"
+    )
+    assert (
+        _default_mutating_rust_base_url("https://sm.example.test")
+        == "https://sm.example.test:444"
+    )
+
+
+def test_mvp_rehearsal_defaults_to_rust_cli_binary():
+    args = _build_parser().parse_args([])
+
+    assert args.sm_binary == DEFAULT_RUST_SM_BINARY
+
+
+def test_mvp_rehearsal_does_not_build_custom_cli_binary():
+    args = _build_parser().parse_args(["--sm-binary", "/tmp/custom-sm"])
+
+    assert _ensure_rust_cli_available(args) is None
+
+
+def test_mvp_rehearsal_mutating_group_fails_on_skipped_checks():
+    manifest = ContractManifest(
+        schema_version=1,
+        source_spec="test",
+        artifacts=(),
+        checks=(
+            ContractCheck(
+                id="cli.fixture_missing_cli",
+                surface="cli",
+                classification="retained",
+                target="rust_only",
+                safety="mutating",
+                command=("noop",),
+                expected_exit=(0,),
+                preconditions=("sm_cli", "mutating_opt_in"),
+                source="test",
+            ),
+        ),
+    )
+
+    step = _run_contract_group(
+        manifest,
+        name="mutating",
+        target="rust",
+        base_url="http://127.0.0.1:8422",
+        sm_binary="/definitely/not/a/session-manager-cli",
+        check_ids={"cli.fixture_missing_cli"},
+        timeout_seconds=0.1,
+        include_mutating=True,
+        fail_on_skipped=True,
+    )
+
+    assert step["status"] == "failed"
+    assert step["summary"]["skipped"] == 1
 
 
 def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
