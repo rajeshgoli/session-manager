@@ -96,6 +96,57 @@ def test_shadow_observation_plan_generates_non_destructive_commands(tmp_path):
     assert "Summarize ledger:" in rendered
 
 
+def test_shadow_observation_plan_includes_report_coverage_gates(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("server: {}\n", encoding="utf-8")
+    ledger = tmp_path / "rust_shadow.jsonl"
+
+    plan = build_observation_plan(
+        config=config,
+        ledger=ledger,
+        probe_health=_python_healthy_rust_unreachable_probe,
+        cargo_resolver=lambda _cargo: "/usr/bin/cargo",
+        report_last_minutes=60,
+        report_min_rows=1000,
+        report_required_routes=["GET /sessions", "GET /events/state"],
+        report_min_route_rows=["GET /sessions=100", "GET /events/state=100"],
+    )
+
+    assert plan["inputs"]["report_last_minutes"] == 60
+    assert plan["inputs"]["report_min_rows"] == 1000
+    assert plan["inputs"]["report_required_routes"] == [
+        "GET /sessions",
+        "GET /events/state",
+    ]
+    assert plan["inputs"]["report_min_route_rows"] == [
+        "GET /sessions=100",
+        "GET /events/state=100",
+    ]
+    assert plan["commands"]["summarize_shadow_ledger"] == [
+        "./venv/bin/python",
+        "-m",
+        "scripts.rust_migration.shadow_report",
+        "--ledger",
+        str(ledger),
+        "--fail-on-blockers",
+        "--last-minutes",
+        "60",
+        "--min-rows",
+        "1000",
+        "--require-route",
+        "GET /sessions",
+        "--require-route",
+        "GET /events/state",
+        "--min-route-rows",
+        "GET /sessions=100",
+        "--min-route-rows",
+        "GET /events/state=100",
+    ]
+    rendered = render_text_plan(plan)
+    assert "--min-rows 1000" in rendered
+    assert "'GET /sessions'" in rendered
+
+
 def test_shadow_observation_plan_blocks_when_rust_port_already_healthy(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("server: {}\n", encoding="utf-8")
@@ -182,6 +233,40 @@ def test_shadow_observation_cli_json_and_fail_on_blockers(tmp_path, capsys):
     assert '"status": "blocked"' in output
     assert "missing_config" in output
     assert "missing_cargo" in output
+
+
+def test_shadow_observation_cli_json_includes_report_coverage_gates(tmp_path, capsys):
+    config = tmp_path / "config.yaml"
+    config.write_text("server: {}\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--config",
+            str(config),
+            "--python-base-url",
+            "http://127.0.0.1:1",
+            "--rust-base-url",
+            "http://127.0.0.1:2",
+            "--reuse-rust-sidecar",
+            "--report-last-minutes",
+            "60",
+            "--report-min-rows",
+            "1000",
+            "--report-require-route",
+            "GET /sessions",
+            "--report-min-route-rows",
+            "GET /sessions=100",
+            "--json",
+            "--fail-on-blockers",
+        ]
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert '"report_last_minutes": 60.0' in output
+    assert '"report_min_rows": 1000' in output
+    assert '"--last-minutes"' in output
+    assert '"GET /sessions=100"' in output
 
 
 def test_shadow_observation_probe_reports_http_error_as_unhealthy(monkeypatch):
