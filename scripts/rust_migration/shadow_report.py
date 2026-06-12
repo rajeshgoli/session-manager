@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
@@ -28,6 +29,8 @@ def summarize_ledger(
     min_rows: int | None = None,
     required_routes: Sequence[str] | None = None,
     min_route_rows: Mapping[str, int] | None = None,
+    required_route_patterns: Sequence[str] | None = None,
+    min_route_pattern_rows: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     ledger_path = ledger_path.expanduser()
     since_filter = _resolve_since_filter(
@@ -110,6 +113,8 @@ def summarize_ledger(
             min_rows=min_rows,
             required_routes=required_routes or (),
             min_route_rows=min_route_rows or {},
+            required_route_patterns=required_route_patterns or (),
+            min_route_pattern_rows=min_route_pattern_rows or {},
         )
     )
 
@@ -131,6 +136,8 @@ def summarize_ledger(
             "min_rows": min_rows,
             "required_routes": list(required_routes or ()),
             "min_route_rows": dict(sorted((min_route_rows or {}).items())),
+            "required_route_patterns": list(required_route_patterns or ()),
+            "min_route_pattern_rows": dict(sorted((min_route_pattern_rows or {}).items())),
         },
         "status": status,
         "row_count": row_count,
@@ -185,6 +192,10 @@ def render_text_report(report: dict[str, Any]) -> str:
             lines.append(f"  required route: {route}")
         for route, count in (gates.get("min_route_rows") or {}).items():
             lines.append(f"  min route rows: {route} >= {count}")
+        for pattern in gates.get("required_route_patterns") or ():
+            lines.append(f"  required route pattern: {pattern}")
+        for pattern, count in (gates.get("min_route_pattern_rows") or {}).items():
+            lines.append(f"  min route pattern rows: {pattern} >= {count}")
 
     if report["blockers"]:
         lines.extend(["", "Blockers:"])
@@ -396,6 +407,8 @@ def _coverage_gate_blockers(
     min_rows: int | None,
     required_routes: Sequence[str],
     min_route_rows: Mapping[str, int],
+    required_route_patterns: Sequence[str],
+    min_route_pattern_rows: Mapping[str, int],
 ) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     if min_rows is not None and row_count < min_rows:
@@ -424,7 +437,34 @@ def _coverage_gate_blockers(
                     "detail": f"observed {observed}, required {minimum}",
                 }
             )
+    for pattern in required_route_patterns:
+        if _route_pattern_count(route_row_counts, pattern) == 0:
+            blockers.append(
+                {
+                    "kind": "missing_required_route_pattern",
+                    "route": pattern,
+                    "detail": "required route pattern not observed",
+                }
+            )
+    for pattern, minimum in min_route_pattern_rows.items():
+        observed = _route_pattern_count(route_row_counts, pattern)
+        if observed < minimum:
+            blockers.append(
+                {
+                    "kind": "insufficient_route_pattern_rows",
+                    "route": pattern,
+                    "detail": f"observed {observed}, required {minimum}",
+                }
+            )
     return blockers
+
+
+def _route_pattern_count(route_row_counts: Mapping[str, int], pattern: str) -> int:
+    return sum(
+        count
+        for route, count in route_row_counts.items()
+        if fnmatch.fnmatchcase(route, pattern)
+    )
 
 
 def _normalize_route_requirement(value: str) -> str:
@@ -510,6 +550,24 @@ def _build_parser() -> argparse.ArgumentParser:
             "'METHOD /path=N'. Repeatable."
         ),
     )
+    parser.add_argument(
+        "--require-route-pattern",
+        action="append",
+        default=[],
+        help=(
+            "Require at least one observation matching a shell-style route "
+            "pattern, formatted as 'METHOD /path/*'. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--min-route-pattern-rows",
+        action="append",
+        default=[],
+        help=(
+            "Require at least N observations matching a shell-style route "
+            "pattern, formatted as 'METHOD /path/*=N'. Repeatable."
+        ),
+    )
     return parser
 
 
@@ -525,6 +583,14 @@ def main(argv: list[str] | None = None) -> int:
             _parse_route_minimum(requirement)
             for requirement in args.min_route_rows
         )
+        required_route_patterns = [
+            _normalize_route_requirement(pattern)
+            for pattern in args.require_route_pattern
+        ]
+        min_route_pattern_rows = dict(
+            _parse_route_minimum(requirement)
+            for requirement in args.min_route_pattern_rows
+        )
         report = summarize_ledger(
             args.ledger,
             since=since,
@@ -532,6 +598,8 @@ def main(argv: list[str] | None = None) -> int:
             min_rows=args.min_rows,
             required_routes=required_routes,
             min_route_rows=min_route_rows,
+            required_route_patterns=required_route_patterns,
+            min_route_pattern_rows=min_route_pattern_rows,
         )
     except ValueError as exc:
         parser.error(str(exc))

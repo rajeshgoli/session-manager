@@ -281,6 +281,7 @@ Generate the non-destructive local plan before touching the running service:
   --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
   --report-last-minutes 60 \
   --report-min-rows 1000 \
+  --mobile-sm-app-profile \
   --report-require-route 'GET /sessions' \
   --report-require-route 'GET /events/state' \
   --report-min-route-rows 'GET /sessions=100' \
@@ -296,7 +297,11 @@ is already healthy, and prints the exact sidecar command, local Python
 `--reuse-rust-sidecar` when intentionally observing against an already-running
 Rust sidecar. `--report-*` options are copied into the generated
 `shadow_report` command so the operator-reviewed plan and the final observation
-gate use the same window and coverage thresholds.
+gate use the same window and coverage thresholds. `--mobile-sm-app-profile`
+adds native app read coverage gates for `/auth/session`, `/client/bootstrap`,
+`/client/sessions`, `/client/analytics/summary`, `/client/sessions/{id}`, and
+`/sessions/{id}/attach-descriptor`; exercise the sm app during that observation
+window or the gate should block.
 
 After reviewing the planner output, prepare the local Python config with the
 dry-run-first activation helper:
@@ -381,15 +386,24 @@ coverage. Quote route arguments because they contain spaces:
   --min-rows 1000 \
   --require-route 'GET /sessions' \
   --require-route 'GET /events/state' \
+  --require-route 'GET /client/analytics/summary' \
+  --require-route-pattern 'GET /client/sessions/*' \
+  --require-route-pattern 'GET /sessions/*/attach-descriptor' \
   --min-route-rows 'GET /sessions=100' \
   --min-route-rows 'GET /events/state=100' \
   --fail-on-blockers
 ```
 
 Coverage gate failures are reported as blockers (`insufficient_rows`,
-`missing_required_route`, or `insufficient_route_rows`) so the same
-`--fail-on-blockers` automation path handles mismatches and insufficient
+`missing_required_route`, `insufficient_route_rows`,
+`missing_required_route_pattern`, or `insufficient_route_pattern_rows`) so the
+same `--fail-on-blockers` automation path handles mismatches and insufficient
 observation evidence.
+
+Passive shadow observation is read-only. Native app side-effect flows such as
+attach-ticket minting, request-status prompts, bug-report submission, and device
+revocation/list changes should be covered by disposable fixture or smoke
+rehearsal gates, not by executing Rust against live state from shadow mode.
 
 ## MVP Sidecar Rehearsal
 
@@ -428,7 +442,11 @@ own yet. `/nodes` includes live node-agent connectivity that the sidecar does
 not own yet. `/client/bootstrap` can advertise Python-only mobile-terminal
 attach support until Rust owns the terminal/ticket routes. The shadow summary
 treats those paths as status-only until Rust owns the corresponding runtime
-state.
+state. The active rehearsal shadow summary also probes
+`/client/analytics/summary` and, when Python has at least one live session,
+`/client/sessions/{id}` plus `/sessions/{id}/attach-descriptor`, so native app
+read prediction is exercised before a longer passive mobile observation window
+is collected.
 
 Reports are written under `.local/rust-mvp-rehearsals/<timestamp>/` unless
 `--output-dir` is supplied. `.local/` is ignored; do not commit host-local

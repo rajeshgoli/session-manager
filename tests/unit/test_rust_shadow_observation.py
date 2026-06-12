@@ -147,6 +147,67 @@ def test_shadow_observation_plan_includes_report_coverage_gates(tmp_path):
     assert "'GET /sessions'" in rendered
 
 
+def test_shadow_observation_mobile_profile_adds_native_app_gates(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("server: {}\n", encoding="utf-8")
+    ledger = tmp_path / "rust_shadow.jsonl"
+
+    plan = build_observation_plan(
+        config=config,
+        ledger=ledger,
+        probe_health=_python_healthy_rust_unreachable_probe,
+        cargo_resolver=lambda _cargo: "/usr/bin/cargo",
+        report_required_routes=["GET /sessions"],
+        mobile_sm_app_profile=True,
+    )
+
+    assert plan["inputs"]["mobile_sm_app_profile"] is True
+    assert plan["inputs"]["report_required_routes"] == [
+        "GET /sessions",
+        "GET /auth/session",
+        "GET /client/bootstrap",
+        "GET /client/sessions",
+        "GET /client/analytics/summary",
+    ]
+    assert plan["inputs"]["report_required_route_patterns"] == [
+        "GET /client/sessions/*",
+        "GET /sessions/*/attach-descriptor",
+    ]
+    assert "--require-route-pattern" in plan["commands"]["summarize_shadow_ledger"]
+    assert "GET /client/sessions/*" in plan["commands"]["summarize_shadow_ledger"]
+    rendered = render_text_plan(plan)
+    assert "--require-route 'GET /client/analytics/summary'" in rendered
+    assert "--require-route-pattern 'GET /sessions/*/attach-descriptor'" in rendered
+    assert "Exercise the native sm app" in rendered
+
+
+def test_shadow_observation_cli_json_includes_mobile_profile_gates(tmp_path, capsys):
+    config = tmp_path / "config.yaml"
+    config.write_text("server: {}\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--config",
+            str(config),
+            "--python-base-url",
+            "http://127.0.0.1:1",
+            "--rust-base-url",
+            "http://127.0.0.1:2",
+            "--reuse-rust-sidecar",
+            "--mobile-sm-app-profile",
+            "--json",
+            "--fail-on-blockers",
+        ]
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert '"mobile_sm_app_profile": true' in output
+    assert '"GET /client/analytics/summary"' in output
+    assert '"GET /sessions/*/attach-descriptor"' in output
+    assert '"--require-route-pattern"' in output
+
+
 def test_shadow_observation_plan_blocks_when_rust_port_already_healthy(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("server: {}\n", encoding="utf-8")
