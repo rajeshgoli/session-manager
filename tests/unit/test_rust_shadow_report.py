@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 from scripts.rust_migration.shadow_report import (
     main,
@@ -220,3 +221,170 @@ def test_shadow_report_marks_non_numeric_http_status_as_blocker(tmp_path):
             "detail": "not-a-status",
         }
     ]
+
+
+def test_shadow_report_filters_valid_rows_since_timestamp(tmp_path):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T01:59:59Z",
+                "method": "GET",
+                "path": "/before",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            },
+            {
+                "observed_at": "2026-06-12T02:00:00+00:00",
+                "method": "GET",
+                "path": "/at",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            },
+            {
+                "observed_at": "2026-06-12T02:00:01+00:00",
+                "method": "GET",
+                "path": "/after",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
+        ],
+    )
+
+    report = summarize_ledger(
+        ledger,
+        since=datetime(2026, 6, 12, 2, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert report["status"] == "passed"
+    assert report["row_count"] == 2
+    assert report["filter"]["since"] == "2026-06-12T02:00:00+00:00"
+    assert [row["route"] for row in report["route_summaries"]] == [
+        "GET /after",
+        "GET /at",
+    ]
+
+
+def test_shadow_report_last_minutes_uses_supplied_now(tmp_path):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T02:44:59+00:00",
+                "method": "GET",
+                "path": "/old",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            },
+            {
+                "observed_at": "2026-06-12T02:45:00+00:00",
+                "method": "GET",
+                "path": "/inside",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            },
+        ],
+    )
+
+    report = summarize_ledger(
+        ledger,
+        last_minutes=15,
+        now=datetime(2026, 6, 12, 3, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert report["status"] == "passed"
+    assert report["row_count"] == 1
+    assert report["filter"] == {
+        "since": "2026-06-12T02:45:00+00:00",
+        "last_minutes": 15,
+    }
+    assert report["route_summaries"][0]["route"] == "GET /inside"
+
+
+def test_shadow_report_keeps_invalid_json_visible_under_filter(tmp_path):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    ledger.write_text(
+        json.dumps(
+            {
+                "observed_at": "2026-06-12T01:00:00Z",
+                "method": "GET",
+                "path": "/old",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            }
+        )
+        + "\n{not-json}\n",
+        encoding="utf-8",
+    )
+
+    report = summarize_ledger(
+        ledger,
+        since=datetime(2026, 6, 12, 2, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert report["status"] == "blocked"
+    assert report["row_count"] == 0
+    assert report["invalid_row_count"] == 1
+    assert report["blockers"][0]["kind"] == "invalid_json"
+
+
+def test_shadow_report_marks_unfilterable_timestamp_as_blocker(tmp_path):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "method": "GET",
+                "path": "/missing-timestamp",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            }
+        ],
+    )
+
+    report = summarize_ledger(
+        ledger,
+        since=datetime(2026, 6, 12, 2, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert report["status"] == "blocked"
+    assert report["row_count"] == 0
+    assert report["blockers"] == [
+        {
+            "kind": "invalid_observed_at",
+            "line": 1,
+            "route": "GET /missing-timestamp",
+            "detail": "missing observed_at timestamp",
+        }
+    ]
+
+
+def test_shadow_report_cli_accepts_since_filter(tmp_path, capsys):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T01:00:00Z",
+                "method": "GET",
+                "path": "/old",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            },
+            {
+                "observed_at": "2026-06-12T02:00:00Z",
+                "method": "GET",
+                "path": "/new",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            },
+        ],
+    )
+
+    assert main(["--ledger", str(ledger), "--since", "2026-06-12T02:00:00Z", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["row_count"] == 1
+    assert report["route_summaries"][0]["route"] == "GET /new"

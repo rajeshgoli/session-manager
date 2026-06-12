@@ -228,6 +228,20 @@ invalid ledger rows. `not_compared` rows are summarized but are not blockers by
 default because retained writes may be intentionally observed without Rust side
 effects before cutover.
 
+For a bounded observation window, filter valid rows by timestamp:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.shadow_report \
+  --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
+  --last-minutes 60 \
+  --fail-on-blockers
+```
+
+Use `--since 2026-06-12T02:00:00Z` when the window start is known exactly.
+Invalid JSON rows, invalid row shapes, and rows with missing or malformed
+`observed_at` timestamps remain blockers under a filter because they cannot be
+assigned safely to an observation window.
+
 ## MVP Sidecar Rehearsal
 
 The MVP rehearsal gate starts Rust as a sidecar, keeps Python authoritative, and

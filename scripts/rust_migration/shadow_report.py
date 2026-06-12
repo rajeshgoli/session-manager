@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +18,19 @@ BLOCKING_COMPARISONS = {
 }
 
 
-def summarize_ledger(ledger_path: Path) -> dict[str, Any]:
+def summarize_ledger(
+    ledger_path: Path,
+    *,
+    since: datetime | None = None,
+    last_minutes: float | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     ledger_path = ledger_path.expanduser()
+    since_filter = _resolve_since_filter(
+        since=since,
+        last_minutes=last_minutes,
+        now=now,
+    )
     route_stats: dict[str, dict[str, Any]] = defaultdict(_route_summary)
     comparison_counts: Counter[str] = Counter()
     support_status_counts: Counter[str] = Counter()
@@ -55,6 +66,13 @@ def summarize_ledger(ledger_path: Path) -> dict[str, Any]:
                     invalid_rows.append(blocker)
                     blockers.append(blocker)
                     continue
+                if since_filter and not _record_is_inside_window(
+                    record=record,
+                    since=since_filter,
+                    line_number=line_number,
+                    blockers=blockers,
+                ):
+                    continue
                 row_count += 1
                 _record_row(
                     record=record,
@@ -87,6 +105,10 @@ def summarize_ledger(ledger_path: Path) -> dict[str, Any]:
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "ledger_path": str(ledger_path),
+        "filter": {
+            "since": since_filter.isoformat() if since_filter else None,
+            "last_minutes": last_minutes,
+        },
         "status": status,
         "row_count": row_count,
         "invalid_row_count": len(invalid_rows),
@@ -101,6 +123,7 @@ def render_text_report(report: dict[str, Any]) -> str:
     lines = [
         "Rust shadow observation report",
         f"ledger: {report['ledger_path']}",
+        f"window: {_window_label(report.get('filter'))}",
         f"status: {report['status']}",
         f"rows: {report['row_count']}",
         f"blockers: {len(report['blockers'])}",
@@ -273,6 +296,74 @@ def _optional_int(value: Any) -> int | str | None:
         return "invalid"
 
 
+def _resolve_since_filter(
+    *,
+    since: datetime | None,
+    last_minutes: float | None,
+    now: datetime | None,
+) -> datetime | None:
+    if since is not None and last_minutes is not None:
+        raise ValueError("since and last_minutes are mutually exclusive")
+    if last_minutes is not None:
+        if last_minutes <= 0:
+            raise ValueError("last_minutes must be greater than zero")
+        resolved_now = _ensure_aware_utc(now or datetime.now(timezone.utc))
+        return resolved_now - timedelta(minutes=last_minutes)
+    if since is not None:
+        return _ensure_aware_utc(since)
+    return None
+
+
+def _record_is_inside_window(
+    *,
+    record: dict[str, Any],
+    since: datetime,
+    line_number: int,
+    blockers: list[dict[str, Any]],
+) -> bool:
+    observed_at = record.get("observed_at")
+    try:
+        observed_at_dt = _parse_timestamp(str(observed_at))
+    except ValueError as exc:
+        blockers.append(
+            {
+                "kind": "invalid_observed_at",
+                "line": line_number,
+                "route": _route_key(record),
+                "detail": str(exc),
+            }
+        )
+        return False
+    return observed_at_dt >= since
+
+
+def _parse_timestamp(value: str) -> datetime:
+    if not value or value == "None":
+        raise ValueError("missing observed_at timestamp")
+    normalized = value
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"invalid observed_at timestamp: {value}") from exc
+    return _ensure_aware_utc(parsed)
+
+
+def _ensure_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _window_label(filter_info: Any) -> str:
+    if not isinstance(filter_info, dict) or not filter_info.get("since"):
+        return "all"
+    if filter_info.get("last_minutes") is not None:
+        return f"last {filter_info['last_minutes']} minutes since {filter_info['since']}"
+    return f"since {filter_info['since']}"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Summarize a Rust shadow JSONL ledger."
@@ -284,6 +375,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Shadow ledger path (default: {DEFAULT_LEDGER_PATH})",
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON report")
+    window_group = parser.add_mutually_exclusive_group()
+    window_group.add_argument(
+        "--since",
+        help=(
+            "Only summarize valid rows observed at or after this ISO-8601 "
+            "timestamp. Invalid rows remain blockers because they cannot be "
+            "timestamp-filtered safely."
+        ),
+    )
+    window_group.add_argument(
+        "--last-minutes",
+        type=float,
+        help="Only summarize valid rows from the last N minutes.",
+    )
     parser.add_argument(
         "--fail-on-blockers",
         action="store_true",
@@ -293,8 +398,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
-    report = summarize_ledger(args.ledger)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        since = _parse_timestamp(args.since) if args.since else None
+        report = summarize_ledger(
+            args.ledger,
+            since=since,
+            last_minutes=args.last_minutes,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
