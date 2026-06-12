@@ -67,6 +67,10 @@ python -m scripts.rust_migration.contracts \
   --check-id http.queue_policy_runs_retired
 ```
 
+For `--target rust`, CLI checks default to `target/debug/sm` so retired or
+Rust-only CLI contracts do not accidentally exercise the Python `sm` on PATH.
+Pass `--sm-binary <path>` when testing another Rust CLI build.
+
 Fixture-backed checks assert concrete session projection and output behavior:
 
 ```bash
