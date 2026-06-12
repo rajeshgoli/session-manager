@@ -257,6 +257,26 @@ Invalid JSON rows, invalid row shapes, and rows with missing or malformed
 `observed_at` timestamps remain blockers under a filter because they cannot be
 assigned safely to an observation window.
 
+For an automation-grade observation gate, require both total volume and route
+coverage. Quote route arguments because they contain spaces:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.shadow_report \
+  --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
+  --last-minutes 60 \
+  --min-rows 1000 \
+  --require-route 'GET /sessions' \
+  --require-route 'GET /events/state' \
+  --min-route-rows 'GET /sessions=100' \
+  --min-route-rows 'GET /events/state=100' \
+  --fail-on-blockers
+```
+
+Coverage gate failures are reported as blockers (`insufficient_rows`,
+`missing_required_route`, or `insufficient_route_rows`) so the same
+`--fail-on-blockers` automation path handles mismatches and insufficient
+observation evidence.
+
 ## MVP Sidecar Rehearsal
 
 The MVP rehearsal gate starts Rust as a sidecar, keeps Python authoritative, and

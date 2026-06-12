@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ def summarize_ledger(
     since: datetime | None = None,
     last_minutes: float | None = None,
     now: datetime | None = None,
+    min_rows: int | None = None,
+    required_routes: Sequence[str] | None = None,
+    min_route_rows: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     ledger_path = ledger_path.expanduser()
     since_filter = _resolve_since_filter(
@@ -31,6 +35,8 @@ def summarize_ledger(
         last_minutes=last_minutes,
         now=now,
     )
+    if min_rows is not None and min_rows < 1:
+        raise ValueError("min_rows must be greater than zero")
     route_stats: dict[str, dict[str, Any]] = defaultdict(_route_summary)
     comparison_counts: Counter[str] = Counter()
     support_status_counts: Counter[str] = Counter()
@@ -84,7 +90,9 @@ def summarize_ledger(
                 )
 
     route_summaries = []
+    route_row_counts: dict[str, int] = {}
     for route, summary in sorted(route_stats.items()):
+        route_row_counts[route] = summary["rows"]
         route_summaries.append(
             {
                 "route": route,
@@ -94,6 +102,16 @@ def summarize_ledger(
                 "blockers": summary["blockers"],
             }
         )
+
+    blockers.extend(
+        _coverage_gate_blockers(
+            row_count=row_count,
+            route_row_counts=route_row_counts,
+            min_rows=min_rows,
+            required_routes=required_routes or (),
+            min_route_rows=min_route_rows or {},
+        )
+    )
 
     status = "passed"
     if blockers:
@@ -108,6 +126,11 @@ def summarize_ledger(
         "filter": {
             "since": since_filter.isoformat() if since_filter else None,
             "last_minutes": last_minutes,
+        },
+        "gates": {
+            "min_rows": min_rows,
+            "required_routes": list(required_routes or ()),
+            "min_route_rows": dict(sorted((min_route_rows or {}).items())),
         },
         "status": status,
         "row_count": row_count,
@@ -152,6 +175,16 @@ def render_text_report(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("  none")
+
+    gates = report.get("gates")
+    if isinstance(gates, dict) and any(gates.values()):
+        lines.extend(["", "Coverage Gates:"])
+        if gates.get("min_rows") is not None:
+            lines.append(f"  min rows: {gates['min_rows']}")
+        for route in gates.get("required_routes") or ():
+            lines.append(f"  required route: {route}")
+        for route, count in (gates.get("min_route_rows") or {}).items():
+            lines.append(f"  min route rows: {route} >= {count}")
 
     if report["blockers"]:
         lines.extend(["", "Blockers:"])
@@ -356,6 +389,66 @@ def _ensure_aware_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _coverage_gate_blockers(
+    *,
+    row_count: int,
+    route_row_counts: Mapping[str, int],
+    min_rows: int | None,
+    required_routes: Sequence[str],
+    min_route_rows: Mapping[str, int],
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if min_rows is not None and row_count < min_rows:
+        blockers.append(
+            {
+                "kind": "insufficient_rows",
+                "detail": f"observed {row_count}, required {min_rows}",
+            }
+        )
+    for route in required_routes:
+        if route_row_counts.get(route, 0) == 0:
+            blockers.append(
+                {
+                    "kind": "missing_required_route",
+                    "route": route,
+                    "detail": "required route not observed",
+                }
+            )
+    for route, minimum in min_route_rows.items():
+        observed = route_row_counts.get(route, 0)
+        if observed < minimum:
+            blockers.append(
+                {
+                    "kind": "insufficient_route_rows",
+                    "route": route,
+                    "detail": f"observed {observed}, required {minimum}",
+                }
+            )
+    return blockers
+
+
+def _normalize_route_requirement(value: str) -> str:
+    parts = value.strip().split(maxsplit=1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError("route requirements must use 'METHOD /path' format")
+    return f"{parts[0].upper()} {parts[1]}"
+
+
+def _parse_route_minimum(value: str) -> tuple[str, int]:
+    if "=" not in value:
+        raise ValueError("route row minimums must use 'METHOD /path=N' format")
+    route, raw_count = value.rsplit("=", 1)
+    try:
+        minimum = int(raw_count)
+    except ValueError as exc:
+        raise ValueError(
+            "route row minimum count must be an integer greater than zero"
+        ) from exc
+    if minimum < 1:
+        raise ValueError("route row minimum count must be greater than zero")
+    return _normalize_route_requirement(route), minimum
+
+
 def _window_label(filter_info: Any) -> str:
     if not isinstance(filter_info, dict) or not filter_info.get("since"):
         return "all"
@@ -394,6 +487,29 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit non-zero when mismatches, shadow errors, or invalid rows exist",
     )
+    parser.add_argument(
+        "--min-rows",
+        type=int,
+        help="Require at least this many valid rows in the selected window.",
+    )
+    parser.add_argument(
+        "--require-route",
+        action="append",
+        default=[],
+        help=(
+            "Require at least one observation for a route, formatted as "
+            "'METHOD /path'. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--min-route-rows",
+        action="append",
+        default=[],
+        help=(
+            "Require at least N observations for a route, formatted as "
+            "'METHOD /path=N'. Repeatable."
+        ),
+    )
     return parser
 
 
@@ -402,10 +518,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         since = _parse_timestamp(args.since) if args.since else None
+        required_routes = [
+            _normalize_route_requirement(route) for route in args.require_route
+        ]
+        min_route_rows = dict(
+            _parse_route_minimum(requirement)
+            for requirement in args.min_route_rows
+        )
         report = summarize_ledger(
             args.ledger,
             since=since,
             last_minutes=args.last_minutes,
+            min_rows=args.min_rows,
+            required_routes=required_routes,
+            min_route_rows=min_route_rows,
         )
     except ValueError as exc:
         parser.error(str(exc))
