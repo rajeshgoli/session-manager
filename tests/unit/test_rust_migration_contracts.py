@@ -24,6 +24,13 @@ from scripts.rust_migration.contracts import (
     run_checks,
     summarize,
 )
+from scripts.rust_migration.mutating_fixture import (
+    DEFAULT_CHILD_SESSION_ID,
+    DEFAULT_EM_SESSION_ID,
+    DEFAULT_NOTIFY_CHILD_SESSION_ID,
+    DEFAULT_SESSION_ID,
+    create_mutating_fixture_workspace,
+)
 
 
 def test_manifest_preserves_mobile_kill_route_while_retiring_cli_alias():
@@ -203,6 +210,18 @@ def test_manifest_covers_rust_core_fixture_lifecycle_cli_checks():
         assert "fixture:base_url" in check.preconditions
 
 
+def test_manifest_uses_dedicated_notify_child_for_stop_notification_fixture():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    notify = checks["http.rust_core_notify_on_stop_fixture"]
+    assert notify.path == "/sessions/{notify_child_session_id}/notify-on-stop"
+    assert "fixture:notify_child_session_id" in notify.preconditions
+    assert "fixture:child_session_id" not in notify.preconditions
+    expectations = {expectation.path: expectation for expectation in notify.expected_json}
+    assert expectations["/session_id"].equals == "{notify_child_session_id}"
+
+
 def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
@@ -372,6 +391,57 @@ def test_read_only_fixture_provides_queue_job_detail_row():
         ).fetchone()
 
     assert row == ("job-fixture", "tests", "fixture queue job", "pending")
+
+
+def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path):
+    workspace = create_mutating_fixture_workspace(tmp_path)
+
+    assert workspace.root == tmp_path.resolve()
+    assert workspace.config_path.exists()
+    assert workspace.state_file.exists()
+    assert workspace.log_dir.exists()
+    assert workspace.fixtures["session_id"] == DEFAULT_SESSION_ID
+    assert workspace.fixtures["child_session_id"] == DEFAULT_CHILD_SESSION_ID
+    assert workspace.fixtures["em_session_id"] == DEFAULT_EM_SESSION_ID
+    assert workspace.fixtures["notify_child_session_id"] == DEFAULT_NOTIFY_CHILD_SESSION_ID
+
+    config_text = workspace.config_path.read_text()
+    assert "fixture_writes_enabled: true" in config_text
+    assert str(workspace.state_file) in config_text
+    assert str(workspace.fixture_dir / "apps") in config_text
+    assert str(workspace.fixture_dir / "queue-runner") in config_text
+    assert str(workspace.root / "message_queue.db") in config_text
+    assert str(workspace.root / "tool_usage.db") in config_text
+    assert "~/.local/share/claude-sessions" not in config_text
+
+    state = json.loads(workspace.state_file.read_text())
+    sessions = {session["id"]: session for session in state["sessions"]}
+    assert sessions[DEFAULT_EM_SESSION_ID]["is_em"] is True
+    assert sessions[DEFAULT_EM_SESSION_ID]["status"] == "running"
+    assert (
+        sessions[DEFAULT_NOTIFY_CHILD_SESSION_ID]["parent_session_id"]
+        == DEFAULT_EM_SESSION_ID
+    )
+    assert sessions[DEFAULT_NOTIFY_CHILD_SESSION_ID]["is_em"] is False
+    assert sessions[DEFAULT_NOTIFY_CHILD_SESSION_ID]["status"] == "running"
+
+    read_only_state = json.loads(
+        Path("scripts/rust_migration/fixtures/read_only/sessions.json").read_text()
+    )
+    read_only_ids = {session["id"] for session in read_only_state["sessions"]}
+    assert DEFAULT_EM_SESSION_ID not in read_only_ids
+    assert DEFAULT_NOTIFY_CHILD_SESSION_ID not in read_only_ids
+
+
+def test_mutating_fixture_workspace_refuses_non_empty_output_dir(tmp_path):
+    (tmp_path / "leftover.txt").write_text("do not overwrite\n")
+
+    try:
+        create_mutating_fixture_workspace(tmp_path)
+    except FileExistsError as exc:
+        assert str(tmp_path) in str(exc)
+    else:
+        raise AssertionError("expected non-empty output directory to be rejected")
 
 
 def test_python_target_does_not_run_rust_only_retirement_checks():

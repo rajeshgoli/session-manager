@@ -1343,15 +1343,15 @@
       "target": "rust_only",
       "safety": "mutating",
       "method": "POST",
-      "path": "/sessions/{child_session_id}/notify-on-stop",
+      "path": "/sessions/{notify_child_session_id}/notify-on-stop",
       "body": {"sender_session_id": "{em_session_id}", "requester_session_id": "{em_session_id}", "delay_seconds": 0},
       "expected_status": [200],
       "expected_json": [
         {"path": "/status", "equals": "ok"},
-        {"path": "/session_id", "equals": "{child_session_id}"},
+        {"path": "/session_id", "equals": "{notify_child_session_id}"},
         {"path": "/sender_session_id", "equals": "{em_session_id}"}
       ],
-      "preconditions": ["live_server", "fixture:em_session_id", "fixture:child_session_id", "mutating_opt_in"],
+      "preconditions": ["live_server", "fixture:em_session_id", "fixture:notify_child_session_id", "mutating_opt_in"],
       "source": "https://github.com/rajeshgoli/session-manager/issues/803"
     },
     {
