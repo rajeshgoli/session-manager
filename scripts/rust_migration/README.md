@@ -152,6 +152,24 @@ are owner-waived for the cutover value gate; compare current Python against the
 Rust scaffold/prototype instead. Do not commit machine-local baseline reports if
 they contain host-specific or private runtime details.
 
+## State Ownership Preflight
+
+Before implementing freeze/final-backup/rollback, generate a non-mutating view
+of the must-preserve stores the cutover tool will need to account for:
+
+```bash
+python -m scripts.rust_migration.state_preflight --config config.yaml --fail-on-blockers
+```
+
+The report resolves retained store paths from config and documented defaults,
+including server config, shared client config, session state, message queue,
+response relay, tool audit, Codex events/requests/observability, queue-runner
+state, bug reports, app artifacts, Telegram archive data, email bridge config,
+and logs. It records existence, kind, readability/copyability, file hashes, and
+directory sizes without writing to live state. Missing optional stores are
+warnings; missing required session state or unreadable/wrong-kind paths are
+blockers for cutover tooling.
+
 ## Shadow Comparison Mode
 
 Shadow mode lets Python stay authoritative while Rust observes bounded
