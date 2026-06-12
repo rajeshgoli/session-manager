@@ -874,6 +874,30 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
     },
     {
+      "id": "cli.list_devices_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["list-devices", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["--json"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:33"
+    },
+    {
+      "id": "cli.remove_device_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["remove-device", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["DEVICE_ID", "--user-id"],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:33"
+    },
+    {
       "id": "cli.review_help",
       "surface": "cli",
       "classification": "retained",
