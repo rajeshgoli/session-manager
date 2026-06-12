@@ -82,6 +82,18 @@ For `--target rust`, CLI checks default to `target/debug/sm` so retired or
 Rust-only CLI contracts do not accidentally exercise the Python `sm` on PATH.
 Pass `--sm-binary <path>` when testing another Rust CLI build.
 
+Audit the retained/retired CLI cutover scope without running commands:
+
+```bash
+python -m scripts.rust_migration.cli_cutover_audit --fail-on-gaps
+```
+
+This verifies that `contracts_manifest.json` still contains the owner-approved
+retained Python/Rust CLI help checks, retained Rust-only mobile device checks,
+and retired Rust-only checks with the expected target, classification, safety,
+and command tuple. It is a manifest-quality gate; use `contracts` for runtime
+CLI execution.
+
 Fixture-backed checks assert concrete session projection and output behavior:
 
 ```bash
