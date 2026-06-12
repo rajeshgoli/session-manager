@@ -163,6 +163,33 @@ def test_manifest_covers_rust_only_retired_cli_surfaces():
         assert "removed" in check.expected_output_contains_any
 
 
+def test_manifest_covers_rust_only_mobile_device_cli_surfaces():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    required_ids = {
+        "cli.list_devices_help",
+        "cli.remove_device_help",
+    }
+
+    missing = required_ids - set(checks)
+    assert not missing
+
+    list_devices = checks["cli.list_devices_help"]
+    assert list_devices.classification == "retained"
+    assert list_devices.target == "rust_only"
+    assert list_devices.command == ("list-devices", "--help")
+    assert list_devices.expected_exit == (0,)
+    assert "--json" in list_devices.expected_output_contains_all
+
+    remove_device = checks["cli.remove_device_help"]
+    assert remove_device.classification == "retained"
+    assert remove_device.target == "rust_only"
+    assert remove_device.command == ("remove-device", "--help")
+    assert remove_device.expected_exit == (0,)
+    assert "DEVICE_ID" in remove_device.expected_output_contains_all
+    assert "--user-id" in remove_device.expected_output_contains_all
+
+
 def test_manifest_covers_rust_only_retired_http_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
