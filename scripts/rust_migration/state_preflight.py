@@ -35,6 +35,17 @@ DEFAULT_BUG_REPORTS_DB = "data/bug_reports.db"
 DEFAULT_LOCAL_ENV = ".local/android-parity/values.env"
 CLIENT_CONFIG_ENV = "SM_CLIENT_CONFIG"
 CLIENT_CONFIG_SUBPATH = "session-manager/client.yaml"
+UNSAFE_DIRECTORY_ROOTS = frozenset(
+    path.resolve()
+    for path in (
+        Path("/"),
+        Path.home(),
+        REPO_ROOT,
+        Path("/tmp"),
+        Path("/private/tmp"),
+        Path("/var/tmp"),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -314,6 +325,17 @@ def _inspect_store(spec: StoreSpec) -> dict[str, Any]:
             _issue(spec, "missing", severity, f"path does not exist: {path}")
         )
         return row
+    if spec.kind == "dir" and is_unsafe_directory_root(path):
+        row["actual_kind"] = "dir" if path.is_dir() else "other"
+        row["issues"].append(
+            _issue(
+                spec,
+                "unsafe_source_root",
+                "blocker",
+                f"directory source is too broad to inspect or back up safely: {path}",
+            )
+        )
+        return row
 
     if path.is_file():
         row["actual_kind"] = "file"
@@ -369,6 +391,14 @@ def _dir_stats(path: Path) -> tuple[bool, int, int]:
     except OSError:
         return False, total_size, file_count
     return True, total_size, file_count
+
+
+def is_unsafe_directory_root(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    return resolved in UNSAFE_DIRECTORY_ROOTS or resolved.parent == resolved
 
 
 def _issue(spec: StoreSpec, kind: str, severity: str, detail: str) -> dict[str, str]:

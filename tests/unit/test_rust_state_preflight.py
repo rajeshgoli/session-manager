@@ -114,6 +114,30 @@ def test_state_preflight_reports_wrong_kind_as_blocker(tmp_path):
     )
 
 
+def test_state_preflight_blocks_unsafe_directory_roots_before_scanning(tmp_path):
+    config = tmp_path / "config.yaml"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "sessions.json").write_text("[]\n", encoding="utf-8")
+    config.write_text(
+        f"""
+paths:
+  state_file: "{state_dir / 'sessions.json'}"
+  log_dir: "/"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = build_state_preflight_report(config_path=config)
+
+    assert report["status"] == "blocked"
+    assert any(
+        issue["store_id"] == "log_dir" and issue["kind"] == "unsafe_source_root"
+        for issue in report["blockers"]
+    )
+
+
 def test_state_preflight_text_report_includes_warnings(tmp_path):
     config = tmp_path / "config.yaml"
     state_dir = tmp_path / "state"

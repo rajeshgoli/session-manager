@@ -170,6 +170,29 @@ directory sizes without writing to live state. Missing optional stores are
 warnings; missing required session state or unreadable/wrong-kind paths are
 blockers for cutover tooling.
 
+Plan a copyable backup manifest without writing:
+
+```bash
+python -m scripts.rust_migration.state_backup \
+  --config config.yaml \
+  --output-dir /tmp/sm-rust-state-backup-plan
+```
+
+Copy the planned stores only after reviewing the dry-run output:
+
+```bash
+python -m scripts.rust_migration.state_backup \
+  --config config.yaml \
+  --output-dir /tmp/sm-rust-state-backup-$(date -u +%Y%m%dT%H%M%SZ) \
+  --execute \
+  --fail-on-blockers
+```
+
+Execution creates a fresh output directory, copies existing copyable stores, and
+writes `state-backup-manifest.json` inside it. Missing optional stores remain
+warnings. Preflight blockers, top-level symlink stores, and pre-existing backup
+roots block execution. Directory copies do not follow symlink children.
+
 ## Shadow Comparison Mode
 
 Shadow mode lets Python stay authoritative while Rust observes bounded
