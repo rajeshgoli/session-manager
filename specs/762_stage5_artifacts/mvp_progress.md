@@ -1,6 +1,6 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #912 merged, live shadow activation, and the fixture-filtered live contract pass.
+Status: implementation snapshot after PR #932 merged and the state-gated MVP rehearsal passed.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -45,6 +45,16 @@ not change retained or removed scope. Binding scope remains
 | #908 | shadow report `--since` and `--last-minutes` filters |
 | #910 | Rust contract CLI checks default to `target/debug/sm` |
 | #912 | `--skip-fixture-checks` for broad live-state contract runs |
+| #914 | handoff refresh after live shadow activation |
+| #916 | shadow report coverage gates |
+| #918 | shadow observation planner carries coverage gates |
+| #920 | mobile device CLI contract checks |
+| #922 | Rust CLI cutover scope audit |
+| #924 | state ownership preflight |
+| #926 | state backup plan and copy tool |
+| #928 | freeze/drain plan ledger scaffold |
+| #930 | backup verification and restore rehearsal |
+| #932 | MVP rehearsal runs state preflight, backup, restore, and freeze/drain evidence |
 
 ## Implemented Capability Groups
 
@@ -52,7 +62,7 @@ The Rust sidecar now has executable coverage for:
 
 | Group | Current state |
 | --- | --- |
-| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, disposable mutating fixtures, and Rust CLI build gating exist. |
+| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, and freeze/drain evidence gates exist. |
 | Retired-surface checks | Retired public/watch/summary/remind/job-watch/queue-policy checks are represented as Rust-target absence or denial fixtures. |
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent slices are merged, with shadow and contract fixtures covering the early cutover path. |
@@ -97,7 +107,7 @@ the expected safety behavior for a live-state read run.
 ## Latest Real-State Rehearsal
 
 Report:
-`.local/rust-mvp-rehearsals/20260612T013237Z-events-state-shadow/mvp-rehearsal-report.json`
+`.local/rust-mvp-rehearsals/20260612T051529Z-state-gated-reuse/mvp-rehearsal-report.json`
 
 Summary:
 
@@ -105,7 +115,8 @@ Summary:
 | --- | --- |
 | Overall status | Passed with 0 blockers |
 | Python health | Passed |
-| Fresh Rust sidecar start and health | Passed |
+| State ownership gate | Passed: 17 stores checked, 13 existing, 13 copied, 13 verified, 13 restored, freeze/drain ledger written |
+| Rust sidecar health | Passed using explicit `--reuse-rust-sidecar` because port 8421 was already healthy |
 | Isolated runtime smoke | Passed |
 | Rust read-only sidecar contracts | 17 passed, 0 failed, 0 skipped |
 | Rust mutating fixture contracts | 30 passed, 0 failed, 0 skipped |
@@ -125,15 +136,15 @@ Measured baseline snapshot from the same run:
 
 | Metric | Python | Rust |
 | --- | ---: | ---: |
-| RSS | 151.516 MiB | 17.422 MiB |
-| Physical footprint | 64.3 MiB | 6.781 MiB |
-| `GET /health` median | 0.800 ms | 0.341 ms |
-| `GET /health/detailed` median | 156.105 ms | 0.340 ms |
-| `GET /auth/session` median | 3.112 ms | 0.306 ms |
-| `GET /client/bootstrap` median | 1.057 ms | 0.407 ms |
-| `GET /events/state` median | 1.152 ms | 0.415 ms |
-| `GET /sessions` median | 26.157 ms | 7.871 ms |
-| `GET /client/sessions` median | 78.619 ms | 8.148 ms |
+| RSS | 151.906 MiB | 21.516 MiB |
+| Physical footprint | 64.8 MiB | 6.891 MiB |
+| `GET /health` median | 4.994 ms | 0.350 ms |
+| `GET /health/detailed` median | 203.143 ms | 0.350 ms |
+| `GET /auth/session` median | 6.793 ms | 0.302 ms |
+| `GET /client/bootstrap` median | 5.511 ms | 0.359 ms |
+| `GET /events/state` median | 6.002 ms | 0.349 ms |
+| `GET /sessions` median | 33.644 ms | 8.662 ms |
+| `GET /client/sessions` median | 69.850 ms | 9.196 ms |
 
 ## Near-Term Remaining Work
 
@@ -144,7 +155,7 @@ These are the next practical buckets before an MVP cutover trial:
 | Shadow observation window | Python-authoritative shadow mode is enabled and a short clean window has been recorded. Continue it for a longer agreed window and triage any unexplained retained-core mismatches before Rust becomes the writer. |
 | Full fixture manifest execution | Run the broader retained manifest with the current synthetic fixture set plus any live mobile/device fixtures needed for final evidence. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
-| State ownership and migration tooling | Implement final freeze/drain/backup/restore ledger behavior from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
+| State ownership and migration tooling | Initial preflight, backup, restore, and freeze/drain evidence tools are merged and exercised by the rehearsal. Remaining work is live write-admission freeze/journal ownership and rollback accounting from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
 | Public-edge deployment integration | Pair the Rust origin gate with the actual edge signer/proxy/device enrollment flow, including revoked-device and node fallback tests. |
 | Node and queue writer completion | Finish retained node-control and narrow queue writer fixtures, including audit, policy, recovery, and rollback semantics. |
 | Service packaging and rollback | Exercise launchd/service cutover, non-destructive port ownership, health checks, rollback, and operator diagnostics. |
