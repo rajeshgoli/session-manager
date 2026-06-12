@@ -388,3 +388,162 @@ def test_shadow_report_cli_accepts_since_filter(tmp_path, capsys):
 
     assert report["row_count"] == 1
     assert report["route_summaries"][0]["route"] == "GET /new"
+
+
+def test_shadow_report_min_rows_gate_blocks_small_window(tmp_path):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T02:00:00Z",
+                "method": "GET",
+                "path": "/sessions",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
+        ],
+    )
+
+    report = summarize_ledger(ledger, min_rows=2)
+
+    assert report["status"] == "blocked"
+    assert report["row_count"] == 1
+    assert report["gates"]["min_rows"] == 2
+    assert report["blockers"] == [
+        {
+            "kind": "insufficient_rows",
+            "detail": "observed 1, required 2",
+        }
+    ]
+    assert "Coverage Gates:" in render_text_report(report)
+    assert "insufficient_rows" in render_text_report(report)
+
+
+def test_shadow_report_route_coverage_gates_block_missing_or_sparse_routes(tmp_path):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T02:00:00Z",
+                "method": "GET",
+                "path": "/sessions",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
+            {
+                "observed_at": "2026-06-12T02:00:01Z",
+                "method": "GET",
+                "path": "/events/state",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
+        ],
+    )
+
+    report = summarize_ledger(
+        ledger,
+        required_routes=("GET /sessions", "GET /client/sessions"),
+        min_route_rows={"GET /sessions": 2, "GET /events/state": 1},
+    )
+
+    assert report["status"] == "blocked"
+    assert report["gates"] == {
+        "min_rows": None,
+        "required_routes": ["GET /sessions", "GET /client/sessions"],
+        "min_route_rows": {
+            "GET /events/state": 1,
+            "GET /sessions": 2,
+        },
+    }
+    assert report["blockers"] == [
+        {
+            "kind": "missing_required_route",
+            "route": "GET /client/sessions",
+            "detail": "required route not observed",
+        },
+        {
+            "kind": "insufficient_route_rows",
+            "route": "GET /sessions",
+            "detail": "observed 1, required 2",
+        },
+    ]
+
+
+def test_shadow_report_cli_accepts_coverage_gates(tmp_path, capsys):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T02:00:00Z",
+                "method": "GET",
+                "path": "/sessions",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
+        ],
+    )
+
+    assert (
+        main(
+            [
+                "--ledger",
+                str(ledger),
+                "--min-rows",
+                "1",
+                "--require-route",
+                "get /sessions",
+                "--min-route-rows",
+                "get /sessions=1",
+                "--json",
+                "--fail-on-blockers",
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["status"] == "passed"
+    assert report["gates"] == {
+        "min_rows": 1,
+        "required_routes": ["GET /sessions"],
+        "min_route_rows": {"GET /sessions": 1},
+    }
+
+
+def test_shadow_report_cli_coverage_gates_fail_with_blockers(tmp_path, capsys):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T02:00:00Z",
+                "method": "GET",
+                "path": "/sessions",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
+        ],
+    )
+
+    assert (
+        main(
+            [
+                "--ledger",
+                str(ledger),
+                "--min-rows",
+                "2",
+                "--require-route",
+                "GET /client/sessions",
+                "--fail-on-blockers",
+            ]
+        )
+        == 1
+    )
+    rendered = capsys.readouterr().out
+
+    assert "status: blocked" in rendered
+    assert "insufficient_rows" in rendered
+    assert "missing_required_route" in rendered
