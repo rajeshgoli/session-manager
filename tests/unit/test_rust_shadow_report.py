@@ -456,6 +456,8 @@ def test_shadow_report_route_coverage_gates_block_missing_or_sparse_routes(tmp_p
             "GET /events/state": 1,
             "GET /sessions": 2,
         },
+        "required_route_patterns": [],
+        "min_route_pattern_rows": {},
     }
     assert report["blockers"] == [
         {
@@ -466,6 +468,65 @@ def test_shadow_report_route_coverage_gates_block_missing_or_sparse_routes(tmp_p
         {
             "kind": "insufficient_route_rows",
             "route": "GET /sessions",
+            "detail": "observed 1, required 2",
+        },
+    ]
+
+
+def test_shadow_report_route_pattern_gates_cover_mobile_detail_routes(tmp_path):
+    ledger = tmp_path / "rust_shadow.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            {
+                "observed_at": "2026-06-12T02:00:00Z",
+                "method": "GET",
+                "path": "/client/sessions/fixture001",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
+            {
+                "observed_at": "2026-06-12T02:00:01Z",
+                "method": "GET",
+                "path": "/sessions/fixture001/attach-descriptor",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "match"},
+            },
+        ],
+    )
+
+    report = summarize_ledger(
+        ledger,
+        required_route_patterns=(
+            "GET /client/sessions/*",
+            "GET /sessions/*/attach-descriptor",
+            "GET /client/bug-reports/*",
+        ),
+        min_route_pattern_rows={
+            "GET /client/sessions/*": 2,
+            "GET /sessions/*/attach-descriptor": 1,
+        },
+    )
+
+    assert report["status"] == "blocked"
+    assert report["gates"]["required_route_patterns"] == [
+        "GET /client/sessions/*",
+        "GET /sessions/*/attach-descriptor",
+        "GET /client/bug-reports/*",
+    ]
+    assert report["gates"]["min_route_pattern_rows"] == {
+        "GET /client/sessions/*": 2,
+        "GET /sessions/*/attach-descriptor": 1,
+    }
+    assert report["blockers"] == [
+        {
+            "kind": "missing_required_route_pattern",
+            "route": "GET /client/bug-reports/*",
+            "detail": "required route pattern not observed",
+        },
+        {
+            "kind": "insufficient_route_pattern_rows",
+            "route": "GET /client/sessions/*",
             "detail": "observed 1, required 2",
         },
     ]
@@ -483,6 +544,13 @@ def test_shadow_report_cli_accepts_coverage_gates(tmp_path, capsys):
                 "rust_http_status": 200,
                 "rust_result": {"comparison": "status_match"},
             },
+            {
+                "observed_at": "2026-06-12T02:00:01Z",
+                "method": "GET",
+                "path": "/client/sessions/fixture001",
+                "rust_http_status": 200,
+                "rust_result": {"comparison": "status_match"},
+            },
         ],
     )
 
@@ -497,6 +565,10 @@ def test_shadow_report_cli_accepts_coverage_gates(tmp_path, capsys):
                 "get /sessions",
                 "--min-route-rows",
                 "get /sessions=1",
+                "--require-route-pattern",
+                "get /client/sessions/*",
+                "--min-route-pattern-rows",
+                "get /client/sessions/*=1",
                 "--json",
                 "--fail-on-blockers",
             ]
@@ -510,6 +582,8 @@ def test_shadow_report_cli_accepts_coverage_gates(tmp_path, capsys):
         "min_rows": 1,
         "required_routes": ["GET /sessions"],
         "min_route_rows": {"GET /sessions": 1},
+        "required_route_patterns": ["GET /client/sessions/*"],
+        "min_route_pattern_rows": {"GET /client/sessions/*": 1},
     }
 
 

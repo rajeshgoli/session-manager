@@ -42,6 +42,7 @@ from scripts.rust_migration.mvp_rehearsal import (
     _default_read_only_fixture_rust_base_url,
     _default_mutating_rust_base_url,
     _ensure_rust_cli_available,
+    _resolve_shadow_compare_paths,
     _run_contract_group,
     _run_state_gate,
     run_rehearsal,
@@ -433,6 +434,58 @@ def test_mvp_rehearsal_records_read_only_fixture_skip_step(tmp_path, monkeypatch
     )
     assert step["status"] == "skipped"
     assert report["summary"]["status"] == "passed"
+
+
+def test_mvp_rehearsal_resolves_mobile_shadow_paths(monkeypatch):
+    def fake_http_request(method, url, *, timeout_seconds, **_kwargs):
+        assert method == "GET"
+        assert url == "http://python.test/sessions"
+        assert timeout_seconds == 0.5
+        return (
+            200,
+            json.dumps({"sessions": [{"id": "mobile-session"}]}).encode(),
+            {},
+        )
+
+    monkeypatch.setattr(
+        "scripts.rust_migration.mvp_rehearsal._http_request",
+        fake_http_request,
+    )
+
+    step = _resolve_shadow_compare_paths(
+        python_base_url="http://python.test",
+        base_paths=("/health", "/client/analytics/summary"),
+        timeout_seconds=0.5,
+    )
+
+    assert step["status"] == "passed"
+    assert step["session_id"] == "mobile-session"
+    assert step["paths"] == [
+        "/health",
+        "/client/analytics/summary",
+        "/client/sessions/mobile-session",
+        "/sessions/mobile-session/attach-descriptor",
+    ]
+
+
+def test_mvp_rehearsal_mobile_shadow_paths_skip_without_session(monkeypatch):
+    def fake_http_request(method, url, *, timeout_seconds, **_kwargs):
+        return 200, b'{"sessions":[]}', {}
+
+    monkeypatch.setattr(
+        "scripts.rust_migration.mvp_rehearsal._http_request",
+        fake_http_request,
+    )
+
+    step = _resolve_shadow_compare_paths(
+        python_base_url="http://python.test",
+        base_paths=("/health",),
+        timeout_seconds=0.5,
+    )
+
+    assert step["status"] == "skipped"
+    assert step["session_id"] is None
+    assert step["paths"] == ["/health"]
 
 
 def test_mvp_rehearsal_state_gate_copies_restores_and_records_plan(

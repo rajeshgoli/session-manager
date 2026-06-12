@@ -129,6 +129,7 @@ SHADOW_COMPARE_PATHS = (
     "/health/detailed",
     "/auth/session",
     "/client/bootstrap",
+    "/client/analytics/summary",
     "/sessions",
     "/client/sessions",
     "/nodes",
@@ -444,10 +445,16 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
                     _add_blocker(report, step["name"], step["detail"])
 
         if not args.skip_shadow:
+            shadow_paths = _resolve_shadow_compare_paths(
+                python_base_url=args.python_base_url,
+                base_paths=SHADOW_COMPARE_PATHS,
+                timeout_seconds=args.timeout,
+            )
+            report["steps"].append(shadow_paths)
             shadow = _run_shadow_summary(
                 python_base_url=args.python_base_url,
                 rust_base_url=args.rust_base_url,
-                paths=SHADOW_COMPARE_PATHS,
+                paths=tuple(shadow_paths["paths"]),
                 timeout_seconds=args.timeout,
                 shadow_secret=args.shadow_secret,
             )
@@ -1148,6 +1155,65 @@ def _run_shadow_summary(
         "summary": {"passed": len(results) - failed, "failed": failed},
         "results": results,
     }
+
+
+def _resolve_shadow_compare_paths(
+    *,
+    python_base_url: str,
+    base_paths: tuple[str, ...],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    paths = list(base_paths)
+    detail = "mobile session detail probes skipped: no live session id resolved"
+    status = "passed"
+    session_id = None
+    try:
+        response_status, response_body, _headers = _http_request(
+            "GET",
+            python_base_url.rstrip("/") + "/sessions",
+            timeout_seconds=timeout_seconds,
+        )
+        if response_status != 200:
+            status = "skipped"
+            detail = f"mobile session detail probes skipped: /sessions returned HTTP {response_status}"
+        else:
+            session_id = _first_shadow_session_id(response_body)
+            if session_id:
+                paths.extend(
+                    [
+                        f"/client/sessions/{session_id}",
+                        f"/sessions/{session_id}/attach-descriptor",
+                    ]
+                )
+                detail = f"mobile session detail probes use session_id={session_id}"
+            else:
+                status = "skipped"
+    except Exception as exc:  # noqa: BLE001 - report should preserve the concrete transport/parsing error.
+        status = "skipped"
+        detail = f"mobile session detail probes skipped: {type(exc).__name__}: {exc}"
+    return {
+        "name": "shadow_mobile_path_resolution",
+        "status": status,
+        "elapsed_ms": _elapsed_ms(started_at),
+        "detail": detail,
+        "session_id": session_id,
+        "paths": paths,
+    }
+
+
+def _first_shadow_session_id(response_body: bytes) -> str | None:
+    payload = json.loads(response_body.decode("utf-8"))
+    sessions = payload.get("sessions") if isinstance(payload, dict) else payload
+    if not isinstance(sessions, list):
+        return None
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        session_id = session.get("id")
+        if isinstance(session_id, str) and session_id:
+            return session_id
+    return None
 
 
 def _baseline_step(name: str, report: dict[str, Any]) -> dict[str, Any]:

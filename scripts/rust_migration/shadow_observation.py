@@ -20,6 +20,16 @@ RUST_BASE_URL = "http://127.0.0.1:8421"
 DEFAULT_LEDGER_PATH = Path("~/.local/share/claude-sessions/rust_shadow.jsonl")
 DEFAULT_CONFIG = Path("config.yaml")
 DEFAULT_TIMEOUT_SECONDS = 1.0
+MOBILE_SM_APP_REQUIRED_ROUTES = (
+    "GET /auth/session",
+    "GET /client/bootstrap",
+    "GET /client/sessions",
+    "GET /client/analytics/summary",
+)
+MOBILE_SM_APP_REQUIRED_ROUTE_PATTERNS = (
+    "GET /client/sessions/*",
+    "GET /sessions/*/attach-descriptor",
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,9 @@ def build_observation_plan(
     report_min_rows: int | None = None,
     report_required_routes: list[str] | None = None,
     report_min_route_rows: list[str] | None = None,
+    report_required_route_patterns: list[str] | None = None,
+    report_min_route_pattern_rows: list[str] | None = None,
+    mobile_sm_app_profile: bool = False,
     probe_health: Callable[[str, float], HealthProbe] = None,
     cargo_resolver: Callable[[str], str | None] = shutil.which,
 ) -> dict[str, Any]:
@@ -55,6 +68,15 @@ def build_observation_plan(
     python_health = probe_health(python_base_url, timeout_seconds)
     rust_health = probe_health(rust_base_url, timeout_seconds)
     cargo_path = cargo_resolver(cargo)
+    resolved_required_routes = list(report_required_routes or ())
+    resolved_required_route_patterns = list(report_required_route_patterns or ())
+    if mobile_sm_app_profile:
+        resolved_required_routes = _append_unique(
+            resolved_required_routes, MOBILE_SM_APP_REQUIRED_ROUTES
+        )
+        resolved_required_route_patterns = _append_unique(
+            resolved_required_route_patterns, MOBILE_SM_APP_REQUIRED_ROUTE_PATTERNS
+        )
 
     blockers: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
@@ -123,10 +145,14 @@ def build_observation_plan(
         report_command.extend(["--last-minutes", str(report_last_minutes)])
     if report_min_rows is not None:
         report_command.extend(["--min-rows", str(report_min_rows)])
-    for route in report_required_routes or ():
+    for route in resolved_required_routes:
         report_command.extend(["--require-route", route])
     for route_minimum in report_min_route_rows or ():
         report_command.extend(["--min-route-rows", route_minimum])
+    for pattern in resolved_required_route_patterns:
+        report_command.extend(["--require-route-pattern", pattern])
+    for pattern_minimum in report_min_route_pattern_rows or ():
+        report_command.extend(["--min-route-pattern-rows", pattern_minimum])
 
     return {
         "schema_version": 1,
@@ -142,8 +168,11 @@ def build_observation_plan(
             "reuse_rust_sidecar": reuse_rust_sidecar,
             "report_last_minutes": report_last_minutes,
             "report_min_rows": report_min_rows,
-            "report_required_routes": list(report_required_routes or ()),
+            "mobile_sm_app_profile": mobile_sm_app_profile,
+            "report_required_routes": resolved_required_routes,
             "report_min_route_rows": list(report_min_route_rows or ()),
+            "report_required_route_patterns": resolved_required_route_patterns,
+            "report_min_route_pattern_rows": list(report_min_route_pattern_rows or ()),
         },
         "checks": {
             "python_health": python_health.__dict__,
@@ -172,6 +201,7 @@ def build_observation_plan(
             "Start the Rust sidecar command in a separate terminal, unless reusing an existing sidecar.",
             "Add the rust_shadow snippet to local config and restart Python Session Manager deliberately.",
             "Let normal traffic run for the agreed observation window.",
+            "Exercise the native sm app during the window when using the mobile profile.",
             "Run the shadow ledger report command and treat blockers as cutover blockers.",
         ],
     }
@@ -268,6 +298,16 @@ def _python_config_snippet(
         ]
     )
     return "\n".join(lines)
+
+
+def _append_unique(existing: list[str], additions: tuple[str, ...]) -> list[str]:
+    values = list(existing)
+    seen = set(values)
+    for value in additions:
+        if value not in seen:
+            values.append(value)
+            seen.add(value)
+    return values
 
 
 def _probe_health(base_url: str, timeout_seconds: float) -> HealthProbe:
@@ -371,6 +411,32 @@ def _build_parser() -> argparse.ArgumentParser:
             "command. Format as 'METHOD /path=N'. Repeatable."
         ),
     )
+    parser.add_argument(
+        "--report-require-route-pattern",
+        action="append",
+        default=[],
+        help=(
+            "Include a --require-route-pattern value in the generated "
+            "shadow_report command. Format as 'METHOD /path/*'. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--report-min-route-pattern-rows",
+        action="append",
+        default=[],
+        help=(
+            "Include a --min-route-pattern-rows value in the generated "
+            "shadow_report command. Format as 'METHOD /path/*=N'. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--mobile-sm-app-profile",
+        action="store_true",
+        help=(
+            "Add native sm app/mobile read coverage gates to the generated "
+            "shadow_report command."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--fail-on-blockers", action="store_true")
     return parser
@@ -392,6 +458,9 @@ def main(argv: list[str] | None = None) -> int:
         report_min_rows=args.report_min_rows,
         report_required_routes=args.report_require_route,
         report_min_route_rows=args.report_min_route_rows,
+        report_required_route_patterns=args.report_require_route_pattern,
+        report_min_route_pattern_rows=args.report_min_route_pattern_rows,
+        mobile_sm_app_profile=args.mobile_sm_app_profile,
     )
     if args.json:
         print(json.dumps(plan, indent=2, sort_keys=True))
