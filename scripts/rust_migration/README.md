@@ -193,6 +193,35 @@ writes `state-backup-manifest.json` inside it. Missing optional stores remain
 warnings. Preflight blockers, top-level symlink stores, and pre-existing backup
 roots block execution. Directory copies do not follow symlink children.
 
+Plan the write-freeze and active-writer drain coverage without activating a
+freeze:
+
+```bash
+python -m scripts.rust_migration.freeze_drain_plan \
+  --config config.yaml \
+  --fail-on-blockers
+```
+
+The report maps Stage 5 writer families to the stores they protect, the current
+evidence source, and the freeze/drain action that must exist before final
+backup. It explicitly reports `freeze_active=false` and
+`rust_ownership_active=false`; it is planning evidence only.
+
+To append a plan-only ledger entry, provide an explicit ledger path:
+
+```bash
+python -m scripts.rust_migration.freeze_drain_plan \
+  --config config.yaml \
+  --record-plan \
+  --ledger /tmp/sm-rust-migration-ledger.jsonl \
+  --fail-on-blockers
+```
+
+Ledger writes are rejected when the output path is a directory, symlink, or has
+a missing/non-directory parent. The entry records the planned coverage only; it
+does not claim write admission is frozen, writers are drained, or Rust owns any
+store.
+
 ## Shadow Comparison Mode
 
 Shadow mode lets Python stay authoritative while Rust observes bounded
