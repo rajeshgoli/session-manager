@@ -40,6 +40,10 @@ def build_observation_plan(
     shadow_secret: str = "",
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     reuse_rust_sidecar: bool = False,
+    report_last_minutes: float | None = None,
+    report_min_rows: int | None = None,
+    report_required_routes: list[str] | None = None,
+    report_min_route_rows: list[str] | None = None,
     probe_health: Callable[[str, float], HealthProbe] = None,
     cargo_resolver: Callable[[str], str | None] = shutil.which,
 ) -> dict[str, Any]:
@@ -115,6 +119,14 @@ def build_observation_plan(
         str(ledger),
         "--fail-on-blockers",
     ]
+    if report_last_minutes is not None:
+        report_command.extend(["--last-minutes", str(report_last_minutes)])
+    if report_min_rows is not None:
+        report_command.extend(["--min-rows", str(report_min_rows)])
+    for route in report_required_routes or ():
+        report_command.extend(["--require-route", route])
+    for route_minimum in report_min_route_rows or ():
+        report_command.extend(["--min-route-rows", route_minimum])
 
     return {
         "schema_version": 1,
@@ -128,6 +140,10 @@ def build_observation_plan(
             "cargo": cargo,
             "shadow_secret_configured": bool(shadow_secret),
             "reuse_rust_sidecar": reuse_rust_sidecar,
+            "report_last_minutes": report_last_minutes,
+            "report_min_rows": report_min_rows,
+            "report_required_routes": list(report_required_routes or ()),
+            "report_min_route_rows": list(report_min_route_rows or ()),
         },
         "checks": {
             "python_health": python_health.__dict__,
@@ -327,6 +343,34 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shadow-secret", default="")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--reuse-rust-sidecar", action="store_true")
+    parser.add_argument(
+        "--report-last-minutes",
+        type=float,
+        help="Include --last-minutes in the generated shadow_report command.",
+    )
+    parser.add_argument(
+        "--report-min-rows",
+        type=int,
+        help="Include --min-rows in the generated shadow_report command.",
+    )
+    parser.add_argument(
+        "--report-require-route",
+        action="append",
+        default=[],
+        help=(
+            "Include a --require-route value in the generated shadow_report "
+            "command. Format as 'METHOD /path'. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--report-min-route-rows",
+        action="append",
+        default=[],
+        help=(
+            "Include a --min-route-rows value in the generated shadow_report "
+            "command. Format as 'METHOD /path=N'. Repeatable."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--fail-on-blockers", action="store_true")
     return parser
@@ -344,6 +388,10 @@ def main(argv: list[str] | None = None) -> int:
         shadow_secret=args.shadow_secret,
         timeout_seconds=args.timeout,
         reuse_rust_sidecar=args.reuse_rust_sidecar,
+        report_last_minutes=args.report_last_minutes,
+        report_min_rows=args.report_min_rows,
+        report_required_routes=args.report_require_route,
+        report_min_route_rows=args.report_min_route_rows,
     )
     if args.json:
         print(json.dumps(plan, indent=2, sort_keys=True))

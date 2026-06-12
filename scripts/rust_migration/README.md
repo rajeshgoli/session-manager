@@ -173,6 +173,12 @@ Generate the non-destructive local plan before touching the running service:
 ./venv/bin/python -m scripts.rust_migration.shadow_observation \
   --config config.yaml \
   --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
+  --report-last-minutes 60 \
+  --report-min-rows 1000 \
+  --report-require-route 'GET /sessions' \
+  --report-require-route 'GET /events/state' \
+  --report-min-route-rows 'GET /sessions=100' \
+  --report-min-route-rows 'GET /events/state=100' \
   --fail-on-blockers
 ```
 
@@ -182,7 +188,9 @@ is already healthy, and prints the exact sidecar command, local Python
 `rust_shadow` config snippet, and ledger report command. It never edits
 `config.yaml`, restarts Session Manager, or starts a process. Use
 `--reuse-rust-sidecar` when intentionally observing against an already-running
-Rust sidecar.
+Rust sidecar. `--report-*` options are copied into the generated
+`shadow_report` command so the operator-reviewed plan and the final observation
+gate use the same window and coverage thresholds.
 
 After reviewing the planner output, prepare the local Python config with the
 dry-run-first activation helper:
