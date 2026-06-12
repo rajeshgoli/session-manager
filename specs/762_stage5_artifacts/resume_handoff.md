@@ -1,6 +1,6 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-11 after PR #880.
+Status: handoff snapshot from 2026-06-12 after PR #894 and the latest real-state MVP rehearsal.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,7 +11,7 @@ coverage in
 ## Current Repository State
 
 - Branch: `main`
-- Latest merged commit: `9854e0c` (`Merge pull request #880`)
+- Latest merged commit: `470b725` (`Merge pull request #894`)
 - Open PRs at handoff: none
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
 - Stale session-manager review agents from the overnight run were retired.
@@ -54,11 +54,21 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #876.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #894.
 - PR #880 added fixture-gated manifest checks for already-implemented detail
   endpoints:
   - `GET /queue-jobs/{queue_job_id}`
   - `GET /codex-review-requests/{codex_review_request_id}`
+- PR #882 added validation-only manifest coverage for device-token and
+  tmux-client hook error paths.
+- PR #884 corrected the retained client-session fixture expectation for
+  classic attach support.
+- PR #886 added a synthetic Codex app read fixture.
+- PR #888 added a synthetic app artifact metadata fixture.
+- PR #890 added a synthetic queue-runner job fixture.
+- PR #892 added the disposable mutating fixture workspace.
+- PR #894 made the MVP rehearsal run both read-only and mutating Rust-core
+  contracts in isolated sidecars.
 - Current contract manifest size:
   - `115` checks total
   - `68` `python_and_rust`
@@ -66,45 +76,31 @@ Merged Rust slices cover:
 
 ## Validation At Handoff
 
-All commands below passed at handoff:
+The latest real-state MVP rehearsal is:
 
 ```bash
-cargo test -p sm-server
-./venv/bin/python -m pytest tests/unit/test_rust_migration_contracts.py
+.local/rust-mvp-rehearsals/20260612T012613Z-real-state/mvp-rehearsal-report.json
 ```
 
-Observed results:
+Observed results from that run:
 
-- Rust tests: `78` lib tests, `20` CLI tests, `142` read-only HTTP tests, and
-  doctests passed.
-- Rust migration contract tests: `34` passed.
-- Latest MVP rehearsal passed with zero blockers:
-  - `.local/rust-mvp-rehearsals/20260611T142302Z/mvp-rehearsal-report.json`
+- overall status: blocked by one rehearsal blocker;
+- Python health, fresh Rust sidecar start/health, and isolated runtime smoke
+  passed;
+- Rust read-only sidecar contracts: `17` passed, `0` failed, `0` skipped;
+- Rust mutating fixture contracts: `30` passed, `0` failed, `0` skipped;
+- gap probes: `0` failed;
+- Python and Rust baseline measurements completed;
+- shadow read summary: `7` passed, `1` failed.
 
-The two new detail checks passed against live Python and a temporary Rust
-sidecar using real local fixture IDs:
+The only blocker is `GET /events/state` shadow comparison. Python and Rust both
+returned status `200`, but the predicted Rust body hash did not match Python.
+The matching shadow reads were `/health`, `/health/detailed`, `/auth/session`,
+`/client/bootstrap`, `/sessions`, `/client/sessions`, and `/nodes`.
 
-```bash
-./venv/bin/python -m scripts.rust_migration.contracts \
-  --target python \
-  --base-url http://127.0.0.1:8420 \
-  --check-id http.queue_job_detail \
-  --check-id http.codex_review_request_detail \
-  --fixture queue_job_id=job_5a66488c1b6b \
-  --fixture codex_review_request_id=255618bcc483 \
-  --json
-
-cargo run -p sm-server --bin sm-server -- --port 8421 --config config.yaml
-
-./venv/bin/python -m scripts.rust_migration.contracts \
-  --target rust \
-  --base-url http://127.0.0.1:8421 \
-  --check-id http.queue_job_detail \
-  --check-id http.codex_review_request_detail \
-  --fixture queue_job_id=job_5a66488c1b6b \
-  --fixture codex_review_request_id=255618bcc483 \
-  --json
-```
+The same run measured the current Python process at `151.438 MiB` RSS and
+`64.3 MiB` physical footprint, while the Rust sidecar measured `17.438 MiB`
+RSS and `6.828 MiB` physical footprint.
 
 ## Useful Local Fixtures Found
 
@@ -116,37 +112,45 @@ contract coverage:
 | `queue_job_id` | `job_5a66488c1b6b` | `~/.local/share/claude-sessions/queue-runner/queue_runner.db` |
 | `codex_review_request_id` | `255618bcc483` | `~/.local/share/claude-sessions/message_queue.db` |
 
-Missing or not found at handoff:
+Historical missing or not-found local fixtures from the earlier #880 handoff:
 
 - no active `provider=codex-app` sessions in `GET /sessions`;
 - no app artifact `meta.json` found in the checked default local artifact paths.
+
+Those gaps are now covered by synthetic read-only fixtures from PR #886 and
+PR #888 for Rust-side fixture execution. Real live-state fixtures are still
+needed for final cutover evidence.
 
 ## What Remains
 
 ### Near-Term Work
 
-1. Build a complete fixture set for the retained manifest.
-   - Need real or synthetic fixtures for `codex_app_session_id`, app artifact
-     metadata, mobile/device flows, disposable mutating sessions, and any
-     retained CLI fixture inputs.
-2. Run the full contract manifest against Python and Rust with those fixtures.
+1. Fix the `/events/state` shadow body mismatch from the latest real-state
+   rehearsal.
+   - Determine whether this is a Rust projection bug, a volatile field that
+     should be status-only, or a Python/Rust ordering/default mismatch.
+   - Add a focused fixture or shadow test before rerunning rehearsal.
+2. Re-run `scripts.rust_migration.mvp_rehearsal --allow-blockers` against real
+   local state and update [mvp_progress.md](mvp_progress.md) with the result.
 3. Enable Python-authoritative shadow mode for a real observation window and
    triage unexplained mismatches.
-4. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
+4. Run the full retained manifest against Python and Rust with the current
+   synthetic fixture set plus any live fixtures needed for mobile/device flows.
+5. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
    - Retained commands should be native Rust or intentionally routed.
    - Removed commands should be absent or explicitly retired.
-5. Implement final state ownership and migration tooling.
+6. Implement final state ownership and migration tooling.
    - Freeze or journal write admission before final backup.
    - Prove rollback restores or accounts for every accepted write after the
      restore point.
-6. Complete public-edge deployment integration.
+7. Complete public-edge deployment integration.
    - Edge signer/proxy, device enrollment/list/remove, revoked-device denial,
      and node fallback proof.
-7. Finish retained node-control and narrow queue writer fixtures.
+8. Finish retained node-control and narrow queue writer fixtures.
    - Include audit, policy, recovery, and rollback semantics.
-8. Exercise service packaging and cutover.
+9. Exercise service packaging and cutover.
    - launchd wrapper, non-destructive port ownership, health checks, rollback.
-9. Run final native mobile smoke checks.
+10. Run final native mobile smoke checks.
    - bootstrap, session list/detail, attach, request-status, analytics, bug
      reports, app artifacts.
 
@@ -167,14 +171,15 @@ Do not start Rust writer ownership or MVP cutover until:
 
 ## Recommended Resume Point
 
-Start with fixture-backed manifest execution:
+Start with the real-state rehearsal blocker:
 
-1. Create or identify a disposable retained session fixture.
-2. Create or identify a real `codex_app_session_id`.
-3. Publish or synthesize an app artifact metadata fixture.
-4. Run the manifest against Python and Rust with the fixture set.
-5. Convert any failures into the next bounded Rust implementation slice.
+1. Inspect the Python and Rust `/events/state` payloads from the latest
+   real-state run or reproduce them against local Python and a Rust sidecar.
+2. Classify the body mismatch as an implementation bug, status-only shadow
+   candidate, or stable ordering/default mismatch.
+3. Patch the Rust projection or shadow predictor, add a focused test, and run
+   the MVP rehearsal again.
 
-This is the highest-signal next step because the MVP rehearsal currently has
-zero blockers only for the core sidecar subset. The full manifest with fixtures
-will expose the next real cutover gaps.
+This is the highest-signal next step because the latest rehearsal passed both
+the read-only sidecar contracts and the mutating Rust-core fixture contracts;
+only one retained read still blocks a clean real-state MVP rehearsal.
