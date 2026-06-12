@@ -1,6 +1,6 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-12 after PR #894 and the latest real-state MVP rehearsal.
+Status: handoff snapshot from 2026-06-12 after PR #898 and the clean real-state MVP rehearsal.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,7 +11,7 @@ coverage in
 ## Current Repository State
 
 - Branch: `main`
-- Latest merged commit: `470b725` (`Merge pull request #894`)
+- Latest merged commit: `0bc8f5e` (`Merge pull request #898`)
 - Open PRs at handoff: none
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
 - Stale session-manager review agents from the overnight run were retired.
@@ -54,7 +54,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #894.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #898.
 - PR #880 added fixture-gated manifest checks for already-implemented detail
   endpoints:
   - `GET /queue-jobs/{queue_job_id}`
@@ -69,6 +69,11 @@ Merged Rust slices cover:
 - PR #892 added the disposable mutating fixture workspace.
 - PR #894 made the MVP rehearsal run both read-only and mutating Rust-core
   contracts in isolated sidecars.
+- PR #896 updated this handoff after the first real-state rehearsal exposed a
+  single `/events/state` shadow body mismatch.
+- PR #898 reclassified `/events/state` shadow comparison as status-only because
+  Python carries live tmux-client event state that a fresh Rust sidecar does not
+  own.
 - Current contract manifest size:
   - `115` checks total
   - `68` `python_and_rust`
@@ -79,28 +84,30 @@ Merged Rust slices cover:
 The latest real-state MVP rehearsal is:
 
 ```bash
-.local/rust-mvp-rehearsals/20260612T012613Z-real-state/mvp-rehearsal-report.json
+.local/rust-mvp-rehearsals/20260612T013237Z-events-state-shadow/mvp-rehearsal-report.json
 ```
 
 Observed results from that run:
 
-- overall status: blocked by one rehearsal blocker;
+- overall status: passed with zero blockers;
 - Python health, fresh Rust sidecar start/health, and isolated runtime smoke
   passed;
 - Rust read-only sidecar contracts: `17` passed, `0` failed, `0` skipped;
 - Rust mutating fixture contracts: `30` passed, `0` failed, `0` skipped;
 - gap probes: `0` failed;
 - Python and Rust baseline measurements completed;
-- shadow read summary: `7` passed, `1` failed.
+- shadow read summary: `8` passed, `0` failed.
 
-The only blocker is `GET /events/state` shadow comparison. Python and Rust both
-returned status `200`, but the predicted Rust body hash did not match Python.
-The matching shadow reads were `/health`, `/health/detailed`, `/auth/session`,
-`/client/bootstrap`, `/sessions`, `/client/sessions`, and `/nodes`.
+The previous blocker was `GET /events/state` shadow comparison. Python and Rust
+both returned status `200`, but the predicted Rust body hash did not match
+Python because Python carries live tmux-client event state. PR #898 made that
+shadow prediction status-only. The clean run now passes `/health`,
+`/health/detailed`, `/auth/session`, `/client/bootstrap`, `/sessions`,
+`/client/sessions`, `/nodes`, and `/events/state`.
 
-The same run measured the current Python process at `151.438 MiB` RSS and
-`64.3 MiB` physical footprint, while the Rust sidecar measured `17.438 MiB`
-RSS and `6.828 MiB` physical footprint.
+The same run measured the current Python process at `151.516 MiB` RSS and
+`64.3 MiB` physical footprint, while the Rust sidecar measured `17.422 MiB`
+RSS and `6.781 MiB` physical footprint.
 
 ## Useful Local Fixtures Found
 
@@ -125,32 +132,25 @@ needed for final cutover evidence.
 
 ### Near-Term Work
 
-1. Fix the `/events/state` shadow body mismatch from the latest real-state
-   rehearsal.
-   - Determine whether this is a Rust projection bug, a volatile field that
-     should be status-only, or a Python/Rust ordering/default mismatch.
-   - Add a focused fixture or shadow test before rerunning rehearsal.
-2. Re-run `scripts.rust_migration.mvp_rehearsal --allow-blockers` against real
-   local state and update [mvp_progress.md](mvp_progress.md) with the result.
-3. Enable Python-authoritative shadow mode for a real observation window and
+1. Enable Python-authoritative shadow mode for a real observation window and
    triage unexplained mismatches.
-4. Run the full retained manifest against Python and Rust with the current
+2. Run the full retained manifest against Python and Rust with the current
    synthetic fixture set plus any live fixtures needed for mobile/device flows.
-5. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
+3. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
    - Retained commands should be native Rust or intentionally routed.
    - Removed commands should be absent or explicitly retired.
-6. Implement final state ownership and migration tooling.
+4. Implement final state ownership and migration tooling.
    - Freeze or journal write admission before final backup.
    - Prove rollback restores or accounts for every accepted write after the
      restore point.
-7. Complete public-edge deployment integration.
+5. Complete public-edge deployment integration.
    - Edge signer/proxy, device enrollment/list/remove, revoked-device denial,
      and node fallback proof.
-8. Finish retained node-control and narrow queue writer fixtures.
+6. Finish retained node-control and narrow queue writer fixtures.
    - Include audit, policy, recovery, and rollback semantics.
-9. Exercise service packaging and cutover.
+7. Exercise service packaging and cutover.
    - launchd wrapper, non-destructive port ownership, health checks, rollback.
-10. Run final native mobile smoke checks.
+8. Run final native mobile smoke checks.
    - bootstrap, session list/detail, attach, request-status, analytics, bug
      reports, app artifacts.
 
@@ -171,15 +171,15 @@ Do not start Rust writer ownership or MVP cutover until:
 
 ## Recommended Resume Point
 
-Start with the real-state rehearsal blocker:
+Start with the shadow observation gate:
 
-1. Inspect the Python and Rust `/events/state` payloads from the latest
-   real-state run or reproduce them against local Python and a Rust sidecar.
-2. Classify the body mismatch as an implementation bug, status-only shadow
-   candidate, or stable ordering/default mismatch.
-3. Patch the Rust projection or shadow predictor, add a focused test, and run
-   the MVP rehearsal again.
+1. Turn on Python-authoritative Rust shadow mode for retained reads against a
+   local Rust sidecar.
+2. Let it observe real traffic for the agreed window.
+3. Summarize the shadow ledger by route, comparison class, and unexplained
+   mismatch.
+4. Convert any unexplained retained-surface mismatch into a bounded Rust slice.
 
 This is the highest-signal next step because the latest rehearsal passed both
 the read-only sidecar contracts and the mutating Rust-core fixture contracts;
-only one retained read still blocks a clean real-state MVP rehearsal.
+the next risk is sustained live-traffic drift, not single-run rehearsal drift.
