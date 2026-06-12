@@ -24,7 +24,11 @@ from urllib.parse import urlparse
 
 from .baseline import run_baseline
 from .contracts import ContractManifest, run_checks, summarize
+from .freeze_drain_plan import build_freeze_drain_plan
 from .mutating_fixture import create_mutating_fixture_workspace
+from .state_backup import build_backup_plan
+from .state_preflight import build_state_preflight_report
+from .state_restore import build_restore_report
 
 
 PYTHON_BASE_URL = "http://127.0.0.1:8420"
@@ -126,6 +130,7 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             "include_gap_probes": not args.core_only,
             "skip_python_health": args.skip_python_health,
             "skip_smoke": args.skip_smoke,
+            "skip_state_gate": args.skip_state_gate,
             "skip_baseline": args.skip_baseline,
             "baseline_repetitions": args.baseline_repetitions,
             "skip_shadow": args.skip_shadow,
@@ -148,6 +153,32 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             report["steps"].append({"name": "python_health", **python_health})
             if python_health["status"] != "passed":
                 _add_blocker(report, "python_health", python_health["detail"])
+
+        if args.skip_state_gate:
+            report["steps"].append(
+                {
+                    "name": "state_ownership_backup_restore_gate",
+                    "status": "skipped",
+                    "detail": "state gate skipped by flag",
+                }
+            )
+        else:
+            state_gate = _run_state_gate(args, output_dir)
+            report["steps"].append(state_gate)
+            for name, path in state_gate.get("artifacts", {}).items():
+                report["artifacts"][f"state_gate_{name}"] = path
+            if state_gate["status"] != "passed":
+                _add_state_gate_blockers(report, state_gate)
+                if not any(
+                    blocker["kind"] == "state_ownership_gate"
+                    for blocker in report["blockers"]
+                ):
+                    _add_blocker(
+                        report,
+                        "state_ownership_gate",
+                        state_gate.get("detail", "state ownership gate failed"),
+                    )
+                return _finalize_report(report, output_dir, started_at)
 
         if args.reuse_rust_sidecar:
             rust_health = _probe_health(args.rust_base_url, args.timeout)
@@ -694,6 +725,205 @@ def _run_mutating_contract_group(
             _terminate_process_group(mutating_process)
 
 
+def _run_state_gate(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    step_name = "state_ownership_backup_restore_gate"
+    started_at = time.perf_counter()
+    root = output_dir / "state-gate"
+    root.mkdir(parents=True, exist_ok=True)
+    artifacts = {
+        "preflight_report": str(root / "state-preflight-report.json"),
+        "backup_report": str(root / "state-backup-report.json"),
+        "backup_manifest": str(root / "backup" / "state-backup-manifest.json"),
+        "restore_verify_report": str(root / "state-restore-verify-report.json"),
+        "restore_report": str(root / "restore" / "state-restore-report.json"),
+        "restore_root": str(root / "restore"),
+        "freeze_drain_report": str(root / "freeze-drain-report.json"),
+        "freeze_drain_ledger": str(root / "freeze-drain-ledger.jsonl"),
+    }
+    reports: dict[str, dict[str, Any] | None] = {
+        "preflight": None,
+        "backup": None,
+        "restore_verify": None,
+        "restore_execute": None,
+        "freeze_drain": None,
+    }
+
+    try:
+        preflight = build_state_preflight_report(
+            config_path=args.config,
+            local_env_path=args.local_env,
+        )
+        reports["preflight"] = preflight
+        _write_json(Path(artifacts["preflight_report"]), preflight)
+
+        backup = build_backup_plan(
+            config_path=args.config,
+            local_env_path=args.local_env,
+            output_dir=root / "backup",
+            execute=True,
+        )
+        reports["backup"] = backup
+        _write_json(Path(artifacts["backup_report"]), backup)
+
+        if backup["status"] == "copied":
+            restore_verify = build_restore_report(
+                manifest_path=Path(backup["manifest_path"]),
+            )
+            reports["restore_verify"] = restore_verify
+            _write_json(Path(artifacts["restore_verify_report"]), restore_verify)
+
+            restore_execute = build_restore_report(
+                manifest_path=Path(backup["manifest_path"]),
+                restore_dir=root / "restore",
+                execute_restore=True,
+            )
+            reports["restore_execute"] = restore_execute
+            # build_restore_report writes this file on success. Write it here too so
+            # blocked/error reports still have an artifact at the advertised path.
+            _write_json(Path(artifacts["restore_report"]), restore_execute)
+
+        freeze_drain = build_freeze_drain_plan(
+            config_path=args.config,
+            local_env_path=args.local_env,
+            ledger_path=root / "freeze-drain-ledger.jsonl",
+            record_plan=True,
+        )
+        reports["freeze_drain"] = freeze_drain
+        _write_json(Path(artifacts["freeze_drain_report"]), freeze_drain)
+    except Exception as exc:  # noqa: BLE001 - preserve concrete tool failure in report.
+        return {
+            "name": step_name,
+            "status": "failed",
+            "elapsed_ms": _elapsed_ms(started_at),
+            "detail": f"state gate raised {type(exc).__name__}: {exc}",
+            "summary": _state_gate_summary(reports),
+            "blockers": [
+                {
+                    "substep": "state_gate",
+                    "kind": "exception",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            ],
+            "artifacts": _existing_artifacts(artifacts),
+        }
+
+    blockers = _state_gate_report_blockers(reports)
+    expected_statuses = {
+        "preflight": "passed",
+        "backup": "copied",
+        "restore_verify": "verified",
+        "restore_execute": "restored",
+        "freeze_drain": "planned",
+    }
+    missing_or_bad = [
+        f"{name}={report.get('status') if report else 'skipped'}"
+        for name, expected in expected_statuses.items()
+        if not (report := reports.get(name)) or report.get("status") != expected
+    ]
+    if missing_or_bad and not blockers:
+        blockers.append(
+            {
+                "substep": "state_gate",
+                "kind": "unexpected_status",
+                "detail": "expected successful state gate statuses; got "
+                + ", ".join(missing_or_bad),
+            }
+        )
+
+    return {
+        "name": step_name,
+        "status": "passed" if not blockers else "failed",
+        "elapsed_ms": _elapsed_ms(started_at),
+        "detail": "state backup/restore gate completed" if not blockers else "state backup/restore gate blocked",
+        "summary": _state_gate_summary(reports),
+        "blockers": blockers,
+        "artifacts": _existing_artifacts(artifacts),
+    }
+
+
+def _existing_artifacts(artifacts: dict[str, str]) -> dict[str, str]:
+    return {
+        name: path
+        for name, path in artifacts.items()
+        if Path(path).exists()
+    }
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _state_gate_summary(
+    reports: dict[str, dict[str, Any] | None],
+) -> dict[str, Any]:
+    preflight = reports.get("preflight") or {}
+    backup = reports.get("backup") or {}
+    restore_verify = reports.get("restore_verify") or {}
+    restore_execute = reports.get("restore_execute") or {}
+    freeze_drain = reports.get("freeze_drain") or {}
+    return {
+        "preflight_status": preflight.get("status"),
+        "preflight_stores": (preflight.get("summary") or {}).get("stores"),
+        "preflight_existing": (preflight.get("summary") or {}).get("existing"),
+        "backup_status": backup.get("status"),
+        "backup_copied": (backup.get("summary") or {}).get("copied"),
+        "backup_skipped": (backup.get("summary") or {}).get("skipped"),
+        "restore_verify_status": restore_verify.get("status"),
+        "restore_verified": (restore_verify.get("summary") or {}).get("verified"),
+        "restore_execute_status": restore_execute.get("status"),
+        "restore_restored": (restore_execute.get("summary") or {}).get("restored"),
+        "freeze_drain_status": freeze_drain.get("status"),
+        "freeze_drain_ledger_written": (freeze_drain.get("ledger") or {}).get("written"),
+        "writer_families": (freeze_drain.get("summary") or {}).get("writer_families"),
+    }
+
+
+def _state_gate_report_blockers(
+    reports: dict[str, dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    blockers: dict[tuple[str | None, str, str], dict[str, Any]] = {}
+    for substep, report in reports.items():
+        if not report:
+            continue
+        for blocker in report.get("blockers", []):
+            store_id = blocker.get("store_id")
+            kind = blocker.get("kind", "blocker")
+            detail = blocker.get("detail", str(blocker))
+            key = (store_id, kind, detail)
+            entry = blockers.setdefault(
+                key,
+                {
+                    "substeps": [],
+                    "store_id": store_id,
+                    "kind": kind,
+                    "detail": detail,
+                },
+            )
+            entry["substeps"].append(substep)
+    return list(blockers.values())
+
+
+def _add_state_gate_blockers(report: dict[str, Any], step: dict[str, Any]) -> None:
+    for blocker in step.get("blockers", []):
+        detail_parts = []
+        if blocker.get("substeps"):
+            detail_parts.append("/".join(str(substep) for substep in blocker["substeps"]))
+        elif blocker.get("substep"):
+            detail_parts.append(str(blocker["substep"]))
+        if blocker.get("store_id"):
+            detail_parts.append(str(blocker["store_id"]))
+        if blocker.get("kind"):
+            detail_parts.append(str(blocker["kind"]))
+        prefix = ": ".join(detail_parts)
+        detail = blocker.get("detail", "state gate blocker")
+        _add_blocker(
+            report,
+            "state_ownership_gate",
+            f"{prefix} - {detail}" if prefix else str(detail),
+        )
+
+
 def _run_shadow_summary(
     *,
     python_base_url: str,
@@ -926,6 +1156,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--reuse-rust-sidecar", action="store_true")
     parser.add_argument("--skip-python-health", action="store_true")
+    parser.add_argument("--skip-state-gate", action="store_true")
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--skip-shadow", action="store_true")

@@ -40,6 +40,8 @@ from scripts.rust_migration.mvp_rehearsal import (
     _default_mutating_rust_base_url,
     _ensure_rust_cli_available,
     _run_contract_group,
+    _run_state_gate,
+    run_rehearsal,
 )
 
 
@@ -336,6 +338,133 @@ def test_mvp_rehearsal_mutating_group_fails_on_skipped_checks():
 
     assert step["status"] == "failed"
     assert step["summary"]["skipped"] == 1
+
+
+def test_mvp_rehearsal_state_gate_copies_restores_and_records_plan(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SM_CLIENT_CONFIG", str(tmp_path / "missing-client.yaml"))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "sessions.json").write_text("[]\n", encoding="utf-8")
+    (state_dir / "message_queue.db").write_text("queue\n", encoding="utf-8")
+    (state_dir / "logs").mkdir()
+    (state_dir / "logs/server.log").write_text("log\n", encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+paths:
+  state_file: "{state_dir / 'sessions.json'}"
+  log_dir: "{state_dir / 'logs'}"
+  server_log_file: "{state_dir / 'server.log'}"
+  app_artifacts_dir: "{state_dir / 'apps'}"
+  bug_reports_db: "{state_dir / 'bug_reports.db'}"
+sm_send:
+  db_path: "{state_dir / 'message_queue.db'}"
+response_relay:
+  db_path: "{state_dir / 'response_relay.db'}"
+tool_logging:
+  db_path: "{state_dir / 'tool_usage.db'}"
+telegram:
+  topic_registry:
+    path: "{state_dir / 'telegram_topics.json'}"
+email:
+  bridge_config: "{state_dir / 'email_send.yaml'}"
+queue_runner:
+  state_dir: "{state_dir / 'queue-runner'}"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    args = _build_parser().parse_args(["--config", str(config)])
+    output_dir = tmp_path / "rehearsal"
+
+    step = _run_state_gate(args, output_dir)
+
+    assert step["status"] == "passed"
+    assert step["summary"]["preflight_status"] == "passed"
+    assert step["summary"]["backup_status"] == "copied"
+    assert step["summary"]["restore_verify_status"] == "verified"
+    assert step["summary"]["restore_execute_status"] == "restored"
+    assert step["summary"]["freeze_drain_status"] == "planned"
+    assert step["summary"]["freeze_drain_ledger_written"] is True
+    for path in step["artifacts"].values():
+        if path.endswith("restore"):
+            assert Path(path).is_dir()
+        else:
+            assert Path(path).exists()
+    manifest = json.loads(
+        Path(step["artifacts"]["backup_manifest"]).read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "copied"
+    restore_report = json.loads(
+        Path(step["artifacts"]["restore_report"]).read_text(encoding="utf-8")
+    )
+    assert restore_report["status"] == "restored"
+    assert (
+        Path(step["artifacts"]["restore_root"]) / "stores/sessions_state"
+    ).read_text(encoding="utf-8") == "[]\n"
+    ledger_rows = Path(step["artifacts"]["freeze_drain_ledger"]).read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(ledger_rows) == 1
+    assert json.loads(ledger_rows[0])["kind"] == "freeze_drain_plan"
+
+
+def test_mvp_rehearsal_stops_after_state_gate_blocker(tmp_path, monkeypatch):
+    monkeypatch.setenv("SM_CLIENT_CONFIG", str(tmp_path / "missing-client.yaml"))
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+paths:
+  state_file: "{state_dir / 'sessions.json'}"
+  log_dir: "{state_dir / 'logs'}"
+sm_send:
+  db_path: "{state_dir / 'message_queue.db'}"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    args = _build_parser().parse_args(
+        [
+            "--skip-python-health",
+            "--config",
+            str(config),
+            "--output-dir",
+            str(tmp_path / "rehearsal"),
+        ]
+    )
+
+    report = run_rehearsal(args)
+
+    assert report["summary"]["status"] == "blocked"
+    state_blockers = [
+        blocker
+        for blocker in report["blockers"]
+        if blocker["kind"] == "state_ownership_gate"
+    ]
+    assert len(state_blockers) == 1
+    assert "preflight/backup/freeze_drain" in state_blockers[0]["detail"]
+    assert "sessions_state" in state_blockers[0]["detail"]
+    step_names = [step["name"] for step in report["steps"]]
+    assert step_names == ["state_ownership_backup_restore_gate"]
+    state_step = report["steps"][0]
+    assert len(state_step["blockers"]) == 1
+    assert state_step["blockers"][0]["substeps"] == [
+        "preflight",
+        "backup",
+        "freeze_drain",
+    ]
+    for name, path in report["artifacts"].items():
+        if name.startswith("state_gate_"):
+            assert Path(path).exists()
+    assert "state_gate_backup_manifest" not in report["artifacts"]
+    assert "state_gate_restore_verify_report" not in report["artifacts"]
+    assert "state_gate_restore_report" not in report["artifacts"]
+    assert "state_gate_restore_root" not in report["artifacts"]
+    assert "state_gate_freeze_drain_ledger" not in report["artifacts"]
 
 
 def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
