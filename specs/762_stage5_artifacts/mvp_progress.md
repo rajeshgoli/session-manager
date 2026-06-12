@@ -1,6 +1,6 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #898 merged and the 2026-06-12 clean real-state MVP rehearsal.
+Status: implementation snapshot after PR #912 merged, live shadow activation, and the fixture-filtered live contract pass.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -38,6 +38,13 @@ not change retained or removed scope. Binding scope remains
 | #894 | MVP rehearsal gate runs isolated read-only and mutating Rust-core contracts |
 | #896 | handoff update after the first real-state rehearsal |
 | #898 | `/events/state` shadow comparison moved to status-only, clearing the rehearsal blocker |
+| #900 | clean #898-era handoff update |
+| #902 | shadow observation report with blocker handling |
+| #904 | non-mutating shadow workflow planner |
+| #906 | safe `rust_shadow` config activation helper |
+| #908 | shadow report `--since` and `--last-minutes` filters |
+| #910 | Rust contract CLI checks default to `target/debug/sm` |
+| #912 | `--skip-fixture-checks` for broad live-state contract runs |
 
 ## Implemented Capability Groups
 
@@ -53,6 +60,39 @@ The Rust sidecar now has executable coverage for:
 | Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, and public-edge assertion validation are merged. |
 | External fallback | Email/human fallback delivery and inbound email validation path are retained in the Rust track. |
 | Queue and nodes | Narrow queue list/detail, queue fixture coverage, and registered-node read paths are implemented; retained node and queue writer behavior still needs final cutover verification. |
+
+## Current Live Shadow And Contract State
+
+Live Python-authoritative Rust shadow mode is active in the local config:
+
+- Python origin: `:8420`;
+- Rust sidecar: `127.0.0.1:8421`;
+- shadow ledger: `~/.local/share/claude-sessions/rust_shadow.jsonl`;
+- config backup created by the activation helper:
+  `config.yaml.shadow-backup-20260612T023248Z`.
+
+The latest clean short-window shadow report at `2026-06-12T02:59:18Z` used
+`--last-minutes 1 --fail-on-blockers` and returned:
+
+| Metric | Result |
+| --- | ---: |
+| Status | passed |
+| Rows | 86 |
+| Blockers | 0 |
+| `GET /events/state` | 28 status matches |
+| `GET /sessions` | 58 status matches |
+
+The fixture-filtered broad live Rust contract run now passes without synthetic
+fixture false failures:
+
+| Metric | Result |
+| --- | ---: |
+| Passed | 71 |
+| Skipped | 3 |
+| Failed | 0 |
+
+The skipped checks are mutating checks without `--include-mutating`, which is
+the expected safety behavior for a live-state read run.
 
 ## Latest Real-State Rehearsal
 
@@ -101,7 +141,7 @@ These are the next practical buckets before an MVP cutover trial:
 
 | Bucket | Why it remains |
 | --- | --- |
-| Shadow observation window | Enable Python-authoritative shadow mode for retained reads and triage unexplained mismatches before Rust becomes the writer. The rehearsal now passes, so the next evidence should come from sustained live traffic rather than single-run probes. |
+| Shadow observation window | Python-authoritative shadow mode is enabled and a short clean window has been recorded. Continue it for a longer agreed window and triage any unexplained retained-core mismatches before Rust becomes the writer. |
 | Full fixture manifest execution | Run the broader retained manifest with the current synthetic fixture set plus any live mobile/device fixtures needed for final evidence. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
 | State ownership and migration tooling | Implement final freeze/drain/backup/restore ledger behavior from [state_ownership_and_migration.md](state_ownership_and_migration.md). |

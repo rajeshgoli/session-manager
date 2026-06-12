@@ -1,6 +1,6 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-12 after PR #898 and the clean real-state MVP rehearsal.
+Status: handoff snapshot from 2026-06-12 after PR #912, live shadow activation, and the fixture-filtered live contract pass.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,11 +11,16 @@ coverage in
 ## Current Repository State
 
 - Branch: `main`
-- Latest merged commit: `0bc8f5e` (`Merge pull request #898`)
+- Latest merged commit: `b17c1e2` (`Merge pull request #912`)
 - Open PRs at handoff: none
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
-- Stale session-manager review agents from the overnight run were retired.
+  and the local `config.yaml.shadow-backup-20260612T023248Z` created when
+  enabling shadow mode.
+- Stale session-manager review agents from the overnight run and PR #912 were retired.
 - Unrelated non-session-manager agents were left alone.
+- Live Python-authoritative Rust shadow mode is enabled in `config.yaml`, with
+  Python serving on `:8420`, the Rust sidecar on `127.0.0.1:8421`, and the
+  ledger at `~/.local/share/claude-sessions/rust_shadow.jsonl`.
 
 ## Completed Work
 
@@ -54,7 +59,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #898.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #912.
 - PR #880 added fixture-gated manifest checks for already-implemented detail
   endpoints:
   - `GET /queue-jobs/{queue_job_id}`
@@ -74,6 +79,15 @@ Merged Rust slices cover:
 - PR #898 reclassified `/events/state` shadow comparison as status-only because
   Python carries live tmux-client event state that a fresh Rust sidecar does not
   own.
+- PR #900 recorded the clean #898-era handoff.
+- PR #902 added `shadow_report` observation evidence with blocker handling for
+  no-data, malformed status, and invalid row shapes.
+- PR #904 added the non-mutating shadow workflow planner.
+- PR #906 added the safe `rust_shadow` config activation helper and backup path.
+- PR #908 added `--since` and `--last-minutes` filtering to `shadow_report`.
+- PR #910 made Rust contract CLI checks default to `target/debug/sm`.
+- PR #912 added `--skip-fixture-checks` so broad live-state contract runs can
+  skip synthetic fixture checks without suppressing ordinary live coverage.
 - Current contract manifest size:
   - `115` checks total
   - `68` `python_and_rust`
@@ -109,6 +123,48 @@ The same run measured the current Python process at `151.516 MiB` RSS and
 `64.3 MiB` physical footprint, while the Rust sidecar measured `17.422 MiB`
 RSS and `6.781 MiB` physical footprint.
 
+## Post-#912 Live Observation
+
+Live shadow mode is currently active. The most recent clean short-window report
+used:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.shadow_report \
+  --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
+  --last-minutes 1 \
+  --fail-on-blockers
+```
+
+Observed at `2026-06-12T02:59:18Z`:
+
+- status: passed;
+- rows: `86`;
+- blockers: `0`;
+- routes observed: `GET /events/state` (`28` status matches) and
+  `GET /sessions` (`58` status matches).
+
+The broad live Rust contract run now uses the fixture filter:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.contracts \
+  --target rust \
+  --base-url http://127.0.0.1:8421 \
+  --session-id 007c6275 \
+  --skip-fixture-checks \
+  --json
+```
+
+Post-#912 result:
+
+- `71` passed;
+- `3` skipped because they are mutating checks without `--include-mutating`;
+- `0` failed.
+
+Transient observation note: while retiring the PR #912 review session, one
+`GET /sessions/765b4805` body mismatch was recorded and then the same route
+matched on the next observation. Treat this as session-state drift unless it
+recurs in a later sustained window.
+
 ## Useful Local Fixtures Found
 
 These were valid at handoff and are useful for continuing fixture-backed
@@ -132,8 +188,8 @@ needed for final cutover evidence.
 
 ### Near-Term Work
 
-1. Enable Python-authoritative shadow mode for a real observation window and
-   triage unexplained mismatches.
+1. Continue Python-authoritative shadow mode for a longer real observation
+   window and triage unexplained mismatches.
 2. Run the full retained manifest against Python and Rust with the current
    synthetic fixture set plus any live fixtures needed for mobile/device flows.
 3. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
@@ -171,10 +227,10 @@ Do not start Rust writer ownership or MVP cutover until:
 
 ## Recommended Resume Point
 
-Start with the shadow observation gate:
+Continue with the shadow observation gate:
 
-1. Turn on Python-authoritative Rust shadow mode for retained reads against a
-   local Rust sidecar.
+1. Keep Python-authoritative Rust shadow mode running for retained reads against
+   the local Rust sidecar.
 2. Let it observe real traffic for the agreed window.
 3. Summarize the shadow ledger by route, comparison class, and unexplained
    mismatch.
