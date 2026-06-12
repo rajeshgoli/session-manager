@@ -2110,6 +2110,39 @@ async fn shadow_http_treats_live_session_lists_as_status_only() {
 }
 
 #[tokio::test]
+async fn shadow_http_treats_live_session_detail_as_status_only() {
+    let app = router(AppState::new(config_with_state_file(
+        &write_session_fixture(),
+    )));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/run12345",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"id\":\"run12345\",\"activity_state\":\"working\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
 async fn shadow_http_reports_codex_review_request_detail_200_as_status_only() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-requests.db");

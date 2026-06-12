@@ -4514,7 +4514,7 @@ fn shadow_predict_session_read(
         .strip_prefix("/sessions/")
         .filter(|value| !value.contains('/'))
     {
-        let Some(session) = state.session_store.get_session(session_id)? else {
+        let Some(_session) = state.session_store.get_session(session_id)? else {
             let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
             return Ok(Some(ShadowPrediction {
                 status: StatusCode::NOT_FOUND.as_u16(),
@@ -4522,11 +4522,10 @@ fn shadow_predict_session_read(
                 support_status: "implemented_read",
             }));
         };
-        let body = serde_json::to_vec(&SessionResponse::from(session))?;
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
-            body_sha256: Some(sha256_hex(&body)),
-            support_status: "implemented_read",
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
         }));
     }
 
