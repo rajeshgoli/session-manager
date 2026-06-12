@@ -34,6 +34,9 @@ from .state_restore import build_restore_report
 PYTHON_BASE_URL = "http://127.0.0.1:8420"
 RUST_BASE_URL = "http://127.0.0.1:8421"
 DEFAULT_RUST_SM_BINARY = "target/debug/sm"
+DEFAULT_READ_ONLY_FIXTURE_CONFIG = Path(
+    "scripts/rust_migration/fixtures/read_only/config.yaml"
+)
 
 CORE_READ_CHECK_IDS = (
     "http.health",
@@ -90,6 +93,26 @@ CORE_MUTATING_CHECK_IDS = (
     "cli.rust_core_wait_retired_fixture",
 )
 
+READ_ONLY_FIXTURE_CHECK_IDS = (
+    "http.session_detail_fixture",
+    "http.client_session_detail_fixture",
+    "http.session_output_fixture",
+    "http.attach_descriptor_fixture",
+    "http.codex_events",
+    "http.codex_activity_actions",
+    "http.codex_pending_requests",
+    "http.app_artifact_metadata",
+    "http.queue_jobs_list",
+    "http.queue_job_detail",
+)
+
+READ_ONLY_FIXTURE_VALUES = {
+    "session_id": "fixture001",
+    "codex_app_session_id": "fixture-codex",
+    "app_name": "session-manager-android",
+    "queue_job_id": "job-fixture",
+}
+
 BASELINE_CHECK_IDS = (
     "http.health",
     "http.health_detailed",
@@ -134,6 +157,9 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             "skip_baseline": args.skip_baseline,
             "baseline_repetitions": args.baseline_repetitions,
             "skip_shadow": args.skip_shadow,
+            "skip_read_only_fixture_contracts": args.skip_read_only_fixture_contracts,
+            "read_only_fixture_config": str(args.read_only_fixture_config),
+            "read_only_fixture_rust_base_url": _read_only_fixture_rust_base_url(args),
             "skip_mutating_contracts": args.skip_mutating_contracts,
             "mutating_rust_base_url": _mutating_rust_base_url(args),
             "sm_binary": args.sm_binary,
@@ -294,6 +320,39 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
         )
         report["steps"].append(core_contracts)
         _add_contract_blockers(report, core_contracts, blocker_kind="core_contract")
+
+        if args.skip_read_only_fixture_contracts:
+            report["steps"].append(
+                {
+                    "name": "rust_read_only_fixture_contracts",
+                    "status": "skipped",
+                    "detail": "read-only fixture contracts skipped by flag",
+                }
+            )
+        else:
+            read_only_fixture_contracts = _run_read_only_fixture_contract_group(
+                manifest, args, output_dir
+            )
+            report["steps"].append(read_only_fixture_contracts)
+            for name, path in read_only_fixture_contracts.get("artifacts", {}).items():
+                report["artifacts"][f"read_only_fixture_{name}"] = path
+            _add_contract_blockers(
+                report,
+                read_only_fixture_contracts,
+                blocker_kind="read_only_fixture_contract",
+                include_skipped=True,
+            )
+            if read_only_fixture_contracts["status"] == "failed" and not any(
+                blocker["kind"] == "read_only_fixture_contract"
+                for blocker in report["blockers"]
+            ):
+                _add_blocker(
+                    report,
+                    "read_only_fixture_contract",
+                    read_only_fixture_contracts.get(
+                        "detail", "read-only fixture contract step failed"
+                    ),
+                )
 
         if args.skip_mutating_contracts:
             report["steps"].append(
@@ -725,6 +784,106 @@ def _run_mutating_contract_group(
             _terminate_process_group(mutating_process)
 
 
+def _run_read_only_fixture_contract_group(
+    manifest: ContractManifest, args: argparse.Namespace, output_dir: Path
+) -> dict[str, Any]:
+    fixture_base_url = _read_only_fixture_rust_base_url(args)
+    step_name = "rust_read_only_fixture_contracts"
+    started_at = time.perf_counter()
+    log_path = output_dir / "rust-read-only-fixture-sidecar.log"
+    artifacts = {
+        "fixture_root": str(args.read_only_fixture_config.parent),
+        "fixture_config": str(args.read_only_fixture_config),
+        "sidecar_log": str(log_path),
+    }
+    if not args.read_only_fixture_config.exists():
+        return {
+            "name": step_name,
+            "status": "failed",
+            "elapsed_ms": _elapsed_ms(started_at),
+            "detail": f"read-only fixture config not found: {args.read_only_fixture_config}",
+            "summary": {"passed": 0, "failed": 1, "skipped": 0},
+            "results": [],
+            "artifacts": artifacts,
+        }
+
+    preflight = _probe_health(fixture_base_url, args.timeout)
+    if preflight["status"] == "passed":
+        return {
+            "name": step_name,
+            "status": "failed",
+            "elapsed_ms": _elapsed_ms(started_at),
+            "detail": (
+                f"{fixture_base_url} was already healthy before read-only fixture "
+                "sidecar start; choose --read-only-fixture-rust-base-url with a free port"
+            ),
+            "summary": {"passed": 0, "failed": 1, "skipped": 0},
+            "results": [],
+            "artifacts": artifacts,
+        }
+
+    fixture_process: subprocess.Popen[str] | None = None
+    try:
+        try:
+            fixture_process = _start_rust_sidecar_process(
+                cargo=args.cargo,
+                base_url=fixture_base_url,
+                config=args.read_only_fixture_config,
+                local_env=None,
+                log_path=log_path,
+            )
+        except OSError as exc:
+            return {
+                "name": step_name,
+                "status": "failed",
+                "elapsed_ms": _elapsed_ms(started_at),
+                "detail": f"failed to start read-only fixture sidecar: {exc}",
+                "summary": {"passed": 0, "failed": 1, "skipped": 0},
+                "results": [],
+                "artifacts": artifacts,
+            }
+
+        health = _wait_for_sidecar_health(
+            fixture_process,
+            fixture_base_url,
+            timeout_seconds=args.startup_timeout,
+            request_timeout=args.timeout,
+            log_path=log_path,
+        )
+        sidecar_exited = health.pop("process_exited", False)
+        if health["status"] != "passed":
+            detail = health["detail"]
+            if sidecar_exited and health.get("exit_code") is not None:
+                detail = f"{detail}; exit_code={health['exit_code']}"
+            return {
+                "name": step_name,
+                "status": "failed",
+                "elapsed_ms": _elapsed_ms(started_at),
+                "detail": detail,
+                "summary": {"passed": 0, "failed": 1, "skipped": 0},
+                "results": [],
+                "artifacts": artifacts,
+            }
+
+        step = _run_contract_group(
+            manifest,
+            name=step_name,
+            target="rust",
+            base_url=fixture_base_url,
+            sm_binary=args.sm_binary,
+            check_ids=set(READ_ONLY_FIXTURE_CHECK_IDS),
+            timeout_seconds=args.timeout,
+            fixtures=dict(READ_ONLY_FIXTURE_VALUES),
+            include_mutating=False,
+            fail_on_skipped=True,
+        )
+        step["artifacts"] = artifacts
+        return step
+    finally:
+        if fixture_process is not None:
+            _terminate_process_group(fixture_process)
+
+
 def _run_state_gate(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     step_name = "state_ownership_backup_restore_gate"
     started_at = time.perf_counter()
@@ -1117,12 +1276,26 @@ def _mutating_rust_base_url(args: argparse.Namespace) -> str:
 
 
 def _default_mutating_rust_base_url(base_url: str) -> str:
+    return _default_offset_rust_base_url(base_url, offset=1)
+
+
+def _read_only_fixture_rust_base_url(args: argparse.Namespace) -> str:
+    if args.read_only_fixture_rust_base_url:
+        return args.read_only_fixture_rust_base_url.rstrip("/")
+    return _default_read_only_fixture_rust_base_url(args.rust_base_url)
+
+
+def _default_read_only_fixture_rust_base_url(base_url: str) -> str:
+    return _default_offset_rust_base_url(base_url, offset=2)
+
+
+def _default_offset_rust_base_url(base_url: str, *, offset: int) -> str:
     parsed = urlparse(base_url)
     scheme = parsed.scheme or "http"
     host = parsed.hostname or "127.0.0.1"
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    return f"{scheme}://{host}:{_port_from_base_url(base_url) + 1}"
+    return f"{scheme}://{host}:{_port_from_base_url(base_url) + offset}"
 
 
 def _tail_text(value: str | bytes, max_chars: int = 4000) -> str:
@@ -1151,6 +1324,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Fresh Rust sidecar URL for disposable mutating fixture checks; defaults to rust port + 1",
     )
+    parser.add_argument(
+        "--read-only-fixture-rust-base-url",
+        default=None,
+        help="Fresh Rust sidecar URL for synthetic read-only fixture checks; defaults to rust port + 2",
+    )
+    parser.add_argument(
+        "--read-only-fixture-config",
+        type=Path,
+        default=DEFAULT_READ_ONLY_FIXTURE_CONFIG,
+        help="Rust config for the synthetic read-only fixture sidecar",
+    )
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     parser.add_argument("--local-env", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -1160,6 +1344,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--skip-shadow", action="store_true")
+    parser.add_argument("--skip-read-only-fixture-contracts", action="store_true")
     parser.add_argument("--skip-mutating-contracts", action="store_true")
     parser.add_argument("--core-only", action="store_true")
     parser.add_argument("--allow-blockers", action="store_true")

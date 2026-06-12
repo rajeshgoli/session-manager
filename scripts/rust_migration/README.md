@@ -413,6 +413,10 @@ By default this:
 - starts Rust `sm-server` on `http://127.0.0.1:8421` with `config.yaml`;
 - runs `scripts/rust-mvp-smoke.sh` for isolated mutating runtime coverage;
 - runs core read/retired-surface contracts against Rust;
+- starts a separate Rust sidecar with
+  `scripts/rust_migration/fixtures/read_only/config.yaml` and runs synthetic
+  read-only fixture contracts for stable session, Codex, app artifact, and queue
+  read surfaces;
 - probes retained MVP gaps when any remain;
 - posts shadow-style read comparisons to Rust `POST /__shadow/http`;
 - writes Python and Rust baseline JSON under the report directory.
@@ -440,14 +444,24 @@ Useful variants:
 # Reuse an already-running Rust sidecar.
 python -m scripts.rust_migration.mvp_rehearsal --reuse-rust-sidecar
 
-# Validate the harness itself with the synthetic read-only fixture.
+# Validate live core reads plus the synthetic read-only fixture without slower gates.
 python -m scripts.rust_migration.mvp_rehearsal \
-  --config scripts/rust_migration/fixtures/read_only/config.yaml \
   --skip-python-health \
   --skip-state-gate \
   --skip-smoke \
   --skip-baseline \
   --skip-shadow \
+  --skip-mutating-contracts \
+  --reuse-rust-sidecar
+
+# Start fresh sidecars for the core and read-only fixture checks only.
+python -m scripts.rust_migration.mvp_rehearsal \
+  --skip-python-health \
+  --skip-state-gate \
+  --skip-smoke \
+  --skip-baseline \
+  --skip-shadow \
+  --skip-mutating-contracts \
   --core-only
 
 # Produce a report even when known MVP gaps remain.
