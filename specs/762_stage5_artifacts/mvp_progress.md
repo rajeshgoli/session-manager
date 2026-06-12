@@ -1,6 +1,6 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #932 merged and the state-gated MVP rehearsal passed.
+Status: implementation snapshot after PR #938 merged and the full MVP rehearsal passed.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -55,6 +55,9 @@ not change retained or removed scope. Binding scope remains
 | #928 | freeze/drain plan ledger scaffold |
 | #930 | backup verification and restore rehearsal |
 | #932 | MVP rehearsal runs state preflight, backup, restore, and freeze/drain evidence |
+| #934 | handoff update after the state-gated rehearsal |
+| #936 | live session detail shadow comparison moved to status-only |
+| #938 | MVP rehearsal runs synthetic read-only fixture contracts in a dedicated sidecar |
 
 ## Implemented Capability Groups
 
@@ -62,7 +65,7 @@ The Rust sidecar now has executable coverage for:
 
 | Group | Current state |
 | --- | --- |
-| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, and freeze/drain evidence gates exist. |
+| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, and freeze/drain evidence gates exist. |
 | Retired-surface checks | Retired public/watch/summary/remind/job-watch/queue-policy checks are represented as Rust-target absence or denial fixtures. |
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent slices are merged, with shadow and contract fixtures covering the early cutover path. |
@@ -107,7 +110,7 @@ the expected safety behavior for a live-state read run.
 ## Latest Real-State Rehearsal
 
 Report:
-`.local/rust-mvp-rehearsals/20260612T051529Z-state-gated-reuse/mvp-rehearsal-report.json`
+`.local/rust-mvp-rehearsals/20260612T-full-after-938/mvp-rehearsal-report.json`
 
 Summary:
 
@@ -118,33 +121,36 @@ Summary:
 | State ownership gate | Passed: 17 stores checked, 13 existing, 13 copied, 13 verified, 13 restored, freeze/drain ledger written |
 | Rust sidecar health | Passed using explicit `--reuse-rust-sidecar` because port 8421 was already healthy |
 | Isolated runtime smoke | Passed |
-| Rust read-only sidecar contracts | 17 passed, 0 failed, 0 skipped |
+| Rust live core sidecar contracts | 17 passed, 0 failed, 0 skipped |
+| Rust synthetic read-only fixture contracts | 10 passed, 0 failed, 0 skipped |
 | Rust mutating fixture contracts | 30 passed, 0 failed, 0 skipped |
 | Gap probes | 0 failed |
 | Python baseline | Passed |
 | Rust baseline | Passed |
 | Shadow read summary | 8 passed, 0 failed |
 
-The previous blocker was a body mismatch for `GET /events/state` in shadow
+The earlier blocker was a body mismatch for `GET /events/state` in shadow
 comparison. PR #898 reclassified that route as status-only because Python
 carries live tmux-client event state that a fresh Rust sidecar does not own.
-The clean run now passes the shadow summary for `/health`, `/health/detailed`,
-`/auth/session`, `/client/bootstrap`, `/sessions`, `/client/sessions`,
-`/nodes`, and `/events/state`.
+After PR #936, live session detail is also status-only for shadow comparison to
+avoid lifecycle TOCTOU noise while fixture-backed deterministic session detail
+checks remain body/assertion based. The clean run now passes the shadow summary
+for `/health`, `/health/detailed`, `/auth/session`, `/client/bootstrap`,
+`/sessions`, `/client/sessions`, `/nodes`, and `/events/state`.
 
 Measured baseline snapshot from the same run:
 
 | Metric | Python | Rust |
 | --- | ---: | ---: |
-| RSS | 151.906 MiB | 21.516 MiB |
-| Physical footprint | 64.8 MiB | 6.891 MiB |
-| `GET /health` median | 4.994 ms | 0.350 ms |
-| `GET /health/detailed` median | 203.143 ms | 0.350 ms |
-| `GET /auth/session` median | 6.793 ms | 0.302 ms |
-| `GET /client/bootstrap` median | 5.511 ms | 0.359 ms |
-| `GET /events/state` median | 6.002 ms | 0.349 ms |
-| `GET /sessions` median | 33.644 ms | 8.662 ms |
-| `GET /client/sessions` median | 69.850 ms | 9.196 ms |
+| RSS | 154.672 MiB | 19.797 MiB |
+| Physical footprint | 66.4 MiB | 6.688 MiB |
+| `GET /health` median | 4.167 ms | 0.275 ms |
+| `GET /health/detailed` median | 1078.139 ms | 0.294 ms |
+| `GET /auth/session` median | 18.825 ms | 0.268 ms |
+| `GET /client/bootstrap` median | 6.622 ms | 0.298 ms |
+| `GET /events/state` median | 5.017 ms | 0.288 ms |
+| `GET /sessions` median | 25.746 ms | 7.972 ms |
+| `GET /client/sessions` median | 58.486 ms | 7.946 ms |
 
 ## Near-Term Remaining Work
 
@@ -153,7 +159,7 @@ These are the next practical buckets before an MVP cutover trial:
 | Bucket | Why it remains |
 | --- | --- |
 | Shadow observation window | Python-authoritative shadow mode is enabled and a short clean window has been recorded. Continue it for a longer agreed window and triage any unexplained retained-core mismatches before Rust becomes the writer. |
-| Full fixture manifest execution | Run the broader retained manifest with the current synthetic fixture set plus any live mobile/device fixtures needed for final evidence. |
+| Full fixture manifest execution | The MVP rehearsal now runs the current synthetic read-only and mutating fixture sets. Remaining work is final live mobile/device fixture evidence and any additional retained fixture rows added by later slices. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
 | State ownership and migration tooling | Initial preflight, backup, restore, and freeze/drain evidence tools are merged and exercised by the rehearsal. Remaining work is live write-admission freeze/journal ownership and rollback accounting from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
 | Public-edge deployment integration | Pair the Rust origin gate with the actual edge signer/proxy/device enrollment flow, including revoked-device and node fallback tests. |

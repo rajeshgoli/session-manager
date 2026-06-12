@@ -1,6 +1,6 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-12 after PR #932 and the state-gated MVP rehearsal passed.
+Status: handoff snapshot from 2026-06-12 after PR #938 and the full MVP rehearsal passed.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,7 +11,7 @@ coverage in
 ## Current Repository State
 
 - Branch: `main`
-- Latest merged commit: `14b54e7` (`Merge pull request #932`)
+- Latest merged commit: `43eb722` (`Merge pull request #938`)
 - Open PRs at handoff: none
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
   and the local `config.yaml.shadow-backup-20260612T023248Z` created when
@@ -59,7 +59,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #932.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #938.
 - PR #880 added fixture-gated manifest checks for already-implemented detail
   endpoints:
   - `GET /queue-jobs/{queue_job_id}`
@@ -99,6 +99,11 @@ Merged Rust slices cover:
 - PR #930 added backup verification and restore rehearsal.
 - PR #932 made the MVP rehearsal run state preflight, backup, restore
   verification, disposable restore, and freeze/drain evidence by default.
+- PR #934 refreshed the handoff after the state-gated rehearsal.
+- PR #936 made live session detail shadow prediction status-only while keeping
+  fixture-backed deterministic session detail checks body/assertion based.
+- PR #938 made the MVP rehearsal run synthetic read-only fixture contracts in a
+  dedicated sidecar.
 - Current contract manifest size:
   - `117` checks total
   - `68` `python_and_rust`
@@ -109,7 +114,7 @@ Merged Rust slices cover:
 The latest real-state MVP rehearsal is:
 
 ```bash
-.local/rust-mvp-rehearsals/20260612T051529Z-state-gated-reuse/mvp-rehearsal-report.json
+.local/rust-mvp-rehearsals/20260612T-full-after-938/mvp-rehearsal-report.json
 ```
 
 Observed results from that run:
@@ -123,22 +128,25 @@ Observed results from that run:
   - `13` backup entries verified;
   - `13` backup entries restored into the disposable restore root;
   - freeze/drain ledger plan written;
-- Rust read-only sidecar contracts: `17` passed, `0` failed, `0` skipped;
+- Rust live core sidecar contracts: `17` passed, `0` failed, `0` skipped;
+- Rust synthetic read-only fixture contracts: `10` passed, `0` failed, `0`
+  skipped;
 - Rust mutating fixture contracts: `30` passed, `0` failed, `0` skipped;
 - gap probes: `0` failed;
 - Python and Rust baseline measurements completed;
 - shadow read summary: `8` passed, `0` failed.
 
-The previous blocker was `GET /events/state` shadow comparison. Python and Rust
+The earlier blocker was `GET /events/state` shadow comparison. Python and Rust
 both returned status `200`, but the predicted Rust body hash did not match
 Python because Python carries live tmux-client event state. PR #898 made that
-shadow prediction status-only. The clean run now passes `/health`,
-`/health/detailed`, `/auth/session`, `/client/bootstrap`, `/sessions`,
-`/client/sessions`, `/nodes`, and `/events/state`.
+shadow prediction status-only. PR #936 also made live session detail
+status-only for shadow to avoid lifecycle TOCTOU noise. The clean run now
+passes `/health`, `/health/detailed`, `/auth/session`, `/client/bootstrap`,
+`/sessions`, `/client/sessions`, `/nodes`, and `/events/state`.
 
-The same run measured the current Python process at `151.906 MiB` RSS and
-`64.8 MiB` physical footprint, while the Rust sidecar measured `21.516 MiB`
-RSS and `6.891 MiB` physical footprint.
+The same run measured the current Python process at `154.672 MiB` RSS and
+`66.4 MiB` physical footprint, while the Rust sidecar measured `19.797 MiB`
+RSS and `6.688 MiB` physical footprint.
 
 ## Live Observation
 
@@ -207,8 +215,10 @@ needed for final cutover evidence.
 
 1. Continue Python-authoritative shadow mode for a longer real observation
    window and triage unexplained mismatches.
-2. Run the full retained manifest against Python and Rust with the current
-   synthetic fixture set plus any live fixtures needed for mobile/device flows.
+2. Continue expanding fixture/live evidence as new retained rows land.
+   - The MVP rehearsal already runs the current synthetic read-only and
+     mutating fixture sets.
+   - Final live mobile/device fixture evidence is still needed.
 3. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
    - Retained commands should be native Rust or intentionally routed.
    - Removed commands should be absent or explicitly retired.
