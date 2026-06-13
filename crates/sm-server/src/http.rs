@@ -17,7 +17,8 @@ use axum::{
     body::{to_bytes, Body},
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query,
+        Request, State,
     },
     http::{
         header::{
@@ -42,6 +43,7 @@ use futures_util::{
     SinkExt,
 };
 use hmac::{Hmac, Mac};
+use jsonwebtoken::jwk::JwkSet;
 #[cfg(unix)]
 use nix::{
     errno::Errno,
@@ -67,6 +69,13 @@ use crate::app_artifacts::{
     APP_ARTIFACT_MAX_SIZE_BYTES,
 };
 use crate::bug_reports::{BugReportStore, CreateBugReport};
+use crate::cloudflare_access::{
+    classify_cloudflare_access_assertion_with_jwks, cloudflare_access_application_for_host,
+    cloudflare_access_assertion_key_id, cloudflare_access_has_enabled_app,
+    cloudflare_access_has_enabled_app_without_hostname, fetch_cloudflare_access_jwks,
+    CloudflareAccessApplication, CloudflareAccessContext, CloudflareAccessContextError,
+    CloudflareAccessError,
+};
 use crate::codex_activity::{list_codex_activity_actions_from_path, CodexActivityActionsResponse};
 use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
 use crate::codex_requests::{list_codex_pending_requests_from_path, CodexPendingRequestsResponse};
@@ -116,6 +125,8 @@ const MOBILE_TERMINAL_MAX_COLS: u16 = 300;
 const MOBILE_TERMINAL_INPUT_MAX_CHARS: usize = 8192;
 const MOBILE_TERMINAL_INITIAL_RESIZE_WAIT_SECONDS: f64 = 2.0;
 const MOBILE_TERMINAL_MAX_ATTACH_SECONDS: u64 = 3600;
+const CLOUDFLARE_ACCESS_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
+const CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -205,6 +216,13 @@ struct MobileTerminalAuthFrame {
 }
 
 #[derive(Clone)]
+struct CloudflareAccessJwksCacheEntry {
+    jwks: Arc<JwkSet>,
+    fetched_at: Instant,
+    last_unknown_key_refresh: Option<Instant>,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
     session_store: SessionStore,
@@ -212,6 +230,7 @@ pub struct AppState {
     mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
     public_edge_assertion_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
+    cloudflare_access_jwks_cache: Arc<Mutex<BTreeMap<String, CloudflareAccessJwksCacheEntry>>>,
     mobile_terminal_revoked_keys: Arc<Mutex<BTreeSet<(String, String)>>>,
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
@@ -231,6 +250,7 @@ impl AppState {
             mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
             public_edge_assertion_nonces: Arc::new(Mutex::new(BTreeMap::new())),
+            cloudflare_access_jwks_cache: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_revoked_keys: Arc::new(Mutex::new(BTreeSet::new())),
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             mobile_terminal_secret,
@@ -443,8 +463,15 @@ async fn auth_session(
 
 async fn auth_device_google(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<DeviceGoogleAuthRequest>,
+    request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+    let Json(payload) = Json::<DeviceGoogleAuthRequest>::from_request(request, &state)
+        .await
+        .map_err(|error| ApiError::Status {
+            status: error.status(),
+            detail: error.body_text(),
+        })?;
     if !state.config.google_auth.ready() {
         return Err(ApiError::Status {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -490,6 +517,11 @@ async fn client_bootstrap(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<ClientBootstrapResponse>, ApiError> {
+    ensure_cloudflare_access_application_for_request(
+        &state,
+        &request,
+        CloudflareAccessApplication::MobileApp,
+    )?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     Ok(Json(client_bootstrap_response(
         &state.config,
@@ -501,8 +533,14 @@ async fn client_analytics_summary(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
     Ok(Json(build_mobile_analytics_summary(
         &state.config,
         &state.session_store,
@@ -516,6 +554,8 @@ async fn client_request_status(
     headers: HeaderMap,
 ) -> Result<Json<ClientRequestStatusResponse>, ApiError> {
     let request_target = request_target_from_uri(&uri);
+    let access_context =
+        ensure_mobile_cloudflare_access_from_parts(&state, &headers, Some(peer_addr))?;
     ensure_public_edge_assertion_from_parts(
         &state,
         &headers,
@@ -528,6 +568,11 @@ async fn client_request_status(
         &headers,
         Some(peer_addr),
         "/client/request-status",
+    )?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email_from_parts(&state.config, &headers, Some(peer_addr)).as_deref(),
     )?;
     ensure_core_writes_enabled(&state)?;
     let sessions = state.session_store.list_sessions(false)?;
@@ -598,6 +643,8 @@ async fn submit_client_bug_report(
     Json(payload): Json<ClientBugReportRequest>,
 ) -> Result<Json<ClientBugReportResponse>, ApiError> {
     let request_target = request_target_from_uri(&uri);
+    let access_context =
+        ensure_mobile_cloudflare_access_from_parts(&state, &headers, Some(peer_addr))?;
     ensure_public_edge_assertion_from_parts(
         &state,
         &headers,
@@ -619,6 +666,11 @@ async fn submit_client_bug_report(
             login_url: None,
         });
     }
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        actor_email.as_deref(),
+    )?;
     let report_text = payload.report_text.trim().to_owned();
     if report_text.is_empty() {
         return Err(ApiError::Status {
@@ -1285,7 +1337,13 @@ async fn get_latest_app_artifact(
     Path(app_name): Path<String>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
     if !valid_app_name(&app_name) {
         return Err(ApiError::NotFound("Artifact not found"));
     }
@@ -1313,7 +1371,13 @@ async fn get_hashed_app_artifact(
     Path((app_name, artifact_file)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
     let Some(artifact_hash) = artifact_file.strip_suffix(".apk") else {
         return Err(ApiError::NotFound("Artifact not found"));
     };
@@ -1349,7 +1413,13 @@ async fn get_app_artifact_metadata(
     Path(app_name): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
     if !valid_app_name(&app_name) {
         return Err(ApiError::NotFound("Artifact metadata not found"));
     }
@@ -1363,7 +1433,13 @@ async fn get_legacy_apk_download(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
     Ok((
         StatusCode::FOUND,
         [(LOCATION, "/apps/session-manager-android/latest.apk")],
@@ -1684,9 +1760,15 @@ async fn list_client_sessions(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
     let actor_email = request_actor_email(&state.config, &request);
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        actor_email.as_deref(),
+    )?;
     let sessions = state
         .session_store
         .list_sessions(false)?
@@ -1846,9 +1928,15 @@ async fn get_client_session(
     Path(session_id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     ensure_session_read_allowed(&state, &request)?;
     let actor_email = request_actor_email(&state.config, &request);
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        actor_email.as_deref(),
+    )?;
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -1865,6 +1953,7 @@ async fn create_mobile_attach_ticket(
     Path(session_id): Path<String>,
     request: Request,
 ) -> Result<Json<MobileAttachTicketResponse>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     let peer_addr = request
         .extensions()
@@ -1875,6 +1964,11 @@ async fn create_mobile_attach_ticket(
         status: StatusCode::UNAUTHORIZED,
         detail: "Authentication required".to_owned(),
     })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(
+        &state,
+        access_context.as_ref(),
+        &actor_email,
+    )?;
     let Some(session) = resolve_session_or_registry_role(&state, &session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -2030,12 +2124,18 @@ async fn disable_mobile_terminal(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<MobileTerminalDisableResponse>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     let actor_email =
         request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
             detail: "Authentication required".to_owned(),
         })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(
+        &state,
+        access_context.as_ref(),
+        &actor_email,
+    )?;
     let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
     else {
         return Err(ApiError::Status {
@@ -2089,12 +2189,18 @@ async fn list_mobile_terminal_devices(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<MobileTerminalDeviceListResponse>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     let actor_email =
         request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
             detail: "Authentication required".to_owned(),
         })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(
+        &state,
+        access_context.as_ref(),
+        &actor_email,
+    )?;
     let Some((actor_user_id, user_config)) =
         mobile_terminal_visible_user(&state.config, &actor_email)
     else {
@@ -2154,6 +2260,7 @@ async fn revoke_mobile_terminal_device(
     Query(query): Query<MobileTerminalRevokeDeviceQuery>,
     request: Request,
 ) -> Result<Json<MobileTerminalRevokeDeviceResponse>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     let device_key_id = device_key_id.trim().to_owned();
     if device_key_id.is_empty() {
@@ -2167,6 +2274,11 @@ async fn revoke_mobile_terminal_device(
             status: StatusCode::UNAUTHORIZED,
             detail: "Authentication required".to_owned(),
         })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(
+        &state,
+        access_context.as_ref(),
+        &actor_email,
+    )?;
     let Some((actor_user_id, user_config)) =
         mobile_terminal_visible_user(&state.config, &actor_email)
     else {
@@ -2211,6 +2323,7 @@ async fn mobile_terminal_endpoint(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
     ensure_public_edge_assertion_for_request(&state, &request)?;
     let (mut parts, _body) = request.into_parts();
     let headers = parts.headers.clone();
@@ -2223,11 +2336,12 @@ async fn mobile_terminal_endpoint(
             .on_upgrade(move |socket| mobile_terminal_websocket(socket, state))
             .into_response());
     }
-    mobile_terminal_upgrade_required(&state, &headers, peer_addr)
+    mobile_terminal_upgrade_required(&state, access_context.as_ref(), &headers, peer_addr)
 }
 
 fn mobile_terminal_upgrade_required(
     state: &AppState,
+    access_context: Option<&CloudflareAccessContext>,
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
 ) -> Result<Response, ApiError> {
@@ -2236,6 +2350,7 @@ fn mobile_terminal_upgrade_required(
             status: StatusCode::UNAUTHORIZED,
             detail: "Authentication required".to_owned(),
         })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(state, access_context, &actor_email)?;
     let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
     else {
         return Err(ApiError::Status {
@@ -5303,6 +5418,389 @@ fn request_target_from_uri(uri: &Uri) -> String {
         .unwrap_or_else(|| uri.path().to_owned())
 }
 
+fn ensure_cloudflare_access_application_for_request<A>(
+    state: &AppState,
+    request: &Request,
+    required_application: A,
+) -> Result<Option<CloudflareAccessContext>, ApiError>
+where
+    A: Into<Option<CloudflareAccessApplication>>,
+{
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    ensure_cloudflare_access_application_from_parts(
+        state,
+        request.headers(),
+        peer_addr,
+        required_application.into(),
+    )
+}
+
+fn ensure_mobile_cloudflare_access_for_request(
+    state: &AppState,
+    request: &Request,
+) -> Result<Option<CloudflareAccessContext>, ApiError> {
+    ensure_cloudflare_access_application_for_request(
+        state,
+        request,
+        CloudflareAccessApplication::MobileApp,
+    )
+}
+
+fn ensure_mobile_cloudflare_access_from_parts(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> Result<Option<CloudflareAccessContext>, ApiError> {
+    ensure_cloudflare_access_application_from_parts(
+        state,
+        headers,
+        peer_addr,
+        Some(CloudflareAccessApplication::MobileApp),
+    )
+}
+
+fn ensure_cloudflare_access_application_from_parts(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    required_application: Option<CloudflareAccessApplication>,
+) -> Result<Option<CloudflareAccessContext>, ApiError> {
+    let config = &state.config;
+    if is_local_bypass_request(headers, peer_addr, config) {
+        return Ok(None);
+    }
+    if cloudflare_access_has_enabled_app_without_hostname(&config.cloudflare_access) {
+        return Err(cloudflare_access_error(
+            CloudflareAccessContextError::IncompleteConfig,
+        ));
+    }
+    let Some(hostname) = request_hostname(headers) else {
+        if cloudflare_access_has_enabled_app(&config.cloudflare_access) {
+            return Err(cloudflare_access_required_application(required_application));
+        }
+        return Ok(None);
+    };
+    let Some(application) =
+        cloudflare_access_application_for_host(&config.cloudflare_access, &hostname)
+    else {
+        if !cloudflare_access_has_enabled_app(&config.cloudflare_access) {
+            return Ok(None);
+        }
+        return Err(cloudflare_access_required_application(required_application));
+    };
+    if required_application.is_some_and(|required| required != application) {
+        return Err(cloudflare_access_required_application(required_application));
+    }
+    let Some(assertion) = header_text(headers, "cf-access-jwt-assertion") else {
+        return Err(cloudflare_access_required_application(required_application));
+    };
+    let context = classify_cloudflare_access_assertion_cached(state, application, &assertion)
+        .map_err(cloudflare_access_error)?;
+    ensure_cloudflare_access_context_allowed(state, &context)?;
+    Ok(Some(context))
+}
+
+fn ensure_cloudflare_access_context_allowed(
+    state: &AppState,
+    context: &CloudflareAccessContext,
+) -> Result<(), ApiError> {
+    if context.application != CloudflareAccessApplication::MobileApp {
+        return Ok(());
+    }
+    ensure_mobile_cloudflare_access_device_enrolled(state, &context.identity)
+}
+
+fn ensure_mobile_cloudflare_access_context_matches_optional_actor(
+    state: &AppState,
+    context: Option<&CloudflareAccessContext>,
+    actor_email: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let Some(actor_email) = actor_email else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        });
+    };
+    ensure_mobile_cloudflare_access_context_matches_actor(state, Some(context), actor_email)
+}
+
+fn ensure_mobile_cloudflare_access_context_matches_actor(
+    state: &AppState,
+    context: Option<&CloudflareAccessContext>,
+    actor_email: &str,
+) -> Result<(), ApiError> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if context.application != CloudflareAccessApplication::MobileApp {
+        return Ok(());
+    }
+    let Some((actor_user_id, _user_config)) =
+        mobile_terminal_visible_user(&state.config, actor_email)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access mobile device is not enrolled for actor".to_owned(),
+        });
+    };
+    ensure_mobile_cloudflare_access_device_enrolled_for_user(
+        state,
+        actor_user_id,
+        &context.identity,
+    )
+}
+
+fn ensure_mobile_cloudflare_access_device_enrolled(
+    state: &AppState,
+    device_common_name: &str,
+) -> Result<(), ApiError> {
+    let device_common_name = device_common_name.trim();
+    if device_common_name.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access mobile device is not enrolled".to_owned(),
+        });
+    }
+    let mut enrolled = false;
+    for user_id in state.config.mobile_terminal.allowed_users.keys() {
+        if mobile_cloudflare_access_device_enrolled_for_user(state, user_id, device_common_name)? {
+            enrolled = true;
+            break;
+        }
+    }
+    if !enrolled {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access mobile device is not enrolled".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_mobile_cloudflare_access_device_enrolled_for_user(
+    state: &AppState,
+    user_id: &str,
+    device_common_name: &str,
+) -> Result<(), ApiError> {
+    if !mobile_cloudflare_access_device_enrolled_for_user(state, user_id, device_common_name)? {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access mobile device is not enrolled for actor".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn mobile_cloudflare_access_device_enrolled_for_user(
+    state: &AppState,
+    user_id: &str,
+    device_common_name: &str,
+) -> Result<bool, ApiError> {
+    let device_common_name = device_common_name.trim();
+    if device_common_name.is_empty() {
+        return Ok(false);
+    }
+    let revoked_keys = state
+        .mobile_terminal_revoked_keys
+        .lock()
+        .map_err(|_| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "Mobile terminal revoked key store is unavailable".to_owned(),
+        })?;
+    Ok(state
+        .config
+        .mobile_terminal
+        .allowed_users
+        .get(user_id)
+        .map(|user_config| {
+            user_config.registered_device_keys.iter().any(|key| {
+                let device_key_id = key.id.trim();
+                key.enabled
+                    && device_key_id == device_common_name
+                    && !key.public_key.trim().is_empty()
+                    && !revoked_keys.contains(&(user_id.to_owned(), device_key_id.to_owned()))
+            })
+        })
+        .unwrap_or(false))
+}
+
+fn classify_cloudflare_access_assertion_cached(
+    state: &AppState,
+    application: CloudflareAccessApplication,
+    assertion: &str,
+) -> Result<CloudflareAccessContext, CloudflareAccessContextError> {
+    let expected_issuer = state
+        .config
+        .cloudflare_access
+        .expected_issuer()
+        .ok_or(CloudflareAccessContextError::IncompleteConfig)?;
+    let app_config = application.config(&state.config.cloudflare_access);
+    if !app_config.enabled {
+        return Err(CloudflareAccessContextError::Disabled);
+    }
+    app_config
+        .expected_audience()
+        .ok_or(CloudflareAccessContextError::IncompleteConfig)?;
+    cloudflare_access_assertion_key_id(assertion).map_err(CloudflareAccessContextError::from)?;
+    let had_cached_jwks = cloudflare_access_has_cached_jwks(state, &expected_issuer);
+    let jwks = cloudflare_access_cached_jwks(state, &expected_issuer, false)?;
+    let result = classify_cloudflare_access_assertion_with_jwks(
+        &state.config.cloudflare_access,
+        application,
+        assertion,
+        &jwks,
+    );
+    if matches!(
+        result,
+        Err(CloudflareAccessContextError::InvalidAssertion(
+            CloudflareAccessError::UnknownKeyId
+        ))
+    ) && had_cached_jwks
+        && cloudflare_access_mark_unknown_key_refresh_if_allowed(state, &expected_issuer)
+    {
+        let refreshed_jwks = cloudflare_access_cached_jwks(state, &expected_issuer, true)?;
+        return classify_cloudflare_access_assertion_with_jwks(
+            &state.config.cloudflare_access,
+            application,
+            assertion,
+            &refreshed_jwks,
+        );
+    }
+    result
+}
+
+fn cloudflare_access_cached_jwks(
+    state: &AppState,
+    expected_issuer: &str,
+    force_refresh: bool,
+) -> Result<Arc<JwkSet>, CloudflareAccessContextError> {
+    if !force_refresh {
+        if let Some(entry) = state
+            .cloudflare_access_jwks_cache
+            .lock()
+            .unwrap()
+            .get(expected_issuer)
+            .cloned()
+            .filter(|entry| cloudflare_access_jwks_cache_entry_is_fresh(entry.fetched_at))
+        {
+            return Ok(entry.jwks);
+        }
+    }
+
+    let last_unknown_key_refresh = state
+        .cloudflare_access_jwks_cache
+        .lock()
+        .unwrap()
+        .get(expected_issuer)
+        .and_then(|entry| entry.last_unknown_key_refresh);
+    let (_normalized_issuer, jwks) = fetch_cloudflare_access_jwks(expected_issuer)
+        .map_err(CloudflareAccessContextError::from)?;
+    let jwks = Arc::new(jwks);
+    state.cloudflare_access_jwks_cache.lock().unwrap().insert(
+        expected_issuer.to_owned(),
+        CloudflareAccessJwksCacheEntry {
+            jwks: jwks.clone(),
+            fetched_at: Instant::now(),
+            last_unknown_key_refresh,
+        },
+    );
+    Ok(jwks)
+}
+
+fn cloudflare_access_jwks_cache_entry_is_fresh(fetched_at: Instant) -> bool {
+    fetched_at.elapsed() < CLOUDFLARE_ACCESS_JWKS_TTL
+}
+
+fn cloudflare_access_has_cached_jwks(state: &AppState, expected_issuer: &str) -> bool {
+    state
+        .cloudflare_access_jwks_cache
+        .lock()
+        .unwrap()
+        .contains_key(expected_issuer)
+}
+
+fn cloudflare_access_mark_unknown_key_refresh_if_allowed(
+    state: &AppState,
+    expected_issuer: &str,
+) -> bool {
+    let mut cache = state.cloudflare_access_jwks_cache.lock().unwrap();
+    let Some(entry) = cache.get_mut(expected_issuer) else {
+        return false;
+    };
+    let now = Instant::now();
+    if entry.last_unknown_key_refresh.is_some_and(|last_refresh| {
+        now.duration_since(last_refresh) < CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL
+    }) {
+        return false;
+    }
+    entry.last_unknown_key_refresh = Some(now);
+    true
+}
+
+fn cloudflare_access_required() -> ApiError {
+    ApiError::Status {
+        status: StatusCode::FORBIDDEN,
+        detail: "Cloudflare Access assertion is required".to_owned(),
+    }
+}
+
+fn cloudflare_access_required_application(
+    application: Option<CloudflareAccessApplication>,
+) -> ApiError {
+    match application {
+        Some(CloudflareAccessApplication::MobileApp) => ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access mobile app assertion is required".to_owned(),
+        },
+        Some(CloudflareAccessApplication::Browser) => ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access browser assertion is required".to_owned(),
+        },
+        Some(CloudflareAccessApplication::NodeFallback) => ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access node assertion is required".to_owned(),
+        },
+        Some(CloudflareAccessApplication::EmailWorker) => ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access worker assertion is required".to_owned(),
+        },
+        None => cloudflare_access_required(),
+    }
+}
+
+fn cloudflare_access_error(error: CloudflareAccessContextError) -> ApiError {
+    match error {
+        CloudflareAccessContextError::Disabled => ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access application is disabled".to_owned(),
+        },
+        CloudflareAccessContextError::IncompleteConfig => ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Cloudflare Access is enabled but incomplete".to_owned(),
+        },
+        CloudflareAccessContextError::MissingIdentity => ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Cloudflare Access assertion is missing required identity".to_owned(),
+        },
+        CloudflareAccessContextError::InvalidAssertion(CloudflareAccessError::JwksFetchFailed) => {
+            ApiError::Status {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                detail: "Cloudflare Access assertion verifier is unavailable".to_owned(),
+            }
+        }
+        CloudflareAccessContextError::InvalidAssertion(_) => ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Invalid Cloudflare Access assertion".to_owned(),
+        },
+    }
+}
+
 fn ensure_public_edge_assertion_from_parts(
     state: &AppState,
     headers: &HeaderMap,
@@ -7209,10 +7707,35 @@ mod tests {
     }
 
     fn public_request(method: Method, uri: &str, body: Body) -> axum::http::Request<Body> {
+        public_request_with_host(method, uri, body, "sm.rajeshgo.li")
+    }
+
+    fn public_request_with_host(
+        method: Method,
+        uri: &str,
+        body: Body,
+        host: &str,
+    ) -> axum::http::Request<Body> {
         let mut request = axum::http::Request::builder()
             .method(method)
             .uri(uri)
-            .header(HOST, "sm.rajeshgo.li")
+            .header(HOST, host)
+            .body(body)
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 10], 4200))));
+        request
+    }
+
+    fn public_request_without_host(
+        method: Method,
+        uri: &str,
+        body: Body,
+    ) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
             .body(body)
             .unwrap();
         request
@@ -7225,6 +7748,24 @@ mod tests {
         let mut config = AppConfig::default();
         config.public_edge.enabled = true;
         config.public_edge.assertion_secret = Some("edge-secret".to_owned());
+        config
+    }
+
+    fn cloudflare_access_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.cloudflare_access.team_domain = Some("team.cloudflareaccess.com".to_owned());
+        config.cloudflare_access.browser.enabled = true;
+        config.cloudflare_access.browser.hostname = Some("sm.example.com".to_owned());
+        config.cloudflare_access.browser.jwt_audience = Some("sm-browser-aud".to_owned());
+        config.cloudflare_access.mobile_app.enabled = true;
+        config.cloudflare_access.mobile_app.hostname = Some("sm-app.example.com".to_owned());
+        config.cloudflare_access.mobile_app.jwt_audience = Some("sm-mobile-aud".to_owned());
+        config.cloudflare_access.node_fallback.enabled = true;
+        config.cloudflare_access.node_fallback.hostname = Some("sm-node.example.com".to_owned());
+        config.cloudflare_access.node_fallback.jwt_audience = Some("sm-node-aud".to_owned());
+        config.cloudflare_access.email_worker.enabled = true;
+        config.cloudflare_access.email_worker.hostname = Some("sm-email.example.com".to_owned());
+        config.cloudflare_access.email_worker.jwt_audience = Some("sm-email-aud".to_owned());
         config
     }
 
@@ -7262,6 +7803,27 @@ mod tests {
                 axum::http::HeaderValue::from_str(&value).unwrap(),
             );
         }
+    }
+
+    fn syntactic_access_token_with_kid(kid: &str) -> String {
+        let header = json!({
+            "alg": "RS256",
+            "typ": "JWT",
+            "kid": kid,
+        });
+        let payload = json!({
+            "iss": "https://team.cloudflareaccess.com",
+            "aud": ["sm-mobile-aud"],
+            "sub": "mobile-device",
+            "common_name": "mobile-device",
+            "exp": 4_102_444_800_i64,
+            "iat": 1_700_000_000_i64,
+        });
+        format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        )
     }
 
     fn sign_ticket_headers(
@@ -7362,6 +7924,16 @@ mod tests {
         }
     }
 
+    fn mobile_access_context(device_common_name: &str) -> CloudflareAccessContext {
+        CloudflareAccessContext {
+            application: CloudflareAccessApplication::MobileApp,
+            subject: "mobile-subject".to_owned(),
+            identity: device_common_name.to_owned(),
+            email: None,
+            common_name: Some(device_common_name.to_owned()),
+        }
+    }
+
     fn test_mobile_terminal_ticket() -> MobileTerminalTicket {
         MobileTerminalTicket {
             ticket_id: "att_test".to_owned(),
@@ -7377,6 +7949,80 @@ mod tests {
             created_at_unix: 1,
             expires_at_unix: 999_999,
         }
+    }
+
+    #[test]
+    fn cloudflare_access_mobile_device_identity_requires_registered_non_revoked_device() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = AppState::new(mobile_ticket_config(&signing_key));
+
+        ensure_cloudflare_access_context_allowed(&state, &mobile_access_context("test-device"))
+            .expect("registered device is allowed");
+
+        let (status, detail) = api_error_status_detail(
+            ensure_cloudflare_access_context_allowed(
+                &state,
+                &mobile_access_context("unknown-device"),
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(detail, "Cloudflare Access mobile device is not enrolled");
+
+        revoke_mobile_terminal_device_in_state(&state, "local_bypass", "test-device")
+            .expect("revocation succeeds");
+        let (status, detail) = api_error_status_detail(
+            ensure_cloudflare_access_context_allowed(&state, &mobile_access_context("test-device"))
+                .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(detail, "Cloudflare Access mobile device is not enrolled");
+    }
+
+    #[test]
+    fn cloudflare_access_mobile_device_identity_must_match_actor() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let mut config = mobile_ticket_config(&signing_key);
+        config.mobile_terminal.allowed_users.insert(
+            "other_user".to_owned(),
+            MobileTerminalUserConfig {
+                email: Some("other@example.com".to_owned()),
+                interactive_shell_access: true,
+                registered_device_keys: vec![MobileTerminalDeviceKeyConfig {
+                    id: "other-device".to_owned(),
+                    public_key,
+                    enabled: true,
+                }],
+                ..MobileTerminalUserConfig::default()
+            },
+        );
+        let state = AppState::new(config);
+        let access_context = mobile_access_context("test-device");
+
+        ensure_mobile_cloudflare_access_context_matches_actor(
+            &state,
+            Some(&access_context),
+            "local_bypass",
+        )
+        .expect("matching actor/device is allowed");
+
+        let (status, detail) = api_error_status_detail(
+            ensure_mobile_cloudflare_access_context_matches_actor(
+                &state,
+                Some(&access_context),
+                "other@example.com",
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            detail,
+            "Cloudflare Access mobile device is not enrolled for actor"
+        );
     }
 
     #[test]
@@ -7496,6 +8142,386 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["auth"]["session_endpoint"], "/auth/session");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_is_disabled_by_default() {
+        let app = router(AppState::new(AppConfig::default()));
+
+        let response = app
+            .oneshot(public_request_with_host(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+                "sm.example.com",
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["auth"]["session_endpoint"], "/auth/session");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_bootstrap_requires_mobile_app_assertion() {
+        let app = router(AppState::new(cloudflare_access_config()));
+
+        for host in [
+            "sm.example.com",
+            "sm-app.example.com",
+            "sm-node.example.com",
+            "sm-email.example.com",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(public_request_with_host(
+                    Method::GET,
+                    "/client/bootstrap",
+                    Body::empty(),
+                    host,
+                ))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{host}");
+            assert_eq!(
+                body["detail"],
+                "Cloudflare Access mobile app assertion is required"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_gates_native_client_routes() {
+        let app = router(AppState::new(cloudflare_access_config()));
+        let routes = [
+            (Method::GET, "/client/bootstrap", "", false),
+            (
+                Method::POST,
+                "/auth/device/google",
+                r#"{"id_token":"fixture"}"#,
+                true,
+            ),
+            (Method::GET, "/client/analytics/summary", "", false),
+            (Method::POST, "/client/request-status", "", false),
+            (
+                Method::POST,
+                "/client/bug-reports",
+                r#"{"report_text":"fixture"}"#,
+                true,
+            ),
+            (Method::GET, "/client/terminal", "", false),
+            (Method::POST, "/client/mobile-terminal/disable", "", false),
+            (Method::GET, "/client/mobile-terminal/devices", "", false),
+            (
+                Method::DELETE,
+                "/client/mobile-terminal/devices/test-device",
+                "",
+                false,
+            ),
+            (Method::GET, "/client/sessions", "", false),
+            (Method::GET, "/client/sessions/fork1001", "", false),
+            (
+                Method::POST,
+                "/client/sessions/fork1001/attach-ticket",
+                "{}",
+                true,
+            ),
+        ];
+
+        for (method, uri, body, json_body) in routes {
+            let mut request = public_request_with_host(
+                method.clone(),
+                uri,
+                Body::from(body.to_owned()),
+                "sm-app.example.com",
+            );
+            if json_body {
+                request
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            }
+
+            let response = app.clone().oneshot(request).await.unwrap();
+            let (status, body) = response_json(response).await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {body}");
+            assert_eq!(
+                body["detail"], "Cloudflare Access mobile app assertion is required",
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_gates_app_artifact_download_routes() {
+        let app = router(AppState::new(cloudflare_access_config()));
+        for uri in [
+            "/apps/session-manager-android/latest.apk",
+            "/apps/session-manager-android/meta.json",
+            "/apps/session-manager-android/deadbeef.apk",
+            "/apk",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(public_request_with_host(
+                    Method::GET,
+                    uri,
+                    Body::empty(),
+                    "sm-app.example.com",
+                ))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert_eq!(
+                body["detail"], "Cloudflare Access mobile app assertion is required",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_rejects_missing_host_when_any_app_is_enabled() {
+        let app = router(AppState::new(cloudflare_access_config()));
+
+        let response = app
+            .oneshot(public_request_without_host(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["detail"],
+            "Cloudflare Access mobile app assertion is required"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_rejects_browser_access_for_native_bootstrap() {
+        let app = router(AppState::new(cloudflare_access_config()));
+        let mut request = public_request_with_host(
+            Method::GET,
+            "/client/bootstrap",
+            Body::empty(),
+            "sm.example.com",
+        );
+        request
+            .headers_mut()
+            .insert("cf-access-jwt-assertion", "not-a-jwt".parse().unwrap());
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body["detail"],
+            "Cloudflare Access mobile app assertion is required"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_rejects_invalid_assertion_before_bootstrap() {
+        let app = router(AppState::new(cloudflare_access_config()));
+        let mut request = public_request_with_host(
+            Method::GET,
+            "/client/bootstrap",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        request
+            .headers_mut()
+            .insert("cf-access-jwt-assertion", "not-a-jwt".parse().unwrap());
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["detail"], "Invalid Cloudflare Access assertion");
+    }
+
+    #[test]
+    fn cloudflare_access_jwks_cache_reuses_fresh_entry() {
+        let state = AppState::new(cloudflare_access_config());
+        let jwks = Arc::new(serde_json::from_str::<JwkSet>(r#"{"keys":[]}"#).unwrap());
+        state.cloudflare_access_jwks_cache.lock().unwrap().insert(
+            "https://team.cloudflareaccess.com".to_owned(),
+            CloudflareAccessJwksCacheEntry {
+                jwks: jwks.clone(),
+                fetched_at: Instant::now(),
+                last_unknown_key_refresh: None,
+            },
+        );
+
+        let cached =
+            cloudflare_access_cached_jwks(&state, "https://team.cloudflareaccess.com", false)
+                .unwrap();
+
+        assert!(Arc::ptr_eq(&cached, &jwks));
+    }
+
+    #[test]
+    fn cloudflare_access_jwks_cache_entries_expire() {
+        assert!(cloudflare_access_jwks_cache_entry_is_fresh(Instant::now()));
+        assert!(!cloudflare_access_jwks_cache_entry_is_fresh(
+            Instant::now() - CLOUDFLARE_ACCESS_JWKS_TTL
+        ));
+    }
+
+    #[test]
+    fn cloudflare_access_unknown_key_refresh_is_rate_limited() {
+        let state = AppState::new(cloudflare_access_config());
+        state.cloudflare_access_jwks_cache.lock().unwrap().insert(
+            "https://team.cloudflareaccess.com".to_owned(),
+            CloudflareAccessJwksCacheEntry {
+                jwks: Arc::new(serde_json::from_str::<JwkSet>(r#"{"keys":[]}"#).unwrap()),
+                fetched_at: Instant::now(),
+                last_unknown_key_refresh: None,
+            },
+        );
+
+        assert!(cloudflare_access_mark_unknown_key_refresh_if_allowed(
+            &state,
+            "https://team.cloudflareaccess.com"
+        ));
+        assert!(!cloudflare_access_mark_unknown_key_refresh_if_allowed(
+            &state,
+            "https://team.cloudflareaccess.com"
+        ));
+
+        state
+            .cloudflare_access_jwks_cache
+            .lock()
+            .unwrap()
+            .get_mut("https://team.cloudflareaccess.com")
+            .unwrap()
+            .last_unknown_key_refresh =
+            Some(Instant::now() - CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL);
+        assert!(cloudflare_access_mark_unknown_key_refresh_if_allowed(
+            &state,
+            "https://team.cloudflareaccess.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_rate_limits_unknown_key_refresh() {
+        let state = AppState::new(cloudflare_access_config());
+        state.cloudflare_access_jwks_cache.lock().unwrap().insert(
+            "https://team.cloudflareaccess.com".to_owned(),
+            CloudflareAccessJwksCacheEntry {
+                jwks: Arc::new(serde_json::from_str::<JwkSet>(r#"{"keys":[]}"#).unwrap()),
+                fetched_at: Instant::now(),
+                last_unknown_key_refresh: Some(Instant::now()),
+            },
+        );
+        let app = router(state);
+        let mut request = public_request_with_host(
+            Method::GET,
+            "/client/bootstrap",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        request.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            syntactic_access_token_with_kid("unknown-key")
+                .parse()
+                .unwrap(),
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["detail"], "Invalid Cloudflare Access assertion");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_fails_closed_when_configured_app_is_incomplete() {
+        let mut config = cloudflare_access_config();
+        config.cloudflare_access.mobile_app.jwt_audience = None;
+        let app = router(AppState::new(config));
+        let mut request = public_request_with_host(
+            Method::GET,
+            "/client/bootstrap",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        request
+            .headers_mut()
+            .insert("cf-access-jwt-assertion", "not-a-jwt".parse().unwrap());
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["detail"],
+            "Cloudflare Access is enabled but incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_fails_closed_when_enabled_app_has_no_hostname() {
+        let mut config = cloudflare_access_config();
+        config.cloudflare_access.browser.hostname = Some(" ".to_owned());
+        let app = router(AppState::new(config));
+
+        let response = app
+            .oneshot(public_request_with_host(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+                "sm.example.com",
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["detail"],
+            "Cloudflare Access is enabled but incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_rejects_unconfigured_public_host_and_allows_local_bypass() {
+        let app = router(AppState::new(cloudflare_access_config()));
+
+        let public_response = app
+            .clone()
+            .oneshot(public_request(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (public_status, public_body) = response_json(public_response).await;
+        assert_eq!(public_status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            public_body["detail"],
+            "Cloudflare Access mobile app assertion is required"
+        );
+
+        let local_response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/bootstrap",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (local_status, local_body) = response_json(local_response).await;
+        assert_eq!(local_status, StatusCode::OK);
+        assert_eq!(local_body["auth"]["session_endpoint"], "/auth/session");
     }
 
     #[tokio::test]
