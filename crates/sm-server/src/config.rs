@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub bug_reports: BugReportsConfig,
     pub google_auth: GoogleAuthConfig,
     pub external_access: ExternalAccessConfig,
+    pub cloudflare_access: CloudflareAccessConfig,
     pub public_edge: PublicEdgeConfig,
     pub mobile_terminal: MobileTerminalConfig,
     pub tmux: TmuxConfig,
@@ -46,6 +47,7 @@ impl Default for AppConfig {
             bug_reports: BugReportsConfig::default(),
             google_auth: GoogleAuthConfig::default(),
             external_access: ExternalAccessConfig::default(),
+            cloudflare_access: CloudflareAccessConfig::default(),
             public_edge: PublicEdgeConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
             tmux: TmuxConfig::default(),
@@ -300,6 +302,60 @@ pub struct ExternalAccessConfig {
     pub ssh_username: Option<String>,
     #[serde(default)]
     pub ssh_proxy_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CloudflareAccessConfig {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub api_token: Option<String>,
+    #[serde(default)]
+    pub team_domain: Option<String>,
+    #[serde(default)]
+    pub browser: CloudflareAccessApplicationConfig,
+    #[serde(default)]
+    pub mobile_app: CloudflareAccessApplicationConfig,
+    #[serde(default)]
+    pub node_fallback: CloudflareAccessApplicationConfig,
+    #[serde(default)]
+    pub email_worker: CloudflareAccessApplicationConfig,
+    #[serde(default)]
+    pub mobile_device_policy_id: Option<String>,
+    #[serde(default)]
+    pub node_policy_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CloudflareAccessApplicationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub jwt_audience: Option<String>,
+}
+
+impl CloudflareAccessApplicationConfig {
+    pub fn expected_audience(&self) -> Option<&str> {
+        self.jwt_audience
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+impl CloudflareAccessConfig {
+    pub fn expected_issuer(&self) -> Option<String> {
+        let value = trimmed(&self.team_domain)?;
+        if value.starts_with("https://") {
+            Some(value.trim_end_matches('/').to_owned())
+        } else {
+            Some(format!("https://{}", value.trim_end_matches('/')))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -822,6 +878,8 @@ struct RawConfig {
     #[serde(default)]
     external_access: ExternalAccessConfig,
     #[serde(default)]
+    cloudflare_access: CloudflareAccessConfig,
+    #[serde(default)]
     public_edge: PublicEdgeConfig,
     #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
@@ -918,6 +976,7 @@ impl From<RawConfig> for AppConfig {
             },
             google_auth: raw.auth.google,
             external_access: raw.external_access,
+            cloudflare_access: raw.cloudflare_access,
             public_edge: raw.public_edge,
             mobile_terminal: raw.mobile_terminal,
             tmux: raw.tmux,
@@ -1696,6 +1755,84 @@ public_edge:
             Some("edge-secret")
         );
         assert_eq!(config.public_edge.assertion_max_skew_seconds, 120);
+    }
+
+    #[test]
+    fn raw_config_reads_cloudflare_access_contract_fields() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+cloudflare_access:
+  account_id: cf-account
+  api_token: cf-token
+  team_domain: team.cloudflareaccess.com
+  mobile_device_policy_id: mobile-policy
+  node_policy_id: node-policy
+  browser:
+    enabled: true
+    app_id: browser-app
+    hostname: sm.rajeshgo.li
+    jwt_audience: browser-aud
+  mobile_app:
+    enabled: true
+    app_id: mobile-app
+    hostname: sm-app.rajeshgo.li
+    jwt_audience: mobile-aud
+  node_fallback:
+    enabled: true
+    app_id: node-app
+    hostname: sm-node.rajeshgo.li
+    jwt_audience: node-aud
+  email_worker:
+    enabled: true
+    app_id: email-app
+    hostname: sm-email.rajeshgo.li
+    jwt_audience: email-aud
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            trimmed(&config.cloudflare_access.account_id).as_deref(),
+            Some("cf-account")
+        );
+        assert_eq!(
+            trimmed(&config.cloudflare_access.api_token).as_deref(),
+            Some("cf-token")
+        );
+        assert_eq!(
+            config.cloudflare_access.expected_issuer().as_deref(),
+            Some("https://team.cloudflareaccess.com")
+        );
+        assert_eq!(
+            trimmed(&config.cloudflare_access.mobile_device_policy_id).as_deref(),
+            Some("mobile-policy")
+        );
+        assert_eq!(
+            trimmed(&config.cloudflare_access.node_policy_id).as_deref(),
+            Some("node-policy")
+        );
+        assert!(config.cloudflare_access.browser.enabled);
+        assert_eq!(
+            config.cloudflare_access.browser.expected_audience(),
+            Some("browser-aud")
+        );
+        assert_eq!(
+            config.cloudflare_access.mobile_app.expected_audience(),
+            Some("mobile-aud")
+        );
+        assert_eq!(
+            config.cloudflare_access.node_fallback.expected_audience(),
+            Some("node-aud")
+        );
+        assert_eq!(
+            config.cloudflare_access.email_worker.expected_audience(),
+            Some("email-aud")
+        );
+        assert_eq!(
+            trimmed(&config.cloudflare_access.mobile_app.hostname).as_deref(),
+            Some("sm-app.rajeshgo.li")
+        );
     }
 
     #[test]

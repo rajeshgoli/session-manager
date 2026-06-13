@@ -163,6 +163,36 @@ external_access:
   ssh_username: "your-ssh-user"
   ssh_proxy_command: "cloudflared access ssh --hostname %h"
 
+# Optional Cloudflare Access application metadata for the Rust zero-trust public
+# edge model. Browser routes use interactive Access; native app/node routes use
+# Cloudflare mTLS/service auth with Common Name allowlists.
+cloudflare_access:
+  account_id: ""
+  api_token: ""
+  team_domain: "your-team.cloudflareaccess.com"
+  mobile_device_policy_id: ""
+  node_policy_id: ""
+  browser:
+    enabled: false
+    app_id: ""
+    hostname: "sm.example.com"
+    jwt_audience: ""
+  mobile_app:
+    enabled: false
+    app_id: ""
+    hostname: "sm-app.example.com"
+    jwt_audience: ""
+  node_fallback:
+    enabled: false
+    app_id: ""
+    hostname: "sm-node.example.com"
+    jwt_audience: ""
+  email_worker:
+    enabled: false
+    app_id: ""
+    hostname: "sm-email.example.com"
+    jwt_audience: ""
+
 # Optional public-edge assertion accepted by the Rust native-client routes.
 # Keep disabled unless a trusted edge proxy signs requests after proving the
 # device/node is allowed to reach the origin.
