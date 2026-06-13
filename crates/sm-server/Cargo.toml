@@ -12,6 +12,7 @@ base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }
 hmac = { workspace = true }
+jsonwebtoken = { workspace = true }
 nix = { workspace = true, features = ["fs", "poll", "term"] }
 p256 = { workspace = true, features = ["ecdsa", "pem"] }
 rand_core = { workspace = true, features = ["getrandom"] }
