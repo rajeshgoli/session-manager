@@ -1,6 +1,6 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-12 after PR #942 and a blocked
+Status: handoff snapshot from 2026-06-13 after PR #950 and a blocked
 post-mobile-shadow rehearsal.
 
 Use this file to resume the Rust cutover track without reconstructing state from
@@ -12,7 +12,7 @@ coverage in
 ## Current Repository State
 
 - Branch: `main`
-- Latest merged commit: `e8fae11` (`Merge pull request #942`)
+- Latest merged commit: `d8f97c0` (`Merge pull request #950`)
 - Open PRs at handoff: none
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
   and the local `config.yaml.shadow-backup-20260612T023248Z` created when
@@ -60,7 +60,10 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #942.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #950.
+- [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
+  records the current Cloudflare Access origin-gate behavior and remaining
+  operator setup/smoke evidence.
 - PR #880 added fixture-gated manifest checks for already-implemented detail
   endpoints:
   - `GET /queue-jobs/{queue_job_id}`
@@ -108,6 +111,14 @@ Merged Rust slices cover:
 - PR #940 refreshed the handoff after the post-#938 clean rehearsal.
 - PR #942 added native mobile/sm-app read paths to rehearsal shadow probes and
   mobile route/pattern gates to the shadow observation planner/report.
+- PR #944 refreshed the handoff after the post-#942 mobile shadow evidence.
+- PR #946 added the Cloudflare Access auth model for browser, mobile app, node
+  fallback, and email worker route classes.
+- PR #948 added Rust Cloudflare Access config parsing and JWT/audience/context
+  classification.
+- PR #950 added Rust origin route gates for native mobile/app routes, app
+  artifacts, `/auth/device/google`, JWKS cache refresh/TTL behavior, public-host
+  fail-closed behavior, and mobile device Common Name actor binding.
 - Current contract manifest size:
   - `117` checks total
   - `68` `python_and_rust`
@@ -263,9 +274,13 @@ needed for final cutover evidence.
      final backup.
    - Prove rollback restores or accounts for every accepted write after the
      restore point.
-5. Complete public-edge deployment integration.
-   - Edge signer/proxy, device enrollment/list/remove, revoked-device denial,
-     and node fallback proof.
+5. Complete Cloudflare Access deployment integration.
+   - Configure the browser, mobile app, node fallback, and email worker Access
+     apps/policies from [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md).
+   - Prove app-host requests require an enrolled mobile device certificate,
+     then SM Google/device bearer auth at origin.
+   - Prove revoked-device denial, browser OAuth callback behavior, and later
+     node fallback proof.
 6. Finish retained node-control and narrow queue writer fixtures.
    - Include audit, policy, recovery, and rollback semantics.
 7. Exercise service packaging and cutover.
@@ -284,6 +299,8 @@ Do not start Rust writer ownership or MVP cutover until:
 - final backup happens after write admission is frozen or journaled;
 - public traffic has proof-of-possession before origin plus origin
   auth/capability checks;
+- Cloudflare Access browser/mobile/node/email route classes are configured with
+  no bypass/broad-certificate policy and verified against Rust origin gates;
 - mobile attach, request-status, bug reports, and app artifacts pass smoke
   checks;
 - rollback restores or explicitly journals every accepted write after the
@@ -291,15 +308,20 @@ Do not start Rust writer ownership or MVP cutover until:
 
 ## Recommended Resume Point
 
-Continue with the shadow observation gate:
+Continue with Cloudflare Access deployment evidence, then return to the shadow
+observation gate:
 
-1. Keep Python-authoritative Rust shadow mode running for retained reads against
+1. Configure or verify the Cloudflare Access apps/policies described in
+   [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md).
+2. Exercise the native app route class through the app hostname so mobile gates
+   collect real traffic and smoke evidence.
+3. Keep Python-authoritative Rust shadow mode running for retained reads against
    the local Rust sidecar.
-2. Let it observe real traffic for the agreed window.
-3. Summarize the shadow ledger by route, comparison class, and unexplained
+4. Let it observe real traffic for the agreed window.
+5. Summarize the shadow ledger by route, comparison class, and unexplained
    mismatch.
-4. Convert any unexplained retained-surface mismatch into a bounded Rust slice.
+6. Convert any unexplained retained-surface mismatch into a bounded Rust slice.
 
-This is the highest-signal next step because the latest rehearsal passed both
-the read-only sidecar contracts and the mutating Rust-core fixture contracts;
-the next risk is sustained live-traffic drift, not single-run rehearsal drift.
+This is the highest-signal next step because the Rust origin gate is now merged,
+but the public edge still needs actual Cloudflare policy and mobile/browser
+smoke evidence before it can count as cutover-ready.

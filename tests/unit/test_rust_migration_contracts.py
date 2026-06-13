@@ -49,6 +49,10 @@ from scripts.rust_migration.mvp_rehearsal import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+STAGE5_DIR = REPO_ROOT / "specs" / "762_stage5_artifacts"
+
+
 def test_manifest_preserves_mobile_kill_route_while_retiring_cli_alias():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
@@ -194,6 +198,50 @@ def test_manifest_covers_rust_only_mobile_device_cli_surfaces():
     assert remove_device.expected_exit == (0,)
     assert "DEVICE_ID" in remove_device.expected_output_contains_all
     assert "--user-id" in remove_device.expected_output_contains_all
+
+
+def test_manifest_links_cloudflare_access_cutover_evidence():
+    manifest = ContractManifest.load()
+
+    assert "specs/945_cloudflare_access_auth_model.md" in manifest.artifacts
+    assert (
+        "specs/762_stage5_artifacts/cloudflare_access_cutover_evidence.md"
+        in manifest.artifacts
+    )
+
+
+def test_cloudflare_access_cutover_evidence_pins_policy_and_origin_gates():
+    evidence = (STAGE5_DIR / "cloudflare_access_cutover_evidence.md").read_text(
+        encoding="utf-8"
+    )
+    index = (STAGE5_DIR / "index.md").read_text(encoding="utf-8")
+
+    assert "cloudflare_access_cutover_evidence.md" in index
+    for required in [
+        "PR #950",
+        "sm-browser",
+        "sm-mobile-app",
+        "sm-node-fallback",
+        "sm-email-worker",
+        "No broad Valid Certificate policy",
+        "same mobile user resolved from the SM session or bearer actor",
+        "revoked-device denial",
+        "Native app smoke",
+    ]:
+        assert required in evidence
+
+
+def test_handoff_and_progress_are_current_through_cloudflare_access_pr950():
+    progress = (STAGE5_DIR / "mvp_progress.md").read_text(encoding="utf-8")
+    handoff = (STAGE5_DIR / "resume_handoff.md").read_text(encoding="utf-8")
+
+    for text in [progress, handoff]:
+        assert "PR #950" in text
+        assert "Cloudflare Access" in text
+        assert "cloudflare_access_cutover_evidence.md" in text
+
+    assert "Latest merged commit: `d8f97c0`" in handoff
+    assert "records the PR lineage through #950" in handoff
 
 
 def test_manifest_covers_rust_only_retired_http_surfaces():
