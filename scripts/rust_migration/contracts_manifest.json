@@ -5,7 +5,9 @@
     "specs/762_stage2_artifacts/route_auth_matrix.md",
     "specs/762_stage2_artifacts/external_client_manifest.md",
     "specs/762_stage5_artifacts/cutover_scope.md",
-    "specs/762_stage5_artifacts/gate_matrix.md"
+    "specs/762_stage5_artifacts/gate_matrix.md",
+    "specs/945_cloudflare_access_auth_model.md",
+    "specs/762_stage5_artifacts/cloudflare_access_cutover_evidence.md"
   ],
   "checks": [
     {

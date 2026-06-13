@@ -1,8 +1,10 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #942 merged. The last clean full MVP
+Status: implementation snapshot after PR #950 merged. The last clean full MVP
 rehearsal remains the post-#938 run; post-#942 full rehearsal is currently
-blocked by Python-origin availability during baseline/shadow.
+blocked by Python-origin availability during baseline/shadow. PRs #946, #948,
+and #950 added the Rust-side Cloudflare Access origin gate; public cutover still
+needs Cloudflare policy setup and mobile/browser smoke evidence.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -62,6 +64,10 @@ not change retained or removed scope. Binding scope remains
 | #938 | MVP rehearsal runs synthetic read-only fixture contracts in a dedicated sidecar |
 | #940 | handoff update after the post-#938 clean rehearsal |
 | #942 | mobile/sm-app routes added to active rehearsal shadow probes and passive shadow coverage gates |
+| #944 | handoff update after the post-#942 mobile shadow evidence |
+| #946 | Cloudflare Access auth model for browser, mobile app, node fallback, and email worker route classes |
+| #948 | Rust Cloudflare Access config parsing and JWT/audience/context classification |
+| #950 | Rust origin route gates for mobile/app surfaces, app artifacts, device-token exchange, JWKS cache behavior, and mobile device actor binding |
 
 ## Implemented Capability Groups
 
@@ -75,6 +81,7 @@ The Rust sidecar now has executable coverage for:
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent slices are merged, with shadow and contract fixtures covering the early cutover path. |
 | Codex retained reads | Codex event stream, pending request ledger reads, activity actions, review detail/list, and Claude/Codex tool-call projections are implemented and covered by manifest checks. |
 | Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, and public-edge assertion validation are merged. |
+| Cloudflare Access origin gate | Config parsing, JWT/audience classification, host/app separation, public-host fail-closed behavior, mobile/app route gating, app artifact gating, device-token exchange gating, JWKS cache refresh/TTL behavior, and mobile Access CN actor binding are merged. |
 | External fallback | Email/human fallback delivery and inbound email validation path are retained in the Rust track. |
 | Queue and nodes | Narrow queue list/detail, queue fixture coverage, and registered-node read paths are implemented; retained node and queue writer behavior still needs final cutover verification. |
 
@@ -103,7 +110,8 @@ The latest clean short-window shadow report after #942 used
 
 This passive window did not satisfy the new mobile route/pattern coverage gates
 from PR #942; those gates need real native app traffic or explicit operator
-exercise.
+exercise. It also predates the Cloudflare Access origin-gate implementation from
+PRs #948 and #950, so it is not public-edge cutover evidence.
 
 The fixture-filtered broad live Rust contract run now passes without synthetic
 fixture false failures:
@@ -204,7 +212,7 @@ These are the next practical buckets before an MVP cutover trial:
 | Full fixture manifest execution | The MVP rehearsal now runs the current synthetic read-only and mutating fixture sets. Remaining work is final live mobile/device fixture evidence and any additional retained fixture rows added by later slices. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
 | State ownership and migration tooling | Initial preflight, backup, restore, and freeze/drain evidence tools are merged and exercised by the rehearsal. Remaining work is live write-admission freeze/journal ownership and rollback accounting from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
-| Public-edge deployment integration | Pair the Rust origin gate with the actual edge signer/proxy/device enrollment flow, including revoked-device and node fallback tests. |
+| Cloudflare Access deployment integration | Pair the merged Rust origin gate with the actual Cloudflare Access apps, mTLS/service-auth policies, device Common Name enrollment/revocation, app-host native auth smoke, browser OAuth smoke, and later node fallback tests. Current evidence lives in [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md). |
 | Node and queue writer completion | Finish retained node-control and narrow queue writer fixtures, including audit, policy, recovery, and rollback semantics. |
 | Service packaging and rollback | Exercise launchd/service cutover, non-destructive port ownership, health checks, rollback, and operator diagnostics. |
 | Final native mobile smoke | Run bootstrap/session/attach/request-status/analytics/bug-report/app-artifact smoke checks against Rust using real mobile assumptions. |
@@ -218,5 +226,6 @@ Do not start an MVP cutover until:
 - shadow mode shows no unexplained mismatches on retained core reads for the agreed observation window;
 - final backup happens after write admission is frozen or journaled;
 - public traffic has proof-of-possession before origin plus origin auth/capability checks;
+- Cloudflare Access browser/mobile/node/email route classes are configured with no bypass/broad-certificate policy and verified against Rust origin gates;
 - mobile attach, request-status, bug reports, and app artifacts pass smoke checks;
 - rollback restores or explicitly journals every accepted write after the restore point.
