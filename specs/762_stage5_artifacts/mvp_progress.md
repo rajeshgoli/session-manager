@@ -1,6 +1,8 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #938 merged and the full MVP rehearsal passed.
+Status: implementation snapshot after PR #942 merged. The last clean full MVP
+rehearsal remains the post-#938 run; post-#942 full rehearsal is currently
+blocked by Python-origin availability during baseline/shadow.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -58,6 +60,8 @@ not change retained or removed scope. Binding scope remains
 | #934 | handoff update after the state-gated rehearsal |
 | #936 | live session detail shadow comparison moved to status-only |
 | #938 | MVP rehearsal runs synthetic read-only fixture contracts in a dedicated sidecar |
+| #940 | handoff update after the post-#938 clean rehearsal |
+| #942 | mobile/sm-app routes added to active rehearsal shadow probes and passive shadow coverage gates |
 
 ## Implemented Capability Groups
 
@@ -65,7 +69,7 @@ The Rust sidecar now has executable coverage for:
 
 | Group | Current state |
 | --- | --- |
-| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, and freeze/drain evidence gates exist. |
+| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, freeze/drain evidence gates, and mobile-aware shadow observation gates exist. |
 | Retired-surface checks | Retired public/watch/summary/remind/job-watch/queue-policy checks are represented as Rust-target absence or denial fixtures. |
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent slices are merged, with shadow and contract fixtures covering the early cutover path. |
@@ -84,16 +88,22 @@ Live Python-authoritative Rust shadow mode is active in the local config:
 - config backup created by the activation helper:
   `config.yaml.shadow-backup-20260612T023248Z`.
 
-The latest clean short-window shadow report at `2026-06-12T02:59:18Z` used
-`--last-minutes 1 --fail-on-blockers` and returned:
+The latest clean short-window shadow report after #942 used
+`--last-minutes 5 --fail-on-blockers` and returned:
 
 | Metric | Result |
 | --- | ---: |
 | Status | passed |
-| Rows | 86 |
+| Rows | 55 |
 | Blockers | 0 |
-| `GET /events/state` | 28 status matches |
-| `GET /sessions` | 58 status matches |
+| `GET /events/state` | 16 status matches |
+| `GET /sessions` | 35 status matches |
+| `GET /health` | 3 exact matches |
+| `POST /codex-review-requests` | 1 unsupported retained-write observation |
+
+This passive window did not satisfy the new mobile route/pattern coverage gates
+from PR #942; those gates need real native app traffic or explicit operator
+exercise.
 
 The fixture-filtered broad live Rust contract run now passes without synthetic
 fixture false failures:
@@ -152,13 +162,45 @@ Measured baseline snapshot from the same run:
 | `GET /sessions` median | 25.746 ms | 7.972 ms |
 | `GET /client/sessions` median | 58.486 ms | 7.946 ms |
 
+## Latest Post-942 Rehearsal Attempt
+
+Reports:
+
+- `.local/rust-mvp-rehearsals/20260613T020040Z-after-942-mobile-shadow/mvp-rehearsal-report.json`
+- `.local/rust-mvp-rehearsals/20260613T020731Z-after-942-mobile-shadow-rerun/mvp-rehearsal-report.json`
+
+The rerun is the current snapshot:
+
+| Area | Result |
+| --- | --- |
+| Overall status | Blocked with 2 blockers |
+| Python health | Passed at start |
+| State ownership gate | Passed: 17 stores checked, 13 existing, 13 copied, 13 verified, 13 restored, freeze/drain ledger written |
+| Rust sidecar health | Passed using existing sidecar |
+| Isolated runtime smoke | Passed |
+| Rust live core sidecar contracts | 17 passed, 0 failed, 0 skipped |
+| Rust synthetic read-only fixture contracts | 10 passed, 0 failed, 0 skipped |
+| Rust mutating fixture contracts | 30 passed, 0 failed, 0 skipped |
+| Gap probes | 0 failed |
+| Python baseline | Failed: Python origin refused connections after the first health probe |
+| Rust baseline | Passed: 20.172 MiB RSS, 6.891 MiB physical footprint |
+| Mobile shadow path resolution | Skipped: Python `/sessions` was unavailable |
+| Shadow read summary | Failed: 9 requested read probes failed with connection refused |
+
+This is not a Rust contract regression: the Rust/state/fixture portions passed.
+The blocker is Python-authoritative origin availability during the baseline and
+shadow steps. Launchd logs around both runs show the Python watchdog reporting
+an event-loop freeze and killing the process for restart. The next clean
+cutover-evidence run needs Python to remain up through baseline and shadow,
+including the new mobile read probes from PR #942.
+
 ## Near-Term Remaining Work
 
 These are the next practical buckets before an MVP cutover trial:
 
 | Bucket | Why it remains |
 | --- | --- |
-| Shadow observation window | Python-authoritative shadow mode is enabled and a short clean window has been recorded. Continue it for a longer agreed window and triage any unexplained retained-core mismatches before Rust becomes the writer. |
+| Shadow observation window | Python-authoritative shadow mode is enabled and a short clean window has been recorded, but mobile gates from PR #942 still need real app/operator traffic. Continue it for a longer agreed window and triage any unexplained retained-core mismatches before Rust becomes the writer. |
 | Full fixture manifest execution | The MVP rehearsal now runs the current synthetic read-only and mutating fixture sets. Remaining work is final live mobile/device fixture evidence and any additional retained fixture rows added by later slices. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
 | State ownership and migration tooling | Initial preflight, backup, restore, and freeze/drain evidence tools are merged and exercised by the rehearsal. Remaining work is live write-admission freeze/journal ownership and rollback accounting from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
@@ -166,6 +208,7 @@ These are the next practical buckets before an MVP cutover trial:
 | Node and queue writer completion | Finish retained node-control and narrow queue writer fixtures, including audit, policy, recovery, and rollback semantics. |
 | Service packaging and rollback | Exercise launchd/service cutover, non-destructive port ownership, health checks, rollback, and operator diagnostics. |
 | Final native mobile smoke | Run bootstrap/session/attach/request-status/analytics/bug-report/app-artifact smoke checks against Rust using real mobile assumptions. |
+| Python-origin availability during evidence runs | Post-#942 full rehearsal is blocked because Python watchdog-restarted during baseline/shadow. This does not call for broad Python hardening, but the cutover evidence path needs a stable Python authority for the observation window. |
 
 ## Stop Conditions For MVP Cutover
 

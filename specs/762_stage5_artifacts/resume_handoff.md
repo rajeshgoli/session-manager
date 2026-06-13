@@ -1,6 +1,7 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-12 after PR #938 and the full MVP rehearsal passed.
+Status: handoff snapshot from 2026-06-12 after PR #942 and a blocked
+post-mobile-shadow rehearsal.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,7 +12,7 @@ coverage in
 ## Current Repository State
 
 - Branch: `main`
-- Latest merged commit: `43eb722` (`Merge pull request #938`)
+- Latest merged commit: `e8fae11` (`Merge pull request #942`)
 - Open PRs at handoff: none
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
   and the local `config.yaml.shadow-backup-20260612T023248Z` created when
@@ -59,7 +60,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #938.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #942.
 - PR #880 added fixture-gated manifest checks for already-implemented detail
   endpoints:
   - `GET /queue-jobs/{queue_job_id}`
@@ -104,6 +105,9 @@ Merged Rust slices cover:
   fixture-backed deterministic session detail checks body/assertion based.
 - PR #938 made the MVP rehearsal run synthetic read-only fixture contracts in a
   dedicated sidecar.
+- PR #940 refreshed the handoff after the post-#938 clean rehearsal.
+- PR #942 added native mobile/sm-app read paths to rehearsal shadow probes and
+  mobile route/pattern gates to the shadow observation planner/report.
 - Current contract manifest size:
   - `117` checks total
   - `68` `python_and_rust`
@@ -111,7 +115,7 @@ Merged Rust slices cover:
 
 ## Validation At Handoff
 
-The latest real-state MVP rehearsal is:
+The latest clean full real-state MVP rehearsal remains:
 
 ```bash
 .local/rust-mvp-rehearsals/20260612T-full-after-938/mvp-rehearsal-report.json
@@ -148,6 +152,33 @@ The same run measured the current Python process at `154.672 MiB` RSS and
 `66.4 MiB` physical footprint, while the Rust sidecar measured `19.797 MiB`
 RSS and `6.688 MiB` physical footprint.
 
+The latest post-#942 full rehearsal attempts are blocked, not cutover evidence:
+
+```bash
+.local/rust-mvp-rehearsals/20260613T020040Z-after-942-mobile-shadow/mvp-rehearsal-report.json
+.local/rust-mvp-rehearsals/20260613T020731Z-after-942-mobile-shadow-rerun/mvp-rehearsal-report.json
+```
+
+The second run is the clearer current snapshot. It started with Python `/health`
+passing, and the state/Rust-side gates passed:
+
+- state ownership gate: `17` stores checked, `13` copied, `13` verified, `13`
+  restored, freeze/drain ledger written;
+- Rust live core sidecar contracts: `17` passed, `0` failed, `0` skipped;
+- Rust synthetic read-only fixture contracts: `10` passed, `0` failed, `0`
+  skipped;
+- Rust mutating fixture contracts: `30` passed, `0` failed, `0` skipped;
+- Rust baseline: passed, `20.172 MiB` RSS and `6.891 MiB` physical footprint.
+
+The same run blocked because the Python authoritative service stopped accepting
+connections during `python_baseline`, after the first health probe. The
+`shadow_mobile_path_resolution` step therefore skipped with connection refused,
+and `shadow_read_summary` failed all `9` requested read probes. Launchd logs
+around the run show the Python watchdog reporting an event-loop freeze and
+killing the process for restart. Do not treat the post-#942 rehearsal as a clean
+MVP cutover artifact until Python-origin availability is stable for the
+baseline/shadow steps.
+
 ## Live Observation
 
 Live shadow mode is currently active. The most recent clean short-window report
@@ -156,17 +187,20 @@ used:
 ```bash
 ./venv/bin/python -m scripts.rust_migration.shadow_report \
   --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
-  --last-minutes 1 \
+  --last-minutes 5 \
   --fail-on-blockers
 ```
 
-Observed at `2026-06-12T02:59:18Z`:
+Observed after #942 at `2026-06-13T02:09Z`:
 
 - status: passed;
-- rows: `86`;
+- rows: `55`;
 - blockers: `0`;
-- routes observed: `GET /events/state` (`28` status matches) and
-  `GET /sessions` (`58` status matches).
+- routes observed: `GET /events/state` (`16` status matches), `GET /sessions`
+  (`35` status matches), `GET /health` (`3` matches), and one unsupported
+  retained write observation for `POST /codex-review-requests`.
+- mobile route/pattern gates from PR #942 were not satisfied by this passive
+  window; they require native app traffic or explicit operator exercise.
 
 The broad live Rust contract run now uses the fixture filter:
 
