@@ -245,14 +245,32 @@ enum QueueCommand {
 
 #[derive(Args)]
 struct QueueRunArgs {
+    #[arg(long = "type", value_parser = ["tests", "perf", "background"], default_value = "tests")]
+    job_type: String,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    cwd: Option<String>,
+    #[arg(long)]
+    timeout: Option<String>,
+    #[arg(long = "env")]
+    env_pairs: Vec<String>,
     #[arg(long)]
     script_file: Option<String>,
     #[arg(long)]
     notify: Option<String>,
+    #[arg(trailing_var_arg = true)]
+    command: Vec<String>,
 }
 
 #[derive(Args)]
 struct QueueListArgs {
+    #[arg(long)]
+    notify: Option<String>,
+    #[arg(long)]
+    all: bool,
+    #[arg(long = "type", value_parser = ["tests", "perf", "background"])]
+    job_type: Option<String>,
     #[arg(long)]
     state: Option<String>,
     #[arg(long)]
@@ -727,6 +745,7 @@ fn run() -> Result<()> {
         Command::SubagentStart(_) => run_subagent_start(&client)?,
         Command::SubagentStop(_) => run_subagent_stop(&client)?,
         Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
+        Command::Queue(args) => run_queue(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())
@@ -817,6 +836,129 @@ fn run_list_devices(client: &ApiClient, args: ListDevicesArgs) -> Result<()> {
         return Ok(());
     }
     print_mobile_devices(&payload)
+}
+
+fn run_queue(client: &ApiClient, args: QueueArgs) -> Result<()> {
+    match args.command {
+        QueueCommand::List(args) => run_queue_list(client, args),
+        QueueCommand::Status(args) => run_queue_status(client, args),
+        QueueCommand::Run(_) => bail!(
+            "sm queue run is not implemented in the Rust cutover slice yet; use Python sm until queue writer ownership lands"
+        ),
+        QueueCommand::Cancel(_) => bail!(
+            "sm queue cancel is not implemented in the Rust cutover slice yet; use Python sm until queue writer ownership lands"
+        ),
+    }
+}
+
+fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
+    let mut query = Vec::new();
+    let effective_notify = args
+        .notify
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            if args.all {
+                None
+            } else {
+                optional_current_session_id()
+            }
+        });
+    if !args.all && effective_notify.is_none() {
+        bail!("No session context. Use --notify or --all.");
+    }
+    if let Some(notify) = effective_notify {
+        query.push(format!("notify_target={}", encode_query_component(&notify)));
+    }
+    if let Some(job_type) = args
+        .job_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(format!("type={}", encode_query_component(job_type)));
+    }
+    if let Some(state) = args
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(format!("state={}", encode_query_component(state)));
+    }
+    if args.all || args.state.is_some() {
+        query.push("include_terminal=true".to_owned());
+    }
+    let path = if query.is_empty() {
+        "/queue-jobs".to_owned()
+    } else {
+        format!("/queue-jobs?{}", query.join("&"))
+    };
+    let payload = client.get_json(&path)?;
+    let jobs = payload["jobs"].as_array().cloned().unwrap_or_default();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&jobs)?);
+        return Ok(());
+    }
+    print_queue_jobs(&jobs);
+    Ok(())
+}
+
+fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
+    let job_id = args.job_id.trim();
+    if job_id.is_empty() {
+        bail!("job id is required");
+    }
+    let payload = client.get_json(&format!("/queue-jobs/{}", encode_path_segment(job_id)))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    println!("Job: {}", payload["id"].as_str().unwrap_or(job_id));
+    println!("Type: {}", payload["type"].as_str().unwrap_or("-"));
+    println!("State: {}", payload["state"].as_str().unwrap_or("-"));
+    println!(
+        "Holding: {}",
+        payload["holding_reason"].as_str().unwrap_or("-")
+    );
+    println!(
+        "Exit: {}",
+        payload["exit_code"]
+            .as_i64()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!("Log: {}", payload["log_path"].as_str().unwrap_or("-"));
+    Ok(())
+}
+
+fn print_queue_jobs(jobs: &[Value]) {
+    if jobs.is_empty() {
+        println!("No queue jobs.");
+        return;
+    }
+    let headers = ["ID", "Type", "State", "Notify", "Label", "Holding", "Log"];
+    let rows = jobs
+        .iter()
+        .map(|job| {
+            vec![
+                json_string(job, "id"),
+                json_string(job, "type"),
+                json_string(job, "state"),
+                job["notify_name"]
+                    .as_str()
+                    .or_else(|| job["notify_session_id"].as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                json_string(job, "label"),
+                job["holding_reason"].as_str().unwrap_or("-").to_owned(),
+                job["log_path"].as_str().unwrap_or("-").to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&headers, &rows);
 }
 
 fn run_remove_device(client: &ApiClient, args: RemoveDeviceArgs) -> Result<()> {

@@ -338,15 +338,23 @@ def test_mvp_rehearsal_read_only_fixture_check_ids_are_retained_reads():
         "http.app_artifact_metadata",
         "http.queue_jobs_list",
         "http.queue_job_detail",
+        "cli.rust_queue_list_fixture",
+        "cli.rust_queue_list_json_fixture",
+        "cli.rust_queue_status_fixture",
+        "cli.rust_queue_status_json_fixture",
     }
 
     assert set(READ_ONLY_FIXTURE_CHECK_IDS) == expected
     for check_id in READ_ONLY_FIXTURE_CHECK_IDS:
         check = checks[check_id]
         assert check.classification == "retained"
-        assert check.target == "python_and_rust"
+        if check.surface == "cli":
+            assert check.target == "rust_only"
+        else:
+            assert check.target == "python_and_rust"
         assert check.safety == "read_only"
-        assert check.method == "GET"
+        if check.surface == "http":
+            assert check.method == "GET"
 
 
 def test_mvp_rehearsal_read_only_fixture_values_cover_preconditions():
@@ -360,7 +368,31 @@ def test_mvp_rehearsal_read_only_fixture_values_cover_preconditions():
                 assert READ_ONLY_FIXTURE_VALUES["session_id"] == "fixture001"
             if precondition.startswith("fixture:"):
                 fixture_name = precondition.split(":", 1)[1]
+                if fixture_name == "base_url":
+                    continue
                 assert READ_ONLY_FIXTURE_VALUES[fixture_name]
+
+
+def test_manifest_covers_rust_queue_cli_read_fixtures():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+    required_ids = {
+        "cli.rust_queue_list_fixture",
+        "cli.rust_queue_list_json_fixture",
+        "cli.rust_queue_status_fixture",
+        "cli.rust_queue_status_json_fixture",
+    }
+
+    missing = required_ids - set(checks)
+    assert not missing
+    for check_id in required_ids:
+        check = checks[check_id]
+        assert check.classification == "retained"
+        assert check.target == "rust_only"
+        assert check.safety == "read_only"
+        assert check.surface == "cli"
+        assert "fixture:queue_job_id" in check.preconditions
+        assert "fixture:base_url" in check.preconditions
 
 
 def test_mvp_rehearsal_defaults_mutating_sidecar_to_next_port():

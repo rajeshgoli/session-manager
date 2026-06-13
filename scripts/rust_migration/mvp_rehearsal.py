@@ -104,6 +104,10 @@ READ_ONLY_FIXTURE_CHECK_IDS = (
     "http.app_artifact_metadata",
     "http.queue_jobs_list",
     "http.queue_job_detail",
+    "cli.rust_queue_list_fixture",
+    "cli.rust_queue_list_json_fixture",
+    "cli.rust_queue_status_fixture",
+    "cli.rust_queue_status_json_fixture",
 )
 
 READ_ONLY_FIXTURE_VALUES = {
@@ -872,6 +876,8 @@ def _run_read_only_fixture_contract_group(
                 "artifacts": artifacts,
             }
 
+        fixtures = dict(READ_ONLY_FIXTURE_VALUES)
+        fixtures["base_url"] = fixture_base_url
         step = _run_contract_group(
             manifest,
             name=step_name,
@@ -880,7 +886,7 @@ def _run_read_only_fixture_contract_group(
             sm_binary=args.sm_binary,
             check_ids=set(READ_ONLY_FIXTURE_CHECK_IDS),
             timeout_seconds=args.timeout,
-            fixtures=dict(READ_ONLY_FIXTURE_VALUES),
+            fixtures=fixtures,
             include_mutating=False,
             fail_on_skipped=True,
         )
