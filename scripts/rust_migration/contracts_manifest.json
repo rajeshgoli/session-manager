@@ -1008,6 +1008,54 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:43"
     },
     {
+      "id": "cli.rust_queue_list_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["--api-url", "{base_url}", "queue", "list", "--all"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["job-fixture", "tests", "pending", "fixture queue job"],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:queue_job_id"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/953"
+    },
+    {
+      "id": "cli.rust_queue_list_json_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["--api-url", "{base_url}", "queue", "list", "--all", "--json"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["job-fixture", "fixture queue job", "\"state\": \"pending\""],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:queue_job_id"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/953"
+    },
+    {
+      "id": "cli.rust_queue_status_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["--api-url", "{base_url}", "queue", "status", "{queue_job_id}"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Job: {queue_job_id}", "Type: tests", "State: pending"],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:queue_job_id"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/953"
+    },
+    {
+      "id": "cli.rust_queue_status_json_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["--api-url", "{base_url}", "queue", "status", "{queue_job_id}", "--json"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["\"id\": \"{queue_job_id}\"", "\"label\": \"fixture queue job\"", "\"state\": \"pending\""],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:queue_job_id"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/953"
+    },
+    {
       "id": "cli.rust_core_spawn_fixture",
       "surface": "cli",
       "classification": "retained",
