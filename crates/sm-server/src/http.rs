@@ -89,8 +89,8 @@ use crate::email::{
 };
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::queue::{
-    CodexReviewRequestFilters, CodexReviewRequestRegistration, CreateQueueJob, QueueJobFilters,
-    QueueJobRecord, RetainedQueueStore,
+    CodexReviewRequestFilters, CodexReviewRequestRegistration, CreateQueueJob,
+    QueueAdmissionPolicy, QueueJobFilters, QueueJobRecord, RetainedQueueStore,
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
@@ -1989,11 +1989,15 @@ async fn create_queue_job(
     )?;
     let job = if state.config.rust_core.runtime_enabled {
         let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
-        RetainedQueueStore::start_queue_job_in_state_dir(
+        RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
             &queue_state_dir,
             &message_queue_db_path,
-            &job.id,
             state.config.queue_runner.cancel_grace_seconds,
+            queue_admission_policy(&state.config),
+        )?;
+        RetainedQueueStore::get_queue_job_from_path(
+            &queue_state_dir.join("queue_runner.db"),
+            &job.id,
         )?
         .unwrap_or(job)
     } else {
@@ -2023,6 +2027,8 @@ async fn cancel_queue_job(
         &message_queue_db_path,
         &job_id,
         state.config.queue_runner.cancel_grace_seconds,
+        queue_admission_policy(&state.config),
+        state.config.rust_core.runtime_enabled,
     )?
     else {
         return Err(ApiError::NotFound("Queue job not found"));
@@ -2041,6 +2047,13 @@ fn resolve_session_or_registry_role(
         return Ok(None);
     };
     Ok(state.session_store.get_session(&registration.session_id)?)
+}
+
+fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
+    QueueAdmissionPolicy {
+        max_running_jobs: config.queue_runner.max_running_jobs,
+        perf_cooldown_seconds: config.queue_runner.perf_cooldown_seconds,
+    }
 }
 
 async fn get_session(
