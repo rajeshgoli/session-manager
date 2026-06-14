@@ -1158,6 +1158,38 @@
       "source": "https://github.com/rajeshgoli/session-manager/issues/795"
     },
     {
+      "id": "http.rust_core_review_existing_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/sessions/{session_id}/review",
+      "body": {"mode": "custom", "custom_prompt": "fixture review request"},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/error", "equals": "Review requires a Codex session (provider=codex, codex-fork, or codex-app)"}
+      ],
+      "preconditions": ["live_server", "session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/981"
+    },
+    {
+      "id": "http.rust_core_spawn_review_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/sessions/review",
+      "body": {"parent_session_id": "{session_id}", "mode": "custom", "custom_prompt": "fixture spawned review", "name": "fixture-review-child"},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/error", "equals": "Failed to send review sequence to tmux"}
+      ],
+      "preconditions": ["live_server", "session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/981"
+    },
+    {
       "id": "cli.rust_queue_run_fixture",
       "surface": "cli",
       "classification": "retained",
