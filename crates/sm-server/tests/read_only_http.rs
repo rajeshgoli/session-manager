@@ -32,6 +32,7 @@ use std::os::unix::net::UnixListener;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
+    collections::VecDeque,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
@@ -174,7 +175,7 @@ fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> 
 struct StubGitHubReviewPoster {
     result: Arc<Mutex<Result<GitHubReviewComment, String>>>,
     calls: Arc<Mutex<Vec<(String, i64, Option<String>)>>>,
-    fresh_review: Arc<Mutex<Option<GitHubReviewMatch>>>,
+    fresh_reviews: Arc<Mutex<VecDeque<GitHubReviewMatch>>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -189,7 +190,7 @@ impl StubGitHubReviewPoster {
                 posted_at: "2026-06-14T02:30:00Z".to_owned(),
             }))),
             calls: Arc::new(Mutex::new(Vec::new())),
-            fresh_review: Arc::new(Mutex::new(None)),
+            fresh_reviews: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -197,7 +198,7 @@ impl StubGitHubReviewPoster {
         Self {
             result: Arc::new(Mutex::new(Err(message.to_owned()))),
             calls: Arc::new(Mutex::new(Vec::new())),
-            fresh_review: Arc::new(Mutex::new(None)),
+            fresh_reviews: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -206,7 +207,12 @@ impl StubGitHubReviewPoster {
     }
 
     fn with_fresh_review(self, review_match: GitHubReviewMatch) -> Self {
-        *self.fresh_review.lock().unwrap() = Some(review_match);
+        self.fresh_reviews.lock().unwrap().push_back(review_match);
+        self
+    }
+
+    fn with_fresh_reviews(self, review_matches: Vec<GitHubReviewMatch>) -> Self {
+        *self.fresh_reviews.lock().unwrap() = review_matches.into_iter().collect();
         self
     }
 }
@@ -231,7 +237,33 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
         _pr_number: i64,
         _since: &str,
     ) -> Result<Option<GitHubReviewMatch>, String> {
-        Ok(self.fresh_review.lock().unwrap().clone())
+        let mut fresh_reviews = self.fresh_reviews.lock().unwrap();
+        if fresh_reviews.len() > 1 {
+            Ok(fresh_reviews.pop_front())
+        } else {
+            Ok(fresh_reviews.front().cloned())
+        }
+    }
+
+    fn find_fresh_codex_review(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+        _since: &str,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        let mut fresh_reviews = self.fresh_reviews.lock().unwrap();
+        if let Some(position) = fresh_reviews
+            .iter()
+            .position(|review_match| review_match.source == "review")
+        {
+            if fresh_reviews.len() > 1 {
+                Ok(fresh_reviews.remove(position))
+            } else {
+                Ok(fresh_reviews.front().cloned())
+            }
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -2195,7 +2227,7 @@ async fn pr_review_route_posts_comment_and_returns_python_shape() {
     .unwrap();
     let queue_db = state_file.with_extension("pr-review-route-message-queue.db");
     let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
-        source: "pull_review".to_owned(),
+        source: "review".to_owned(),
         created_at: "2026-06-14T02:30:01Z".to_owned(),
         id: Some(json!("PRR_kw123")),
         url: Some(
@@ -2240,6 +2272,137 @@ async fn pr_review_route_posts_comment_and_returns_python_shape() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         queued_message_texts(&queue_db, "caller1"),
+        vec!["Review --pr 967 (rajeshgoli/session-manager) completed: Codex posted review on PR #967"]
+    );
+}
+
+#[tokio::test]
+async fn pr_review_route_wait_ignores_issue_comments_until_review_or_timeout() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "caller-comment",
+                    "name": "codex-fork-caller-comment",
+                    "working_dir": "/repo/caller",
+                    "tmux_session": "codex-fork-caller-comment",
+                    "log_file": "/tmp/caller-comment.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "provider": "codex-fork"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let queue_db = state_file.with_extension("pr-review-route-comment-message-queue.db");
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "comment".to_owned(),
+        created_at: "2026-06-14T02:30:01Z".to_owned(),
+        id: Some(json!(4701300000_i64)),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
+                .to_owned(),
+        ),
+    });
+    let mut config = AppConfig::default();
+    config.paths.state_file = state_file.display().to_string();
+    config.sm_send.db_path = queue_db.display().to_string();
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
+
+    let (status, payload) = post_json(
+        app,
+        "/reviews/pr",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "wait": 1,
+            "caller_session_id": "caller-comment"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["server_polling"], true);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        queued_message_texts(&queue_db, "caller-comment"),
+        vec!["Review --pr 967 (rajeshgoli/session-manager) timed out after 1s"]
+    );
+}
+
+#[tokio::test]
+async fn pr_review_route_wait_completes_when_comment_precedes_review() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "caller-review",
+                    "name": "codex-fork-caller-review",
+                    "working_dir": "/repo/caller",
+                    "tmux_session": "codex-fork-caller-review",
+                    "log_file": "/tmp/caller-review.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "provider": "codex-fork"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let queue_db = state_file.with_extension("pr-review-route-real-review-message-queue.db");
+    let poster = StubGitHubReviewPoster::successful().with_fresh_reviews(vec![
+        GitHubReviewMatch {
+            source: "comment".to_owned(),
+            created_at: "2026-06-14T02:30:01Z".to_owned(),
+            id: Some(json!(4701300000_i64)),
+            url: Some(
+                "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
+                    .to_owned(),
+            ),
+        },
+        GitHubReviewMatch {
+            source: "review".to_owned(),
+            created_at: "2026-06-14T02:30:30Z".to_owned(),
+            id: Some(json!("PRR_kw123")),
+            url: Some(
+                "https://github.com/rajeshgoli/session-manager/pull/967#pullrequestreview-1"
+                    .to_owned(),
+            ),
+        },
+    ]);
+    let mut config = AppConfig::default();
+    config.paths.state_file = state_file.display().to_string();
+    config.sm_send.db_path = queue_db.display().to_string();
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
+
+    let (status, payload) = post_json(
+        app,
+        "/reviews/pr",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "wait": 600,
+            "caller_session_id": "caller-review"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["server_polling"], true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        queued_message_texts(&queue_db, "caller-review"),
         vec!["Review --pr 967 (rajeshgoli/session-manager) completed: Codex posted review on PR #967"]
     );
 }

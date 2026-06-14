@@ -259,6 +259,15 @@ pub trait GitHubReviewPoster: Send + Sync {
     ) -> Result<Option<GitHubReviewMatch>, String> {
         Ok(None)
     }
+
+    fn find_fresh_codex_review(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+        _since: &str,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
@@ -286,6 +295,15 @@ impl GitHubReviewPoster for GhCliReviewPoster {
         since: &str,
     ) -> Result<Option<GitHubReviewMatch>, String> {
         find_fresh_codex_review_or_comment_with_gh(repo, pr_number, since)
+    }
+
+    fn find_fresh_codex_review(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        since: &str,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        find_fresh_codex_review_with_gh(repo, pr_number, since)
     }
 }
 
@@ -531,6 +549,23 @@ fn find_fresh_codex_review_or_comment_with_gh(
     pr_number: i64,
     since: &str,
 ) -> Result<Option<GitHubReviewMatch>, String> {
+    find_fresh_codex_review_or_comment_with_gh_filtered(repo, pr_number, since, None)
+}
+
+fn find_fresh_codex_review_with_gh(
+    repo: &str,
+    pr_number: i64,
+    since: &str,
+) -> Result<Option<GitHubReviewMatch>, String> {
+    find_fresh_codex_review_or_comment_with_gh_filtered(repo, pr_number, since, Some("review"))
+}
+
+fn find_fresh_codex_review_or_comment_with_gh_filtered(
+    repo: &str,
+    pr_number: i64,
+    since: &str,
+    source_filter: Option<&str>,
+) -> Result<Option<GitHubReviewMatch>, String> {
     let Some(since_dt) = parse_github_datetime(since) else {
         return Ok(None);
     };
@@ -542,7 +577,7 @@ fn find_fresh_codex_review_or_comment_with_gh(
             .and_then(parse_github_datetime)
             .filter(|created_at| *created_at > since_dt)
         {
-            candidates.push(GitHubReviewMatch {
+            let review_match = GitHubReviewMatch {
                 source: "review".to_owned(),
                 created_at: created_at
                     .format(&Rfc3339)
@@ -552,41 +587,46 @@ fn find_fresh_codex_review_or_comment_with_gh(
                     .get("url")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
-            });
+            };
+            if source_filter.map_or(true, |source| source == review_match.source) {
+                candidates.push(review_match);
+            }
         }
     }
 
-    let comments = gh_api_json(
-        repo,
-        &format!(
-            "issues/{pr_number}/comments?since={}",
-            since_dt
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| since.to_owned())
-        ),
-        true,
-    )?;
-    if let Some(items) = comments.as_array() {
-        for comment in items {
-            let Some(created_at) = comment
-                .get("created_at")
-                .and_then(Value::as_str)
-                .and_then(parse_github_datetime)
-            else {
-                continue;
-            };
-            if created_at > since_dt && github_actor_is_codex(comment) {
-                candidates.push(GitHubReviewMatch {
-                    source: "comment".to_owned(),
-                    created_at: created_at
-                        .format(&Rfc3339)
-                        .unwrap_or_else(|_| now_rfc3339()),
-                    id: comment.get("id").cloned(),
-                    url: comment
-                        .get("html_url")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                });
+    if source_filter.map_or(true, |source| source == "comment") {
+        let comments = gh_api_json(
+            repo,
+            &format!(
+                "issues/{pr_number}/comments?since={}",
+                since_dt
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| since.to_owned())
+            ),
+            true,
+        )?;
+        if let Some(items) = comments.as_array() {
+            for comment in items {
+                let Some(created_at) = comment
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .and_then(parse_github_datetime)
+                else {
+                    continue;
+                };
+                if created_at > since_dt && github_actor_is_codex(comment) {
+                    candidates.push(GitHubReviewMatch {
+                        source: "comment".to_owned(),
+                        created_at: created_at
+                            .format(&Rfc3339)
+                            .unwrap_or_else(|_| now_rfc3339()),
+                        id: comment.get("id").cloned(),
+                        url: comment
+                            .get("html_url")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    });
+                }
             }
         }
     }
@@ -2703,7 +2743,7 @@ fn spawn_pr_review_completion_notifier(
         let wait_duration = Duration::from_secs(wait_seconds.max(0) as u64);
         let deadline = Instant::now() + wait_duration;
         loop {
-            if let Ok(Some(_review_match)) = github_find_fresh_review(
+            if let Ok(Some(_review_match)) = github_find_fresh_pull_review(
                 state.github_review_poster.clone(),
                 &repo,
                 pr_number,
@@ -3000,6 +3040,19 @@ async fn github_find_fresh_review(
     })
     .await
     .map_err(|error| format!("review poll task failed: {error}"))?
+}
+
+async fn github_find_fresh_pull_review(
+    poster: Arc<dyn GitHubReviewPoster>,
+    repo: &str,
+    pr_number: i64,
+    since: &str,
+) -> Result<Option<GitHubReviewMatch>, String> {
+    let repo = repo.to_owned();
+    let since = since.to_owned();
+    tokio::task::spawn_blocking(move || poster.find_fresh_codex_review(&repo, pr_number, &since))
+        .await
+        .map_err(|error| format!("review poll task failed: {error}"))?
 }
 
 async fn github_post_review_request(
