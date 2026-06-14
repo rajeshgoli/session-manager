@@ -1,7 +1,7 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-14 after the post-#984 review-route
-fixture line.
+Status: handoff snapshot from 2026-06-14 after PR #996 Cloudflare Access
+mobile smoke evidence runner.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,9 +11,9 @@ coverage in
 
 ## Current Repository State
 
-- Branch: `main` after PR #984.
-- Latest merged commit before this docs refresh: `8c261ee` (`Merge pull
-  request #984`)
+- Branch: `main` after PR #996.
+- Latest merged commit before this docs refresh: `af7ac2d` (`Merge pull
+  request #996`)
 - Open PRs at handoff: none before this docs refresh PR.
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
   and the local `config.yaml.shadow-backup-20260612T023248Z` created when
@@ -63,7 +63,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #984.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #996.
 - [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
   records the current Cloudflare Access origin-gate behavior and remaining
   operator setup/smoke evidence.
@@ -140,11 +140,17 @@ Merged Rust slices cover:
 - PR #983 fixed session review wait timeout semantics and spawned review
   startup settle behavior.
 - PR #984 added mutating fixture contracts for retained session review routes.
+- PR #986 refreshed this handoff after the post-#984 review-route fixture line.
+- PR #988 added a node restore mutating fixture contract.
+- PR #990 added Rust CLI node restore fixture support.
+- PR #992 added the stopped-service final backup gate.
+- PR #994 integrated the final backup gate into MVP rehearsal.
+- PR #996 added the Cloudflare Access mobile smoke evidence runner.
 - Current contract manifest size:
-  - `131` checks total
+  - `133` checks total
   - `73` `python_and_rust`
-  - `58` `rust_only`
-  - `39` mutating checks
+  - `60` `rust_only`
+  - `41` mutating checks
 
 ## Validation At Handoff
 
@@ -204,8 +210,8 @@ It used alternate ports because a Rust sidecar was already healthy on `8421`:
 ```
 
 This was not a full cutover rehearsal because it skipped Python baseline and
-shadow, but it is the current fixture/state-gate evidence for the post-#984
-manifest:
+shadow, but it remains the current fixture/state-gate evidence for the
+post-#984 manifest:
 
 - overall status: passed with zero blockers;
 - state ownership gate: `17` stores checked, `13` existing, `13` copied, `13`
@@ -214,6 +220,12 @@ manifest:
 - Rust synthetic read-only fixture contracts: `14` passed, `0` failed, `0`
   skipped;
 - Rust mutating fixture contracts: `35` passed, `0` failed, `0` skipped.
+
+PRs #986-#996 added more cutover tooling and evidence gates after this focused
+run, including node restore fixtures, stopped-origin final backup, rehearsal
+final-backup integration, and the Cloudflare Access mobile smoke runner. Run a
+fresh full rehearsal once Cloudflare/mobile smoke inputs are available and
+Python-origin availability is stable.
 
 The latest post-#942 full rehearsal attempts are blocked, not cutover evidence:
 
@@ -244,26 +256,30 @@ baseline/shadow steps.
 
 ## Live Observation
 
-Live shadow mode is currently active. The most recent clean short-window report
-used:
+Live shadow mode is currently active. The most recent clean passive report used:
 
 ```bash
 ./venv/bin/python -m scripts.rust_migration.shadow_report \
   --ledger ~/.local/share/claude-sessions/rust_shadow.jsonl \
-  --last-minutes 5 \
-  --fail-on-blockers
+  --last-minutes 30 \
+  --fail-on-blockers \
+  --json
 ```
 
-Observed after #942 at `2026-06-13T02:09Z`:
+Observed after #996 at `2026-06-14T23:36Z`:
 
 - status: passed;
-- rows: `55`;
+- rows: `2,238`;
 - blockers: `0`;
-- routes observed: `GET /events/state` (`16` status matches), `GET /sessions`
-  (`35` status matches), `GET /health` (`3` matches), and one unsupported
-  retained write observation for `POST /codex-review-requests`.
+- invalid rows: `0`;
+- routes observed: `GET /events/state` (`861` status matches) and
+  `GET /sessions` (`1,377` status matches).
 - mobile route/pattern gates from PR #942 were not satisfied by this passive
   window; they require native app traffic or explicit operator exercise.
+- this is not Cloudflare/public-edge evidence; the local shell did not have
+  `CF_MOBILE_ACCESS_JWT`, `CF_BROWSER_ACCESS_JWT`,
+  `SM_PUBLIC_EDGE_SECRET`, `SM_DEVICE_BEARER_TOKEN`, or `SM_COOKIE` set, and
+  `--mobile-host` / `--browser-host` were not supplied for a real smoke run.
 
 The broad live Rust contract run now uses the fixture filter:
 
@@ -316,9 +332,10 @@ needed for final cutover evidence.
    - The MVP rehearsal already runs the current synthetic read-only and
      mutating fixture sets, including review-route fixtures.
    - Final live mobile/device fixture evidence is still needed.
-3. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
-   - Retained commands should be native Rust or intentionally routed.
-   - Removed commands should be absent or explicitly retired.
+3. Re-run the CLI cutover audit whenever retained or retired CLI surface
+   changes.
+   - PR #922 added the audit; use it as a regression gate rather than an open
+     discovery task.
 4. Complete final state ownership and migration tooling.
    - Initial preflight, backup, restore, and freeze/drain evidence tools are
      merged and exercised by the MVP rehearsal.
@@ -342,6 +359,9 @@ needed for final cutover evidence.
 8. Run final native mobile smoke checks.
    - bootstrap, session list/detail, attach, request-status, analytics, bug
      reports, app artifacts.
+   - PR #996 added the read-only Cloudflare Access smoke runner; passing
+     evidence still requires the real Cloudflare Access JWTs, public-edge
+     secret, and SM auth token or cookie.
 
 ### Cutover Stop Conditions
 
