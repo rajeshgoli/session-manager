@@ -20,8 +20,8 @@ use sm_server::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
         CodexObservabilityConfig, CodexRequestsConfig, CodexRolloutConfig, EmailConfig,
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
-        MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
-        RustCoreConfig, SmSendConfig, ToolLoggingConfig,
+        MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, ProviderLaunchConfig,
+        QueueRunnerConfig, RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
 };
@@ -5065,7 +5065,7 @@ async fn shadow_http_treats_nodes_as_status_only_until_node_agents_are_ported() 
 
     let python_body = br#"{"node":"primary","ok":true,"error":null}"#;
     let (status, payload) = post_json(
-        app,
+        app.clone(),
         "/__shadow/http",
         json!({
             "schema_version": 1,
@@ -5987,7 +5987,7 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
         .contains("never performs retained write side effects"));
 
     let (status, payload) = post_json(
-        app,
+        app.clone(),
         "/__shadow/http",
         json!({
             "schema_version": 1,
@@ -6013,6 +6013,37 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
         .as_str()
         .unwrap()
         .contains("never performs retained write side effects"));
+
+    for path in ["/sessions/review", "/sessions/reviewcodex/review"] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/__shadow/http",
+            json!({
+                "schema_version": 1,
+                "request": {
+                    "method": "POST",
+                    "path": path,
+                    "query_string": "",
+                    "headers": {},
+                    "body_sha256": sha256_hex(b"{\"mode\":\"custom\"}")
+                },
+                "python_response": {
+                    "status": 200,
+                    "body_sha256": sha256_hex(b"{\"status\":\"started\"}")
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            payload["support_status"],
+            "implemented_retained_write_status_only"
+        );
+        assert_eq!(payload["comparison"], "status_match");
+        assert_eq!(payload["would_write"], false);
+        assert_eq!(payload["body_sha256_match"], Value::Null);
+    }
 }
 
 #[tokio::test]
@@ -11129,7 +11160,7 @@ async fn runtime_core_rejects_unsupported_provider() {
         json!({
             "id": "runtimecodex",
             "working_dir": working_dir.display().to_string(),
-            "provider": "codex",
+            "provider": "gemini",
             "initial_message": "codex should not launch claude"
         }),
     )
@@ -11138,10 +11169,444 @@ async fn runtime_core_rejects_unsupported_provider() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         payload,
-        json!({ "detail": "Rust runtime does not support provider codex" })
+        json!({ "detail": "Rust runtime does not support provider gemini" })
     );
     let (status, _) = get_json(app, "/sessions/runtimecodex").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn runtime_core_starts_review_on_existing_codex_session() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-review-existing-repo");
+    create_git_repo(&working_dir);
+    let tmux_socket = format!(
+        "sm-rust-test-review-existing-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewcodex",
+            "name": "review-codex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewwatcher",
+            "name": "review-watcher",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewcodex/review",
+        json!({
+            "mode": "custom",
+            "custom_prompt": "inspect retained review route",
+            "wait": 1,
+            "watcher_session_id": "reviewwatcher"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "reviewcodex");
+    assert_eq!(payload["review_mode"], "custom");
+    assert_eq!(payload["status"], "started");
+    assert_eq!(payload["steer_queued"], false);
+    wait_for_output_contains(
+        app.clone(),
+        "reviewcodex",
+        "runtime:/review inspect retained review route",
+    )
+    .await;
+    wait_for_output_contains(
+        app.clone(),
+        "reviewwatcher",
+        "[sm wait] review-codex is now idle",
+    )
+    .await;
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "reviewcodex")
+        .unwrap();
+    assert_eq!(session["review_config"]["mode"], "custom");
+    assert_eq!(
+        session["review_config"]["custom_prompt"],
+        "inspect retained review route"
+    );
+    assert_eq!(session["review_config"]["steer_delivered"], false);
+    assert_eq!(session["review_config"]["dispatch_in_progress"], false);
+    assert!(session["review_config"]["dispatch_completed_at"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert_eq!(session["status"], "running");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewcodex/review",
+        json!({
+            "mode": "custom",
+            "custom_prompt": "inspect retained review route again"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "reviewcodex");
+    assert_eq!(payload["review_mode"], "custom");
+    assert_eq!(payload["status"], "started");
+    wait_for_output_contains(
+        app.clone(),
+        "reviewcodex",
+        "runtime:/review inspect retained review route again",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn runtime_core_starts_commit_review_with_requested_sha() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-review-commit-repo");
+    create_git_repo(&working_dir);
+    let commit_sha = create_git_commit(&working_dir, "review-target.txt", "review target\n");
+    let tmux_socket = format!(
+        "sm-rust-test-review-commit-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewcommit",
+            "name": "review-commit",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewcommit/review",
+        json!({
+            "mode": "commit",
+            "commit_sha": commit_sha
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "reviewcommit");
+    assert_eq!(payload["review_mode"], "commit");
+    assert_eq!(payload["commit_sha"], commit_sha);
+    assert_eq!(payload["status"], "started");
+    wait_for_output_contains(
+        app.clone(),
+        "reviewcommit",
+        &format!("runtime:{commit_sha}"),
+    )
+    .await;
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "reviewcommit")
+        .unwrap();
+    assert_eq!(session["review_config"]["mode"], "commit");
+    assert_eq!(session["review_config"]["commit_sha"], commit_sha);
+}
+
+#[tokio::test]
+async fn runtime_core_rejects_review_when_session_is_busy() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-review-busy-repo");
+    create_git_repo(&working_dir);
+    let tmux_socket = format!(
+        "sm-rust-test-review-busy-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewbusy",
+            "name": "review-busy",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "reviewbusy")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    session.insert(
+        "last_tool_call".to_owned(),
+        Value::String("2026-06-14T04:00:00Z".to_owned()),
+    );
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewbusy/review",
+        json!({
+            "mode": "custom",
+            "custom_prompt": "should not be delivered"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "error": "Session is busy. Wait for current work to complete or use sm clear first."
+        })
+    );
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "reviewbusy")
+        .unwrap();
+    assert!(session.get("review_config").is_none() || session["review_config"].is_null());
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "reviewbusy")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    session.insert(
+        "parent_session_id".to_owned(),
+        Value::String("reviewparent".to_owned()),
+    );
+    session.insert(
+        "review_config".to_owned(),
+        json!({
+            "mode": "custom",
+            "dispatch_in_progress": true,
+            "dispatch_completed_at": null
+        }),
+    );
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewbusy/clear",
+        json!({ "prompt": "reset stale review dispatch" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "status": "cleared", "session_id": "reviewbusy" })
+    );
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "reviewbusy")
+        .unwrap();
+    assert_eq!(session["review_config"]["dispatch_in_progress"], false);
+    assert!(session["review_config"]["dispatch_completed_at"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewbusy/review",
+        json!({
+            "mode": "custom",
+            "custom_prompt": "review after stale dispatch clear"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "reviewbusy");
+    assert_eq!(payload["status"], "started");
+    wait_for_output_contains(
+        app.clone(),
+        "reviewbusy",
+        "runtime:/review review after stale dispatch clear",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn runtime_core_spawns_codex_review_child() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-review-spawn-repo");
+    create_git_repo(&working_dir);
+    let tmux_socket = format!(
+        "sm-rust-test-review-spawn-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewparent",
+            "name": "review-parent",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/review",
+        json!({
+            "parent_session_id": "reviewparent",
+            "mode": "custom",
+            "custom_prompt": "inspect spawned child",
+            "name": "spawned-review"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["name"], "spawned-review");
+    assert_eq!(payload["friendly_name"], "spawned-review");
+    assert_eq!(payload["review_mode"], "custom");
+    assert_eq!(payload["status"], "started");
+    let child_id = payload["session_id"].as_str().unwrap();
+    wait_for_output_contains(
+        app.clone(),
+        child_id,
+        "runtime:/review inspect spawned child",
+    )
+    .await;
+
+    let (status, child) = get_json(app, &format!("/sessions/{child_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(child["provider"], "codex");
+    assert_eq!(child["parent_session_id"], "reviewparent");
+}
+
+#[tokio::test]
+async fn runtime_core_spawn_review_rejects_invalid_requested_name() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-review-bad-name-repo");
+    create_git_repo(&working_dir);
+    let tmux_socket = format!(
+        "sm-rust-test-review-bad-name-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewparent",
+            "name": "review-parent",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/review",
+        json!({
+            "parent_session_id": "reviewparent",
+            "mode": "custom",
+            "custom_prompt": "should not spawn",
+            "name": "bad\n/clear"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "Invalid name: Name must be alphanumeric with - or _ only (no spaces)"
+    );
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -12809,6 +13274,51 @@ fn unique_short_temp_dir(prefix: &str) -> PathBuf {
     ))
 }
 
+fn create_git_repo(path: &PathBuf) {
+    fs::create_dir_all(path).unwrap();
+    let status = Command::new("git")
+        .args(["init"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn create_git_commit(path: &PathBuf, file_name: &str, contents: &str) -> String {
+    let status = Command::new("git")
+        .args(["config", "user.email", "sm-rust-test@example.invalid"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .args(["config", "user.name", "SM Rust Test"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::write(path.join(file_name), contents).unwrap();
+    let status = Command::new("git")
+        .args(["add", file_name])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .args(["commit", "-m", "add review target"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> axum::Router {
     runtime_app_with_command(
         state_file,
@@ -12844,6 +13354,11 @@ fn runtime_app_with_command(
             send_keys_settle_max_ms: Some(50.0),
             send_keys_max_chunk_chars: Some(128),
             ..RustCoreConfig::default()
+        },
+        codex: ProviderLaunchConfig {
+            command: runtime_command.to_owned(),
+            args: Vec::new(),
+            default_model: None,
         },
         ..AppConfig::default()
     }))

@@ -11,7 +11,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::config::{AppConfig, RustCoreConfig};
+use crate::config::{AppConfig, CodexReviewConfig, RustCoreConfig};
 
 const DEFAULT_SEND_KEYS_SETTLE_MS: f64 = 300.0;
 const DEFAULT_SEND_KEYS_SETTLE_MAX_MS: f64 = 900.0;
@@ -25,6 +25,9 @@ pub struct TmuxRuntime {
     tmux_binary: String,
     claude_command: String,
     claude_args: Vec<String>,
+    codex_command: String,
+    codex_args: Vec<String>,
+    codex_default_model: Option<String>,
     codex_fork_command: String,
     codex_fork_args: Vec<String>,
     codex_fork_default_model: Option<String>,
@@ -73,6 +76,9 @@ impl TmuxRuntime {
                 .unwrap_or("claude")
                 .to_owned(),
             claude_args: Vec::new(),
+            codex_command: "codex".to_owned(),
+            codex_args: Vec::new(),
+            codex_default_model: None,
             codex_fork_command: "codex".to_owned(),
             codex_fork_args: vec![
                 "-c".to_owned(),
@@ -124,6 +130,9 @@ impl TmuxRuntime {
             runtime.claude_command = config.claude.command.clone();
             runtime.claude_args = config.claude.args.clone();
         }
+        runtime.codex_command = config.codex.command.clone();
+        runtime.codex_args = config.codex.args.clone();
+        runtime.codex_default_model = config.codex.default_model.clone();
         runtime.codex_fork_command = config.codex_fork.command.clone();
         runtime.codex_fork_args = config.codex_fork.args.clone();
         runtime.codex_fork_default_model = config.codex_fork.default_model.clone();
@@ -262,6 +271,75 @@ impl TmuxRuntime {
         Ok(true)
     }
 
+    pub fn send_review_sequence(
+        &self,
+        tmux_session: &str,
+        mode: &str,
+        base_branch: Option<&str>,
+        commit_sha: Option<&str>,
+        custom_prompt: Option<&str>,
+        branch_position: Option<usize>,
+        timing: &CodexReviewConfig,
+    ) -> Result<bool> {
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
+        }
+        let mode = mode.trim();
+        if mode == "custom" {
+            let prompt = custom_prompt.unwrap_or("").trim();
+            self.send_text_then_enter(tmux_session, &format!("/review {prompt}"))?;
+            return Ok(true);
+        }
+
+        self.send_text_then_enter(tmux_session, "/review")?;
+        thread::sleep(duration_from_seconds(timing.menu_settle_seconds));
+
+        match mode {
+            "branch" => {
+                self.send_key(tmux_session, "Enter")?;
+                thread::sleep(duration_from_seconds(timing.branch_settle_seconds));
+                if base_branch.is_some() {
+                    for _ in 0..branch_position.unwrap_or(0) {
+                        self.send_key(tmux_session, "Down")?;
+                    }
+                }
+                thread::sleep(self.compute_settle_delay(base_branch.unwrap_or("")));
+                self.send_key(tmux_session, "Enter")?;
+            }
+            "uncommitted" => {
+                self.send_key(tmux_session, "Down")?;
+                thread::sleep(self.compute_settle_delay(mode));
+                self.send_key(tmux_session, "Enter")?;
+            }
+            "commit" => {
+                self.send_key(tmux_session, "Down")?;
+                self.send_key(tmux_session, "Down")?;
+                thread::sleep(self.compute_settle_delay(mode));
+                self.send_key(tmux_session, "Enter")?;
+                thread::sleep(duration_from_seconds(timing.branch_settle_seconds));
+                if let Some(commit_sha) =
+                    commit_sha.map(str::trim).filter(|value| !value.is_empty())
+                {
+                    self.send_text(tmux_session, commit_sha)?;
+                    thread::sleep(self.compute_settle_delay(commit_sha));
+                }
+                self.send_key(tmux_session, "Enter")?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    pub fn send_steer_text(&self, tmux_session: &str, text: &str) -> Result<bool> {
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
+        }
+        self.send_key(tmux_session, "Enter")?;
+        thread::sleep(self.compute_settle_delay(text));
+        self.send_text_then_enter(tmux_session, text)?;
+        Ok(true)
+    }
+
     pub fn clear_session(
         &self,
         tmux_session: &str,
@@ -337,12 +415,17 @@ impl TmuxRuntime {
     }
 
     fn send_text_then_enter(&self, tmux_session: &str, text: &str) -> Result<()> {
+        self.send_text(tmux_session, text)?;
+        thread::sleep(self.compute_settle_delay(text));
+        self.send_key(tmux_session, "Enter")
+    }
+
+    fn send_text(&self, tmux_session: &str, text: &str) -> Result<()> {
         self.exit_copy_mode_if_needed(tmux_session);
         for chunk in split_send_text_chunks(text, self.send_keys_max_chunk_chars) {
             self.run_tmux(["send-keys", "-t", tmux_session, "-l", "--", chunk])?;
         }
-        thread::sleep(self.compute_settle_delay(text));
-        self.send_key(tmux_session, "Enter")
+        Ok(())
     }
 
     fn send_key(&self, tmux_session: &str, key: &str) -> Result<()> {
@@ -406,6 +489,7 @@ impl TmuxRuntime {
     fn launch_command(&self, spec: &TmuxSessionSpec, prompt_mode: &str) -> Result<String> {
         let mut parts = match spec.provider.as_str() {
             "claude" => command_parts(&self.claude_command, &self.claude_args),
+            "codex" => command_parts(&self.codex_command, &self.codex_args),
             "codex-fork" => self.codex_fork_command_parts(spec)?,
             provider => bail!("Rust runtime does not support provider {provider}"),
         };
@@ -415,11 +499,19 @@ impl TmuxRuntime {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .or_else(|| {
-                (spec.provider == "codex-fork")
-                    .then_some(self.codex_fork_default_model.as_deref())
-                    .flatten()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
+                if spec.provider == "codex" {
+                    self.codex_default_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                } else if spec.provider == "codex-fork" {
+                    self.codex_fork_default_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                } else {
+                    None
+                }
             });
         if let Some(model) = model {
             parts.push("--model".to_owned());
@@ -555,6 +647,10 @@ fn finite_nonnegative_or_default(value: Option<f64>, default: f64) -> f64 {
 
 fn duration_from_millis(millis: f64) -> Duration {
     Duration::from_secs_f64((millis.max(0.0)) / 1000.0)
+}
+
+fn duration_from_seconds(seconds: f64) -> Duration {
+    Duration::from_secs_f64(seconds.max(0.0))
 }
 
 fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {
