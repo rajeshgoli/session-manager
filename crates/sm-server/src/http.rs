@@ -129,6 +129,8 @@ const MOBILE_TERMINAL_INITIAL_RESIZE_WAIT_SECONDS: f64 = 2.0;
 const MOBILE_TERMINAL_MAX_ATTACH_SECONDS: u64 = 3600;
 const CLOUDFLARE_ACCESS_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
 const CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const REVIEW_WAIT_IDLE_THRESHOLD: Duration = Duration::from_secs(1);
+const REVIEW_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -2304,7 +2306,7 @@ async fn spawn_review_session(
             .create_core_session(create_payload, log_dir)?
     };
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(runtime.startup_settle_duration()).await;
 
     let review_request = StartReviewRequest {
         mode: payload.mode.clone(),
@@ -2416,7 +2418,7 @@ fn spawn_session_wait_monitor(
         let mut idle_since = Instant::now();
         let started_at = Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(REVIEW_WAIT_POLL_INTERVAL).await;
             let elapsed = started_at.elapsed().as_secs();
             let Ok(Some(target)) = state.session_store.get_session(&target_session_id) else {
                 queue_wait_notification(
@@ -2439,10 +2441,16 @@ fn spawn_session_wait_monitor(
                 Some(format!(
                     "[sm wait] {target_name} reached stopped (waited {elapsed}s)"
                 ))
+            } else if idle_since.elapsed() >= REVIEW_WAIT_IDLE_THRESHOLD {
+                Some(format!(
+                    "[sm wait] {target_name} is now idle (waited {elapsed}s)"
+                ))
+            } else if elapsed >= wait_seconds {
+                Some(format!(
+                    "[sm wait] Timeout: {target_name} still active after {wait_seconds}s"
+                ))
             } else {
-                Some(idle_since.elapsed().as_secs())
-                    .filter(|idle_seconds| *idle_seconds >= wait_seconds)
-                    .map(|_| format!("[sm wait] {target_name} is now idle (waited {elapsed}s)"))
+                None
             };
             if let Some(notification) = notification {
                 queue_wait_notification(&state, &watcher_session_id, notification);
