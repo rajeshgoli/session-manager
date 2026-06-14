@@ -965,7 +965,10 @@
         "status",
         "cancel",
         "--notify",
-        "--repo"
+        "--repo",
+        "--steer",
+        "--poll-interval",
+        "--retry-interval"
       ],
       "preconditions": ["sm_cli"],
       "source": "specs/762_stage5_artifacts/cutover_scope.md:32"

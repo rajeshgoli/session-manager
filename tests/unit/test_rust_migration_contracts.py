@@ -91,6 +91,9 @@ def test_manifest_retains_local_and_durable_codex_review_cli_surfaces():
     assert durable.target == "python_and_rust"
     assert durable.command == ("request-codex-review", "--help")
     assert "--notify" in durable.expected_output_contains_all
+    assert "--steer" in durable.expected_output_contains_all
+    assert "--poll-interval" in durable.expected_output_contains_all
+    assert "--retry-interval" in durable.expected_output_contains_all
 
     for check_id, subcommand in {
         "cli.request_codex_review_list_help": "list",
