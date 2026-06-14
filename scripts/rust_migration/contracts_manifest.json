@@ -971,6 +971,58 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
     {
+      "id": "cli.request_codex_review_list_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["request-codex-review", "list", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": [
+        "--notify",
+        "--repo",
+        "--all",
+        "--inactive",
+        "--json",
+        "--pr"
+      ],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.request_codex_review_status_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["request-codex-review", "status", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": [
+        "request_id",
+        "--notify",
+        "--repo",
+        "--all",
+        "--json",
+        "--pr"
+      ],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
+      "id": "cli.request_codex_review_cancel_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["request-codex-review", "cancel", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": [
+        "request_id"
+      ],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
+    },
+    {
       "id": "cli.claude_help",
       "surface": "cli",
       "classification": "retained",

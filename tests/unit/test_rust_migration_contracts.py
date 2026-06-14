@@ -92,6 +92,16 @@ def test_manifest_retains_local_and_durable_codex_review_cli_surfaces():
     assert durable.command == ("request-codex-review", "--help")
     assert "--notify" in durable.expected_output_contains_all
 
+    for check_id, subcommand in {
+        "cli.request_codex_review_list_help": "list",
+        "cli.request_codex_review_status_help": "status",
+        "cli.request_codex_review_cancel_help": "cancel",
+    }.items():
+        check = checks[check_id]
+        assert check.classification == "retained"
+        assert check.target == "python_and_rust"
+        assert check.command == ("request-codex-review", subcommand, "--help")
+
 
 def test_manifest_covers_core_retained_cli_help_surfaces():
     manifest = ContractManifest.load()
@@ -128,6 +138,9 @@ def test_manifest_covers_core_retained_cli_help_surfaces():
         "cli.queue_cancel_help",
         "cli.review_help",
         "cli.request_codex_review_help",
+        "cli.request_codex_review_list_help",
+        "cli.request_codex_review_status_help",
+        "cli.request_codex_review_cancel_help",
         "cli.claude_help",
         "cli.codex_help",
         "cli.codex_app_help",
