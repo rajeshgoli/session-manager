@@ -27,6 +27,7 @@ DEFAULT_CHILD_SESSION_ID = "fixture-child"
 DEFAULT_CHILD_SESSION_NAME = "FixtureChild"
 DEFAULT_EM_SESSION_ID = "fixture-em"
 DEFAULT_NOTIFY_CHILD_SESSION_ID = "fixture-notify-child"
+DEFAULT_STOPPED_SESSION_ID = "fixture-stop"
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ def create_mutating_fixture_workspace(output_dir: Path | None = None) -> Mutatin
         "clear_prompt_text": "new task after clear",
         "em_session_id": DEFAULT_EM_SESSION_ID,
         "notify_child_session_id": DEFAULT_NOTIFY_CHILD_SESSION_ID,
+        "stopped_session_id": DEFAULT_STOPPED_SESSION_ID,
         "queue_job_id": "job-fixture",
     }
     return MutatingFixtureWorkspace(
@@ -103,6 +105,7 @@ def create_mutating_fixture_workspace(output_dir: Path | None = None) -> Mutatin
 def _seed_em_notify_sessions(state_file: Path, log_dir: Path, working_dir: Path) -> None:
     state = json.loads(state_file.read_text())
     sessions = list(state.get("sessions", []))
+    _relocate_existing_session_logs(sessions, log_dir)
     seeded_ids = {DEFAULT_EM_SESSION_ID, DEFAULT_NOTIFY_CHILD_SESSION_ID}
     sessions = [session for session in sessions if session.get("id") not in seeded_ids]
     created_at = "2026-06-01T00:10:00"
@@ -141,6 +144,24 @@ def _seed_em_notify_sessions(state_file: Path, log_dir: Path, working_dir: Path)
     )
     state["sessions"] = sessions
     state_file.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def _relocate_existing_session_logs(sessions: list[dict[str, Any]], log_dir: Path) -> None:
+    for session in sessions:
+        session_id = str(session.get("id") or session.get("name") or "session")
+        destination = log_dir / f"{session_id}.log"
+        source = session.get("log_file")
+        if isinstance(source, str) and source:
+            source_path = Path(source).expanduser()
+            if not source_path.is_absolute():
+                source_path = REPO_ROOT / source_path
+            if source_path.exists() and source_path.is_file():
+                shutil.copyfile(source_path, destination)
+            else:
+                destination.touch()
+        else:
+            destination.touch()
+        session["log_file"] = str(destination)
 
 
 def _write_config(

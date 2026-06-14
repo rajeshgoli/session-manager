@@ -93,6 +93,7 @@ CORE_MUTATING_CHECK_IDS = (
     "http.rust_core_turn_complete_fixture",
     "http.rust_core_notify_on_stop_fixture",
     "http.rust_queue_job_create_fixture",
+    "http.rust_node_primary_restore_fixture",
     "cli.rust_core_restore_fixture",
     "cli.rust_core_retire_restored_fixture",
     "cli.rust_core_wait_retired_fixture",
