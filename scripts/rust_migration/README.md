@@ -448,6 +448,39 @@ attach-ticket minting, request-status prompts, bug-report submission, and device
 revocation/list changes should be covered by disposable fixture or smoke
 rehearsal gates, not by executing Rust against live state from shadow mode.
 
+## Cloudflare Access Smoke Evidence
+
+After the Cloudflare Access apps and tunnel policies are configured, collect
+read-only origin-gate evidence with:
+
+```bash
+python -m scripts.rust_migration.cloudflare_access_smoke \
+  --base-url http://127.0.0.1:8421 \
+  --mobile-host sm-app.rajeshgo.li \
+  --browser-host sm.rajeshgo.li \
+  --mobile-access-jwt-env CF_MOBILE_ACCESS_JWT \
+  --browser-access-jwt-env CF_BROWSER_ACCESS_JWT \
+  --public-edge-secret-env SM_PUBLIC_EDGE_SECRET \
+  --bearer-token-env SM_DEVICE_BEARER_TOKEN \
+  --output /tmp/sm-cloudflare-access-smoke.json \
+  --fail-on-blockers
+```
+
+Sensitive Cloudflare Access, public-edge, SM bearer, and cookie values should be
+provided through `--*-env` or `--*-file` options so they do not appear in process
+arguments or shell history. File inputs strip one trailing newline.
+
+The smoke runner does not configure Cloudflare and does not perform mutating
+native app flows by default. It records missing/provided Access proof behavior,
+mobile bootstrap, app artifact metadata, the mobile Access-to-SM-auth boundary,
+and optional authenticated native session reads when an SM bearer token or
+cookie is supplied. Mobile success probes reject redirects/login HTML by
+requiring the expected JSON response shape. Browser `/auth/session` Access
+denial is enforced by Cloudflare at the edge rather than by the Rust origin, so
+the loopback smoke report records those checks as skipped edge-only evidence.
+Use the JSON output as operator evidence alongside
+`specs/762_stage5_artifacts/cloudflare_access_cutover_evidence.md`.
+
 ## MVP Sidecar Rehearsal
 
 The MVP rehearsal gate starts Rust as a sidecar, keeps Python authoritative, and
