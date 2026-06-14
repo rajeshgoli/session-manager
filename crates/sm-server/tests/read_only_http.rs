@@ -2171,6 +2171,124 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
 }
 
 #[tokio::test]
+async fn pr_review_route_posts_comment_and_returns_python_shape() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "caller1",
+                    "name": "codex-fork-caller1",
+                    "working_dir": "/repo/caller",
+                    "tmux_session": "codex-fork-caller1",
+                    "log_file": "/tmp/caller1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "provider": "codex-fork"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let queue_db = state_file.with_extension("pr-review-route-message-queue.db");
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "pull_review".to_owned(),
+        created_at: "2026-06-14T02:30:01Z".to_owned(),
+        id: Some(json!("PRR_kw123")),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/967#pullrequestreview-1".to_owned(),
+        ),
+    });
+    let mut config = AppConfig::default();
+    config.paths.state_file = state_file.display().to_string();
+    config.sm_send.db_path = queue_db.display().to_string();
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/reviews/pr",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "steer": "focus create",
+            "wait": 600,
+            "caller_session_id": "caller1"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["repo"], "rajeshgoli/session-manager");
+    assert_eq!(payload["pr_number"], 967);
+    assert_eq!(payload["posted_at"], "2026-06-14T02:30:00Z");
+    assert_eq!(payload["comment_id"], 4701290334_i64);
+    assert_eq!(payload["comment_body"], "@codex review for focus create");
+    assert_eq!(payload["status"], "posted");
+    assert_eq!(payload["server_polling"], true);
+    assert_eq!(
+        poster.calls(),
+        vec![(
+            "rajeshgoli/session-manager".to_owned(),
+            967,
+            Some("focus create".to_owned())
+        )]
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        queued_message_texts(&queue_db, "caller1"),
+        vec!["Review --pr 967 (rajeshgoli/session-manager) completed: Codex posted review on PR #967"]
+    );
+}
+
+#[tokio::test]
+async fn pr_review_route_returns_error_payloads_and_preserves_write_gate() {
+    let poster = StubGitHubReviewPoster::failing("PR #999 not found in owner/repo");
+    let mut config = AppConfig::default();
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/reviews/pr",
+        json!({
+            "pr_number": 999,
+            "repo": "owner/repo"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"], "PR #999 not found in owner/repo");
+    assert_eq!(poster.calls(), vec![("owner/repo".to_owned(), 999, None)]);
+
+    let (status, payload) = post_json(app.clone(), "/reviews/pr", json!({ "pr_number": 42 })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["error"],
+        "Could not determine repo. Provide --repo or run from a git directory."
+    );
+
+    let gated_app = router(AppState::new(AppConfig::default()));
+    let (status, payload) = post_json(
+        gated_app,
+        "/reviews/pr",
+        json!({
+            "pr_number": 42,
+            "repo": "owner/repo"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("Rust core writes are disabled"));
+}
+
+#[tokio::test]
 async fn codex_review_request_watcher_completes_and_queues_wake() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-create-watch.db");
@@ -5064,6 +5182,42 @@ async fn shadow_http_reports_codex_review_request_create_as_status_only_without_
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
     assert!(!queue_db.exists());
+}
+
+#[tokio::test]
+async fn shadow_http_reports_pr_review_create_as_status_only_without_writing() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/reviews/pr",
+                "query_string": "",
+                "headers": {},
+                "body_sha256": sha256_hex(b"{\"pr_number\":967}")
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"status\":\"posted\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["support_status"],
+        "implemented_retained_write_status_only"
+    );
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
 }
 
 #[tokio::test]
