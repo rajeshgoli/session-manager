@@ -28,6 +28,7 @@ from scripts.rust_migration.contracts import (
 )
 from scripts.rust_migration.mutating_fixture import (
     DEFAULT_CHILD_SESSION_ID,
+    DEFAULT_CLI_RESTORE_SESSION_ID,
     DEFAULT_EM_SESSION_ID,
     DEFAULT_NOTIFY_CHILD_SESSION_ID,
     DEFAULT_SESSION_ID,
@@ -248,17 +249,18 @@ def test_cloudflare_access_cutover_evidence_pins_policy_and_origin_gates():
         assert required in evidence
 
 
-def test_handoff_and_progress_are_current_through_cloudflare_access_pr950():
+def test_handoff_and_progress_are_current_through_review_route_pr984():
     progress = (STAGE5_DIR / "mvp_progress.md").read_text(encoding="utf-8")
     handoff = (STAGE5_DIR / "resume_handoff.md").read_text(encoding="utf-8")
 
     for text in [progress, handoff]:
-        assert "PR #950" in text
+        assert "#950" in text
+        assert "#984" in text
         assert "Cloudflare Access" in text
         assert "cloudflare_access_cutover_evidence.md" in text
 
-    assert "Latest merged commit: `d8f97c0`" in handoff
-    assert "records the PR lineage through #950" in handoff
+    assert "Latest merged commit before this docs refresh: `8c261ee`" in handoff
+    assert "records the PR lineage through #984" in handoff
 
 
 def test_manifest_covers_rust_only_retired_http_surfaces():
@@ -303,6 +305,7 @@ def test_manifest_covers_rust_core_fixture_lifecycle_cli_checks():
         "cli.rust_core_tail_fixture",
         "cli.rust_core_retire_fixture",
         "cli.rust_core_restore_fixture",
+        "cli.rust_core_restore_node_primary_fixture",
         "cli.rust_core_retire_restored_fixture",
         "cli.rust_core_wait_retired_fixture",
     }
@@ -411,6 +414,26 @@ def test_manifest_covers_rust_node_restore_fixture_check():
     assert expectations["/id"].equals == "{stopped_session_id}"
     assert expectations["/status"].equals == "running"
     assert expectations["/stopped_at"].value_type == "null"
+
+
+def test_manifest_covers_rust_cli_restore_node_fixture_check():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    restore_check = checks["cli.rust_core_restore_node_primary_fixture"]
+    assert restore_check.classification == "retained"
+    assert restore_check.target == "rust_only"
+    assert restore_check.safety == "mutating"
+    assert restore_check.command == (
+        "--api-url",
+        "{base_url}",
+        "restore",
+        "{cli_restore_session_id}",
+        "--node",
+        "primary",
+    )
+    assert "fixture:cli_restore_session_id" in restore_check.preconditions
+    assert "mutating_opt_in" in restore_check.preconditions
 
 
 def test_mvp_rehearsal_mutating_check_ids_match_manifest():
@@ -979,6 +1002,7 @@ def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path)
     assert workspace.fixtures["em_session_id"] == DEFAULT_EM_SESSION_ID
     assert workspace.fixtures["notify_child_session_id"] == DEFAULT_NOTIFY_CHILD_SESSION_ID
     assert workspace.fixtures["stopped_session_id"] == DEFAULT_STOPPED_SESSION_ID
+    assert workspace.fixtures["cli_restore_session_id"] == DEFAULT_CLI_RESTORE_SESSION_ID
     assert workspace.fixtures["queue_job_id"] == "job-fixture"
 
     config_text = workspace.config_path.read_text()
@@ -993,6 +1017,7 @@ def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path)
     state = json.loads(workspace.state_file.read_text())
     sessions = {session["id"]: session for session in state["sessions"]}
     assert sessions[DEFAULT_STOPPED_SESSION_ID]["status"] == "stopped"
+    assert sessions[DEFAULT_CLI_RESTORE_SESSION_ID]["status"] == "stopped"
     for session in sessions.values():
         assert Path(session["log_file"]).is_relative_to(workspace.log_dir)
     assert sessions[DEFAULT_EM_SESSION_ID]["is_em"] is True
@@ -1010,6 +1035,7 @@ def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path)
     read_only_ids = {session["id"] for session in read_only_state["sessions"]}
     assert DEFAULT_EM_SESSION_ID not in read_only_ids
     assert DEFAULT_NOTIFY_CHILD_SESSION_ID not in read_only_ids
+    assert DEFAULT_CLI_RESTORE_SESSION_ID not in read_only_ids
 
 
 def test_mutating_fixture_workspace_refuses_non_empty_output_dir(tmp_path):
