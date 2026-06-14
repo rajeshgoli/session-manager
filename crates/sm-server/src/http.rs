@@ -295,6 +295,7 @@ pub struct AppState {
     session_store: SessionStore,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
+    codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
     mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
@@ -317,6 +318,7 @@ impl AppState {
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
             codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
+            codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -767,6 +769,8 @@ pub fn router(state: AppState) -> Router {
         .ok()
         .map(|bridge| bridge.webhook_path())
         .unwrap_or_else(|| DEFAULT_EMAIL_WEBHOOK_PATH.to_owned());
+    let state = Arc::new(state);
+    recover_codex_review_request_watchers(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
@@ -906,7 +910,7 @@ pub fn router(state: AppState) -> Router {
     app.layer(DefaultBodyLimit::max(
         APP_ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024,
     ))
-    .with_state(Arc::new(state))
+    .with_state(state)
 }
 
 async fn health() -> Json<Value> {
@@ -2595,11 +2599,60 @@ fn validate_codex_review_create_payload(
     Ok(())
 }
 
+fn recover_codex_review_request_watchers(state: Arc<AppState>) {
+    if !state.config.rust_core.runtime_enabled {
+        return;
+    }
+    let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    match RetainedQueueStore::list_active_codex_review_requests_from_path(&queue_db_path) {
+        Ok(registrations) => {
+            for registration in registrations {
+                if state
+                    .session_store
+                    .get_session(&registration.notify_session_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    if let Err(error) =
+                        RetainedQueueStore::cancel_codex_review_request_with_error_in_path(
+                            &queue_db_path,
+                            &registration.id,
+                            "Notify session no longer exists",
+                        )
+                    {
+                        eprintln!(
+                            "Codex review request recovery failed to cancel {}: {error:#}",
+                            registration.id
+                        );
+                    }
+                    continue;
+                }
+                spawn_codex_review_request_watcher(state.clone(), registration.id);
+            }
+        }
+        Err(error) => eprintln!("Codex review request recovery failed: {error:#}"),
+    }
+}
+
 fn spawn_codex_review_request_watcher(state: Arc<AppState>, request_id: String) {
+    {
+        let mut watcher_ids = state.codex_review_watcher_ids.lock().unwrap();
+        if !watcher_ids.insert(request_id.clone()) {
+            return;
+        }
+    }
     tokio::spawn(async move {
-        if let Err(error) = run_codex_review_request_watcher(state, request_id.clone()).await {
+        if let Err(error) =
+            run_codex_review_request_watcher(state.clone(), request_id.clone()).await
+        {
             eprintln!("Codex review request watcher {request_id} stopped with error: {error}");
         }
+        state
+            .codex_review_watcher_ids
+            .lock()
+            .unwrap()
+            .remove(&request_id);
     });
 }
 

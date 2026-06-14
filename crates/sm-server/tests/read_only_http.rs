@@ -2271,6 +2271,126 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
 }
 
 #[tokio::test]
+async fn codex_review_request_recovery_spawns_active_watchers() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-recover-watch.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "notify1",
+                    "name": "codex-fork-notify1",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify1",
+                    "log_file": "/tmp/notify1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "recovered-watch", "notify1", 1);
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "pull_review".to_owned(),
+        created_at: "2026-06-14T02:31:00Z".to_owned(),
+        id: Some(json!("PRR_kwRecovered")),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/971#pullrequestreview-1".to_owned(),
+        ),
+    });
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
+
+    let mut completed = None;
+    for _ in 0..30 {
+        let conn = Connection::open(&queue_db).unwrap();
+        let row: (String, i64, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT state, is_active, review_url
+                FROM codex_review_request_registrations
+                WHERE id = 'recovered-watch'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        if row.0 == "completed" {
+            completed = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let completed = completed.expect("recovered watcher should complete retained request");
+    assert_eq!(completed.1, 0);
+    assert_eq!(
+        completed.2.as_deref(),
+        Some("https://github.com/rajeshgoli/session-manager/pull/971#pullrequestreview-1")
+    );
+
+    let conn = Connection::open(&queue_db).unwrap();
+    let message: String = conn
+        .query_row(
+            "SELECT text FROM message_queue WHERE target_session_id = 'notify1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        message,
+        "[sm review] Codex review for PR #971 is here. https://github.com/rajeshgoli/session-manager/pull/971#pullrequestreview-1"
+    );
+}
+
+#[tokio::test]
+async fn codex_review_request_recovery_cancels_missing_notify_session() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-recover-missing-notify.db");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "missing-notify", "notify-missing", 1);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(AppState::new(config));
+
+    let conn = Connection::open(&queue_db).unwrap();
+    let row: (String, i64, Option<String>) = conn
+        .query_row(
+            r#"
+            SELECT state, is_active, last_error
+            FROM codex_review_request_registrations
+            WHERE id = 'missing-notify'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "cancelled");
+    assert_eq!(row.1, 0);
+    assert_eq!(row.2.as_deref(), Some("Notify session no longer exists"));
+}
+
+#[tokio::test]
 async fn codex_review_request_create_rejects_duplicates_before_github_post() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-create-duplicate.db");
@@ -11613,6 +11733,67 @@ fn create_codex_review_request_fixture_db(path: &PathBuf) {
              'https://example.com/review/R_kw123', NULL, NULL, 'completed', 1)
         "#,
         [],
+    )
+    .unwrap();
+}
+
+fn create_active_codex_review_request_fixture_db(
+    path: &PathBuf,
+    request_id: &str,
+    notify_session_id: &str,
+    poll_interval_seconds: i64,
+) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_review_request_registrations (
+            id TEXT PRIMARY KEY,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            requester_session_id TEXT,
+            notify_session_id TEXT NOT NULL,
+            steer TEXT,
+            requested_at TIMESTAMP NOT NULL,
+            latest_request_comment_id INTEGER,
+            latest_request_comment_url TEXT,
+            latest_request_posted_at TIMESTAMP,
+            attempt_count INTEGER NOT NULL,
+            next_retry_at TIMESTAMP,
+            poll_interval_seconds INTEGER NOT NULL,
+            retry_interval_seconds INTEGER NOT NULL,
+            pickup_detected_at TIMESTAMP,
+            pickup_source TEXT,
+            review_landed_at TIMESTAMP,
+            review_source TEXT,
+            review_comment_id INTEGER,
+            review_url TEXT,
+            last_polled_at TIMESTAMP,
+            last_error TEXT,
+            state TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1
+        );
+        "#,
+    )
+    .unwrap();
+    conn.execute(
+        r#"
+        INSERT INTO codex_review_request_registrations
+            (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+             requested_at, latest_request_comment_id, latest_request_comment_url,
+             latest_request_posted_at, attempt_count, next_retry_at,
+             poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+             pickup_source, review_landed_at, review_source, review_comment_id,
+             review_url, last_polled_at, last_error, state, is_active)
+        VALUES
+            (?1, 'rajeshgoli/session-manager', 971, 'requester1', ?2, 'recover watchers',
+             '2026-06-14T02:30:00Z', 4701290334,
+             'https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701290334',
+             '2026-06-14T02:30:00Z', 1, '2026-06-14T02:45:00Z',
+             ?3, 600, NULL,
+             NULL, NULL, NULL, NULL,
+             NULL, NULL, NULL, 'active', 1)
+        "#,
+        rusqlite::params![request_id, notify_session_id, poll_interval_seconds],
     )
     .unwrap();
 }
