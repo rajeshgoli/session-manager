@@ -11290,6 +11290,88 @@ async fn runtime_core_starts_review_on_existing_codex_session() {
 }
 
 #[tokio::test]
+async fn runtime_core_existing_review_wait_times_out_while_session_stays_active() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-review-wait-timeout-repo");
+    create_git_repo(&working_dir);
+    let tmux_socket = format!(
+        "sm-rust-test-review-wait-timeout-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewtimeout",
+            "name": "review-codex-timeout",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "reviewtimeoutwatcher",
+            "name": "review-timeout-watcher",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewtimeout/review",
+        json!({
+            "mode": "custom",
+            "custom_prompt": "stay active until timeout",
+            "wait": 2,
+            "watcher_session_id": "reviewtimeoutwatcher"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "started");
+
+    let state_path = state_file.clone();
+    let activity_task = tokio::spawn(async move {
+        for tick in 0..16 {
+            touch_session_activity(&state_path, "reviewtimeout", tick);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    });
+
+    wait_for_output_contains(
+        app.clone(),
+        "reviewtimeout",
+        "runtime:/review stay active until timeout",
+    )
+    .await;
+    wait_for_output_contains(
+        app.clone(),
+        "reviewtimeoutwatcher",
+        "[sm wait] Timeout: review-codex-timeout still active after 2s",
+    )
+    .await;
+    activity_task.abort();
+}
+
+#[tokio::test]
 async fn runtime_core_starts_commit_review_with_requested_sha() {
     if !tmux_available() {
         return;
@@ -13317,6 +13399,24 @@ fn create_git_commit(path: &PathBuf, file_name: &str, contents: &str) -> String 
         .unwrap();
     assert!(output.status.success());
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn touch_session_activity(state_file: &PathBuf, session_id: &str, tick: usize) {
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(state_file).unwrap()).unwrap();
+    let Some(session) = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == session_id)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    session.insert(
+        "last_activity".to_owned(),
+        Value::String(format!("2026-06-14T04:00:{:02}Z", tick % 60)),
+    );
+    fs::write(state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 }
 
 fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> axum::Router {

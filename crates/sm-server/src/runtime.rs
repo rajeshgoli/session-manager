@@ -144,6 +144,10 @@ impl TmuxRuntime {
         self.socket_name.as_deref()
     }
 
+    pub fn startup_settle_duration(&self) -> Duration {
+        Duration::from_millis(self.start_settle_ms)
+    }
+
     pub fn for_socket_name(&self, socket_name: Option<&str>) -> Self {
         let mut runtime = self.clone();
         runtime.socket_name = socket_name
