@@ -246,6 +246,32 @@ a missing/non-directory parent. The entry records the planned coverage only; it
 does not claim write admission is frozen, writers are drained, or Rust owns any
 store.
 
+For the MVP cutover path, the final rollback restore point is copied only after
+the Python origin is stopped. Generate the stopped-service final backup with:
+
+```bash
+python -m scripts.rust_migration.final_backup \
+  --config config.yaml \
+  --output-dir /tmp/sm-rust-final-backup-$(date -u +%Y%m%dT%H%M%SZ) \
+  --execute \
+  --record-ledger \
+  --ledger /tmp/sm-rust-migration-ledger.jsonl \
+  --fail-on-blockers
+```
+
+This command fails closed if any HTTP service answers the Python health URL, if
+the health probe times out, or if the backup/ledger paths are unsafe. A
+connection-refused health probe held across multiple checks is the required
+stopped-service evidence for this MVP path. By default `--execute` requires two
+refused probes over `--stopped-hold-seconds 5`; increase that hold window if the
+launchd/watchdog restart gap can be longer locally. By default the health URL
+is derived from `server.host` and `server.port` in `--config`; use
+`--python-health-url` only when the operator intentionally needs to probe a
+different origin. The command writes the normal `state-backup-manifest.json`
+and a `final_backup` ledger row only after the stopped-origin check and backup
+copy both pass. The ledger row includes the manifest SHA-256 and per-store
+backup evidence needed for rollback audits.
+
 ## Shadow Comparison Mode
 
 Shadow mode lets Python stay authoritative while Rust observes bounded
