@@ -818,6 +818,7 @@ pub fn router(state: AppState) -> Router {
             "/codex-review-requests/{request_id}",
             get(get_codex_review_request).delete(cancel_codex_review_request),
         )
+        .route("/reviews/pr", post(start_pr_review))
         .route("/nodes", get(list_nodes))
         .route("/nodes/{node_id}/ping", post(ping_node))
         .route(
@@ -2573,6 +2574,168 @@ async fn create_codex_review_request(
         .await
         .remove(&creation_key);
     create_result
+}
+
+async fn start_pr_review(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<PrReviewRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/reviews/pr")?;
+    ensure_core_writes_enabled(&state)?;
+    let repo = match resolve_pr_review_repo(
+        &state,
+        payload.repo.as_deref(),
+        payload.caller_session_id.as_deref(),
+    )
+    .await
+    {
+        Ok(repo) => repo,
+        Err(error) => return Ok(Json(json!({ "error": error }))),
+    };
+    let steer = trimmed(&payload.steer);
+    let poster = state.github_review_poster.clone();
+    let comment = match github_post_review_request(
+        poster,
+        &repo,
+        payload.pr_number,
+        steer.as_deref(),
+    )
+    .await
+    {
+        Ok(comment) => comment,
+        Err(error) => return Ok(Json(json!({ "error": error }))),
+    };
+    let caller_session_id = trimmed(&payload.caller_session_id);
+    let server_polling = payload.wait.is_some_and(|wait| wait != 0) && caller_session_id.is_some();
+    if server_polling {
+        spawn_pr_review_completion_notifier(
+            state.clone(),
+            repo.clone(),
+            payload.pr_number,
+            comment.posted_at.clone(),
+            payload.wait.unwrap_or_default(),
+            caller_session_id.clone().unwrap_or_default(),
+        );
+    }
+
+    Ok(Json(json!({
+        "repo": repo,
+        "pr_number": payload.pr_number,
+        "posted_at": comment.posted_at,
+        "comment_id": comment.comment_id.unwrap_or(0),
+        "comment_body": codex_review_comment_body(steer.as_deref()),
+        "status": "posted",
+        "server_polling": server_polling,
+    })))
+}
+
+async fn resolve_pr_review_repo(
+    state: &AppState,
+    repo: Option<&str>,
+    caller_session_id: Option<&str>,
+) -> Result<String, String> {
+    if let Some(repo) = repo.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(repo.to_owned());
+    }
+    let Some(caller_session_id) = caller_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(
+            "Could not determine repo. Provide --repo or run from a git directory.".to_owned(),
+        );
+    };
+    let Some(caller) = state
+        .session_store
+        .get_session(caller_session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Err(
+            "Could not determine repo. Provide --repo or run from a git directory.".to_owned(),
+        );
+    };
+    let working_dir = caller.working_dir;
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("gh")
+            .args([
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "--jq",
+                ".nameWithOwner",
+            ])
+            .current_dir(working_dir)
+            .output()
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    if let Some(output) = output {
+        if output.status.success() {
+            let repo = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !repo.is_empty() {
+                return Ok(repo);
+            }
+        }
+    }
+    Err("Could not determine repo. Provide --repo or run from a git directory.".to_owned())
+}
+
+fn codex_review_comment_body(steer: Option<&str>) -> String {
+    match steer.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(steer) => format!("@codex review for {steer}"),
+        None => "@codex review".to_owned(),
+    }
+}
+
+fn spawn_pr_review_completion_notifier(
+    state: Arc<AppState>,
+    repo: String,
+    pr_number: i64,
+    posted_at: String,
+    wait_seconds: i64,
+    caller_session_id: String,
+) {
+    tokio::spawn(async move {
+        let wait_duration = Duration::from_secs(wait_seconds.max(0) as u64);
+        let deadline = Instant::now() + wait_duration;
+        loop {
+            if let Ok(Some(_review_match)) = github_find_fresh_review(
+                state.github_review_poster.clone(),
+                &repo,
+                pr_number,
+                &posted_at,
+            )
+            .await
+            {
+                let text =
+                    format!("Review --pr {pr_number} ({repo}) completed: Codex posted review on PR #{pr_number}");
+                enqueue_pr_review_notification(&state, &caller_session_id, &text);
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let sleep_for = std::cmp::min(
+                Duration::from_secs(30),
+                deadline.saturating_duration_since(now),
+            );
+            tokio::time::sleep(sleep_for).await;
+        }
+
+        let text = format!("Review --pr {pr_number} ({repo}) timed out after {wait_seconds}s");
+        enqueue_pr_review_notification(&state, &caller_session_id, &text);
+    });
+}
+
+fn enqueue_pr_review_notification(state: &AppState, caller_session_id: &str, text: &str) {
+    let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let queue = RetainedQueueStore::new(queue_db_path);
+    let _ = queue.enqueue_message(caller_session_id, text, "important", None);
 }
 
 fn validate_codex_review_create_payload(
@@ -5534,6 +5697,13 @@ fn shadow_predict_retained_write(
             support_status: "implemented_retained_write_status_only",
         }));
     }
+    if method == "POST" && path == "/reviews/pr" {
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_retained_write_status_only",
+        }));
+    }
     if method == "DELETE" {
         if let Some(request_id) = path
             .strip_prefix("/codex-review-requests/")
@@ -7858,6 +8028,9 @@ fn is_retained_write_surface(method: &str, path: &str) -> bool {
     if method == "POST" && path == "/codex-review-requests" {
         return true;
     }
+    if method == "POST" && path == "/reviews/pr" {
+        return true;
+    }
     if path.starts_with("/codex-review-requests/") {
         return matches!(method, "POST" | "DELETE");
     }
@@ -8526,6 +8699,19 @@ struct CodexReviewRequestCreateRequest {
     poll_interval_seconds: i64,
     #[serde(default = "default_codex_review_retry_interval_seconds")]
     retry_interval_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrReviewRequest {
+    pr_number: i64,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    steer: Option<String>,
+    #[serde(default)]
+    wait: Option<i64>,
+    #[serde(default)]
+    caller_session_id: Option<String>,
 }
 
 fn default_codex_review_poll_interval_seconds() -> i64 {
