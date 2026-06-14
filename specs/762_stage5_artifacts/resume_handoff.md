@@ -1,7 +1,7 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-13 after PR #950 and a blocked
-post-mobile-shadow rehearsal.
+Status: handoff snapshot from 2026-06-14 after the post-#984 review-route
+fixture line.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,9 +11,10 @@ coverage in
 
 ## Current Repository State
 
-- Branch: `main`
-- Latest merged commit: `d8f97c0` (`Merge pull request #950`)
-- Open PRs at handoff: none
+- Branch: `main` after PR #984.
+- Latest merged commit before this docs refresh: `8c261ee` (`Merge pull
+  request #984`)
+- Open PRs at handoff: none before this docs refresh PR.
 - Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
   and the local `config.yaml.shadow-backup-20260612T023248Z` created when
   enabling shadow mode.
@@ -46,10 +47,12 @@ Merged Rust slices cover:
   rehearsal tooling;
 - core health/auth/bootstrap/session list/detail/output/events/SSE reads;
 - core runtime slices for session/tmux/spawn/session graph/message queue/task
-  complete/input batch/subagents;
-- nodes list;
-- queue jobs list/detail;
-- Codex review requests list/detail;
+  complete/input batch/subagents and retained review routes;
+- nodes list and node HTTP routes;
+- queue jobs list/detail, CLI reads, pending submit, simple execute/cancel, and
+  recovery;
+- Codex review requests list/detail/create/cancel/recovery and retained
+  `sm review` / PR review routes;
 - tool-call projections for Claude and Codex fork;
 - Codex events, pending requests, activity actions;
 - mobile bootstrap/session support, attach-ticket proof, terminal WebSocket
@@ -60,7 +63,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #950.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #984.
 - [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
   records the current Cloudflare Access origin-gate behavior and remaining
   operator setup/smoke evidence.
@@ -119,10 +122,29 @@ Merged Rust slices cover:
 - PR #950 added Rust origin route gates for native mobile/app routes, app
   artifacts, `/auth/device/google`, JWKS cache refresh/TTL behavior, public-host
   fail-closed behavior, and mobile device Common Name actor binding.
+- PR #952 recorded Cloudflare Access cutover evidence.
+- PR #954 added Rust queue list/status CLI reads.
+- PR #956 added pending queue job submission.
+- PR #958 added simple queue job execute/cancel runtime.
+- PR #960 added queue runtime recovery.
+- PR #962 added node HTTP routes.
+- PR #964 added Codex review request cancel.
+- PR #966 wired `request-codex-review` list/status/cancel CLI surfaces.
+- PR #968 added retained Codex review request creation.
+- PR #970 wired `request-codex-review create`.
+- PR #972 added active Codex review watch recovery.
+- PR #974 wired retained `sm review`.
+- PR #976 added retained `/reviews/pr`.
+- PR #979 made PR review wait require actual review events before completion.
+- PR #980 added retained session review runtime routes.
+- PR #983 fixed session review wait timeout semantics and spawned review
+  startup settle behavior.
+- PR #984 added mutating fixture contracts for retained session review routes.
 - Current contract manifest size:
-  - `117` checks total
-  - `68` `python_and_rust`
-  - `49` `rust_only`
+  - `131` checks total
+  - `73` `python_and_rust`
+  - `58` `rust_only`
+  - `39` mutating checks
 
 ## Validation At Handoff
 
@@ -162,6 +184,36 @@ passes `/health`, `/health/detailed`, `/auth/session`, `/client/bootstrap`,
 The same run measured the current Python process at `154.672 MiB` RSS and
 `66.4 MiB` physical footprint, while the Rust sidecar measured `19.797 MiB`
 RSS and `6.688 MiB` physical footprint.
+
+The latest focused post-#984 fixture/state-gated rehearsal is:
+
+```bash
+/tmp/session-manager-pr981-rehearsal-ports/mvp-rehearsal-report.json
+```
+
+It used alternate ports because a Rust sidecar was already healthy on `8421`:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.mvp_rehearsal \
+  --output-dir /tmp/session-manager-pr981-rehearsal-ports \
+  --rust-base-url http://127.0.0.1:18421 \
+  --skip-python-health \
+  --skip-baseline \
+  --skip-shadow \
+  --core-only
+```
+
+This was not a full cutover rehearsal because it skipped Python baseline and
+shadow, but it is the current fixture/state-gate evidence for the post-#984
+manifest:
+
+- overall status: passed with zero blockers;
+- state ownership gate: `17` stores checked, `13` existing, `13` copied, `13`
+  verified, `13` restored, freeze/drain ledger written;
+- Rust live core sidecar contracts: `17` passed, `0` failed, `0` skipped;
+- Rust synthetic read-only fixture contracts: `14` passed, `0` failed, `0`
+  skipped;
+- Rust mutating fixture contracts: `35` passed, `0` failed, `0` skipped.
 
 The latest post-#942 full rehearsal attempts are blocked, not cutover evidence:
 
@@ -262,7 +314,7 @@ needed for final cutover evidence.
    window and triage unexplained mismatches.
 2. Continue expanding fixture/live evidence as new retained rows land.
    - The MVP rehearsal already runs the current synthetic read-only and
-     mutating fixture sets.
+     mutating fixture sets, including review-route fixtures.
    - Final live mobile/device fixture evidence is still needed.
 3. Audit retained CLI commands against [cutover_scope.md](cutover_scope.md).
    - Retained commands should be native Rust or intentionally routed.
@@ -281,8 +333,10 @@ needed for final cutover evidence.
      then SM Google/device bearer auth at origin.
    - Prove revoked-device denial, browser OAuth callback behavior, and later
      node fallback proof.
-6. Finish retained node-control and narrow queue writer fixtures.
-   - Include audit, policy, recovery, and rollback semantics.
+6. Finish retained node-control and narrow queue writer evidence.
+   - Basic node HTTP routes and narrow queue writer/recovery are implemented.
+   - Remaining work is final live/recovery cutover evidence, audit/rollback
+     accounting, and any retained node-agent remote-control gaps.
 7. Exercise service packaging and cutover.
    - launchd wrapper, non-destructive port ownership, health checks, rollback.
 8. Run final native mobile smoke checks.
