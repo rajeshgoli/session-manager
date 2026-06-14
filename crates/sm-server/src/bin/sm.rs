@@ -321,10 +321,14 @@ struct ReviewArgs {
 
 #[derive(Args)]
 struct RequestCodexReviewArgs {
+    #[arg(value_name = "PR_NUMBER")]
+    action_or_pr: Option<String>,
     #[arg(long, global = true)]
     notify: Option<String>,
     #[arg(long, global = true)]
     repo: Option<String>,
+    #[arg(long, global = true)]
+    steer: Option<String>,
     #[arg(long, global = true)]
     all: bool,
     #[arg(long, global = true)]
@@ -333,6 +337,10 @@ struct RequestCodexReviewArgs {
     json: bool,
     #[arg(long = "pr", global = true)]
     pr_number: Option<i64>,
+    #[arg(long = "poll-interval", global = true, default_value_t = 30)]
+    poll_interval_seconds: i64,
+    #[arg(long = "retry-interval", global = true, default_value_t = 600)]
+    retry_interval_seconds: i64,
     #[command(subcommand)]
     command: Option<RequestCodexReviewCommand>,
 }
@@ -1045,8 +1053,61 @@ fn run_request_codex_review(client: &ApiClient, mut args: RequestCodexReviewArgs
         Some(RequestCodexReviewCommand::Cancel { request_id }) => {
             run_request_codex_review_cancel(client, args, request_id)
         }
-        None => bail!("request-codex-review subcommand required (list, status, cancel)"),
+        None => run_request_codex_review_create(client, args),
     }
+}
+
+fn run_request_codex_review_create(client: &ApiClient, args: RequestCodexReviewArgs) -> Result<()> {
+    let action_or_pr = args
+        .action_or_pr
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("first argument must be a PR number, list, status, or cancel"))?;
+    let pr_number = action_or_pr
+        .parse::<i64>()
+        .map_err(|_| anyhow!("first argument must be a PR number, list, status, or cancel"))?;
+    let current_session_id = optional_current_session_id();
+    let effective_notify = args
+        .notify
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| current_session_id.clone())
+        .ok_or_else(|| {
+            anyhow!("No notify target. Use --notify or run from within a managed session.")
+        })?;
+    let resolved_repo = args
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(resolve_codex_review_repo_from_cwd);
+    if resolved_repo.is_none() && current_session_id.is_none() {
+        bail!("Could not determine GitHub repo; pass --repo explicitly.");
+    }
+    let payload = codex_review_create_payload(
+        pr_number,
+        resolved_repo,
+        args.steer.as_deref(),
+        &effective_notify,
+        current_session_id.as_deref(),
+        args.poll_interval_seconds,
+        args.retry_interval_seconds,
+    );
+    let response = client.post_json("/codex-review-requests", payload)?;
+    println!("Review requested for PR #{pr_number}, will sm send you when review arrives.");
+    println!(
+        "  Request: {} -> {}",
+        response["id"].as_str().unwrap_or("unknown"),
+        response["notify_name"]
+            .as_str()
+            .or_else(|| response["notify_session_id"].as_str())
+            .unwrap_or(&effective_notify)
+    );
+    Ok(())
 }
 
 fn run_request_codex_review_list(client: &ApiClient, args: RequestCodexReviewArgs) -> Result<()> {
@@ -1162,6 +1223,52 @@ fn codex_review_requests_list_path(
     } else {
         format!("/codex-review-requests?{}", query.join("&"))
     })
+}
+
+fn codex_review_create_payload(
+    pr_number: i64,
+    repo: Option<String>,
+    steer: Option<&str>,
+    notify_target: &str,
+    requester_session_id: Option<&str>,
+    poll_interval_seconds: i64,
+    retry_interval_seconds: i64,
+) -> Value {
+    json!({
+        "pr_number": pr_number,
+        "repo": repo,
+        "steer": trimmed_string(steer),
+        "notify_target": notify_target,
+        "requester_session_id": trimmed_string(requester_session_id),
+        "poll_interval_seconds": poll_interval_seconds,
+        "retry_interval_seconds": retry_interval_seconds,
+    })
+}
+
+fn trimmed_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_codex_review_repo_from_cwd() -> Option<String> {
+    let output = process::Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let repo = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!repo.is_empty()).then_some(repo)
 }
 
 fn print_codex_review_requests(requests: &[Value]) {
@@ -2679,6 +2786,36 @@ mod tests {
 
     #[test]
     fn request_codex_review_cli_parses_retained_subcommands() {
+        let create_cli = Cli::try_parse_from([
+            "sm",
+            "request-codex-review",
+            "967",
+            "--notify",
+            "notify123",
+            "--repo",
+            "rajeshgoli/session-manager",
+            "--steer",
+            "focus on auth",
+            "--poll-interval",
+            "45",
+            "--retry-interval",
+            "900",
+        ])
+        .unwrap();
+        let Command::RequestCodexReview(create_args) = create_cli.command else {
+            panic!("expected request-codex-review command");
+        };
+        assert_eq!(create_args.action_or_pr.as_deref(), Some("967"));
+        assert_eq!(create_args.notify.as_deref(), Some("notify123"));
+        assert_eq!(
+            create_args.repo.as_deref(),
+            Some("rajeshgoli/session-manager")
+        );
+        assert_eq!(create_args.steer.as_deref(), Some("focus on auth"));
+        assert_eq!(create_args.poll_interval_seconds, 45);
+        assert_eq!(create_args.retry_interval_seconds, 900);
+        assert!(create_args.command.is_none());
+
         let list_cli = Cli::try_parse_from([
             "sm",
             "request-codex-review",
@@ -2739,12 +2876,16 @@ mod tests {
         env::set_var("SESSION_MANAGER_ID", "session one");
 
         let args = RequestCodexReviewArgs {
+            action_or_pr: None,
             notify: None,
             repo: Some("rajeshgoli/session-manager".to_owned()),
+            steer: None,
             all: false,
             inactive: false,
             json: false,
             pr_number: Some(964),
+            poll_interval_seconds: 30,
+            retry_interval_seconds: 600,
             command: Some(RequestCodexReviewCommand::List),
         };
         assert_eq!(
@@ -2753,18 +2894,48 @@ mod tests {
         );
 
         let all_args = RequestCodexReviewArgs {
+            action_or_pr: None,
             notify: None,
             repo: None,
+            steer: None,
             all: true,
             inactive: false,
             json: false,
             pr_number: None,
+            poll_interval_seconds: 30,
+            retry_interval_seconds: 600,
             command: Some(RequestCodexReviewCommand::List),
         };
         assert_eq!(
             codex_review_requests_list_path(&all_args, true).unwrap(),
             "/codex-review-requests?include_inactive=true"
         );
+    }
+
+    #[test]
+    fn codex_review_create_payload_preserves_python_fields() {
+        let payload = codex_review_create_payload(
+            967,
+            Some("rajeshgoli/session-manager".to_owned()),
+            Some(" focus on auth "),
+            "notify123",
+            Some(" requester001 "),
+            45,
+            900,
+        );
+        assert_eq!(payload["pr_number"], 967);
+        assert_eq!(payload["repo"], "rajeshgoli/session-manager");
+        assert_eq!(payload["steer"], "focus on auth");
+        assert_eq!(payload["notify_target"], "notify123");
+        assert_eq!(payload["requester_session_id"], "requester001");
+        assert_eq!(payload["poll_interval_seconds"], 45);
+        assert_eq!(payload["retry_interval_seconds"], 900);
+
+        let fallback_payload =
+            codex_review_create_payload(967, None, Some("   "), "notify123", None, 30, 600);
+        assert!(fallback_payload["repo"].is_null());
+        assert!(fallback_payload["steer"].is_null());
+        assert!(fallback_payload["requester_session_id"].is_null());
     }
 
     #[test]
