@@ -23,7 +23,7 @@ use sm_server::{
         MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
         RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
-    http::{router, AppState, GitHubReviewComment, GitHubReviewPoster},
+    http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -174,6 +174,7 @@ fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> 
 struct StubGitHubReviewPoster {
     result: Arc<Mutex<Result<GitHubReviewComment, String>>>,
     calls: Arc<Mutex<Vec<(String, i64, Option<String>)>>>,
+    fresh_review: Arc<Mutex<Option<GitHubReviewMatch>>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -188,6 +189,7 @@ impl StubGitHubReviewPoster {
                 posted_at: "2026-06-14T02:30:00Z".to_owned(),
             }))),
             calls: Arc::new(Mutex::new(Vec::new())),
+            fresh_review: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -195,11 +197,17 @@ impl StubGitHubReviewPoster {
         Self {
             result: Arc::new(Mutex::new(Err(message.to_owned()))),
             calls: Arc::new(Mutex::new(Vec::new())),
+            fresh_review: Arc::new(Mutex::new(None)),
         }
     }
 
     fn calls(&self) -> Vec<(String, i64, Option<String>)> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn with_fresh_review(self, review_match: GitHubReviewMatch) -> Self {
+        *self.fresh_review.lock().unwrap() = Some(review_match);
+        self
     }
 }
 
@@ -215,6 +223,15 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
             .unwrap()
             .push((repo.to_owned(), pr_number, steer.map(ToOwned::to_owned)));
         self.result.lock().unwrap().clone()
+    }
+
+    fn find_fresh_codex_review_or_comment(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+        _since: &str,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        Ok(self.fresh_review.lock().unwrap().clone())
     }
 }
 
@@ -2151,6 +2168,106 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     let (status, payload) = get_json(app, &format!("/codex-review-requests/{request_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], request_id);
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_completes_and_queues_wake() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-create-watch.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "notify1",
+                    "name": "codex-fork-notify1",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify1",
+                    "log_file": "/tmp/notify1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "comment".to_owned(),
+        created_at: "2026-06-14T02:31:00Z".to_owned(),
+        id: Some(json!(4701300000_i64)),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
+                .to_owned(),
+        ),
+    });
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+
+    let mut completed = None;
+    for _ in 0..30 {
+        let conn = Connection::open(&queue_db).unwrap();
+        let row: (String, i64, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT state, is_active, review_url
+                FROM codex_review_request_registrations
+                WHERE id = ?1
+                "#,
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        if row.0 == "completed" {
+            completed = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let completed = completed.expect("watcher should complete retained request");
+    assert_eq!(completed.1, 0);
+    assert_eq!(
+        completed.2.as_deref(),
+        Some("https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000")
+    );
+
+    let conn = Connection::open(&queue_db).unwrap();
+    let message: String = conn
+        .query_row(
+            "SELECT text FROM message_queue WHERE target_session_id = 'notify1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        message,
+        "[sm review] Codex comment for PR #967 is here. https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
+    );
 }
 
 #[tokio::test]

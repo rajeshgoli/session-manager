@@ -79,6 +79,23 @@ pub struct CreateCodexReviewRequest {
     pub retry_interval_seconds: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryCodexReviewRequest {
+    pub latest_request_comment_id: Option<i64>,
+    pub latest_request_comment_url: Option<String>,
+    pub latest_request_posted_at: String,
+    pub next_retry_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteCodexReviewRequest {
+    pub review_landed_at: String,
+    pub review_source: Option<String>,
+    pub review_comment_id: Option<JsonValue>,
+    pub review_url: Option<String>,
+    pub last_polled_at: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct QueueJobFilters {
     pub notify_session_id: Option<String>,
@@ -344,6 +361,145 @@ impl RetainedQueueStore {
             Err(_) => return Ok(false),
         };
         active_codex_review_request_exists_conn(&conn, repo, pr_number, notify_session_id)
+    }
+
+    pub fn mark_codex_review_request_pickup_in_path(
+        db_path: &Path,
+        request_id: &str,
+        last_polled_at: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET pickup_detected_at = COALESCE(pickup_detected_at, ?2),
+                pickup_source = COALESCE(pickup_source, 'reaction'),
+                last_polled_at = ?2,
+                last_error = NULL
+            WHERE id = ?1 AND is_active = 1
+            "#,
+            params![request_id, last_polled_at],
+        )?;
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
+    pub fn mark_codex_review_request_poll_error_in_path(
+        db_path: &Path,
+        request_id: &str,
+        last_polled_at: &str,
+        last_error: &str,
+        next_retry_at: Option<&str>,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET last_polled_at = ?2,
+                last_error = ?3,
+                next_retry_at = COALESCE(?4, next_retry_at)
+            WHERE id = ?1 AND is_active = 1
+            "#,
+            params![request_id, last_polled_at, last_error, next_retry_at],
+        )?;
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
+    pub fn mark_codex_review_request_polled_in_path(
+        db_path: &Path,
+        request_id: &str,
+        last_polled_at: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET last_polled_at = ?2,
+                last_error = NULL
+            WHERE id = ?1 AND is_active = 1
+            "#,
+            params![request_id, last_polled_at],
+        )?;
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
+    pub fn retry_codex_review_request_in_path(
+        db_path: &Path,
+        request_id: &str,
+        retry: RetryCodexReviewRequest,
+        last_polled_at: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET attempt_count = attempt_count + 1,
+                latest_request_comment_id = ?2,
+                latest_request_comment_url = ?3,
+                latest_request_posted_at = ?4,
+                pickup_detected_at = NULL,
+                pickup_source = NULL,
+                next_retry_at = ?5,
+                last_polled_at = ?6,
+                last_error = NULL
+            WHERE id = ?1 AND is_active = 1
+            "#,
+            params![
+                request_id,
+                retry.latest_request_comment_id,
+                retry.latest_request_comment_url,
+                retry.latest_request_posted_at,
+                retry.next_retry_at,
+                last_polled_at,
+            ],
+        )?;
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
+    pub fn complete_codex_review_request_in_path(
+        db_path: &Path,
+        request_id: &str,
+        completion: CompleteCodexReviewRequest,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        let review_comment_id = completion.review_comment_id.map(json_scalar_to_sql_value);
+        conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET review_landed_at = ?2,
+                review_source = ?3,
+                review_comment_id = ?4,
+                review_url = ?5,
+                state = 'completed',
+                is_active = 0,
+                last_polled_at = ?6,
+                last_error = NULL
+            WHERE id = ?1 AND is_active = 1
+            "#,
+            params![
+                request_id,
+                completion.review_landed_at,
+                completion.review_source,
+                review_comment_id,
+                completion.review_url,
+                completion.last_polled_at,
+            ],
+        )?;
+        get_codex_review_request_conn(&conn, request_id)
     }
 
     pub fn list_queue_jobs_from_path(
@@ -2949,6 +3105,26 @@ fn optional_sqlite_json_scalar(value: ValueRef<'_>) -> Option<JsonValue> {
         ValueRef::Blob(value) => Some(JsonValue::String(
             String::from_utf8_lossy(value).into_owned(),
         )),
+    }
+}
+
+fn json_scalar_to_sql_value(value: JsonValue) -> SqlValue {
+    match value {
+        JsonValue::Null => SqlValue::Null,
+        JsonValue::Bool(value) => SqlValue::Integer(i64::from(value)),
+        JsonValue::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                SqlValue::Integer(value)
+            } else if let Some(value) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+                SqlValue::Integer(value)
+            } else if let Some(value) = value.as_f64() {
+                SqlValue::Real(value)
+            } else {
+                SqlValue::Text(value.to_string())
+            }
+        }
+        JsonValue::String(value) => SqlValue::Text(value),
+        JsonValue::Array(_) | JsonValue::Object(_) => SqlValue::Text(value.to_string()),
     }
 }
 
