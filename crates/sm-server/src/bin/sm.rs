@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
@@ -305,6 +305,7 @@ struct RemoveDeviceArgs {
 
 #[derive(Args)]
 struct ReviewArgs {
+    session: Option<String>,
     #[arg(long)]
     base: Option<String>,
     #[arg(long)]
@@ -316,7 +317,27 @@ struct ReviewArgs {
     #[arg(long)]
     new: bool,
     #[arg(long)]
+    name: Option<String>,
+    #[arg(long, value_name = "SECONDS")]
+    wait: Option<u64>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    working_dir: Option<String>,
+    #[arg(long)]
+    steer: Option<String>,
+    #[arg(long)]
     pr: Option<u64>,
+    #[arg(long)]
+    repo: Option<String>,
+}
+
+#[derive(Debug)]
+struct ReviewModeSelection {
+    mode: &'static str,
+    base_branch: Option<String>,
+    commit_sha: Option<String>,
+    custom_prompt: Option<String>,
 }
 
 #[derive(Args)]
@@ -763,6 +784,7 @@ fn run() -> Result<()> {
         Command::SubagentStop(_) => run_subagent_stop(&client)?,
         Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
         Command::Queue(args) => run_queue(&client, args)?,
+        Command::Review(args) => run_review(&client, args)?,
         Command::RequestCodexReview(args) => run_request_codex_review(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
@@ -1041,6 +1063,281 @@ fn run_queue_cancel(client: &ApiClient, args: QueueCancelArgs) -> Result<()> {
         payload["id"].as_str().unwrap_or(job_id),
         payload["state"].as_str().unwrap_or("-")
     );
+    Ok(())
+}
+
+fn run_review(client: &ApiClient, args: ReviewArgs) -> Result<()> {
+    if let Some(pr_number) = args.pr {
+        return run_review_pr(client, &args, pr_number);
+    }
+
+    let selection = review_mode_selection(&args)?;
+    let parent_session_id = optional_current_session_id();
+    let wait = effective_review_wait(args.wait, parent_session_id.as_deref());
+
+    if args.new {
+        let parent_session_id = parent_session_id.ok_or_else(|| {
+            anyhow!("Error: --new requires session context (CLAUDE_SESSION_MANAGER_ID must be set)")
+        })?;
+        let payload = review_spawn_payload(
+            &parent_session_id,
+            &selection,
+            args.steer.as_deref(),
+            args.name.as_deref(),
+            wait,
+            args.model.as_deref(),
+            args.working_dir.as_deref(),
+        );
+        let response = client.post_json("/sessions/review", payload)?;
+        bail_review_error(&response)?;
+
+        let child_id = response["session_id"].as_str().unwrap_or("unknown");
+        let child_name = response["friendly_name"]
+            .as_str()
+            .or_else(|| response["name"].as_str())
+            .unwrap_or(child_id);
+        println!(
+            "Review started on {child_name} ({child_id}) — mode={}",
+            selection.mode
+        );
+        if let Some(wait) = wait {
+            println!("  Watching for completion (timeout={wait}s)");
+        }
+        return Ok(());
+    }
+
+    let session = args
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Error: Must specify a session or use --new"))?;
+    let session_id = lookup_identifier(client, session)?
+        .ok_or_else(|| anyhow!("Error: Session '{session}' not found"))?;
+    let session_info =
+        client.get_json(&format!("/sessions/{}", encode_path_segment(&session_id)))?;
+    let payload = review_existing_payload(
+        &selection,
+        args.steer.as_deref(),
+        wait,
+        parent_session_id.as_deref(),
+    );
+    let response = client.post_json(
+        &format!("/sessions/{}/review", encode_path_segment(&session_id)),
+        payload,
+    )?;
+    bail_review_error(&response)?;
+
+    let session_name = session_info["friendly_name"]
+        .as_str()
+        .or_else(|| session_info["name"].as_str())
+        .unwrap_or(&session_id);
+    println!(
+        "Review started on {session_name} ({session_id}) — mode={}",
+        selection.mode
+    );
+    if let Some(steer) = trimmed_string(args.steer.as_deref()) {
+        let preview = steer.chars().take(60).collect::<String>();
+        println!("  Steer queued: {preview}...");
+    }
+    if let Some(wait) = wait {
+        println!("  Watching for completion (timeout={wait}s)");
+    }
+    Ok(())
+}
+
+fn run_review_pr(client: &ApiClient, args: &ReviewArgs, pr_number: u64) -> Result<()> {
+    if args
+        .session
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || args.new
+    {
+        bail!("Error: --pr is mutually exclusive with session/--new");
+    }
+    if !review_tui_mode_names(args).is_empty() {
+        bail!("Error: --pr is mutually exclusive with --base/--uncommitted/--commit/--custom");
+    }
+
+    let parent_session_id = optional_current_session_id();
+    let wait = effective_review_wait(args.wait, parent_session_id.as_deref());
+    let payload = review_pr_payload(
+        pr_number,
+        args.repo.as_deref(),
+        args.steer.as_deref(),
+        wait,
+        parent_session_id.as_deref(),
+    );
+    let response = client.post_json("/reviews/pr", payload)?;
+    bail_review_error(&response)?;
+
+    let resolved_repo = response["repo"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| trimmed_string(args.repo.as_deref()))
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("Posted @codex review on PR #{pr_number} ({resolved_repo})");
+    if response["server_polling"].as_bool().unwrap_or(false) {
+        if let Some(wait) = wait {
+            println!("  Server polling for completion (timeout={wait}s)");
+        }
+    }
+    Ok(())
+}
+
+fn review_mode_selection(args: &ReviewArgs) -> Result<ReviewModeSelection> {
+    let modes = review_tui_mode_names(args);
+    if modes.is_empty() {
+        bail!("Error: Must specify one of --base, --uncommitted, --commit, --custom, or --pr");
+    }
+    if modes.len() > 1 {
+        bail!(
+            "Error: Modes are mutually exclusive. Got: {}",
+            modes.join(", ")
+        );
+    }
+
+    match modes[0] {
+        "base" => Ok(ReviewModeSelection {
+            mode: "branch",
+            base_branch: trimmed_string(args.base.as_deref()),
+            commit_sha: None,
+            custom_prompt: None,
+        }),
+        "uncommitted" => Ok(ReviewModeSelection {
+            mode: "uncommitted",
+            base_branch: None,
+            commit_sha: None,
+            custom_prompt: None,
+        }),
+        "commit" => Ok(ReviewModeSelection {
+            mode: "commit",
+            base_branch: None,
+            commit_sha: trimmed_string(args.commit.as_deref()),
+            custom_prompt: None,
+        }),
+        "custom" => Ok(ReviewModeSelection {
+            mode: "custom",
+            base_branch: None,
+            commit_sha: None,
+            custom_prompt: trimmed_string(args.custom.as_deref()),
+        }),
+        _ => unreachable!("review_tui_mode_names returned an unknown mode"),
+    }
+}
+
+fn review_tui_mode_names(args: &ReviewArgs) -> Vec<&'static str> {
+    let mut modes = Vec::new();
+    if trimmed_string(args.base.as_deref()).is_some() {
+        modes.push("base");
+    }
+    if args.uncommitted {
+        modes.push("uncommitted");
+    }
+    if trimmed_string(args.commit.as_deref()).is_some() {
+        modes.push("commit");
+    }
+    if trimmed_string(args.custom.as_deref()).is_some() {
+        modes.push("custom");
+    }
+    modes
+}
+
+fn effective_review_wait(
+    explicit_wait: Option<u64>,
+    parent_session_id: Option<&str>,
+) -> Option<u64> {
+    explicit_wait.or_else(|| parent_session_id.map(|_| 600))
+}
+
+fn review_existing_payload(
+    selection: &ReviewModeSelection,
+    steer: Option<&str>,
+    wait: Option<u64>,
+    watcher_session_id: Option<&str>,
+) -> Value {
+    let mut payload = review_mode_payload(selection);
+    insert_trimmed(&mut payload, "steer", steer);
+    insert_u64(&mut payload, "wait", wait);
+    insert_trimmed(&mut payload, "watcher_session_id", watcher_session_id);
+    Value::Object(payload)
+}
+
+fn review_spawn_payload(
+    parent_session_id: &str,
+    selection: &ReviewModeSelection,
+    steer: Option<&str>,
+    name: Option<&str>,
+    wait: Option<u64>,
+    model: Option<&str>,
+    working_dir: Option<&str>,
+) -> Value {
+    let mut payload = review_mode_payload(selection);
+    payload.insert(
+        "parent_session_id".to_owned(),
+        Value::String(parent_session_id.to_owned()),
+    );
+    insert_trimmed(&mut payload, "steer", steer);
+    insert_trimmed(&mut payload, "name", name);
+    insert_u64(&mut payload, "wait", wait);
+    insert_trimmed(&mut payload, "model", model);
+    insert_trimmed(&mut payload, "working_dir", working_dir);
+    Value::Object(payload)
+}
+
+fn review_pr_payload(
+    pr_number: u64,
+    repo: Option<&str>,
+    steer: Option<&str>,
+    wait: Option<u64>,
+    caller_session_id: Option<&str>,
+) -> Value {
+    let mut payload = Map::new();
+    payload.insert("pr_number".to_owned(), json!(pr_number));
+    insert_trimmed(&mut payload, "repo", repo);
+    insert_trimmed(&mut payload, "steer", steer);
+    insert_u64(&mut payload, "wait", wait);
+    insert_trimmed(&mut payload, "caller_session_id", caller_session_id);
+    Value::Object(payload)
+}
+
+fn review_mode_payload(selection: &ReviewModeSelection) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert("mode".to_owned(), Value::String(selection.mode.to_owned()));
+    insert_trimmed(
+        &mut payload,
+        "base_branch",
+        selection.base_branch.as_deref(),
+    );
+    insert_trimmed(&mut payload, "commit_sha", selection.commit_sha.as_deref());
+    insert_trimmed(
+        &mut payload,
+        "custom_prompt",
+        selection.custom_prompt.as_deref(),
+    );
+    payload
+}
+
+fn insert_trimmed(payload: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = trimmed_string(value) {
+        payload.insert(key.to_owned(), Value::String(value));
+    }
+}
+
+fn insert_u64(payload: &mut Map<String, Value>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        payload.insert(key.to_owned(), json!(value));
+    }
+}
+
+fn bail_review_error(payload: &Value) -> Result<()> {
+    if let Some(error) = payload["error"]
+        .as_str()
+        .or_else(|| payload["detail"].as_str())
+    {
+        bail!("Error: {error}");
+    }
     Ok(())
 }
 
@@ -2785,6 +3082,150 @@ mod tests {
     }
 
     #[test]
+    fn review_cli_parses_retained_modes() {
+        let existing_cli = Cli::try_parse_from([
+            "sm",
+            "review",
+            "session-one",
+            "--base",
+            "main",
+            "--wait",
+            "12",
+            "--steer",
+            "focus on auth",
+        ])
+        .unwrap();
+        let Command::Review(existing_args) = existing_cli.command else {
+            panic!("expected review command");
+        };
+        assert_eq!(existing_args.session.as_deref(), Some("session-one"));
+        assert_eq!(existing_args.base.as_deref(), Some("main"));
+        assert_eq!(existing_args.wait, Some(12));
+        assert_eq!(existing_args.steer.as_deref(), Some("focus on auth"));
+
+        let new_cli = Cli::try_parse_from([
+            "sm",
+            "review",
+            "--new",
+            "--custom",
+            "check the auth path",
+            "--name",
+            "reviewer",
+            "--model",
+            "gpt-5.4",
+            "--working-dir",
+            "/tmp/project",
+        ])
+        .unwrap();
+        let Command::Review(new_args) = new_cli.command else {
+            panic!("expected review command");
+        };
+        assert!(new_args.new);
+        assert_eq!(new_args.custom.as_deref(), Some("check the auth path"));
+        assert_eq!(new_args.name.as_deref(), Some("reviewer"));
+        assert_eq!(new_args.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(new_args.working_dir.as_deref(), Some("/tmp/project"));
+
+        let pr_cli = Cli::try_parse_from([
+            "sm",
+            "review",
+            "--pr",
+            "972",
+            "--repo",
+            "rajeshgoli/session-manager",
+            "--wait",
+            "600",
+            "--steer",
+            "focus on recovery",
+        ])
+        .unwrap();
+        let Command::Review(pr_args) = pr_cli.command else {
+            panic!("expected review command");
+        };
+        assert_eq!(pr_args.pr, Some(972));
+        assert_eq!(pr_args.repo.as_deref(), Some("rajeshgoli/session-manager"));
+        assert_eq!(pr_args.wait, Some(600));
+        assert_eq!(pr_args.steer.as_deref(), Some("focus on recovery"));
+    }
+
+    #[test]
+    fn review_mode_selection_preserves_python_validation() {
+        let mut args = default_review_args();
+        let error = review_mode_selection(&args).unwrap_err().to_string();
+        assert!(error.contains(
+            "Error: Must specify one of --base, --uncommitted, --commit, --custom, or --pr"
+        ));
+
+        args.base = Some("main".to_owned());
+        args.uncommitted = true;
+        let error = review_mode_selection(&args).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Error: Modes are mutually exclusive. Got: base, uncommitted"
+        );
+
+        args.uncommitted = false;
+        let selection = review_mode_selection(&args).unwrap();
+        assert_eq!(selection.mode, "branch");
+        assert_eq!(selection.base_branch.as_deref(), Some("main"));
+        assert!(selection.commit_sha.is_none());
+        assert!(selection.custom_prompt.is_none());
+    }
+
+    #[test]
+    fn review_payloads_preserve_python_fields() {
+        let mut args = default_review_args();
+        args.custom = Some("  inspect auth carefully  ".to_owned());
+        let selection = review_mode_selection(&args).unwrap();
+        let existing = review_existing_payload(
+            &selection,
+            Some("  focus on auth  "),
+            Some(600),
+            Some("parent001"),
+        );
+        assert_eq!(existing["mode"], "custom");
+        assert_eq!(existing["custom_prompt"], "inspect auth carefully");
+        assert_eq!(existing["steer"], "focus on auth");
+        assert_eq!(existing["wait"], 600);
+        assert_eq!(existing["watcher_session_id"], "parent001");
+        assert!(existing["base_branch"].is_null());
+
+        let mut base_args = default_review_args();
+        base_args.base = Some(" main ".to_owned());
+        let base_selection = review_mode_selection(&base_args).unwrap();
+        let spawn = review_spawn_payload(
+            "parent001",
+            &base_selection,
+            Some(" steer "),
+            Some(" reviewer "),
+            Some(60),
+            Some(" gpt-5.4 "),
+            Some(" /tmp/project "),
+        );
+        assert_eq!(spawn["parent_session_id"], "parent001");
+        assert_eq!(spawn["mode"], "branch");
+        assert_eq!(spawn["base_branch"], "main");
+        assert_eq!(spawn["steer"], "steer");
+        assert_eq!(spawn["name"], "reviewer");
+        assert_eq!(spawn["wait"], 60);
+        assert_eq!(spawn["model"], "gpt-5.4");
+        assert_eq!(spawn["working_dir"], "/tmp/project");
+
+        let pr = review_pr_payload(
+            972,
+            Some(" rajeshgoli/session-manager "),
+            Some(" focus on recovery "),
+            Some(600),
+            Some("parent001"),
+        );
+        assert_eq!(pr["pr_number"], 972);
+        assert_eq!(pr["repo"], "rajeshgoli/session-manager");
+        assert_eq!(pr["steer"], "focus on recovery");
+        assert_eq!(pr["wait"], 600);
+        assert_eq!(pr["caller_session_id"], "parent001");
+    }
+
+    #[test]
     fn request_codex_review_cli_parses_retained_subcommands() {
         let create_cli = Cli::try_parse_from([
             "sm",
@@ -2936,6 +3377,24 @@ mod tests {
         assert!(fallback_payload["repo"].is_null());
         assert!(fallback_payload["steer"].is_null());
         assert!(fallback_payload["requester_session_id"].is_null());
+    }
+
+    fn default_review_args() -> ReviewArgs {
+        ReviewArgs {
+            session: None,
+            base: None,
+            uncommitted: false,
+            commit: None,
+            custom: None,
+            new: false,
+            name: None,
+            wait: None,
+            model: None,
+            working_dir: None,
+            steer: None,
+            pr: None,
+            repo: None,
+        }
     }
 
     #[test]
