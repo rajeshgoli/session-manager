@@ -1,6 +1,6 @@
 # Cloudflare Access Cutover Evidence
 
-Status: implementation evidence after PR #950 merged.
+Status: implementation evidence after PR #996 merged.
 
 This artifact records the current Rust-side Cloudflare Access boundary for the
 Rust cutover track. It complements the design in
@@ -9,13 +9,15 @@ and does not replace the rollout gates in [gate_matrix.md](gate_matrix.md).
 
 ## Merged Runtime Boundary
 
-Rust `main` now includes the Cloudflare Access origin gate through PR #950:
+Rust `main` now includes the Cloudflare Access origin gate and read-only smoke
+evidence runner through PR #996:
 
 | PR | Evidence added |
 | --- | --- |
 | #946 | Design artifact for the SM Cloudflare Access model. |
 | #948 | Rust config parsing and Cloudflare Access JWT/audience/context classification. |
 | #950 | Origin route gates, JWKS caching/refresh, public-host fail-closed behavior, app artifact gating, device-token exchange gating, and mobile device identity binding. |
+| #996 | Read-only Cloudflare Access smoke runner for mobile app origin-gate, public-edge proof, SM-auth boundary, app artifact metadata, and browser edge-only notes. |
 
 Current origin behavior:
 
@@ -69,8 +71,8 @@ Cloudflare tunnel requirements:
 
 ## Remaining Cutover Evidence
 
-The Rust origin gate is merged, but public cutover still needs operator-side
-Cloudflare and native-app evidence:
+The Rust origin gate and smoke runner are merged, but public cutover still
+needs operator-side Cloudflare and native-app evidence:
 
 | Evidence | Required before public mobile cutover |
 | --- | --- |
@@ -81,6 +83,13 @@ Cloudflare and native-app evidence:
 | Browser smoke | Exercise browser Access owner email login, SM Google OAuth callback, `/auth/session`, and authenticated/proofed watch diagnostics through the browser hostname. |
 | Node fallback smoke | Once node fallback is ported, prove LAN-first behavior and Cloudflare node certificate fallback for a registered node. |
 | Shadow/rehearsal | Record a clean shadow/rehearsal window that includes native app traffic or an explicit operator-driven mobile route exercise. |
+
+The smoke runner requires real deployment inputs. The local shell used for the
+post-#996 handoff refresh did not have `CF_MOBILE_ACCESS_JWT`,
+`CF_BROWSER_ACCESS_JWT`, `SM_PUBLIC_EDGE_SECRET`, `SM_DEVICE_BEARER_TOKEN`,
+or `SM_COOKIE` set, and `--mobile-host` / `--browser-host` were not supplied,
+so no passing Cloudflare/mobile smoke evidence was produced there. Missing
+required mobile inputs are blockers by design.
 
 Do not treat the Cloudflare Access design as complete cutover evidence until
 these setup and smoke checks are recorded. The revoked-device denial and native
