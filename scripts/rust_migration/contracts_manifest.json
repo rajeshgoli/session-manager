@@ -205,6 +205,24 @@
       "source": "specs/762_stage2_artifacts/route_manifest.md:GET /nodes/{node_id}/restore-candidates"
     },
     {
+      "id": "http.rust_node_primary_restore_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/nodes/primary/restore-candidates/{stopped_session_id}/restore",
+      "body": {},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/id", "equals": "{stopped_session_id}"},
+        {"path": "/status", "equals": "running"},
+        {"path": "/stopped_at", "type": "null"}
+      ],
+      "preconditions": ["live_server", "fixture:stopped_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/987"
+    },
+    {
       "id": "http.queue_jobs_list",
       "surface": "http",
       "classification": "retained",

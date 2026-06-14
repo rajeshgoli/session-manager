@@ -31,6 +31,7 @@ from scripts.rust_migration.mutating_fixture import (
     DEFAULT_EM_SESSION_ID,
     DEFAULT_NOTIFY_CHILD_SESSION_ID,
     DEFAULT_SESSION_ID,
+    DEFAULT_STOPPED_SESSION_ID,
     create_mutating_fixture_workspace,
 )
 from scripts.rust_migration.mvp_rehearsal import (
@@ -387,6 +388,29 @@ def test_manifest_covers_rust_queue_writer_fixture_checks():
     assert http_check.path == "/queue-jobs"
     assert http_check.body["argv"] == ["echo", "queue http fixture"]
     assert "mutating_opt_in" in http_check.preconditions
+
+
+def test_manifest_covers_rust_node_restore_fixture_check():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    restore_check = checks["http.rust_node_primary_restore_fixture"]
+    assert restore_check.classification == "retained"
+    assert restore_check.target == "rust_only"
+    assert restore_check.safety == "mutating"
+    assert restore_check.method == "POST"
+    assert (
+        restore_check.path
+        == "/nodes/primary/restore-candidates/{stopped_session_id}/restore"
+    )
+    assert "fixture:stopped_session_id" in restore_check.preconditions
+    assert "mutating_opt_in" in restore_check.preconditions
+    expectations = {
+        expectation.path: expectation for expectation in restore_check.expected_json
+    }
+    assert expectations["/id"].equals == "{stopped_session_id}"
+    assert expectations["/status"].equals == "running"
+    assert expectations["/stopped_at"].value_type == "null"
 
 
 def test_mvp_rehearsal_mutating_check_ids_match_manifest():
@@ -954,6 +978,7 @@ def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path)
     assert workspace.fixtures["child_session_id"] == DEFAULT_CHILD_SESSION_ID
     assert workspace.fixtures["em_session_id"] == DEFAULT_EM_SESSION_ID
     assert workspace.fixtures["notify_child_session_id"] == DEFAULT_NOTIFY_CHILD_SESSION_ID
+    assert workspace.fixtures["stopped_session_id"] == DEFAULT_STOPPED_SESSION_ID
     assert workspace.fixtures["queue_job_id"] == "job-fixture"
 
     config_text = workspace.config_path.read_text()
@@ -967,6 +992,9 @@ def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path)
 
     state = json.loads(workspace.state_file.read_text())
     sessions = {session["id"]: session for session in state["sessions"]}
+    assert sessions[DEFAULT_STOPPED_SESSION_ID]["status"] == "stopped"
+    for session in sessions.values():
+        assert Path(session["log_file"]).is_relative_to(workspace.log_dir)
     assert sessions[DEFAULT_EM_SESSION_ID]["is_em"] is True
     assert sessions[DEFAULT_EM_SESSION_ID]["status"] == "running"
     assert (
