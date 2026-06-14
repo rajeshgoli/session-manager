@@ -321,10 +321,18 @@ struct ReviewArgs {
 
 #[derive(Args)]
 struct RequestCodexReviewArgs {
-    #[arg(long)]
+    #[arg(long, global = true)]
     notify: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     repo: Option<String>,
+    #[arg(long, global = true)]
+    all: bool,
+    #[arg(long, global = true)]
+    inactive: bool,
+    #[arg(long, global = true)]
+    json: bool,
+    #[arg(long = "pr", global = true)]
+    pr_number: Option<i64>,
     #[command(subcommand)]
     command: Option<RequestCodexReviewCommand>,
 }
@@ -747,6 +755,7 @@ fn run() -> Result<()> {
         Command::SubagentStop(_) => run_subagent_stop(&client)?,
         Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
         Command::Queue(args) => run_queue(&client, args)?,
+        Command::RequestCodexReview(args) => run_request_codex_review(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())
@@ -1025,6 +1034,236 @@ fn run_queue_cancel(client: &ApiClient, args: QueueCancelArgs) -> Result<()> {
         payload["state"].as_str().unwrap_or("-")
     );
     Ok(())
+}
+
+fn run_request_codex_review(client: &ApiClient, mut args: RequestCodexReviewArgs) -> Result<()> {
+    match args.command.take() {
+        Some(RequestCodexReviewCommand::List) => run_request_codex_review_list(client, args),
+        Some(RequestCodexReviewCommand::Status { request_id }) => {
+            run_request_codex_review_status(client, args, request_id)
+        }
+        Some(RequestCodexReviewCommand::Cancel { request_id }) => {
+            run_request_codex_review_cancel(client, args, request_id)
+        }
+        None => bail!("request-codex-review subcommand required (list, status, cancel)"),
+    }
+}
+
+fn run_request_codex_review_list(client: &ApiClient, args: RequestCodexReviewArgs) -> Result<()> {
+    let path = codex_review_requests_list_path(&args, args.inactive || args.all)?;
+    let payload = client.get_json(&path)?;
+    let requests = payload["requests"].as_array().cloned().unwrap_or_default();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&requests)?);
+        return Ok(());
+    }
+    print_codex_review_requests(&requests);
+    Ok(())
+}
+
+fn run_request_codex_review_status(
+    client: &ApiClient,
+    args: RequestCodexReviewArgs,
+    request_id: Option<String>,
+) -> Result<()> {
+    let payload = if let Some(request_id) = request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        client.get_json(&format!(
+            "/codex-review-requests/{}",
+            encode_path_segment(request_id)
+        ))?
+    } else {
+        let path = codex_review_requests_list_path(&args, true)?;
+        let requests = client.get_json(&path)?["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        requests
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("No Codex review request found"))?
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    print_codex_review_request(&payload);
+    Ok(())
+}
+
+fn run_request_codex_review_cancel(
+    client: &ApiClient,
+    args: RequestCodexReviewArgs,
+    request_id: Option<String>,
+) -> Result<()> {
+    let request_id = request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("request ID required for cancel"))?;
+    let payload = client.delete_json(
+        &format!("/codex-review-requests/{}", encode_path_segment(request_id)),
+        json!({}),
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    println!(
+        "Cancelled Codex review request: {}",
+        payload["id"].as_str().unwrap_or(request_id)
+    );
+    Ok(())
+}
+
+fn codex_review_requests_list_path(
+    args: &RequestCodexReviewArgs,
+    include_inactive: bool,
+) -> Result<String> {
+    let mut query = Vec::new();
+    let effective_notify = args
+        .notify
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            if args.all {
+                None
+            } else {
+                optional_current_session_id()
+            }
+        });
+    if !args.all && effective_notify.is_none() {
+        bail!("No session context. Use --notify or --all.");
+    }
+    if let Some(notify) = effective_notify {
+        query.push(format!("notify_target={}", encode_query_component(&notify)));
+    }
+    if let Some(repo) = args
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(format!("repo={}", encode_query_component(repo)));
+    }
+    if let Some(pr_number) = args.pr_number {
+        query.push(format!("pr_number={pr_number}"));
+    }
+    if include_inactive {
+        query.push("include_inactive=true".to_owned());
+    }
+    Ok(if query.is_empty() {
+        "/codex-review-requests".to_owned()
+    } else {
+        format!("/codex-review-requests?{}", query.join("&"))
+    })
+}
+
+fn print_codex_review_requests(requests: &[Value]) {
+    if requests.is_empty() {
+        println!("No Codex review requests.");
+        return;
+    }
+    let headers = [
+        "ID",
+        "PR",
+        "Notify",
+        "State",
+        "Attempts",
+        "Pickup",
+        "Next Retry",
+    ];
+    let rows = requests
+        .iter()
+        .map(|request| {
+            vec![
+                json_string(request, "id"),
+                format!(
+                    "{}#{}",
+                    request["repo"].as_str().unwrap_or("?"),
+                    request["pr_number"]
+                        .as_i64()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_owned())
+                ),
+                request["notify_name"]
+                    .as_str()
+                    .or_else(|| request["notify_session_id"].as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                request["state"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| {
+                        if request["is_active"].as_bool().unwrap_or(true) {
+                            "active".to_owned()
+                        } else {
+                            "inactive".to_owned()
+                        }
+                    }),
+                request["attempt_count"]
+                    .as_i64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "0".to_owned()),
+                if request["pickup_detected_at"].is_null() {
+                    "-".to_owned()
+                } else {
+                    "yes".to_owned()
+                },
+                request["next_retry_at"].as_str().unwrap_or("-").to_owned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&headers, &rows);
+}
+
+fn print_codex_review_request(payload: &Value) {
+    println!("Request: {}", payload["id"].as_str().unwrap_or("unknown"));
+    println!(
+        "PR: {}#{}",
+        payload["repo"].as_str().unwrap_or("?"),
+        payload["pr_number"]
+            .as_i64()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_owned())
+    );
+    println!(
+        "Notify: {}",
+        payload["notify_name"]
+            .as_str()
+            .or_else(|| payload["notify_session_id"].as_str())
+            .unwrap_or("-")
+    );
+    println!("State: {}", payload["state"].as_str().unwrap_or("-"));
+    println!(
+        "Attempts: {}",
+        payload["attempt_count"].as_i64().unwrap_or(0)
+    );
+    println!(
+        "Pickup: {}",
+        payload["pickup_detected_at"].as_str().unwrap_or("-")
+    );
+    println!(
+        "Review landed: {}",
+        payload["review_landed_at"].as_str().unwrap_or("-")
+    );
+    println!(
+        "Review source: {}",
+        payload["review_source"].as_str().unwrap_or("-")
+    );
+    println!(
+        "Next retry: {}",
+        payload["next_retry_at"].as_str().unwrap_or("-")
+    );
+    println!(
+        "Last error: {}",
+        payload["last_error"].as_str().unwrap_or("-")
+    );
 }
 
 fn print_queue_jobs(jobs: &[Value]) {
@@ -2436,6 +2675,96 @@ mod tests {
             panic!("expected queue cancel command");
         };
         assert_eq!(cancel_args.job_id, "job_123abc");
+    }
+
+    #[test]
+    fn request_codex_review_cli_parses_retained_subcommands() {
+        let list_cli = Cli::try_parse_from([
+            "sm",
+            "request-codex-review",
+            "list",
+            "--notify",
+            "notify123",
+            "--repo",
+            "rajeshgoli/session-manager",
+            "--pr",
+            "964",
+            "--inactive",
+            "--json",
+        ])
+        .unwrap();
+        let Command::RequestCodexReview(list_args) = list_cli.command else {
+            panic!("expected request-codex-review command");
+        };
+        assert_eq!(list_args.notify.as_deref(), Some("notify123"));
+        assert_eq!(
+            list_args.repo.as_deref(),
+            Some("rajeshgoli/session-manager")
+        );
+        assert_eq!(list_args.pr_number, Some(964));
+        assert!(list_args.inactive);
+        assert!(list_args.json);
+        assert!(matches!(
+            list_args.command,
+            Some(RequestCodexReviewCommand::List)
+        ));
+
+        let status_cli =
+            Cli::try_parse_from(["sm", "request-codex-review", "--all", "status", "req123"])
+                .unwrap();
+        let Command::RequestCodexReview(status_args) = status_cli.command else {
+            panic!("expected request-codex-review command");
+        };
+        assert!(status_args.all);
+        let Some(RequestCodexReviewCommand::Status { request_id }) = status_args.command else {
+            panic!("expected status subcommand");
+        };
+        assert_eq!(request_id.as_deref(), Some("req123"));
+
+        let cancel_cli =
+            Cli::try_parse_from(["sm", "request-codex-review", "cancel", "req456"]).unwrap();
+        let Command::RequestCodexReview(cancel_args) = cancel_cli.command else {
+            panic!("expected request-codex-review command");
+        };
+        let Some(RequestCodexReviewCommand::Cancel { request_id }) = cancel_args.command else {
+            panic!("expected cancel subcommand");
+        };
+        assert_eq!(request_id.as_deref(), Some("req456"));
+    }
+
+    #[test]
+    fn codex_review_request_list_path_preserves_python_filters() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "session one");
+
+        let args = RequestCodexReviewArgs {
+            notify: None,
+            repo: Some("rajeshgoli/session-manager".to_owned()),
+            all: false,
+            inactive: false,
+            json: false,
+            pr_number: Some(964),
+            command: Some(RequestCodexReviewCommand::List),
+        };
+        assert_eq!(
+            codex_review_requests_list_path(&args, false).unwrap(),
+            "/codex-review-requests?notify_target=session%20one&repo=rajeshgoli%2Fsession-manager&pr_number=964"
+        );
+
+        let all_args = RequestCodexReviewArgs {
+            notify: None,
+            repo: None,
+            all: true,
+            inactive: false,
+            json: false,
+            pr_number: None,
+            command: Some(RequestCodexReviewCommand::List),
+        };
+        assert_eq!(
+            codex_review_requests_list_path(&all_args, true).unwrap(),
+            "/codex-review-requests?include_inactive=true"
+        );
     }
 
     #[test]
