@@ -435,6 +435,140 @@ nodes:
 }
 
 #[tokio::test]
+async fn node_ping_preserves_primary_unknown_and_remote_error_contracts() {
+    let config_path = unique_temp_path();
+    let local_env_path = unique_temp_path();
+    fs::write(
+        &config_path,
+        r#"
+nodes:
+  registry:
+    macbook:
+      ssh: macbook.local
+      node_token: secret-node-token
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&local_env_path)).unwrap();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(app.clone(), "/nodes/primary/ping", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "node": "primary",
+            "ok": true,
+            "error": null
+        })
+    );
+
+    let (status, payload) = post_json(app.clone(), "/nodes/missing/ping", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Unknown node: missing");
+
+    let (status, payload) = post_json(app, "/nodes/macbook/ping", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        payload["detail"],
+        "node-agent not connected for node macbook"
+    );
+    assert!(!payload.to_string().contains("secret-node-token"));
+}
+
+#[tokio::test]
+async fn node_restore_candidates_project_primary_stopped_sessions() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/nodes/primary/restore-candidates?refresh=true").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["node"], "primary");
+    let sessions = payload["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let candidate = &sessions[0];
+    assert_eq!(candidate["id"], "stop1234");
+    assert_eq!(candidate["status"], "stopped");
+    assert_eq!(candidate["node"], "primary");
+    assert_eq!(candidate["origin_node"], "primary");
+    assert_eq!(candidate["source_session_id"], "stop1234");
+    assert_eq!(candidate["restore_source"], "server_state");
+    assert_eq!(candidate["activity_state"], "stopped");
+    assert_eq!(candidate["provider"], "claude");
+}
+
+#[tokio::test]
+async fn node_restore_candidates_preserve_unknown_and_remote_errors() {
+    let config_path = unique_temp_path();
+    let local_env_path = unique_temp_path();
+    fs::write(
+        &config_path,
+        r#"
+nodes:
+  registry:
+    macbook:
+      ssh: macbook.local
+      node_token: secret-node-token
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&local_env_path)).unwrap();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = get_json(app.clone(), "/nodes/missing/restore-candidates").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Unknown node: missing");
+
+    let (status, payload) = get_json(app, "/nodes/macbook/restore-candidates").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        payload["detail"],
+        "node-agent not connected for node macbook"
+    );
+    assert!(!payload.to_string().contains("secret-node-token"));
+}
+
+#[tokio::test]
+async fn node_restore_candidate_restore_round_trips_primary_fixture() {
+    let state_file = write_session_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/nodes/primary/restore-candidates/stop1234/restore",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "stop1234");
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["stopped_at"], Value::Null);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/nodes/primary/restore-candidates/run12345/restore",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(payload["detail"], "Session is not stopped");
+
+    let (status, payload) = post_json(
+        app,
+        "/nodes/primary/restore-candidates/missing/restore",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(payload["detail"], "Session not found");
+}
+
+#[tokio::test]
 async fn client_analytics_summary_reports_live_metrics_from_state_queue_and_logs() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("analytics-message-queue.db");
@@ -2600,7 +2734,7 @@ async fn shadow_http_reports_match_for_stable_read_only_route() {
     let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
 
     let (status, payload) = post_json(
-        app,
+        app.clone(),
         "/__shadow/http",
         json!({
             "schema_version": 1,
@@ -2641,7 +2775,7 @@ async fn shadow_http_treats_events_state_as_status_only() {
     .unwrap();
 
     let (status, payload) = post_json(
-        app,
+        app.clone(),
         "/__shadow/http",
         json!({
             "schema_version": 1,
@@ -2674,13 +2808,40 @@ async fn shadow_http_treats_nodes_as_status_only_until_node_agents_are_ported() 
     let python_body = br#"{"default":"primary","nodes":[{"id":"primary","primary":true,"ssh":null,"api_url":null,"hook_base_url":null,"projects_root":null,"log_dir":null,"codex_fork_node_agent":true}]}"#;
 
     let (status, payload) = post_json(
-        app,
+        app.clone(),
         "/__shadow/http",
         json!({
             "schema_version": 1,
             "request": {
                 "method": "GET",
                 "path": "/nodes",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+
+    let python_body = br#"{"node":"primary","ok":true,"error":null}"#;
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/nodes/primary/ping",
                 "query_string": "",
                 "headers": {}
             },
@@ -3428,7 +3589,7 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
     let app = router(AppState::new(AppConfig::default()));
 
     let (status, payload) = post_json(
-        app,
+        app.clone(),
         "/__shadow/http",
         json!({
             "schema_version": 1,
@@ -3442,6 +3603,34 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
             "python_response": {
                 "status": 200,
                 "body_sha256": sha256_hex(b"{\"id\":\"python-owned\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "unsupported_retained_write");
+    assert_eq!(payload["comparison"], "not_compared");
+    assert_eq!(payload["would_write"], false);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("never performs retained write side effects"));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/nodes/primary/restore-candidates/stop1234/restore",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"id\":\"stop1234\"}")
             }
         }),
     )

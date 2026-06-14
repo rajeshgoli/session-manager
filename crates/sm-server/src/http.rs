@@ -308,6 +308,15 @@ pub fn router(state: AppState) -> Router {
             get(get_codex_review_request),
         )
         .route("/nodes", get(list_nodes))
+        .route("/nodes/{node_id}/ping", post(ping_node))
+        .route(
+            "/nodes/{node_id}/restore-candidates",
+            get(list_node_restore_candidates),
+        )
+        .route(
+            "/nodes/{node_id}/restore-candidates/{session_id}/restore",
+            post(restore_node_restore_candidate),
+        )
         .route("/humans", get(list_humans))
         .route("/humans/{identifier}", get(get_human))
         .route("/humans/{identifier}/email", post(send_human_email))
@@ -1787,6 +1796,129 @@ async fn list_nodes(
 ) -> Result<Json<NodesListResponse>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
     Ok(Json(nodes_list_response(&state.config)))
+}
+
+async fn ping_node(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    request: Request,
+) -> Result<Json<NodePingResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let node_id = normalize_node_id(&node_id);
+    let Some(node) = state.config.nodes.registry.get(&node_id) else {
+        return Err(unknown_node_error(&node_id));
+    };
+    if is_primary_node(&node.id) {
+        return Ok(Json(NodePingResponse {
+            node: node_id,
+            ok: true,
+            error: None,
+        }));
+    }
+    Err(ApiError::Status {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        detail: format!("node-agent not connected for node {node_id}"),
+    })
+}
+
+async fn list_node_restore_candidates(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    Query(query): Query<NodeRestoreCandidatesQuery>,
+    request: Request,
+) -> Result<Json<NodeRestoreCandidatesResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let node_id = normalize_node_id(&node_id);
+    let Some(node) = state.config.nodes.registry.get(&node_id) else {
+        return Err(unknown_node_error(&node_id));
+    };
+    if !is_primary_node(&node.id) {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: format!("node-agent not connected for node {node_id}"),
+        });
+    }
+    let _force_refresh = query.refresh;
+    let sessions = state
+        .session_store
+        .list_sessions(true)?
+        .into_iter()
+        .filter(|session| session.status.trim() == "stopped")
+        .filter(|session| is_primary_node(&session.node))
+        .map(|session| node_restore_candidate_value(session, &node_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(NodeRestoreCandidatesResponse {
+        node: node_id,
+        sessions,
+    }))
+}
+
+async fn restore_node_restore_candidate(
+    State(state): State<Arc<AppState>>,
+    Path((node_id, session_id)): Path<(String, String)>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/nodes/{node_id}/restore-candidates/{session_id}/restore"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let node_id = normalize_node_id(&node_id);
+    if !state.config.nodes.registry.contains_key(&node_id) {
+        return Err(unknown_node_error(&node_id));
+    }
+    if !is_primary_node(&node_id) {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: format!("node-agent not connected for node {node_id}"),
+        });
+    }
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Session not found".to_owned(),
+        });
+    };
+    if session.status.trim() != "stopped" {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is not stopped".to_owned(),
+        });
+    }
+    let outcome = if state.config.rust_core.runtime_enabled {
+        let runtime = TmuxRuntime::from_app_config(&state.config);
+        state
+            .session_store
+            .restore_core_session_with_runtime(&session_id, &runtime)?
+    } else {
+        state.session_store.restore_core_session(&session_id)?
+    };
+    match outcome {
+        Some(CoreRestoreOutcome::Restored(session)) => Ok(Json(SessionResponse::from(session))),
+        Some(CoreRestoreOutcome::NotStopped) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is not stopped".to_owned(),
+        }),
+        Some(CoreRestoreOutcome::UnsupportedNode(node)) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Rust runtime does not support remote node {node}"),
+        }),
+        Some(CoreRestoreOutcome::UnsupportedProvider(provider)) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Rust runtime does not support provider {provider}"),
+        }),
+        Some(CoreRestoreOutcome::MissingProviderResumeId(provider)) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Cannot restore {provider} session without provider_resume_id"),
+        }),
+        None => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Session not found".to_owned(),
+        }),
+    }
 }
 
 async fn list_codex_review_requests(
@@ -4335,6 +4467,29 @@ fn shadow_predict_read(
     path: &str,
     query_string: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
+    if method == "POST" {
+        if let Some(node_id) = node_ping_path_node_id(path) {
+            let node_id = normalize_node_id(node_id);
+            if !state.config.nodes.registry.contains_key(&node_id) {
+                let body =
+                    serde_json::to_vec(&json!({ "detail": format!("Unknown node: {node_id}") }))?;
+                return Ok(Some(ShadowPrediction {
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                    body_sha256: Some(sha256_hex(&body)),
+                    support_status: "implemented_read",
+                }));
+            }
+            return Ok(Some(ShadowPrediction {
+                status: if is_primary_node(&node_id) {
+                    StatusCode::OK.as_u16()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16()
+                },
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+    }
     if method != "GET" {
         return Ok(None);
     }
@@ -4386,6 +4541,32 @@ fn shadow_predict_read(
                 }))
             }
         };
+    }
+
+    if let Some(node_id) = path
+        .strip_prefix("/nodes/")
+        .and_then(|value| value.strip_suffix("/restore-candidates"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
+        let node_id = normalize_node_id(node_id);
+        if !state.config.nodes.registry.contains_key(&node_id) {
+            let body =
+                serde_json::to_vec(&json!({ "detail": format!("Unknown node: {node_id}") }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        }
+        return Ok(Some(ShadowPrediction {
+            status: if is_primary_node(&node_id) {
+                StatusCode::OK.as_u16()
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE.as_u16()
+            },
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
+        }));
     }
 
     let body = match path {
@@ -6583,6 +6764,9 @@ fn is_retained_write_surface(method: &str, path: &str) -> bool {
     if path.starts_with("/queue-jobs/") {
         return matches!(method, "POST" | "DELETE");
     }
+    if method == "POST" && is_node_restore_post_path(path) {
+        return true;
+    }
     false
 }
 
@@ -6591,6 +6775,9 @@ fn is_auth_denial_status(status: u16) -> bool {
 }
 
 fn is_protected_read_surface(method: &str, path: &str) -> bool {
+    if method == "POST" {
+        return node_ping_path_node_id(path).is_some();
+    }
     if method != "GET" {
         return false;
     }
@@ -6603,11 +6790,32 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/queue-jobs"
         || path.starts_with("/queue-jobs/")
         || path == "/nodes"
+        || path.starts_with("/nodes/")
         || path == "/sessions"
         || path == "/client/sessions"
         || path.starts_with("/apps/")
         || path.starts_with("/sessions/")
         || path.starts_with("/client/sessions/")
+}
+
+fn node_ping_path_node_id(path: &str) -> Option<&str> {
+    path.strip_prefix("/nodes/")
+        .and_then(|value| value.strip_suffix("/ping"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+}
+
+fn is_node_restore_post_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/nodes/") else {
+        return false;
+    };
+    let Some((node_id, rest)) = rest.split_once("/restore-candidates/") else {
+        return false;
+    };
+    !node_id.is_empty()
+        && !node_id.contains('/')
+        && rest
+            .strip_suffix("/restore")
+            .is_some_and(|session_id| !session_id.is_empty() && !session_id.contains('/'))
 }
 
 fn ensure_shadow_allowed(
@@ -7422,6 +7630,25 @@ struct TmuxClientHookQuery {
     event: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct NodeRestoreCandidatesQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct NodePingResponse {
+    node: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeRestoreCandidatesResponse {
+    node: String,
+    sessions: Vec<Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct ClientRequestStatusResponse {
     status: &'static str,
@@ -7601,6 +7828,55 @@ fn nodes_list_response(config: &AppConfig) -> NodesListResponse {
         default: config.nodes.default_node.clone(),
         nodes: config.nodes.redacted_nodes(),
     }
+}
+
+fn normalize_node_id(node_id: &str) -> String {
+    let node_id = node_id.trim();
+    if node_id.is_empty() {
+        "primary".to_owned()
+    } else {
+        node_id.to_owned()
+    }
+}
+
+fn unknown_node_error(node_id: &str) -> ApiError {
+    ApiError::Status {
+        status: StatusCode::NOT_FOUND,
+        detail: format!("Unknown node: {node_id}"),
+    }
+}
+
+fn node_restore_candidate_value(session: SessionRecord, node_id: &str) -> Result<Value, ApiError> {
+    let source_session_id = session.id.clone();
+    let mut value = serde_json::to_value(session)?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: "failed to project node restore candidate".to_owned(),
+        });
+    };
+    object.insert("node".to_owned(), Value::String(node_id.to_owned()));
+    object.insert("origin_node".to_owned(), Value::String(node_id.to_owned()));
+    object.insert(
+        "source_session_id".to_owned(),
+        Value::String(source_session_id),
+    );
+    object.insert(
+        "restore_source".to_owned(),
+        Value::String(
+            if is_primary_node(node_id) {
+                "server_state"
+            } else {
+                "node_agent"
+            }
+            .to_owned(),
+        ),
+    );
+    object.insert(
+        "activity_state".to_owned(),
+        Value::String("stopped".to_owned()),
+    );
+    Ok(value)
 }
 
 fn codex_review_request_response(
