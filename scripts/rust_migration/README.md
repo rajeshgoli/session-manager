@@ -272,6 +272,23 @@ and a `final_backup` ledger row only after the stopped-origin check and backup
 copy both pass. The ledger row includes the manifest SHA-256 and per-store
 backup evidence needed for rollback audits.
 
+To record the same stopped-origin final-backup gate inside the MVP rehearsal
+artifact, opt in explicitly after stopping Python:
+
+```bash
+python -m scripts.rust_migration.mvp_rehearsal \
+  --config config.yaml \
+  --output-dir /tmp/sm-rust-cutover-rehearsal-$(date -u +%Y%m%dT%H%M%SZ) \
+  --run-final-backup-gate \
+  --skip-baseline \
+  --skip-shadow
+```
+
+The rehearsal gate records `final_backup_*` artifacts only when the underlying
+files exist. It skips the normal Python liveness probe because the final-backup
+gate requires stopped-origin evidence instead. Keep using the default rehearsal
+mode for ordinary sidecar validation where Python remains authoritative.
+
 ## Shadow Comparison Mode
 
 Shadow mode lets Python stay authoritative while Rust observes bounded
@@ -481,6 +498,10 @@ reports. The state gate writes detailed artifacts under
 `state-restore-report.json`, and `freeze-drain-ledger.jsonl`. If this gate
 blocks, the rehearsal exits before Rust sidecar startup because the run cannot
 serve as cutover evidence.
+
+For a stopped-origin cutover rehearsal, add `--run-final-backup-gate` after
+stopping Python; this records `final_backup_*` artifacts and skips the normal
+Python liveness probe.
 
 Useful variants:
 
