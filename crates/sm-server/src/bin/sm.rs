@@ -39,7 +39,7 @@ enum Command {
     Children(ChildrenArgs),
     Tail(TailArgs),
     Retire(SessionIdArgs),
-    Restore(SessionIdArgs),
+    Restore(RestoreArgs),
     Attach(SessionIdArgs),
     Output(OutputArgs),
     Clear(ClearArgs),
@@ -155,6 +155,13 @@ struct ChildrenArgs {
 #[derive(Args)]
 struct SessionIdArgs {
     session_id: String,
+}
+
+#[derive(Args)]
+struct RestoreArgs {
+    session_id: String,
+    #[arg(long)]
+    node: Option<String>,
 }
 
 #[derive(Args)]
@@ -641,12 +648,7 @@ fn run() -> Result<()> {
             println!("{}", payload["status"].as_str().unwrap_or("stopped"));
         }
         Command::Restore(args) => {
-            let payload =
-                client.post_json(&format!("/sessions/{}/restore", args.session_id), json!({}))?;
-            println!(
-                "Session restored: {}",
-                payload["id"].as_str().unwrap_or(&args.session_id)
-            );
+            restore_session(&client, args)?;
         }
         Command::Attach(args) => attach_session(&client, &args.session_id)?,
         Command::Clear(args) => {
@@ -2406,6 +2408,142 @@ fn attach_session(client: &ApiClient, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn restore_session(client: &ApiClient, args: RestoreArgs) -> Result<()> {
+    let node = args
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let restore_session_id =
+        if let Some(node) = node.filter(|value| !is_primary_restore_node(value)) {
+            resolve_node_restore_candidate_id(client, node, &args.session_id)?
+                .ok_or_else(|| anyhow!("Session '{}' not found", args.session_id))?
+        } else {
+            args.session_id.clone()
+        };
+    let path = restore_session_path(&restore_session_id, node);
+    let payload = client.post_json(&path, json!({}))?;
+    let restored_id = payload["id"].as_str().unwrap_or(&restore_session_id);
+    if let Some(node) = node.filter(|value| !is_primary_restore_node(value)) {
+        println!("Session restored: {restored_id} on node {node}");
+    } else {
+        println!("Session restored: {restored_id}");
+    }
+    Ok(())
+}
+
+fn restore_session_path(session_id: &str, node: Option<&str>) -> String {
+    if let Some(node) = node.filter(|value| !is_primary_restore_node(value)) {
+        format!(
+            "/nodes/{}/restore-candidates/{}/restore",
+            encode_path_segment(node),
+            encode_path_segment(session_id)
+        )
+    } else {
+        format!("/sessions/{}/restore", encode_path_segment(session_id))
+    }
+}
+
+fn is_primary_restore_node(node: &str) -> bool {
+    matches!(node.trim(), "" | "primary")
+}
+
+fn resolve_node_restore_candidate_id(
+    client: &ApiClient,
+    node: &str,
+    identifier: &str,
+) -> Result<Option<String>> {
+    let payload = client.get_json(&node_restore_candidates_path(node))?;
+    let sessions = payload["sessions"].as_array().cloned().unwrap_or_default();
+    resolve_node_restore_candidate_id_from_sessions(identifier, &sessions)
+}
+
+fn node_restore_candidates_path(node: &str) -> String {
+    format!(
+        "/nodes/{}/restore-candidates?refresh=true",
+        encode_path_segment(node)
+    )
+}
+
+fn resolve_node_restore_candidate_id_from_sessions(
+    identifier: &str,
+    sessions: &[Value],
+) -> Result<Option<String>> {
+    let direct_matches = sessions
+        .iter()
+        .filter(|session| {
+            ["id", "source_session_id"].iter().any(|field| {
+                session[*field]
+                    .as_str()
+                    .is_some_and(|value| value == identifier)
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match direct_matches.len() {
+        1 => return Ok(non_empty_json_string(&direct_matches[0], "id")),
+        count if count > 1 => {
+            let matched_ids = node_restore_candidate_ids(&direct_matches);
+            bail!(
+                "Multiple node restore candidates match '{}': {}. Use a session ID.",
+                identifier,
+                matched_ids
+            );
+        }
+        _ => {}
+    }
+
+    let alias_matches = sessions
+        .iter()
+        .filter(|session| {
+            session["aliases"].as_array().is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .any(|alias| alias.as_str() == Some(identifier))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let name_matches = sessions
+        .iter()
+        .filter(|session| session["friendly_name"].as_str() == Some(identifier))
+        .cloned()
+        .collect::<Vec<_>>();
+    let candidates = if alias_matches.is_empty() {
+        name_matches
+    } else {
+        alias_matches
+    };
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(non_empty_json_string(&candidates[0], "id")),
+        _ => {
+            let candidate_ids = node_restore_candidate_ids(&candidates);
+            bail!(
+                "Multiple node restore candidates match '{}': {}. Use a session ID.",
+                identifier,
+                candidate_ids
+            );
+        }
+    }
+}
+
+fn node_restore_candidate_ids(candidates: &[Value]) -> String {
+    candidates
+        .iter()
+        .filter_map(|candidate| non_empty_json_string(candidate, "id"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn non_empty_json_string(value: &Value, key: &str) -> Option<String> {
+    value[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn ensure_clear_authorized(
     client: &ApiClient,
     target_session_id: &str,
@@ -3618,6 +3756,116 @@ mod tests {
         assert_eq!(
             resolve_launch_working_dir(Some(remote_path.to_owned()), Some("worker")).unwrap(),
             remote_path
+        );
+    }
+
+    #[test]
+    fn restore_session_path_uses_node_inventory_for_non_primary_nodes() {
+        assert_eq!(
+            restore_session_path("abc123", None),
+            "/sessions/abc123/restore"
+        );
+        assert_eq!(
+            restore_session_path("abc123", Some("primary")),
+            "/sessions/abc123/restore"
+        );
+        assert_eq!(
+            restore_session_path("abc123", Some("local")),
+            "/nodes/local/restore-candidates/abc123/restore"
+        );
+        assert_eq!(
+            restore_session_path("abc123", Some("localhost")),
+            "/nodes/localhost/restore-candidates/abc123/restore"
+        );
+        assert_eq!(
+            restore_session_path("abc123", Some("studio")),
+            "/nodes/studio/restore-candidates/abc123/restore"
+        );
+        assert_eq!(
+            restore_session_path("abc123", Some("macbook")),
+            "/nodes/macbook/restore-candidates/abc123/restore"
+        );
+        assert_eq!(
+            restore_session_path("id/with space", Some("node/with space")),
+            "/nodes/node%2Fwith%20space/restore-candidates/id%2Fwith%20space/restore"
+        );
+    }
+
+    #[test]
+    fn node_restore_candidates_path_forces_inventory_refresh() {
+        assert_eq!(
+            node_restore_candidates_path("macbook"),
+            "/nodes/macbook/restore-candidates?refresh=true"
+        );
+        assert_eq!(
+            node_restore_candidates_path("node/with space"),
+            "/nodes/node%2Fwith%20space/restore-candidates?refresh=true"
+        );
+    }
+
+    #[test]
+    fn node_restore_candidate_resolution_matches_python_order() {
+        let sessions = vec![
+            json!({
+                "id": "candidate-a",
+                "source_session_id": "source-a",
+                "aliases": ["alias-a"],
+                "friendly_name": "shared-name"
+            }),
+            json!({
+                "id": "candidate-b",
+                "source_session_id": "source-b",
+                "aliases": ["alias-b"],
+                "friendly_name": "friendly-b"
+            }),
+        ];
+
+        assert_eq!(
+            resolve_node_restore_candidate_id_from_sessions("candidate-a", &sessions).unwrap(),
+            Some("candidate-a".to_owned())
+        );
+        assert_eq!(
+            resolve_node_restore_candidate_id_from_sessions("source-b", &sessions).unwrap(),
+            Some("candidate-b".to_owned())
+        );
+        assert_eq!(
+            resolve_node_restore_candidate_id_from_sessions("alias-a", &sessions).unwrap(),
+            Some("candidate-a".to_owned())
+        );
+        assert_eq!(
+            resolve_node_restore_candidate_id_from_sessions("friendly-b", &sessions).unwrap(),
+            Some("candidate-b".to_owned())
+        );
+        assert_eq!(
+            resolve_node_restore_candidate_id_from_sessions("missing", &sessions).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn node_restore_candidate_resolution_reports_ambiguity() {
+        let sessions = vec![
+            json!({
+                "id": "candidate-a",
+                "source_session_id": "source-a",
+                "aliases": ["shared-alias"],
+                "friendly_name": "friendly-a"
+            }),
+            json!({
+                "id": "candidate-b",
+                "source_session_id": "source-b",
+                "aliases": ["shared-alias"],
+                "friendly_name": "friendly-b"
+            }),
+        ];
+
+        let error = resolve_node_restore_candidate_id_from_sessions("shared-alias", &sessions)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "Multiple node restore candidates match 'shared-alias': candidate-a, candidate-b. Use a session ID."
         );
     }
 

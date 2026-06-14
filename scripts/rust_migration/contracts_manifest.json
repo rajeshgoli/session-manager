@@ -1626,6 +1626,18 @@
       "source": "https://github.com/rajeshgoli/session-manager/issues/797"
     },
     {
+      "id": "cli.rust_core_restore_node_primary_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "restore", "{cli_restore_session_id}", "--node", "primary"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Session restored", "{cli_restore_session_id}"],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:cli_restore_session_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/989"
+    },
+    {
       "id": "cli.rust_core_retire_restored_fixture",
       "surface": "cli",
       "classification": "retained",

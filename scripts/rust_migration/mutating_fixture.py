@@ -28,6 +28,7 @@ DEFAULT_CHILD_SESSION_NAME = "FixtureChild"
 DEFAULT_EM_SESSION_ID = "fixture-em"
 DEFAULT_NOTIFY_CHILD_SESSION_ID = "fixture-notify-child"
 DEFAULT_STOPPED_SESSION_ID = "fixture-stop"
+DEFAULT_CLI_RESTORE_SESSION_ID = "fixture-cli-restore"
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,7 @@ def create_mutating_fixture_workspace(output_dir: Path | None = None) -> Mutatin
         "em_session_id": DEFAULT_EM_SESSION_ID,
         "notify_child_session_id": DEFAULT_NOTIFY_CHILD_SESSION_ID,
         "stopped_session_id": DEFAULT_STOPPED_SESSION_ID,
+        "cli_restore_session_id": DEFAULT_CLI_RESTORE_SESSION_ID,
         "queue_job_id": "job-fixture",
     }
     return MutatingFixtureWorkspace(
@@ -106,11 +108,29 @@ def _seed_em_notify_sessions(state_file: Path, log_dir: Path, working_dir: Path)
     state = json.loads(state_file.read_text())
     sessions = list(state.get("sessions", []))
     _relocate_existing_session_logs(sessions, log_dir)
-    seeded_ids = {DEFAULT_EM_SESSION_ID, DEFAULT_NOTIFY_CHILD_SESSION_ID}
+    seeded_ids = {
+        DEFAULT_EM_SESSION_ID,
+        DEFAULT_NOTIFY_CHILD_SESSION_ID,
+        DEFAULT_CLI_RESTORE_SESSION_ID,
+    }
     sessions = [session for session in sessions if session.get("id") not in seeded_ids]
     created_at = "2026-06-01T00:10:00"
     sessions.extend(
         [
+            {
+                "id": DEFAULT_CLI_RESTORE_SESSION_ID,
+                "name": "fixture-cli-restore",
+                "working_dir": str(working_dir),
+                "tmux_session": "fixture-cli-restore",
+                "node": "primary",
+                "provider": "claude",
+                "log_file": str(log_dir / "fixture-cli-restore.log"),
+                "status": "stopped",
+                "created_at": created_at,
+                "last_activity": created_at,
+                "stopped_at": "2026-06-01T00:11:00",
+                "friendly_name": "Fixture CLI Restore",
+            },
             {
                 "id": DEFAULT_EM_SESSION_ID,
                 "name": "fixture-em",
