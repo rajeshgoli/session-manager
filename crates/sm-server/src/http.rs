@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     fs,
     net::SocketAddr,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -61,7 +61,7 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::timeout;
 
 use crate::app_artifacts::{
@@ -89,8 +89,8 @@ use crate::email::{
 };
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::queue::{
-    CodexReviewRequestFilters, CodexReviewRequestRegistration, CreateQueueJob,
-    QueueAdmissionPolicy, QueueJobFilters, QueueJobRecord, RetainedQueueStore,
+    CodexReviewRequestFilters, CodexReviewRequestRegistration, CreateCodexReviewRequest,
+    CreateQueueJob, QueueAdmissionPolicy, QueueJobFilters, QueueJobRecord, RetainedQueueStore,
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
@@ -222,10 +222,43 @@ struct CloudflareAccessJwksCacheEntry {
     last_unknown_key_refresh: Option<Instant>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GitHubReviewComment {
+    pub comment_id: Option<i64>,
+    pub comment_url: Option<String>,
+    pub posted_at: String,
+}
+
+pub trait GitHubReviewPoster: Send + Sync {
+    fn post_initial_review_request(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        steer: Option<&str>,
+    ) -> Result<GitHubReviewComment, String>;
+}
+
+#[derive(Debug)]
+struct GhCliReviewPoster;
+
+impl GitHubReviewPoster for GhCliReviewPoster {
+    fn post_initial_review_request(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        steer: Option<&str>,
+    ) -> Result<GitHubReviewComment, String> {
+        validate_open_pr_with_gh(repo, pr_number)?;
+        post_pr_review_comment_with_gh(repo, pr_number, steer)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
     session_store: SessionStore,
+    github_review_poster: Arc<dyn GitHubReviewPoster>,
+    codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
     mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
     mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
@@ -246,6 +279,8 @@ impl AppState {
         Self {
             config,
             session_store,
+            github_review_poster: Arc::new(GhCliReviewPoster),
+            codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
             mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -255,6 +290,169 @@ impl AppState {
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             mobile_terminal_secret,
         }
+    }
+
+    pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
+        self.github_review_poster = poster;
+        self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPrViewPayload {
+    state: Option<String>,
+}
+
+fn validate_open_pr_with_gh(repo: &str, pr_number: i64) -> Result<(), String> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "number,state,title,url",
+        ])
+        .output()
+        .map_err(|error| format!("gh pr view failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "PR #{} not found in {}: {}",
+            pr_number,
+            repo,
+            command_stderr(&output)
+        ));
+    }
+    let payload: GhPrViewPayload = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("gh pr view returned invalid JSON: {error}"))?;
+    if payload.state.as_deref() != Some("OPEN") {
+        return Err(format!(
+            "PR #{} is {}, not OPEN",
+            pr_number,
+            payload.state.as_deref().unwrap_or("unknown")
+        ));
+    }
+    Ok(())
+}
+
+fn post_pr_review_comment_with_gh(
+    repo: &str,
+    pr_number: i64,
+    steer: Option<&str>,
+) -> Result<GitHubReviewComment, String> {
+    let body = match steer.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(steer) => format!("@codex review for {steer}"),
+        None => "@codex review".to_owned(),
+    };
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "comment",
+            &pr_number.to_string(),
+            "--repo",
+            repo,
+            "--body",
+            &body,
+        ])
+        .output()
+        .map_err(|error| format!("gh pr comment failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("gh pr comment failed: {}", command_stderr(&output)));
+    }
+    let raw_comment_url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let comment_url = (!raw_comment_url.is_empty()).then_some(raw_comment_url);
+    let comment_id = comment_url
+        .as_deref()
+        .and_then(|url| url.rsplit("#issuecomment-").next())
+        .and_then(|value| value.parse::<i64>().ok());
+    Ok(GitHubReviewComment {
+        comment_id,
+        comment_url,
+        posted_at: now_rfc3339(),
+    })
+}
+
+fn command_stderr(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    } else {
+        stderr
+    }
+}
+
+async fn resolve_codex_review_repo(
+    state: &AppState,
+    repo: Option<&str>,
+    requester_session_id: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(repo) = repo.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(repo.to_owned());
+    }
+    let Some(requester_session_id) = requester_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(codex_review_repo_error());
+    };
+    let Some(requester) = state.session_store.get_session(requester_session_id)? else {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Requester session {requester_session_id} not found"),
+        });
+    };
+    let working_dir = requester.working_dir;
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("gh")
+            .args([
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "--jq",
+                ".nameWithOwner",
+            ])
+            .current_dir(working_dir)
+            .output()
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    if let Some(output) = output {
+        if output.status.success() {
+            let repo = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !repo.is_empty() {
+                return Ok(repo);
+            }
+        }
+    }
+    Err(codex_review_repo_error())
+}
+
+fn codex_review_repo_error() -> ApiError {
+    ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail:
+            "Could not determine GitHub repo without requester session context; pass --repo explicitly"
+                .to_owned(),
+    }
+}
+
+fn codex_review_store_error(error: anyhow::Error) -> ApiError {
+    let detail = error.to_string();
+    if detail.contains("poll_interval_seconds")
+        || detail.contains("retry_interval_seconds")
+        || detail.contains("Active Codex review request already exists")
+    {
+        return ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        };
+    }
+    ApiError::Status {
+        status: StatusCode::BAD_GATEWAY,
+        detail: format!("Failed to request Codex review: {detail}"),
     }
 }
 
@@ -302,7 +500,10 @@ pub fn router(state: AppState) -> Router {
             "/queue-jobs/{job_id}",
             get(get_queue_job).delete(cancel_queue_job),
         )
-        .route("/codex-review-requests", get(list_codex_review_requests))
+        .route(
+            "/codex-review-requests",
+            get(list_codex_review_requests).post(create_codex_review_request),
+        )
         .route(
             "/codex-review-requests/{request_id}",
             get(get_codex_review_request).delete(cancel_codex_review_request),
@@ -1919,6 +2120,171 @@ async fn restore_node_restore_candidate(
             detail: "Session not found".to_owned(),
         }),
     }
+}
+
+async fn create_codex_review_request(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<CodexReviewRequestCreateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/codex-review-requests",
+    )?;
+    validate_codex_review_create_payload(&payload)?;
+    ensure_core_writes_enabled(&state)?;
+
+    let notify_identifier = payload
+        .notify_target
+        .as_deref()
+        .or(payload.requester_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "notify_target or requester_session_id is required".to_owned(),
+        })?;
+    let Some(notify_session) = resolve_session_or_registry_role(&state, notify_identifier)? else {
+        return Err(ApiError::NotFound("Notify target not found"));
+    };
+    if let Some(requester_session_id) = payload
+        .requester_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if state
+            .session_store
+            .get_session(requester_session_id)?
+            .is_none()
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!("Requester session {requester_session_id} not found"),
+            });
+        }
+    }
+    let repo = resolve_codex_review_repo(
+        &state,
+        payload.repo.as_deref(),
+        payload.requester_session_id.as_deref(),
+    )
+    .await?;
+    let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let creation_key = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        repo, payload.pr_number, notify_session.id
+    );
+    {
+        let mut locks = state.codex_review_creation_locks.lock().await;
+        if !locks.insert(creation_key.clone()) {
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!(
+                    "Active Codex review request already exists for {} PR #{}",
+                    repo, payload.pr_number
+                ),
+            });
+        }
+    }
+
+    let create_result = async {
+        match RetainedQueueStore::active_codex_review_request_exists_from_path(
+            &queue_db_path,
+            &repo,
+            payload.pr_number,
+            &notify_session.id,
+        ) {
+            Ok(true) => {
+                return Err(ApiError::Status {
+                    status: StatusCode::BAD_REQUEST,
+                    detail: format!(
+                        "Active Codex review request already exists for {} PR #{}",
+                        repo, payload.pr_number
+                    ),
+                });
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(ApiError::Status {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    detail: format!("Failed to inspect Codex review requests: {error}"),
+                });
+            }
+        }
+
+        let poster = state.github_review_poster.clone();
+        let repo_for_poster = repo.clone();
+        let steer_for_poster = payload.steer.clone();
+        let comment = tokio::task::spawn_blocking(move || {
+            poster.post_initial_review_request(
+                &repo_for_poster,
+                payload.pr_number,
+                steer_for_poster.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Failed to request Codex review: {error}"),
+        })?
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: error,
+        })?;
+
+        let registration = RetainedQueueStore::create_codex_review_request_in_path(
+            &queue_db_path,
+            CreateCodexReviewRequest {
+                repo: repo.clone(),
+                pr_number: payload.pr_number,
+                requester_session_id: trimmed(&payload.requester_session_id),
+                notify_session_id: notify_session.id.clone(),
+                steer: trimmed(&payload.steer),
+                latest_request_comment_id: comment.comment_id,
+                latest_request_comment_url: comment.comment_url,
+                latest_request_posted_at: comment.posted_at,
+                poll_interval_seconds: payload.poll_interval_seconds,
+                retry_interval_seconds: payload.retry_interval_seconds,
+            },
+        )
+        .map_err(codex_review_store_error)?;
+        codex_review_request_response(&state, registration).map(Json)
+    }
+    .await;
+    state
+        .codex_review_creation_locks
+        .lock()
+        .await
+        .remove(&creation_key);
+    create_result
+}
+
+fn validate_codex_review_create_payload(
+    payload: &CodexReviewRequestCreateRequest,
+) -> Result<(), ApiError> {
+    if payload.pr_number <= 0 {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "pr_number must be > 0".to_owned(),
+        });
+    }
+    if payload.poll_interval_seconds <= 0 {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "poll_interval_seconds must be > 0".to_owned(),
+        });
+    }
+    if payload.retry_interval_seconds <= 0 {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "retry_interval_seconds must be > 0".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 async fn list_codex_review_requests(
@@ -4531,6 +4897,13 @@ fn shadow_predict_retained_write(
     method: &str,
     path: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
+    if method == "POST" && path == "/codex-review-requests" {
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_retained_write_status_only",
+        }));
+    }
     if method == "DELETE" {
         if let Some(request_id) = path
             .strip_prefix("/codex-review-requests/")
@@ -7506,6 +7879,31 @@ struct ListChildrenQuery {
     status: Option<String>,
     #[serde(default)]
     include_terminated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexReviewRequestCreateRequest {
+    pr_number: i64,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    steer: Option<String>,
+    #[serde(default)]
+    notify_target: Option<String>,
+    #[serde(default)]
+    requester_session_id: Option<String>,
+    #[serde(default = "default_codex_review_poll_interval_seconds")]
+    poll_interval_seconds: i64,
+    #[serde(default = "default_codex_review_retry_interval_seconds")]
+    retry_interval_seconds: i64,
+}
+
+fn default_codex_review_poll_interval_seconds() -> i64 {
+    30
+}
+
+fn default_codex_review_retry_interval_seconds() -> i64 {
+    600
 }
 
 #[derive(Debug, Deserialize)]

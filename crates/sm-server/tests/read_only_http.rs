@@ -23,7 +23,7 @@ use sm_server::{
         MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, QueueRunnerConfig,
         RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
-    http::{router, AppState},
+    http::{router, AppState, GitHubReviewComment, GitHubReviewPoster},
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -39,7 +39,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -168,6 +168,54 @@ fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> 
         thread::sleep(Duration::from_millis(50));
     }
     None
+}
+
+#[derive(Debug, Clone)]
+struct StubGitHubReviewPoster {
+    result: Arc<Mutex<Result<GitHubReviewComment, String>>>,
+    calls: Arc<Mutex<Vec<(String, i64, Option<String>)>>>,
+}
+
+impl StubGitHubReviewPoster {
+    fn successful() -> Self {
+        Self {
+            result: Arc::new(Mutex::new(Ok(GitHubReviewComment {
+                comment_id: Some(4701290334),
+                comment_url: Some(
+                    "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701290334"
+                        .to_owned(),
+                ),
+                posted_at: "2026-06-14T02:30:00Z".to_owned(),
+            }))),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn failing(message: &str) -> Self {
+        Self {
+            result: Arc::new(Mutex::new(Err(message.to_owned()))),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> Vec<(String, i64, Option<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl GitHubReviewPoster for StubGitHubReviewPoster {
+    fn post_initial_review_request(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        steer: Option<&str>,
+    ) -> Result<GitHubReviewComment, String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((repo.to_owned(), pr_number, steer.map(ToOwned::to_owned)));
+        self.result.lock().unwrap().clone()
+    }
 }
 
 fn queue_job_text_column(queue_state_dir: &PathBuf, job_id: &str, column: &str) -> String {
@@ -1964,6 +2012,321 @@ async fn codex_review_request_cancel_updates_active_row_and_preserves_inactive_r
     assert_eq!(payload["id"], "inactive");
     assert_eq!(payload["state"], "cancelled");
     assert_eq!(payload["is_active"], false);
+}
+
+#[tokio::test]
+async fn codex_review_request_create_posts_and_persists_active_row() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-create.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "requester1",
+                    "name": "codex-fork-requester1",
+                    "working_dir": "/repo/requester",
+                    "tmux_session": "codex-fork-requester1",
+                    "log_file": "/tmp/requester1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z",
+                    "provider": "codex-fork",
+                    "native_title": "native requester"
+                },
+                {
+                    "id": "notify1",
+                    "name": "codex-fork-notify1",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify1",
+                    "log_file": "/tmp/notify1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }
+            ],
+            "agent_registrations": [
+                {
+                    "role": "reviewer",
+                    "session_id": "notify1",
+                    "created_at": "2026-06-01T00:02:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "steer": "focus create",
+            "requester_session_id": "requester1",
+            "notify_target": "reviewer",
+            "poll_interval_seconds": 45,
+            "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap();
+    assert_eq!(request_id.len(), 12);
+    assert!(request_id.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_eq!(payload["repo"], "rajeshgoli/session-manager");
+    assert_eq!(payload["pr_number"], 967);
+    assert_eq!(payload["requester_session_id"], "requester1");
+    assert_eq!(payload["requester_name"], "native requester");
+    assert_eq!(payload["notify_session_id"], "notify1");
+    assert_eq!(payload["notify_name"], "reviewer");
+    assert_eq!(payload["steer"], "focus create");
+    assert_eq!(payload["latest_request_comment_id"], 4701290334_i64);
+    assert_eq!(
+        payload["latest_request_comment_url"],
+        "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701290334"
+    );
+    assert_eq!(payload["attempt_count"], 1);
+    assert_eq!(payload["poll_interval_seconds"], 45);
+    assert_eq!(payload["retry_interval_seconds"], 900);
+    assert_eq!(payload["state"], "active");
+    assert_eq!(payload["is_active"], true);
+    assert_eq!(
+        poster.calls(),
+        vec![(
+            "rajeshgoli/session-manager".to_owned(),
+            967,
+            Some("focus create".to_owned())
+        )]
+    );
+
+    let conn = Connection::open(&queue_db).unwrap();
+    let row: (String, i64, String, i64, String, String, i64) = conn
+        .query_row(
+            r#"
+            SELECT id, latest_request_comment_id, latest_request_comment_url,
+                   attempt_count, state, next_retry_at, is_active
+            FROM codex_review_request_registrations
+            WHERE id = ?1
+            "#,
+            [request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, request_id);
+    assert_eq!(row.1, 4701290334);
+    assert_eq!(
+        row.2,
+        "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701290334"
+    );
+    assert_eq!(row.3, 1);
+    assert_eq!(row.4, "active");
+    assert_eq!(row.5, "2026-06-14T02:45:00Z");
+    assert_eq!(row.6, 1);
+
+    let (status, payload) = get_json(app, &format!("/codex-review-requests/{request_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], request_id);
+}
+
+#[tokio::test]
+async fn codex_review_request_create_rejects_duplicates_before_github_post() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-create-duplicate.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "notify1",
+                    "name": "codex-fork-notify1",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify1",
+                    "log_file": "/tmp/notify1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_codex_review_request_fixture_db(&queue_db);
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 830,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "Active Codex review request already exists for rajeshgoli/session-manager PR #830"
+    );
+    assert!(poster.calls().is_empty());
+}
+
+#[tokio::test]
+async fn codex_review_request_create_preserves_validation_errors_and_write_gate() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-create-errors.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "notify1",
+                    "name": "codex-fork-notify1",
+                    "working_dir": "/repo/notify",
+                    "tmux_session": "codex-fork-notify1",
+                    "log_file": "/tmp/notify1.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let disabled_app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let (status, payload) = post_json(
+        disabled_app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(payload["detail"], "Rust core writes are disabled");
+
+    let poster = StubGitHubReviewPoster::failing("gh pr comment failed: denied");
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "missing"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Notify target not found");
+    assert!(poster.calls().is_empty());
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1",
+            "poll_interval_seconds": 0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "poll_interval_seconds must be > 0");
+    assert!(poster.calls().is_empty());
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 0,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(payload["detail"], "pr_number must be > 0");
+    assert!(poster.calls().is_empty());
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(payload["detail"], "gh pr comment failed: denied");
+    assert_eq!(
+        poster.calls(),
+        vec![("rajeshgoli/session-manager".to_owned(), 967, None)]
+    );
+    assert!(!queue_db.exists());
 }
 
 #[tokio::test]
@@ -4416,6 +4779,54 @@ async fn shadow_http_reports_codex_review_request_cancel_as_status_only_without_
     assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["state"], "completed");
     assert_eq!(detail["is_active"], true);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_review_request_create_as_status_only_without_writing() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-requests-shadow-create.db");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/codex-review-requests",
+                "query_string": "",
+                "headers": {},
+                "body_sha256": sha256_hex(b"{\"pr_number\":967}")
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"id\":\"python-owned\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["support_status"],
+        "implemented_retained_write_status_only"
+    );
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+    assert!(!queue_db.exists());
 }
 
 #[tokio::test]

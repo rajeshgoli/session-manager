@@ -65,6 +65,20 @@ pub struct CodexReviewRequestRegistration {
     pub is_active: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateCodexReviewRequest {
+    pub repo: String,
+    pub pr_number: i64,
+    pub requester_session_id: Option<String>,
+    pub notify_session_id: String,
+    pub steer: Option<String>,
+    pub latest_request_comment_id: Option<i64>,
+    pub latest_request_comment_url: Option<String>,
+    pub latest_request_posted_at: String,
+    pub poll_interval_seconds: i64,
+    pub retry_interval_seconds: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct QueueJobFilters {
     pub notify_session_id: Option<String>,
@@ -294,6 +308,42 @@ impl RetainedQueueStore {
             ],
         )?;
         Ok(Some(registration))
+    }
+
+    pub fn create_codex_review_request_in_path(
+        db_path: &Path,
+        request: CreateCodexReviewRequest,
+    ) -> Result<CodexReviewRequestRegistration> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create message queue db directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("failed to open message queue db {}", db_path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_codex_review_requests_schema(&conn)?;
+        create_codex_review_request_conn(&conn, request)
+    }
+
+    pub fn active_codex_review_request_exists_from_path(
+        db_path: &Path,
+        repo: &str,
+        pr_number: i64,
+        notify_session_id: &str,
+    ) -> Result<bool> {
+        if !db_path.exists() {
+            return Ok(false);
+        }
+        let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => conn,
+            Err(_) => return Ok(false),
+        };
+        active_codex_review_request_exists_conn(&conn, repo, pr_number, notify_session_id)
     }
 
     pub fn list_queue_jobs_from_path(
@@ -1343,6 +1393,40 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "queued_notified_at", "TEXT")?;
     ensure_column(conn, "queue_jobs", "started_notified_at", "TEXT")?;
     ensure_column(conn, "queue_jobs", "completion_notified_at", "TEXT")?;
+    Ok(())
+}
+
+fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS codex_review_request_registrations (
+            id TEXT PRIMARY KEY,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            requester_session_id TEXT,
+            notify_session_id TEXT NOT NULL,
+            steer TEXT,
+            requested_at TIMESTAMP NOT NULL,
+            latest_request_comment_id INTEGER,
+            latest_request_comment_url TEXT,
+            latest_request_posted_at TIMESTAMP,
+            attempt_count INTEGER NOT NULL,
+            next_retry_at TIMESTAMP,
+            poll_interval_seconds INTEGER NOT NULL,
+            retry_interval_seconds INTEGER NOT NULL,
+            pickup_detected_at TIMESTAMP,
+            pickup_source TEXT,
+            review_landed_at TIMESTAMP,
+            review_source TEXT,
+            review_comment_id INTEGER,
+            review_url TEXT,
+            last_polled_at TIMESTAMP,
+            last_error TEXT,
+            state TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1
+        );
+        "#,
+    )?;
     Ok(())
 }
 
@@ -2548,6 +2632,125 @@ fn list_codex_review_requests_conn(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+fn active_codex_review_request_exists_conn(
+    conn: &Connection,
+    repo: &str,
+    pr_number: i64,
+    notify_session_id: &str,
+) -> Result<bool> {
+    let count = match conn.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM codex_review_request_registrations
+        WHERE repo = ?1
+            AND pr_number = ?2
+            AND notify_session_id = ?3
+            AND is_active = 1
+        "#,
+        params![repo, pr_number, notify_session_id],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(count) => count,
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table") =>
+        {
+            0
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(count > 0)
+}
+
+fn create_codex_review_request_conn(
+    conn: &Connection,
+    request: CreateCodexReviewRequest,
+) -> Result<CodexReviewRequestRegistration> {
+    if request.poll_interval_seconds <= 0 {
+        anyhow::bail!("poll_interval_seconds must be > 0");
+    }
+    if request.retry_interval_seconds <= 0 {
+        anyhow::bail!("retry_interval_seconds must be > 0");
+    }
+    if active_codex_review_request_exists_conn(
+        conn,
+        &request.repo,
+        request.pr_number,
+        &request.notify_session_id,
+    )? {
+        anyhow::bail!(
+            "Active Codex review request already exists for {} PR #{}",
+            request.repo,
+            request.pr_number
+        );
+    }
+
+    let latest_posted_at = request.latest_request_posted_at;
+    let next_retry_at =
+        codex_review_next_retry_at(&latest_posted_at, request.retry_interval_seconds)?;
+    let registration = CodexReviewRequestRegistration {
+        id: generate_codex_review_request_id(),
+        repo: request.repo,
+        pr_number: request.pr_number,
+        requester_session_id: request.requester_session_id,
+        notify_session_id: request.notify_session_id,
+        steer: request.steer,
+        requested_at: latest_posted_at.clone(),
+        latest_request_comment_id: request.latest_request_comment_id,
+        latest_request_comment_url: request.latest_request_comment_url,
+        latest_request_posted_at: Some(latest_posted_at),
+        attempt_count: 1,
+        next_retry_at: Some(next_retry_at),
+        poll_interval_seconds: request.poll_interval_seconds,
+        retry_interval_seconds: request.retry_interval_seconds,
+        pickup_detected_at: None,
+        pickup_source: None,
+        review_landed_at: None,
+        review_source: None,
+        review_comment_id: None,
+        review_url: None,
+        last_polled_at: None,
+        last_error: None,
+        state: "active".to_owned(),
+        is_active: true,
+    };
+    conn.execute(
+        r#"
+        INSERT INTO codex_review_request_registrations
+            (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+             requested_at, latest_request_comment_id, latest_request_comment_url,
+             latest_request_posted_at, attempt_count, next_retry_at,
+             poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+             pickup_source, review_landed_at, review_source, review_comment_id,
+             review_url, last_polled_at, last_error, state, is_active)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6,
+             ?7, ?8, ?9,
+             ?10, ?11, ?12,
+             ?13, ?14, NULL,
+             NULL, NULL, NULL, NULL,
+             NULL, NULL, NULL, ?15, 1)
+        "#,
+        params![
+            registration.id,
+            registration.repo,
+            registration.pr_number,
+            registration.requester_session_id,
+            registration.notify_session_id,
+            registration.steer,
+            registration.requested_at,
+            registration.latest_request_comment_id,
+            registration.latest_request_comment_url,
+            registration.latest_request_posted_at,
+            registration.attempt_count,
+            registration.next_retry_at,
+            registration.poll_interval_seconds,
+            registration.retry_interval_seconds,
+            registration.state,
+        ],
+    )?;
+    Ok(registration)
+}
+
 fn get_codex_review_request_conn(
     conn: &Connection,
     request_id: &str,
@@ -2843,10 +3046,27 @@ fn generate_queue_job_id() -> String {
     format!("job_{suffix}")
 }
 
+fn generate_codex_review_request_id() -> String {
+    let mut bytes = [0u8; 6];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn codex_review_next_retry_at(posted_at: &str, retry_interval_seconds: i64) -> Result<String> {
+    let posted_at = parse_queue_datetime(posted_at)
+        .or_else(|| parse_python_naive_datetime(posted_at).map(PrimitiveDateTime::assume_utc))
+        .unwrap_or_else(OffsetDateTime::now_utc);
+    let next_retry_at = posted_at + Duration::seconds(retry_interval_seconds.max(1));
+    Ok(next_retry_at.format(&Rfc3339)?)
 }
 
 fn timeout_at_rfc3339(timeout_seconds: Option<u64>) -> Result<Option<String>> {
