@@ -1,6 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
+use rand_core::{OsRng, RngCore};
 use rusqlite::{
     params,
     types::{Value as SqlValue, ValueRef},
@@ -81,6 +85,19 @@ pub struct QueueJobRecord {
     pub process_group_id: Option<i64>,
     pub exit_code: Option<i64>,
     pub log_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateQueueJob {
+    pub job_type: String,
+    pub label: String,
+    pub requester_session_id: Option<String>,
+    pub notify_session_id: String,
+    pub cwd: String,
+    pub argv: Option<Vec<String>>,
+    pub script: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub timeout_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +224,31 @@ impl RetainedQueueStore {
             Err(_) => return Ok(None),
         };
         get_queue_job_conn(&conn, job_id)
+    }
+
+    pub fn create_queue_job_in_state_dir(
+        state_dir: &Path,
+        request: CreateQueueJob,
+    ) -> Result<QueueJobRecord> {
+        std::fs::create_dir_all(state_dir).with_context(|| {
+            format!(
+                "failed to create queue runner state dir {}",
+                state_dir.display()
+            )
+        })?;
+        std::fs::create_dir_all(state_dir.join("logs")).with_context(|| {
+            format!(
+                "failed to create queue runner log dir {}",
+                state_dir.join("logs").display()
+            )
+        })?;
+        let db_path = state_dir.join("queue_runner.db");
+        let conn = Connection::open(&db_path)
+            .with_context(|| format!("failed to open queue runner db {}", db_path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_queue_jobs_schema(&conn)?;
+        create_queue_job_conn(&conn, state_dir, request)
     }
 
     pub fn ensure_schema(&self) -> Result<()> {
@@ -894,6 +936,187 @@ fn init_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS queue_jobs (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            label TEXT NOT NULL,
+            requester_session_id TEXT,
+            notify_session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            argv_json TEXT,
+            script_path TEXT,
+            env_json TEXT NOT NULL,
+            timeout_seconds INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            holding_reason TEXT,
+            queued_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            pid INTEGER,
+            process_group_id INTEGER,
+            exit_code INTEGER,
+            log_path TEXT,
+            exit_code_path TEXT,
+            wrapper_path TEXT,
+            queued_notified_at TEXT,
+            started_notified_at TEXT,
+            completion_notified_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_jobs_state_type_queued
+            ON queue_jobs(state, type, queued_at);
+        CREATE INDEX IF NOT EXISTS idx_queue_jobs_notify_state
+            ON queue_jobs(notify_session_id, state);
+        CREATE INDEX IF NOT EXISTS idx_queue_jobs_finished
+            ON queue_jobs(finished_at);
+        CREATE TABLE IF NOT EXISTS queue_resource_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sampled_at TEXT NOT NULL,
+            pending_by_type_json TEXT NOT NULL,
+            running_by_type_json TEXT NOT NULL,
+            total_running INTEGER NOT NULL,
+            memory_json TEXT NOT NULL,
+            cpu_json TEXT NOT NULL,
+            gpu_json TEXT
+        );
+        "#,
+    )?;
+    ensure_column(conn, "queue_jobs", "queued_notified_at", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "started_notified_at", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "completion_notified_at", "TEXT")?;
+    Ok(())
+}
+
+fn create_queue_job_conn(
+    conn: &Connection,
+    state_dir: &Path,
+    request: CreateQueueJob,
+) -> Result<QueueJobRecord> {
+    let id = generate_queue_job_id();
+    let job_dir = state_dir.join(&id);
+    std::fs::create_dir_all(&job_dir)
+        .with_context(|| format!("failed to create queue job dir {}", job_dir.display()))?;
+    let logs_dir = state_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)
+        .with_context(|| format!("failed to create queue log dir {}", logs_dir.display()))?;
+    let script_path = if let Some(script) = request.script.as_deref() {
+        let path = job_dir.join("submitted.zsh");
+        std::fs::write(&path, script)
+            .with_context(|| format!("failed to write queue job script {}", path.display()))?;
+        Some(path.display().to_string())
+    } else {
+        None
+    };
+    let exit_code_path = job_dir.join("exit.code");
+    let wrapper_path = job_dir.join("run.zsh");
+    let log_path = logs_dir.join(format!("{id}.log"));
+    write_queue_job_wrapper(
+        &wrapper_path,
+        &request.cwd,
+        request.argv.as_deref(),
+        script_path.as_deref(),
+        &request.env,
+        &exit_code_path,
+    )?;
+    let queued_at = now_rfc3339();
+    let argv_json = request
+        .argv
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let env_json = serde_json::to_string(&request.env)?;
+    conn.execute(
+        r#"
+        INSERT INTO queue_jobs
+            (id, type, label, requester_session_id, notify_session_id, cwd,
+             argv_json, script_path, env_json, timeout_seconds, state,
+             holding_reason, queued_at, started_at, finished_at, pid,
+             process_group_id, exit_code, log_path, exit_code_path, wrapper_path,
+             queued_notified_at, started_notified_at, completion_notified_at)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending',
+             NULL, ?11, NULL, NULL, NULL, NULL, NULL, ?12, ?13, ?14,
+             NULL, NULL, NULL)
+        "#,
+        params![
+            id,
+            request.job_type,
+            request.label,
+            request.requester_session_id,
+            request.notify_session_id,
+            request.cwd,
+            argv_json,
+            script_path,
+            env_json,
+            request.timeout_seconds,
+            queued_at,
+            log_path.display().to_string(),
+            exit_code_path.display().to_string(),
+            wrapper_path.display().to_string(),
+        ],
+    )?;
+    get_queue_job_conn(conn, &id)?.context("created queue job was not persisted")
+}
+
+fn write_queue_job_wrapper(
+    path: &Path,
+    cwd: &str,
+    argv: Option<&[String]>,
+    script_path: Option<&str>,
+    env: &BTreeMap<String, String>,
+    exit_code_path: &Path,
+) -> Result<()> {
+    let mut lines = vec![
+        "#!/bin/zsh".to_owned(),
+        "set +e".to_owned(),
+        format!("cd {} || exit 127", shell_quote(cwd)),
+    ];
+    for (key, value) in env {
+        lines.push(format!(
+            "export {}={}",
+            shell_quote(key),
+            shell_quote(value)
+        ));
+    }
+    if let Some(argv) = argv {
+        lines.push(
+            argv.iter()
+                .map(|part| shell_quote(part))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    } else if let Some(script_path) = script_path {
+        lines.push(format!("/bin/zsh {}", shell_quote(script_path)));
+    }
+    lines.extend([
+        "code=$?".to_owned(),
+        format!(
+            "printf '%s\\n' \"$code\" > {}",
+            shell_quote(&exit_code_path.display().to_string())
+        ),
+        "exit \"$code\"".to_owned(),
+    ]);
+    std::fs::write(path, format!("{}\n", lines.join("\n")))
+        .with_context(|| format!("failed to write queue job wrapper {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn list_codex_review_requests_conn(
     conn: &Connection,
     filters: CodexReviewRequestFilters,
@@ -1231,6 +1454,16 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str
 fn generate_record_id(prefix: &str) -> String {
     let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
     format!("{prefix}{:x}{:x}", std::process::id(), nanos as u128)
+}
+
+fn generate_queue_job_id() -> String {
+    let mut bytes = [0u8; 6];
+    OsRng.fill_bytes(&mut bytes);
+    let suffix = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("job_{suffix}")
 }
 
 fn now_rfc3339() -> String {

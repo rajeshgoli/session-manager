@@ -1069,6 +1069,18 @@
       "source": "https://github.com/rajeshgoli/session-manager/issues/795"
     },
     {
+      "id": "cli.rust_queue_run_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "queue", "run", "--label", "cli queue fixture", "--cwd", "{working_dir}", "--notify", "{session_id}", "--timeout", "5", "--", "echo", "queue cli fixture"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Queued job job_", "cli queue fixture", "[pending]"],
+      "preconditions": ["sm_cli", "fixture:base_url", "session_id", "fixture:working_dir", "mutating_opt_in"],
+      "source": "specs/762_stage5_artifacts/implementation_workstreams.md:21"
+    },
+    {
       "id": "cli.rust_core_send_fixture",
       "surface": "cli",
       "classification": "retained",
@@ -1427,6 +1439,28 @@
       ],
       "preconditions": ["live_server", "fixture:em_session_id", "fixture:notify_child_session_id", "mutating_opt_in"],
       "source": "https://github.com/rajeshgoli/session-manager/issues/803"
+    },
+    {
+      "id": "http.rust_queue_job_create_fixture",
+      "surface": "http",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "method": "POST",
+      "path": "/queue-jobs",
+      "body": {"type": "tests", "label": "http queue fixture", "argv": ["echo", "queue http fixture"], "cwd": "{working_dir}", "env": {"EXTRA": "1"}, "notify_target": "{session_id}", "requester_session_id": "{session_id}", "timeout_seconds": 5},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/id", "type": "string"},
+        {"path": "/type", "equals": "tests"},
+        {"path": "/label", "equals": "http queue fixture"},
+        {"path": "/state", "equals": "pending"},
+        {"path": "/notify_session_id", "equals": "{session_id}"},
+        {"path": "/requester_session_id", "equals": "{session_id}"},
+        {"path": "/timeout_seconds", "equals": 5}
+      ],
+      "preconditions": ["live_server", "session_id", "fixture:working_dir", "mutating_opt_in"],
+      "source": "specs/762_stage5_artifacts/implementation_workstreams.md:21"
     },
     {
       "id": "cli.rust_core_restore_fixture",
