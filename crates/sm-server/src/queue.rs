@@ -6,6 +6,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration as StdDuration, Instant},
 };
@@ -94,13 +95,44 @@ pub struct QueueJobRecord {
     pub log_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueAdmissionPolicy {
+    pub max_running_jobs: i64,
+    pub perf_cooldown_seconds: i64,
+}
+
+impl Default for QueueAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            max_running_jobs: DEFAULT_MAX_RUNNING_QUEUE_JOBS,
+            perf_cooldown_seconds: DEFAULT_PERF_COOLDOWN_SECONDS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueRecoverySummary {
+    pub recovered_running: usize,
+    pub started_pending: usize,
+    pub requeued_pending: usize,
+    pub held_pending: usize,
+    pub polling_running: usize,
+    pub finished_succeeded: usize,
+    pub finished_failed: usize,
+    pub finished_timed_out: usize,
+    pub finished_cancelled: usize,
+    pub finished_displaced: usize,
+}
+
 #[derive(Debug, Clone)]
 struct QueueJobRuntimeRecord {
     id: String,
+    job_type: String,
     state: String,
     notify_session_id: Option<String>,
     queued_at: String,
     started_at: Option<String>,
+    finished_at: Option<String>,
     holding_reason: Option<String>,
     wrapper_path: Option<String>,
     log_path: Option<String>,
@@ -109,6 +141,12 @@ struct QueueJobRuntimeRecord {
     pid: Option<i64>,
     process_group_id: Option<i64>,
     completion_notified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredQueueJobAction {
+    Polling,
+    Finished(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +319,22 @@ impl RetainedQueueStore {
         job_id: &str,
         cancel_grace_seconds: u64,
     ) -> Result<Option<QueueJobRecord>> {
+        Self::start_queue_job_in_state_dir_with_policy(
+            state_dir,
+            message_queue_db_path,
+            job_id,
+            cancel_grace_seconds,
+            QueueAdmissionPolicy::default(),
+        )
+    }
+
+    fn start_queue_job_in_state_dir_with_policy(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        job_id: &str,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+    ) -> Result<Option<QueueJobRecord>> {
         let db_path = state_dir.join("queue_runner.db");
         let conn = open_queue_jobs_connection(&db_path)?;
         init_queue_jobs_schema(&conn)?;
@@ -322,9 +376,73 @@ impl RetainedQueueStore {
                 child,
                 timeout_seconds,
                 cancel_grace_seconds,
+                admission_policy,
             );
         });
         get_queue_job_conn(&conn, job_id)
+    }
+
+    pub fn admit_queue_jobs_in_state_dir(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        cancel_grace_seconds: u64,
+    ) -> Result<()> {
+        Self::admit_queue_jobs_in_state_dir_with_policy(
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            QueueAdmissionPolicy::default(),
+            false,
+        )
+    }
+
+    pub fn admit_queue_jobs_in_state_dir_continuing_after_failed_start(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        cancel_grace_seconds: u64,
+    ) -> Result<()> {
+        Self::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            QueueAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+    ) -> Result<()> {
+        Self::admit_queue_jobs_in_state_dir_with_policy(
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            admission_policy,
+            true,
+        )
+    }
+
+    fn admit_queue_jobs_in_state_dir_with_policy(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+        continue_after_failed_start: bool,
+    ) -> Result<()> {
+        let db_path = state_dir.join("queue_runner.db");
+        let conn = open_queue_jobs_connection(&db_path)?;
+        init_queue_jobs_schema(&conn)?;
+        admit_pending_queue_jobs_conn(
+            &conn,
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            admission_policy,
+            continue_after_failed_start,
+        )?;
+        Ok(())
     }
 
     pub fn cancel_queue_job_in_state_dir(
@@ -332,6 +450,8 @@ impl RetainedQueueStore {
         message_queue_db_path: &Path,
         job_id: &str,
         cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+        admit_after_cancel: bool,
     ) -> Result<Option<QueueJobRecord>> {
         let db_path = state_dir.join("queue_runner.db");
         let conn = open_queue_jobs_connection(&db_path)?;
@@ -356,7 +476,103 @@ impl RetainedQueueStore {
             exit_code,
             Some(message_queue_db_path),
         )?;
+        if admit_after_cancel {
+            let _ = admit_pending_queue_jobs_conn(
+                &conn,
+                state_dir,
+                message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                true,
+            );
+        }
         get_queue_job_conn(&conn, job_id)
+    }
+
+    pub fn recover_queue_jobs_in_state_dir(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        cancel_grace_seconds: u64,
+    ) -> Result<QueueRecoverySummary> {
+        Self::recover_queue_jobs_in_state_dir_with_policy(
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            QueueAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn recover_queue_jobs_in_state_dir_with_policy(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+    ) -> Result<QueueRecoverySummary> {
+        let db_path = state_dir.join("queue_runner.db");
+        if !db_path.exists() {
+            return Ok(QueueRecoverySummary::default());
+        }
+        let conn = open_queue_jobs_connection(&db_path)?;
+        init_queue_jobs_schema(&conn)?;
+        let mut statement = conn.prepare(
+            r#"
+            SELECT id
+            FROM queue_jobs
+            WHERE state = 'running'
+            ORDER BY queued_at, id
+            "#,
+        )?;
+        let job_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let mut summary = QueueRecoverySummary::default();
+        for job_id in job_ids {
+            let Some(job) = get_queue_job_runtime_conn(&conn, &job_id)? else {
+                continue;
+            };
+            if job.state.as_str() == "running" {
+                summary.recovered_running += 1;
+                match recover_running_queue_job_conn(
+                    &conn,
+                    state_dir,
+                    message_queue_db_path,
+                    &job,
+                    cancel_grace_seconds,
+                    admission_policy,
+                )? {
+                    RecoveredQueueJobAction::Polling => summary.polling_running += 1,
+                    RecoveredQueueJobAction::Finished("succeeded") => {
+                        summary.finished_succeeded += 1
+                    }
+                    RecoveredQueueJobAction::Finished("failed") => summary.finished_failed += 1,
+                    RecoveredQueueJobAction::Finished("timed_out") => {
+                        summary.finished_timed_out += 1
+                    }
+                    RecoveredQueueJobAction::Finished("cancelled") => {
+                        summary.finished_cancelled += 1
+                    }
+                    RecoveredQueueJobAction::Finished("displaced") => {
+                        summary.finished_displaced += 1
+                    }
+                    RecoveredQueueJobAction::Finished(_) => {}
+                }
+            }
+        }
+        let admission = admit_pending_queue_jobs_conn(
+            &conn,
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            admission_policy,
+            true,
+        )?;
+        summary.started_pending += admission.started;
+        summary.requeued_pending += admission.requeued;
+        summary.held_pending += admission.held;
+        summary.finished_failed += admission.failed_start;
+        Ok(summary)
     }
 
     pub fn ensure_schema(&self) -> Result<()> {
@@ -1247,9 +1463,9 @@ fn get_queue_job_runtime_conn(
 ) -> Result<Option<QueueJobRuntimeRecord>> {
     let mut statement = match conn.prepare(
         r#"
-        SELECT id, state, notify_session_id, queued_at, started_at, holding_reason, wrapper_path,
-               log_path, exit_code_path, timeout_seconds, pid, process_group_id,
-               completion_notified_at
+        SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
+               holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
+               pid, process_group_id, completion_notified_at
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -1267,22 +1483,350 @@ fn get_queue_job_runtime_conn(
         .query_row(params![job_id], |row| {
             Ok(QueueJobRuntimeRecord {
                 id: row.get(0)?,
-                state: row.get(1)?,
-                notify_session_id: row.get(2)?,
-                queued_at: row.get(3)?,
-                started_at: row.get(4)?,
-                holding_reason: row.get(5)?,
-                wrapper_path: row.get(6)?,
-                log_path: row.get(7)?,
-                exit_code_path: row.get(8)?,
-                timeout_seconds: row.get(9)?,
-                pid: row.get(10)?,
-                process_group_id: row.get(11)?,
-                completion_notified_at: row.get(12)?,
+                job_type: row.get(1)?,
+                state: row.get(2)?,
+                notify_session_id: row.get(3)?,
+                queued_at: row.get(4)?,
+                started_at: row.get(5)?,
+                finished_at: row.get(6)?,
+                holding_reason: row.get(7)?,
+                wrapper_path: row.get(8)?,
+                log_path: row.get(9)?,
+                exit_code_path: row.get(10)?,
+                timeout_seconds: row.get(11)?,
+                pid: row.get(12)?,
+                process_group_id: row.get(13)?,
+                completion_notified_at: row.get(14)?,
             })
         })
         .optional()
         .map_err(Into::into)
+}
+
+fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJobRuntimeRecord>> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
+               holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
+               pid, process_group_id, completion_notified_at
+        FROM queue_jobs
+        ORDER BY queued_at, id
+        "#,
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(QueueJobRuntimeRecord {
+                id: row.get(0)?,
+                job_type: row.get(1)?,
+                state: row.get(2)?,
+                notify_session_id: row.get(3)?,
+                queued_at: row.get(4)?,
+                started_at: row.get(5)?,
+                finished_at: row.get(6)?,
+                holding_reason: row.get(7)?,
+                wrapper_path: row.get(8)?,
+                log_path: row.get(9)?,
+                exit_code_path: row.get(10)?,
+                timeout_seconds: row.get(11)?,
+                pid: row.get(12)?,
+                process_group_id: row.get(13)?,
+                completion_notified_at: row.get(14)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[derive(Debug, Default)]
+struct QueueAdmissionSummary {
+    started: usize,
+    requeued: usize,
+    held: usize,
+    failed_start: usize,
+    retry_after_seconds: Option<u64>,
+}
+
+fn admit_pending_queue_jobs_conn(
+    conn: &Connection,
+    state_dir: &Path,
+    message_queue_db_path: &Path,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+    continue_after_failed_start: bool,
+) -> Result<QueueAdmissionSummary> {
+    let _admission_guard = QUEUE_ADMISSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let requeued = conn.execute(
+        "UPDATE queue_jobs SET holding_reason = NULL WHERE state = 'pending' AND holding_reason IS NOT NULL",
+        [],
+    )?;
+    let mut summary = QueueAdmissionSummary {
+        requeued,
+        ..QueueAdmissionSummary::default()
+    };
+    loop {
+        let jobs = list_queue_job_runtime_records_conn(conn)?;
+        if !jobs.iter().any(|job| job.state == "pending") {
+            break;
+        }
+        if running_queue_job_count(&jobs, None) as i64 >= admission_policy.max_running_jobs {
+            if displace_background_for_perf_conn(
+                conn,
+                &jobs,
+                message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+            )? {
+                continue;
+            }
+            summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "concurrency_cap")?;
+            break;
+        }
+        let Some(candidate_id) =
+            next_admissible_queue_job_id_conn(conn, &jobs, admission_policy, &mut summary)?
+        else {
+            break;
+        };
+        match RetainedQueueStore::start_queue_job_in_state_dir_with_policy(
+            state_dir,
+            message_queue_db_path,
+            &candidate_id,
+            cancel_grace_seconds,
+            admission_policy,
+        ) {
+            Ok(Some(job)) if job.state == "running" => summary.started += 1,
+            Ok(_) => {}
+            Err(error) => {
+                let Some(current) = get_queue_job_conn(conn, &candidate_id)? else {
+                    return Err(error);
+                };
+                if continue_after_failed_start && current.state == "failed" {
+                    summary.failed_start += 1;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    if let Some(seconds) = summary.retry_after_seconds {
+        schedule_queue_admission_retry(
+            state_dir.to_path_buf(),
+            message_queue_db_path.to_path_buf(),
+            cancel_grace_seconds,
+            admission_policy,
+            seconds,
+        );
+    }
+    Ok(summary)
+}
+
+fn schedule_queue_admission_retry(
+    state_dir: PathBuf,
+    message_queue_db_path: PathBuf,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+    delay_seconds: u64,
+) {
+    thread::spawn(move || {
+        thread::sleep(StdDuration::from_secs(delay_seconds.max(1)));
+        let _ =
+            RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+                &state_dir,
+                &message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+            );
+    });
+}
+
+const DEFAULT_MAX_RUNNING_QUEUE_JOBS: i64 = 2;
+const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
+const QUEUE_JOB_TYPE_ORDER: [&str; 3] = ["perf", "tests", "background"];
+static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
+
+fn next_admissible_queue_job_id_conn(
+    conn: &Connection,
+    jobs: &[QueueJobRuntimeRecord],
+    admission_policy: QueueAdmissionPolicy,
+    summary: &mut QueueAdmissionSummary,
+) -> Result<Option<String>> {
+    for job_type in QUEUE_JOB_TYPE_ORDER {
+        let Some(job) = oldest_pending_queue_job(jobs, job_type) else {
+            continue;
+        };
+        if running_queue_job_count(jobs, Some(job_type)) >= max_concurrent_queue_jobs(job_type) {
+            summary.held +=
+                mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "concurrency_cap")?;
+            continue;
+        }
+        if job_type == "perf" && perf_cooldown_active(jobs, admission_policy) {
+            summary.held +=
+                mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "perf_cooldown")?;
+            if let Some(remaining) = perf_cooldown_remaining_seconds(jobs, admission_policy) {
+                summary.retry_after_seconds = Some(
+                    summary
+                        .retry_after_seconds
+                        .map_or(remaining, |current| current.min(remaining)),
+                );
+            }
+            continue;
+        }
+        if job_type == "perf" && perf_blocked_by_tests_after_perf(jobs) {
+            summary.held +=
+                mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "awaiting_tests")?;
+            continue;
+        }
+        return Ok(Some(job.id.clone()));
+    }
+    Ok(None)
+}
+
+fn displace_background_for_perf_conn(
+    conn: &Connection,
+    jobs: &[QueueJobRuntimeRecord],
+    message_queue_db_path: &Path,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+) -> Result<bool> {
+    if oldest_pending_queue_job(jobs, "perf").is_none() {
+        return Ok(false);
+    }
+    if running_queue_job_count(jobs, Some("perf")) >= max_concurrent_queue_jobs("perf") {
+        return Ok(false);
+    }
+    if perf_cooldown_active(jobs, admission_policy) || perf_blocked_by_tests_after_perf(jobs) {
+        return Ok(false);
+    }
+    let Some(background) = jobs
+        .iter()
+        .filter(|job| job.state == "running" && job.job_type == "background")
+        .min_by_key(|job| (job.started_at.as_deref().unwrap_or(&job.queued_at), &job.id))
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    mark_queue_job_displacing_conn(conn, &background.id)?;
+    let mut background = background;
+    background.holding_reason = Some("displacing".to_owned());
+    if let Some(pgid) = background.process_group_id.or(background.pid) {
+        terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+    }
+    let exit_code = read_exit_code(background.exit_code_path.as_deref());
+    finish_queue_job_conn(
+        conn,
+        &background,
+        "displaced",
+        exit_code,
+        Some(message_queue_db_path),
+    )?;
+    Ok(true)
+}
+
+fn oldest_pending_queue_job<'a>(
+    jobs: &'a [QueueJobRuntimeRecord],
+    job_type: &str,
+) -> Option<&'a QueueJobRuntimeRecord> {
+    jobs.iter()
+        .filter(|job| job.state == "pending" && job.job_type == job_type)
+        .min_by_key(|job| (&job.queued_at, &job.id))
+}
+
+fn running_queue_job_count(jobs: &[QueueJobRuntimeRecord], job_type: Option<&str>) -> usize {
+    jobs.iter()
+        .filter(|job| {
+            job.state == "running"
+                && match job_type {
+                    Some(expected) => job.job_type == expected,
+                    None => true,
+                }
+        })
+        .count()
+}
+
+fn max_concurrent_queue_jobs(job_type: &str) -> usize {
+    match job_type {
+        "perf" => 1,
+        "tests" | "background" => 2,
+        _ => 1,
+    }
+}
+
+fn mark_pending_queue_jobs_holding_conn(
+    conn: &Connection,
+    job_id: Option<&str>,
+    reason: &str,
+) -> Result<usize> {
+    let updated = if let Some(job_id) = job_id {
+        conn.execute(
+            r#"
+            UPDATE queue_jobs
+            SET holding_reason = ?2
+            WHERE id = ?1 AND state = 'pending' AND COALESCE(holding_reason, '') != ?2
+            "#,
+            params![job_id, reason],
+        )?
+    } else {
+        conn.execute(
+            r#"
+            UPDATE queue_jobs
+            SET holding_reason = ?1
+            WHERE state = 'pending' AND COALESCE(holding_reason, '') != ?1
+            "#,
+            params![reason],
+        )?
+    };
+    Ok(updated)
+}
+
+fn perf_cooldown_active(
+    jobs: &[QueueJobRuntimeRecord],
+    admission_policy: QueueAdmissionPolicy,
+) -> bool {
+    perf_cooldown_remaining_seconds(jobs, admission_policy).is_some()
+}
+
+fn perf_cooldown_remaining_seconds(
+    jobs: &[QueueJobRuntimeRecord],
+    admission_policy: QueueAdmissionPolicy,
+) -> Option<u64> {
+    if admission_policy.perf_cooldown_seconds <= 0 {
+        return None;
+    }
+    let now = OffsetDateTime::now_utc();
+    jobs.iter()
+        .filter(|job| matches!(job.job_type.as_str(), "perf" | "tests"))
+        .filter_map(|job| {
+            let elapsed = queue_elapsed_since(job.finished_at.as_deref()?, now)?;
+            if elapsed < 0 || elapsed >= admission_policy.perf_cooldown_seconds {
+                return None;
+            }
+            let remaining: u64 = (admission_policy.perf_cooldown_seconds - elapsed)
+                .try_into()
+                .ok()?;
+            Some(remaining.max(1))
+        })
+        .max()
+}
+
+fn perf_blocked_by_tests_after_perf(jobs: &[QueueJobRuntimeRecord]) -> bool {
+    let now = OffsetDateTime::now_utc();
+    let latest = jobs
+        .iter()
+        .filter(|job| matches!(job.job_type.as_str(), "perf" | "tests"))
+        .filter_map(|job| {
+            let finished_at = job.finished_at.as_deref()?;
+            let elapsed = queue_elapsed_since(finished_at, now)?;
+            if elapsed < 0 {
+                return None;
+            }
+            Some((elapsed, job.job_type.as_str()))
+        })
+        .min_by_key(|(elapsed, _)| *elapsed);
+    matches!(latest, Some((_, "perf")))
+        && jobs.iter().any(|job| {
+            job.job_type == "tests" && matches!(job.state.as_str(), "pending" | "running")
+        })
 }
 
 fn spawn_queue_job_process(job: &QueueJobRuntimeRecord) -> Result<Child> {
@@ -1332,6 +1876,7 @@ fn monitor_queue_job_completion(
     mut child: Child,
     timeout_seconds: u64,
     cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
 ) {
     let started = Instant::now();
     let timeout = StdDuration::from_secs(timeout_seconds.max(1));
@@ -1350,6 +1895,8 @@ fn monitor_queue_job_completion(
                     &job_id,
                     state,
                     exit_code,
+                    cancel_grace_seconds,
+                    admission_policy,
                 );
                 return;
             }
@@ -1394,6 +1941,8 @@ fn monitor_queue_job_completion(
                     &job_id,
                     "timed_out",
                     exit_code,
+                    cancel_grace_seconds,
+                    admission_policy,
                 );
                 return;
             }
@@ -1405,11 +1954,214 @@ fn monitor_queue_job_completion(
                     &job_id,
                     "failed",
                     None,
+                    cancel_grace_seconds,
+                    admission_policy,
                 );
                 return;
             }
         }
     }
+}
+
+fn recover_running_queue_job_conn(
+    conn: &Connection,
+    state_dir: &Path,
+    message_queue_db_path: &Path,
+    job: &QueueJobRuntimeRecord,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+) -> Result<RecoveredQueueJobAction> {
+    if let Some(final_state) =
+        forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
+    {
+        if let Some(pgid) = job.process_group_id.or(job.pid) {
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+        }
+        let exit_code = read_exit_code(job.exit_code_path.as_deref());
+        finish_queue_job_conn(
+            conn,
+            job,
+            final_state,
+            exit_code,
+            Some(message_queue_db_path),
+        )?;
+        return Ok(RecoveredQueueJobAction::Finished(final_state));
+    }
+    if queue_job_exit_code_path_exists(job) {
+        let exit_code = read_exit_code(job.exit_code_path.as_deref());
+        let state = if exit_code == Some(0) {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        finish_queue_job_conn(conn, job, state, exit_code, Some(message_queue_db_path))?;
+        return Ok(RecoveredQueueJobAction::Finished(state));
+    }
+    if queue_job_timed_out(job) {
+        if let Some(pgid) = job.process_group_id.or(job.pid) {
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+        }
+        let exit_code = read_exit_code(job.exit_code_path.as_deref());
+        finish_queue_job_conn(
+            conn,
+            job,
+            "timed_out",
+            exit_code,
+            Some(message_queue_db_path),
+        )?;
+        return Ok(RecoveredQueueJobAction::Finished("timed_out"));
+    }
+    let Some(pid) = job.pid else {
+        finish_queue_job_conn(conn, job, "failed", None, Some(message_queue_db_path))?;
+        return Ok(RecoveredQueueJobAction::Finished("failed"));
+    };
+    if !process_exists(pid) {
+        finish_queue_job_conn(conn, job, "failed", None, Some(message_queue_db_path))?;
+        return Ok(RecoveredQueueJobAction::Finished("failed"));
+    }
+
+    let state_dir = state_dir.to_path_buf();
+    let message_queue_db_path = message_queue_db_path.to_path_buf();
+    let job_id = job.id.clone();
+    thread::spawn(move || {
+        poll_recovered_queue_job(
+            state_dir,
+            message_queue_db_path,
+            job_id,
+            pid,
+            cancel_grace_seconds,
+            admission_policy,
+        );
+    });
+    Ok(RecoveredQueueJobAction::Polling)
+}
+
+fn poll_recovered_queue_job(
+    state_dir: PathBuf,
+    message_queue_db_path: PathBuf,
+    job_id: String,
+    pid: i64,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+) {
+    loop {
+        thread::sleep(StdDuration::from_millis(100));
+        let db_path = state_dir.join("queue_runner.db");
+        let Ok(conn) = open_queue_jobs_connection(&db_path) else {
+            return;
+        };
+        let _ = init_queue_jobs_schema(&conn);
+        let Ok(Some(job)) = get_queue_job_runtime_conn(&conn, &job_id) else {
+            return;
+        };
+        if job.state != "running" {
+            return;
+        }
+        if let Some(final_state) =
+            forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
+        {
+            if let Some(pgid) = job.process_group_id.or(job.pid) {
+                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            }
+            let exit_code = read_exit_code(job.exit_code_path.as_deref());
+            let _ = finish_queue_job_conn(
+                &conn,
+                &job,
+                final_state,
+                exit_code,
+                Some(&message_queue_db_path),
+            );
+            let _ = admit_pending_queue_jobs_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                true,
+            );
+            return;
+        }
+        if queue_job_exit_code_path_exists(&job) {
+            let exit_code = read_exit_code(job.exit_code_path.as_deref());
+            let state = if exit_code == Some(0) {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            let _ =
+                finish_queue_job_conn(&conn, &job, state, exit_code, Some(&message_queue_db_path));
+            let _ = admit_pending_queue_jobs_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                true,
+            );
+            return;
+        }
+        if queue_job_timed_out(&job) {
+            if let Some(pgid) = job.process_group_id.or(job.pid) {
+                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            }
+            let exit_code = read_exit_code(job.exit_code_path.as_deref());
+            let _ = finish_queue_job_conn(
+                &conn,
+                &job,
+                "timed_out",
+                exit_code,
+                Some(&message_queue_db_path),
+            );
+            let _ = admit_pending_queue_jobs_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                true,
+            );
+            return;
+        }
+        if !process_exists(pid) {
+            let _ =
+                finish_queue_job_conn(&conn, &job, "failed", None, Some(&message_queue_db_path));
+            let _ = admit_pending_queue_jobs_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                true,
+            );
+            return;
+        }
+    }
+}
+
+fn queue_job_timed_out(job: &QueueJobRuntimeRecord) -> bool {
+    queue_job_timed_out_at(job, OffsetDateTime::now_utc())
+}
+
+fn queue_job_timed_out_at(job: &QueueJobRuntimeRecord, now_utc: OffsetDateTime) -> bool {
+    let Some(started_at) = job.started_at.as_deref() else {
+        return false;
+    };
+    let Some(elapsed_seconds) = queue_elapsed_since(started_at, now_utc) else {
+        return false;
+    };
+    elapsed_seconds >= job.timeout_seconds.max(1)
+}
+
+fn queue_elapsed_since(value: &str, now_utc: OffsetDateTime) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = OffsetDateTime::parse(value, &Rfc3339) {
+        return Some((now_utc - parsed).whole_seconds());
+    }
+    let parsed = parse_python_naive_datetime(value)?;
+    Some((local_now_naive(now_utc) - parsed).whole_seconds())
 }
 
 fn queue_job_is_cancelled_in_state_dir(state_dir: &Path, job_id: &str) -> bool {
@@ -1435,12 +2187,34 @@ fn mark_queue_job_cancelling_conn(conn: &Connection, job_id: &str) -> Result<()>
     Ok(())
 }
 
+fn mark_queue_job_displacing_conn(conn: &Connection, job_id: &str) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET holding_reason = 'displacing'
+        WHERE id = ?1 AND state = 'running'
+        "#,
+        params![job_id],
+    )?;
+    Ok(())
+}
+
+fn forced_terminal_state_for_holding_reason(holding_reason: Option<&str>) -> Option<&'static str> {
+    match holding_reason {
+        Some("cancelling") => Some("cancelled"),
+        Some("displacing") => Some("displaced"),
+        _ => None,
+    }
+}
+
 fn finish_queue_job_in_state_dir_if_running(
     state_dir: &Path,
     message_queue_db_path: &Path,
     job_id: &str,
     state: &str,
     exit_code: Option<i64>,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
 ) -> Result<()> {
     let db_path = state_dir.join("queue_runner.db");
     let conn = open_queue_jobs_connection(&db_path)?;
@@ -1451,11 +2225,8 @@ fn finish_queue_job_in_state_dir_if_running(
     if job.state != "running" {
         return Ok(());
     }
-    let final_state = if job.holding_reason.as_deref() == Some("cancelling") {
-        "cancelled"
-    } else {
-        state
-    };
+    let final_state =
+        forced_terminal_state_for_holding_reason(job.holding_reason.as_deref()).unwrap_or(state);
     finish_queue_job_conn(
         &conn,
         &job,
@@ -1463,6 +2234,14 @@ fn finish_queue_job_in_state_dir_if_running(
         exit_code,
         Some(message_queue_db_path),
     )?;
+    let _ = admit_pending_queue_jobs_conn(
+        &conn,
+        state_dir,
+        message_queue_db_path,
+        cancel_grace_seconds,
+        admission_policy,
+        true,
+    );
     Ok(())
 }
 
@@ -1613,6 +2392,12 @@ fn read_queue_job_exit_code_from_state_dir(state_dir: &Path, job_id: &str) -> Op
     read_exit_code(Some(&exit_code_path))
 }
 
+fn queue_job_exit_code_path_exists(job: &QueueJobRuntimeRecord) -> bool {
+    job.exit_code_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path).exists())
+}
+
 fn read_exit_code(path: Option<&str>) -> Option<i64> {
     let path = path?;
     fs::read_to_string(path).ok()?.trim().parse::<i64>().ok()
@@ -1650,6 +2435,19 @@ fn process_group_exists(pgid: i64) -> bool {
     Command::new("/bin/kill")
         .arg("-0")
         .arg(format!("-{pgid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn process_exists(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -2176,6 +2974,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expired_count, 0);
+    }
+
+    #[test]
+    fn queue_job_timeout_treats_python_naive_started_at_as_local_time() {
+        let now_utc = OffsetDateTime::now_utc();
+        let now_local = local_now_naive(now_utc);
+        let recent_started_at = python_naive_timestamp(now_local - Duration::seconds(30));
+        let old_started_at = python_naive_timestamp(now_local - Duration::seconds(300));
+        let mut job = QueueJobRuntimeRecord {
+            id: "job-naive-timeout".to_owned(),
+            job_type: "tests".to_owned(),
+            state: "running".to_owned(),
+            notify_session_id: None,
+            queued_at: recent_started_at.clone(),
+            started_at: Some(recent_started_at),
+            finished_at: None,
+            holding_reason: None,
+            wrapper_path: None,
+            log_path: None,
+            exit_code_path: None,
+            timeout_seconds: 120,
+            pid: None,
+            process_group_id: None,
+            completion_notified_at: None,
+        };
+
+        assert!(!queue_job_timed_out_at(&job, now_utc));
+        job.started_at = Some(old_started_at);
+        assert!(queue_job_timed_out_at(&job, now_utc));
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

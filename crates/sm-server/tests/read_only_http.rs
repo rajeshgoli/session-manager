@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use sm_server::config::RustShadowConfig;
-use sm_server::queue::RetainedQueueStore;
+use sm_server::queue::{QueueAdmissionPolicy, RetainedQueueStore};
 use sm_server::{
     config::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
@@ -124,27 +124,220 @@ async fn wait_for_queue_job_state(app: axum::Router, job_id: &str, states: &[&st
 }
 
 fn queued_message_texts(db_path: &PathBuf, target_session_id: &str) -> Vec<String> {
-    let conn = Connection::open(db_path).unwrap();
-    let mut statement = conn
-        .prepare(
-            "SELECT text FROM message_queue WHERE target_session_id = ?1 ORDER BY queued_at, id",
-        )
-        .unwrap();
-    statement
-        .query_map([target_session_id], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    let mut last_texts = Vec::new();
+    let mut stable_reads = 0;
+    for attempt in 0..50 {
+        if let Ok(conn) = Connection::open(db_path) {
+            if let Ok(mut statement) = conn.prepare(
+                "SELECT text FROM message_queue WHERE target_session_id = ?1 ORDER BY queued_at, id",
+            ) {
+                let texts = statement
+                    .query_map([target_session_id], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                if texts == last_texts {
+                    stable_reads += 1;
+                } else {
+                    stable_reads = 0;
+                    last_texts = texts;
+                }
+                if (!last_texts.is_empty() && stable_reads >= 2) || attempt == 49 {
+                    return last_texts;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    last_texts
 }
 
 fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> Option<String> {
+    for attempt in 0..50 {
+        let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+        let completion_notified_at = conn
+            .query_row(
+                "SELECT completion_notified_at FROM queue_jobs WHERE id = ?1",
+                [job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        if completion_notified_at.is_some() || attempt == 49 {
+            return completion_notified_at;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+fn queue_job_text_column(queue_state_dir: &PathBuf, job_id: &str, column: &str) -> String {
+    assert!(matches!(column, "exit_code_path" | "log_path"));
     let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
     conn.query_row(
-        "SELECT completion_notified_at FROM queue_jobs WHERE id = ?1",
+        &format!("SELECT {column} FROM queue_jobs WHERE id = ?1"),
         [job_id],
-        |row| row.get::<_, Option<String>>(0),
+        |row| row.get::<_, String>(0),
     )
     .unwrap()
+}
+
+fn set_queue_job_text_column_null(queue_state_dir: &PathBuf, job_id: &str, column: &str) {
+    assert!(matches!(column, "wrapper_path" | "log_path"));
+    let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+    conn.execute(
+        &format!("UPDATE queue_jobs SET {column} = NULL WHERE id = ?1"),
+        [job_id],
+    )
+    .unwrap();
+}
+
+fn set_queue_job_holding_reason(queue_state_dir: &PathBuf, job_id: &str, holding_reason: &str) {
+    let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+    conn.execute(
+        "UPDATE queue_jobs SET holding_reason = ?2 WHERE id = ?1",
+        (job_id, holding_reason),
+    )
+    .unwrap();
+}
+
+fn mark_queue_job_terminal(
+    queue_state_dir: &PathBuf,
+    job_id: &str,
+    state: &str,
+    started_at: &str,
+    finished_at: &str,
+    exit_code: i64,
+) {
+    assert!(matches!(
+        state,
+        "succeeded" | "failed" | "cancelled" | "timed_out"
+    ));
+    let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+    conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET state = ?2,
+            started_at = ?3,
+            finished_at = ?4,
+            exit_code = ?5,
+            holding_reason = NULL
+        WHERE id = ?1
+        "#,
+        (job_id, state, started_at, finished_at, exit_code),
+    )
+    .unwrap();
+}
+
+fn mark_queue_job_running(
+    queue_state_dir: &PathBuf,
+    job_id: &str,
+    started_at: &str,
+    pid: i64,
+    process_group_id: i64,
+) {
+    mark_queue_job_running_with_holding(
+        queue_state_dir,
+        job_id,
+        started_at,
+        pid,
+        process_group_id,
+        None,
+    );
+}
+
+fn mark_queue_job_running_with_holding(
+    queue_state_dir: &PathBuf,
+    job_id: &str,
+    started_at: &str,
+    pid: i64,
+    process_group_id: i64,
+    holding_reason: Option<&str>,
+) {
+    let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+    conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET state = 'running',
+            started_at = ?2,
+            pid = ?3,
+            process_group_id = ?4,
+            holding_reason = ?5
+        WHERE id = ?1
+        "#,
+        (job_id, started_at, pid, process_group_id, holding_reason),
+    )
+    .unwrap();
+}
+
+fn test_now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+fn queue_runtime_test_app(
+    state_file: &PathBuf,
+    queue_state_dir: &PathBuf,
+    message_queue_db: &PathBuf,
+    runtime_enabled: bool,
+    fixture_writes_enabled: bool,
+) -> axum::Router {
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 0,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = runtime_enabled;
+    config.rust_core.fixture_writes_enabled = fixture_writes_enabled;
+    router(AppState::new(config))
+}
+
+async fn create_pending_queue_job(
+    app: axum::Router,
+    working_dir: &PathBuf,
+    label: &str,
+    script: &str,
+    timeout_seconds: i64,
+) -> String {
+    create_pending_queue_job_of_type(app, working_dir, "tests", label, script, timeout_seconds)
+        .await
+}
+
+async fn create_pending_queue_job_of_type(
+    app: axum::Router,
+    working_dir: &PathBuf,
+    job_type: &str,
+    label: &str,
+    script: &str,
+    timeout_seconds: i64,
+) -> String {
+    let (status, payload) = post_json(
+        app,
+        "/queue-jobs",
+        json!({
+            "type": job_type,
+            "label": label,
+            "script": script,
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": timeout_seconds
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["state"], "pending");
+    payload["id"].as_str().unwrap().to_owned()
 }
 
 async fn json_request_with_headers_and_peer(
@@ -1781,6 +1974,7 @@ async fn queue_jobs_missing_db_returns_empty_jobs() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -1798,6 +1992,7 @@ async fn queue_jobs_missing_db_returns_empty_jobs() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -1871,6 +2066,7 @@ async fn queue_jobs_lists_rows_with_filters_and_session_names() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -2016,6 +2212,7 @@ async fn queue_jobs_unknown_notify_target_returns_404() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -2067,6 +2264,7 @@ async fn queue_job_create_is_disabled_by_default() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -2103,6 +2301,7 @@ async fn queue_job_create_persists_pending_job_and_files() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     };
@@ -2206,6 +2405,7 @@ async fn queue_job_create_validates_request_shape() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     };
@@ -2293,6 +2493,7 @@ async fn queue_job_create_runs_when_runtime_enabled() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: message_queue_db.display().to_string(),
@@ -2341,6 +2542,77 @@ async fn queue_job_create_runs_when_runtime_enabled() {
 }
 
 #[tokio::test]
+async fn queue_job_runtime_respects_configured_max_running_jobs() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-configured-cap");
+    let message_queue_db = state_file.with_extension("queue-configured-cap-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 0,
+            max_running_jobs: 1,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, first) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "configured cap first",
+            "script": "printf first-start; sleep 1; printf first-end",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 5
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    let first_running = wait_for_queue_job_state(app.clone(), &first_id, &["running"]).await;
+    assert_eq!(first_running["state"], "running");
+
+    let (status, second) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "configured cap second",
+            "script": "printf second-started",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 5
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second_id = second["id"].as_str().unwrap().to_owned();
+    assert_eq!(second["state"], "pending");
+    assert_eq!(second["holding_reason"], "concurrency_cap");
+
+    let first_final = wait_for_queue_job_state(app.clone(), &first_id, &["succeeded"]).await;
+    assert_eq!(first_final["exit_code"], 0);
+    let second_final = wait_for_queue_job_state(app, &second_id, &["succeeded"]).await;
+    assert_eq!(second_final["exit_code"], 0);
+    assert_eq!(second_final["holding_reason"], Value::Null);
+}
+
+#[tokio::test]
 async fn queue_job_runtime_persists_failure_and_timeout() {
     let state_file = write_session_fixture();
     let queue_state_dir = state_file.with_extension("queue-runner-terminal");
@@ -2355,6 +2627,7 @@ async fn queue_job_runtime_persists_failure_and_timeout() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: message_queue_db.display().to_string(),
@@ -2419,6 +2692,823 @@ async fn queue_job_runtime_persists_failure_and_timeout() {
 }
 
 #[tokio::test]
+async fn queue_runtime_recovery_requeues_held_pending_job() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-held-pending");
+    let message_queue_db = state_file.with_extension("queue-recover-held-pending-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover held pending",
+        "printf recovered-held",
+        5,
+    )
+    .await;
+    set_queue_job_holding_reason(&queue_state_dir, &job_id, "memory_pressure");
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.requeued_pending, 1);
+    assert_eq!(summary.started_pending, 1);
+    assert_eq!(summary.held_pending, 0);
+    let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(final_payload["holding_reason"], Value::Null);
+    assert!(final_payload["started_at"].as_str().is_some());
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
+}
+
+#[tokio::test]
+async fn queue_runtime_recovery_admits_pending_jobs_through_concurrency_cap() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-pending-cap");
+    let message_queue_db = state_file.with_extension("queue-recover-pending-cap-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let first_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover cap first",
+        "sleep 0.5; printf first",
+        5,
+    )
+    .await;
+    let second_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover cap second",
+        "sleep 0.5; printf second",
+        5,
+    )
+    .await;
+    let third_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover cap third",
+        "printf third",
+        5,
+    )
+    .await;
+    set_queue_job_holding_reason(&queue_state_dir, &third_id, "memory_pressure");
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.started_pending, 2);
+    assert_eq!(summary.requeued_pending, 1);
+    assert!(summary.held_pending >= 1);
+    let (status, third_pending) = get_json(app.clone(), &format!("/queue-jobs/{third_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(third_pending["state"], "pending");
+    assert_eq!(third_pending["holding_reason"], "concurrency_cap");
+
+    let first_final = wait_for_queue_job_state(app.clone(), &first_id, &["succeeded"]).await;
+    let second_final = wait_for_queue_job_state(app.clone(), &second_id, &["succeeded"]).await;
+    let third_final = wait_for_queue_job_state(app, &third_id, &["succeeded"]).await;
+    assert_eq!(first_final["exit_code"], 0);
+    assert_eq!(second_final["exit_code"], 0);
+    assert_eq!(third_final["exit_code"], 0);
+}
+
+#[tokio::test]
+async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-displace-background");
+    let message_queue_db = state_file.with_extension("queue-displace-background-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 2,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, first_background) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "background",
+            "label": "first background",
+            "script": "trap 'exit 0' TERM; printf first-start; while true; do sleep 1; done",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_background_id = first_background["id"].as_str().unwrap().to_owned();
+    let (status, second_background) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "background",
+            "label": "second background",
+            "script": "printf second-start; sleep 2; printf second-end",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second_background_id = second_background["id"].as_str().unwrap().to_owned();
+    let first_running =
+        wait_for_queue_job_state(app.clone(), &first_background_id, &["running"]).await;
+    let second_running =
+        wait_for_queue_job_state(app.clone(), &second_background_id, &["running"]).await;
+    assert!(first_running["pid"].as_i64().unwrap_or_default() > 0);
+    assert!(second_running["pid"].as_i64().unwrap_or_default() > 0);
+
+    let (status, perf) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "perf",
+            "label": "ready perf",
+            "script": "printf perf-started",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let perf_id = perf["id"].as_str().unwrap().to_owned();
+
+    let first_final =
+        wait_for_queue_job_state(app.clone(), &first_background_id, &["displaced"]).await;
+    assert_eq!(first_final["state"], "displaced");
+    let perf_final = wait_for_queue_job_state(app.clone(), &perf_id, &["succeeded"]).await;
+    assert_eq!(perf_final["exit_code"], 0);
+    assert_eq!(perf_final["holding_reason"], Value::Null);
+    let second_final = wait_for_queue_job_state(app, &second_background_id, &["succeeded"]).await;
+    assert_eq!(second_final["exit_code"], 0);
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert!(notifications.iter().any(|text| text.contains(&format!(
+        "[sm queue] {first_background_id} completed: displaced"
+    ))));
+    assert!(notifications
+        .iter()
+        .any(|text| text.contains(&format!("[sm queue] {perf_id} completed: succeeded"))));
+}
+
+#[tokio::test]
+async fn queue_runtime_recovery_retries_perf_after_cooldown_expires() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-perf-cooldown");
+    let message_queue_db =
+        state_file.with_extension("queue-recover-perf-cooldown-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let seed_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "cooldown seed",
+        "printf cooldown-seed",
+        5,
+    )
+    .await;
+    let now = time::OffsetDateTime::now_utc();
+    let started_at = (now - time::Duration::seconds(29))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let finished_at = (now - time::Duration::seconds(28))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    mark_queue_job_terminal(
+        &queue_state_dir,
+        &seed_id,
+        "succeeded",
+        &started_at,
+        &finished_at,
+        0,
+    );
+    let perf_id = create_pending_queue_job_of_type(
+        app.clone(),
+        &working_dir,
+        "perf",
+        "perf after cooldown",
+        "printf perf-after-cooldown",
+        5,
+    )
+    .await;
+
+    RetainedQueueStore::admit_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+        .unwrap();
+
+    let (status, held) = get_json(app.clone(), &format!("/queue-jobs/{perf_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(held["state"], "pending");
+    assert_eq!(held["holding_reason"], "perf_cooldown");
+
+    let final_payload = wait_for_queue_job_state(app, &perf_id, &["succeeded"]).await;
+    assert_eq!(final_payload["holding_reason"], Value::Null);
+    assert_eq!(final_payload["exit_code"], 0);
+    assert_eq!(
+        fs::read_to_string(queue_state_dir.join(format!("logs/{perf_id}.log"))).unwrap(),
+        "perf-after-cooldown"
+    );
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &perf_id).is_some());
+}
+
+#[tokio::test]
+async fn queue_runtime_admission_respects_configured_perf_cooldown() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-configured-perf-cooldown");
+    let message_queue_db =
+        state_file.with_extension("queue-configured-perf-cooldown-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let seed_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "configured cooldown seed",
+        "printf configured-cooldown-seed",
+        5,
+    )
+    .await;
+    let now = time::OffsetDateTime::now_utc();
+    let started_at = (now - time::Duration::seconds(4))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let finished_at = (now - time::Duration::seconds(3))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    mark_queue_job_terminal(
+        &queue_state_dir,
+        &seed_id,
+        "succeeded",
+        &started_at,
+        &finished_at,
+        0,
+    );
+    let perf_id = create_pending_queue_job_of_type(
+        app.clone(),
+        &working_dir,
+        "perf",
+        "configured cooldown perf",
+        "printf configured-perf",
+        5,
+    )
+    .await;
+
+    RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+        &queue_state_dir,
+        &message_queue_db,
+        0,
+        QueueAdmissionPolicy {
+            max_running_jobs: 2,
+            perf_cooldown_seconds: 5,
+        },
+    )
+    .unwrap();
+
+    let (status, held) = get_json(app.clone(), &format!("/queue-jobs/{perf_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(held["state"], "pending");
+    assert_eq!(held["holding_reason"], "perf_cooldown");
+
+    RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+        &queue_state_dir,
+        &message_queue_db,
+        0,
+        QueueAdmissionPolicy {
+            max_running_jobs: 2,
+            perf_cooldown_seconds: 1,
+        },
+    )
+    .unwrap();
+
+    let final_payload = wait_for_queue_job_state(app, &perf_id, &["succeeded"]).await;
+    assert_eq!(final_payload["exit_code"], 0);
+    assert_eq!(final_payload["holding_reason"], Value::Null);
+}
+
+#[tokio::test]
+async fn queue_runtime_admission_serializes_concurrent_start_claims() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-concurrent-admission");
+    let message_queue_db = state_file.with_extension("queue-concurrent-admission-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let marker_path = working_dir.join("started.txt");
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "concurrent admission",
+        &format!("printf started >> {}; sleep 0.1", marker_path.display()),
+        5,
+    )
+    .await;
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let queue_state_dir = queue_state_dir.clone();
+        let message_queue_db = message_queue_db.clone();
+        handles.push(thread::spawn(move || {
+            RetainedQueueStore::admit_queue_jobs_in_state_dir(
+                &queue_state_dir,
+                &message_queue_db,
+                0,
+            )
+            .unwrap();
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(final_payload["exit_code"], 0);
+    assert_eq!(
+        fs::read_to_string(marker_path)
+            .unwrap()
+            .matches("started")
+            .count(),
+        1
+    );
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
+}
+
+#[tokio::test]
+async fn queue_runtime_recovery_starts_pending_job() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-pending");
+    let message_queue_db = state_file.with_extension("queue-recover-pending-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover pending",
+        "printf recovered-pending",
+        5,
+    )
+    .await;
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.started_pending, 1);
+    let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(final_payload["exit_code"], 0);
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
+    assert!(notifications[0].contains("log tail:\nrecovered-pending"));
+}
+
+#[tokio::test]
+async fn queue_runtime_recovery_continues_after_bad_pending_job() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-bad-pending");
+    let message_queue_db = state_file.with_extension("queue-recover-bad-pending-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let bad_job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover bad pending",
+        "printf should-not-start",
+        5,
+    )
+    .await;
+    let good_job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover good pending",
+        "printf recovered-after-bad-pending",
+        5,
+    )
+    .await;
+    set_queue_job_text_column_null(&queue_state_dir, &bad_job_id, "wrapper_path");
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.finished_failed, 1);
+    assert_eq!(summary.started_pending, 1);
+    let (bad_status, bad_detail) =
+        get_json(app.clone(), &format!("/queue-jobs/{bad_job_id}")).await;
+    assert_eq!(bad_status, StatusCode::OK);
+    assert_eq!(bad_detail["state"], "failed");
+    let good_final = wait_for_queue_job_state(app, &good_job_id, &["succeeded"]).await;
+    assert_eq!(good_final["exit_code"], 0);
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notifications.len(), 2);
+    assert!(notifications[0].contains(&format!("[sm queue] {bad_job_id} completed: failed")));
+    assert!(notifications[1].contains(&format!("[sm queue] {good_job_id} completed: succeeded")));
+}
+
+#[tokio::test]
+async fn queue_job_create_continues_after_bad_existing_pending_job() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-create-after-bad-pending");
+    let message_queue_db = state_file.with_extension("queue-create-after-bad-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let seed_app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let bad_job_id = create_pending_queue_job(
+        seed_app,
+        &working_dir,
+        "bad existing pending",
+        "printf should-not-start",
+        5,
+    )
+    .await;
+    set_queue_job_text_column_null(&queue_state_dir, &bad_job_id, "wrapper_path");
+
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        true,
+        false,
+    );
+    let (status, created) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "created after bad pending",
+            "script": "printf created-after-bad",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 5
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let created_id = created["id"].as_str().unwrap().to_owned();
+
+    let bad_final = wait_for_queue_job_state(app.clone(), &bad_job_id, &["failed"]).await;
+    assert_eq!(bad_final["state"], "failed");
+    let created_final = wait_for_queue_job_state(app, &created_id, &["succeeded"]).await;
+    assert_eq!(created_final["exit_code"], 0);
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notifications.len(), 2);
+    assert!(notifications[0].contains(&format!("[sm queue] {bad_job_id} completed: failed")));
+    assert!(notifications[1].contains(&format!("[sm queue] {created_id} completed: succeeded")));
+}
+
+#[tokio::test]
+async fn queue_runtime_recovery_finishes_running_job_with_exit_code() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-exit");
+    let message_queue_db = state_file.with_extension("queue-recover-exit-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover exit",
+        "printf recovered-exit",
+        5,
+    )
+    .await;
+    let exit_code_path = queue_job_text_column(&queue_state_dir, &job_id, "exit_code_path");
+    let log_path = queue_job_text_column(&queue_state_dir, &job_id, "log_path");
+    fs::write(&exit_code_path, "0\n").unwrap();
+    fs::write(&log_path, "recovered-exit").unwrap();
+    mark_queue_job_running(
+        &queue_state_dir,
+        &job_id,
+        &test_now_rfc3339(),
+        9_999_999,
+        9_999_999,
+    );
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.recovered_running, 1);
+    assert_eq!(summary.finished_succeeded, 1);
+    let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["state"], "succeeded");
+    assert_eq!(detail["exit_code"], 0);
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
+}
+
+#[tokio::test]
+async fn queue_runtime_recovery_marks_dead_running_job_failed() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-dead");
+    let message_queue_db = state_file.with_extension("queue-recover-dead-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover dead",
+        "printf never-ran",
+        5,
+    )
+    .await;
+    mark_queue_job_running(
+        &queue_state_dir,
+        &job_id,
+        &test_now_rfc3339(),
+        9_999_999,
+        9_999_999,
+    );
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.recovered_running, 1);
+    assert_eq!(summary.finished_failed, 1);
+    let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["state"], "failed");
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_honors_persisted_running_cancellation() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-cancelling");
+    let message_queue_db = state_file.with_extension("queue-recover-cancelling-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover cancelling",
+        "printf never-completes",
+        30,
+    )
+    .await;
+    let ready_path = queue_state_dir.join("recover-cancelling.ready");
+    let mut child = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("printf ready > \"$READY_PATH\"; while true; do sleep 1; done")
+        .env("READY_PATH", &ready_path)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let _ready = wait_for_file_contains(&ready_path, "ready").await;
+    let pid = i64::from(child.id());
+    mark_queue_job_running_with_holding(
+        &queue_state_dir,
+        &job_id,
+        &test_now_rfc3339(),
+        pid,
+        pid,
+        Some("cancelling"),
+    );
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.recovered_running, 1);
+    assert_eq!(summary.finished_cancelled, 1);
+    let mut exited = false;
+    for _ in 0..50 {
+        if child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !exited {
+        let _ = Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .status();
+        let _ = child.wait();
+    }
+    assert!(exited, "recovered cancelling process was not stopped");
+    let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["state"], "cancelled");
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_polls_live_running_job_to_completion() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-live");
+    let message_queue_db = state_file.with_extension("queue-recover-live-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover live",
+        "printf placeholder",
+        5,
+    )
+    .await;
+    let exit_code_path = queue_job_text_column(&queue_state_dir, &job_id, "exit_code_path");
+    let log_path = queue_job_text_column(&queue_state_dir, &job_id, "log_path");
+    let ready_path = queue_state_dir.join("recover-live.ready");
+    let mut child = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("printf ready > \"$READY_PATH\"; sleep 0.3; printf recovered-live > \"$LOG_PATH\"; printf '0\\n' > \"$EXIT_CODE_PATH\"")
+        .env("READY_PATH", &ready_path)
+        .env("LOG_PATH", &log_path)
+        .env("EXIT_CODE_PATH", &exit_code_path)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let _ready = wait_for_file_contains(&ready_path, "ready").await;
+    let pid = i64::from(child.id());
+    mark_queue_job_running(&queue_state_dir, &job_id, &test_now_rfc3339(), pid, pid);
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+    assert_eq!(summary.recovered_running, 1);
+    assert_eq!(summary.polling_running, 1);
+    let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(final_payload["exit_code"], 0);
+    let _ = child.wait();
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains("log tail:\nrecovered-live"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_times_out_and_stops_live_running_job() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-timeout");
+    let message_queue_db = state_file.with_extension("queue-recover-timeout-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover timeout",
+        "printf never-completes",
+        1,
+    )
+    .await;
+    let ready_path = queue_state_dir.join("recover-timeout.ready");
+    let mut child = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("trap '' TERM; printf ready > \"$READY_PATH\"; while true; do sleep 1; done")
+        .env("READY_PATH", &ready_path)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let _ready = wait_for_file_contains(&ready_path, "ready").await;
+    let pid = i64::from(child.id());
+    mark_queue_job_running(&queue_state_dir, &job_id, "2026-06-14T00:00:00Z", pid, pid);
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+
+    assert_eq!(summary.recovered_running, 1);
+    assert_eq!(summary.finished_timed_out, 1);
+    let mut exited = false;
+    for _ in 0..50 {
+        if child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !exited {
+        let _ = Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .status();
+        let _ = child.wait();
+    }
+    assert!(exited, "recovered timed-out process was not stopped");
+    let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["state"], "timed_out");
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
+}
+
+#[tokio::test]
 async fn queue_job_cancel_persists_pending_cancel() {
     let state_file = write_session_fixture();
     let queue_state_dir = state_file.with_extension("queue-runner-cancel");
@@ -2433,6 +3523,7 @@ async fn queue_job_cancel_persists_pending_cancel() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: message_queue_db.display().to_string(),
@@ -2477,6 +3568,63 @@ async fn queue_job_cancel_persists_pending_cancel() {
 }
 
 #[tokio::test]
+async fn queue_job_cancel_does_not_admit_pending_jobs_without_runtime_ownership() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-cancel-no-runtime-admission");
+    let message_queue_db = state_file.with_extension("queue-cancel-no-runtime-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 0,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let first_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "cancel fixture first",
+        "printf first-should-not-run",
+        5,
+    )
+    .await;
+    let second_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "cancel fixture second",
+        "printf second-should-not-run",
+        5,
+    )
+    .await;
+
+    let (status, cancelled) =
+        delete_json(app.clone(), &format!("/queue-jobs/{first_id}"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["state"], "cancelled");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (status, second_detail) = get_json(app, &format!("/queue-jobs/{second_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second_detail["state"], "pending");
+    assert_eq!(second_detail["pid"], Value::Null);
+    assert!(!queue_state_dir
+        .join(format!("logs/{second_id}.log"))
+        .exists());
+}
+
+#[tokio::test]
 async fn queue_job_cancel_terminates_running_job() {
     let state_file = write_session_fixture();
     let queue_state_dir = state_file.with_extension("queue-runner-cancel-running");
@@ -2491,6 +3639,7 @@ async fn queue_job_cancel_terminates_running_job() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: message_queue_db.display().to_string(),
@@ -2540,6 +3689,88 @@ async fn queue_job_cancel_terminates_running_job() {
     assert!(notifications[0].contains("log tail:\nbefore-cancel"));
 }
 
+#[tokio::test]
+async fn queue_job_cancel_admits_next_pending_job() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-cancel-admits-next");
+    let message_queue_db = state_file.with_extension("queue-cancel-admits-next-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        true,
+        false,
+    );
+
+    let (status, first) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "cancel admits first",
+            "script": "printf first-start; sleep 2; printf first-end",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    let (status, second) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "cancel admits second",
+            "script": "printf second-start; sleep 2; printf second-end",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second_id = second["id"].as_str().unwrap().to_owned();
+    let first_running = wait_for_queue_job_state(app.clone(), &first_id, &["running"]).await;
+    let second_running = wait_for_queue_job_state(app.clone(), &second_id, &["running"]).await;
+    assert!(first_running["pid"].as_i64().unwrap_or_default() > 0);
+    assert!(second_running["pid"].as_i64().unwrap_or_default() > 0);
+
+    let third_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "cancel admits third",
+        "printf third-started",
+        10,
+    )
+    .await;
+    let (status, third_pending) = get_json(app.clone(), &format!("/queue-jobs/{third_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(third_pending["state"], "pending");
+    assert_eq!(third_pending["holding_reason"], "concurrency_cap");
+
+    let (status, cancelled) =
+        delete_json(app.clone(), &format!("/queue-jobs/{first_id}"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["state"], "cancelled");
+    let third_final = wait_for_queue_job_state(app.clone(), &third_id, &["succeeded"]).await;
+    assert_eq!(third_final["exit_code"], 0);
+    assert_eq!(third_final["holding_reason"], Value::Null);
+    assert_eq!(
+        fs::read_to_string(queue_state_dir.join(format!("logs/{third_id}.log"))).unwrap(),
+        "third-started"
+    );
+    let second_final = wait_for_queue_job_state(app, &second_id, &["succeeded"]).await;
+    assert_eq!(second_final["exit_code"], 0);
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &first_id).is_some());
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &third_id).is_some());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn queue_job_cancel_force_stops_unmonitored_running_process_group() {
@@ -2556,6 +3787,7 @@ async fn queue_job_cancel_force_stops_unmonitored_running_process_group() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         sm_send: SmSendConfig {
             db_path: message_queue_db.display().to_string(),
@@ -3446,6 +4678,7 @@ async fn shadow_http_reports_queue_job_detail_404() {
                 .to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     }));
@@ -3491,6 +4724,7 @@ async fn shadow_http_reports_queue_job_detail_200_as_status_only() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             configured: true,
+            ..QueueRunnerConfig::default()
         },
         ..AppConfig::default()
     }));

@@ -1,10 +1,12 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, thread};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use sm_server::{
     config::AppConfig,
     http::{router, AppState},
+    queue::{QueueAdmissionPolicy, QueueRecoverySummary, RetainedQueueStore},
+    sessions::expand_home,
 };
 use tokio::net::TcpListener;
 
@@ -31,6 +33,31 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind {address}"))?;
+
+    if config.rust_core.runtime_enabled {
+        let queue_state_dir_config = config.queue_runner_state_dir();
+        let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
+        let message_queue_db_path = expand_home(&config.sm_send.db_path);
+        let cancel_grace_seconds = config.queue_runner.cancel_grace_seconds;
+        let admission_policy = QueueAdmissionPolicy {
+            max_running_jobs: config.queue_runner.max_running_jobs,
+            perf_cooldown_seconds: config.queue_runner.perf_cooldown_seconds,
+        };
+        thread::spawn(
+            move || match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
+                &queue_state_dir,
+                &message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+            ) {
+                Ok(summary) if summary != QueueRecoverySummary::default() => {
+                    eprintln!("queue runtime recovery: {summary:?}");
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("queue runtime recovery failed: {error:#}"),
+            },
+        );
+    }
 
     eprintln!("sm-server listening on http://{address}");
     axum::serve(

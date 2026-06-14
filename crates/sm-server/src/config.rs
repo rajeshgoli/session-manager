@@ -758,6 +758,10 @@ pub struct QueueRunnerConfig {
     pub state_dir: String,
     #[serde(default = "default_queue_runner_cancel_grace_seconds")]
     pub cancel_grace_seconds: u64,
+    #[serde(default = "default_queue_runner_max_running_jobs")]
+    pub max_running_jobs: i64,
+    #[serde(default = "default_queue_runner_perf_cooldown_seconds")]
+    pub perf_cooldown_seconds: i64,
     #[serde(skip)]
     pub configured: bool,
 }
@@ -767,6 +771,8 @@ impl Default for QueueRunnerConfig {
         Self {
             state_dir: default_queue_runner_state_dir(),
             cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
+            max_running_jobs: default_queue_runner_max_running_jobs(),
+            perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
             configured: false,
         }
     }
@@ -780,6 +786,14 @@ fn default_queue_runner_cancel_grace_seconds() -> u64 {
     10
 }
 
+fn default_queue_runner_max_running_jobs() -> i64 {
+    2
+}
+
+fn default_queue_runner_perf_cooldown_seconds() -> i64 {
+    30
+}
+
 fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
     if state_file == default_state_file() {
         return QueueRunnerConfig::default();
@@ -789,6 +803,8 @@ fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
             .to_string_lossy()
             .into_owned(),
         cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
+        max_running_jobs: default_queue_runner_max_running_jobs(),
+        perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
         configured: false,
     }
 }
@@ -1868,6 +1884,8 @@ cloudflare_access:
 queue_runner:
   state_dir: /tmp/custom-queue-runner
   cancel_grace_seconds: 3
+  max_running_jobs: 1
+  perf_cooldown_seconds: 7
 "#,
         )
         .unwrap();
@@ -1875,6 +1893,8 @@ queue_runner:
 
         assert_eq!(config.queue_runner.state_dir, "/tmp/custom-queue-runner");
         assert_eq!(config.queue_runner.cancel_grace_seconds, 3);
+        assert_eq!(config.queue_runner.max_running_jobs, 1);
+        assert_eq!(config.queue_runner.perf_cooldown_seconds, 7);
     }
 
     #[test]
@@ -1893,6 +1913,8 @@ paths:
             "/tmp/sm-fixture/queue-runner"
         );
         assert_eq!(config.queue_runner.cancel_grace_seconds, 10);
+        assert_eq!(config.queue_runner.max_running_jobs, 2);
+        assert_eq!(config.queue_runner.perf_cooldown_seconds, 30);
     }
 
     #[test]
