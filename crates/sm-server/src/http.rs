@@ -89,8 +89,8 @@ use crate::email::{
 };
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::queue::{
-    CodexReviewRequestFilters, CodexReviewRequestRegistration, QueueJobFilters, QueueJobRecord,
-    RetainedQueueStore,
+    CodexReviewRequestFilters, CodexReviewRequestRegistration, CreateQueueJob, QueueJobFilters,
+    QueueJobRecord, RetainedQueueStore,
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
@@ -297,7 +297,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
-        .route("/queue-jobs", get(list_queue_jobs))
+        .route("/queue-jobs", get(list_queue_jobs).post(create_queue_job))
         .route("/queue-jobs/{job_id}", get(get_queue_job))
         .route("/codex-review-requests", get(list_codex_review_requests))
         .route(
@@ -1895,6 +1895,95 @@ async fn get_queue_job(
     let Some(job) = RetainedQueueStore::get_queue_job_from_path(&queue_db_path, &job_id)? else {
         return Err(ApiError::NotFound("Queue job not found"));
     };
+    Ok(Json(queue_job_response(&state, job)?))
+}
+
+async fn create_queue_job(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<QueueJobCreateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/queue-jobs")?;
+    ensure_core_writes_enabled(&state)?;
+
+    let notify_identifier = trimmed(&payload.notify_target)
+        .or_else(|| trimmed(&payload.requester_session_id))
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "notify_target or requester_session_id is required".to_owned(),
+        })?;
+    let Some(notify_session) = resolve_session_or_registry_role(&state, &notify_identifier)? else {
+        return Err(ApiError::NotFound("Notify target not found"));
+    };
+
+    let job_type = payload.job_type.trim();
+    let default_timeout =
+        queue_job_default_timeout_seconds(job_type).ok_or_else(|| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("unknown queue job type: {job_type}"),
+        })?;
+    let argv = payload
+        .argv
+        .and_then(|argv| (!argv.is_empty()).then_some(argv));
+    let script = payload.script.filter(|script| !script.is_empty());
+    if argv.is_some() == script.is_some() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "exactly one of argv or script is required".to_owned(),
+        });
+    }
+    let cwd_path = expand_home(&payload.cwd);
+    let cwd_path = cwd_path.canonicalize().map_err(|_| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: format!("cwd does not exist or is not a directory: {}", payload.cwd),
+    })?;
+    if !cwd_path.is_dir() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("cwd does not exist or is not a directory: {}", payload.cwd),
+        });
+    }
+    let timeout_seconds = payload.timeout_seconds.unwrap_or(default_timeout);
+    if timeout_seconds <= 0 {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "timeout_seconds must be greater than 0".to_owned(),
+        });
+    }
+    let label = payload
+        .label
+        .as_deref()
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            argv.as_ref().and_then(|argv| {
+                argv.first().map(|first| {
+                    std::path::Path::new(first)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or(first)
+                        .to_owned()
+                })
+            })
+        })
+        .unwrap_or_else(|| "script".to_owned());
+    let queue_state_dir_config = state.config.queue_runner_state_dir();
+    let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
+    let job = RetainedQueueStore::create_queue_job_in_state_dir(
+        &queue_state_dir,
+        CreateQueueJob {
+            job_type: job_type.to_owned(),
+            label,
+            requester_session_id: trimmed(&payload.requester_session_id),
+            notify_session_id: notify_session.id,
+            cwd: cwd_path.display().to_string(),
+            argv,
+            script,
+            env: payload.env,
+            timeout_seconds,
+        },
+    )?;
     Ok(Json(queue_job_response(&state, job)?))
 }
 
@@ -7090,6 +7179,40 @@ struct ListQueueJobsQuery {
     state: Option<String>,
     #[serde(default)]
     include_terminal: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueJobCreateRequest {
+    #[serde(default = "default_queue_job_type", rename = "type")]
+    job_type: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    script: Option<String>,
+    cwd: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    notify_target: Option<String>,
+    #[serde(default)]
+    requester_session_id: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<i64>,
+}
+
+fn default_queue_job_type() -> String {
+    "tests".to_owned()
+}
+
+fn queue_job_default_timeout_seconds(job_type: &str) -> Option<i64> {
+    match job_type {
+        "tests" => Some(900),
+        "perf" => Some(2700),
+        "background" => Some(3600),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -1875,6 +1875,228 @@ async fn queue_jobs_rejects_public_host_without_auth() {
 }
 
 #[tokio::test]
+async fn queue_job_create_is_disabled_by_default() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-create-disabled");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = post_json(
+        app,
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "argv": ["echo", "disabled"],
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(payload["detail"], "Rust core writes are disabled");
+    assert!(!queue_state_dir.join("queue_runner.db").exists());
+}
+
+#[tokio::test]
+async fn queue_job_create_persists_pending_job_and_files() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-create");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "api queue",
+            "argv": ["echo", "hello queue"],
+            "cwd": working_dir.display().to_string(),
+            "env": {"EXTRA": "1"},
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 5
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let job_id = payload["id"].as_str().unwrap();
+    assert!(job_id.starts_with("job_"));
+    assert_eq!(payload["type"], "tests");
+    assert_eq!(payload["label"], "api queue");
+    assert_eq!(payload["requester_session_id"], "run12345");
+    assert_eq!(payload["notify_session_id"], "run12345");
+    assert_eq!(payload["notify_name"], "Runner Native");
+    assert_eq!(payload["argv"], json!(["echo", "hello queue"]));
+    assert_eq!(payload["script_path"], Value::Null);
+    assert_eq!(payload["timeout_seconds"], 5);
+    assert_eq!(payload["state"], "pending");
+    assert_eq!(payload["holding_reason"], Value::Null);
+    assert!(payload["queued_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(payload["started_at"], Value::Null);
+    assert_eq!(payload["finished_at"], Value::Null);
+    assert!(payload["log_path"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("logs/{job_id}.log")));
+
+    let db_path = queue_state_dir.join("queue_runner.db");
+    let conn = Connection::open(&db_path).unwrap();
+    let row = conn
+        .query_row(
+            "SELECT id, type, label, notify_session_id, argv_json, env_json, state, exit_code_path, wrapper_path FROM queue_jobs WHERE id = ?1",
+            [&job_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, job_id);
+    assert_eq!(row.1, "tests");
+    assert_eq!(row.2, "api queue");
+    assert_eq!(row.3, "run12345");
+    assert_eq!(row.4, r#"["echo","hello queue"]"#);
+    assert_eq!(row.5, r#"{"EXTRA":"1"}"#);
+    assert_eq!(row.6, "pending");
+    assert!(PathBuf::from(&row.7).ends_with(format!("{job_id}/exit.code")));
+    let wrapper_path = PathBuf::from(row.8);
+    let wrapper = fs::read_to_string(&wrapper_path).unwrap();
+    assert!(wrapper.contains("cd "));
+    assert!(wrapper.contains("export 'EXTRA'='1'"));
+    assert!(wrapper.contains("'echo' 'hello queue'"));
+    assert!(wrapper.contains("exit.code"));
+
+    let (status, detail) = get_json(app.clone(), &format!("/queue-jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["id"], job_id);
+    assert_eq!(detail["state"], "pending");
+
+    let (status, list) = get_json(app, "/queue-jobs?notify_target=run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["jobs"][0]["id"], job_id);
+}
+
+#[tokio::test]
+async fn queue_job_create_validates_request_shape() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-create-validation");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            configured: true,
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "argv": ["echo", "missing notify"],
+            "cwd": working_dir.display().to_string()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "notify_target or requester_session_id is required"
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "unknown",
+            "argv": ["echo", "bad type"],
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(payload["detail"], "unknown queue job type: unknown");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "argv": ["echo", "both"],
+            "script": "echo both",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "exactly one of argv or script is required"
+    );
+
+    let (status, payload) = post_json(
+        app,
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "script": "echo missing cwd",
+            "cwd": working_dir.join("missing").display().to_string(),
+            "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .starts_with("cwd does not exist or is not a directory:"));
+}
+
+#[tokio::test]
 async fn auth_session_reports_disabled_bypass_when_google_auth_not_requested() {
     let app = router(AppState::new(AppConfig::default()));
 

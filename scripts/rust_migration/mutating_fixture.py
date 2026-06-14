@@ -27,7 +27,6 @@ DEFAULT_CHILD_SESSION_ID = "fixture-child"
 DEFAULT_CHILD_SESSION_NAME = "FixtureChild"
 DEFAULT_EM_SESSION_ID = "fixture-em"
 DEFAULT_NOTIFY_CHILD_SESSION_ID = "fixture-notify-child"
-DEFAULT_WORKING_DIR = "/tmp/sm-fixture-workspace"
 
 
 @dataclass(frozen=True)
@@ -68,8 +67,10 @@ def create_mutating_fixture_workspace(output_dir: Path | None = None) -> Mutatin
 
     log_dir = root / "logs"
     log_dir.mkdir()
+    working_dir = root / "workspace"
+    working_dir.mkdir()
     state_file = fixture_dir / "sessions.json"
-    _seed_em_notify_sessions(state_file, log_dir)
+    _seed_em_notify_sessions(state_file, log_dir, working_dir)
 
     config_path = root / "config.yaml"
     _write_config(config_path, root, fixture_dir, state_file, log_dir)
@@ -79,7 +80,7 @@ def create_mutating_fixture_workspace(output_dir: Path | None = None) -> Mutatin
         "session_name": DEFAULT_SESSION_NAME,
         "child_session_id": DEFAULT_CHILD_SESSION_ID,
         "child_session_name": DEFAULT_CHILD_SESSION_NAME,
-        "working_dir": DEFAULT_WORKING_DIR,
+        "working_dir": str(working_dir),
         "message_text": "hello from rust fixture",
         "status_text": "writing Rust status",
         "urgent_message_text": "urgent fixture note",
@@ -98,7 +99,7 @@ def create_mutating_fixture_workspace(output_dir: Path | None = None) -> Mutatin
     )
 
 
-def _seed_em_notify_sessions(state_file: Path, log_dir: Path) -> None:
+def _seed_em_notify_sessions(state_file: Path, log_dir: Path, working_dir: Path) -> None:
     state = json.loads(state_file.read_text())
     sessions = list(state.get("sessions", []))
     seeded_ids = {DEFAULT_EM_SESSION_ID, DEFAULT_NOTIFY_CHILD_SESSION_ID}
@@ -109,7 +110,7 @@ def _seed_em_notify_sessions(state_file: Path, log_dir: Path) -> None:
             {
                 "id": DEFAULT_EM_SESSION_ID,
                 "name": "fixture-em",
-                "working_dir": DEFAULT_WORKING_DIR,
+                "working_dir": str(working_dir),
                 "tmux_session": "",
                 "node": "primary",
                 "provider": "claude",
@@ -123,7 +124,7 @@ def _seed_em_notify_sessions(state_file: Path, log_dir: Path) -> None:
             {
                 "id": DEFAULT_NOTIFY_CHILD_SESSION_ID,
                 "name": "fixture-notify-child",
-                "working_dir": DEFAULT_WORKING_DIR,
+                "working_dir": str(working_dir),
                 "tmux_session": "",
                 "node": "primary",
                 "provider": "claude",

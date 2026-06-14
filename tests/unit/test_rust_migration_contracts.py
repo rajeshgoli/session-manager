@@ -313,6 +313,28 @@ def test_manifest_uses_dedicated_notify_child_for_stop_notification_fixture():
     assert expectations["/session_id"].equals == "{notify_child_session_id}"
 
 
+def test_manifest_covers_rust_queue_writer_fixture_checks():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    cli_check = checks["cli.rust_queue_run_fixture"]
+    assert cli_check.classification == "retained"
+    assert cli_check.target == "rust_only"
+    assert cli_check.safety == "mutating"
+    assert "mutating_opt_in" in cli_check.preconditions
+    assert "fixture:working_dir" in cli_check.preconditions
+    assert cli_check.command[:4] == ("--api-url", "{base_url}", "queue", "run")
+
+    http_check = checks["http.rust_queue_job_create_fixture"]
+    assert http_check.classification == "retained"
+    assert http_check.target == "rust_only"
+    assert http_check.safety == "mutating"
+    assert http_check.method == "POST"
+    assert http_check.path == "/queue-jobs"
+    assert http_check.body["argv"] == ["echo", "queue http fixture"]
+    assert "mutating_opt_in" in http_check.preconditions
+
+
 def test_mvp_rehearsal_mutating_check_ids_match_manifest():
     manifest = ContractManifest.load()
     expected = {
@@ -873,6 +895,7 @@ def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path)
     assert workspace.config_path.exists()
     assert workspace.state_file.exists()
     assert workspace.log_dir.exists()
+    assert Path(workspace.fixtures["working_dir"]).is_dir()
     assert workspace.fixtures["session_id"] == DEFAULT_SESSION_ID
     assert workspace.fixtures["child_session_id"] == DEFAULT_CHILD_SESSION_ID
     assert workspace.fixtures["em_session_id"] == DEFAULT_EM_SESSION_ID

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{self, IsTerminal, Read, Write},
     net::TcpStream,
@@ -842,13 +843,90 @@ fn run_queue(client: &ApiClient, args: QueueArgs) -> Result<()> {
     match args.command {
         QueueCommand::List(args) => run_queue_list(client, args),
         QueueCommand::Status(args) => run_queue_status(client, args),
-        QueueCommand::Run(_) => bail!(
-            "sm queue run is not implemented in the Rust cutover slice yet; use Python sm until queue writer ownership lands"
-        ),
+        QueueCommand::Run(args) => run_queue_run(client, args),
         QueueCommand::Cancel(_) => bail!(
             "sm queue cancel is not implemented in the Rust cutover slice yet; use Python sm until queue writer ownership lands"
         ),
     }
+}
+
+fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
+    let notify_target = args
+        .notify
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(optional_current_session_id)
+        .ok_or_else(|| anyhow!("No session context. Use --notify or SESSION_MANAGER_ID."))?;
+    let requester_session_id = optional_current_session_id();
+    let cwd = match args.cwd {
+        Some(value) => value,
+        None => env::current_dir()?.display().to_string(),
+    };
+    let mut command = args.command;
+    if command.first().is_some_and(|value| value == "--") {
+        command.remove(0);
+    }
+    let script = match args.script_file {
+        Some(path) if path == "-" => {
+            let mut script = String::new();
+            io::stdin()
+                .read_to_string(&mut script)
+                .context("failed to read queue script from stdin")?;
+            Some(script)
+        }
+        Some(path) => Some(
+            fs::read_to_string(&path)
+                .with_context(|| format!("failed to read queue script file {}", path))?,
+        ),
+        None => None,
+    };
+    let argv = (!command.is_empty()).then_some(command);
+    if argv.is_some() == script.is_some() {
+        bail!("exactly one of command or --script-file is required");
+    }
+    let mut env_values = BTreeMap::new();
+    for pair in args.env_pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --env value {pair:?}; expected KEY=VALUE"))?;
+        if key.trim().is_empty() {
+            bail!("invalid --env value {pair:?}; key is empty");
+        }
+        env_values.insert(key.to_owned(), value.to_owned());
+    }
+    let timeout_seconds = args
+        .timeout
+        .as_deref()
+        .map(parse_duration_seconds)
+        .transpose()?;
+    let mut body = json!({
+        "type": args.job_type,
+        "label": args.label,
+        "cwd": cwd,
+        "env": env_values,
+        "notify_target": notify_target,
+        "requester_session_id": requester_session_id,
+    });
+    if let Some(argv) = argv {
+        body["argv"] = json!(argv);
+    }
+    if let Some(script) = script {
+        body["script"] = json!(script);
+    }
+    if let Some(timeout_seconds) = timeout_seconds {
+        body["timeout_seconds"] = json!(timeout_seconds);
+    }
+    let payload = client.post_json("/queue-jobs", body)?;
+    let id = payload["id"].as_str().unwrap_or("unknown");
+    let label = payload["label"].as_str().unwrap_or("-");
+    let state = payload["state"].as_str().unwrap_or("-");
+    println!("Queued job {id}: {label} [{state}]");
+    if let Some(log_path) = payload["log_path"].as_str() {
+        println!("Log: {log_path}");
+    }
+    Ok(())
 }
 
 fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
@@ -1873,6 +1951,55 @@ fn encode_query_component(value: &str) -> String {
     encode_path_segment(value)
 }
 
+fn parse_duration_seconds(value: &str) -> Result<i64> {
+    if value.is_empty() {
+        bail!("invalid duration: {value}");
+    }
+    if value.chars().all(|ch| ch.is_ascii_digit()) {
+        let seconds = value
+            .parse::<i64>()
+            .with_context(|| format!("invalid duration: {value}"))?;
+        if seconds <= 0 {
+            bail!("invalid duration: {value}");
+        }
+        return Ok(seconds);
+    }
+    let mut total = 0i64;
+    let mut index = 0usize;
+    let bytes = value.as_bytes();
+    while index < bytes.len() {
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if start == index || index >= bytes.len() {
+            bail!("invalid duration: {value}");
+        }
+        let number = value[start..index]
+            .parse::<i64>()
+            .with_context(|| format!("invalid duration: {value}"))?;
+        let multiplier = match bytes[index].to_ascii_lowercase() {
+            b's' => 1,
+            b'm' => 60,
+            b'h' => 3600,
+            b'd' => 86400,
+            _ => bail!("invalid duration: {value}"),
+        };
+        total = total
+            .checked_add(
+                number
+                    .checked_mul(multiplier)
+                    .ok_or_else(|| anyhow!("invalid duration: {value}"))?,
+            )
+            .ok_or_else(|| anyhow!("invalid duration: {value}"))?;
+        index += 1;
+    }
+    if total <= 0 {
+        bail!("invalid duration: {value}");
+    }
+    Ok(total)
+}
+
 fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16)> {
     let default_port = default_port.to_string();
     let (host, port) = authority
@@ -2237,6 +2364,51 @@ mod tests {
         };
         assert_eq!(remove_args.device_id, "android-1");
         assert_eq!(remove_args.user_id.as_deref(), Some("local_bypass"));
+    }
+
+    #[test]
+    fn queue_run_cli_parses_retained_writer_command() {
+        let cli = Cli::try_parse_from([
+            "sm",
+            "--api-url",
+            "http://127.0.0.1:8422",
+            "queue",
+            "run",
+            "--type",
+            "tests",
+            "--label",
+            "unit queue",
+            "--cwd",
+            "/tmp",
+            "--timeout",
+            "10m",
+            "--env",
+            "EXTRA=1",
+            "--notify",
+            "run12345",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(cli.api_url.as_deref(), Some("http://127.0.0.1:8422"));
+        let Command::Queue(queue_args) = cli.command else {
+            panic!("expected queue command");
+        };
+        let QueueCommand::Run(run_args) = queue_args.command else {
+            panic!("expected queue run command");
+        };
+        assert_eq!(run_args.job_type, "tests");
+        assert_eq!(run_args.label.as_deref(), Some("unit queue"));
+        assert_eq!(run_args.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(run_args.timeout.as_deref(), Some("10m"));
+        assert_eq!(run_args.env_pairs, vec!["EXTRA=1"]);
+        assert_eq!(run_args.notify.as_deref(), Some("run12345"));
+        assert_eq!(run_args.command, vec!["echo", "hello"]);
+        assert_eq!(parse_duration_seconds("45").unwrap(), 45);
+        assert_eq!(parse_duration_seconds("10m").unwrap(), 600);
+        assert_eq!(parse_duration_seconds("2h30m").unwrap(), 9000);
+        assert_eq!(parse_duration_seconds("1d").unwrap(), 86400);
     }
 
     #[test]
