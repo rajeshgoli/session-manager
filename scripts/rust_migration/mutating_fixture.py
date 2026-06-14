@@ -88,6 +88,7 @@ def create_mutating_fixture_workspace(output_dir: Path | None = None) -> Mutatin
         "clear_prompt_text": "new task after clear",
         "em_session_id": DEFAULT_EM_SESSION_ID,
         "notify_child_session_id": DEFAULT_NOTIFY_CHILD_SESSION_ID,
+        "queue_job_id": "job-fixture",
     }
     return MutatingFixtureWorkspace(
         root=root,

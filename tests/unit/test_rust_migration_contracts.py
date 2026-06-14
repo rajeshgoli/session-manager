@@ -325,6 +325,14 @@ def test_manifest_covers_rust_queue_writer_fixture_checks():
     assert "fixture:working_dir" in cli_check.preconditions
     assert cli_check.command[:4] == ("--api-url", "{base_url}", "queue", "run")
 
+    cancel_check = checks["cli.rust_queue_cancel_fixture"]
+    assert cancel_check.classification == "retained"
+    assert cancel_check.target == "rust_only"
+    assert cancel_check.safety == "mutating"
+    assert "mutating_opt_in" in cancel_check.preconditions
+    assert "fixture:queue_job_id" in cancel_check.preconditions
+    assert cancel_check.command[:4] == ("--api-url", "{base_url}", "queue", "cancel")
+
     http_check = checks["http.rust_queue_job_create_fixture"]
     assert http_check.classification == "retained"
     assert http_check.target == "rust_only"
@@ -900,6 +908,7 @@ def test_mutating_fixture_workspace_creates_disposable_config_and_seed(tmp_path)
     assert workspace.fixtures["child_session_id"] == DEFAULT_CHILD_SESSION_ID
     assert workspace.fixtures["em_session_id"] == DEFAULT_EM_SESSION_ID
     assert workspace.fixtures["notify_child_session_id"] == DEFAULT_NOTIFY_CHILD_SESSION_ID
+    assert workspace.fixtures["queue_job_id"] == "job-fixture"
 
     config_text = workspace.config_path.read_text()
     assert "fixture_writes_enabled: true" in config_text

@@ -86,6 +86,7 @@ CORE_MUTATING_CHECK_IDS = (
     "cli.rust_core_maintainer_clear_fixture",
     "cli.rust_core_retire_fixture",
     "cli.rust_queue_run_fixture",
+    "cli.rust_queue_cancel_fixture",
     "http.rust_core_task_complete_fixture",
     "http.rust_core_turn_complete_fixture",
     "http.rust_core_notify_on_stop_fixture",
