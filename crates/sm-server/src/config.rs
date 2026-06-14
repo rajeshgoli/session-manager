@@ -756,6 +756,8 @@ fn default_codex_observability_db_path() -> String {
 pub struct QueueRunnerConfig {
     #[serde(default = "default_queue_runner_state_dir")]
     pub state_dir: String,
+    #[serde(default = "default_queue_runner_cancel_grace_seconds")]
+    pub cancel_grace_seconds: u64,
     #[serde(skip)]
     pub configured: bool,
 }
@@ -764,6 +766,7 @@ impl Default for QueueRunnerConfig {
     fn default() -> Self {
         Self {
             state_dir: default_queue_runner_state_dir(),
+            cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
             configured: false,
         }
     }
@@ -771,6 +774,10 @@ impl Default for QueueRunnerConfig {
 
 fn default_queue_runner_state_dir() -> String {
     "~/.local/share/claude-sessions/queue-runner".to_owned()
+}
+
+fn default_queue_runner_cancel_grace_seconds() -> u64 {
+    10
 }
 
 fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
@@ -781,6 +788,7 @@ fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
         state_dir: queue_runner_state_dir_for_state_file(state_file)
             .to_string_lossy()
             .into_owned(),
+        cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
         configured: false,
     }
 }
@@ -1859,12 +1867,14 @@ cloudflare_access:
             r#"
 queue_runner:
   state_dir: /tmp/custom-queue-runner
+  cancel_grace_seconds: 3
 "#,
         )
         .unwrap();
         let config = AppConfig::from(raw);
 
         assert_eq!(config.queue_runner.state_dir, "/tmp/custom-queue-runner");
+        assert_eq!(config.queue_runner.cancel_grace_seconds, 3);
     }
 
     #[test]
@@ -1882,6 +1892,7 @@ paths:
             config.queue_runner.state_dir,
             "/tmp/sm-fixture/queue-runner"
         );
+        assert_eq!(config.queue_runner.cancel_grace_seconds, 10);
     }
 
     #[test]

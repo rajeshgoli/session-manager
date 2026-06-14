@@ -844,9 +844,7 @@ fn run_queue(client: &ApiClient, args: QueueArgs) -> Result<()> {
         QueueCommand::List(args) => run_queue_list(client, args),
         QueueCommand::Status(args) => run_queue_status(client, args),
         QueueCommand::Run(args) => run_queue_run(client, args),
-        QueueCommand::Cancel(_) => bail!(
-            "sm queue cancel is not implemented in the Rust cutover slice yet; use Python sm until queue writer ownership lands"
-        ),
+        QueueCommand::Cancel(args) => run_queue_cancel(client, args),
     }
 }
 
@@ -1009,6 +1007,23 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
             .unwrap_or_else(|| "-".to_owned())
     );
     println!("Log: {}", payload["log_path"].as_str().unwrap_or("-"));
+    Ok(())
+}
+
+fn run_queue_cancel(client: &ApiClient, args: QueueCancelArgs) -> Result<()> {
+    let job_id = args.job_id.trim();
+    if job_id.is_empty() {
+        bail!("job id is required");
+    }
+    let payload = client.delete_json(
+        &format!("/queue-jobs/{}", encode_path_segment(job_id)),
+        json!({}),
+    )?;
+    println!(
+        "Cancelled queue job: {} ({})",
+        payload["id"].as_str().unwrap_or(job_id),
+        payload["state"].as_str().unwrap_or("-")
+    );
     Ok(())
 }
 
@@ -2409,6 +2424,18 @@ mod tests {
         assert_eq!(parse_duration_seconds("10m").unwrap(), 600);
         assert_eq!(parse_duration_seconds("2h30m").unwrap(), 9000);
         assert_eq!(parse_duration_seconds("1d").unwrap(), 86400);
+    }
+
+    #[test]
+    fn queue_cancel_cli_parses_retained_runtime_command() {
+        let cli = Cli::try_parse_from(["sm", "queue", "cancel", "job_123abc"]).unwrap();
+        let Command::Queue(queue_args) = cli.command else {
+            panic!("expected queue command");
+        };
+        let QueueCommand::Cancel(cancel_args) = queue_args.command else {
+            panic!("expected queue cancel command");
+        };
+        assert_eq!(cancel_args.job_id, "job_123abc");
     }
 
     #[test]

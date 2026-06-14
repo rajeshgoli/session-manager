@@ -1081,6 +1081,18 @@
       "source": "specs/762_stage5_artifacts/implementation_workstreams.md:21"
     },
     {
+      "id": "cli.rust_queue_cancel_fixture",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "mutating",
+      "command": ["--api-url", "{base_url}", "queue", "cancel", "{queue_job_id}"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["Cancelled queue job: {queue_job_id}", "(cancelled)"],
+      "preconditions": ["sm_cli", "fixture:base_url", "fixture:queue_job_id", "mutating_opt_in"],
+      "source": "https://github.com/rajeshgoli/session-manager/issues/957"
+    },
+    {
       "id": "cli.rust_core_send_fixture",
       "surface": "cli",
       "classification": "retained",

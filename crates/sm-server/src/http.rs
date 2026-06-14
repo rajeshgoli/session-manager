@@ -298,7 +298,10 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
         .route("/queue-jobs", get(list_queue_jobs).post(create_queue_job))
-        .route("/queue-jobs/{job_id}", get(get_queue_job))
+        .route(
+            "/queue-jobs/{job_id}",
+            get(get_queue_job).delete(cancel_queue_job),
+        )
         .route("/codex-review-requests", get(list_codex_review_requests))
         .route(
             "/codex-review-requests/{request_id}",
@@ -1984,6 +1987,46 @@ async fn create_queue_job(
             timeout_seconds,
         },
     )?;
+    let job = if state.config.rust_core.runtime_enabled {
+        let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
+        RetainedQueueStore::start_queue_job_in_state_dir(
+            &queue_state_dir,
+            &message_queue_db_path,
+            &job.id,
+            state.config.queue_runner.cancel_grace_seconds,
+        )?
+        .unwrap_or(job)
+    } else {
+        job
+    };
+    Ok(Json(queue_job_response(&state, job)?))
+}
+
+async fn cancel_queue_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/queue-jobs/{job_id}"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let queue_state_dir_config = state.config.queue_runner_state_dir();
+    let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
+    let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let Some(job) = RetainedQueueStore::cancel_queue_job_in_state_dir(
+        &queue_state_dir,
+        &message_queue_db_path,
+        &job_id,
+        state.config.queue_runner.cancel_grace_seconds,
+    )?
+    else {
+        return Err(ApiError::NotFound("Queue job not found"));
+    };
     Ok(Json(queue_job_response(&state, job)?))
 }
 
