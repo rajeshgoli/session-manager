@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 from .baseline import run_baseline
 from .contracts import ContractManifest, run_checks, summarize
+from .final_backup import build_final_backup_report, configured_python_health_url
 from .freeze_drain_plan import build_freeze_drain_plan
 from .mutating_fixture import create_mutating_fixture_workspace
 from .state_backup import build_backup_plan
@@ -166,6 +167,10 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             "skip_python_health": args.skip_python_health,
             "skip_smoke": args.skip_smoke,
             "skip_state_gate": args.skip_state_gate,
+            "run_final_backup_gate": args.run_final_backup_gate,
+            "final_backup_python_health_url": args.final_backup_python_health_url,
+            "final_backup_stopped_hold_seconds": args.final_backup_stopped_hold_seconds,
+            "final_backup_stopped_probe_count": args.final_backup_stopped_probe_count,
             "skip_baseline": args.skip_baseline,
             "baseline_repetitions": args.baseline_repetitions,
             "skip_shadow": args.skip_shadow,
@@ -186,11 +191,19 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
     rust_process: subprocess.Popen[str] | None = None
     rust_ready = False
     try:
-        if not args.skip_python_health:
+        if not args.skip_python_health and not args.run_final_backup_gate:
             python_health = _probe_health(args.python_base_url, args.timeout)
             report["steps"].append({"name": "python_health", **python_health})
             if python_health["status"] != "passed":
                 _add_blocker(report, "python_health", python_health["detail"])
+        elif args.run_final_backup_gate and not args.skip_python_health:
+            report["steps"].append(
+                {
+                    "name": "python_health",
+                    "status": "skipped",
+                    "detail": "Python liveness probe is superseded by stopped-origin final backup gate",
+                }
+            )
 
         if args.skip_state_gate:
             report["steps"].append(
@@ -215,6 +228,26 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
                         report,
                         "state_ownership_gate",
                         state_gate.get("detail", "state ownership gate failed"),
+                    )
+                return _finalize_report(report, output_dir, started_at)
+
+        if args.run_final_backup_gate:
+            final_backup = _run_final_backup_gate(args, output_dir)
+            report["steps"].append(final_backup)
+            for name, path in final_backup.get("artifacts", {}).items():
+                report["artifacts"][f"final_backup_{name}"] = path
+            if final_backup["status"] != "passed":
+                for blocker in final_backup.get("blockers", []):
+                    _add_blocker(
+                        report,
+                        "final_backup_gate",
+                        blocker.get("detail", str(blocker)),
+                    )
+                if not final_backup.get("blockers"):
+                    _add_blocker(
+                        report,
+                        "final_backup_gate",
+                        final_backup.get("detail", "final backup gate failed"),
                     )
                 return _finalize_report(report, output_dir, started_at)
 
@@ -1020,6 +1053,104 @@ def _run_state_gate(args: argparse.Namespace, output_dir: Path) -> dict[str, Any
     }
 
 
+def _run_final_backup_gate(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    step_name = "stopped_origin_final_backup_gate"
+    started_at = time.perf_counter()
+    root = output_dir / "final-backup"
+    root.mkdir(parents=True, exist_ok=True)
+    artifacts = {
+        "report": str(root / "final-backup-report.json"),
+        "backup_manifest": str(root / "backup" / "state-backup-manifest.json"),
+        "ledger": str(root / "final-backup-ledger.jsonl"),
+    }
+
+    try:
+        final_backup = build_final_backup_report(
+            config_path=args.config,
+            local_env_path=args.local_env,
+            output_dir=root / "backup",
+            python_health_url=_final_backup_python_health_url(args),
+            health_timeout_seconds=args.final_backup_health_timeout,
+            stopped_hold_seconds=args.final_backup_stopped_hold_seconds,
+            stopped_probe_count=args.final_backup_stopped_probe_count,
+            execute=True,
+            ledger_path=root / "final-backup-ledger.jsonl",
+            record_ledger=True,
+        )
+        _write_json(Path(artifacts["report"]), final_backup)
+    except Exception as exc:  # noqa: BLE001 - preserve concrete tool failure in report.
+        return {
+            "name": step_name,
+            "status": "failed",
+            "elapsed_ms": _elapsed_ms(started_at),
+            "detail": f"final backup gate raised {type(exc).__name__}: {exc}",
+            "summary": {
+                "final_backup_status": None,
+                "python_origin_stopped": None,
+                "backup_status": None,
+                "backup_copied": None,
+                "ledger_written": None,
+            },
+            "blockers": [
+                {
+                    "substep": "final_backup",
+                    "kind": "exception",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            ],
+            "artifacts": _existing_artifacts(artifacts),
+        }
+
+    blockers = [
+        {
+            "substep": blocker.get("store_id", "final_backup"),
+            "kind": blocker.get("kind", "blocker"),
+            "detail": blocker.get("detail", str(blocker)),
+        }
+        for blocker in final_backup.get("blockers", [])
+    ]
+    status = final_backup.get("status")
+    if status != "copied" and not blockers:
+        blockers.append(
+            {
+                "substep": "final_backup",
+                "kind": "unexpected_status",
+                "detail": f"expected copied final backup; got {status}",
+            }
+        )
+
+    return {
+        "name": step_name,
+        "status": "passed" if not blockers else "failed",
+        "elapsed_ms": _elapsed_ms(started_at),
+        "detail": "stopped-origin final backup completed" if not blockers else "stopped-origin final backup blocked",
+        "summary": {
+            "final_backup_status": status,
+            "python_origin_stopped": (final_backup.get("python_origin") or {}).get("stopped"),
+            "backup_status": (final_backup.get("summary") or {}).get("backup_status"),
+            "backup_copied": (final_backup.get("summary") or {}).get("copied"),
+            "ledger_written": (final_backup.get("ledger") or {}).get("written"),
+        },
+        "blockers": blockers,
+        "artifacts": _existing_artifacts(artifacts),
+    }
+
+
+def _final_backup_python_health_url(args: argparse.Namespace) -> str:
+    if args.final_backup_python_health_url:
+        return args.final_backup_python_health_url
+    config_url = configured_python_health_url(args.config)
+    rehearsal_url = args.python_base_url.rstrip("/") + "/health"
+    if rehearsal_url != config_url:
+        raise ValueError(
+            "final backup health URL is ambiguous: "
+            f"--python-base-url resolves to {rehearsal_url}, "
+            f"but --config resolves to {config_url}; pass "
+            "--final-backup-python-health-url explicitly"
+        )
+    return config_url
+
+
 def _existing_artifacts(artifacts: dict[str, str]) -> dict[str, str]:
     return {
         name: path
@@ -1420,6 +1551,34 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reuse-rust-sidecar", action="store_true")
     parser.add_argument("--skip-python-health", action="store_true")
     parser.add_argument("--skip-state-gate", action="store_true")
+    parser.add_argument(
+        "--run-final-backup-gate",
+        action="store_true",
+        help="After state preflight/backup/restore/freeze-drain, require stopped Python evidence and create the final backup",
+    )
+    parser.add_argument(
+        "--final-backup-python-health-url",
+        default=None,
+        help="Override the Python health URL used by the stopped-origin final backup gate",
+    )
+    parser.add_argument(
+        "--final-backup-health-timeout",
+        type=float,
+        default=1.0,
+        help="Per-probe timeout for stopped-origin final backup health checks",
+    )
+    parser.add_argument(
+        "--final-backup-stopped-hold-seconds",
+        type=float,
+        default=5.0,
+        help="Hold window for durable stopped-origin final backup evidence",
+    )
+    parser.add_argument(
+        "--final-backup-stopped-probe-count",
+        type=_positive_int,
+        default=2,
+        help="Number of refused probes required for stopped-origin final backup evidence",
+    )
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument("--skip-shadow", action="store_true")

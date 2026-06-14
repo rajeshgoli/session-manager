@@ -44,8 +44,10 @@ from scripts.rust_migration.mvp_rehearsal import (
     _default_read_only_fixture_rust_base_url,
     _default_mutating_rust_base_url,
     _ensure_rust_cli_available,
+    _final_backup_python_health_url,
     _resolve_shadow_compare_paths,
     _run_contract_group,
+    _run_final_backup_gate,
     _run_state_gate,
     run_rehearsal,
 )
@@ -816,6 +818,167 @@ sm_send:
     assert "state_gate_restore_report" not in report["artifacts"]
     assert "state_gate_restore_root" not in report["artifacts"]
     assert "state_gate_freeze_drain_ledger" not in report["artifacts"]
+
+
+def test_mvp_rehearsal_final_backup_gate_defaults_off():
+    args = _build_parser().parse_args([])
+
+    assert args.run_final_backup_gate is False
+
+
+def test_mvp_rehearsal_final_backup_health_url_defaults_to_config_when_unambiguous(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  host: 127.0.0.1\n  port: 18420\n", encoding="utf-8")
+    args = _build_parser().parse_args(
+        [
+            "--config",
+            str(config),
+            "--python-base-url",
+            "http://127.0.0.1:18420/",
+            "--run-final-backup-gate",
+        ]
+    )
+
+    assert _final_backup_python_health_url(args) == "http://127.0.0.1:18420/health"
+
+    override = _build_parser().parse_args(
+        [
+            "--config",
+            str(config),
+            "--python-base-url",
+            "http://127.0.0.1:18420",
+            "--run-final-backup-gate",
+            "--final-backup-python-health-url",
+            "http://127.0.0.1:19420/health",
+        ]
+    )
+    assert _final_backup_python_health_url(override) == "http://127.0.0.1:19420/health"
+
+
+def test_mvp_rehearsal_final_backup_health_url_blocks_ambiguous_default(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  host: 127.0.0.1\n  port: 8420\n", encoding="utf-8")
+    args = _build_parser().parse_args(
+        [
+            "--config",
+            str(config),
+            "--python-base-url",
+            "http://127.0.0.1:18420",
+            "--run-final-backup-gate",
+        ]
+    )
+
+    try:
+        _final_backup_python_health_url(args)
+    except ValueError as exc:
+        assert "final backup health URL is ambiguous" in str(exc)
+        assert "http://127.0.0.1:18420/health" in str(exc)
+        assert "http://127.0.0.1:8420/health" in str(exc)
+    else:
+        raise AssertionError("expected ambiguous final backup health URL to block")
+
+
+def test_mvp_rehearsal_final_backup_gate_records_artifacts(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  port: 18420\n", encoding="utf-8")
+
+    def fake_final_backup_report(**kwargs):
+        output_dir = kwargs["output_dir"]
+        ledger_path = kwargs["ledger_path"]
+        assert kwargs["execute"] is True
+        assert kwargs["record_ledger"] is True
+        assert kwargs["python_health_url"] == "http://127.0.0.1:9/health"
+        assert kwargs["stopped_hold_seconds"] == 0.0
+        assert kwargs["stopped_probe_count"] == 2
+        output_dir.mkdir(parents=True)
+        manifest_path = output_dir / "state-backup-manifest.json"
+        manifest_path.write_text('{"status":"copied"}\n', encoding="utf-8")
+        ledger_path.write_text('{"kind":"final_backup"}\n', encoding="utf-8")
+        return {
+            "status": "copied",
+            "python_origin": {"stopped": True},
+            "summary": {"backup_status": "copied", "copied": 3},
+            "ledger": {"written": True},
+            "blockers": [],
+        }
+
+    monkeypatch.setattr(
+        "scripts.rust_migration.mvp_rehearsal.build_final_backup_report",
+        fake_final_backup_report,
+    )
+    args = _build_parser().parse_args(
+        [
+            "--config",
+            str(config),
+            "--run-final-backup-gate",
+            "--final-backup-python-health-url",
+            "http://127.0.0.1:9/health",
+            "--final-backup-stopped-hold-seconds",
+            "0",
+            "--final-backup-stopped-probe-count",
+            "2",
+        ]
+    )
+
+    step = _run_final_backup_gate(args, tmp_path / "rehearsal")
+
+    assert step["status"] == "passed"
+    assert step["summary"]["final_backup_status"] == "copied"
+    assert step["summary"]["python_origin_stopped"] is True
+    assert step["summary"]["ledger_written"] is True
+    assert set(step["artifacts"]) == {"report", "backup_manifest", "ledger"}
+    for path in step["artifacts"].values():
+        assert Path(path).exists()
+
+
+def test_mvp_rehearsal_final_backup_gate_blocks_without_missing_artifacts(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  port: 18420\n", encoding="utf-8")
+
+    def fake_final_backup_report(**_kwargs):
+        return {
+            "status": "blocked",
+            "python_origin": {"stopped": False},
+            "summary": {"backup_status": None, "copied": 0},
+            "ledger": {"written": False},
+            "blockers": [
+                {
+                    "store_id": "python_origin",
+                    "kind": "python_origin_reachable",
+                    "detail": "Python origin answered with HTTP 200",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        "scripts.rust_migration.mvp_rehearsal.build_final_backup_report",
+        fake_final_backup_report,
+    )
+    args = _build_parser().parse_args(
+        [
+            "--config",
+            str(config),
+            "--python-base-url",
+            "http://127.0.0.1:18420",
+            "--run-final-backup-gate",
+        ]
+    )
+
+    step = _run_final_backup_gate(args, tmp_path / "rehearsal")
+
+    assert step["status"] == "failed"
+    assert step["summary"]["final_backup_status"] == "blocked"
+    assert step["blockers"] == [
+        {
+            "substep": "python_origin",
+            "kind": "python_origin_reachable",
+            "detail": "Python origin answered with HTTP 200",
+        }
+    ]
+    assert set(step["artifacts"]) == {"report"}
+    assert Path(step["artifacts"]["report"]).exists()
 
 
 def test_manifest_has_json_shape_assertions_for_core_http_surfaces():
