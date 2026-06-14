@@ -171,6 +171,40 @@
       "source": "specs/762_stage5_artifacts/gate_matrix.md:73"
     },
     {
+      "id": "http.node_primary_ping",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "POST",
+      "path": "/nodes/primary/ping",
+      "body": {},
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/node", "equals": "primary"},
+        {"path": "/ok", "equals": true},
+        {"path": "/error", "type": "null"}
+      ],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage2_artifacts/route_manifest.md:POST /nodes/{node_id}/ping"
+    },
+    {
+      "id": "http.node_primary_restore_candidates",
+      "surface": "http",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "method": "GET",
+      "path": "/nodes/primary/restore-candidates",
+      "expected_status": [200],
+      "expected_json": [
+        {"path": "/node", "equals": "primary"},
+        {"path": "/sessions", "type": "array"}
+      ],
+      "preconditions": ["live_server"],
+      "source": "specs/762_stage2_artifacts/route_manifest.md:GET /nodes/{node_id}/restore-candidates"
+    },
+    {
       "id": "http.queue_jobs_list",
       "surface": "http",
       "classification": "retained",
