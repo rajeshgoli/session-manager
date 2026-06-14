@@ -1,10 +1,11 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #950 merged. The last clean full MVP
-rehearsal remains the post-#938 run; post-#942 full rehearsal is currently
-blocked by Python-origin availability during baseline/shadow. PRs #946, #948,
-and #950 added the Rust-side Cloudflare Access origin gate; public cutover still
-needs Cloudflare policy setup and mobile/browser smoke evidence.
+Status: implementation snapshot after the post-#984 review-route fixture line.
+The last clean full real-state MVP rehearsal remains the post-#938 run; the
+post-#984 focused rehearsal proves state gates, live core contracts, read-only
+fixtures, and mutating fixtures on isolated sidecars, but intentionally skips
+Python baseline and shadow. Public cutover still needs Cloudflare policy setup,
+mobile/browser smoke evidence, and a stable Python-authoritative shadow window.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -68,6 +69,23 @@ not change retained or removed scope. Binding scope remains
 | #946 | Cloudflare Access auth model for browser, mobile app, node fallback, and email worker route classes |
 | #948 | Rust Cloudflare Access config parsing and JWT/audience/context classification |
 | #950 | Rust origin route gates for mobile/app surfaces, app artifacts, device-token exchange, JWKS cache behavior, and mobile device actor binding |
+| #952 | Cloudflare Access cutover evidence snapshot |
+| #954 | Rust queue list/status CLI reads |
+| #956 | Pending queue job submission |
+| #958 | Simple queue job execute/cancel runtime |
+| #960 | Queue runtime recovery |
+| #962 | Node HTTP routes |
+| #964 | Codex review request cancel |
+| #966 | `request-codex-review` CLI list/status/cancel wiring |
+| #968 | Retained Codex review request creation |
+| #970 | `request-codex-review create` CLI wiring |
+| #972 | Active Codex review watch recovery |
+| #974 | Retained `sm review` CLI wiring |
+| #976 | Retained `/reviews/pr` PR review route |
+| #979 | PR review wait observes actual review events before completion |
+| #980 | Retained session review runtime routes |
+| #983 | Follow-up session review wait timeout and spawned-child startup settle fixes |
+| #984 | Review-route mutating fixture contracts |
 
 ## Implemented Capability Groups
 
@@ -78,12 +96,12 @@ The Rust sidecar now has executable coverage for:
 | Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, freeze/drain evidence gates, and mobile-aware shadow observation gates exist. |
 | Retired-surface checks | Retired public/watch/summary/remind/job-watch/queue-policy checks are represented as Rust-target absence or denial fixtures. |
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
-| Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent slices are merged, with shadow and contract fixtures covering the early cutover path. |
+| Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent and retained review-route slices are merged, with shadow and contract fixtures covering the early cutover path. |
 | Codex retained reads | Codex event stream, pending request ledger reads, activity actions, review detail/list, and Claude/Codex tool-call projections are implemented and covered by manifest checks. |
 | Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, and public-edge assertion validation are merged. |
 | Cloudflare Access origin gate | Config parsing, JWT/audience classification, host/app separation, public-host fail-closed behavior, mobile/app route gating, app artifact gating, device-token exchange gating, JWKS cache refresh/TTL behavior, and mobile Access CN actor binding are merged. |
 | External fallback | Email/human fallback delivery and inbound email validation path are retained in the Rust track. |
-| Queue and nodes | Narrow queue list/detail, queue fixture coverage, and registered-node read paths are implemented; retained node and queue writer behavior still needs final cutover verification. |
+| Queue and nodes | Queue list/detail, CLI list/status, pending submit, simple execute/cancel, queue recovery, queue fixtures, node reads, and node HTTP routes are implemented; remaining work is final live/recovery cutover evidence and any retained node-agent remote-control gaps. |
 
 ## Current Live Shadow And Contract State
 
@@ -124,6 +142,38 @@ fixture false failures:
 
 The skipped checks are mutating checks without `--include-mutating`, which is
 the expected safety behavior for a live-state read run.
+
+Current executable manifest size after the review-route fixture line:
+
+| Metric | Count |
+| --- | ---: |
+| Total checks | 131 |
+| `python_and_rust` checks | 73 |
+| `rust_only` checks | 58 |
+| Read-only checks | 92 |
+| Mutating checks | 39 |
+
+The latest focused isolated-sidecar rehearsal for the current fixture set is:
+
+```bash
+/tmp/session-manager-pr981-rehearsal-ports/mvp-rehearsal-report.json
+```
+
+It was run with `--skip-python-health --skip-baseline --skip-shadow --core-only`
+and `--rust-base-url http://127.0.0.1:18421` to avoid an existing local sidecar
+on port `8421`. Results:
+
+| Area | Result |
+| --- | --- |
+| Overall status | Passed with 0 blockers |
+| State ownership gate | Passed: 17 stores checked, 13 existing, 13 copied, 13 verified, 13 restored, freeze/drain ledger written |
+| Rust live core sidecar contracts | 17 passed, 0 failed, 0 skipped |
+| Rust synthetic read-only fixture contracts | 14 passed, 0 failed, 0 skipped |
+| Rust mutating fixture contracts | 35 passed, 0 failed, 0 skipped |
+
+This is not a full cutover rehearsal because it skips Python baseline and
+shadow. It is the current best fixture/state-gate evidence for the post-#984
+contract set.
 
 ## Latest Real-State Rehearsal
 
@@ -209,11 +259,11 @@ These are the next practical buckets before an MVP cutover trial:
 | Bucket | Why it remains |
 | --- | --- |
 | Shadow observation window | Python-authoritative shadow mode is enabled and a short clean window has been recorded, but mobile gates from PR #942 still need real app/operator traffic. Continue it for a longer agreed window and triage any unexplained retained-core mismatches before Rust becomes the writer. |
-| Full fixture manifest execution | The MVP rehearsal now runs the current synthetic read-only and mutating fixture sets. Remaining work is final live mobile/device fixture evidence and any additional retained fixture rows added by later slices. |
+| Full fixture manifest execution | The MVP rehearsal now runs the current synthetic read-only and mutating fixture sets, including review-route fixtures. Remaining work is final live mobile/device fixture evidence and any additional retained fixture rows added by later slices. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
 | State ownership and migration tooling | Initial preflight, backup, restore, and freeze/drain evidence tools are merged and exercised by the rehearsal. Remaining work is live write-admission freeze/journal ownership and rollback accounting from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
 | Cloudflare Access deployment integration | Pair the merged Rust origin gate with the actual Cloudflare Access apps, mTLS/service-auth policies, device Common Name enrollment/revocation, app-host native auth smoke, browser OAuth smoke, and later node fallback tests. Current evidence lives in [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md). |
-| Node and queue writer completion | Finish retained node-control and narrow queue writer fixtures, including audit, policy, recovery, and rollback semantics. |
+| Node and queue writer completion | Basic node HTTP routes and narrow queue writer/recovery are implemented. Remaining work is final live/recovery cutover evidence, audit/rollback accounting, and any retained node-agent remote-control gaps. |
 | Service packaging and rollback | Exercise launchd/service cutover, non-destructive port ownership, health checks, rollback, and operator diagnostics. |
 | Final native mobile smoke | Run bootstrap/session/attach/request-status/analytics/bug-report/app-artifact smoke checks against Rust using real mobile assumptions. |
 | Python-origin availability during evidence runs | Post-#942 full rehearsal is blocked because Python watchdog-restarted during baseline/shadow. This does not call for broad Python hardening, but the cutover evidence path needs a stable Python authority for the observation window. |
