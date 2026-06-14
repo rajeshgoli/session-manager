@@ -1913,6 +1913,102 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
 }
 
 #[tokio::test]
+async fn codex_review_request_cancel_updates_active_row_and_preserves_inactive_row() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-cancel.db");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_codex_review_request_fixture_db(&queue_db);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) =
+        delete_json(app.clone(), "/codex-review-requests/active-old", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "active-old");
+    assert_eq!(payload["state"], "cancelled");
+    assert_eq!(payload["is_active"], false);
+    assert_eq!(payload["last_error"], Value::Null);
+
+    let conn = Connection::open(&queue_db).unwrap();
+    let (state, is_active): (String, i64) = conn
+        .query_row(
+            "SELECT state, is_active FROM codex_review_request_registrations WHERE id = 'active-old'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "cancelled");
+    assert_eq!(is_active, 0);
+
+    let (status, payload) = get_json(app.clone(), "/codex-review-requests").await;
+    assert_eq!(status, StatusCode::OK);
+    let active_ids = payload["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(active_ids, vec!["active-new"]);
+
+    let (status, payload) = delete_json(app, "/codex-review-requests/inactive", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "inactive");
+    assert_eq!(payload["state"], "cancelled");
+    assert_eq!(payload["is_active"], false);
+}
+
+#[tokio::test]
+async fn codex_review_request_cancel_preserves_missing_and_write_gate_errors() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-cancel-gates.db");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_codex_review_request_fixture_db(&queue_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) =
+        delete_json(app.clone(), "/codex-review-requests/active-old", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(payload["detail"], "Rust core writes are disabled");
+    let (status, payload) = get_json(app.clone(), "/codex-review-requests/active-old").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["state"], "completed");
+    assert_eq!(payload["is_active"], true);
+
+    let mut write_config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    write_config.rust_core.fixture_writes_enabled = true;
+    let write_app = router(AppState::new(write_config));
+    let (status, payload) =
+        delete_json(write_app, "/codex-review-requests/missing", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Codex review request not found");
+}
+
+#[tokio::test]
 async fn codex_review_requests_unknown_notify_target_returns_404() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-requests-empty.db");
@@ -1950,8 +2046,29 @@ async fn codex_review_requests_rejects_public_host_without_auth() {
         "/auth/google/login?next=%2Fcodex-review-requests"
     );
 
-    let (status, payload) =
-        get_json_with_host(app, "/codex-review-requests/active-old", "sm.example.com").await;
+    let (status, payload) = get_json_with_host(
+        app.clone(),
+        "/codex-review-requests/active-old",
+        "sm.example.com",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Authentication required");
+    assert_eq!(
+        payload["login_url"],
+        "/auth/google/login?next=%2Fcodex-review-requests%2Factive-old"
+    );
+
+    let (status, payload) = json_request_with_headers_and_peer(
+        app,
+        "DELETE",
+        "/codex-review-requests/active-old",
+        json!({}),
+        &[("host", "sm.example.com")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(payload["detail"], "Authentication required");
@@ -4246,6 +4363,59 @@ async fn shadow_http_reports_codex_review_request_detail_404() {
     assert_eq!(payload["comparison"], "match");
     assert_eq!(payload["predicted_status"], 404);
     assert_eq!(payload["body_sha256_match"], true);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_codex_review_request_cancel_as_status_only_without_writing() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-requests-shadow-delete.db");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_codex_review_request_fixture_db(&queue_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+    let python_body = br#"{"id":"active-old","state":"cancelled","is_active":false}"#;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "DELETE",
+                "path": "/codex-review-requests/active-old",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["support_status"],
+        "implemented_retained_write_status_only"
+    );
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+
+    let (status, detail) = get_json(app, "/codex-review-requests/active-old").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["state"], "completed");
+    assert_eq!(detail["is_active"], true);
 }
 
 #[tokio::test]
