@@ -329,6 +329,36 @@ def test_manifest_uses_dedicated_notify_child_for_stop_notification_fixture():
     assert expectations["/session_id"].equals == "{notify_child_session_id}"
 
 
+def test_manifest_covers_rust_core_review_fixture_checks():
+    manifest = ContractManifest.load()
+    checks = {check.id: check for check in manifest.checks}
+
+    existing = checks["http.rust_core_review_existing_fixture"]
+    assert existing.classification == "retained"
+    assert existing.target == "rust_only"
+    assert existing.safety == "mutating"
+    assert existing.method == "POST"
+    assert existing.path == "/sessions/{session_id}/review"
+    assert existing.body["mode"] == "custom"
+    assert "session_id" in existing.preconditions
+    assert "mutating_opt_in" in existing.preconditions
+    expectations = {expectation.path: expectation for expectation in existing.expected_json}
+    assert expectations["/error"].equals.startswith("Review requires a Codex session")
+
+    spawned = checks["http.rust_core_spawn_review_fixture"]
+    assert spawned.classification == "retained"
+    assert spawned.target == "rust_only"
+    assert spawned.safety == "mutating"
+    assert spawned.method == "POST"
+    assert spawned.path == "/sessions/review"
+    assert spawned.body["parent_session_id"] == "{session_id}"
+    assert spawned.body["mode"] == "custom"
+    assert "session_id" in spawned.preconditions
+    assert "mutating_opt_in" in spawned.preconditions
+    expectations = {expectation.path: expectation for expectation in spawned.expected_json}
+    assert expectations["/error"].equals == "Failed to send review sequence to tmux"
+
+
 def test_manifest_covers_rust_queue_writer_fixture_checks():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}

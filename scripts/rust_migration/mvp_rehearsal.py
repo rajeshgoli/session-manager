@@ -62,6 +62,8 @@ MVP_GAP_PROBE_CHECK_IDS = ()
 
 CORE_MUTATING_CHECK_IDS = (
     "cli.rust_core_spawn_fixture",
+    "http.rust_core_review_existing_fixture",
+    "http.rust_core_spawn_review_fixture",
     "cli.rust_core_send_fixture",
     "cli.rust_core_spawn_child_inherits_parent_fixture",
     "cli.rust_core_me_fixture",
