@@ -263,6 +263,39 @@ impl RetainedQueueStore {
         get_codex_review_request_conn(&conn, request_id)
     }
 
+    pub fn cancel_codex_review_request_in_path(
+        db_path: &Path,
+        request_id: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        let Some(mut registration) = get_codex_review_request_conn(&conn, request_id)? else {
+            return Ok(None);
+        };
+        if !registration.is_active {
+            return Ok(Some(registration));
+        }
+        registration.is_active = false;
+        registration.state = "cancelled".to_owned();
+        conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET is_active = 0,
+                state = ?2,
+                last_error = ?3
+            WHERE id = ?1 AND is_active = 1
+            "#,
+            params![
+                request_id,
+                registration.state.as_str(),
+                registration.last_error.as_deref()
+            ],
+        )?;
+        Ok(Some(registration))
+    }
+
     pub fn list_queue_jobs_from_path(
         db_path: &Path,
         filters: QueueJobFilters,

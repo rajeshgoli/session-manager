@@ -305,7 +305,7 @@ pub fn router(state: AppState) -> Router {
         .route("/codex-review-requests", get(list_codex_review_requests))
         .route(
             "/codex-review-requests/{request_id}",
-            get(get_codex_review_request),
+            get(get_codex_review_request).delete(cancel_codex_review_request),
         )
         .route("/nodes", get(list_nodes))
         .route("/nodes/{node_id}/ping", post(ping_node))
@@ -1969,6 +1969,28 @@ async fn get_codex_review_request(
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
     let Some(registration) =
         RetainedQueueStore::get_codex_review_request_from_path(&queue_db_path, &request_id)?
+    else {
+        return Err(ApiError::NotFound("Codex review request not found"));
+    };
+    Ok(Json(codex_review_request_response(&state, registration)?))
+}
+
+async fn cancel_codex_review_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/codex-review-requests/{request_id}"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let Some(registration) =
+        RetainedQueueStore::cancel_codex_review_request_in_path(&queue_db_path, &request_id)?
     else {
         return Err(ApiError::NotFound("Codex review request not found"));
     };
@@ -4394,6 +4416,36 @@ fn shadow_compare(
     let path = envelope.request.path.trim().to_owned();
     let python_status = envelope.python_response.status;
 
+    if let Some(prediction) = shadow_predict_retained_write(state, &method, &path)? {
+        let status_matches = prediction.status == python_status;
+        let body_matches = prediction
+            .body_sha256
+            .as_ref()
+            .map(|value| value == &envelope.python_response.body_sha256);
+        let comparison = match (status_matches, body_matches) {
+            (true, Some(true)) => "match",
+            (true, None) => "status_match",
+            (false, _) => "status_mismatch",
+            (true, Some(false)) => "body_mismatch",
+        };
+        return Ok(ShadowHttpResult {
+            schema_version: 1,
+            method,
+            path,
+            support_status: prediction.support_status,
+            comparison,
+            would_write: false,
+            python_status,
+            predicted_status: Some(prediction.status),
+            predicted_body_sha256: prediction.body_sha256,
+            body_sha256_match: body_matches,
+            detail: Some(
+                "Rust shadow mode predicts this implemented retained write without performing side effects"
+                    .to_owned(),
+            ),
+        });
+    }
+
     if is_retained_write_surface(&method, &path) {
         return Ok(ShadowHttpResult {
             schema_version: 1,
@@ -4472,6 +4524,41 @@ fn shadow_compare(
         body_sha256_match: body_matches,
         detail: None,
     })
+}
+
+fn shadow_predict_retained_write(
+    state: &AppState,
+    method: &str,
+    path: &str,
+) -> anyhow::Result<Option<ShadowPrediction>> {
+    if method == "DELETE" {
+        if let Some(request_id) = path
+            .strip_prefix("/codex-review-requests/")
+            .filter(|value| !value.is_empty() && !value.contains('/'))
+        {
+            let queue_db_path = expand_home(&state.config.sm_send.db_path);
+            return match RetainedQueueStore::get_codex_review_request_from_path(
+                &queue_db_path,
+                request_id,
+            )? {
+                Some(_) => Ok(Some(ShadowPrediction {
+                    status: StatusCode::OK.as_u16(),
+                    body_sha256: None,
+                    support_status: "implemented_retained_write_status_only",
+                })),
+                None => {
+                    let body =
+                        serde_json::to_vec(&json!({ "detail": "Codex review request not found" }))?;
+                    Ok(Some(ShadowPrediction {
+                        status: StatusCode::NOT_FOUND.as_u16(),
+                        body_sha256: Some(sha256_hex(&body)),
+                        support_status: "implemented_retained_write",
+                    }))
+                }
+            };
+        }
+    }
+    Ok(None)
 }
 
 fn shadow_predict_read(
