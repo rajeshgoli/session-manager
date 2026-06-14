@@ -99,12 +99,12 @@ use crate::sessions::{
     expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
     ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
     MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
     SendCoreInputBatchRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SubagentStartOutcome, SubagentStartRequest,
-    SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest,
-    TurnCompleteOutcome,
+    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
+    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
+    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
 };
 use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path, ToolCallRow,
@@ -877,8 +877,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
+        .route("/sessions/review", post(spawn_review_session))
         .route("/sessions/context-monitor", get(get_context_monitor_status))
         .route("/sessions/{session_id}", get(get_session))
+        .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
             "/sessions/{parent_session_id}/children",
             get(list_children_sessions),
@@ -2179,6 +2181,302 @@ async fn spawn_session(
     Ok(Json(serde_json::to_value(SpawnSessionResponse::from(
         child,
     ))?))
+}
+
+async fn start_session_review(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(payload): Json<StartReviewRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}/review"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    let wait_seconds = payload.wait;
+    let watcher_session_id = payload
+        .watcher_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    match state.session_store.start_review_with_runtime(
+        &session_id,
+        payload,
+        &runtime,
+        &state.config.codex_review,
+    )? {
+        CoreReviewOutcome::Started(result) => {
+            spawn_review_steer_if_needed(state.clone(), &result, &runtime);
+            if let (Some(wait_seconds), Some(watcher_session_id)) =
+                (wait_seconds, watcher_session_id)
+            {
+                spawn_session_wait_monitor(
+                    state,
+                    result.session_id.clone(),
+                    watcher_session_id,
+                    wait_seconds,
+                );
+            }
+            Ok(Json(serde_json::to_value(result)?))
+        }
+        CoreReviewOutcome::NotFound => Err(ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: "Session not found".to_owned(),
+        }),
+        CoreReviewOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
+    }
+}
+
+async fn spawn_review_session(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<SpawnReviewRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/sessions/review",
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let Some(parent) = state
+        .session_store
+        .get_session(&payload.parent_session_id)?
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: "Parent session not found".to_owned(),
+        });
+    };
+    if let Some(name) = payload
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_requested_friendly_name(name)?;
+    }
+
+    let working_dir = payload
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(parent.working_dir.as_str())
+        .to_owned();
+    let create_payload = CreateCoreSessionRequest {
+        id: None,
+        name: Some(
+            payload
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("child-{}", short_session_id(&parent.id))),
+        ),
+        working_dir: Some(working_dir),
+        provider: Some("codex".to_owned()),
+        parent_session_id: Some(parent.id.clone()),
+        node: Some("primary".to_owned()),
+        initial_message: None,
+        model: payload.model.clone(),
+        wait: None,
+    };
+    let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    let child = if state.config.rust_core.runtime_enabled {
+        ensure_core_runtime_provider_supported(&create_payload)?;
+        ensure_core_runtime_request_node_supported(&state, &create_payload)?;
+        state
+            .session_store
+            .create_core_session_with_runtime(create_payload, log_dir, &runtime)?
+    } else {
+        state
+            .session_store
+            .create_core_session(create_payload, log_dir)?
+    };
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let review_request = StartReviewRequest {
+        mode: payload.mode.clone(),
+        base_branch: payload.base_branch.clone(),
+        commit_sha: payload.commit_sha.clone(),
+        custom_prompt: payload.custom_prompt.clone(),
+        steer_text: payload.steer_text.clone(),
+        wait: None,
+        watcher_session_id: None,
+    };
+    let review_outcome = match state.session_store.start_review_with_runtime(
+        &child.id,
+        review_request,
+        &runtime,
+        &state.config.codex_review,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            retire_spawned_review_child(&state, &child.id, &runtime);
+            return Err(error.into());
+        }
+    };
+    match review_outcome {
+        CoreReviewOutcome::Started(result) => {
+            spawn_review_steer_if_needed(state.clone(), &result, &runtime);
+            if let Some(wait_seconds) = payload.wait {
+                spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
+            }
+            Ok(Json(json!({
+                "session_id": child.id,
+                "name": child.name,
+                "friendly_name": child
+                    .friendly_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(child.name.as_str()),
+                "review_mode": payload.mode,
+                "base_branch": payload.base_branch,
+                "status": "started"
+            })))
+        }
+        CoreReviewOutcome::NotFound => {
+            Ok(Json(json!({ "error": "Failed to spawn review session" })))
+        }
+        CoreReviewOutcome::Error(error) => {
+            retire_spawned_review_child(&state, &child.id, &runtime);
+            Ok(Json(json!({ "error": error })))
+        }
+    }
+}
+
+fn retire_spawned_review_child(state: &AppState, child_id: &str, runtime: &TmuxRuntime) {
+    let _ = if state.config.rust_core.runtime_enabled {
+        state
+            .session_store
+            .retire_core_session_with_runtime(child_id, None, runtime)
+    } else {
+        state.session_store.retire_core_session(child_id, None)
+    };
+}
+
+fn spawn_review_steer_if_needed(
+    state: Arc<AppState>,
+    result: &crate::sessions::CoreReviewResult,
+    runtime: &TmuxRuntime,
+) {
+    let Some(steer_text) = result
+        .steer_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    let session_id = result.session_id.clone();
+    let tmux_session = result.tmux_session.clone();
+    let session_runtime = runtime.for_socket_name(result.tmux_socket_name.as_deref());
+    let delay = Duration::from_secs_f64(state.config.codex_review.steer_delay_seconds.max(0.0));
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let delivered = tokio::task::spawn_blocking(move || {
+            session_runtime.send_steer_text(&tmux_session, &steer_text)
+        })
+        .await;
+        if matches!(delivered, Ok(Ok(true))) {
+            let _ = state.session_store.mark_review_steer_delivered(&session_id);
+        }
+    });
+}
+
+fn spawn_session_wait_monitor(
+    state: Arc<AppState>,
+    target_session_id: String,
+    watcher_session_id: String,
+    wait_seconds: u64,
+) {
+    tokio::spawn(async move {
+        let Ok(Some(initial_target)) = state.session_store.get_session(&target_session_id) else {
+            queue_wait_notification(
+                &state,
+                &watcher_session_id,
+                format!("[sm wait] {target_session_id} no longer exists (waited 0s)"),
+            );
+            return;
+        };
+        let mut last_activity = initial_target.last_activity.clone();
+        let mut last_output_size = child_output_size(&initial_target);
+        let mut idle_since = Instant::now();
+        let started_at = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let elapsed = started_at.elapsed().as_secs();
+            let Ok(Some(target)) = state.session_store.get_session(&target_session_id) else {
+                queue_wait_notification(
+                    &state,
+                    &watcher_session_id,
+                    format!("[sm wait] {target_session_id} no longer exists (waited {elapsed}s)"),
+                );
+                break;
+            };
+            let output_size = child_output_size(&target);
+            if target.last_activity != last_activity || output_size != last_output_size {
+                last_activity = target.last_activity.clone();
+                last_output_size = output_size;
+                idle_since = Instant::now();
+            }
+            let target_name = child_display_name(&target);
+            let notification = if session_status_is_stopped(&target.status)
+                || runtime_child_session_exited(&state, &target)
+            {
+                Some(format!(
+                    "[sm wait] {target_name} reached stopped (waited {elapsed}s)"
+                ))
+            } else {
+                Some(idle_since.elapsed().as_secs())
+                    .filter(|idle_seconds| *idle_seconds >= wait_seconds)
+                    .map(|_| format!("[sm wait] {target_name} is now idle (waited {elapsed}s)"))
+            };
+            if let Some(notification) = notification {
+                queue_wait_notification(&state, &watcher_session_id, notification);
+                break;
+            }
+        }
+    });
+}
+
+fn queue_wait_notification(state: &AppState, watcher_session_id: &str, text: String) {
+    let request = SendCoreInputRequest {
+        text,
+        delivery_mode: "important".to_owned(),
+        sender_session_id: None,
+        from_sm_send: false,
+        timeout_seconds: None,
+        notify_on_delivery: false,
+        notify_after_seconds: None,
+        notify_on_stop: false,
+        remind_soft_threshold: None,
+        remind_hard_threshold: None,
+        remind_cancel_on_reply_session_id: None,
+        parent_session_id: None,
+    };
+    let _ = if state.config.rust_core.runtime_enabled {
+        let runtime = TmuxRuntime::from_app_config(&state.config);
+        state
+            .session_store
+            .send_core_input_with_runtime(watcher_session_id, request, &runtime)
+    } else {
+        state
+            .session_store
+            .send_core_input(watcher_session_id, request)
+    };
 }
 
 fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_seconds: u64) {
@@ -5743,6 +6041,15 @@ fn shadow_predict_retained_write(
     method: &str,
     path: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
+    if method == "POST"
+        && (path == "/sessions/review" || session_review_path_session_id(path).is_some())
+    {
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_retained_write_status_only",
+        }));
+    }
     if method == "POST" && path == "/codex-review-requests" {
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
@@ -8099,6 +8406,33 @@ fn is_retained_write_surface(method: &str, path: &str) -> bool {
     false
 }
 
+fn session_review_path_session_id(path: &str) -> Option<&str> {
+    let session_id = path.strip_prefix("/sessions/")?.strip_suffix("/review")?;
+    (!session_id.is_empty() && !session_id.contains('/')).then_some(session_id)
+}
+
+fn validate_requested_friendly_name(name: &str) -> Result<(), ApiError> {
+    let detail = if name.is_empty() {
+        Some("Invalid name: Name cannot be empty")
+    } else if name.chars().count() > 32 {
+        Some("Invalid name: Name too long (max 32 chars)")
+    } else if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Some("Invalid name: Name must be alphanumeric with - or _ only (no spaces)")
+    } else {
+        None
+    };
+    match detail {
+        Some(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: detail.to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
 fn is_auth_denial_status(status: u16) -> bool {
     matches!(status, 401 | 403 | 503)
 }
@@ -8294,7 +8628,7 @@ fn ensure_core_runtime_provider_supported(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("claude");
-    if matches!(provider, "claude" | "codex-fork") {
+    if matches!(provider, "claude" | "codex" | "codex-fork") {
         return Ok(());
     }
     Err(ApiError::Status {

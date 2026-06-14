@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub codex_observability: CodexObservabilityConfig,
     pub claude: ProviderLaunchConfig,
     pub codex: ProviderLaunchConfig,
+    pub codex_review: CodexReviewConfig,
     pub codex_fork: CodexForkLaunchConfig,
     pub nodes: NodesConfig,
     pub queue_runner: QueueRunnerConfig,
@@ -63,6 +64,7 @@ impl Default for AppConfig {
                 Some("sonnet".to_owned()),
             ),
             codex: ProviderLaunchConfig::new("codex".to_owned(), Vec::new(), None),
+            codex_review: CodexReviewConfig::default(),
             codex_fork: CodexForkLaunchConfig::default(),
             nodes: NodesConfig::default(),
             queue_runner: QueueRunnerConfig::default(),
@@ -577,6 +579,45 @@ impl Default for ProviderLaunchConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CodexReviewConfig {
+    #[serde(default = "default_codex_review_default_wait")]
+    pub default_wait: u64,
+    #[serde(default = "default_codex_review_menu_settle_seconds")]
+    pub menu_settle_seconds: f64,
+    #[serde(default = "default_codex_review_branch_settle_seconds")]
+    pub branch_settle_seconds: f64,
+    #[serde(default = "default_codex_review_steer_delay_seconds")]
+    pub steer_delay_seconds: f64,
+}
+
+impl Default for CodexReviewConfig {
+    fn default() -> Self {
+        Self {
+            default_wait: default_codex_review_default_wait(),
+            menu_settle_seconds: default_codex_review_menu_settle_seconds(),
+            branch_settle_seconds: default_codex_review_branch_settle_seconds(),
+            steer_delay_seconds: default_codex_review_steer_delay_seconds(),
+        }
+    }
+}
+
+fn default_codex_review_default_wait() -> u64 {
+    600
+}
+
+fn default_codex_review_menu_settle_seconds() -> f64 {
+    1.0
+}
+
+fn default_codex_review_branch_settle_seconds() -> f64 {
+    1.0
+}
+
+fn default_codex_review_steer_delay_seconds() -> f64 {
+    5.0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexForkLaunchConfig {
     pub command: String,
@@ -926,7 +967,7 @@ struct RawConfig {
     #[serde(default)]
     claude: RawProviderLaunchConfig,
     #[serde(default)]
-    codex: RawProviderLaunchConfig,
+    codex: RawCodexConfig,
     #[serde(default)]
     codex_fork: RawCodexForkLaunchConfig,
     #[serde(default)]
@@ -957,7 +998,8 @@ impl From<RawConfig> for AppConfig {
         let codex_requests = codex_requests_config(raw.codex_requests, &paths.state_file);
         let codex_events = codex_events_config(raw.codex_events, &paths.state_file);
         let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new());
-        let codex = provider_launch_config(raw.codex, "codex", None, Vec::new());
+        let codex_review = raw.codex.review;
+        let codex = provider_launch_config(raw.codex.provider, "codex", None, Vec::new());
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
         if trimmed(&rust_core.tmux_socket_name).is_none() {
             rust_core.tmux_socket_name = trimmed(&raw.tmux.socket_name);
@@ -1012,6 +1054,7 @@ impl From<RawConfig> for AppConfig {
             codex_observability,
             claude,
             codex,
+            codex_review,
             codex_fork,
             nodes: nodes_config_from_yaml(raw.nodes),
             queue_runner,
@@ -1075,6 +1118,14 @@ struct RawProviderLaunchConfig {
     args: Option<Vec<String>>,
     #[serde(default)]
     default_model: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct RawCodexConfig {
+    #[serde(flatten)]
+    provider: RawProviderLaunchConfig,
+    #[serde(default)]
+    review: CodexReviewConfig,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1944,6 +1995,36 @@ codex_fork:
         );
         assert_eq!(config.codex_fork.default_model.as_deref(), Some("gpt-5"));
         assert_eq!(config.codex_fork.event_schema_version, 7);
+    }
+
+    #[test]
+    fn raw_config_reads_codex_launch_and_review_timing() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+codex:
+  command: "/opt/bin/codex"
+  args: ["--dangerously-bypass-approvals-and-sandbox"]
+  default_model: "gpt-5"
+  review:
+    default_wait: 42
+    menu_settle_seconds: 0.25
+    branch_settle_seconds: 0.5
+    steer_delay_seconds: 0.75
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.codex.command, "/opt/bin/codex");
+        assert_eq!(
+            config.codex.args,
+            vec!["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(config.codex.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(config.codex_review.default_wait, 42);
+        assert_eq!(config.codex_review.menu_settle_seconds, 0.25);
+        assert_eq!(config.codex_review.branch_settle_seconds, 0.5);
+        assert_eq!(config.codex_review.steer_delay_seconds, 0.75);
     }
 
     #[test]
