@@ -6262,15 +6262,18 @@ async fn shadow_http_reports_device_google_auth_as_status_only() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["support_status"], "implemented_read_status_only");
-    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["support_status"], "unsupported");
+    assert_eq!(payload["comparison"], "not_compared");
     assert_eq!(payload["would_write"], false);
-    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_status"], Value::Null);
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
 
+    let app = router(AppState::new(config_with_state_file_and_auth(
+        &write_session_fixture(),
+    )));
     let (status, payload) = post_json(
-        app,
+        app.clone(),
         "/__shadow/http",
         json!({
             "schema_version": 1,
@@ -6294,6 +6297,34 @@ async fn shadow_http_reports_device_google_auth_as_status_only() {
     assert_eq!(payload["comparison"], "status_match");
     assert_eq!(payload["would_write"], false);
     assert_eq!(payload["predicted_status"], 401);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/auth/device/google",
+                "query_string": "",
+                "headers": {},
+                "body_sha256": sha256_hex(b"{\"id_token\":\"unallowlisted\"}")
+            },
+            "python_response": {
+                "status": 403,
+                "body_sha256": sha256_hex(b"{\"detail\":\"Google account is not allowlisted\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "unsupported");
+    assert_eq!(payload["comparison"], "not_compared");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], Value::Null);
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
 

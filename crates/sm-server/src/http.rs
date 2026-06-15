@@ -5970,7 +5970,10 @@ fn shadow_compare(
     let path = envelope.request.path.trim().to_owned();
     let python_status = envelope.python_response.status;
 
-    if method == "POST" && path == "/auth/device/google" {
+    if method == "POST"
+        && path == "/auth/device/google"
+        && is_device_google_auth_shadow_status(python_status)
+    {
         return Ok(ShadowHttpResult {
             schema_version: 1,
             method,
@@ -8657,6 +8660,10 @@ fn validate_requested_friendly_name(name: &str) -> Result<(), ApiError> {
 
 fn is_auth_denial_status(status: u16) -> bool {
     matches!(status, 401 | 403 | 503)
+}
+
+fn is_device_google_auth_shadow_status(status: u16) -> bool {
+    matches!(status, 401 | 422 | 503)
 }
 
 fn is_protected_read_surface(method: &str, path: &str) -> bool {
