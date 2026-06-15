@@ -20,9 +20,7 @@ class MainActivity : ComponentActivity() {
             SessionManagerTheme {
                 AppNavigation(
                     pendingEnrollmentUrl = pendingEnrollmentUrl.value,
-                    onEnrollmentDeepLinkConsumed = {
-                        pendingEnrollmentUrl.value = null
-                    },
+                    onEnrollmentDeepLinkConsumed = ::clearEnrollmentDeepLink,
                 )
             }
         }
@@ -40,5 +38,10 @@ class MainActivity : ComponentActivity() {
             return null
         }
         return uri.getQueryParameter("url")?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun clearEnrollmentDeepLink() {
+        pendingEnrollmentUrl.value = null
+        setIntent(Intent(this, MainActivity::class.java))
     }
 }

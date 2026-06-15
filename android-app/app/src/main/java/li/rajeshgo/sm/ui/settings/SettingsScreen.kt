@@ -23,7 +23,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -52,6 +55,7 @@ fun SettingsScreen(
     val context = LocalContext.current
     val googleSignInManager = GoogleSignInManager(context)
     val coroutineScope = rememberCoroutineScope()
+    var pendingDeepLinkEnrollmentUrl by remember { mutableStateOf<String?>(null) }
     val enrollmentScanner = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.trim()?.takeIf { it.isNotBlank() }?.let(viewModel::enrollCloudflareDeviceFromQr)
     }
@@ -61,7 +65,7 @@ fun SettingsScreen(
     LaunchedEffect(pendingEnrollmentUrl) {
         val enrollmentUrl = pendingEnrollmentUrl?.trim()
         if (!enrollmentUrl.isNullOrBlank()) {
-            viewModel.enrollCloudflareDeviceFromQr(enrollmentUrl)
+            pendingDeepLinkEnrollmentUrl = enrollmentUrl
             onEnrollmentDeepLinkConsumed()
         }
     }
@@ -235,6 +239,41 @@ fun SettingsScreen(
                         CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
                     } else {
                         Text("Scan enrollment QR")
+                    }
+                }
+                pendingDeepLinkEnrollmentUrl?.let { enrollmentUrl ->
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "Enrollment link opened from camera",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = enrollmentUrl,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Cyan,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                viewModel.enrollCloudflareDeviceFromQr(enrollmentUrl)
+                                pendingDeepLinkEnrollmentUrl = null
+                            },
+                            enabled = !state.cloudflareEnrollmentInProgress,
+                        ) {
+                            Text("Enroll device")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                pendingDeepLinkEnrollmentUrl = null
+                            },
+                            enabled = !state.cloudflareEnrollmentInProgress,
+                        ) {
+                            Text("Dismiss")
+                        }
                     }
                 }
                 Spacer(Modifier.height(10.dp))
