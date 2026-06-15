@@ -18,7 +18,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
-use qrcode::QrCode;
+use qrcode::{render::unicode, QrCode};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,7 @@ struct PairingState {
     db_path: PathBuf,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
+    advertised_base_url: String,
     unknown_attempts: Arc<Mutex<u32>>,
     shutdown: Arc<Notify>,
 }
@@ -351,6 +352,7 @@ pub fn run_enroll_device(options: EnrollDeviceOptions) -> Result<()> {
         options.listen,
         ca_cert_path,
         ca_key_path,
+        base_url,
     ))
 }
 
@@ -360,6 +362,7 @@ pub async fn serve_pairing_listener(
     bind_addr: SocketAddr,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
+    advertised_base_url: String,
 ) -> Result<()> {
     let shutdown = Arc::new(Notify::new());
     let state = PairingState {
@@ -367,6 +370,7 @@ pub async fn serve_pairing_listener(
         db_path,
         ca_cert_path,
         ca_key_path,
+        advertised_base_url,
         unknown_attempts: Arc::new(Mutex::new(0)),
         shutdown: shutdown.clone(),
     };
@@ -423,13 +427,11 @@ async fn open_device_enrollment(
             )
         }
     }
-    let host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("127.0.0.1:19192");
-    let enrollment_url = format!("http://{host}{}", enrollment_path(&token));
+    let enrollment_url = format!(
+        "{}/{}",
+        request_base_url(&state, &headers).trim_end_matches('/'),
+        enrollment_path(&token).trim_start_matches('/')
+    );
     Html(enrollment_redirect_html(&enrollment_url)).into_response()
 }
 
@@ -1496,6 +1498,27 @@ fn pairing_base_url(listen: SocketAddr) -> String {
     format!("http://{host}:{port}")
 }
 
+fn request_base_url(state: &PairingState, headers: &HeaderMap) -> String {
+    let advertised = state.advertised_base_url.trim();
+    if !advertised.is_empty() {
+        return advertised.to_owned();
+    }
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:19192");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    format!("{scheme}://{host}")
+}
+
 fn local_lan_ip() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("1.1.1.1:80").ok()?;
@@ -1504,13 +1527,7 @@ fn local_lan_ip() -> Option<String> {
 
 fn qr_ascii(value: &str) -> Result<String> {
     let code = QrCode::new(value.as_bytes()).context("failed to render enrollment QR")?;
-    Ok(code
-        .render::<char>()
-        .quiet_zone(true)
-        .module_dimensions(2, 1)
-        .dark_color('#')
-        .light_color(' ')
-        .build())
+    Ok(code.render::<unicode::Dense1x2>().quiet_zone(true).build())
 }
 
 fn enrollment_redirect_html(enrollment_url: &str) -> String {
@@ -1771,6 +1788,56 @@ mod tests {
         assert_eq!(
             enrollment_path("abc123"),
             "/client/mobile-terminal/enroll/abc123"
+        );
+    }
+
+    #[test]
+    fn qr_ascii_uses_dense_unicode_blocks() {
+        let qr = qr_ascii("http://192.168.4.31:19192/client/mobile-terminal/enroll/abc123")
+            .expect("render QR");
+
+        assert!(!qr.contains('#'));
+        assert!(qr.contains('█') || qr.contains('▀') || qr.contains('▄'));
+    }
+
+    #[test]
+    fn request_base_url_prefers_advertised_url() {
+        let state = PairingState {
+            config: AppConfig::default(),
+            db_path: PathBuf::new(),
+            ca_cert_path: PathBuf::new(),
+            ca_key_path: PathBuf::new(),
+            advertised_base_url: "https://sm-app.rajeshgo.li/pair".to_owned(),
+            unknown_attempts: Arc::new(Mutex::new(0)),
+            shutdown: Arc::new(Notify::new()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "127.0.0.1:19192".parse().expect("host header"));
+
+        assert_eq!(
+            request_base_url(&state, &headers),
+            "https://sm-app.rajeshgo.li/pair"
+        );
+    }
+
+    #[test]
+    fn request_base_url_falls_back_to_forwarded_proto_and_host() {
+        let state = PairingState {
+            config: AppConfig::default(),
+            db_path: PathBuf::new(),
+            ca_cert_path: PathBuf::new(),
+            ca_key_path: PathBuf::new(),
+            advertised_base_url: String::new(),
+            unknown_attempts: Arc::new(Mutex::new(0)),
+            shutdown: Arc::new(Notify::new()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "pairing.internal:19192".parse().expect("host header"));
+        headers.insert("x-forwarded-proto", "https".parse().expect("proto header"));
+
+        assert_eq!(
+            request_base_url(&state, &headers),
+            "https://pairing.internal:19192"
         );
     }
 
