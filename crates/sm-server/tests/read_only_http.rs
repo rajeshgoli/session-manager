@@ -8880,19 +8880,15 @@ async fn fixture_registry_clear_removes_recovered_maintainer_history() {
 }
 
 #[tokio::test]
-async fn shadow_attach_descriptor_reuses_real_attach_support_rules() {
+async fn shadow_attach_descriptor_uses_status_only_for_live_sessions() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
-    let expected_body = serde_json::to_vec(&json!({
+    let python_body = serde_json::to_vec(&json!({
         "attach": {
             "session_id": "stop1234",
             "provider": "claude",
             "attach_supported": false,
-            "tmux_session": "claude-stop1234",
-            "tmux_socket_name": null,
-            "runtime_id": null,
-            "lifecycle_state": "stopped",
-            "message": "Session is stopped"
+            "python_only_runtime_field": "live descriptor values can drift"
         }
     }))
     .unwrap();
@@ -8910,6 +8906,37 @@ async fn shadow_attach_descriptor_reuses_real_attach_support_rules() {
             },
             "python_response": {
                 "status": 200,
+                "body_sha256": sha256_hex(&python_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+}
+
+#[tokio::test]
+async fn shadow_attach_descriptor_compares_missing_session_body() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let expected_body = serde_json::to_vec(&json!({ "detail": "Session not found" })).unwrap();
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/sessions/missing/attach-descriptor",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 404,
                 "body_sha256": sha256_hex(&expected_body)
             }
         }),
