@@ -20,6 +20,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
@@ -43,6 +44,8 @@ import kotlinx.coroutines.launch
 @Composable
 fun SettingsScreen(
     onNavigateToWatch: () -> Unit,
+    pendingEnrollmentUrl: String? = null,
+    onEnrollmentDeepLinkConsumed: () -> Unit = {},
     viewModel: SettingsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -54,6 +57,14 @@ fun SettingsScreen(
     }
     val effectiveGoogleClientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() }
         ?: LocalDefaults.googleServerClientId.takeIf { it.isNotBlank() }
+
+    LaunchedEffect(pendingEnrollmentUrl) {
+        val enrollmentUrl = pendingEnrollmentUrl?.trim()
+        if (!enrollmentUrl.isNullOrBlank()) {
+            viewModel.enrollCloudflareDeviceFromQr(enrollmentUrl)
+            onEnrollmentDeepLinkConsumed()
+        }
+    }
 
     Column(
         modifier = Modifier

@@ -12,9 +12,9 @@ use std::{
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{ConnectInfo, Path as AxumPath, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{get, post},
+    http::{header::HOST, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::get,
     Json, Router,
 };
 use base64::Engine as _;
@@ -374,7 +374,7 @@ pub async fn serve_pairing_listener(
         .route("/health", get(pairing_health))
         .route(
             &format!("{PAIRING_PATH_PREFIX}/{{token}}"),
-            post(complete_device_enrollment),
+            get(open_device_enrollment).post(complete_device_enrollment),
         )
         .with_state(state);
     let listener = TcpListener::bind(bind_addr)
@@ -397,6 +397,40 @@ pub fn enrollment_path(token: &str) -> String {
 
 async fn pairing_health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"ok": true})))
+}
+
+async fn open_device_enrollment(
+    State(state): State<PairingState>,
+    AxumPath(token): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "Enrollment token is required");
+    }
+    match pending_pairing_registration(&state.db_path, &token) {
+        Ok(Some(_registration)) => {}
+        Ok(None) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "Unknown, expired, or already used enrollment token",
+            )
+        }
+        Err(error) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Enrollment lookup failed: {error}"),
+            )
+        }
+    }
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:19192");
+    let enrollment_url = format!("http://{host}{}", enrollment_path(&token));
+    Html(enrollment_redirect_html(&enrollment_url)).into_response()
 }
 
 async fn complete_device_enrollment(
@@ -1479,6 +1513,62 @@ fn qr_ascii(value: &str) -> Result<String> {
         .build())
 }
 
+fn enrollment_redirect_html(enrollment_url: &str) -> String {
+    let encoded_url = percent_encode_query_value(enrollment_url);
+    let app_link = format!("sm-enroll://enroll?url={encoded_url}");
+    let intent_link = format!(
+        "intent://enroll?url={encoded_url}#Intent;scheme=sm-enroll;package=li.rajeshgo.sm;S.browser_fallback_url={encoded_url};end"
+    );
+    let intent_js = serde_json::to_string(&intent_link).unwrap_or_else(|_| "\"\"".to_owned());
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Open Session Manager</title>
+  <script>
+    window.location.href = {intent_js};
+  </script>
+</head>
+<body>
+  <h1>Open Session Manager</h1>
+  <p>This enrollment link must be opened in the Session Manager Android app.</p>
+  <p><a href="{intent_link}">Open Session Manager</a></p>
+  <p><a href="{app_link}">Open with app link</a></p>
+  <p>If the button does not work, open the app Settings screen and use Scan enrollment QR.</p>
+  <p>Enrollment URL: <code>{enrollment_url}</code></p>
+</body>
+</html>"#,
+        intent_link = escape_html_attr(&intent_link),
+        app_link = escape_html_attr(&app_link),
+        enrollment_url = escape_html(enrollment_url),
+    )
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            output.push(byte as char);
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_html_attr(value: &str) -> String {
+    escape_html(value).replace('"', "&quot;")
+}
+
 fn valid_device_id(value: &str) -> bool {
     let len = value.len();
     (3..=128).contains(&len)
@@ -1681,6 +1771,24 @@ mod tests {
         assert_eq!(
             enrollment_path("abc123"),
             "/client/mobile-terminal/enroll/abc123"
+        );
+    }
+
+    #[test]
+    fn enrollment_redirect_html_contains_android_intent_deep_link() {
+        let url = "http://192.168.4.31:19192/client/mobile-terminal/enroll/abc123";
+        let html = enrollment_redirect_html(url);
+
+        assert!(html.contains("intent://enroll?url=http%3A%2F%2F192.168.4.31%3A19192%2Fclient%2Fmobile-terminal%2Fenroll%2Fabc123#Intent;scheme=sm-enroll;package=li.rajeshgo.sm;"));
+        assert!(html.contains("sm-enroll://enroll?url=http%3A%2F%2F192.168.4.31%3A19192%2Fclient%2Fmobile-terminal%2Fenroll%2Fabc123"));
+        assert!(html.contains("Enrollment URL:"));
+    }
+
+    #[test]
+    fn percent_encode_query_value_matches_deep_link_needs() {
+        assert_eq!(
+            percent_encode_query_value("http://host/path?x=1&y=a b"),
+            "http%3A%2F%2Fhost%2Fpath%3Fx%3D1%26y%3Da%20b"
         );
     }
 }
