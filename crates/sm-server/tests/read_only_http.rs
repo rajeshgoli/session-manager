@@ -6262,12 +6262,19 @@ async fn shadow_http_reports_device_google_auth_as_status_only() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["support_status"], "unsupported");
-    assert_eq!(payload["comparison"], "not_compared");
+    assert_eq!(
+        payload["support_status"],
+        "unimplemented_device_auth_success"
+    );
+    assert_eq!(payload["comparison"], "status_mismatch");
     assert_eq!(payload["would_write"], false);
-    assert_eq!(payload["predicted_status"], Value::Null);
+    assert_eq!(payload["predicted_status"], 401);
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("block cutover evidence"));
 
     let app = router(AppState::new(config_with_state_file_and_auth(
         &write_session_fixture(),

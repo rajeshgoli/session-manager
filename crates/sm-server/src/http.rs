@@ -5970,6 +5970,26 @@ fn shadow_compare(
     let path = envelope.request.path.trim().to_owned();
     let python_status = envelope.python_response.status;
 
+    if method == "POST" && path == "/auth/device/google" && python_status == StatusCode::OK.as_u16()
+    {
+        return Ok(ShadowHttpResult {
+            schema_version: 1,
+            method,
+            path,
+            support_status: "unimplemented_device_auth_success",
+            comparison: "status_mismatch",
+            would_write: false,
+            python_status,
+            predicted_status: Some(StatusCode::UNAUTHORIZED.as_u16()),
+            predicted_body_sha256: None,
+            body_sha256_match: None,
+            detail: Some(
+                "Rust cannot yet verify Google ID tokens or issue native bearer credentials; successful Python exchanges block cutover evidence"
+                    .to_owned(),
+            ),
+        });
+    }
+
     if method == "POST"
         && path == "/auth/device/google"
         && is_device_google_auth_shadow_status(python_status)
