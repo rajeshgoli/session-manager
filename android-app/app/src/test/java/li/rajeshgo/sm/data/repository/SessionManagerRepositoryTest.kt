@@ -110,6 +110,16 @@ class SessionManagerRepositoryTest {
     }
 
     @Test
+    fun deviceEnrollmentQrAcceptsPrivateHttpPairingUrl() {
+        assertEquals(
+            "http://192.168.4.31:19192/client/mobile-terminal/enroll/abc",
+            DeviceEnrollmentRepository.enrollmentUrlFromQrContents(
+                "http://192.168.4.31:19192/client/mobile-terminal/enroll/abc",
+            ),
+        )
+    }
+
+    @Test
     fun deviceEnrollmentQrAcceptsJsonEnrollmentUrl() {
         assertEquals(
             "https://sm-app.example.com/client/mobile-terminal/enroll/abc",
@@ -122,6 +132,30 @@ class SessionManagerRepositoryTest {
     @Test(expected = IllegalArgumentException::class)
     fun deviceEnrollmentQrRejectsNonHttpUrl() {
         DeviceEnrollmentRepository.enrollmentUrlFromQrContents("sm-enroll://abc")
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun deviceEnrollmentQrRejectsPublicHttpUrl() {
+        DeviceEnrollmentRepository.enrollmentUrlFromQrContents(
+            "http://attacker.example.com/client/mobile-terminal/enroll/abc",
+        )
+    }
+
+    @Test
+    fun deviceEnrollmentLocalHttpHostClassifierMatchesPairingHosts() {
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("localhost"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("studio.local"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("127.0.0.1"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("10.0.0.9"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("172.16.1.2"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("192.168.4.31"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("fd00::1"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("[fc00::1]"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("fe80::1"))
+        assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("8.8.8.8"))
+        assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("example.com"))
+        assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("fdattacker.example.com"))
+        assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("2001:4860:4860::8888"))
     }
 
     private fun ticket(): MobileAttachTicketResponse {

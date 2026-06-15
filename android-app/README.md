@@ -27,7 +27,7 @@ The app expects:
 - `/auth/device/google` enabled on the server
 - `/apps/session-manager-android/meta.json` and `/apps/session-manager-android/latest.apk` available on the server
 - `/client/*`, `/auth/device/google`, and app update routes available through the native app endpoint
-- when the native endpoint is behind Cloudflare Access, a signed SM mobile client certificate chain pasted into Settings
+- when the native endpoint is behind Cloudflare Access, a device certificate enrolled through `sm enroll-device`
 
 ## Publish a new APK
 
@@ -63,15 +63,16 @@ The intended Android attach path is:
 - run `sm enroll-device` on the trusted Session Manager host and scan its QR
   code from Settings within the short enrollment window
 - the app submits its Android Keystore CSR and public key to the pairing URL
-- Session Manager issues an SM mobile Cloudflare Access client certificate
-  whose Common Name matches that device key id
-- the app stores the signed certificate chain returned by enrollment
+- Session Manager issues an SM mobile Cloudflare Access client-certificate
+  credential whose Common Name matches that device key id
+- the app stores the credential internally for HTTPS client-certificate auth
 - authenticate the native HTTPS origin with Cloudflare Access client-certificate proof
 - sign in with Google and exchange the ID token for the SM device bearer token
 - request an in-app terminal attach ticket using the Android Keystore device key
 
 Cloudflare client-certificate proof is only the public-edge gate. The app still needs the SM bearer token and route-local attach-ticket proof before shell access is available.
 
-Manual CSR copy and certificate-chain paste in Settings remain available for
-debugging, but QR enrollment is the normal path. The server pairing token should
+QR enrollment through the phone Camera app is the supported path. The app does
+not request camera permission, does not include an in-app scanner, and does not
+expose the certificate material in Settings. The server pairing token should
 be single-use and expire after about 15 minutes.

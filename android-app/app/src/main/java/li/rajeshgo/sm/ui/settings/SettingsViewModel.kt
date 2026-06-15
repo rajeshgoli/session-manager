@@ -4,12 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlin.Result
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.repository.AppUpdateRepository
 import li.rajeshgo.sm.data.repository.AvailableAppUpdate
@@ -29,7 +27,6 @@ data class SettingsUiState(
     val mobileDeviceKeyId: String = "",
     val mobileDevicePublicKey: String = "",
     val mobileDeviceCertificateSigningRequest: String = "",
-    val cloudflareDeviceCertificateChainPem: String = "",
     val cloudflareDeviceCertificateConfigured: Boolean = false,
     val cloudflareEnrollmentInProgress: Boolean = false,
     val cloudflareEnrollmentStatus: String? = null,
@@ -57,7 +54,6 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 userEmail = settingsRepository.userEmail.first(),
                 userName = settingsRepository.userName.first(),
                 isLoggedIn = settingsRepository.isLoggedIn.first(),
-                cloudflareDeviceCertificateChainPem = settingsRepository.cloudflareDeviceCertificateChainPem.first(),
                 cloudflareDeviceCertificateConfigured = settingsRepository.hasCloudflareDeviceCertificate.first(),
             )
             loadMobileDeviceKey()
@@ -110,42 +106,6 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun updateCloudflareDeviceCertificateChain(value: String) {
-        _uiState.value = _uiState.value.copy(
-            cloudflareDeviceCertificateChainPem = value,
-            cloudflareEnrollmentError = null,
-        )
-    }
-
-    fun saveCloudflareDeviceCertificateChain() {
-        val certificateChainPem = _uiState.value.cloudflareDeviceCertificateChainPem.trim()
-        if (certificateChainPem.isBlank()) {
-            clearCloudflareDeviceCertificateChain()
-            return
-        }
-        viewModelScope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    check(deviceKeyManager.certificateChainMatchesDeviceKey(certificateChainPem)) {
-                        "Certificate chain does not match this mobile device key"
-                    }
-                }
-                settingsRepository.saveCloudflareDeviceCertificateChainPem(certificateChainPem)
-            }.onSuccess {
-                _uiState.value = _uiState.value.copy(
-                    cloudflareDeviceCertificateChainPem = certificateChainPem,
-                    cloudflareDeviceCertificateConfigured = true,
-                    cloudflareEnrollmentStatus = "Client certificate saved",
-                    cloudflareEnrollmentError = null,
-                )
-            }.onFailure { error ->
-                _uiState.value = _uiState.value.copy(
-                    cloudflareEnrollmentError = error.message ?: "Failed to save Cloudflare certificate",
-                )
-            }
-        }
-    }
-
     fun enrollCloudflareDeviceFromQr(qrContents: String) {
         if (_uiState.value.cloudflareEnrollmentInProgress) {
             return
@@ -159,10 +119,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             runCatching {
                 deviceEnrollmentRepository.enrollFromQr(qrContents)
             }.onSuccess { result ->
-                val certificateChainPem = settingsRepository.cloudflareDeviceCertificateChainPem.first()
                 _uiState.value = _uiState.value.copy(
-                    cloudflareDeviceCertificateChainPem = certificateChainPem,
-                    cloudflareDeviceCertificateConfigured = certificateChainPem.isNotBlank(),
+                    cloudflareDeviceCertificateConfigured = true,
                     cloudflareEnrollmentInProgress = false,
                     cloudflareEnrollmentStatus = buildString {
                         append("Enrolled ")
@@ -188,7 +146,6 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             settingsRepository.clearCloudflareDeviceCertificateChainPem()
             _uiState.value = _uiState.value.copy(
-                cloudflareDeviceCertificateChainPem = "",
                 cloudflareDeviceCertificateConfigured = false,
                 cloudflareEnrollmentStatus = "Client certificate cleared",
                 cloudflareEnrollmentError = null,

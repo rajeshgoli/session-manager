@@ -1,6 +1,7 @@
 package li.rajeshgo.sm.ui.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.LocalContext
@@ -21,7 +22,10 @@ object Routes {
 }
 
 @Composable
-fun AppNavigation() {
+fun AppNavigation(
+    pendingEnrollmentUrl: String? = null,
+    onEnrollmentDeepLinkConsumed: () -> Unit = {},
+) {
     val navController = rememberNavController()
     val context = LocalContext.current
     val settingsRepository = SettingsRepository(context)
@@ -33,6 +37,14 @@ fun AppNavigation() {
         null -> return
     }
 
+    LaunchedEffect(pendingEnrollmentUrl) {
+        if (!pendingEnrollmentUrl.isNullOrBlank()) {
+            navController.navigate(Routes.SETTINGS) {
+                launchSingleTop = true
+            }
+        }
+    }
+
     NavHost(navController = navController, startDestination = startDestination) {
         composable(Routes.SETTINGS) {
             SettingsScreen(
@@ -41,6 +53,8 @@ fun AppNavigation() {
                         popUpTo(Routes.SETTINGS) { inclusive = true }
                     }
                 },
+                pendingEnrollmentUrl = pendingEnrollmentUrl,
+                onEnrollmentDeepLinkConsumed = onEnrollmentDeepLinkConsumed,
             )
         }
         composable(Routes.WATCH) {
