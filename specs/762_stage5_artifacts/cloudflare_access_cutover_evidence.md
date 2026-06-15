@@ -1,6 +1,6 @@
 # Cloudflare Access Cutover Evidence
 
-Status: implementation evidence after PR #996 merged.
+Status: implementation evidence after PR #1012 merged.
 
 This artifact records the current Rust-side Cloudflare Access boundary for the
 Rust cutover track. It complements the design in
@@ -9,8 +9,9 @@ and does not replace the rollout gates in [gate_matrix.md](gate_matrix.md).
 
 ## Merged Runtime Boundary
 
-Rust `main` now includes the Cloudflare Access origin gate and read-only smoke
-evidence runner through PR #996:
+Rust `main` now includes the Cloudflare Access origin gate, read-only smoke
+evidence runner, Rust mobile-device enrollment, Cloudflare mTLS CA automation,
+and Android Camera-app enrollment flow through PR #1012:
 
 | PR | Evidence added |
 | --- | --- |
@@ -18,6 +19,12 @@ evidence runner through PR #996:
 | #948 | Rust config parsing and Cloudflare Access JWT/audience/context classification. |
 | #950 | Origin route gates, JWKS caching/refresh, public-host fail-closed behavior, app artifact gating, device-token exchange gating, and mobile device identity binding. |
 | #996 | Read-only Cloudflare Access smoke runner for mobile app origin-gate, public-edge proof, SM-auth boundary, app artifact metadata, and browser edge-only notes. |
+| #1000 | Android Cloudflare Access client-certificate storage and OkHttp/WebSocket client-certificate presentation. |
+| #1002 | Initial Android QR enrollment support; superseded by the Camera-app deep-link flow in #1012 for scanning. |
+| #1005 | Rust `sm enroll-device`, 15-minute mobile-device pairing listener, mobile device DB enrollment, CSR signing, and per-device Common Name policy sync. |
+| #1007 | Cloudflare mTLS CA upload/association automation for the mobile app hostname, keeping the CA private key local. |
+| #1010 | Android artifact version-code/version-name override support so published APK metadata matches the installed build. |
+| #1012 | Android Camera-app QR handoff via `sm-enroll://enroll`, direct in-app certificate save, no camera permission, no in-app scanner, and no certificate material exposed in Settings. |
 
 Current origin behavior:
 
@@ -38,6 +45,14 @@ Current origin behavior:
   device identity before returning native bootstrap metadata.
 - Local loopback plus trusted local host still preserves local operator bypass.
 - Non-mobile Access contexts are not accepted for native app routes.
+- `sm enroll-device` is the intended pairing path for native app
+  client-certificate setup. The pairing token is short-lived, the app submits
+  its Android Keystore-backed CSR, Rust signs it with the local mobile-device
+  CA, and the app stores the returned credential internally.
+- When Cloudflare API configuration is present, enrollment ensures the mobile
+  device CA is uploaded/associated with the app hostname and syncs the enrolled
+  device key id as a Common Name include entry. Broad "any valid certificate"
+  policy remains out of scope for cutover approval.
 
 The merged Rust tests currently cover:
 
@@ -85,11 +100,16 @@ needs operator-side Cloudflare and native-app evidence:
 | Shadow/rehearsal | Record a clean shadow/rehearsal window that includes native app traffic or an explicit operator-driven mobile route exercise. |
 
 The smoke runner requires real deployment inputs. The local shell used for the
-post-#996 handoff refresh did not have `CF_MOBILE_ACCESS_JWT`,
+post-#1012 handoff refresh did not have `CF_MOBILE_ACCESS_JWT`,
 `CF_BROWSER_ACCESS_JWT`, `SM_PUBLIC_EDGE_SECRET`, `SM_DEVICE_BEARER_TOKEN`,
 or `SM_COOKIE` set, and `--mobile-host` / `--browser-host` were not supplied,
 so no passing Cloudflare/mobile smoke evidence was produced there. Missing
 required mobile inputs are blockers by design.
+
+The Android artifact published during PR #1012 is versionCode `1013`,
+versionName `0.1.0-enroll-ui-cleanup`, artifact hash `cbb61798`. It supports
+Camera-app enrollment handoff and direct internal credential storage, but that
+published artifact is not by itself full Cloudflare Access cutover evidence.
 
 Do not treat the Cloudflare Access design as complete cutover evidence until
 these setup and smoke checks are recorded. The revoked-device denial and native

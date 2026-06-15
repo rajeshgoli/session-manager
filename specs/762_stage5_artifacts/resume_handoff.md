@@ -1,7 +1,7 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-14 after PR #996 Cloudflare Access
-mobile smoke evidence runner.
+Status: handoff snapshot from 2026-06-14 after PR #1012 Android Camera-app
+enrollment flow.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,13 +11,14 @@ coverage in
 
 ## Current Repository State
 
-- Branch: `main` after PR #996.
-- Latest merged commit before this docs refresh: `af7ac2d` (`Merge pull
-  request #996`)
+- Branch: `main` after PR #1012.
+- Latest merged commit before this docs refresh: `5fbbfa4` (`Merge pull
+  request #1012`)
 - Open PRs at handoff: none before this docs refresh PR.
-- Dirty worktree at handoff: only pre-existing untracked `.claude/settings.local.json`
-  and the local `config.yaml.shadow-backup-20260612T023248Z` created when
-  enabling shadow mode.
+- Dirty worktree at handoff: only pre-existing untracked
+  `.claude/settings.local.json`, `certs/`, `data/`, and the local
+  `config.yaml.shadow-backup-20260612T023248Z` created when enabling shadow
+  mode.
 - Stale session-manager review agents from the overnight run and PR #932 were retired.
 - Unrelated non-session-manager agents were left alone.
 - Live Python-authoritative Rust shadow mode is enabled in `config.yaml`, with
@@ -63,7 +64,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #996.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1012.
 - [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
   records the current Cloudflare Access origin-gate behavior and remaining
   operator setup/smoke evidence.
@@ -146,10 +147,25 @@ Merged Rust slices cover:
 - PR #992 added the stopped-service final backup gate.
 - PR #994 integrated the final backup gate into MVP rehearsal.
 - PR #996 added the Cloudflare Access mobile smoke evidence runner.
+- PR #998 refreshed the handoff after the Cloudflare smoke runner.
+- PR #1000 added Android Cloudflare client-certificate storage and native
+  HTTP/WebSocket client-certificate presentation.
+- PR #1002 added the first Android QR enrollment flow; PR #1012 later replaced
+  the in-app scanner/manual certificate UI with Camera-app deep-link
+  enrollment.
+- PR #1005 added Rust `sm enroll-device`, mobile device DB enrollment, CSR
+  signing, and per-device Common Name policy sync.
+- PR #1007 automated Cloudflare mTLS CA upload and mobile app hostname
+  association while keeping the CA private key local.
+- PR #1010 added Android artifact version-code/version-name override support.
+- PR #1012 added Android Camera-app QR handoff, `sm-enroll://enroll`, direct
+  in-app credential save, local/private HTTP pairing fallback, and removed
+  camera permission plus manual certificate UI.
 - Current contract manifest size:
-  - `133` checks total
+  - `134` checks total
   - `73` `python_and_rust`
-  - `60` `rust_only`
+  - `61` `rust_only`
+  - `93` read-only checks
   - `41` mutating checks
 
 ## Validation At Handoff
@@ -221,11 +237,12 @@ post-#984 manifest:
   skipped;
 - Rust mutating fixture contracts: `35` passed, `0` failed, `0` skipped.
 
-PRs #986-#996 added more cutover tooling and evidence gates after this focused
+PRs #986-#1012 added more cutover tooling and evidence gates after this focused
 run, including node restore fixtures, stopped-origin final backup, rehearsal
-final-backup integration, and the Cloudflare Access mobile smoke runner. Run a
-fresh full rehearsal once Cloudflare/mobile smoke inputs are available and
-Python-origin availability is stable.
+final-backup integration, the Cloudflare Access mobile smoke runner, Rust
+mobile-device enrollment, Cloudflare mTLS CA automation, and Android Camera-app
+enrollment. Run a fresh full rehearsal once Cloudflare/mobile smoke inputs are
+available and Python-origin availability is stable.
 
 The latest post-#942 full rehearsal attempts are blocked, not cutover evidence:
 
@@ -280,6 +297,13 @@ Observed after #996 at `2026-06-14T23:36Z`:
   `CF_MOBILE_ACCESS_JWT`, `CF_BROWSER_ACCESS_JWT`,
   `SM_PUBLIC_EDGE_SECRET`, `SM_DEVICE_BEARER_TOKEN`, or `SM_COOKIE` set, and
   `--mobile-host` / `--browser-host` were not supplied for a real smoke run.
+
+No newer clean full passive shadow or Cloudflare/mobile smoke artifact has been
+recorded in this handoff. PR #1012 published Android artifact `cbb61798`
+(`versionCode=1013`, `versionName=0.1.0-enroll-ui-cleanup`) and operator
+testing confirmed the app reached "Client certificate saved" after Camera-app
+deep-link enrollment, but the full Access smoke runner and sustained shadow
+window still need recorded artifacts.
 
 The broad live Rust contract run now uses the fixture filter:
 
@@ -359,9 +383,11 @@ needed for final cutover evidence.
 8. Run final native mobile smoke checks.
    - bootstrap, session list/detail, attach, request-status, analytics, bug
      reports, app artifacts.
-   - PR #996 added the read-only Cloudflare Access smoke runner; passing
-     evidence still requires the real Cloudflare Access JWTs, public-edge
-     secret, and SM auth token or cookie.
+   - PR #996 added the read-only Cloudflare Access smoke runner.
+   - PRs #1005, #1007, and #1012 added the mobile enrollment path needed to
+     generate app credentials for that smoke.
+   - Passing evidence still requires the real Cloudflare Access JWTs,
+     public-edge secret, SM auth token or cookie, and mobile app traffic.
 
 ### Cutover Stop Conditions
 

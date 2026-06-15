@@ -11,7 +11,7 @@ This bundle supports Stage 5 of [762_rust_migration_and_ruggedization.md](../762
 | [state_ownership_and_migration.md](state_ownership_and_migration.md) | Store-by-store ownership, backup, migration, rollback, and downgrade rules. |
 | [gate_matrix.md](gate_matrix.md) | Falsifiable value gate, compatibility/security/ops gates, and observability requirements. |
 | [implementation_workstreams.md](implementation_workstreams.md) | Epic split and sequencing for implementation tickets after this spec converges. |
-| [mvp_progress.md](mvp_progress.md) | Dated implementation snapshot for the Rust MVP track after merged PR #950 and the clean real-state rehearsal. |
+| [mvp_progress.md](mvp_progress.md) | Dated implementation snapshot for the Rust MVP track after merged PR #1012 and the latest clean real-state rehearsal. |
 | [resume_handoff.md](resume_handoff.md) | Current resume point, validation state, known fixtures, and next slices for the Rust port. |
 | [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md) | Current Cloudflare Access origin-gate evidence, required policies, and remaining public/mobile setup checks. |
 
