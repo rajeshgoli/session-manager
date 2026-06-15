@@ -135,7 +135,6 @@ class DeviceEnrollmentRepository(
             output.write(requestHeaders)
             output.write(bodyBytes)
             output.flush()
-            socket.shutdownOutput()
             return readEnrollmentHttpResponse(socket.getInputStream())
         }
     }
