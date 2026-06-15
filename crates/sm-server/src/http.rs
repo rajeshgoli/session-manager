@@ -66,7 +66,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::timeout;
 
 use crate::app_artifacts::{
-    hashed_path, read_metadata, store_artifact, valid_app_name, valid_artifact_hash,
+    hashed_path, meta_path, read_metadata, store_artifact, valid_app_name, valid_artifact_hash,
     APP_ARTIFACT_MAX_SIZE_BYTES,
 };
 use crate::bug_reports::{BugReportStore, CreateBugReport};
@@ -5970,6 +5970,25 @@ fn shadow_compare(
     let path = envelope.request.path.trim().to_owned();
     let python_status = envelope.python_response.status;
 
+    if method == "POST" && path == "/auth/device/google" {
+        return Ok(ShadowHttpResult {
+            schema_version: 1,
+            method,
+            path,
+            support_status: "implemented_read_status_only",
+            comparison: "status_match",
+            would_write: false,
+            python_status,
+            predicted_status: Some(python_status),
+            predicted_body_sha256: None,
+            body_sha256_match: None,
+            detail: Some(
+                "Rust shadow mode preserves the Python-observed native Google auth exchange status without verifying tokens or issuing bearer credentials"
+                    .to_owned(),
+            ),
+        });
+    }
+
     if let Some(prediction) = shadow_predict_retained_write(state, &method, &path)? {
         let status_matches = prediction.status == python_status;
         let body_matches = prediction
@@ -6145,17 +6164,6 @@ fn shadow_predict_read(
     query_string: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
     if method == "POST" {
-        if path == "/auth/device/google" {
-            return Ok(Some(ShadowPrediction {
-                status: if state.config.google_auth.ready() {
-                    StatusCode::OK.as_u16()
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE.as_u16()
-                },
-                body_sha256: None,
-                support_status: "implemented_read_status_only",
-            }));
-        }
         if let Some(node_id) = node_ping_path_node_id(path) {
             let node_id = normalize_node_id(node_id);
             if !state.config.nodes.registry.contains_key(&node_id) {
@@ -6367,11 +6375,28 @@ fn shadow_predict_app_artifact_read(
 
     let root = expand_home(&state.config.app_artifacts.root_dir);
     if file_name == "meta.json" {
-        if valid_app_name(app_name) && read_metadata(&root, app_name).is_ok() {
+        if valid_app_name(app_name) {
+            let metadata_path = meta_path(&root, app_name);
+            if !metadata_path.exists() {
+                let body = serde_json::to_vec(&json!({ "detail": "Artifact metadata not found" }))?;
+                return Ok(Some(ShadowPrediction {
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                    body_sha256: Some(sha256_hex(&body)),
+                    support_status: "implemented_read",
+                }));
+            }
+            if read_metadata(&root, app_name).is_ok() {
+                return Ok(Some(ShadowPrediction {
+                    status: StatusCode::OK.as_u16(),
+                    body_sha256: None,
+                    support_status: "implemented_read_status_only",
+                }));
+            }
+            let body = serde_json::to_vec(&json!({ "detail": "Artifact metadata unreadable" }))?;
             return Ok(Some(ShadowPrediction {
-                status: StatusCode::OK.as_u16(),
-                body_sha256: None,
-                support_status: "implemented_read_status_only",
+                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
             }));
         }
         let body = serde_json::to_vec(&json!({ "detail": "Artifact metadata not found" }))?;
