@@ -1,6 +1,5 @@
 package li.rajeshgo.sm.ui.settings
 
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -28,8 +27,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
 import li.rajeshgo.sm.BuildConfig
 import li.rajeshgo.sm.auth.GoogleSignInManager
 import li.rajeshgo.sm.ui.theme.BorderStrong
@@ -52,9 +49,6 @@ fun SettingsScreen(
     val googleSignInManager = GoogleSignInManager(context)
     val coroutineScope = rememberCoroutineScope()
     val deepLinkEnrollmentUrl = pendingEnrollmentUrl?.trim()?.takeIf { it.isNotBlank() }
-    val enrollmentScanner = rememberLauncherForActivityResult(ScanContract()) { result ->
-        result.contents?.trim()?.takeIf { it.isNotBlank() }?.let(viewModel::enrollCloudflareDeviceFromQr)
-    }
     val effectiveGoogleClientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() }
         ?: LocalDefaults.googleServerClientId.takeIf { it.isNotBlank() }
 
@@ -193,7 +187,7 @@ fun SettingsScreen(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = "Use this CSR when issuing the SM mobile Access certificate. The certificate Common Name should stay equal to the device key id.",
+                    text = "Run sm enroll-device on the Session Manager host, scan the QR with the phone Camera app, then open the link in Session Manager.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -209,26 +203,6 @@ fun SettingsScreen(
                     color = if (state.cloudflareDeviceCertificateConfigured) Emerald else Rose,
                     fontFamily = FontFamily.Monospace,
                 )
-                Spacer(Modifier.height(10.dp))
-                Button(
-                    onClick = {
-                        val options = ScanOptions().apply {
-                            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                            setPrompt("Scan sm enroll-device QR")
-                            setBeepEnabled(false)
-                            setOrientationLocked(false)
-                        }
-                        enrollmentScanner.launch(options)
-                    },
-                    enabled = !state.cloudflareEnrollmentInProgress,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    if (state.cloudflareEnrollmentInProgress) {
-                        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
-                    } else {
-                        Text("Scan enrollment QR")
-                    }
-                }
                 deepLinkEnrollmentUrl?.let { enrollmentUrl ->
                     Spacer(Modifier.height(10.dp))
                     Text(
@@ -265,46 +239,15 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(Modifier.height(10.dp))
-                OutlinedButton(
-                    onClick = {
-                        val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                        clipboard?.setPrimaryClip(
-                            android.content.ClipData.newPlainText(
-                                "sm mobile cloudflare csr",
-                                state.mobileDeviceCertificateSigningRequest,
-                            ),
-                        )
-                    },
-                    enabled = state.mobileDeviceCertificateSigningRequest.isNotBlank(),
-                ) {
-                    Text("Copy CSR")
+                if (state.cloudflareEnrollmentInProgress) {
+                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
+                    Spacer(Modifier.height(10.dp))
                 }
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = state.cloudflareDeviceCertificateChainPem,
-                    onValueChange = viewModel::updateCloudflareDeviceCertificateChain,
-                    label = { Text("Signed certificate chain PEM") },
-                    placeholder = { Text("-----BEGIN CERTIFICATE-----") },
-                    maxLines = 8,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(170.dp),
-                )
-                Spacer(Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = viewModel::saveCloudflareDeviceCertificateChain,
-                        enabled = state.cloudflareDeviceCertificateChainPem.isNotBlank() && !state.cloudflareEnrollmentInProgress,
-                    ) {
-                        Text("Save cert")
-                    }
-                    OutlinedButton(
-                        onClick = viewModel::clearCloudflareDeviceCertificateChain,
-                        enabled = (state.cloudflareDeviceCertificateConfigured || state.cloudflareDeviceCertificateChainPem.isNotBlank()) &&
-                            !state.cloudflareEnrollmentInProgress,
-                    ) {
-                        Text("Clear cert")
-                    }
+                OutlinedButton(
+                    onClick = viewModel::clearCloudflareDeviceCertificateChain,
+                    enabled = state.cloudflareDeviceCertificateConfigured && !state.cloudflareEnrollmentInProgress,
+                ) {
+                    Text("Clear cert")
                 }
                 state.cloudflareEnrollmentStatus?.let { status ->
                     Spacer(Modifier.height(10.dp))
