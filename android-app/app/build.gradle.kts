@@ -18,10 +18,23 @@ fun Project.stringProp(name: String, default: String = ""): String {
     if (fromLocalDefaults.isNotBlank()) {
         return fromLocalDefaults
     }
+    val fromEnv = (System.getenv(name) ?: "").trim()
+    if (fromEnv.isNotBlank()) {
+        return fromEnv
+    }
     return (findProperty(name) as String?)?.trim() ?: default
 }
 
 fun String.toBuildConfigString(): String = '"' + replace("\\", "\\\\").replace("\"", "\\\"") + '"'
+
+fun Project.intProp(name: String, default: Int): Int {
+    val value = stringProp(name)
+    if (value.isBlank()) {
+        return default
+    }
+    return value.toIntOrNull()
+        ?: throw GradleException("$name must be an integer")
+}
 
 android {
     namespace = "li.rajeshgo.sm"
@@ -31,8 +44,8 @@ android {
         applicationId = "li.rajeshgo.sm"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = project.intProp("SM_VERSION_CODE", 1)
+        versionName = project.stringProp("SM_VERSION_NAME", "0.1.0")
 
         buildConfigField("String", "SM_DEFAULT_SERVER_URL", project.stringProp("SM_DEFAULT_SERVER_URL").toBuildConfigString())
         buildConfigField("String", "SM_GOOGLE_SERVER_CLIENT_ID", project.stringProp("SM_GOOGLE_SERVER_CLIENT_ID").toBuildConfigString())

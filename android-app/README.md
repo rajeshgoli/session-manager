@@ -35,14 +35,14 @@ Build the app:
 
 ```
 cd android-app
-./gradlew assembleDebug
+SM_VERSION_CODE=2 SM_VERSION_NAME=0.1.1 ./gradlew assembleDebug
 ```
 
 Then publish it to the local Session Manager artifact server:
 
 ```
 cd ..
-VERSION_NAME=0.1.0 ./scripts/deploy_android_app.sh
+VERSION_CODE=2 VERSION_NAME=0.1.1 ./scripts/deploy_android_app.sh
 ```
 
 By default the deploy script uploads:
