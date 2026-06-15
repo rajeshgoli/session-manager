@@ -6154,6 +6154,9 @@ async fn shadow_http_reports_app_artifact_reads_as_status_only() {
 #[tokio::test]
 async fn shadow_http_reports_app_artifact_missing_reads_with_stable_body() {
     let artifact_root = unique_short_temp_dir("sm-rust-shadow-missing-app-artifacts");
+    let malformed_app_dir = artifact_root.join("malformed-app");
+    fs::create_dir_all(&malformed_app_dir).unwrap();
+    fs::write(malformed_app_dir.join("meta.json"), b"{not-json").unwrap();
     let app = router(AppState::new(AppConfig {
         app_artifacts: AppArtifactsConfig {
             root_dir: artifact_root.display().to_string(),
@@ -6202,6 +6205,33 @@ async fn shadow_http_reports_app_artifact_missing_reads_with_stable_body() {
         assert_eq!(payload["body_sha256_match"], true, "{path}");
     }
 
+    let unreadable_body =
+        serde_json::to_vec(&json!({ "detail": "Artifact metadata unreadable" })).unwrap();
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "GET",
+                "path": "/apps/malformed-app/meta.json",
+                "query_string": "",
+                "headers": {}
+            },
+            "python_response": {
+                "status": 500,
+                "body_sha256": sha256_hex(&unreadable_body)
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read");
+    assert_eq!(payload["comparison"], "match");
+    assert_eq!(payload["predicted_status"], 500);
+    assert_eq!(payload["body_sha256_match"], true);
+
     let _ = fs::remove_dir_all(artifact_root);
 }
 
@@ -6236,6 +6266,34 @@ async fn shadow_http_reports_device_google_auth_as_status_only() {
     assert_eq!(payload["comparison"], "status_match");
     assert_eq!(payload["would_write"], false);
     assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/auth/device/google",
+                "query_string": "",
+                "headers": {},
+                "body_sha256": sha256_hex(b"{\"id_token\":\"invalid\"}")
+            },
+            "python_response": {
+                "status": 401,
+                "body_sha256": sha256_hex(b"{\"detail\":\"Invalid Google ID token\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 401);
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
 
