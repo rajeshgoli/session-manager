@@ -327,6 +327,8 @@ pub struct CloudflareAccessConfig {
     #[serde(default)]
     pub account_id: Option<String>,
     #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
     pub api_token: Option<String>,
     #[serde(default)]
     pub team_domain: Option<String>,
@@ -340,6 +342,8 @@ pub struct CloudflareAccessConfig {
     pub email_worker: CloudflareAccessApplicationConfig,
     #[serde(default)]
     pub mobile_device_policy_id: Option<String>,
+    #[serde(default)]
+    pub mobile_device_ca_certificate_id: Option<String>,
     #[serde(default)]
     pub node_policy_id: Option<String>,
 }
@@ -1883,9 +1887,11 @@ public_edge:
             r#"
 cloudflare_access:
   account_id: cf-account
+  zone_id: cf-zone
   api_token: cf-token
   team_domain: team.cloudflareaccess.com
   mobile_device_policy_id: mobile-policy
+  mobile_device_ca_certificate_id: mobile-ca
   node_policy_id: node-policy
   browser:
     enabled: true
@@ -1917,6 +1923,10 @@ cloudflare_access:
             Some("cf-account")
         );
         assert_eq!(
+            trimmed(&config.cloudflare_access.zone_id).as_deref(),
+            Some("cf-zone")
+        );
+        assert_eq!(
             trimmed(&config.cloudflare_access.api_token).as_deref(),
             Some("cf-token")
         );
@@ -1927,6 +1937,10 @@ cloudflare_access:
         assert_eq!(
             trimmed(&config.cloudflare_access.mobile_device_policy_id).as_deref(),
             Some("mobile-policy")
+        );
+        assert_eq!(
+            trimmed(&config.cloudflare_access.mobile_device_ca_certificate_id).as_deref(),
+            Some("mobile-ca")
         );
         assert_eq!(
             trimmed(&config.cloudflare_access.node_policy_id).as_deref(),

@@ -313,6 +313,7 @@ pub fn run_enroll_device(options: EnrollDeviceOptions) -> Result<()> {
         .clone()
         .unwrap_or_else(|| expand_home(&config.mobile_terminal.device_ca_key_path));
     ensure_device_ca(&ca_cert_path, &ca_key_path)?;
+    ensure_cloudflare_mobile_device_ca(&config.cloudflare_access, &ca_cert_path)?;
     let registration = create_pairing_registration(
         &db_path,
         &options.user_id,
@@ -839,6 +840,16 @@ fn insert_audit_event(
     Ok(())
 }
 
+fn ensure_cloudflare_mobile_device_ca(
+    config: &CloudflareAccessConfig,
+    ca_cert_path: &Path,
+) -> Result<()> {
+    let Some(request) = DeviceCaTrustRequest::from_config(config, ca_cert_path)? else {
+        return Ok(());
+    };
+    request.execute()
+}
+
 pub fn sync_device_common_name(
     config: &CloudflareAccessConfig,
     common_name: &str,
@@ -858,6 +869,165 @@ struct DevicePolicyRequest {
     api_token: String,
     common_name: String,
     action: DevicePolicyAction,
+}
+
+#[derive(Debug)]
+struct DeviceCaTrustRequest {
+    account_id: String,
+    zone_id: Option<String>,
+    api_token: String,
+    hostname: String,
+    configured_certificate_id: Option<String>,
+    ca_cert_path: PathBuf,
+    ca_cert_pem: String,
+    ca_name: String,
+}
+
+impl DeviceCaTrustRequest {
+    fn from_config(config: &CloudflareAccessConfig, ca_cert_path: &Path) -> Result<Option<Self>> {
+        let Some(account_id) = trimmed(&config.account_id) else {
+            return Ok(None);
+        };
+        let Some(api_token) = trimmed(&config.api_token) else {
+            return Ok(None);
+        };
+        let Some(hostname) = trimmed(&config.mobile_app.hostname) else {
+            return Ok(None);
+        };
+        if !config.mobile_app.enabled {
+            return Ok(None);
+        }
+        let ca_cert_pem = fs::read_to_string(ca_cert_path).with_context(|| {
+            format!(
+                "failed to read device CA certificate {}",
+                ca_cert_path.display()
+            )
+        })?;
+        let fingerprint = certificate_pem_fingerprint(&ca_cert_pem);
+        Ok(Some(Self {
+            account_id,
+            zone_id: trimmed(&config.zone_id),
+            api_token,
+            hostname,
+            configured_certificate_id: trimmed(&config.mobile_device_ca_certificate_id),
+            ca_cert_path: ca_cert_path.to_path_buf(),
+            ca_cert_pem,
+            ca_name: format!("session-manager-mobile-device-ca-{}", &fingerprint[..16]),
+        }))
+    }
+
+    fn execute(&self) -> Result<()> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let certificate_id = match &self.configured_certificate_id {
+            Some(certificate_id) => certificate_id.clone(),
+            None => self.ensure_uploaded_ca(&agent)?,
+        };
+        let zone_id = match &self.zone_id {
+            Some(zone_id) => zone_id.clone(),
+            None => self.lookup_zone_id(&agent)?,
+        };
+        self.ensure_hostname_association(&agent, &zone_id, &certificate_id)
+    }
+
+    fn ensure_uploaded_ca(&self, agent: &ureq::Agent) -> Result<String> {
+        if let Some(certificate_id) = self.find_uploaded_ca(agent)? {
+            return Ok(certificate_id);
+        }
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/mtls_certificates",
+            self.account_id
+        );
+        let body = json!({
+            "name": self.ca_name,
+            "ca": true,
+            "certificates": self.ca_cert_pem,
+        });
+        let response = cloudflare_post(agent, &url, &self.api_token, body)?;
+        cloudflare_result_id(&response).with_context(|| {
+            format!(
+                "Cloudflare mTLS upload response missing certificate id for {}",
+                self.ca_cert_path.display()
+            )
+        })
+    }
+
+    fn find_uploaded_ca(&self, agent: &ureq::Agent) -> Result<Option<String>> {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/mtls_certificates?type=custom",
+            self.account_id
+        );
+        let response = cloudflare_get(agent, &url, &self.api_token)?;
+        let Some(results) = response.get("result").and_then(Value::as_array) else {
+            bail!("Cloudflare mTLS certificate list response missing result array");
+        };
+        for certificate in results {
+            let name = certificate.get("name").and_then(Value::as_str);
+            if name == Some(self.ca_name.as_str()) {
+                if let Some(id) = certificate.get("id").and_then(Value::as_str) {
+                    return Ok(Some(id.to_owned()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn lookup_zone_id(&self, agent: &ureq::Agent) -> Result<String> {
+        let zone_name = parent_zone_name(&self.hostname)?;
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones?name={zone_name}&account.id={}",
+            self.account_id
+        );
+        let response = cloudflare_get(agent, &url, &self.api_token)?;
+        let zones = response
+            .get("result")
+            .and_then(Value::as_array)
+            .context("Cloudflare zone lookup response missing result array")?;
+        let Some(zone) = zones.first() else {
+            bail!(
+                "Cloudflare zone lookup found no zone for mobile_app.hostname {}; set cloudflare_access.zone_id explicitly",
+                self.hostname
+            );
+        };
+        zone.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("Cloudflare zone lookup response missing zone id")
+    }
+
+    fn ensure_hostname_association(
+        &self,
+        agent: &ureq::Agent,
+        zone_id: &str,
+        certificate_id: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/certificate_authorities/hostname_associations?mtls_certificate_id={certificate_id}"
+        );
+        let response = cloudflare_get(agent, &url, &self.api_token)?;
+        let mut hostnames = hostname_associations_from_response(&response)?;
+        if hostnames.iter().any(|hostname| hostname == &self.hostname) {
+            return Ok(());
+        }
+        hostnames.push(self.hostname.clone());
+        hostnames.sort();
+        hostnames.dedup();
+        let update_url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/certificate_authorities/hostname_associations"
+        );
+        cloudflare_put(
+            agent,
+            &update_url,
+            &self.api_token,
+            json!({
+                "hostnames": hostnames,
+                "mtls_certificate_id": certificate_id,
+            }),
+        )?;
+        Ok(())
+    }
 }
 
 impl DevicePolicyRequest {
@@ -888,14 +1058,14 @@ impl DevicePolicyRequest {
             .http_status_as_error(false)
             .build()
             .into();
-        let current = self.cloudflare_get(&agent, &url)?;
+        let current = cloudflare_get(&agent, &url, &self.api_token)?;
         let mut policy = current
             .get("result")
             .cloned()
             .context("Cloudflare Access policy response missing result")?;
         mutate_policy_common_name_allowlist(&mut policy, &self.common_name, self.action)?;
         let payload = policy_update_payload(policy)?;
-        self.cloudflare_put(&agent, &url, payload)?;
+        cloudflare_put(&agent, &url, &self.api_token, payload)?;
         Ok(())
     }
 
@@ -912,43 +1082,50 @@ impl DevicePolicyRequest {
             )
         }
     }
+}
 
-    fn cloudflare_get(&self, agent: &ureq::Agent, url: &str) -> Result<Value> {
-        let response = agent
-            .get(url)
-            .header("Authorization", format!("Bearer {}", self.api_token))
-            .header("Content-Type", "application/json")
-            .call()
-            .with_context(|| format!("Cloudflare API request failed: {url}"))?;
-        self.parse_cloudflare_response(response)
-    }
+fn cloudflare_get(agent: &ureq::Agent, url: &str, api_token: &str) -> Result<Value> {
+    let response = agent
+        .get(url)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/json")
+        .call()
+        .with_context(|| format!("Cloudflare API request failed: {url}"))?;
+    parse_cloudflare_response(response)
+}
 
-    fn cloudflare_put(&self, agent: &ureq::Agent, url: &str, body: Value) -> Result<Value> {
-        let response = agent
-            .put(url)
-            .header("Authorization", format!("Bearer {}", self.api_token))
-            .header("Content-Type", "application/json")
-            .send(body.to_string().as_bytes())
-            .with_context(|| format!("Cloudflare API request failed: {url}"))?;
-        self.parse_cloudflare_response(response)
-    }
+fn cloudflare_post(agent: &ureq::Agent, url: &str, api_token: &str, body: Value) -> Result<Value> {
+    let response = agent
+        .post(url)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/json")
+        .send(body.to_string().as_bytes())
+        .with_context(|| format!("Cloudflare API request failed: {url}"))?;
+    parse_cloudflare_response(response)
+}
 
-    fn parse_cloudflare_response(
-        &self,
-        mut response: ureq::http::Response<ureq::Body>,
-    ) -> Result<Value> {
-        let status = response.status().as_u16();
-        let response_body = response
-            .body_mut()
-            .read_to_string()
-            .context("Cloudflare API response body was unreadable")?;
-        let value = serde_json::from_str::<Value>(&response_body)
-            .context("Cloudflare API returned non-JSON response")?;
-        if status >= 400 || value.get("success").and_then(Value::as_bool) != Some(true) {
-            bail!("Cloudflare API request failed with status {status}: {value}");
-        }
-        Ok(value)
+fn cloudflare_put(agent: &ureq::Agent, url: &str, api_token: &str, body: Value) -> Result<Value> {
+    let response = agent
+        .put(url)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .header("Content-Type", "application/json")
+        .send(body.to_string().as_bytes())
+        .with_context(|| format!("Cloudflare API request failed: {url}"))?;
+    parse_cloudflare_response(response)
+}
+
+fn parse_cloudflare_response(mut response: ureq::http::Response<ureq::Body>) -> Result<Value> {
+    let status = response.status().as_u16();
+    let response_body = response
+        .body_mut()
+        .read_to_string()
+        .context("Cloudflare API response body was unreadable")?;
+    let value = serde_json::from_str::<Value>(&response_body)
+        .context("Cloudflare API returned non-JSON response")?;
+    if status >= 400 || value.get("success").and_then(Value::as_bool) != Some(true) {
+        bail!("Cloudflare API request failed with status {status}: {value}");
     }
+    Ok(value)
 }
 
 fn mutate_policy_common_name_allowlist(
@@ -1014,6 +1191,74 @@ fn policy_update_payload(policy: Value) -> Result<Value> {
         bail!("Cloudflare Access policy result missing required update fields");
     }
     Ok(Value::Object(payload))
+}
+
+fn certificate_pem_fingerprint(certificate_pem: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(certificate_pem.trim().as_bytes());
+    hex_bytes(&hasher.finalize())
+}
+
+fn cloudflare_result_id(response: &Value) -> Option<String> {
+    response
+        .get("result")
+        .and_then(|result| result.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn hostname_associations_from_response(response: &Value) -> Result<Vec<String>> {
+    let result = response
+        .get("result")
+        .context("Cloudflare hostname association response missing result")?;
+    let mut hostnames = Vec::new();
+    collect_hostnames(result, &mut hostnames);
+    hostnames.sort();
+    hostnames.dedup();
+    Ok(hostnames)
+}
+
+fn collect_hostnames(value: &Value, hostnames: &mut Vec<String>) {
+    match value {
+        Value::String(hostname) => {
+            if !hostname.trim().is_empty() {
+                hostnames.push(hostname.trim().to_owned());
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_hostnames(value, hostnames);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(hostname) = object.get("hostname").and_then(Value::as_str) {
+                if !hostname.trim().is_empty() {
+                    hostnames.push(hostname.trim().to_owned());
+                }
+            }
+            if let Some(values) = object.get("hostnames") {
+                collect_hostnames(values, hostnames);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parent_zone_name(hostname: &str) -> Result<String> {
+    let labels: Vec<&str> = hostname
+        .trim()
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|label| !label.is_empty())
+        .collect();
+    if labels.len() < 2 {
+        bail!("Cloudflare mobile_app.hostname must be a fully qualified hostname");
+    }
+    Ok(format!(
+        "{}.{}",
+        labels[labels.len() - 2],
+        labels[labels.len() - 1]
+    ))
 }
 
 fn extract_public_key_from_csr_with_openssl(csr_pem: &str) -> Result<String> {
@@ -1369,6 +1614,65 @@ mod tests {
             json!([
                 {"common_name": {"common_name": EMPTY_DEVICE_COMMON_NAME}}
             ])
+        );
+    }
+
+    #[test]
+    fn cloudflare_ca_trust_request_derives_name_and_zone_from_mobile_host() {
+        let temp_dir = temporary_dir("sm-test-ca").expect("temp dir");
+        let ca_path = temp_dir.join("ca.pem");
+        fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write ca");
+        let mut config = CloudflareAccessConfig {
+            account_id: Some("account".to_owned()),
+            api_token: Some("token".to_owned()),
+            mobile_device_policy_id: Some("policy".to_owned()),
+            ..CloudflareAccessConfig::default()
+        };
+        config.mobile_app.enabled = true;
+        config.mobile_app.hostname = Some("sm-app.rajeshgo.li".to_owned());
+
+        let request = DeviceCaTrustRequest::from_config(&config, &ca_path)
+            .expect("request result")
+            .expect("request configured");
+
+        assert_eq!(request.account_id, "account");
+        assert_eq!(request.hostname, "sm-app.rajeshgo.li");
+        assert_eq!(parent_zone_name(&request.hostname).unwrap(), "rajeshgo.li");
+        assert!(request
+            .ca_name
+            .starts_with("session-manager-mobile-device-ca-"));
+        assert!(request.configured_certificate_id.is_none());
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn cloudflare_hostname_association_parser_accepts_common_response_shapes() {
+        let from_strings = hostname_associations_from_response(&json!({
+            "result": ["sm-app.rajeshgo.li", "sm-node.rajeshgo.li"]
+        }))
+        .expect("parse strings");
+        assert_eq!(
+            from_strings,
+            vec!["sm-app.rajeshgo.li", "sm-node.rajeshgo.li"]
+        );
+
+        let from_objects = hostname_associations_from_response(&json!({
+            "result": {
+                "hostnames": [
+                    {"hostname": "sm-app.rajeshgo.li"},
+                    {"hostname": "sm-app.rajeshgo.li"},
+                    "sm-node.rajeshgo.li"
+                ]
+            }
+        }))
+        .expect("parse objects");
+        assert_eq!(
+            from_objects,
+            vec!["sm-app.rajeshgo.li", "sm-node.rajeshgo.li"]
         );
     }
 

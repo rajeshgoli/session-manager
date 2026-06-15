@@ -168,9 +168,11 @@ external_access:
 # Cloudflare mTLS/service auth with Common Name allowlists.
 cloudflare_access:
   account_id: ""
+  zone_id: ""
   api_token: ""
   team_domain: "your-team.cloudflareaccess.com"
   mobile_device_policy_id: ""
+  mobile_device_ca_certificate_id: ""
   node_policy_id: ""
   browser:
     enabled: false
