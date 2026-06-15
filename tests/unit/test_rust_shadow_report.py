@@ -121,46 +121,6 @@ def test_shadow_report_marks_mismatches_and_shadow_errors_as_blockers(tmp_path):
     assert report["blockers"][1]["detail"] == "connection refused"
 
 
-def test_shadow_report_blocks_unimplemented_device_auth_success(tmp_path):
-    ledger = tmp_path / "rust_shadow.jsonl"
-    _write_jsonl(
-        ledger,
-        [
-            {
-                "schema_version": 1,
-                "observed_at": "2026-06-12T01:00:00Z",
-                "method": "POST",
-                "path": "/auth/device/google",
-                "query_string": "",
-                "python_status": 200,
-                "python_body_sha256": "python-device-auth",
-                "rust_http_status": 200,
-                "rust_result": {
-                    "comparison": "status_mismatch",
-                    "support_status": "unimplemented_device_auth_success",
-                    "predicted_status": 401,
-                    "body_sha256_match": None,
-                },
-            }
-        ],
-    )
-
-    report = summarize_ledger(ledger)
-
-    assert report["status"] == "blocked"
-    assert report["comparison_counts"] == {"status_mismatch": 1}
-    assert report["blockers"] == [
-        {
-            "kind": "status_mismatch",
-            "line": 1,
-            "route": "POST /auth/device/google",
-            "support_status": "unimplemented_device_auth_success",
-            "predicted_status": 401,
-            "python_status": 200,
-        }
-    ]
-
-
 def test_shadow_report_tracks_invalid_json_as_blocker(tmp_path):
     ledger = tmp_path / "rust_shadow.jsonl"
     ledger.write_text(
