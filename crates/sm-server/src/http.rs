@@ -88,6 +88,10 @@ use crate::email::{
     extract_text_from_raw_email, normalize_explicit_session_id, EmailBridge,
     HumanRecipientResponse, SendAgentEmailRequest, DEFAULT_EMAIL_WEBHOOK_PATH,
 };
+use crate::google_auth::{
+    fetch_google_id_token_jwks, google_id_token_key_id, verify_google_id_token_with_jwks,
+    GoogleIdTokenClaims, GoogleIdTokenError,
+};
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::mobile_devices::{self, mobile_device_db_path};
 use crate::queue::{
@@ -130,6 +134,9 @@ const MOBILE_TERMINAL_INITIAL_RESIZE_WAIT_SECONDS: f64 = 2.0;
 const MOBILE_TERMINAL_MAX_ATTACH_SECONDS: u64 = 3600;
 const CLOUDFLARE_ACCESS_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
 const CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const GOOGLE_ID_TOKEN_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
+const GOOGLE_ID_TOKEN_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DEVICE_TOKEN_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const REVIEW_WAIT_IDLE_THRESHOLD: Duration = Duration::from_secs(1);
 const REVIEW_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -222,6 +229,13 @@ struct MobileTerminalAuthFrame {
 
 #[derive(Clone)]
 struct CloudflareAccessJwksCacheEntry {
+    jwks: Arc<JwkSet>,
+    fetched_at: Instant,
+    last_unknown_key_refresh: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct GoogleIdTokenJwksCacheEntry {
     jwks: Arc<JwkSet>,
     fetched_at: Instant,
     last_unknown_key_refresh: Option<Instant>,
@@ -322,6 +336,7 @@ pub struct AppState {
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
     public_edge_assertion_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
     cloudflare_access_jwks_cache: Arc<Mutex<BTreeMap<String, CloudflareAccessJwksCacheEntry>>>,
+    google_id_token_jwks_cache: Arc<Mutex<Option<GoogleIdTokenJwksCacheEntry>>>,
     mobile_terminal_revoked_keys: Arc<Mutex<BTreeSet<(String, String)>>>,
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
@@ -345,6 +360,7 @@ impl AppState {
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
             public_edge_assertion_nonces: Arc::new(Mutex::new(BTreeMap::new())),
             cloudflare_access_jwks_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            google_id_token_jwks_cache: Arc::new(Mutex::new(None)),
             mobile_terminal_revoked_keys: Arc::new(Mutex::new(BTreeSet::new())),
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             mobile_terminal_secret,
@@ -1034,7 +1050,8 @@ async fn auth_device_google(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+    ensure_public_edge_assertion_for_request(&state, &request)?;
     let Json(payload) = Json::<DeviceGoogleAuthRequest>::from_request(request, &state)
         .await
         .map_err(|error| ApiError::Status {
@@ -1047,11 +1064,55 @@ async fn auth_device_google(
             detail: "Google auth is not configured".to_owned(),
         });
     }
-    let _id_token = payload.id_token.trim();
-    Err(ApiError::Status {
-        status: StatusCode::UNAUTHORIZED,
-        detail: "Invalid Google ID token".to_owned(),
-    })
+    let id_token = payload.id_token.trim();
+    let token_info =
+        verify_google_id_token_cached(&state, id_token).map_err(|error| match error {
+            GoogleIdTokenError::MalformedToken
+            | GoogleIdTokenError::MissingKeyId
+            | GoogleIdTokenError::JwksFetchFailed
+            | GoogleIdTokenError::UnknownKeyId
+            | GoogleIdTokenError::InvalidToken => ApiError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                detail: "Invalid Google ID token".to_owned(),
+            },
+        })?;
+
+    if !allowed_google_audiences(&state.config).contains(token_info.aud.trim()) {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Google ID token audience is not allowed".to_owned(),
+        });
+    }
+
+    let email = token_info
+        .email
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !token_info.email_verified || !allowlisted_google_email(&state.config, &email) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Google account is not allowlisted".to_owned(),
+        });
+    }
+    ensure_mobile_cloudflare_access_context_matches_actor(&state, access_context.as_ref(), &email)?;
+
+    let name = trimmed(&token_info.name).unwrap_or_else(|| email.clone());
+    let issued = issue_device_access_token(&state.config, &email, &name).ok_or_else(|| {
+        ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Device auth signing is not configured".to_owned(),
+        }
+    })?;
+
+    Ok(Json(serde_json::to_value(DeviceGoogleAuthResponse {
+        access_token: issued.access_token,
+        token_type: "Bearer",
+        expires_at: issued.expires_at,
+        email,
+        name: Some(name),
+    })?))
 }
 
 async fn tmux_client_hook(
@@ -5970,26 +6031,6 @@ fn shadow_compare(
     let path = envelope.request.path.trim().to_owned();
     let python_status = envelope.python_response.status;
 
-    if method == "POST" && path == "/auth/device/google" && python_status == StatusCode::OK.as_u16()
-    {
-        return Ok(ShadowHttpResult {
-            schema_version: 1,
-            method,
-            path,
-            support_status: "unimplemented_device_auth_success",
-            comparison: "status_mismatch",
-            would_write: false,
-            python_status,
-            predicted_status: Some(StatusCode::UNAUTHORIZED.as_u16()),
-            predicted_body_sha256: None,
-            body_sha256_match: None,
-            detail: Some(
-                "Rust cannot yet verify Google ID tokens or issue native bearer credentials; successful Python exchanges block cutover evidence"
-                    .to_owned(),
-            ),
-        });
-    }
-
     if method == "POST"
         && path == "/auth/device/google"
         && is_device_google_auth_shadow_status(python_status)
@@ -6006,7 +6047,7 @@ fn shadow_compare(
             predicted_body_sha256: None,
             body_sha256_match: None,
             detail: Some(
-                "Rust shadow mode preserves the Python-observed native Google auth exchange status without verifying tokens or issuing bearer credentials"
+                "Rust shadow mode preserves the Python-observed native Google auth exchange status without replaying token verification or issuing bearer credentials"
                     .to_owned(),
             ),
         });
@@ -8683,7 +8724,7 @@ fn is_auth_denial_status(status: u16) -> bool {
 }
 
 fn is_device_google_auth_shadow_status(status: u16) -> bool {
-    matches!(status, 401 | 422 | 503)
+    matches!(status, 200 | 401 | 403 | 422 | 503)
 }
 
 fn is_protected_read_surface(method: &str, path: &str) -> bool {
@@ -8996,6 +9037,132 @@ fn authenticated_user(headers: &HeaderMap, config: &AppConfig) -> Option<Authent
         return Some(user);
     }
     browser_session_user(headers, config)
+}
+
+fn verify_google_id_token_cached(
+    state: &AppState,
+    token: &str,
+) -> Result<GoogleIdTokenClaims, GoogleIdTokenError> {
+    google_id_token_key_id(token)?;
+    let had_cached_jwks = google_id_token_has_cached_jwks(state);
+    let jwks = google_id_token_cached_jwks(state, false)?;
+    let result = verify_google_id_token_with_jwks(token, &jwks);
+    if matches!(result, Err(GoogleIdTokenError::UnknownKeyId))
+        && had_cached_jwks
+        && google_id_token_mark_unknown_key_refresh_if_allowed(state)
+    {
+        let refreshed_jwks = google_id_token_cached_jwks(state, true)?;
+        return verify_google_id_token_with_jwks(token, &refreshed_jwks);
+    }
+    result
+}
+
+fn google_id_token_cached_jwks(
+    state: &AppState,
+    force_refresh: bool,
+) -> Result<Arc<JwkSet>, GoogleIdTokenError> {
+    if !force_refresh {
+        if let Some(entry) = state
+            .google_id_token_jwks_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .filter(|entry| google_id_token_jwks_cache_entry_is_fresh(entry.fetched_at))
+        {
+            return Ok(entry.jwks);
+        }
+    }
+
+    let last_unknown_key_refresh = state
+        .google_id_token_jwks_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|entry| entry.last_unknown_key_refresh);
+    let jwks = Arc::new(fetch_google_id_token_jwks()?);
+    *state.google_id_token_jwks_cache.lock().unwrap() = Some(GoogleIdTokenJwksCacheEntry {
+        jwks: jwks.clone(),
+        fetched_at: Instant::now(),
+        last_unknown_key_refresh,
+    });
+    Ok(jwks)
+}
+
+fn google_id_token_jwks_cache_entry_is_fresh(fetched_at: Instant) -> bool {
+    fetched_at.elapsed() < GOOGLE_ID_TOKEN_JWKS_TTL
+}
+
+fn google_id_token_has_cached_jwks(state: &AppState) -> bool {
+    state.google_id_token_jwks_cache.lock().unwrap().is_some()
+}
+
+fn google_id_token_mark_unknown_key_refresh_if_allowed(state: &AppState) -> bool {
+    let mut cache = state.google_id_token_jwks_cache.lock().unwrap();
+    let Some(entry) = cache.as_mut() else {
+        return false;
+    };
+    let now = Instant::now();
+    if entry.last_unknown_key_refresh.is_some_and(|last_refresh| {
+        now.duration_since(last_refresh) < GOOGLE_ID_TOKEN_UNKNOWN_KID_REFRESH_INTERVAL
+    }) {
+        return false;
+    }
+    entry.last_unknown_key_refresh = Some(now);
+    true
+}
+
+fn allowed_google_audiences(config: &AppConfig) -> BTreeSet<String> {
+    [
+        &config.google_auth.client_id,
+        &config.google_auth.android_client_id,
+    ]
+    .into_iter()
+    .filter_map(trimmed)
+    .collect()
+}
+
+fn allowlisted_google_email(config: &AppConfig, email: &str) -> bool {
+    let email = email.trim().to_ascii_lowercase();
+    !email.is_empty()
+        && config
+            .google_auth
+            .allowlist_emails
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case(&email))
+}
+
+fn issue_device_access_token(
+    config: &AppConfig,
+    email: &str,
+    name: &str,
+) -> Option<IssuedDeviceAccessToken> {
+    let secret = trimmed(&config.google_auth.session_cookie_secret)?;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let exp = now.checked_add(DEVICE_TOKEN_MAX_AGE_SECONDS)?;
+    let payload = json!({
+        "v": 1,
+        "type": "device_access",
+        "email": email,
+        "name": name,
+        "iat": now,
+        "exp": exp,
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).ok()?);
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(payload_b64.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let mut expires_at = OffsetDateTime::from_unix_timestamp(exp)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()?;
+    if let Some(stripped) = expires_at.strip_suffix('Z') {
+        expires_at = format!("{stripped}+00:00");
+    }
+    Some(IssuedDeviceAccessToken {
+        access_token: format!("smat_{payload_b64}.{signature}"),
+        expires_at,
+    })
 }
 
 fn request_actor_email_from_parts(
@@ -9575,6 +9742,20 @@ struct DeviceGoogleAuthRequest {
     id_token: String,
 }
 
+#[derive(Debug, Serialize)]
+struct DeviceGoogleAuthResponse {
+    access_token: String,
+    token_type: &'static str,
+    expires_at: String,
+    email: String,
+    name: Option<String>,
+}
+
+struct IssuedDeviceAccessToken {
+    access_token: String,
+    expires_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct TmuxClientHookQuery {
     event: String,
@@ -10022,14 +10203,19 @@ struct SessionOpenDefaults {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::google_auth::test_support::{
+        test_google_id_token, test_google_jwks, test_private_key_pem,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::Method,
     };
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use p256::{
         ecdsa::{signature::Signer, SigningKey},
         pkcs8::{EncodePublicKey, LineEnding},
     };
+    use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
 
@@ -10159,6 +10345,71 @@ mod tests {
         config.cloudflare_access.email_worker.hostname = Some("sm-email.example.com".to_owned());
         config.cloudflare_access.email_worker.jwt_audience = Some("sm-email-aud".to_owned());
         config
+    }
+
+    fn google_auth_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.google_auth.enabled = true;
+        config.google_auth.public_host = Some("sm.rajeshgo.li".to_owned());
+        config.google_auth.public_path_prefix = Some("/sm".to_owned());
+        config.google_auth.client_id = Some("web-client-id".to_owned());
+        config.google_auth.android_client_id = Some("android-client-id".to_owned());
+        config.google_auth.client_secret = Some("web-client-secret".to_owned());
+        config.google_auth.redirect_uri =
+            Some("https://sm.rajeshgo.li/auth/google/callback".to_owned());
+        config.google_auth.allowlist_emails = vec!["rajeshgoli@gmail.com".to_owned()];
+        config.google_auth.session_cookie_secret = Some("session-cookie-secret".to_owned());
+        config
+    }
+
+    fn google_auth_state() -> AppState {
+        let state = AppState::new(google_auth_config());
+        *state.google_id_token_jwks_cache.lock().unwrap() = Some(GoogleIdTokenJwksCacheEntry {
+            jwks: Arc::new(test_google_jwks()),
+            fetched_at: Instant::now(),
+            last_unknown_key_refresh: None,
+        });
+        state
+    }
+
+    #[derive(Serialize)]
+    struct TestAccessClaims<'a> {
+        sub: &'a str,
+        aud: &'a str,
+        iss: &'a str,
+        exp: usize,
+        iat: usize,
+        common_name: &'a str,
+    }
+
+    fn test_mobile_access_assertion(common_name: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("google-test-key".to_owned());
+        let claims = TestAccessClaims {
+            sub: "mobile-device-subject",
+            aud: "sm-mobile-aud",
+            iss: "https://team.cloudflareaccess.com",
+            exp: 4_102_444_800,
+            iat: 1_700_000_000,
+            common_name,
+        };
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(test_private_key_pem()).expect("private key"),
+        )
+        .expect("access token")
+    }
+
+    fn seed_cloudflare_access_jwks(state: &AppState) {
+        state.cloudflare_access_jwks_cache.lock().unwrap().insert(
+            "https://team.cloudflareaccess.com".to_owned(),
+            CloudflareAccessJwksCacheEntry {
+                jwks: Arc::new(test_google_jwks()),
+                fetched_at: Instant::now(),
+                last_unknown_key_refresh: None,
+            },
+        );
     }
 
     fn sign_public_edge_headers(
@@ -10341,6 +10592,181 @@ mod tests {
             created_at_unix: 1,
             expires_at_unix: 999_999,
         }
+    }
+
+    #[tokio::test]
+    async fn auth_device_google_exchanges_id_token_and_bearer_authenticates() {
+        let app = router(google_auth_state());
+        let token = test_google_id_token(
+            "android-client-id",
+            "rajeshgoli@gmail.com",
+            true,
+            "Rajesh Goli",
+        );
+        let mut request = public_request(
+            Method::POST,
+            "/auth/device/google",
+            Body::from(serde_json::to_vec(&json!({ "id_token": token })).unwrap()),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["token_type"], "Bearer");
+        assert_eq!(body["email"], "rajeshgoli@gmail.com");
+        assert_eq!(body["name"], "Rajesh Goli");
+        let access_token = body["access_token"].as_str().unwrap();
+        assert!(access_token.starts_with("smat_"));
+        assert!(body["expires_at"].as_str().unwrap().contains('T'));
+
+        let mut auth_request = public_request(Method::GET, "/auth/session", Body::empty());
+        auth_request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {access_token}").parse().unwrap(),
+        );
+        let response = app.oneshot(auth_request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["authenticated"], true);
+        assert_eq!(body["bypass"], false);
+        assert_eq!(body["email"], "rajeshgoli@gmail.com");
+        assert_eq!(body["name"], "Rajesh Goli");
+        assert_eq!(body["auth_type"], "device_bearer");
+    }
+
+    #[tokio::test]
+    async fn auth_device_google_rejects_wrong_audience_and_unallowlisted_email() {
+        let app = router(google_auth_state());
+        let wrong_audience = test_google_id_token(
+            "wrong-client-id",
+            "rajeshgoli@gmail.com",
+            true,
+            "Rajesh Goli",
+        );
+        let mut request = public_request(
+            Method::POST,
+            "/auth/device/google",
+            Body::from(serde_json::to_vec(&json!({ "id_token": wrong_audience })).unwrap()),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let response = app.clone().oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["detail"], "Google ID token audience is not allowed");
+
+        let unallowlisted = test_google_id_token(
+            "android-client-id",
+            "intruder@example.com",
+            true,
+            "Intruder",
+        );
+        let mut request = public_request(
+            Method::POST,
+            "/auth/device/google",
+            Body::from(serde_json::to_vec(&json!({ "id_token": unallowlisted })).unwrap()),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let response = app.clone().oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["detail"], "Google account is not allowlisted");
+
+        let unverified = test_google_id_token(
+            "android-client-id",
+            "rajeshgoli@gmail.com",
+            false,
+            "Rajesh Goli",
+        );
+        let mut request = public_request(
+            Method::POST,
+            "/auth/device/google",
+            Body::from(serde_json::to_vec(&json!({ "id_token": unverified })).unwrap()),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["detail"], "Google account is not allowlisted");
+    }
+
+    #[tokio::test]
+    async fn auth_device_google_binds_cloudflare_mobile_device_to_google_actor() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.mobile_terminal.allowed_users.insert(
+            "rajesh".to_owned(),
+            MobileTerminalUserConfig {
+                email: Some("rajeshgoli@gmail.com".to_owned()),
+                registered_device_keys: vec![MobileTerminalDeviceKeyConfig {
+                    id: "rajesh-device".to_owned(),
+                    public_key: "configured-key".to_owned(),
+                    enabled: true,
+                }],
+                ..MobileTerminalUserConfig::default()
+            },
+        );
+        config.mobile_terminal.allowed_users.insert(
+            "other".to_owned(),
+            MobileTerminalUserConfig {
+                email: Some("other@example.com".to_owned()),
+                registered_device_keys: vec![MobileTerminalDeviceKeyConfig {
+                    id: "mobile-device".to_owned(),
+                    public_key: "configured-key".to_owned(),
+                    enabled: true,
+                }],
+                ..MobileTerminalUserConfig::default()
+            },
+        );
+        let state = AppState::new(config);
+        *state.google_id_token_jwks_cache.lock().unwrap() = Some(GoogleIdTokenJwksCacheEntry {
+            jwks: Arc::new(test_google_jwks()),
+            fetched_at: Instant::now(),
+            last_unknown_key_refresh: None,
+        });
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let google_token = test_google_id_token(
+            "android-client-id",
+            "rajeshgoli@gmail.com",
+            true,
+            "Rajesh Goli",
+        );
+        let mut request = public_request_with_host(
+            Method::POST,
+            "/auth/device/google",
+            Body::from(serde_json::to_vec(&json!({ "id_token": google_token })).unwrap()),
+            "sm-app.example.com",
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        request.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            test_mobile_access_assertion("mobile-device")
+                .parse()
+                .unwrap(),
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body["detail"],
+            "Cloudflare Access mobile device is not enrolled for actor"
+        );
     }
 
     #[test]
@@ -10943,6 +11369,11 @@ mod tests {
 
         for request in [
             public_request(Method::GET, "/client/bootstrap", Body::empty()),
+            public_request(
+                Method::POST,
+                "/auth/device/google",
+                Body::from(r#"{"id_token":"fixture"}"#),
+            ),
             public_request(Method::GET, "/client/sessions", Body::empty()),
             public_request(
                 Method::POST,
