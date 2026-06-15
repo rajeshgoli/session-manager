@@ -247,31 +247,43 @@ def test_cloudflare_access_cutover_evidence_pins_policy_and_origin_gates():
 
     assert "cloudflare_access_cutover_evidence.md" in index
     for required in [
-        "PR #950",
+        "PR #1012",
         "sm-browser",
         "sm-mobile-app",
         "sm-node-fallback",
         "sm-email-worker",
         "No broad Valid Certificate policy",
         "same mobile user resolved from the SM session or bearer actor",
+        "sm enroll-device",
+        "Camera-app QR handoff",
+        "no camera permission",
+        "no certificate material exposed in Settings",
         "revoked-device denial",
         "Native app smoke",
+        "versionCode `1013`",
     ]:
         assert required in evidence
 
 
-def test_handoff_and_progress_are_current_through_review_route_pr984():
+def test_handoff_and_progress_are_current_through_android_enrollment_pr1012():
     progress = (STAGE5_DIR / "mvp_progress.md").read_text(encoding="utf-8")
     handoff = (STAGE5_DIR / "resume_handoff.md").read_text(encoding="utf-8")
 
     for text in [progress, handoff]:
         assert "#950" in text
         assert "#984" in text
+        assert "#996" in text
+        assert "#1005" in text
+        assert "#1007" in text
+        assert "#1012" in text
         assert "Cloudflare Access" in text
         assert "cloudflare_access_cutover_evidence.md" in text
 
-    assert "Latest merged commit before this docs refresh: `8c261ee`" in handoff
-    assert "records the PR lineage through #984" in handoff
+    assert "Latest merged commit before this docs refresh: `5fbbfa4`" in handoff
+    assert "records the PR lineage through #1012" in handoff
+    assert "Camera-app" in handoff
+    assert "deep-link enrollment" in handoff
+    assert "versionName=0.1.0-enroll-ui-cleanup" in handoff
 
 
 def test_manifest_covers_rust_only_retired_http_surfaces():

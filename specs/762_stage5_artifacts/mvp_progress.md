@@ -1,15 +1,16 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #996 Cloudflare Access mobile smoke
-runner.
+Status: implementation snapshot after PR #1012 Android Camera-app enrollment
+flow.
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
 post-#984 focused rehearsal proves state gates, live core contracts, read-only
 fixtures, and mutating fixtures on isolated sidecars, but intentionally skips
-Python baseline and shadow. PRs #986-#996 added node restore fixtures,
-stopped-origin final backup gates, rehearsal final-backup integration, and the
-Cloudflare Access mobile smoke evidence runner. Public cutover still needs
-Cloudflare policy setup, real mobile/browser smoke evidence, and a stable
-Python-authoritative shadow window.
+Python baseline and shadow. PRs #986-#1012 added node restore fixtures,
+stopped-origin final backup gates, rehearsal final-backup integration,
+Cloudflare Access smoke evidence tooling, Rust mobile-device enrollment,
+Cloudflare mTLS CA automation, and the Android Camera-app enrollment handoff.
+Public cutover still needs Cloudflare policy setup, real mobile/browser smoke
+evidence, and a stable Python-authoritative shadow window.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -96,6 +97,13 @@ not change retained or removed scope. Binding scope remains
 | #992 | Stopped-service final backup gate |
 | #994 | Final backup gate integrated into MVP rehearsal |
 | #996 | Cloudflare Access mobile smoke evidence runner |
+| #998 | Handoff refresh after Cloudflare smoke runner |
+| #1000 | Android Cloudflare client-certificate storage and native HTTP/WebSocket client-certificate presentation |
+| #1002 | Initial Android QR enrollment support; later replaced by the Camera-app deep-link flow |
+| #1005 | Rust `sm enroll-device`, mobile device DB enrollment, CSR signing, and per-device Common Name sync |
+| #1007 | Cloudflare mTLS CA upload and mobile app hostname association automation |
+| #1010 | Android artifact version-code/version-name override support |
+| #1012 | Android Camera-app QR handoff, `sm-enroll://enroll` deep link, direct in-app credential save, and no camera permission/manual cert UI |
 
 ## Implemented Capability Groups
 
@@ -108,8 +116,8 @@ The Rust sidecar now has executable coverage for:
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent and retained review-route slices are merged, with shadow and contract fixtures covering the early cutover path. |
 | Codex retained reads | Codex event stream, pending request ledger reads, activity actions, review detail/list, and Claude/Codex tool-call projections are implemented and covered by manifest checks. |
-| Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, and public-edge assertion validation are merged. |
-| Cloudflare Access origin gate | Config parsing, JWT/audience classification, host/app separation, public-host fail-closed behavior, mobile/app route gating, app artifact gating, device-token exchange gating, JWKS cache refresh/TTL behavior, mobile Access CN actor binding, and read-only smoke evidence collection are merged. |
+| Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, public-edge assertion validation, Android client-certificate storage, Rust `sm enroll-device`, and Camera-app deep-link enrollment are merged. |
+| Cloudflare Access origin gate | Config parsing, JWT/audience classification, host/app separation, public-host fail-closed behavior, mobile/app route gating, app artifact gating, device-token exchange gating, JWKS cache refresh/TTL behavior, mobile Access CN actor binding, Cloudflare mTLS CA upload/hostname association, per-device Common Name policy sync, and read-only smoke evidence collection are merged. |
 | External fallback | Email/human fallback delivery and inbound email validation path are retained in the Rust track. |
 | Queue and nodes | Queue list/detail, CLI list/status, pending submit, simple execute/cancel, queue recovery, queue fixtures, node reads, and node HTTP routes are implemented; remaining work is final live/recovery cutover evidence and any retained node-agent remote-control gaps. |
 
@@ -171,14 +179,14 @@ fixture false failures:
 The skipped checks are mutating checks without `--include-mutating`, which is
 the expected safety behavior for a live-state read run.
 
-Current executable manifest size after PR #996:
+Current executable manifest size after PR #1012:
 
 | Metric | Count |
 | --- | ---: |
-| Total checks | 133 |
+| Total checks | 134 |
 | `python_and_rust` checks | 73 |
-| `rust_only` checks | 60 |
-| Read-only checks | 92 |
+| `rust_only` checks | 61 |
+| Read-only checks | 93 |
 | Mutating checks | 41 |
 
 The latest focused isolated-sidecar rehearsal for the current fixture set is:
