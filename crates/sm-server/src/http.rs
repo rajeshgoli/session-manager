@@ -6145,6 +6145,17 @@ fn shadow_predict_read(
     query_string: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
     if method == "POST" {
+        if path == "/auth/device/google" {
+            return Ok(Some(ShadowPrediction {
+                status: if state.config.google_auth.ready() {
+                    StatusCode::OK.as_u16()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16()
+                },
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
         if let Some(node_id) = node_ping_path_node_id(path) {
             let node_id = normalize_node_id(node_id);
             if !state.config.nodes.registry.contains_key(&node_id) {
@@ -6169,6 +6180,10 @@ fn shadow_predict_read(
     }
     if method != "GET" {
         return Ok(None);
+    }
+
+    if let Some(prediction) = shadow_predict_app_artifact_read(state, path)? {
+        return Ok(Some(prediction));
     }
 
     if let Some(request_id) = path
@@ -6323,6 +6338,93 @@ fn shadow_predict_read(
 
     Ok(body.map(|body| ShadowPrediction {
         status: StatusCode::OK.as_u16(),
+        body_sha256: Some(sha256_hex(&body)),
+        support_status: "implemented_read",
+    }))
+}
+
+fn shadow_predict_app_artifact_read(
+    state: &AppState,
+    path: &str,
+) -> anyhow::Result<Option<ShadowPrediction>> {
+    if path == "/apk" {
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::FOUND.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
+        }));
+    }
+
+    let Some(rest) = path.strip_prefix("/apps/") else {
+        return Ok(None);
+    };
+    let Some((app_name, file_name)) = rest.split_once('/') else {
+        return Ok(None);
+    };
+    if app_name.is_empty() || file_name.is_empty() || file_name.contains('/') {
+        return Ok(None);
+    }
+
+    let root = expand_home(&state.config.app_artifacts.root_dir);
+    if file_name == "meta.json" {
+        if valid_app_name(app_name) && read_metadata(&root, app_name).is_ok() {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::OK.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+        let body = serde_json::to_vec(&json!({ "detail": "Artifact metadata not found" }))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::NOT_FOUND.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    if file_name == "latest.apk" {
+        let metadata = valid_app_name(app_name)
+            .then(|| read_metadata(&root, app_name).ok())
+            .flatten();
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| valid_artifact_hash(&metadata.artifact_hash))
+        {
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::FOUND.as_u16(),
+                body_sha256: None,
+                support_status: "implemented_read_status_only",
+            }));
+        }
+        let body = serde_json::to_vec(&json!({ "detail": "Artifact not found" }))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::NOT_FOUND.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    let Some(artifact_hash) = file_name.strip_suffix(".apk") else {
+        let body = serde_json::to_vec(&json!({ "detail": "Artifact not found" }))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::NOT_FOUND.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    };
+    if valid_app_name(app_name)
+        && valid_artifact_hash(artifact_hash)
+        && hashed_path(&root, app_name, artifact_hash).is_file()
+    {
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: None,
+            support_status: "implemented_read_status_only",
+        }));
+    }
+    let body = serde_json::to_vec(&json!({ "detail": "Artifact not found" }))?;
+    Ok(Some(ShadowPrediction {
+        status: StatusCode::NOT_FOUND.as_u16(),
         body_sha256: Some(sha256_hex(&body)),
         support_status: "implemented_read",
     }))
