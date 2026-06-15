@@ -928,6 +928,23 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:42"
     },
     {
+      "id": "cli.enroll_device_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "rust_only",
+      "safety": "read_only",
+      "command": ["enroll-device", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": [
+        "--user-id",
+        "--expires-in-minutes",
+        "--url-base",
+        "--no-qr"
+      ],
+      "preconditions": ["sm_cli"],
+      "source": "specs/762_stage5_artifacts/cutover_scope.md:33"
+    },
+    {
       "id": "cli.list_devices_help",
       "surface": "cli",
       "classification": "retained",

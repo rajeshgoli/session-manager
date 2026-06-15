@@ -8,6 +8,7 @@ pub mod config;
 pub mod email;
 pub mod http;
 pub mod mobile_analytics;
+pub mod mobile_devices;
 pub mod queue;
 pub mod runtime;
 pub mod sessions;

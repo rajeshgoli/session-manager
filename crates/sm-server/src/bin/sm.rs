@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     io::{self, IsTerminal, Read, Write},
-    net::TcpStream,
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process, thread,
     time::{Duration, Instant},
@@ -11,6 +11,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Map, Value};
+use sm_server::{config::AppConfig, mobile_devices};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
@@ -57,6 +58,8 @@ enum Command {
     Lookup(LookupArgs),
     Roster(EmptyArgs),
     Queue(QueueArgs),
+    #[command(name = "enroll-device")]
+    EnrollDevice(EnrollDeviceArgs),
     #[command(name = "list-devices")]
     ListDevices(ListDevicesArgs),
     #[command(name = "remove-device")]
@@ -298,6 +301,26 @@ struct QueueCancelArgs {
 }
 
 #[derive(Args)]
+struct EnrollDeviceArgs {
+    #[arg(long, default_value = "config.yaml")]
+    config: PathBuf,
+    #[arg(long = "user-id")]
+    user_id: Option<String>,
+    #[arg(long, default_value_t = 15)]
+    expires_in_minutes: u64,
+    #[arg(long, default_value = "0.0.0.0:19192")]
+    listen: SocketAddr,
+    #[arg(long = "url-base")]
+    url_base: Option<String>,
+    #[arg(long = "device-ca-cert")]
+    device_ca_cert: Option<PathBuf>,
+    #[arg(long = "device-ca-key")]
+    device_ca_key: Option<PathBuf>,
+    #[arg(long)]
+    no_qr: bool,
+}
+
+#[derive(Args)]
 struct ListDevicesArgs {
     #[arg(long)]
     json: bool,
@@ -410,10 +433,15 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let command = cli.command;
+    let command = match command {
+        Command::EnrollDevice(args) => return run_enroll_device(args),
+        command => command,
+    };
     let api_url = resolve_api_url(cli.api_url)?;
     let client = ApiClient::parse(&api_url)?;
 
-    match cli.command {
+    match command {
         Command::Status(args) => {
             if !args.text.is_empty() {
                 let session_id = current_session_id()?;
@@ -878,6 +906,45 @@ fn run_list_devices(client: &ApiClient, args: ListDevicesArgs) -> Result<()> {
         return Ok(());
     }
     print_mobile_devices(&payload)
+}
+
+fn run_enroll_device(args: EnrollDeviceArgs) -> Result<()> {
+    let user_id = resolve_enroll_device_user_id(&args)?;
+    mobile_devices::run_enroll_device(mobile_devices::EnrollDeviceOptions {
+        config_path: args.config,
+        user_id,
+        expires_in_minutes: args.expires_in_minutes,
+        listen: args.listen,
+        advertised_base_url: args.url_base,
+        device_ca_cert: args.device_ca_cert,
+        device_ca_key: args.device_ca_key,
+        no_qr: args.no_qr,
+    })
+}
+
+fn resolve_enroll_device_user_id(args: &EnrollDeviceArgs) -> Result<String> {
+    if let Some(user_id) = args
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(user_id.to_owned());
+    }
+    let config = AppConfig::load_from_path(&args.config)?;
+    let mut allowed = config
+        .mobile_terminal
+        .allowed_users
+        .iter()
+        .filter(|(_, user_config)| user_config.interactive_shell_access)
+        .map(|(user_id, _)| user_id.clone())
+        .collect::<Vec<_>>();
+    allowed.sort();
+    match allowed.as_slice() {
+        [user_id] => Ok(user_id.clone()),
+        [] => bail!("no mobile_terminal.allowed_users have interactive_shell_access; pass --user-id after configuring a user"),
+        _ => bail!("multiple mobile terminal users are configured; pass --user-id"),
+    }
 }
 
 fn run_queue(client: &ApiClient, args: QueueArgs) -> Result<()> {
@@ -3141,6 +3208,28 @@ mod tests {
 
     #[test]
     fn device_management_cli_parses_retained_commands() {
+        let enroll_cli = Cli::try_parse_from([
+            "sm",
+            "enroll-device",
+            "--config",
+            "config.yaml",
+            "--user-id",
+            "rajesh",
+            "--url-base",
+            "http://studio.local:19192",
+        ])
+        .unwrap();
+        let Command::EnrollDevice(enroll_args) = enroll_cli.command else {
+            panic!("expected enroll-device command");
+        };
+        assert_eq!(enroll_args.config, PathBuf::from("config.yaml"));
+        assert_eq!(enroll_args.user_id.as_deref(), Some("rajesh"));
+        assert_eq!(enroll_args.expires_in_minutes, 15);
+        assert_eq!(
+            enroll_args.url_base.as_deref(),
+            Some("http://studio.local:19192")
+        );
+
         let list_cli = Cli::try_parse_from(["sm", "list-devices", "--json"]).unwrap();
         let Command::ListDevices(list_args) = list_cli.command else {
             panic!("expected list-devices command");

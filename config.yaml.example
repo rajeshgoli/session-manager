@@ -227,6 +227,11 @@ mobile_terminal:
   max_concurrent_attaches_per_session: 1
   max_concurrent_attaches_global: 4
   require_tls: true
+  # Used by `sm enroll-device` for QR-based Android Cloudflare mTLS enrollment.
+  device_enrollment_db_path: "~/.local/share/claude-sessions/mobile_devices.db"
+  device_ca_cert_path: "certs/sm-mobile-device-ca.pem"
+  device_ca_key_path: "certs/sm-mobile-device-ca.key"
+  device_enrollment_ttl_minutes: 15
 
 auth:
   google:

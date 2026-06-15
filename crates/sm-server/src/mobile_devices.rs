@@ -1,0 +1,1382 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    collections::BTreeSet,
+    fs,
+    net::{SocketAddr, UdpSocket},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+};
+
+use anyhow::{bail, Context, Result};
+use axum::{
+    extract::{ConnectInfo, Path as AxumPath, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use base64::Engine as _;
+use qrcode::QrCode;
+use rand_core::{OsRng, RngCore};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use tokio::{net::TcpListener, sync::Notify};
+
+use crate::{
+    config::{trimmed, AppConfig, CloudflareAccessConfig},
+    sessions::expand_home,
+};
+
+const EMPTY_DEVICE_COMMON_NAME: &str = "__sm_no_enrolled_mobile_devices__";
+const MAX_UNKNOWN_PAIRING_ATTEMPTS: u32 = 25;
+const PAIRING_PATH_PREFIX: &str = "/client/mobile-terminal/enroll";
+
+#[derive(Debug, Clone)]
+pub struct DeviceEnrollment {
+    pub user_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub public_key_pem: String,
+    pub common_name: String,
+    pub paired_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PairingRegistration {
+    pub token: String,
+    pub user_id: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnrollDeviceOptions {
+    pub config_path: PathBuf,
+    pub user_id: String,
+    pub expires_in_minutes: u64,
+    pub listen: SocketAddr,
+    pub advertised_base_url: Option<String>,
+    pub device_ca_cert: Option<PathBuf>,
+    pub device_ca_key: Option<PathBuf>,
+    pub no_qr: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PairingState {
+    config: AppConfig,
+    db_path: PathBuf,
+    ca_cert_path: PathBuf,
+    ca_key_path: PathBuf,
+    unknown_attempts: Arc<Mutex<u32>>,
+    shutdown: Arc<Notify>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceEnrollmentRequest {
+    #[serde(default)]
+    device_id: String,
+    #[serde(default)]
+    device_name: String,
+    #[serde(default)]
+    csr_pem: String,
+    #[serde(default)]
+    public_key_pem: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceEnrollmentResponse {
+    device_id: String,
+    device_name: String,
+    certificate_chain_pem: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevicePolicyAction {
+    Allow,
+    Revoke,
+}
+
+pub fn mobile_device_db_path(config: &AppConfig) -> PathBuf {
+    expand_home(&config.mobile_terminal.device_enrollment_db_path)
+}
+
+pub fn active_device_public_key(
+    db_path: &Path,
+    user_id: &str,
+    device_id: &str,
+) -> Result<Option<String>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let connection = open_device_db(db_path)?;
+    connection
+        .query_row(
+            r#"
+            SELECT public_key_pem
+            FROM mobile_device_enrollments
+            WHERE user_id = ?
+              AND device_id = ?
+              AND revoked_at IS NULL
+            LIMIT 1
+            "#,
+            params![user_id, device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to look up mobile device enrollment")
+}
+
+pub fn user_has_active_device(db_path: &Path, user_id: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let connection = open_device_db(db_path)?;
+    let count: i64 = connection
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM mobile_device_enrollments
+            WHERE user_id = ?
+              AND revoked_at IS NULL
+            "#,
+            params![user_id],
+            |row| row.get(0),
+        )
+        .context("failed to count mobile device enrollments")?;
+    Ok(count > 0)
+}
+
+pub fn active_device_exists(db_path: &Path, user_id: &str, device_id: &str) -> Result<bool> {
+    Ok(active_device_public_key(db_path, user_id, device_id)?.is_some())
+}
+
+pub fn device_exists(db_path: &Path, user_id: &str, device_id: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let connection = open_device_db(db_path)?;
+    let count: i64 = connection
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM mobile_device_enrollments
+            WHERE user_id = ?
+              AND device_id = ?
+            "#,
+            params![user_id, device_id],
+            |row| row.get(0),
+        )
+        .context("failed to count mobile device enrollment")?;
+    Ok(count > 0)
+}
+
+pub fn list_active_devices_for_users(
+    db_path: &Path,
+    allowed_users: &BTreeSet<String>,
+) -> Result<Vec<DeviceEnrollment>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let connection = open_device_db(db_path)?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT user_id, device_id, device_name, public_key_pem, common_name, paired_at, revoked_at
+            FROM mobile_device_enrollments
+            WHERE revoked_at IS NULL
+            ORDER BY user_id, device_id
+            "#,
+        )
+        .context("failed to prepare mobile device list query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(DeviceEnrollment {
+                user_id: row.get(0)?,
+                device_id: row.get(1)?,
+                device_name: row.get(2)?,
+                public_key_pem: row.get(3)?,
+                common_name: row.get(4)?,
+                paired_at: row.get(5)?,
+                revoked_at: row.get(6)?,
+            })
+        })
+        .context("failed to query mobile device enrollments")?;
+    let mut devices = Vec::new();
+    for row in rows {
+        let device = row.context("failed to read mobile device enrollment row")?;
+        if allowed_users.contains(&device.user_id) {
+            devices.push(device);
+        }
+    }
+    Ok(devices)
+}
+
+pub fn revoke_device(db_path: &Path, user_id: &str, device_id: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let connection = open_device_db(db_path)?;
+    let now = local_timestamp();
+    let changed = connection
+        .execute(
+            r#"
+            UPDATE mobile_device_enrollments
+            SET revoked_at = ?
+            WHERE user_id = ?
+              AND device_id = ?
+              AND revoked_at IS NULL
+            "#,
+            params![now, user_id, device_id],
+        )
+        .context("failed to revoke mobile device enrollment")?;
+    if changed > 0 {
+        insert_audit_event(
+            &connection,
+            Some(user_id),
+            Some(device_id),
+            "device_revoked",
+            None,
+            None,
+        )?;
+    }
+    Ok(changed > 0)
+}
+
+pub fn create_pairing_registration(
+    db_path: &Path,
+    user_id: &str,
+    expires_in_minutes: u64,
+) -> Result<PairingRegistration> {
+    let user_id = user_id.trim();
+    if user_id.is_empty() {
+        bail!("user_id must not be empty");
+    }
+    let ttl_minutes = expires_in_minutes.clamp(1, 60 * 24);
+    let connection = open_device_db(db_path)?;
+    let token = random_urlsafe_token(24);
+    let now = local_timestamp();
+    let expires_at = (time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+        + time::Duration::minutes(ttl_minutes as i64))
+    .format(&time::format_description::well_known::Rfc3339)
+    .unwrap_or_else(|_| now.clone());
+    connection
+        .execute(
+            r#"
+            INSERT INTO mobile_device_pairings (token, user_id, created_at, expires_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+            params![token, user_id, now, expires_at],
+        )
+        .context("failed to create mobile device pairing registration")?;
+    insert_audit_event(
+        &connection,
+        Some(user_id),
+        None,
+        "pairing_created",
+        None,
+        Some(&json!({ "expires_at": expires_at })),
+    )?;
+    Ok(PairingRegistration {
+        token,
+        user_id: user_id.to_owned(),
+        expires_at,
+    })
+}
+
+pub fn run_enroll_device(options: EnrollDeviceOptions) -> Result<()> {
+    let config = AppConfig::load_from_path(&options.config_path)?;
+    let Some(user_config) = config.mobile_terminal.allowed_users.get(&options.user_id) else {
+        bail!(
+            "mobile_terminal.allowed_users does not contain user_id {}",
+            options.user_id
+        );
+    };
+    if !user_config.interactive_shell_access {
+        bail!(
+            "mobile terminal user {} does not allow interactive shell access",
+            options.user_id
+        );
+    }
+    let db_path = mobile_device_db_path(&config);
+    let ca_cert_path = options
+        .device_ca_cert
+        .clone()
+        .unwrap_or_else(|| expand_home(&config.mobile_terminal.device_ca_cert_path));
+    let ca_key_path = options
+        .device_ca_key
+        .clone()
+        .unwrap_or_else(|| expand_home(&config.mobile_terminal.device_ca_key_path));
+    ensure_device_ca(&ca_cert_path, &ca_key_path)?;
+    let registration = create_pairing_registration(
+        &db_path,
+        &options.user_id,
+        if options.expires_in_minutes == 0 {
+            config.mobile_terminal.device_enrollment_ttl_minutes
+        } else {
+            options.expires_in_minutes
+        },
+    )?;
+    let base_url = options
+        .advertised_base_url
+        .clone()
+        .unwrap_or_else(|| pairing_base_url(options.listen));
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        enrollment_path(&registration.token).trim_start_matches('/')
+    );
+    println!("Device enrollment for user_id={}", registration.user_id);
+    println!("Expires at: {}", registration.expires_at);
+    println!("Enrollment URL: {url}");
+    if !options.no_qr {
+        println!();
+        println!("{}", qr_ascii(&url)?);
+    }
+    println!(
+        "Waiting for Android app enrollment on {} ...",
+        options.listen
+    );
+
+    let runtime = tokio::runtime::Runtime::new().context("failed to start pairing runtime")?;
+    runtime.block_on(serve_pairing_listener(
+        config,
+        db_path,
+        options.listen,
+        ca_cert_path,
+        ca_key_path,
+    ))
+}
+
+pub async fn serve_pairing_listener(
+    config: AppConfig,
+    db_path: PathBuf,
+    bind_addr: SocketAddr,
+    ca_cert_path: PathBuf,
+    ca_key_path: PathBuf,
+) -> Result<()> {
+    let shutdown = Arc::new(Notify::new());
+    let state = PairingState {
+        config,
+        db_path,
+        ca_cert_path,
+        ca_key_path,
+        unknown_attempts: Arc::new(Mutex::new(0)),
+        shutdown: shutdown.clone(),
+    };
+    let app = Router::new()
+        .route("/health", get(pairing_health))
+        .route(
+            &format!("{PAIRING_PATH_PREFIX}/{{token}}"),
+            post(complete_device_enrollment),
+        )
+        .with_state(state);
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind mobile device pairing listener at {bind_addr}"))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown.notified().await;
+    })
+    .await
+    .context("mobile device pairing listener failed")
+}
+
+pub fn enrollment_path(token: &str) -> String {
+    format!("{PAIRING_PATH_PREFIX}/{}", token.trim())
+}
+
+async fn pairing_health() -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({"ok": true})))
+}
+
+async fn complete_device_enrollment(
+    State(state): State<PairingState>,
+    AxumPath(token): AxumPath<String>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<DeviceEnrollmentRequest>,
+) -> Response {
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "Enrollment token is required");
+    }
+    let device_id = payload.device_id.trim().to_owned();
+    if !valid_device_id(&device_id) {
+        return json_error(StatusCode::BAD_REQUEST, "Invalid device_id");
+    }
+    let device_name = payload
+        .device_name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let device_name = if device_name.is_empty() {
+        device_id.clone()
+    } else {
+        device_name
+    };
+    let registration = match pending_pairing_registration(&state.db_path, &token) {
+        Ok(Some(registration)) => registration,
+        Ok(None) => {
+            let attempts = increment_unknown_attempts(&state);
+            let _ = log_unknown_pairing_attempt(
+                &state.db_path,
+                &token,
+                Some(&remote_addr.to_string()),
+                if attempts > MAX_UNKNOWN_PAIRING_ATTEMPTS {
+                    "too_many_unknown_attempts"
+                } else {
+                    "unknown_expired_or_already_paired"
+                },
+            );
+            if attempts > MAX_UNKNOWN_PAIRING_ATTEMPTS {
+                return json_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many invalid enrollment attempts",
+                );
+            }
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "Unknown, expired, or already used enrollment token",
+            );
+        }
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let Some(user_config) = state
+        .config
+        .mobile_terminal
+        .allowed_users
+        .get(&registration.user_id)
+    else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "Enrollment user is no longer configured",
+        );
+    };
+    if !user_config.interactive_shell_access {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "Enrollment user is not allowed to use mobile terminal attach",
+        );
+    }
+    let csr_public_key_pem = match extract_public_key_from_csr_with_openssl(&payload.csr_pem) {
+        Ok(value) => value,
+        Err(error) => {
+            return invalid_csr_response(&state, &token, Some(&remote_addr.to_string()), &error)
+        }
+    };
+    if normalize_pem(&csr_public_key_pem) != normalize_pem(&payload.public_key_pem) {
+        let error = anyhow::anyhow!("CSR public key does not match public_key_pem");
+        return invalid_csr_response(&state, &token, Some(&remote_addr.to_string()), &error);
+    }
+    let certificate_pem = match sign_csr_with_openssl(
+        &state.ca_cert_path,
+        &state.ca_key_path,
+        &payload.csr_pem,
+        &device_id,
+    ) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let certificate_chain_pem =
+        match build_certificate_chain_pem(&certificate_pem, &state.ca_cert_path) {
+            Ok(value) => value,
+            Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        };
+    let completed_registration = match complete_pairing_registration(
+        &state.db_path,
+        &token,
+        &device_id,
+        &device_name,
+        &csr_public_key_pem,
+        Some(&remote_addr.to_string()),
+    ) {
+        Ok(Some(registration)) => registration,
+        Ok(None) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "Unknown, expired, or already used enrollment token",
+            )
+        }
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    if let Err(error) = sync_device_common_name(
+        &state.config.cloudflare_access,
+        &device_id,
+        DevicePolicyAction::Allow,
+    ) {
+        let _ = revoke_device(&state.db_path, &completed_registration.user_id, &device_id);
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    state.shutdown.notify_waiters();
+    Json(DeviceEnrollmentResponse {
+        device_id,
+        device_name,
+        certificate_chain_pem,
+        expires_at: completed_registration.expires_at,
+    })
+    .into_response()
+}
+
+fn json_error(status: StatusCode, detail: &str) -> Response {
+    (status, Json(json!({ "detail": detail }))).into_response()
+}
+
+fn invalid_csr_response(
+    state: &PairingState,
+    token: &str,
+    remote_addr: Option<&str>,
+    error: &anyhow::Error,
+) -> Response {
+    let exhausted = record_pairing_failure(
+        &state.db_path,
+        token,
+        "pairing_csr_rejected",
+        remote_addr,
+        &error.to_string(),
+    )
+    .unwrap_or(false);
+    if exhausted {
+        json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many invalid enrollment attempts",
+        )
+    } else {
+        json_error(StatusCode::BAD_REQUEST, "Invalid device CSR")
+    }
+}
+
+fn increment_unknown_attempts(state: &PairingState) -> u32 {
+    let mut attempts = state
+        .unknown_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *attempts += 1;
+    *attempts
+}
+
+fn open_device_db(db_path: &Path) -> Result<Connection> {
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create mobile device DB dir {}", parent.display())
+        })?;
+    }
+    let connection = Connection::open(db_path)
+        .with_context(|| format!("failed to open mobile device DB {}", db_path.display()))?;
+    migrate_device_db(&connection)?;
+    Ok(connection)
+}
+
+fn migrate_device_db(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS mobile_device_pairings (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                paired_at TEXT,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                last_failed_attempt_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_mobile_device_pairings_user_id ON mobile_device_pairings(user_id);
+            CREATE INDEX IF NOT EXISTS idx_mobile_device_pairings_expires_at ON mobile_device_pairings(expires_at);
+
+            CREATE TABLE IF NOT EXISTS mobile_device_enrollments (
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                public_key_pem TEXT NOT NULL,
+                common_name TEXT NOT NULL,
+                paired_at TEXT NOT NULL,
+                revoked_at TEXT,
+                last_seen_at TEXT,
+                PRIMARY KEY (user_id, device_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollments_common_name ON mobile_device_enrollments(common_name);
+            CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollments_revoked_at ON mobile_device_enrollments(revoked_at);
+
+            CREATE TABLE IF NOT EXISTS mobile_device_enrollment_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                user_id TEXT,
+                device_id TEXT,
+                event TEXT NOT NULL,
+                remote_addr TEXT,
+                details_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_timestamp ON mobile_device_enrollment_audit(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_device_id ON mobile_device_enrollment_audit(device_id);
+            CREATE INDEX IF NOT EXISTS idx_mobile_device_enrollment_audit_event ON mobile_device_enrollment_audit(event);
+            "#,
+        )
+        .context("failed to migrate mobile device enrollment DB")?;
+    Ok(())
+}
+
+fn pending_pairing_registration(
+    db_path: &Path,
+    token: &str,
+) -> Result<Option<PairingRegistration>> {
+    let connection = open_device_db(db_path)?;
+    let now = local_timestamp();
+    connection
+        .query_row(
+            r#"
+            SELECT token, user_id, expires_at
+            FROM mobile_device_pairings
+            WHERE token = ?
+              AND paired_at IS NULL
+              AND expires_at > ?
+              AND failed_attempts < 5
+            LIMIT 1
+            "#,
+            params![token, now],
+            |row| {
+                Ok(PairingRegistration {
+                    token: row.get(0)?,
+                    user_id: row.get(1)?,
+                    expires_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to look up mobile device pairing")
+}
+
+fn complete_pairing_registration(
+    db_path: &Path,
+    token: &str,
+    device_id: &str,
+    device_name: &str,
+    public_key_pem: &str,
+    remote_addr: Option<&str>,
+) -> Result<Option<PairingRegistration>> {
+    let mut connection = open_device_db(db_path)?;
+    let transaction = connection
+        .transaction()
+        .context("failed to start mobile device enrollment transaction")?;
+    let now = local_timestamp();
+    let registration = transaction
+        .query_row(
+            r#"
+            SELECT token, user_id, expires_at
+            FROM mobile_device_pairings
+            WHERE token = ?
+              AND paired_at IS NULL
+              AND expires_at > ?
+              AND failed_attempts < 5
+            LIMIT 1
+            "#,
+            params![token, now],
+            |row| {
+                Ok(PairingRegistration {
+                    token: row.get(0)?,
+                    user_id: row.get(1)?,
+                    expires_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to check pairing eligibility")?;
+    let Some(registration) = registration else {
+        return Ok(None);
+    };
+    transaction
+        .execute(
+            "UPDATE mobile_device_pairings SET paired_at = ? WHERE token = ?",
+            params![now, token],
+        )
+        .context("failed to mark pairing used")?;
+    transaction
+        .execute(
+            r#"
+            INSERT INTO mobile_device_enrollments (
+                user_id, device_id, device_name, public_key_pem, common_name, paired_at, revoked_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(user_id, device_id) DO UPDATE SET
+                device_name = excluded.device_name,
+                public_key_pem = excluded.public_key_pem,
+                common_name = excluded.common_name,
+                paired_at = excluded.paired_at,
+                revoked_at = NULL
+            "#,
+            params![
+                registration.user_id,
+                device_id,
+                device_name,
+                public_key_pem.trim(),
+                device_id,
+                now
+            ],
+        )
+        .context("failed to upsert mobile device enrollment")?;
+    insert_audit_event(
+        &transaction,
+        Some(&registration.user_id),
+        Some(device_id),
+        "pairing_completed",
+        remote_addr,
+        Some(&json!({
+            "public_key_fingerprint": public_key_fingerprint(public_key_pem),
+        })),
+    )?;
+    transaction
+        .commit()
+        .context("failed to commit mobile device enrollment")?;
+    Ok(Some(registration))
+}
+
+fn record_pairing_failure(
+    db_path: &Path,
+    token: &str,
+    event: &str,
+    remote_addr: Option<&str>,
+    error: &str,
+) -> Result<bool> {
+    let connection = open_device_db(db_path)?;
+    let now = local_timestamp();
+    let changed = connection
+        .execute(
+            r#"
+            UPDATE mobile_device_pairings
+            SET failed_attempts = failed_attempts + 1,
+                last_failed_attempt_at = ?
+            WHERE token = ?
+              AND paired_at IS NULL
+              AND expires_at > ?
+            "#,
+            params![now, token, now],
+        )
+        .context("failed to record mobile device pairing failure")?;
+    let exhausted = if changed > 0 {
+        let attempts: i64 = connection
+            .query_row(
+                "SELECT failed_attempts FROM mobile_device_pairings WHERE token = ?",
+                params![token],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        attempts >= 5
+    } else {
+        false
+    };
+    insert_audit_event(
+        &connection,
+        None,
+        None,
+        event,
+        remote_addr,
+        Some(&json!({
+            "token_hash": public_key_fingerprint(token),
+            "error": error,
+            "exhausted": exhausted,
+        })),
+    )?;
+    Ok(exhausted)
+}
+
+fn log_unknown_pairing_attempt(
+    db_path: &Path,
+    token: &str,
+    remote_addr: Option<&str>,
+    event: &str,
+) -> Result<()> {
+    let connection = open_device_db(db_path)?;
+    insert_audit_event(
+        &connection,
+        None,
+        None,
+        "pairing_token_rejected",
+        remote_addr,
+        Some(&json!({
+            "token_hash": public_key_fingerprint(token),
+            "reason": event,
+        })),
+    )
+}
+
+fn insert_audit_event(
+    connection: &Connection,
+    user_id: Option<&str>,
+    device_id: Option<&str>,
+    event: &str,
+    remote_addr: Option<&str>,
+    details: Option<&Value>,
+) -> Result<()> {
+    let details_json = details.map(Value::to_string);
+    connection
+        .execute(
+            r#"
+            INSERT INTO mobile_device_enrollment_audit (
+                timestamp, user_id, device_id, event, remote_addr, details_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                local_timestamp(),
+                user_id,
+                device_id,
+                event,
+                remote_addr,
+                details_json
+            ],
+        )
+        .context("failed to insert mobile device enrollment audit event")?;
+    Ok(())
+}
+
+pub fn sync_device_common_name(
+    config: &CloudflareAccessConfig,
+    common_name: &str,
+    action: DevicePolicyAction,
+) -> Result<()> {
+    let Some(request) = DevicePolicyRequest::from_config(config, common_name, action) else {
+        return Ok(());
+    };
+    request.execute()
+}
+
+#[derive(Debug)]
+struct DevicePolicyRequest {
+    account_id: String,
+    app_id: Option<String>,
+    policy_id: String,
+    api_token: String,
+    common_name: String,
+    action: DevicePolicyAction,
+}
+
+impl DevicePolicyRequest {
+    fn from_config(
+        config: &CloudflareAccessConfig,
+        common_name: &str,
+        action: DevicePolicyAction,
+    ) -> Option<Self> {
+        let account_id = trimmed(&config.account_id)?;
+        let policy_id = trimmed(&config.mobile_device_policy_id)?;
+        let api_token = trimmed(&config.api_token)?;
+        Some(Self {
+            account_id,
+            app_id: trimmed(&config.mobile_app.app_id),
+            policy_id,
+            api_token,
+            common_name: common_name.trim().to_owned(),
+            action,
+        })
+    }
+
+    fn execute(&self) -> Result<()> {
+        if self.common_name.is_empty() {
+            bail!("Cloudflare mobile device policy sync requires a non-empty common name");
+        }
+        let url = self.policy_url();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let current = self.cloudflare_get(&agent, &url)?;
+        let mut policy = current
+            .get("result")
+            .cloned()
+            .context("Cloudflare Access policy response missing result")?;
+        mutate_policy_common_name_allowlist(&mut policy, &self.common_name, self.action)?;
+        let payload = policy_update_payload(policy)?;
+        self.cloudflare_put(&agent, &url, payload)?;
+        Ok(())
+    }
+
+    fn policy_url(&self) -> String {
+        if let Some(app_id) = &self.app_id {
+            format!(
+                "https://api.cloudflare.com/client/v4/accounts/{}/access/apps/{}/policies/{}",
+                self.account_id, app_id, self.policy_id
+            )
+        } else {
+            format!(
+                "https://api.cloudflare.com/client/v4/accounts/{}/access/policies/{}",
+                self.account_id, self.policy_id
+            )
+        }
+    }
+
+    fn cloudflare_get(&self, agent: &ureq::Agent, url: &str) -> Result<Value> {
+        let response = agent
+            .get(url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .header("Content-Type", "application/json")
+            .call()
+            .with_context(|| format!("Cloudflare API request failed: {url}"))?;
+        self.parse_cloudflare_response(response)
+    }
+
+    fn cloudflare_put(&self, agent: &ureq::Agent, url: &str, body: Value) -> Result<Value> {
+        let response = agent
+            .put(url)
+            .header("Authorization", format!("Bearer {}", self.api_token))
+            .header("Content-Type", "application/json")
+            .send(body.to_string().as_bytes())
+            .with_context(|| format!("Cloudflare API request failed: {url}"))?;
+        self.parse_cloudflare_response(response)
+    }
+
+    fn parse_cloudflare_response(
+        &self,
+        mut response: ureq::http::Response<ureq::Body>,
+    ) -> Result<Value> {
+        let status = response.status().as_u16();
+        let response_body = response
+            .body_mut()
+            .read_to_string()
+            .context("Cloudflare API response body was unreadable")?;
+        let value = serde_json::from_str::<Value>(&response_body)
+            .context("Cloudflare API returned non-JSON response")?;
+        if status >= 400 || value.get("success").and_then(Value::as_bool) != Some(true) {
+            bail!("Cloudflare API request failed with status {status}: {value}");
+        }
+        Ok(value)
+    }
+}
+
+fn mutate_policy_common_name_allowlist(
+    policy: &mut Value,
+    common_name: &str,
+    action: DevicePolicyAction,
+) -> Result<()> {
+    let include = policy
+        .get_mut("include")
+        .and_then(Value::as_array_mut)
+        .context("Cloudflare Access policy result missing include array")?;
+    include.retain(|rule| rule.get("certificate").is_none());
+    include.retain(|rule| {
+        common_name_from_rule(rule)
+            .map(|value| value != common_name && value != EMPTY_DEVICE_COMMON_NAME)
+            .unwrap_or(true)
+    });
+    if action == DevicePolicyAction::Allow {
+        include.push(json!({"common_name": {"common_name": common_name}}));
+    }
+    if !include
+        .iter()
+        .any(|rule| common_name_from_rule(rule).is_some())
+    {
+        include.push(json!({"common_name": {"common_name": EMPTY_DEVICE_COMMON_NAME}}));
+    }
+    Ok(())
+}
+
+fn common_name_from_rule(rule: &Value) -> Option<&str> {
+    rule.get("common_name")
+        .and_then(|value| value.get("common_name"))
+        .and_then(Value::as_str)
+}
+
+fn policy_update_payload(policy: Value) -> Result<Value> {
+    let object = policy
+        .as_object()
+        .context("Cloudflare Access policy result must be an object")?;
+    let mut payload = Map::new();
+    for key in [
+        "name",
+        "decision",
+        "include",
+        "exclude",
+        "require",
+        "precedence",
+        "session_duration",
+        "approval_groups",
+        "approval_required",
+        "purpose_justification_required",
+        "purpose_justification_prompt",
+        "isolation_required",
+    ] {
+        if let Some(value) = object.get(key) {
+            payload.insert(key.to_owned(), value.clone());
+        }
+    }
+    if !payload.contains_key("name")
+        || !payload.contains_key("decision")
+        || !payload.contains_key("include")
+    {
+        bail!("Cloudflare Access policy result missing required update fields");
+    }
+    Ok(Value::Object(payload))
+}
+
+fn extract_public_key_from_csr_with_openssl(csr_pem: &str) -> Result<String> {
+    let temp_dir = temporary_dir("sm-mobile-csr")?;
+    let csr_path = temp_dir.join("device.csr.pem");
+    fs::write(&csr_path, csr_pem).context("failed to write device CSR")?;
+    verify_csr_self_signature_with_openssl(&csr_path)?;
+    let output = Command::new("openssl")
+        .arg("req")
+        .arg("-in")
+        .arg(&csr_path)
+        .arg("-pubkey")
+        .arg("-noout")
+        .output()
+        .context("failed to invoke openssl for CSR public key extraction")?;
+    let _ = fs::remove_dir_all(&temp_dir);
+    if !output.status.success() {
+        bail!("openssl failed to read CSR public key");
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .context("openssl returned non-UTF-8 CSR public key")
+}
+
+fn verify_csr_self_signature_with_openssl(csr_path: &Path) -> Result<()> {
+    let output = Command::new("openssl")
+        .arg("req")
+        .arg("-in")
+        .arg(csr_path)
+        .arg("-verify")
+        .arg("-noout")
+        .output()
+        .context("failed to invoke openssl for CSR verification")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "openssl failed to verify CSR self-signature: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn sign_csr_with_openssl(
+    ca_cert_path: &Path,
+    ca_key_path: &Path,
+    csr_pem: &str,
+    common_name: &str,
+) -> Result<String> {
+    let temp_dir = temporary_dir("sm-mobile-cert")?;
+    let csr_path = temp_dir.join("device.csr.pem");
+    let cert_path = temp_dir.join("device.cert.pem");
+    let ext_path = temp_dir.join("client.ext");
+    let serial_path = temp_dir.join("device.srl");
+    fs::write(&csr_path, csr_pem).context("failed to write device CSR")?;
+    fs::write(
+        &ext_path,
+        r#"
+[client_cert]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+"#,
+    )
+    .context("failed to write client certificate extension file")?;
+    let status = Command::new("openssl")
+        .arg("x509")
+        .arg("-req")
+        .arg("-in")
+        .arg(&csr_path)
+        .arg("-CA")
+        .arg(ca_cert_path)
+        .arg("-CAkey")
+        .arg(ca_key_path)
+        .arg("-CAcreateserial")
+        .arg("-CAserial")
+        .arg(&serial_path)
+        .arg("-out")
+        .arg(&cert_path)
+        .arg("-subj")
+        .arg(format!("/CN={common_name}"))
+        .arg("-days")
+        .arg("3650")
+        .arg("-sha256")
+        .arg("-extfile")
+        .arg(&ext_path)
+        .arg("-extensions")
+        .arg("client_cert")
+        .status()
+        .context("failed to invoke openssl for CSR signing")?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        bail!("openssl failed to sign CSR");
+    }
+    let certificate_pem =
+        fs::read_to_string(&cert_path).context("failed to read signed certificate");
+    let _ = fs::remove_dir_all(&temp_dir);
+    certificate_pem
+}
+
+fn ensure_device_ca(ca_cert_path: &Path, ca_key_path: &Path) -> Result<()> {
+    let cert_exists = ca_cert_path.exists();
+    let key_exists = ca_key_path.exists();
+    match (cert_exists, key_exists) {
+        (true, true) => return Ok(()),
+        (true, false) | (false, true) => {
+            bail!(
+                "mobile device CA files must both exist or both be absent: {} and {}",
+                ca_cert_path.display(),
+                ca_key_path.display()
+            );
+        }
+        (false, false) => {}
+    }
+
+    if let Some(parent) = ca_cert_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create CA certificate dir {}", parent.display()))?;
+    }
+    if let Some(parent) = ca_key_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create CA private key dir {}", parent.display()))?;
+    }
+    let output = Command::new("openssl")
+        .arg("req")
+        .arg("-x509")
+        .arg("-newkey")
+        .arg("rsa:2048")
+        .arg("-nodes")
+        .arg("-sha256")
+        .arg("-days")
+        .arg("3650")
+        .arg("-subj")
+        .arg("/CN=Session Manager Mobile Device CA")
+        .arg("-addext")
+        .arg("basicConstraints=critical,CA:TRUE,pathlen:0")
+        .arg("-addext")
+        .arg("keyUsage=critical,keyCertSign,cRLSign")
+        .arg("-keyout")
+        .arg(ca_key_path)
+        .arg("-out")
+        .arg(ca_cert_path)
+        .output()
+        .context("failed to invoke openssl for mobile device CA generation")?;
+    if !output.status.success() {
+        let _ = fs::remove_file(ca_cert_path);
+        let _ = fs::remove_file(ca_key_path);
+        bail!(
+            "openssl failed to generate mobile device CA: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    restrict_private_key_permissions(ca_key_path)?;
+    Ok(())
+}
+
+fn restrict_private_key_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to restrict private key permissions {}",
+                path.display()
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn build_certificate_chain_pem(certificate_pem: &str, ca_cert_path: &Path) -> Result<String> {
+    let ca_cert_pem =
+        fs::read_to_string(ca_cert_path).context("failed to read device CA certificate")?;
+    Ok(format!(
+        "{}\n{}",
+        certificate_pem.trim(),
+        ca_cert_pem.trim()
+    ))
+}
+
+fn temporary_dir(prefix: &str) -> Result<PathBuf> {
+    let mut bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut bytes);
+    let path = std::env::temp_dir().join(format!("{prefix}-{}", hex_bytes(&bytes)));
+    fs::create_dir(&path)
+        .with_context(|| format!("failed to create temporary directory {}", path.display()))?;
+    Ok(path)
+}
+
+fn pairing_base_url(listen: SocketAddr) -> String {
+    let port = listen.port();
+    let host = if listen.ip().is_unspecified() {
+        local_lan_ip().unwrap_or_else(|| "127.0.0.1".to_owned())
+    } else {
+        listen.ip().to_string()
+    };
+    format!("http://{host}:{port}")
+}
+
+fn local_lan_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("1.1.1.1:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn qr_ascii(value: &str) -> Result<String> {
+    let code = QrCode::new(value.as_bytes()).context("failed to render enrollment QR")?;
+    Ok(code
+        .render::<char>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .dark_color('#')
+        .light_color(' ')
+        .build())
+}
+
+fn valid_device_id(value: &str) -> bool {
+    let len = value.len();
+    (3..=128).contains(&len)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn normalize_pem(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn public_key_fingerprint(value: &str) -> String {
+    let digest = Sha256::digest(value.trim().as_bytes());
+    hex_bytes(&digest)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn random_urlsafe_token(byte_len: usize) -> String {
+    let mut bytes = vec![0u8; byte_len];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn local_timestamp() -> String {
+    time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrollment_db_round_trip_and_revoke() {
+        let temp_dir = temporary_dir("sm-mobile-test").expect("temp dir");
+        let db_path = temp_dir.join("mobile_devices.db");
+        let pairing = create_pairing_registration(&db_path, "rajesh", 15).expect("create pairing");
+        assert_eq!(pairing.user_id, "rajesh");
+        let completed = complete_pairing_registration(
+            &db_path,
+            &pairing.token,
+            "android-abc",
+            "Pixel",
+            "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----",
+            Some("127.0.0.1:1"),
+        )
+        .expect("complete")
+        .expect("completed");
+        assert_eq!(completed.token, pairing.token);
+        assert!(active_device_exists(&db_path, "rajesh", "android-abc").expect("exists"));
+        assert!(active_device_public_key(&db_path, "rajesh", "android-abc")
+            .expect("public key")
+            .is_some());
+        assert!(revoke_device(&db_path, "rajesh", "android-abc").expect("revoke"));
+        assert!(!active_device_exists(&db_path, "rajesh", "android-abc").expect("revoked"));
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn ensure_device_ca_generates_missing_pair() {
+        let temp_dir = temporary_dir("sm-mobile-ca-test").expect("temp dir");
+        let cert_path = temp_dir.join("device-ca.pem");
+        let key_path = temp_dir.join("device-ca.key");
+
+        ensure_device_ca(&cert_path, &key_path).expect("generate CA");
+
+        let cert = fs::read_to_string(&cert_path).expect("read cert");
+        let key = fs::read_to_string(&key_path).expect("read key");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("BEGIN PRIVATE KEY"));
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&key_path)
+                .expect("key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn cloudflare_policy_sync_removes_broad_certificate_rule() {
+        let mut policy = json!({
+            "include": [
+                {"certificate": {}},
+                {"common_name": {"common_name": "old-device"}}
+            ]
+        });
+
+        mutate_policy_common_name_allowlist(&mut policy, "android-new", DevicePolicyAction::Allow)
+            .expect("mutate policy");
+
+        assert_eq!(
+            policy["include"],
+            json!([
+                {"common_name": {"common_name": "old-device"}},
+                {"common_name": {"common_name": "android-new"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn cloudflare_policy_revoke_leaves_impossible_rule_when_empty() {
+        let mut policy = json!({
+            "include": [
+                {"common_name": {"common_name": "android-old"}}
+            ]
+        });
+
+        mutate_policy_common_name_allowlist(&mut policy, "android-old", DevicePolicyAction::Revoke)
+            .expect("mutate policy");
+
+        assert_eq!(
+            policy["include"],
+            json!([
+                {"common_name": {"common_name": EMPTY_DEVICE_COMMON_NAME}}
+            ])
+        );
+    }
+
+    #[test]
+    fn enrollment_path_matches_android_qr_contract() {
+        assert_eq!(
+            enrollment_path("abc123"),
+            "/client/mobile-terminal/enroll/abc123"
+        );
+    }
+}

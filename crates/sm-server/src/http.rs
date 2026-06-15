@@ -80,15 +80,16 @@ use crate::cloudflare_access::{
 use crate::codex_activity::{list_codex_activity_actions_from_path, CodexActivityActionsResponse};
 use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
 use crate::codex_requests::{list_codex_pending_requests_from_path, CodexPendingRequestsResponse};
-use crate::config::{
-    trimmed, AppConfig, MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PublicNodeConfig,
-};
+#[cfg(test)]
+use crate::config::MobileTerminalDeviceKeyConfig;
+use crate::config::{trimmed, AppConfig, MobileTerminalUserConfig, PublicNodeConfig};
 use crate::email::{
     extract_reply_message_body, extract_routed_session_id, extract_subject_from_raw_email,
     extract_text_from_raw_email, normalize_explicit_session_id, EmailBridge,
     HumanRecipientResponse, SendAgentEmailRequest, DEFAULT_EMAIL_WEBHOOK_PATH,
 };
 use crate::mobile_analytics::build_mobile_analytics_summary;
+use crate::mobile_devices::{self, mobile_device_db_path};
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
     CreateCodexReviewRequest, CreateQueueJob, QueueAdmissionPolicy, QueueJobFilters,
@@ -4041,12 +4042,20 @@ async fn list_mobile_terminal_devices(
             detail: "Mobile terminal revoked key store is unavailable".to_owned(),
         })?
         .clone();
-    let devices = state
+    let allowed_user_ids = state
         .config
         .mobile_terminal
         .allowed_users
         .iter()
         .filter(|(user_id, _)| owner_view || user_id.as_str() == actor_user_id)
+        .map(|(user_id, _)| user_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut devices = state
+        .config
+        .mobile_terminal
+        .allowed_users
+        .iter()
+        .filter(|(user_id, _)| allowed_user_ids.contains(user_id.as_str()))
         .flat_map(|(user_id, config)| {
             let revoked_keys = revoked_keys.clone();
             config.registered_device_keys.iter().filter_map(move |key| {
@@ -4062,7 +4071,24 @@ async fn list_mobile_terminal_devices(
                 })
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let dynamic_devices = mobile_devices::list_active_devices_for_users(
+        &mobile_device_db_path(&state.config),
+        &allowed_user_ids,
+    )?;
+    for device in dynamic_devices {
+        let already_present = devices.iter().any(|existing| {
+            existing.user_id == device.user_id && existing.device_key_id == device.device_id
+        });
+        if !already_present {
+            devices.push(MobileTerminalDeviceSummary {
+                user_id: device.user_id,
+                device_key_id: device.device_id,
+                enabled: !device.public_key_pem.trim().is_empty(),
+                revoked: false,
+            });
+        }
+    }
 
     Ok(Json(MobileTerminalDeviceListResponse {
         devices,
@@ -4112,11 +4138,21 @@ async fn revoke_mobile_terminal_device(
     }
     let owner_view = mobile_terminal_user_can_disable(user_config);
     let target_user_id = resolve_mobile_terminal_revoke_target(
-        &state.config,
+        &state,
         actor_user_id,
         owner_view,
         &device_key_id,
         query.user_id.as_deref(),
+    )?;
+    mobile_devices::sync_device_common_name(
+        &state.config.cloudflare_access,
+        &device_key_id,
+        mobile_devices::DevicePolicyAction::Revoke,
+    )?;
+    let persisted_revoked = mobile_devices::revoke_device(
+        &mobile_device_db_path(&state.config),
+        &target_user_id,
+        &device_key_id,
     )?;
     let (already_revoked, pending_tickets_revoked, active_stops) =
         revoke_mobile_terminal_device_in_state(&state, &target_user_id, &device_key_id)?;
@@ -4129,10 +4165,10 @@ async fn revoke_mobile_terminal_device(
         revoked: true,
         user_id: target_user_id,
         device_key_id,
-        already_revoked,
+        already_revoked: already_revoked && !persisted_revoked,
         pending_tickets_revoked,
         active_attaches_terminated: active_stops.len(),
-        runtime_only: true,
+        runtime_only: !persisted_revoked,
     }))
 }
 
@@ -6876,7 +6912,18 @@ fn authorize_mobile_terminal_ticket_request(
             detail: "interactive shell access is not enabled".to_owned(),
         });
     }
-    if !mobile_terminal_user_has_registered_device(user_config) {
+    let requested_device_key_id = header_text(headers, "x-sm-device-key-id");
+    if !mobile_terminal_user_has_available_registered_device(state, user_id, user_config) {
+        if requested_device_key_id
+            .as_deref()
+            .map(|device_key_id| mobile_terminal_user_device_exists(state, user_id, device_key_id))
+            .unwrap_or(false)
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                detail: "Device key is not registered".to_owned(),
+            });
+        }
         return Err(ApiError::Status {
             status: StatusCode::FORBIDDEN,
             detail: "registered mobile device key is required".to_owned(),
@@ -6914,7 +6961,7 @@ fn authorize_mobile_terminal_ticket_request(
         .map(str::to_owned);
     validate_mobile_terminal_tmux_target(&tmux_session, tmux_socket_name.as_deref())?;
 
-    let device_key_id = header_text(headers, "x-sm-device-key-id");
+    let device_key_id = requested_device_key_id;
     let timestamp = header_text(headers, "x-sm-device-timestamp");
     let nonce = header_text(headers, "x-sm-device-nonce");
     let signature = header_text(headers, "x-sm-device-signature");
@@ -6932,8 +6979,8 @@ fn authorize_mobile_terminal_ticket_request(
         &timestamp,
         config.mobile_terminal.device_signature_max_skew_seconds,
     )?;
-    let Some(device_config) =
-        mobile_terminal_device_config(state, user_id, user_config, &device_key_id)?
+    let Some(device_public_key) =
+        mobile_terminal_device_public_key(state, user_id, user_config, &device_key_id)?
     else {
         return Err(ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
@@ -6949,7 +6996,7 @@ fn authorize_mobile_terminal_ticket_request(
         &timestamp,
         &nonce,
     );
-    verify_mobile_terminal_p256_signature(&device_config.public_key, &signature, &message)?;
+    verify_mobile_terminal_p256_signature(&device_public_key, &signature, &message)?;
 
     Ok(MobileTerminalAuthorization {
         user_id: user_id.to_owned(),
@@ -6993,13 +7040,6 @@ fn mobile_terminal_visible_user<'a>(
         })
 }
 
-fn mobile_terminal_user_has_registered_device(user_config: &MobileTerminalUserConfig) -> bool {
-    user_config
-        .registered_device_keys
-        .iter()
-        .any(|key| key.enabled && !key.id.trim().is_empty() && !key.public_key.trim().is_empty())
-}
-
 fn mobile_terminal_user_has_available_registered_device(
     state: &AppState,
     user_id: &str,
@@ -7008,27 +7048,39 @@ fn mobile_terminal_user_has_available_registered_device(
     let Ok(revoked_keys) = state.mobile_terminal_revoked_keys.lock() else {
         return false;
     };
-    user_config.registered_device_keys.iter().any(|key| {
+    if user_config.registered_device_keys.iter().any(|key| {
         let device_key_id = key.id.trim();
         key.enabled
             && !device_key_id.is_empty()
             && !key.public_key.trim().is_empty()
             && !revoked_keys.contains(&(user_id.to_owned(), device_key_id.to_owned()))
-    })
+    }) {
+        return true;
+    }
+    mobile_devices::user_has_active_device(&mobile_device_db_path(&state.config), user_id)
+        .unwrap_or(false)
 }
 
-fn mobile_terminal_device_config<'a>(
+fn mobile_terminal_device_public_key(
     state: &AppState,
     user_id: &str,
-    user_config: &'a MobileTerminalUserConfig,
+    user_config: &MobileTerminalUserConfig,
     device_key_id: &str,
-) -> Result<Option<&'a MobileTerminalDeviceKeyConfig>, ApiError> {
+) -> Result<Option<String>, ApiError> {
     if mobile_terminal_device_revoked(state, user_id, device_key_id)? {
         return Ok(None);
     }
-    Ok(user_config.registered_device_keys.iter().find(|key| {
+    if let Some(key) = user_config.registered_device_keys.iter().find(|key| {
         key.enabled && key.id.trim() == device_key_id && !key.public_key.trim().is_empty()
-    }))
+    }) {
+        return Ok(Some(key.public_key.clone()));
+    }
+    mobile_devices::active_device_public_key(
+        &mobile_device_db_path(&state.config),
+        user_id,
+        device_key_id,
+    )
+    .map_err(ApiError::from)
 }
 
 fn mobile_terminal_device_revoked(
@@ -7047,11 +7099,12 @@ fn mobile_terminal_device_revoked(
 }
 
 fn mobile_terminal_user_device_exists(
-    config: &AppConfig,
+    state: &AppState,
     user_id: &str,
     device_key_id: &str,
 ) -> bool {
-    config
+    if state
+        .config
         .mobile_terminal
         .allowed_users
         .get(user_id)
@@ -7062,10 +7115,19 @@ fn mobile_terminal_user_device_exists(
                 .any(|key| key.id.trim() == device_key_id)
         })
         .unwrap_or(false)
+    {
+        return true;
+    }
+    mobile_devices::device_exists(
+        &mobile_device_db_path(&state.config),
+        user_id,
+        device_key_id,
+    )
+    .unwrap_or(false)
 }
 
 fn resolve_mobile_terminal_revoke_target(
-    config: &AppConfig,
+    state: &AppState,
     actor_user_id: &str,
     owner_view: bool,
     device_key_id: &str,
@@ -7081,20 +7143,21 @@ fn resolve_mobile_terminal_revoke_target(
                 detail: "User is not allowed to revoke this mobile terminal device".to_owned(),
             });
         }
-        if mobile_terminal_user_device_exists(config, requested_user_id, device_key_id) {
+        if mobile_terminal_user_device_exists(state, requested_user_id, device_key_id) {
             return Ok(requested_user_id.to_owned());
         }
         return Err(ApiError::NotFound("Mobile terminal device not found"));
     }
 
-    if mobile_terminal_user_device_exists(config, actor_user_id, device_key_id) {
+    if mobile_terminal_user_device_exists(state, actor_user_id, device_key_id) {
         return Ok(actor_user_id.to_owned());
     }
     if !owner_view {
         return Err(ApiError::NotFound("Mobile terminal device not found"));
     }
 
-    let matches = config
+    let mut matches = state
+        .config
         .mobile_terminal
         .allowed_users
         .iter()
@@ -7106,6 +7169,22 @@ fn resolve_mobile_terminal_revoke_target(
         })
         .map(|(user_id, _)| user_id.clone())
         .collect::<Vec<_>>();
+    if let Ok(dynamic_devices) = mobile_devices::list_active_devices_for_users(
+        &mobile_device_db_path(&state.config),
+        &state
+            .config
+            .mobile_terminal
+            .allowed_users
+            .keys()
+            .cloned()
+            .collect(),
+    ) {
+        for device in dynamic_devices {
+            if device.device_id == device_key_id && !matches.contains(&device.user_id) {
+                matches.push(device.user_id);
+            }
+        }
+    }
     match matches.as_slice() {
         [] => Err(ApiError::NotFound("Mobile terminal device not found")),
         [user_id] => Ok(user_id.clone()),
@@ -7567,7 +7646,7 @@ fn mobile_cloudflare_access_device_enrolled_for_user(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             detail: "Mobile terminal revoked key store is unavailable".to_owned(),
         })?;
-    Ok(state
+    if state
         .config
         .mobile_terminal
         .allowed_users
@@ -7581,7 +7660,16 @@ fn mobile_cloudflare_access_device_enrolled_for_user(
                     && !revoked_keys.contains(&(user_id.to_owned(), device_key_id.to_owned()))
             })
         })
-        .unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    mobile_devices::active_device_exists(
+        &mobile_device_db_path(&state.config),
+        user_id,
+        device_common_name,
+    )
+    .map_err(ApiError::from)
 }
 
 fn classify_cloudflare_access_assertion_cached(
@@ -8078,8 +8166,8 @@ fn consume_mobile_terminal_ticket(
             detail: "User is no longer allowed to attach".to_owned(),
         });
     }
-    let Some(device_config) =
-        mobile_terminal_device_config(state, &ticket.user_id, user_config, &device_key_id)?
+    let Some(device_public_key) =
+        mobile_terminal_device_public_key(state, &ticket.user_id, user_config, &device_key_id)?
     else {
         return Err(ApiError::Status {
             status: StatusCode::UNAUTHORIZED,
@@ -8093,7 +8181,7 @@ fn consume_mobile_terminal_ticket(
         &device_key_id,
         &nonce,
     );
-    verify_mobile_terminal_p256_signature(&device_config.public_key, &signature, &message)?;
+    verify_mobile_terminal_p256_signature(&device_public_key, &signature, &message)?;
 
     let Some(session) = state.session_store.get_session(&ticket.session_id)? else {
         return Err(ApiError::Status {

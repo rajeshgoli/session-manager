@@ -15,6 +15,7 @@ hmac = { workspace = true }
 jsonwebtoken = { workspace = true }
 nix = { workspace = true, features = ["fs", "poll", "term"] }
 p256 = { workspace = true, features = ["ecdsa", "pem"] }
+qrcode = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
