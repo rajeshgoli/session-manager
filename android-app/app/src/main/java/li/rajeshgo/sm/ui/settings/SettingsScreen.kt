@@ -176,6 +176,71 @@ fun SettingsScreen(
                         Text("Copy config")
                     }
                 }
+                Spacer(Modifier.height(18.dp))
+                Text(
+                    text = "Cloudflare Access client certificate",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "Use this CSR when issuing the SM mobile Access certificate. The certificate Common Name should stay equal to the device key id.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "Client auth",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = if (state.cloudflareDeviceCertificateConfigured) "Configured" else "Not configured",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (state.cloudflareDeviceCertificateConfigured) Emerald else Rose,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                        clipboard?.setPrimaryClip(
+                            android.content.ClipData.newPlainText(
+                                "sm mobile cloudflare csr",
+                                state.mobileDeviceCertificateSigningRequest,
+                            ),
+                        )
+                    },
+                    enabled = state.mobileDeviceCertificateSigningRequest.isNotBlank(),
+                ) {
+                    Text("Copy CSR")
+                }
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = state.cloudflareDeviceCertificateChainPem,
+                    onValueChange = viewModel::updateCloudflareDeviceCertificateChain,
+                    label = { Text("Signed certificate chain PEM") },
+                    placeholder = { Text("-----BEGIN CERTIFICATE-----") },
+                    maxLines = 8,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(170.dp),
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = viewModel::saveCloudflareDeviceCertificateChain,
+                        enabled = state.cloudflareDeviceCertificateChainPem.isNotBlank(),
+                    ) {
+                        Text("Save cert")
+                    }
+                    OutlinedButton(
+                        onClick = viewModel::clearCloudflareDeviceCertificateChain,
+                        enabled = state.cloudflareDeviceCertificateConfigured || state.cloudflareDeviceCertificateChainPem.isNotBlank(),
+                    ) {
+                        Text("Clear cert")
+                    }
+                }
             }
         }
 
@@ -310,7 +375,7 @@ fun SettingsScreen(
 
         Spacer(Modifier.height(24.dp))
         Text(
-            text = "Attach note: HTTPS in-app attach is primary when mobile_terminal is enabled server-side. Termux remains a temporary fallback for sessions without mobile terminal support.",
+            text = "Attach note: HTTPS in-app attach is available when mobile_terminal is enabled server-side and this device key is registered.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

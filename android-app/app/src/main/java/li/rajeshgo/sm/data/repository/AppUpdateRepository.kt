@@ -8,7 +8,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import retrofit2.HttpException
 import retrofit2.Retrofit
@@ -16,10 +15,10 @@ import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFact
 import li.rajeshgo.sm.BuildConfig
 import li.rajeshgo.sm.data.model.AppArtifactMetadata
 import li.rajeshgo.sm.data.remote.ApiService
+import li.rajeshgo.sm.data.remote.HttpClientFactory
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
 
 data class AvailableAppUpdate(
     val artifactHash: String,
@@ -32,6 +31,7 @@ class AppUpdateRepository(
     private val settingsRepository: SettingsRepository,
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
+    private val httpClientFactory = HttpClientFactory(settingsRepository)
 
     @Volatile
     private var cachedCurrentArtifactHash: String? = null
@@ -70,7 +70,7 @@ class AppUpdateRepository(
         val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
         val apkFile = File(updatesDir, "session-manager-${update.artifactHash}.apk")
 
-        okHttpClient().newCall(request).execute().use { response ->
+        httpClientFactory.create(includeLogging = false).newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("Update download failed: HTTP ${response.code}")
             }
@@ -144,17 +144,12 @@ class AppUpdateRepository(
             .take(8)
     }
 
-    private fun apiService(serverUrl: String): ApiService {
+    private suspend fun apiService(serverUrl: String): ApiService {
         val retrofit = Retrofit.Builder()
             .baseUrl("$serverUrl/")
-            .client(okHttpClient())
+            .client(httpClientFactory.create(includeLogging = false))
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
         return retrofit.create(ApiService::class.java)
     }
-
-    private fun okHttpClient(): OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
 }

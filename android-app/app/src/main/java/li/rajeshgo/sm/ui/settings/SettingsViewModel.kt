@@ -4,10 +4,12 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlin.Result
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.repository.AppUpdateRepository
 import li.rajeshgo.sm.data.repository.AvailableAppUpdate
@@ -25,6 +27,9 @@ data class SettingsUiState(
     val availableUpdate: AvailableAppUpdate? = null,
     val mobileDeviceKeyId: String = "",
     val mobileDevicePublicKey: String = "",
+    val mobileDeviceCertificateSigningRequest: String = "",
+    val cloudflareDeviceCertificateChainPem: String = "",
+    val cloudflareDeviceCertificateConfigured: Boolean = false,
     val mobileDeviceKeyError: String? = null,
     val updateInstalling: Boolean = false,
     val updateError: String? = null,
@@ -33,7 +38,7 @@ data class SettingsUiState(
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
-    private val sessionRepository = SessionManagerRepository()
+    private val sessionRepository = SessionManagerRepository(settingsRepository)
     private val appUpdateRepository = AppUpdateRepository(application, settingsRepository)
     private val deviceKeyManager = DeviceKeyManager()
 
@@ -47,6 +52,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 userEmail = settingsRepository.userEmail.first(),
                 userName = settingsRepository.userName.first(),
                 isLoggedIn = settingsRepository.isLoggedIn.first(),
+                cloudflareDeviceCertificateChainPem = settingsRepository.cloudflareDeviceCertificateChainPem.first(),
+                cloudflareDeviceCertificateConfigured = settingsRepository.hasCloudflareDeviceCertificate.first(),
             )
             loadMobileDeviceKey()
             refreshBootstrap()
@@ -79,16 +86,67 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun loadMobileDeviceKey() {
         runCatching {
-            deviceKeyManager.deviceKeyId() to deviceKeyManager.publicKeyPem()
-        }.onSuccess { (keyId, publicKey) ->
+            Triple(
+                deviceKeyManager.deviceKeyId(),
+                deviceKeyManager.publicKeyPem(),
+                deviceKeyManager.certificateSigningRequestPem(),
+            )
+        }.onSuccess { (keyId, publicKey, certificateSigningRequest) ->
             _uiState.value = _uiState.value.copy(
                 mobileDeviceKeyId = keyId,
                 mobileDevicePublicKey = publicKey,
+                mobileDeviceCertificateSigningRequest = certificateSigningRequest,
                 mobileDeviceKeyError = null,
             )
         }.onFailure { error ->
             _uiState.value = _uiState.value.copy(
                 mobileDeviceKeyError = error.message ?: "Failed to load mobile attach device key",
+            )
+        }
+    }
+
+    fun updateCloudflareDeviceCertificateChain(value: String) {
+        _uiState.value = _uiState.value.copy(
+            cloudflareDeviceCertificateChainPem = value,
+            mobileDeviceKeyError = null,
+        )
+    }
+
+    fun saveCloudflareDeviceCertificateChain() {
+        val certificateChainPem = _uiState.value.cloudflareDeviceCertificateChainPem.trim()
+        if (certificateChainPem.isBlank()) {
+            clearCloudflareDeviceCertificateChain()
+            return
+        }
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    check(deviceKeyManager.certificateChainMatchesDeviceKey(certificateChainPem)) {
+                        "Certificate chain does not match this mobile device key"
+                    }
+                }
+                settingsRepository.saveCloudflareDeviceCertificateChainPem(certificateChainPem)
+            }.onSuccess {
+                _uiState.value = _uiState.value.copy(
+                    cloudflareDeviceCertificateChainPem = certificateChainPem,
+                    cloudflareDeviceCertificateConfigured = true,
+                    mobileDeviceKeyError = null,
+                )
+            }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    mobileDeviceKeyError = error.message ?: "Failed to save Cloudflare certificate",
+                )
+            }
+        }
+    }
+
+    fun clearCloudflareDeviceCertificateChain() {
+        viewModelScope.launch {
+            settingsRepository.clearCloudflareDeviceCertificateChainPem()
+            _uiState.value = _uiState.value.copy(
+                cloudflareDeviceCertificateChainPem = "",
+                cloudflareDeviceCertificateConfigured = false,
+                mobileDeviceKeyError = null,
             )
         }
     }

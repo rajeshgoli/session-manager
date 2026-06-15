@@ -19,6 +19,7 @@ class SettingsRepository(private val context: Context) {
         val USER_EMAIL = stringPreferencesKey("user_email")
         val USER_NAME = stringPreferencesKey("user_name")
         val EXPIRES_AT = stringPreferencesKey("expires_at")
+        val CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM = stringPreferencesKey("cloudflare_device_certificate_chain_pem")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
     }
 
@@ -44,6 +45,12 @@ class SettingsRepository(private val context: Context) {
 
     val isLoggedIn: Flow<Boolean> = accessToken.map { it.isNotBlank() }
 
+    val cloudflareDeviceCertificateChainPem: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM] ?: ""
+    }
+
+    val hasCloudflareDeviceCertificate: Flow<Boolean> = cloudflareDeviceCertificateChainPem.map { it.isNotBlank() }
+
     val dismissedUpdateArtifactHash: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.DISMISSED_UPDATE_ARTIFACT_HASH] ?: ""
     }
@@ -60,6 +67,18 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.USER_EMAIL] = email
             prefs[Keys.USER_NAME] = name.orEmpty()
             prefs[Keys.EXPIRES_AT] = expiresAt
+        }
+    }
+
+    suspend fun saveCloudflareDeviceCertificateChainPem(certificateChainPem: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM] = certificateChainPem.trim()
+        }
+    }
+
+    suspend fun clearCloudflareDeviceCertificateChainPem() {
+        context.dataStore.edit { prefs ->
+            prefs.remove(Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM)
         }
     }
 

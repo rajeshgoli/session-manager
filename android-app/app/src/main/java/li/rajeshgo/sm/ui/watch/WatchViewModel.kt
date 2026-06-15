@@ -70,7 +70,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private val settingsRepository = SettingsRepository(application)
-    private val sessionRepository = SessionManagerRepository()
+    private val sessionRepository = SessionManagerRepository(settingsRepository)
     private val deviceKeyManager = DeviceKeyManager()
     private var refreshJob: Job? = null
     private var terminalSocket: WebSocket? = null
