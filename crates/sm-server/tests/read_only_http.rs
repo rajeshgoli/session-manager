@@ -6085,6 +6085,189 @@ async fn shadow_http_classifies_native_mobile_writes_without_side_effects() {
 }
 
 #[tokio::test]
+async fn shadow_http_reports_app_artifact_reads_as_status_only() {
+    let artifact_root = unique_short_temp_dir("sm-rust-shadow-app-artifacts");
+    let app_dir = artifact_root.join("session-manager-android");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(app_dir.join("deadbeef.apk"), b"apk-bytes").unwrap();
+    fs::write(app_dir.join("latest.apk"), b"apk-bytes").unwrap();
+    fs::write(
+        app_dir.join("meta.json"),
+        json!({
+            "artifact_hash": "deadbeef",
+            "size_bytes": 9,
+            "uploaded_at": "2026-06-15T00:00:00Z",
+            "uploaded_by": "local_bypass",
+            "version_code": 1016,
+            "version_name": "0.1.0-shadow"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        app_artifacts: AppArtifactsConfig {
+            root_dir: artifact_root.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    for (path, python_status) in [
+        ("/apk", 302),
+        ("/apps/session-manager-android/latest.apk", 302),
+        ("/apps/session-manager-android/deadbeef.apk", 200),
+        ("/apps/session-manager-android/meta.json", 200),
+    ] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/__shadow/http",
+            json!({
+                "schema_version": 1,
+                "request": {
+                    "method": "GET",
+                    "path": path,
+                    "query_string": "",
+                    "headers": {}
+                },
+                "python_response": {
+                    "status": python_status,
+                    "body_sha256": sha256_hex(b"live-artifact-body-or-redirect")
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            payload["support_status"], "implemented_read_status_only",
+            "{path}"
+        );
+        assert_eq!(payload["comparison"], "status_match", "{path}");
+        assert_eq!(payload["would_write"], false, "{path}");
+        assert_eq!(payload["predicted_status"], python_status, "{path}");
+        assert_eq!(payload["predicted_body_sha256"], Value::Null, "{path}");
+        assert_eq!(payload["body_sha256_match"], Value::Null, "{path}");
+    }
+
+    let _ = fs::remove_dir_all(artifact_root);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_app_artifact_missing_reads_with_stable_body() {
+    let artifact_root = unique_short_temp_dir("sm-rust-shadow-missing-app-artifacts");
+    let app = router(AppState::new(AppConfig {
+        app_artifacts: AppArtifactsConfig {
+            root_dir: artifact_root.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    for (path, detail) in [
+        (
+            "/apps/session-manager-android/meta.json",
+            "Artifact metadata not found",
+        ),
+        (
+            "/apps/session-manager-android/latest.apk",
+            "Artifact not found",
+        ),
+        (
+            "/apps/session-manager-android/deadbeef.apk",
+            "Artifact not found",
+        ),
+    ] {
+        let body = serde_json::to_vec(&json!({ "detail": detail })).unwrap();
+        let (status, payload) = post_json(
+            app.clone(),
+            "/__shadow/http",
+            json!({
+                "schema_version": 1,
+                "request": {
+                    "method": "GET",
+                    "path": path,
+                    "query_string": "",
+                    "headers": {}
+                },
+                "python_response": {
+                    "status": 404,
+                    "body_sha256": sha256_hex(&body)
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(payload["support_status"], "implemented_read", "{path}");
+        assert_eq!(payload["comparison"], "match", "{path}");
+        assert_eq!(payload["predicted_status"], 404, "{path}");
+        assert_eq!(payload["body_sha256_match"], true, "{path}");
+    }
+
+    let _ = fs::remove_dir_all(artifact_root);
+}
+
+#[tokio::test]
+async fn shadow_http_reports_device_google_auth_as_status_only() {
+    let app = router(AppState::new(config_with_state_file_and_auth(
+        &write_session_fixture(),
+    )));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/auth/device/google",
+                "query_string": "",
+                "headers": {},
+                "body_sha256": sha256_hex(b"{\"id_token\":\"valid\"}")
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": sha256_hex(b"{\"access_token\":\"python-owned\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+    assert_eq!(payload["predicted_status"], 200);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+    assert_eq!(payload["body_sha256_match"], Value::Null);
+
+    let app = router(AppState::new(AppConfig::default()));
+    let (status, payload) = post_json(
+        app,
+        "/__shadow/http",
+        json!({
+            "schema_version": 1,
+            "request": {
+                "method": "POST",
+                "path": "/auth/device/google",
+                "query_string": "",
+                "headers": {},
+                "body_sha256": sha256_hex(b"{\"id_token\":\"valid\"}")
+            },
+            "python_response": {
+                "status": 503,
+                "body_sha256": sha256_hex(b"{\"detail\":\"Google auth is not configured\"}")
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["support_status"], "implemented_read_status_only");
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["predicted_status"], 503);
+    assert_eq!(payload["predicted_body_sha256"], Value::Null);
+}
+
+#[tokio::test]
 async fn shadow_http_preserves_python_auth_denial_for_app_artifact_reads() {
     let app = router(AppState::new(AppConfig::default()));
 
