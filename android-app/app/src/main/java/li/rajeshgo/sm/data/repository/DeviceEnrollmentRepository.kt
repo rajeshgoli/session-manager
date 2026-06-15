@@ -272,8 +272,11 @@ class DeviceEnrollmentRepository(
             if (normalized == "::1" || normalized.startsWith("fe80:")) {
                 return true
             }
-            if (normalized.length >= 2 && normalized[0] == 'f' && normalized[1] in setOf('c', 'd')) {
-                return true
+            if (normalized.contains(':')) {
+                val firstWord = normalized.substringBefore(':').toIntOrNull(16)
+                if (firstWord != null && (firstWord and 0xfe00) == 0xfc00) {
+                    return true
+                }
             }
             val octets = normalized.split('.')
             if (octets.size != 4) {

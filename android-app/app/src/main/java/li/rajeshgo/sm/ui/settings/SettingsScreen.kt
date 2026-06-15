@@ -20,13 +20,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -55,20 +51,12 @@ fun SettingsScreen(
     val context = LocalContext.current
     val googleSignInManager = GoogleSignInManager(context)
     val coroutineScope = rememberCoroutineScope()
-    var pendingDeepLinkEnrollmentUrl by remember { mutableStateOf<String?>(null) }
+    val deepLinkEnrollmentUrl = pendingEnrollmentUrl?.trim()?.takeIf { it.isNotBlank() }
     val enrollmentScanner = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.trim()?.takeIf { it.isNotBlank() }?.let(viewModel::enrollCloudflareDeviceFromQr)
     }
     val effectiveGoogleClientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() }
         ?: LocalDefaults.googleServerClientId.takeIf { it.isNotBlank() }
-
-    LaunchedEffect(pendingEnrollmentUrl) {
-        val enrollmentUrl = pendingEnrollmentUrl?.trim()
-        if (!enrollmentUrl.isNullOrBlank()) {
-            pendingDeepLinkEnrollmentUrl = enrollmentUrl
-            onEnrollmentDeepLinkConsumed()
-        }
-    }
 
     Column(
         modifier = Modifier
@@ -241,7 +229,7 @@ fun SettingsScreen(
                         Text("Scan enrollment QR")
                     }
                 }
-                pendingDeepLinkEnrollmentUrl?.let { enrollmentUrl ->
+                deepLinkEnrollmentUrl?.let { enrollmentUrl ->
                     Spacer(Modifier.height(10.dp))
                     Text(
                         text = "Enrollment link opened from camera",
@@ -260,7 +248,7 @@ fun SettingsScreen(
                         Button(
                             onClick = {
                                 viewModel.enrollCloudflareDeviceFromQr(enrollmentUrl)
-                                pendingDeepLinkEnrollmentUrl = null
+                                onEnrollmentDeepLinkConsumed()
                             },
                             enabled = !state.cloudflareEnrollmentInProgress,
                         ) {
@@ -268,7 +256,7 @@ fun SettingsScreen(
                         }
                         OutlinedButton(
                             onClick = {
-                                pendingDeepLinkEnrollmentUrl = null
+                                onEnrollmentDeepLinkConsumed()
                             },
                             enabled = !state.cloudflareEnrollmentInProgress,
                         ) {

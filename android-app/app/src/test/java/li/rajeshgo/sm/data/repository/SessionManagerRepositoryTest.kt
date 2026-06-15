@@ -149,8 +149,13 @@ class SessionManagerRepositoryTest {
         assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("10.0.0.9"))
         assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("172.16.1.2"))
         assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("192.168.4.31"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("fd00::1"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("[fc00::1]"))
+        assertTrue(DeviceEnrollmentRepository.isLocalPairingHttpHost("fe80::1"))
         assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("8.8.8.8"))
         assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("example.com"))
+        assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("fdattacker.example.com"))
+        assertFalse(DeviceEnrollmentRepository.isLocalPairingHttpHost("2001:4860:4860::8888"))
     }
 
     private fun ticket(): MobileAttachTicketResponse {
