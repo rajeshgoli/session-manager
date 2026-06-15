@@ -20,14 +20,13 @@ import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.ToolCallRow
 import li.rajeshgo.sm.data.remote.ApiService
-import li.rajeshgo.sm.data.remote.AuthInterceptor
+import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.security.DeviceProof
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.HttpException
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
@@ -40,8 +39,11 @@ class SessionManagerBackendUnavailableException(message: String, cause: Throwabl
 
 const val RETIRE_REQUEST_FAILED_MESSAGE = "Retire request failed"
 
-class SessionManagerRepository {
+class SessionManagerRepository(
+    private val settingsRepository: SettingsRepository? = null,
+) {
     private val json = Json { ignoreUnknownKeys = true }
+    private val httpClientFactory = HttpClientFactory(settingsRepository)
 
     private companion object {
         private const val READ_RETRY_ATTEMPTS = 3
@@ -56,15 +58,9 @@ class SessionManagerRepository {
         val message: String? = null,
     )
 
-    private fun httpClient(token: String = ""): OkHttpClient {
-        val logger = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }
-        return OkHttpClient.Builder()
-            .addInterceptor(AuthInterceptor { token })
-            .addInterceptor(logger)
-            .build()
-    }
+    private suspend fun httpClient(token: String = ""): OkHttpClient = httpClientFactory.create(token = token)
 
-    private fun api(baseUrl: String, token: String = ""): ApiService {
+    private suspend fun api(baseUrl: String, token: String = ""): ApiService {
         require(baseUrl.isNotBlank()) { "Server URL is required" }
         val normalizedBaseUrl = baseUrl.trim().trimEnd('/') + "/"
         return Retrofit.Builder()
@@ -246,7 +242,7 @@ class SessionManagerRepository {
         return if (trimmed.startsWith("/")) trimmed else "/$trimmed"
     }
 
-    fun openMobileTerminalSocket(
+    suspend fun openMobileTerminalSocket(
         ticket: MobileAttachTicketResponse,
         accessToken: String,
         listener: WebSocketListener,

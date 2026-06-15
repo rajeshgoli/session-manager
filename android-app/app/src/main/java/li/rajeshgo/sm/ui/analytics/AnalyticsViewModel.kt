@@ -26,7 +26,7 @@ data class AnalyticsUiState(
 
 class AnalyticsViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
-    private val sessionRepository = SessionManagerRepository()
+    private val sessionRepository = SessionManagerRepository(settingsRepository)
     private var refreshJob: Job? = null
 
     private val _uiState = MutableStateFlow(AnalyticsUiState())
