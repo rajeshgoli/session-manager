@@ -84,6 +84,30 @@ data class DeviceGoogleAuthResponse(
 )
 
 @Serializable
+data class DeviceEnrollmentRequest(
+    @SerialName("device_id")
+    val deviceId: String,
+    @SerialName("device_name")
+    val deviceName: String,
+    @SerialName("csr_pem")
+    val csrPem: String,
+    @SerialName("public_key_pem")
+    val publicKeyPem: String,
+)
+
+@Serializable
+data class DeviceEnrollmentResponse(
+    @SerialName("device_id")
+    val deviceId: String,
+    @SerialName("device_name")
+    val deviceName: String? = null,
+    @SerialName("certificate_chain_pem")
+    val certificateChainPem: String,
+    @SerialName("expires_at")
+    val expiresAt: String? = null,
+)
+
+@Serializable
 data class AppArtifactMetadata(
     @SerialName("artifact_hash")
     val artifactHash: String? = null,

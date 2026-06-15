@@ -1,5 +1,6 @@
 package li.rajeshgo.sm.ui.settings
 
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +28,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import li.rajeshgo.sm.BuildConfig
 import li.rajeshgo.sm.auth.GoogleSignInManager
 import li.rajeshgo.sm.ui.theme.BorderStrong
@@ -46,6 +49,9 @@ fun SettingsScreen(
     val context = LocalContext.current
     val googleSignInManager = GoogleSignInManager(context)
     val coroutineScope = rememberCoroutineScope()
+    val enrollmentScanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.trim()?.takeIf { it.isNotBlank() }?.let(viewModel::enrollCloudflareDeviceFromQr)
+    }
     val effectiveGoogleClientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() }
         ?: LocalDefaults.googleServerClientId.takeIf { it.isNotBlank() }
 
@@ -201,6 +207,26 @@ fun SettingsScreen(
                     fontFamily = FontFamily.Monospace,
                 )
                 Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        val options = ScanOptions().apply {
+                            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            setPrompt("Scan sm enroll-device QR")
+                            setBeepEnabled(false)
+                            setOrientationLocked(false)
+                        }
+                        enrollmentScanner.launch(options)
+                    },
+                    enabled = !state.cloudflareEnrollmentInProgress,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (state.cloudflareEnrollmentInProgress) {
+                        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
+                    } else {
+                        Text("Scan enrollment QR")
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
                 OutlinedButton(
                     onClick = {
                         val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
@@ -230,16 +256,33 @@ fun SettingsScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = viewModel::saveCloudflareDeviceCertificateChain,
-                        enabled = state.cloudflareDeviceCertificateChainPem.isNotBlank(),
+                        enabled = state.cloudflareDeviceCertificateChainPem.isNotBlank() && !state.cloudflareEnrollmentInProgress,
                     ) {
                         Text("Save cert")
                     }
                     OutlinedButton(
                         onClick = viewModel::clearCloudflareDeviceCertificateChain,
-                        enabled = state.cloudflareDeviceCertificateConfigured || state.cloudflareDeviceCertificateChainPem.isNotBlank(),
+                        enabled = (state.cloudflareDeviceCertificateConfigured || state.cloudflareDeviceCertificateChainPem.isNotBlank()) &&
+                            !state.cloudflareEnrollmentInProgress,
                     ) {
                         Text("Clear cert")
                     }
+                }
+                state.cloudflareEnrollmentStatus?.let { status ->
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = status,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Emerald,
+                    )
+                }
+                state.cloudflareEnrollmentError?.let { error ->
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Rose,
+                    )
                 }
             }
         }

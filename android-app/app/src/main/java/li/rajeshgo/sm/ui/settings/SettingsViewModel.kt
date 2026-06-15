@@ -13,6 +13,7 @@ import kotlinx.coroutines.withContext
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.repository.AppUpdateRepository
 import li.rajeshgo.sm.data.repository.AvailableAppUpdate
+import li.rajeshgo.sm.data.repository.DeviceEnrollmentRepository
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.data.security.DeviceKeyManager
@@ -30,6 +31,9 @@ data class SettingsUiState(
     val mobileDeviceCertificateSigningRequest: String = "",
     val cloudflareDeviceCertificateChainPem: String = "",
     val cloudflareDeviceCertificateConfigured: Boolean = false,
+    val cloudflareEnrollmentInProgress: Boolean = false,
+    val cloudflareEnrollmentStatus: String? = null,
+    val cloudflareEnrollmentError: String? = null,
     val mobileDeviceKeyError: String? = null,
     val updateInstalling: Boolean = false,
     val updateError: String? = null,
@@ -41,6 +45,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val sessionRepository = SessionManagerRepository(settingsRepository)
     private val appUpdateRepository = AppUpdateRepository(application, settingsRepository)
     private val deviceKeyManager = DeviceKeyManager()
+    private val deviceEnrollmentRepository = DeviceEnrollmentRepository(settingsRepository, deviceKeyManager)
 
     private val _uiState = MutableStateFlow(SettingsUiState())
     val uiState: StateFlow<SettingsUiState> = _uiState
@@ -108,7 +113,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun updateCloudflareDeviceCertificateChain(value: String) {
         _uiState.value = _uiState.value.copy(
             cloudflareDeviceCertificateChainPem = value,
-            mobileDeviceKeyError = null,
+            cloudflareEnrollmentError = null,
         )
     }
 
@@ -130,11 +135,50 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 _uiState.value = _uiState.value.copy(
                     cloudflareDeviceCertificateChainPem = certificateChainPem,
                     cloudflareDeviceCertificateConfigured = true,
-                    mobileDeviceKeyError = null,
+                    cloudflareEnrollmentStatus = "Client certificate saved",
+                    cloudflareEnrollmentError = null,
                 )
             }.onFailure { error ->
                 _uiState.value = _uiState.value.copy(
-                    mobileDeviceKeyError = error.message ?: "Failed to save Cloudflare certificate",
+                    cloudflareEnrollmentError = error.message ?: "Failed to save Cloudflare certificate",
+                )
+            }
+        }
+    }
+
+    fun enrollCloudflareDeviceFromQr(qrContents: String) {
+        if (_uiState.value.cloudflareEnrollmentInProgress) {
+            return
+        }
+        _uiState.value = _uiState.value.copy(
+            cloudflareEnrollmentInProgress = true,
+            cloudflareEnrollmentStatus = "Enrolling device",
+            cloudflareEnrollmentError = null,
+        )
+        viewModelScope.launch {
+            runCatching {
+                deviceEnrollmentRepository.enrollFromQr(qrContents)
+            }.onSuccess { result ->
+                val certificateChainPem = settingsRepository.cloudflareDeviceCertificateChainPem.first()
+                _uiState.value = _uiState.value.copy(
+                    cloudflareDeviceCertificateChainPem = certificateChainPem,
+                    cloudflareDeviceCertificateConfigured = certificateChainPem.isNotBlank(),
+                    cloudflareEnrollmentInProgress = false,
+                    cloudflareEnrollmentStatus = buildString {
+                        append("Enrolled ")
+                        append(result.deviceName?.takeIf { it.isNotBlank() } ?: result.deviceId)
+                        result.expiresAt?.takeIf { it.isNotBlank() }?.let { expiresAt ->
+                            append(" until ")
+                            append(expiresAt)
+                        }
+                    },
+                    cloudflareEnrollmentError = null,
+                )
+            }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    cloudflareEnrollmentInProgress = false,
+                    cloudflareEnrollmentStatus = null,
+                    cloudflareEnrollmentError = error.message ?: "Device enrollment failed",
                 )
             }
         }
@@ -146,7 +190,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             _uiState.value = _uiState.value.copy(
                 cloudflareDeviceCertificateChainPem = "",
                 cloudflareDeviceCertificateConfigured = false,
-                mobileDeviceKeyError = null,
+                cloudflareEnrollmentStatus = "Client certificate cleared",
+                cloudflareEnrollmentError = null,
             )
         }
     }

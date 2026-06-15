@@ -60,11 +60,18 @@ The server stores:
 ## Attach security model
 
 The intended Android attach path is:
-- copy the app's mobile device key/CSR from Settings
-- issue an SM mobile Cloudflare Access client certificate whose Common Name matches that device key id
-- paste the signed certificate chain into Settings
+- run `sm enroll-device` on the trusted Session Manager host and scan its QR
+  code from Settings within the short enrollment window
+- the app submits its Android Keystore CSR and public key to the pairing URL
+- Session Manager issues an SM mobile Cloudflare Access client certificate
+  whose Common Name matches that device key id
+- the app stores the signed certificate chain returned by enrollment
 - authenticate the native HTTPS origin with Cloudflare Access client-certificate proof
 - sign in with Google and exchange the ID token for the SM device bearer token
 - request an in-app terminal attach ticket using the Android Keystore device key
 
 Cloudflare client-certificate proof is only the public-edge gate. The app still needs the SM bearer token and route-local attach-ticket proof before shell access is available.
+
+Manual CSR copy and certificate-chain paste in Settings remain available for
+debugging, but QR enrollment is the normal path. The server pairing token should
+be single-use and expire after about 15 minutes.
