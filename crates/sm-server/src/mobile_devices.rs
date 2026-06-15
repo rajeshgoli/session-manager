@@ -1553,7 +1553,7 @@ fn enrollment_redirect_html(enrollment_url: &str) -> String {
   <p>This enrollment link must be opened in the Session Manager Android app.</p>
   <p><a href="{intent_link}">Open Session Manager</a></p>
   <p><a href="{app_link}">Open with app link</a></p>
-  <p>If the button does not work, open the app Settings screen and use Scan enrollment QR.</p>
+  <p>If the button does not work, scan the QR again with the phone Camera app and open it in Session Manager.</p>
   <p>Enrollment URL: <code>{enrollment_url}</code></p>
 </body>
 </html>"#,
