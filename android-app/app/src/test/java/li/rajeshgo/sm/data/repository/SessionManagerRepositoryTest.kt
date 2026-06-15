@@ -99,6 +99,31 @@ class SessionManagerRepositoryTest {
         assertFalse(repository.isRetryableMobileTerminalSocketFailure(null, "timeout"))
     }
 
+    @Test
+    fun deviceEnrollmentQrAcceptsPlainPairingUrl() {
+        assertEquals(
+            "http://studio.local:8420/client/mobile-terminal/enroll/abc",
+            DeviceEnrollmentRepository.enrollmentUrlFromQrContents(
+                " http://studio.local:8420/client/mobile-terminal/enroll/abc ",
+            ),
+        )
+    }
+
+    @Test
+    fun deviceEnrollmentQrAcceptsJsonEnrollmentUrl() {
+        assertEquals(
+            "https://sm-app.example.com/client/mobile-terminal/enroll/abc",
+            DeviceEnrollmentRepository.enrollmentUrlFromQrContents(
+                """{"enrollment_url":"https://sm-app.example.com/client/mobile-terminal/enroll/abc"}""",
+            ),
+        )
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun deviceEnrollmentQrRejectsNonHttpUrl() {
+        DeviceEnrollmentRepository.enrollmentUrlFromQrContents("sm-enroll://abc")
+    }
+
     private fun ticket(): MobileAttachTicketResponse {
         return MobileAttachTicketResponse(
             ticketId = "ticket-1",
