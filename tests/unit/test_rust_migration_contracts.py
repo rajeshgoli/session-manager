@@ -197,12 +197,21 @@ def test_manifest_covers_rust_only_mobile_device_cli_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
     required_ids = {
+        "cli.enroll_device_help",
         "cli.list_devices_help",
         "cli.remove_device_help",
     }
 
     missing = required_ids - set(checks)
     assert not missing
+
+    enroll_device = checks["cli.enroll_device_help"]
+    assert enroll_device.classification == "retained"
+    assert enroll_device.target == "rust_only"
+    assert enroll_device.command == ("enroll-device", "--help")
+    assert enroll_device.expected_exit == (0,)
+    assert "--expires-in-minutes" in enroll_device.expected_output_contains_all
+    assert "--url-base" in enroll_device.expected_output_contains_all
 
     list_devices = checks["cli.list_devices_help"]
     assert list_devices.classification == "retained"

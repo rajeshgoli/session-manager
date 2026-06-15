@@ -192,6 +192,22 @@ fn default_mobile_terminal_max_attach_seconds() -> u64 {
     3600
 }
 
+fn default_mobile_terminal_device_enrollment_db_path() -> String {
+    "~/.local/share/claude-sessions/mobile_devices.db".to_owned()
+}
+
+fn default_mobile_terminal_device_ca_cert_path() -> String {
+    "certs/sm-mobile-device-ca.pem".to_owned()
+}
+
+fn default_mobile_terminal_device_ca_key_path() -> String {
+    "certs/sm-mobile-device-ca.key".to_owned()
+}
+
+fn default_mobile_terminal_device_enrollment_ttl_minutes() -> u64 {
+    15
+}
+
 fn default_public_edge_assertion_max_skew_seconds() -> u64 {
     60
 }
@@ -408,6 +424,14 @@ pub struct MobileTerminalConfig {
     pub history_preload_lines: usize,
     #[serde(default = "default_mobile_terminal_max_attach_seconds")]
     pub max_attach_seconds: u64,
+    #[serde(default = "default_mobile_terminal_device_enrollment_db_path")]
+    pub device_enrollment_db_path: String,
+    #[serde(default = "default_mobile_terminal_device_ca_cert_path")]
+    pub device_ca_cert_path: String,
+    #[serde(default = "default_mobile_terminal_device_ca_key_path")]
+    pub device_ca_key_path: String,
+    #[serde(default = "default_mobile_terminal_device_enrollment_ttl_minutes")]
+    pub device_enrollment_ttl_minutes: u64,
 }
 
 impl Default for MobileTerminalConfig {
@@ -427,6 +451,10 @@ impl Default for MobileTerminalConfig {
             initial_resize_wait_seconds: default_mobile_terminal_initial_resize_wait_seconds(),
             history_preload_lines: default_mobile_terminal_history_preload_lines(),
             max_attach_seconds: default_mobile_terminal_max_attach_seconds(),
+            device_enrollment_db_path: default_mobile_terminal_device_enrollment_db_path(),
+            device_ca_cert_path: default_mobile_terminal_device_ca_cert_path(),
+            device_ca_key_path: default_mobile_terminal_device_ca_key_path(),
+            device_enrollment_ttl_minutes: default_mobile_terminal_device_enrollment_ttl_minutes(),
         }
     }
 }
@@ -1766,6 +1794,10 @@ mobile_terminal:
   initial_resize_wait_seconds: 1.5
   history_preload_lines: 1234
   max_attach_seconds: 600
+  device_enrollment_db_path: /tmp/sm-fixture/mobile_devices.db
+  device_ca_cert_path: /tmp/sm-fixture/mobile-ca.pem
+  device_ca_key_path: /tmp/sm-fixture/mobile-ca.key
+  device_enrollment_ttl_minutes: 15
   allowed_users:
     local_bypass:
       email: local@example.com
@@ -1800,6 +1832,19 @@ mobile_terminal:
         assert_eq!(config.mobile_terminal.initial_resize_wait_seconds, 1.5);
         assert_eq!(config.mobile_terminal.history_preload_lines, 1234);
         assert_eq!(config.mobile_terminal.max_attach_seconds, 600);
+        assert_eq!(
+            config.mobile_terminal.device_enrollment_db_path,
+            "/tmp/sm-fixture/mobile_devices.db"
+        );
+        assert_eq!(
+            config.mobile_terminal.device_ca_cert_path,
+            "/tmp/sm-fixture/mobile-ca.pem"
+        );
+        assert_eq!(
+            config.mobile_terminal.device_ca_key_path,
+            "/tmp/sm-fixture/mobile-ca.key"
+        );
+        assert_eq!(config.mobile_terminal.device_enrollment_ttl_minutes, 15);
         let user = config
             .mobile_terminal
             .allowed_users
