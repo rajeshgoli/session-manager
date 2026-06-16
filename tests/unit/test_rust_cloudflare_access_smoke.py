@@ -106,6 +106,23 @@ def test_cloudflare_access_smoke_blocks_when_access_assertion_is_missing():
 
 def test_cloudflare_access_smoke_blocks_when_public_edge_secret_is_missing():
     def fake_urlopen(request, timeout):
+        path = request.full_url.removeprefix("http://127.0.0.1:8421")
+        if path == "/client/bootstrap" and not request.get_header(
+            "Cf-access-jwt-assertion"
+        ):
+            raise _http_error(
+                request.full_url,
+                403,
+                {"detail": "Cloudflare Access mobile app assertion is required"},
+            )
+        if path == "/client/bootstrap" and not request.get_header(
+            "X-sm-edge-signature"
+        ):
+            raise _http_error(
+                request.full_url,
+                403,
+                {"detail": "Public edge assertion is required"},
+            )
         raise AssertionError(f"unexpected request to {request.full_url}")
 
     report = build_smoke_report(
@@ -118,9 +135,7 @@ def test_cloudflare_access_smoke_blocks_when_public_edge_secret_is_missing():
 
     assert report["status"] == "blocked"
     assert [blocker["check_id"] for blocker in report["blockers"]] == [
-        "mobile.bootstrap_requires_access",
         "mobile.bootstrap_with_access",
-        "mobile.bootstrap_requires_public_edge",
         "mobile.sessions_require_sm_auth",
         "mobile.sessions_with_sm_auth",
         "mobile.app_artifact_metadata",
@@ -131,8 +146,11 @@ def test_cloudflare_access_smoke_blocks_when_public_edge_secret_is_missing():
     assert {
         check["detail"]
         for check in report["checks"]
-        if check["id"].startswith("mobile.")
+        if check["id"].startswith("mobile.") and check["status"] == "skipped"
     } == {"public edge secret was not supplied"}
+    by_id = {check["id"]: check for check in report["checks"]}
+    assert by_id["mobile.bootstrap_requires_access"]["status"] == "passed"
+    assert by_id["mobile.bootstrap_requires_public_edge"]["status"] == "passed"
 
 
 def test_cloudflare_access_smoke_records_mobile_boundary_and_headers():

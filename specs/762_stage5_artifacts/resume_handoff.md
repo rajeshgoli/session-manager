@@ -161,6 +161,14 @@ Merged Rust slices cover:
 - PR #1012 added Android Camera-app QR handoff, `sm-enroll://enroll`, direct
   in-app credential save, local/private HTTP pairing fallback, and removed
   camera permission plus manual certificate UI.
+- PR #1023 blocked `/auth/device/google` shadow successes while Rust still
+  lacked native bearer issuance.
+- PR #1025 implemented Rust native Google device auth success, including Google
+  JWKS verification, mobile Access actor binding, public-edge gating, and
+  zero-skew token temporal checks.
+- PR #1026 is the post-#1025 smoke evidence slice; the first run records one
+  mobile Access-denial boundary pass and the missing proof inputs blocking full
+  smoke.
 - Current contract manifest size:
   - `134` checks total
   - `73` `python_and_rust`
@@ -298,8 +306,24 @@ Observed after #996 at `2026-06-14T23:36Z`:
   `SM_PUBLIC_EDGE_SECRET`, `SM_DEVICE_BEARER_TOKEN`, or `SM_COOKIE` set, and
   `--mobile-host` / `--browser-host` were not supplied for a real smoke run.
 
-No newer clean full passive shadow or Cloudflare/mobile smoke artifact has been
-recorded in this handoff. PR #1012 published Android artifact `cbb61798`
+Post-#1025, the Rust sidecar was rebuilt and restarted from current `main` on
+`127.0.0.1:8421`. The Cloudflare/mobile smoke runner was executed with
+`--mobile-host sm-app.rajeshgo.li` and `--browser-host sm.rajeshgo.li`; output
+was recorded at:
+
+```text
+.local/rust-mvp-rehearsals/post-1025-mobile-auth-smoke-blocked.json
+```
+
+That run passed `mobile.bootstrap_requires_access`, proving the Rust origin
+denies mobile bootstrap requests on the app host when no Cloudflare Access
+assertion is present. It remains blocked because the shell did not have
+`CF_MOBILE_ACCESS_JWT`, `CF_BROWSER_ACCESS_JWT`, `SM_PUBLIC_EDGE_SECRET`,
+`SM_DEVICE_BEARER_TOKEN`, or `SM_COOKIE` set. Summary: `1` passed, `5`
+blocked, `7` skipped. This is partial boundary evidence only.
+
+No newer clean full passive shadow or full Cloudflare/mobile smoke artifact has
+been recorded in this handoff. PR #1012 published Android artifact `cbb61798`
 (`versionCode=1013`, `versionName=0.1.0-enroll-ui-cleanup`) and operator
 testing confirmed the app reached "Client certificate saved" after Camera-app
 deep-link enrollment, but the full Access smoke runner and sustained shadow
@@ -411,16 +435,19 @@ Do not start Rust writer ownership or MVP cutover until:
 Continue with Cloudflare Access deployment evidence, then return to the shadow
 observation gate:
 
-1. Configure or verify the Cloudflare Access apps/policies described in
+1. Provide the smoke runner proof inputs for the already configured Cloudflare
+   Access apps: mobile/browser Access JWTs, public-edge HMAC secret, and SM
+   bearer/cookie.
+2. Configure or verify any remaining Cloudflare Access apps/policies described in
    [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md).
-2. Exercise the native app route class through the app hostname so mobile gates
+3. Exercise the native app route class through the app hostname so mobile gates
    collect real traffic and smoke evidence.
-3. Keep Python-authoritative Rust shadow mode running for retained reads against
+4. Keep Python-authoritative Rust shadow mode running for retained reads against
    the local Rust sidecar.
-4. Let it observe real traffic for the agreed window.
-5. Summarize the shadow ledger by route, comparison class, and unexplained
+5. Let it observe real traffic for the agreed window.
+6. Summarize the shadow ledger by route, comparison class, and unexplained
    mismatch.
-6. Convert any unexplained retained-surface mismatch into a bounded Rust slice.
+7. Convert any unexplained retained-surface mismatch into a bounded Rust slice.
 
 This is the highest-signal next step because the Rust origin gate is now merged,
 but the public edge still needs actual Cloudflare policy and mobile/browser
