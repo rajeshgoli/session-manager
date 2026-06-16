@@ -57,7 +57,6 @@ def build_smoke_report(
             expected_detail="Cloudflare Access mobile app assertion is required",
             timeout_seconds=timeout_seconds,
             urlopen=urlopen,
-            require_public_edge_secret=True,
         ),
         _request_check(
             check_id="mobile.bootstrap_with_access",
@@ -89,7 +88,6 @@ def build_smoke_report(
             timeout_seconds=timeout_seconds,
             urlopen=urlopen,
             skip_without_access=True,
-            require_public_edge_secret=True,
             send_public_edge_proof=False,
         ),
         _request_check(

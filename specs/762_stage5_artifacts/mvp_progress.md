@@ -1,16 +1,17 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #1012 Android Camera-app enrollment
-flow.
+Status: implementation snapshot after PR #1025 Rust native Google device auth
+success.
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
 post-#984 focused rehearsal proves state gates, live core contracts, read-only
 fixtures, and mutating fixtures on isolated sidecars, but intentionally skips
-Python baseline and shadow. PRs #986-#1012 added node restore fixtures,
+Python baseline and shadow. PRs #986-#1025 added node restore fixtures,
 stopped-origin final backup gates, rehearsal final-backup integration,
 Cloudflare Access smoke evidence tooling, Rust mobile-device enrollment,
-Cloudflare mTLS CA automation, and the Android Camera-app enrollment handoff.
-Public cutover still needs Cloudflare policy setup, real mobile/browser smoke
-evidence, and a stable Python-authoritative shadow window.
+Cloudflare mTLS CA automation, the Android Camera-app enrollment handoff, and
+Rust native Google device-auth bearer issuance. Public cutover still needs full
+Cloudflare policy/proof inputs, real mobile/browser smoke evidence, and a
+stable Python-authoritative shadow window.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -104,6 +105,9 @@ not change retained or removed scope. Binding scope remains
 | #1007 | Cloudflare mTLS CA upload and mobile app hostname association automation |
 | #1010 | Android artifact version-code/version-name override support |
 | #1012 | Android Camera-app QR handoff, `sm-enroll://enroll` deep link, direct in-app credential save, and no camera permission/manual cert UI |
+| #1023 | Block unported `/auth/device/google` shadow successes until Rust can issue native device bearers |
+| #1025 | Rust native Google device-auth success with Google JWKS verification, mobile Access actor binding, public-edge gate, and zero-skew token temporal checks |
+| #1026 | Post-#1025 smoke evidence slice; first blocked run records the mobile Access-denial boundary and missing proof inputs |
 
 ## Implemented Capability Groups
 
@@ -116,8 +120,8 @@ The Rust sidecar now has executable coverage for:
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent and retained review-route slices are merged, with shadow and contract fixtures covering the early cutover path. |
 | Codex retained reads | Codex event stream, pending request ledger reads, activity actions, review detail/list, and Claude/Codex tool-call projections are implemented and covered by manifest checks. |
-| Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, public-edge assertion validation, Android client-certificate storage, Rust `sm enroll-device`, and Camera-app deep-link enrollment are merged. |
-| Cloudflare Access origin gate | Config parsing, JWT/audience classification, host/app separation, public-host fail-closed behavior, mobile/app route gating, app artifact gating, device-token exchange gating, JWKS cache refresh/TTL behavior, mobile Access CN actor binding, Cloudflare mTLS CA upload/hostname association, per-device Common Name policy sync, and read-only smoke evidence collection are merged. |
+| Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, public-edge assertion validation, Android client-certificate storage, Rust `sm enroll-device`, Camera-app deep-link enrollment, and Rust Google device-auth bearer issuance are merged. |
+| Cloudflare Access origin gate | Config parsing, JWT/audience classification, host/app separation, public-host fail-closed behavior, mobile/app route gating, app artifact gating, device-token exchange, Google JWKS cache refresh/TTL behavior, mobile Access CN actor binding, Cloudflare mTLS CA upload/hostname association, per-device Common Name policy sync, and read-only smoke evidence collection are merged. |
 | External fallback | Email/human fallback delivery and inbound email validation path are retained in the Rust track. |
 | Queue and nodes | Queue list/detail, CLI list/status, pending submit, simple execute/cancel, queue recovery, queue fixtures, node reads, and node HTTP routes are implemented; remaining work is final live/recovery cutover evidence and any retained node-agent remote-control gaps. |
 
@@ -147,6 +151,22 @@ This passive window did not satisfy the new mobile route/pattern coverage gates
 from PR #942; those gates need real native app traffic or explicit operator
 exercise. It also does not include Cloudflare Access proof inputs, so it is not
 public-edge cutover evidence.
+
+After PR #1025, the Rust sidecar was rebuilt and restarted from current `main`
+on `127.0.0.1:8421`, then the Cloudflare/mobile smoke runner was executed with
+`--mobile-host sm-app.rajeshgo.li` and `--browser-host sm.rajeshgo.li`. The
+blocked evidence file is:
+
+```text
+.local/rust-mvp-rehearsals/post-1025-mobile-auth-smoke-blocked.json
+```
+
+That run passed `mobile.bootstrap_requires_access`, proving the Rust origin
+denies mobile bootstrap requests on the app host when no Cloudflare Access
+assertion is present. It remains blocked because the shell did not provide the
+Access JWTs, public-edge HMAC secret, or SM bearer/cookie needed for success
+checks. Summary: `1` passed, `5` blocked, `7` skipped. This is partial boundary
+evidence only, not full mobile auth smoke evidence.
 
 The local shell used for this refresh did not have the Cloudflare/mobile smoke
 secret inputs set, and the hostnames still need to be supplied with the runner

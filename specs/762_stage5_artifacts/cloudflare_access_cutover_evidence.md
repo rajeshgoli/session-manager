@@ -1,6 +1,7 @@
 # Cloudflare Access Cutover Evidence
 
-Status: implementation evidence after PR #1012 merged.
+Status: implementation evidence after PR #1025 merged and the first post-#1025
+smoke-boundary run was recorded.
 
 This artifact records the current Rust-side Cloudflare Access boundary for the
 Rust cutover track. It complements the design in
@@ -11,7 +12,8 @@ and does not replace the rollout gates in [gate_matrix.md](gate_matrix.md).
 
 Rust `main` now includes the Cloudflare Access origin gate, read-only smoke
 evidence runner, Rust mobile-device enrollment, Cloudflare mTLS CA automation,
-and Android Camera-app enrollment flow through PR #1012:
+Android Camera-app enrollment flow, and native Google device-auth bearer
+issuance:
 
 | PR | Evidence added |
 | --- | --- |
@@ -25,6 +27,8 @@ and Android Camera-app enrollment flow through PR #1012:
 | #1007 | Cloudflare mTLS CA upload/association automation for the mobile app hostname, keeping the CA private key local. |
 | #1010 | Android artifact version-code/version-name override support so published APK metadata matches the installed build. |
 | #1012 | Android Camera-app QR handoff via `sm-enroll://enroll`, direct in-app certificate save, no camera permission, no in-app scanner, and no certificate material exposed in Settings. |
+| #1025 | Rust native Google device-auth success path for `/auth/device/google`, including Google JWKS verification, mobile Access actor binding, public-edge gate, and zero-skew temporal checks. |
+| #1026 | Post-#1025 smoke evidence slice; runner now records denial-path boundary evidence even when success-path proof inputs are missing. |
 
 Current origin behavior:
 
@@ -99,12 +103,21 @@ needs operator-side Cloudflare and native-app evidence:
 | Node fallback smoke | Once node fallback is ported, prove LAN-first behavior and Cloudflare node certificate fallback for a registered node. |
 | Shadow/rehearsal | Record a clean shadow/rehearsal window that includes native app traffic or an explicit operator-driven mobile route exercise. |
 
-The smoke runner requires real deployment inputs. The local shell used for the
-post-#1012 handoff refresh did not have `CF_MOBILE_ACCESS_JWT`,
-`CF_BROWSER_ACCESS_JWT`, `SM_PUBLIC_EDGE_SECRET`, `SM_DEVICE_BEARER_TOKEN`,
-or `SM_COOKIE` set, and `--mobile-host` / `--browser-host` were not supplied,
-so no passing Cloudflare/mobile smoke evidence was produced there. Missing
-required mobile inputs are blockers by design.
+The smoke runner requires real deployment inputs. The post-#1025 run used
+`--mobile-host sm-app.rajeshgo.li` and `--browser-host sm.rajeshgo.li` against a
+freshly rebuilt Rust sidecar on `127.0.0.1:8421`. It wrote:
+
+```text
+.local/rust-mvp-rehearsals/post-1025-mobile-auth-smoke-blocked.json
+```
+
+The run passed `mobile.bootstrap_requires_access`, proving the Rust origin
+denies mobile bootstrap requests on the app host when no Cloudflare Access
+assertion is present. It remained blocked because the local shell did not have
+`CF_MOBILE_ACCESS_JWT`, `CF_BROWSER_ACCESS_JWT`, `SM_PUBLIC_EDGE_SECRET`,
+`SM_DEVICE_BEARER_TOKEN`, or `SM_COOKIE` set. Summary: `1` passed, `5`
+blocked, `7` skipped. Missing required mobile success-path inputs are blockers
+by design; this partial pass is not full mobile cutover evidence.
 
 The Android artifact published during PR #1012 is versionCode `1013`,
 versionName `0.1.0-enroll-ui-cleanup`, artifact hash `cbb61798`. It supports
