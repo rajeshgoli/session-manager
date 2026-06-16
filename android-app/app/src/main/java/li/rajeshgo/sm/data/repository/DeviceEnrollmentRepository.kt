@@ -44,10 +44,14 @@ class DeviceEnrollmentRepository(
         val enrollmentUrl = enrollmentUrlFromQrContents(qrContents)
         val previousAlias = settingsRepository.cloudflareDeviceCertificateAlias.first().trim()
         val alias = cloudflareCredentialManager.newCredentialAlias()
+        val cloudflareCredential = cloudflareCredentialManager.certificateSigningRequest(
+            alias,
+            deviceKeyManager.deviceKeyId(),
+        )
         val requestBody = DeviceEnrollmentRequest(
             deviceId = deviceKeyManager.deviceKeyId(),
             deviceName = deviceName(),
-            csrPem = cloudflareCredentialManager.certificateSigningRequestPem(alias, deviceKeyManager.deviceKeyId()),
+            csrPem = cloudflareCredential.csrPem,
             publicKeyPem = deviceKeyManager.publicKeyPem(),
         )
         try {
@@ -61,10 +65,19 @@ class DeviceEnrollmentRepository(
             check(payload.deviceId.trim() == requestBody.deviceId) {
                 "Enrollment response device id did not match this device"
             }
-            check(cloudflareCredentialManager.certificateChainMatchesAlias(payload.certificateChainPem, alias)) {
+            check(
+                cloudflareCredentialManager.certificateChainMatchesPrivateKey(
+                    payload.certificateChainPem,
+                    cloudflareCredential.privateKeyPkcs8,
+                ),
+            ) {
                 "Enrollment certificate does not match this device credential"
             }
-            settingsRepository.saveCloudflareDeviceCredential(alias, payload.certificateChainPem)
+            settingsRepository.saveCloudflareDeviceCredential(
+                alias,
+                payload.certificateChainPem,
+                cloudflareCredential.privateKeyPkcs8,
+            )
             if (previousAlias.isNotBlank() && previousAlias != alias) {
                 cloudflareCredentialManager.deleteCredential(previousAlias)
             }
