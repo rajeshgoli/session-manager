@@ -265,7 +265,7 @@ def test_cloudflare_access_cutover_evidence_pins_policy_and_origin_gates():
         assert required in evidence
 
 
-def test_handoff_and_progress_are_current_through_android_enrollment_pr1012():
+def test_handoff_and_progress_are_current_through_android_artifact_auth_pr1035():
     progress = (STAGE5_DIR / "mvp_progress.md").read_text(encoding="utf-8")
     handoff = (STAGE5_DIR / "resume_handoff.md").read_text(encoding="utf-8")
 
@@ -276,14 +276,16 @@ def test_handoff_and_progress_are_current_through_android_enrollment_pr1012():
         assert "#1005" in text
         assert "#1007" in text
         assert "#1012" in text
+        assert "#1025" in text
+        assert "#1035" in text
         assert "Cloudflare Access" in text
         assert "cloudflare_access_cutover_evidence.md" in text
 
-    assert "Latest merged commit before this docs refresh: `5fbbfa4`" in handoff
-    assert "records the PR lineage through #1012" in handoff
+    assert "Latest merged commit before this docs refresh: `1f85ce9`" in handoff
+    assert "records the PR lineage through #1035" in handoff
     assert "Camera-app" in handoff
     assert "deep-link enrollment" in handoff
-    assert "versionName=0.1.0-enroll-ui-cleanup" in handoff
+    assert "app update artifact access works through the certificate-gated app path" in handoff
 
 
 def test_manifest_covers_rust_only_retired_http_surfaces():
@@ -1554,6 +1556,48 @@ def test_http_check_renders_json_expectation_fixture_values():
         )
 
     assert result.status == "passed"
+
+
+def test_http_check_reads_large_json_response_by_default():
+    large_value = "x" * 80_000
+    body = json.dumps({"sessions": [{"id": "fixture001", "output": large_value}]}).encode()
+    assert len(body) > 65_536
+    seen = {}
+    check = ContractCheck(
+        id="http.large_json",
+        surface="http",
+        classification="retained",
+        target="python_and_rust",
+        safety="read_only",
+        method="GET",
+        path="/client/sessions",
+        expected_status=(200,),
+        expected_json=(JsonExpectation(path="/sessions", value_type="array"),),
+        preconditions=("live_server",),
+        source="test",
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size):
+            seen["size"] = size
+            return body[:size]
+
+    with patch(
+        "scripts.rust_migration.contracts.urllib.request.urlopen",
+        return_value=FakeResponse(),
+    ):
+        result = _run_http_check(check, "http://127.0.0.1:8420", {}, 1.0)
+
+    assert result.status == "passed"
+    assert seen["size"] > 65_536
 
 
 def test_http_check_reports_json_shape_mismatch():

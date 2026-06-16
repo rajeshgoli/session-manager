@@ -23,6 +23,7 @@ from typing import Any, Iterable
 
 MANIFEST_PATH = Path(__file__).with_name("contracts_manifest.json")
 DEFAULT_TIMEOUT_SECONDS = 5.0
+DEFAULT_HTTP_READ_BYTES = 4 * 1024 * 1024
 DEFAULT_PYTHON_SM_BINARY = "sm"
 DEFAULT_RUST_SM_BINARY = "target/debug/sm"
 
@@ -70,7 +71,7 @@ class ContractCheck:
     env: tuple[tuple[str, str], ...] = ()
     body: Any = None
     read_mode: str = "bytes"
-    read_bytes: int = 65536
+    read_bytes: int = DEFAULT_HTTP_READ_BYTES
     expected_body_contains_any: tuple[str, ...] = ()
     expected_body_contains_all: tuple[str, ...] = ()
     expected_json: tuple[JsonExpectation, ...] = ()
@@ -103,7 +104,7 @@ class ContractCheck:
             env=tuple((str(key), str(value)) for key, value in raw.get("env", {}).items()),
             body=raw.get("body"),
             read_mode=str(raw.get("read_mode", "bytes")),
-            read_bytes=int(raw.get("read_bytes", 65536)),
+            read_bytes=int(raw.get("read_bytes", DEFAULT_HTTP_READ_BYTES)),
             expected_body_contains_any=tuple(
                 str(v) for v in raw.get("expected_body_contains_any", [])
             ),
