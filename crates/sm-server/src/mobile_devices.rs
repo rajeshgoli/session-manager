@@ -18,6 +18,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use p256::{ecdsa::VerifyingKey, pkcs8::DecodePublicKey};
 use qrcode::{render::unicode, QrCode};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -512,9 +513,11 @@ async fn complete_device_enrollment(
             return invalid_csr_response(&state, &token, Some(&remote_addr.to_string()), &error)
         }
     };
-    if normalize_pem(&csr_public_key_pem) != normalize_pem(&payload.public_key_pem) {
-        let error = anyhow::anyhow!("CSR public key does not match public_key_pem");
+    if let Err(error) = validate_cloudflare_client_csr_public_key(&csr_public_key_pem) {
         return invalid_csr_response(&state, &token, Some(&remote_addr.to_string()), &error);
+    }
+    if let Err(error) = validate_mobile_terminal_proof_public_key(&payload.public_key_pem) {
+        return invalid_public_key_response(&state, &token, Some(&remote_addr.to_string()), &error);
     }
     let certificate_pem = match sign_csr_with_openssl(
         &state.ca_cert_path,
@@ -535,7 +538,7 @@ async fn complete_device_enrollment(
         &token,
         &device_id,
         &device_name,
-        &csr_public_key_pem,
+        &payload.public_key_pem,
         Some(&remote_addr.to_string()),
     ) {
         Ok(Some(registration)) => registration,
@@ -590,6 +593,30 @@ fn invalid_csr_response(
         )
     } else {
         json_error(StatusCode::BAD_REQUEST, "Invalid device CSR")
+    }
+}
+
+fn invalid_public_key_response(
+    state: &PairingState,
+    token: &str,
+    remote_addr: Option<&str>,
+    error: &anyhow::Error,
+) -> Response {
+    let exhausted = record_pairing_failure(
+        &state.db_path,
+        token,
+        "pairing_public_key_rejected",
+        remote_addr,
+        &error.to_string(),
+    )
+    .unwrap_or(false);
+    if exhausted {
+        json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many invalid enrollment attempts",
+        )
+    } else {
+        json_error(StatusCode::BAD_REQUEST, "Invalid device public key")
     }
 }
 
@@ -1319,6 +1346,35 @@ fn extract_public_key_from_csr_with_openssl(csr_pem: &str) -> Result<String> {
         .context("openssl returned non-UTF-8 CSR public key")
 }
 
+fn validate_cloudflare_client_csr_public_key(public_key_pem: &str) -> Result<()> {
+    let temp_dir = temporary_dir("sm-mobile-csr-public-key")?;
+    let public_key_path = temp_dir.join("device.pub.pem");
+    fs::write(&public_key_path, public_key_pem).context("failed to write device CSR public key")?;
+    let output = Command::new("openssl")
+        .arg("pkey")
+        .arg("-pubin")
+        .arg("-in")
+        .arg(&public_key_path)
+        .arg("-noout")
+        .arg("-text")
+        .output()
+        .context("failed to invoke openssl for CSR public key type check")?;
+    let _ = fs::remove_dir_all(&temp_dir);
+    if !output.status.success() {
+        bail!("openssl failed to inspect CSR public key");
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let has_rsa_modulus = text.lines().any(|line| line.trim_start() == "Modulus:");
+    let has_rsa_exponent = text
+        .lines()
+        .any(|line| line.trim_start().starts_with("Exponent:"));
+    if has_rsa_modulus && has_rsa_exponent {
+        Ok(())
+    } else {
+        bail!("Cloudflare client certificate CSR public key must be RSA")
+    }
+}
+
 fn verify_csr_self_signature_with_openssl(csr_path: &Path) -> Result<()> {
     let output = Command::new("openssl")
         .arg("req")
@@ -1594,18 +1650,15 @@ fn valid_device_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn normalize_pem(value: &str) -> String {
-    value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn public_key_fingerprint(value: &str) -> String {
     let digest = Sha256::digest(value.trim().as_bytes());
     hex_bytes(&digest)
+}
+
+fn validate_mobile_terminal_proof_public_key(public_key_pem: &str) -> Result<()> {
+    VerifyingKey::from_public_key_pem(public_key_pem.trim())
+        .map(|_| ())
+        .context("mobile terminal proof public key must be a P-256 public key")
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -1633,6 +1686,10 @@ fn local_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::{
+        ecdsa::SigningKey,
+        pkcs8::{EncodePublicKey, LineEnding},
+    };
 
     #[test]
     fn enrollment_db_round_trip_and_revoke() {
@@ -1661,6 +1718,30 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_proof_public_key_requires_p256_key() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public key pem");
+
+        validate_mobile_terminal_proof_public_key(&public_key).expect("p256 key accepted");
+        validate_mobile_terminal_proof_public_key(
+            "-----BEGIN PUBLIC KEY-----\ninvalid\n-----END PUBLIC KEY-----",
+        )
+        .expect_err("invalid key rejected");
+    }
+
+    #[test]
+    fn enrollment_csr_public_key_requires_rsa_for_cloudflare_mtls() {
+        let rsa_public_key = openssl_public_key_pem("rsa").expect("rsa public key");
+        let ec_public_key = openssl_public_key_pem("ec").expect("ec public key");
+
+        validate_cloudflare_client_csr_public_key(&rsa_public_key).expect("rsa key accepted");
+        validate_cloudflare_client_csr_public_key(&ec_public_key).expect_err("ec key rejected");
+    }
+
+    #[test]
     fn ensure_device_ca_generates_missing_pair() {
         let temp_dir = temporary_dir("sm-mobile-ca-test").expect("temp dir");
         let cert_path = temp_dir.join("device-ca.pem");
@@ -1682,6 +1763,51 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn openssl_public_key_pem(kind: &str) -> Result<String> {
+        let temp_dir = temporary_dir("sm-mobile-key-test")?;
+        let key_path = temp_dir.join(format!("{kind}.key"));
+        let public_key_path = temp_dir.join(format!("{kind}.pub.pem"));
+        let key_status = if kind == "rsa" {
+            Command::new("openssl")
+                .arg("genrsa")
+                .arg("-out")
+                .arg(&key_path)
+                .arg("2048")
+                .status()
+                .context("failed to invoke openssl genrsa")?
+        } else {
+            Command::new("openssl")
+                .arg("ecparam")
+                .arg("-name")
+                .arg("prime256v1")
+                .arg("-genkey")
+                .arg("-noout")
+                .arg("-out")
+                .arg(&key_path)
+                .status()
+                .context("failed to invoke openssl ecparam")?
+        };
+        if !key_status.success() {
+            bail!("openssl failed to generate {kind} key");
+        }
+        let output_status = Command::new("openssl")
+            .arg("pkey")
+            .arg("-in")
+            .arg(&key_path)
+            .arg("-pubout")
+            .arg("-out")
+            .arg(&public_key_path)
+            .status()
+            .context("failed to invoke openssl public key export")?;
+        if !output_status.success() {
+            bail!("openssl failed to export {kind} public key");
+        }
+        let public_key =
+            fs::read_to_string(&public_key_path).context("failed to read generated public key")?;
+        let _ = fs::remove_dir_all(temp_dir);
+        Ok(public_key)
     }
 
     #[test]

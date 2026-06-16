@@ -3,7 +3,6 @@ package li.rajeshgo.sm.data.remote
 import android.util.Log
 import kotlinx.coroutines.flow.first
 import li.rajeshgo.sm.data.repository.SettingsRepository
-import li.rajeshgo.sm.data.security.DeviceKeyManager
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import java.io.ByteArrayInputStream
@@ -24,7 +23,6 @@ import javax.net.ssl.X509TrustManager
 
 class HttpClientFactory(
     private val settingsRepository: SettingsRepository? = null,
-    private val deviceKeyManager: DeviceKeyManager? = null,
 ) {
     suspend fun create(
         token: String = "",
@@ -47,16 +45,20 @@ class HttpClientFactory(
             )
         }
 
+        val certificateAlias = settingsRepository
+            ?.cloudflareDeviceCertificateAlias
+            ?.first()
+            ?.trim()
+            .orEmpty()
         val certificateChainPem = settingsRepository
             ?.cloudflareDeviceCertificateChainPem
             ?.first()
             ?.trim()
             .orEmpty()
-        if (certificateChainPem.isNotBlank()) {
+        if (certificateAlias.isNotBlank() && certificateChainPem.isNotBlank()) {
             runCatching {
-                val manager = deviceKeyManager ?: DeviceKeyManager()
                 loadClientCertificate(
-                    alias = manager.deviceKeyAlias(),
+                    alias = certificateAlias,
                     certificateChainPem = certificateChainPem,
                 )
             }

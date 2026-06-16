@@ -3,20 +3,11 @@ package li.rajeshgo.sm.data.security
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import org.bouncycastle.asn1.x500.X500Name
-import org.bouncycastle.openssl.jcajce.JcaPEMWriter
-import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
-import org.bouncycastle.pkcs.PKCS10CertificationRequest
-import org.bouncycastle.pkcs.jcajce.JcaPKCS10CertificationRequestBuilder
-import java.io.ByteArrayInputStream
-import java.io.StringWriter
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.Signature
-import java.security.cert.CertificateFactory
-import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 
 data class DeviceProof(
@@ -28,8 +19,6 @@ data class DeviceProof(
 
 class DeviceKeyManager {
     private val keyStore: KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-
-    fun deviceKeyAlias(): String = KEY_ALIAS
 
     fun deviceKeyId(): String {
         val publicKey = ensureKeyPair().certificate.publicKey.encoded
@@ -43,24 +32,6 @@ class DeviceKeyManager {
             .chunked(64)
             .joinToString("\n")
         return "-----BEGIN PUBLIC KEY-----\n$body\n-----END PUBLIC KEY-----"
-    }
-
-    fun certificateSigningRequestPem(): String {
-        val entry = ensureKeyPair()
-        val subject = X500Name("CN=${deviceKeyId()}")
-        val builder = JcaPKCS10CertificationRequestBuilder(subject, entry.certificate.publicKey)
-        val signer = JcaContentSignerBuilder("SHA256withECDSA").build(entry.privateKey)
-        val request: PKCS10CertificationRequest = builder.build(signer)
-        val writer = StringWriter()
-        JcaPEMWriter(writer).use { pemWriter ->
-            pemWriter.writeObject(request)
-        }
-        return writer.toString()
-    }
-
-    fun certificateChainMatchesDeviceKey(certificateChainPem: String): Boolean {
-        val leaf = decodeCertificates(certificateChainPem).firstOrNull() ?: return false
-        return leaf.publicKey.encoded.contentEquals(ensureKeyPair().certificate.publicKey.encoded)
     }
 
     fun signTicketRequest(
@@ -145,15 +116,6 @@ class DeviceKeyManager {
         val bytes = ByteArray(18)
         java.security.SecureRandom().nextBytes(bytes)
         return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-    }
-
-    private fun decodeCertificates(certificateChainPem: String): List<X509Certificate> {
-        if (certificateChainPem.isBlank()) {
-            return emptyList()
-        }
-        val certificateFactory = CertificateFactory.getInstance("X.509")
-        return certificateFactory.generateCertificates(ByteArrayInputStream(certificateChainPem.toByteArray()))
-            .filterIsInstance<X509Certificate>()
     }
 
     private companion object {
