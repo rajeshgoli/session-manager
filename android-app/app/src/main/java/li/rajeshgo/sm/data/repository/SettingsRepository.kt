@@ -9,6 +9,10 @@ import androidx.datastore.preferences.preferencesDataStore
 import li.rajeshgo.sm.util.LocalDefaults
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import java.io.ByteArrayInputStream
+import java.security.KeyStore
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "session_manager_android")
 
@@ -19,6 +23,7 @@ class SettingsRepository(private val context: Context) {
         val USER_EMAIL = stringPreferencesKey("user_email")
         val USER_NAME = stringPreferencesKey("user_name")
         val EXPIRES_AT = stringPreferencesKey("expires_at")
+        val CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS = stringPreferencesKey("cloudflare_device_certificate_alias")
         val CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM = stringPreferencesKey("cloudflare_device_certificate_chain_pem")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
     }
@@ -45,11 +50,19 @@ class SettingsRepository(private val context: Context) {
 
     val isLoggedIn: Flow<Boolean> = accessToken.map { it.isNotBlank() }
 
+    val cloudflareDeviceCertificateAlias: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS] ?: ""
+    }
+
     val cloudflareDeviceCertificateChainPem: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM] ?: ""
     }
 
-    val hasCloudflareDeviceCertificate: Flow<Boolean> = cloudflareDeviceCertificateChainPem.map { it.isNotBlank() }
+    val hasCloudflareDeviceCertificate: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        val alias = prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS]?.trim().orEmpty()
+        val certificateChainPem = prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM]?.trim().orEmpty()
+        hasUsableCloudflareDeviceCredential(alias, certificateChainPem)
+    }
 
     val dismissedUpdateArtifactHash: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.DISMISSED_UPDATE_ARTIFACT_HASH] ?: ""
@@ -70,14 +83,16 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    suspend fun saveCloudflareDeviceCertificateChainPem(certificateChainPem: String) {
+    suspend fun saveCloudflareDeviceCredential(alias: String, certificateChainPem: String) {
         context.dataStore.edit { prefs ->
+            prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS] = alias.trim()
             prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM] = certificateChainPem.trim()
         }
     }
 
-    suspend fun clearCloudflareDeviceCertificateChainPem() {
+    suspend fun clearCloudflareDeviceCredential() {
         context.dataStore.edit { prefs ->
+            prefs.remove(Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS)
             prefs.remove(Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM)
         }
     }
@@ -95,5 +110,30 @@ class SettingsRepository(private val context: Context) {
             prefs.remove(Keys.USER_NAME)
             prefs.remove(Keys.EXPIRES_AT)
         }
+    }
+
+    private fun hasUsableCloudflareDeviceCredential(alias: String, certificateChainPem: String): Boolean =
+        alias.isNotBlank() &&
+            certificateChainPem.isNotBlank() &&
+            cloudflareDeviceCertificateMatchesAlias(alias, certificateChainPem)
+
+    private fun cloudflareDeviceCertificateMatchesAlias(alias: String, certificateChainPem: String): Boolean =
+        runCatching {
+            val certificates = CertificateFactory.getInstance("X.509")
+                .generateCertificates(ByteArrayInputStream(certificateChainPem.toByteArray()))
+                .filterIsInstance<X509Certificate>()
+            val leaf = certificates.firstOrNull()
+            val storedPublicKey = KeyStore.getInstance(ANDROID_KEYSTORE)
+                .apply { load(null) }
+                .getCertificate(alias)
+                ?.publicKey
+            leaf != null &&
+                leaf.publicKey.algorithm.equals("RSA", ignoreCase = true) &&
+                storedPublicKey != null &&
+                leaf.publicKey.encoded.contentEquals(storedPublicKey.encoded)
+        }.getOrDefault(false)
+
+    private companion object {
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 }

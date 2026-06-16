@@ -2,6 +2,7 @@ package li.rajeshgo.sm.data.repository
 
 import android.os.Build
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
@@ -9,6 +10,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import li.rajeshgo.sm.data.model.DeviceEnrollmentRequest
 import li.rajeshgo.sm.data.model.DeviceEnrollmentResponse
 import li.rajeshgo.sm.data.remote.HttpClientFactory
+import li.rajeshgo.sm.data.security.CloudflareDeviceCredentialManager
 import li.rajeshgo.sm.data.security.DeviceKeyManager
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
@@ -33,37 +35,48 @@ private data class EnrollmentHttpResponse(
 class DeviceEnrollmentRepository(
     private val settingsRepository: SettingsRepository,
     private val deviceKeyManager: DeviceKeyManager,
+    private val cloudflareCredentialManager: CloudflareDeviceCredentialManager = CloudflareDeviceCredentialManager(),
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
-    private val httpClientFactory = HttpClientFactory(settingsRepository, deviceKeyManager)
+    private val httpClientFactory = HttpClientFactory(settingsRepository)
 
     suspend fun enrollFromQr(qrContents: String): DeviceEnrollmentResult = withContext(Dispatchers.IO) {
         val enrollmentUrl = enrollmentUrlFromQrContents(qrContents)
+        val previousAlias = settingsRepository.cloudflareDeviceCertificateAlias.first().trim()
+        val alias = cloudflareCredentialManager.newCredentialAlias()
         val requestBody = DeviceEnrollmentRequest(
             deviceId = deviceKeyManager.deviceKeyId(),
             deviceName = deviceName(),
-            csrPem = deviceKeyManager.certificateSigningRequestPem(),
+            csrPem = cloudflareCredentialManager.certificateSigningRequestPem(alias, deviceKeyManager.deviceKeyId()),
             publicKeyPem = deviceKeyManager.publicKeyPem(),
         )
-        val requestJson = json.encodeToString(DeviceEnrollmentRequest.serializer(), requestBody)
-        val response = postEnrollmentRequest(enrollmentUrl, requestJson)
-        val body = response.body
-        if (response.statusCode !in 200..299) {
-            throw IllegalStateException(enrollmentErrorMessage(body, response.statusCode))
+        try {
+            val requestJson = json.encodeToString(DeviceEnrollmentRequest.serializer(), requestBody)
+            val response = postEnrollmentRequest(enrollmentUrl, requestJson)
+            val body = response.body
+            if (response.statusCode !in 200..299) {
+                throw IllegalStateException(enrollmentErrorMessage(body, response.statusCode))
+            }
+            val payload = json.decodeFromString(DeviceEnrollmentResponse.serializer(), body)
+            check(payload.deviceId.trim() == requestBody.deviceId) {
+                "Enrollment response device id did not match this device"
+            }
+            check(cloudflareCredentialManager.certificateChainMatchesAlias(payload.certificateChainPem, alias)) {
+                "Enrollment certificate does not match this device credential"
+            }
+            settingsRepository.saveCloudflareDeviceCredential(alias, payload.certificateChainPem)
+            if (previousAlias.isNotBlank() && previousAlias != alias) {
+                cloudflareCredentialManager.deleteCredential(previousAlias)
+            }
+            DeviceEnrollmentResult(
+                deviceId = payload.deviceId,
+                deviceName = payload.deviceName,
+                expiresAt = payload.expiresAt,
+            )
+        } catch (error: Exception) {
+            cloudflareCredentialManager.deleteCredential(alias)
+            throw error
         }
-        val payload = json.decodeFromString(DeviceEnrollmentResponse.serializer(), body)
-        check(payload.deviceId.trim() == requestBody.deviceId) {
-            "Enrollment response device id did not match this device"
-        }
-        check(deviceKeyManager.certificateChainMatchesDeviceKey(payload.certificateChainPem)) {
-            "Enrollment certificate does not match this device key"
-        }
-        settingsRepository.saveCloudflareDeviceCertificateChainPem(payload.certificateChainPem)
-        DeviceEnrollmentResult(
-            deviceId = payload.deviceId,
-            deviceName = payload.deviceName,
-            expiresAt = payload.expiresAt,
-        )
     }
 
     private suspend fun postEnrollmentRequest(enrollmentUrl: String, requestJson: String): EnrollmentHttpResponse {

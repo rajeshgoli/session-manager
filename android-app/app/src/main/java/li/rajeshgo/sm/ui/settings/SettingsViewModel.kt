@@ -14,6 +14,7 @@ import li.rajeshgo.sm.data.repository.AvailableAppUpdate
 import li.rajeshgo.sm.data.repository.DeviceEnrollmentRepository
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
+import li.rajeshgo.sm.data.security.CloudflareDeviceCredentialManager
 import li.rajeshgo.sm.data.security.DeviceKeyManager
 
 data class SettingsUiState(
@@ -26,7 +27,6 @@ data class SettingsUiState(
     val availableUpdate: AvailableAppUpdate? = null,
     val mobileDeviceKeyId: String = "",
     val mobileDevicePublicKey: String = "",
-    val mobileDeviceCertificateSigningRequest: String = "",
     val cloudflareDeviceCertificateConfigured: Boolean = false,
     val cloudflareEnrollmentInProgress: Boolean = false,
     val cloudflareEnrollmentStatus: String? = null,
@@ -42,6 +42,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val sessionRepository = SessionManagerRepository(settingsRepository)
     private val appUpdateRepository = AppUpdateRepository(application, settingsRepository)
     private val deviceKeyManager = DeviceKeyManager()
+    private val cloudflareCredentialManager = CloudflareDeviceCredentialManager()
     private val deviceEnrollmentRepository = DeviceEnrollmentRepository(settingsRepository, deviceKeyManager)
 
     private val _uiState = MutableStateFlow(SettingsUiState())
@@ -87,16 +88,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun loadMobileDeviceKey() {
         runCatching {
-            Triple(
-                deviceKeyManager.deviceKeyId(),
-                deviceKeyManager.publicKeyPem(),
-                deviceKeyManager.certificateSigningRequestPem(),
-            )
-        }.onSuccess { (keyId, publicKey, certificateSigningRequest) ->
+            deviceKeyManager.deviceKeyId() to deviceKeyManager.publicKeyPem()
+        }.onSuccess { (keyId, publicKey) ->
             _uiState.value = _uiState.value.copy(
                 mobileDeviceKeyId = keyId,
                 mobileDevicePublicKey = publicKey,
-                mobileDeviceCertificateSigningRequest = certificateSigningRequest,
                 mobileDeviceKeyError = null,
             )
         }.onFailure { error ->
@@ -144,7 +140,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun clearCloudflareDeviceCertificateChain() {
         viewModelScope.launch {
-            settingsRepository.clearCloudflareDeviceCertificateChainPem()
+            val alias = settingsRepository.cloudflareDeviceCertificateAlias.first()
+            cloudflareCredentialManager.deleteCredential(alias)
+            settingsRepository.clearCloudflareDeviceCredential()
             _uiState.value = _uiState.value.copy(
                 cloudflareDeviceCertificateConfigured = false,
                 cloudflareEnrollmentStatus = "Client certificate cleared",
