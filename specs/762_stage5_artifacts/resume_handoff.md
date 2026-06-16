@@ -1,7 +1,7 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-14 after PR #1012 Android Camera-app
-enrollment flow.
+Status: handoff snapshot from 2026-06-16 after PR #1035 Android artifact auth
+fix and the post-#1035 evidence refresh.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,9 +11,9 @@ coverage in
 
 ## Current Repository State
 
-- Branch: `main` after PR #1012.
-- Latest merged commit before this docs refresh: `5fbbfa4` (`Merge pull
-  request #1012`)
+- Branch: `main` after PR #1035.
+- Latest merged commit before this docs refresh: `1f85ce9` (`Merge pull
+  request #1035`)
 - Open PRs at handoff: none before this docs refresh PR.
 - Dirty worktree at handoff: only pre-existing untracked
   `.claude/settings.local.json`, `certs/`, `data/`, and the local
@@ -64,7 +64,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1012.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1035.
 - [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
   records the current Cloudflare Access origin-gate behavior and remaining
   operator setup/smoke evidence.
@@ -166,9 +166,15 @@ Merged Rust slices cover:
 - PR #1025 implemented Rust native Google device auth success, including Google
   JWKS verification, mobile Access actor binding, public-edge gating, and
   zero-skew token temporal checks.
-- PR #1026 is the post-#1025 smoke evidence slice; the first run records one
+- PR #1027 is the post-#1025 smoke evidence slice; the first run records one
   mobile Access-denial boundary pass and the missing proof inputs blocking full
   smoke.
+- PR #1029 clarified the post-#1025 smoke input status.
+- PR #1031 made Android enrollment use a separate RSA mTLS credential.
+- PR #1033 made Android Cloudflare mTLS use a software RSA key with protected
+  local storage.
+- PR #1035 allowed Android app artifacts to be read with cert-gated app auth
+  while preserving Cloudflare edge and session-auth fallbacks.
 - Current contract manifest size:
   - `134` checks total
   - `73` `python_and_rust`
@@ -245,39 +251,47 @@ post-#984 manifest:
   skipped;
 - Rust mutating fixture contracts: `35` passed, `0` failed, `0` skipped.
 
-PRs #986-#1012 added more cutover tooling and evidence gates after this focused
+PRs #986-#1035 added more cutover tooling and evidence gates after this focused
 run, including node restore fixtures, stopped-origin final backup, rehearsal
 final-backup integration, the Cloudflare Access mobile smoke runner, Rust
-mobile-device enrollment, Cloudflare mTLS CA automation, and Android Camera-app
-enrollment. Run a fresh full rehearsal once Cloudflare/mobile smoke inputs are
-available and Python-origin availability is stable.
+mobile-device enrollment, Cloudflare mTLS CA automation, Android Camera-app
+enrollment, Android mTLS fixes, native device auth, and app artifact auth
+fixes. The latest post-#1035 rehearsal below is the current evidence snapshot.
 
-The latest post-#942 full rehearsal attempts are blocked, not cutover evidence:
+The latest post-#1035 full rehearsal attempts are blocked, not cutover evidence:
 
 ```bash
-.local/rust-mvp-rehearsals/20260613T020040Z-after-942-mobile-shadow/mvp-rehearsal-report.json
-.local/rust-mvp-rehearsals/20260613T020731Z-after-942-mobile-shadow-rerun/mvp-rehearsal-report.json
+.local/rust-mvp-rehearsals/20260616T215701Z-post-1035/mvp-rehearsal-report.json
+.local/rust-mvp-rehearsals/20260616T220122Z-post-1035/mvp-rehearsal-report.json
+.local/rust-mvp-rehearsals/20260616T221117Z-post-1035/mvp-rehearsal-report.json
 ```
 
-The second run is the clearer current snapshot. It started with Python `/health`
-passing, and the state/Rust-side gates passed:
+The first run exposed a contract-harness limit: live `/client/sessions`
+responses were valid JSON but exceeded the old 64 KiB default read budget, so
+the harness truncated the body before JSON assertions. This refresh raises the
+default contract HTTP read budget and adds a regression test for large JSON
+responses.
 
-- state ownership gate: `17` stores checked, `13` copied, `13` verified, `13`
+The latest run is the clearer current snapshot. It started with Python
+`/health` passing, and the state/Rust-side gates passed:
+
+- state ownership gate: `17` stores checked, `14` copied, `14` verified, `14`
   restored, freeze/drain ledger written;
 - Rust live core sidecar contracts: `17` passed, `0` failed, `0` skipped;
-- Rust synthetic read-only fixture contracts: `10` passed, `0` failed, `0`
+- Rust synthetic read-only fixture contracts: `14` passed, `0` failed, `0`
   skipped;
-- Rust mutating fixture contracts: `30` passed, `0` failed, `0` skipped;
-- Rust baseline: passed, `20.172 MiB` RSS and `6.891 MiB` physical footprint.
+- Rust mutating fixture contracts: `37` passed, `0` failed, `0` skipped;
+- Rust baseline: passed, `19.359 MiB` RSS and `8.125 MiB` physical footprint.
 
 The same run blocked because the Python authoritative service stopped accepting
 connections during `python_baseline`, after the first health probe. The
 `shadow_mobile_path_resolution` step therefore skipped with connection refused,
 and `shadow_read_summary` failed all `9` requested read probes. Launchd logs
 around the run show the Python watchdog reporting an event-loop freeze and
-killing the process for restart. Do not treat the post-#942 rehearsal as a clean
-MVP cutover artifact until Python-origin availability is stable for the
-baseline/shadow steps.
+killing the process for restart; after that, port `8420` stopped accepting
+connections. Do not treat the post-#1035 rehearsal as a clean MVP cutover
+artifact until Python-origin availability is stable for the baseline/shadow
+steps.
 
 ## Live Observation
 
@@ -326,8 +340,10 @@ No newer clean full passive shadow or full Cloudflare/mobile smoke artifact has
 been recorded in this handoff. PR #1012 published Android artifact `cbb61798`
 (`versionCode=1013`, `versionName=0.1.0-enroll-ui-cleanup`) and operator
 testing confirmed the app reached "Client certificate saved" after Camera-app
-deep-link enrollment, but the full Access smoke runner and sustained shadow
-window still need recorded artifacts.
+deep-link enrollment. After PR #1035, operator testing also confirmed Android
+app update artifact access works through the certificate-gated app path. The
+full Access smoke runner and sustained shadow window still need recorded
+artifacts.
 
 The broad live Rust contract run now uses the fixture filter:
 

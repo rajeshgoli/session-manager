@@ -1,15 +1,15 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #1025 Rust native Google device auth
-success.
+Status: implementation snapshot after PR #1035 Android artifact auth fix.
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
-post-#984 focused rehearsal proves state gates, live core contracts, read-only
-fixtures, and mutating fixtures on isolated sidecars, but intentionally skips
-Python baseline and shadow. PRs #986-#1025 added node restore fixtures,
-stopped-origin final backup gates, rehearsal final-backup integration,
-Cloudflare Access smoke evidence tooling, Rust mobile-device enrollment,
-Cloudflare mTLS CA automation, the Android Camera-app enrollment handoff, and
-Rust native Google device-auth bearer issuance. Public cutover still needs full
+post-#1035 rehearsal proves state gates, live core contracts, read-only
+fixtures, mutating fixtures, and Rust baseline on isolated sidecars, but blocks
+on Python-origin availability during Python baseline and shadow. PRs #986-#1035
+added node restore fixtures, stopped-origin final backup gates, rehearsal
+final-backup integration, Cloudflare Access smoke evidence tooling, Rust
+mobile-device enrollment, Cloudflare mTLS CA automation, the Android Camera-app
+enrollment handoff, and Rust native Google device-auth bearer issuance, plus
+Android mTLS and artifact read fixes. Public cutover still needs full
 Cloudflare policy/proof inputs, real mobile/browser smoke evidence, and a
 stable Python-authoritative shadow window.
 
@@ -107,7 +107,11 @@ not change retained or removed scope. Binding scope remains
 | #1012 | Android Camera-app QR handoff, `sm-enroll://enroll` deep link, direct in-app credential save, and no camera permission/manual cert UI |
 | #1023 | Block unported `/auth/device/google` shadow successes until Rust can issue native device bearers |
 | #1025 | Rust native Google device-auth success with Google JWKS verification, mobile Access actor binding, public-edge gate, and zero-skew token temporal checks |
-| #1026 | Post-#1025 smoke evidence slice; first blocked run records the mobile Access-denial boundary and missing proof inputs |
+| #1027 | Post-#1025 mobile auth smoke boundary evidence; records mobile Access denial and missing proof inputs |
+| #1029 | Clarify post-#1025 smoke input status |
+| #1031 | Android enrollment uses separate RSA mTLS credentials |
+| #1033 | Android Cloudflare mTLS uses a software RSA key with protected local storage |
+| #1035 | Android app artifacts can be read with cert-gated app auth while preserving edge/session fallbacks |
 
 ## Implemented Capability Groups
 
@@ -197,7 +201,7 @@ fixture false failures:
 The skipped checks are mutating checks without `--include-mutating`, which is
 the expected safety behavior for a live-state read run.
 
-Current executable manifest size after PR #1012:
+Current executable manifest size after PR #1035:
 
 | Metric | Count |
 | --- | ---: |
@@ -207,7 +211,7 @@ Current executable manifest size after PR #1012:
 | Read-only checks | 93 |
 | Mutating checks | 41 |
 
-The latest focused isolated-sidecar rehearsal for the current fixture set is:
+The latest focused isolated-sidecar rehearsal before the post-#1035 run is:
 
 ```bash
 /tmp/session-manager-pr981-rehearsal-ports/mvp-rehearsal-report.json
@@ -226,10 +230,8 @@ on port `8421`. Results:
 | Rust mutating fixture contracts | 35 passed, 0 failed, 0 skipped |
 
 This is not a full cutover rehearsal because it skips Python baseline and
-shadow. It remains the current best fixture/state-gate evidence for the
-post-#984 contract set; PRs #986-#996 added additional tooling/evidence gates
-that still need a fresh full rehearsal once Cloudflare/mobile inputs are
-available and Python-origin availability is stable.
+shadow. It remains useful historical fixture/state-gate evidence for the
+post-#984 contract set; newer post-#1035 evidence is below.
 
 ## Latest Real-State Rehearsal
 
@@ -276,37 +278,42 @@ Measured baseline snapshot from the same run:
 | `GET /sessions` median | 25.746 ms | 7.972 ms |
 | `GET /client/sessions` median | 58.486 ms | 7.946 ms |
 
-## Latest Post-942 Rehearsal Attempt
+## Latest Post-1035 Rehearsal Attempt
 
 Reports:
 
-- `.local/rust-mvp-rehearsals/20260613T020040Z-after-942-mobile-shadow/mvp-rehearsal-report.json`
-- `.local/rust-mvp-rehearsals/20260613T020731Z-after-942-mobile-shadow-rerun/mvp-rehearsal-report.json`
+- `.local/rust-mvp-rehearsals/20260616T215701Z-post-1035/mvp-rehearsal-report.json`
+- `.local/rust-mvp-rehearsals/20260616T220122Z-post-1035/mvp-rehearsal-report.json`
+- `.local/rust-mvp-rehearsals/20260616T221117Z-post-1035/mvp-rehearsal-report.json`
 
-The rerun is the current snapshot:
+The latest run is the current snapshot. It includes the contract harness fix
+that raised the default HTTP read budget above the old 64 KiB limit; before that
+fix, live `/client/sessions` responses were valid JSON but the harness truncated
+them before JSON assertion checks.
 
 | Area | Result |
 | --- | --- |
 | Overall status | Blocked with 2 blockers |
 | Python health | Passed at start |
-| State ownership gate | Passed: 17 stores checked, 13 existing, 13 copied, 13 verified, 13 restored, freeze/drain ledger written |
-| Rust sidecar health | Passed using existing sidecar |
+| State ownership gate | Passed: 17 stores checked, 14 existing, 14 copied, 14 verified, 14 restored, freeze/drain ledger written |
+| Rust sidecar health | Passed using fresh sidecar |
 | Isolated runtime smoke | Passed |
 | Rust live core sidecar contracts | 17 passed, 0 failed, 0 skipped |
-| Rust synthetic read-only fixture contracts | 10 passed, 0 failed, 0 skipped |
-| Rust mutating fixture contracts | 30 passed, 0 failed, 0 skipped |
+| Rust synthetic read-only fixture contracts | 14 passed, 0 failed, 0 skipped |
+| Rust mutating fixture contracts | 37 passed, 0 failed, 0 skipped |
 | Gap probes | 0 failed |
 | Python baseline | Failed: Python origin refused connections after the first health probe |
-| Rust baseline | Passed: 20.172 MiB RSS, 6.891 MiB physical footprint |
+| Rust baseline | Passed: 19.359 MiB RSS, 8.125 MiB physical footprint |
 | Mobile shadow path resolution | Skipped: Python `/sessions` was unavailable |
 | Shadow read summary | Failed: 9 requested read probes failed with connection refused |
 
 This is not a Rust contract regression: the Rust/state/fixture portions passed.
 The blocker is Python-authoritative origin availability during the baseline and
-shadow steps. Launchd logs around both runs show the Python watchdog reporting
-an event-loop freeze and killing the process for restart. The next clean
-cutover-evidence run needs Python to remain up through baseline and shadow,
-including the new mobile read probes from PR #942.
+shadow steps. Logs around the latest run show the Python watchdog reporting an
+event-loop freeze and killing the process for restart; after the kill, port
+`8420` stopped accepting connections. The next clean cutover-evidence run needs
+Python to remain up through baseline and shadow, including the mobile read
+probes from PR #942.
 
 ## Near-Term Remaining Work
 
