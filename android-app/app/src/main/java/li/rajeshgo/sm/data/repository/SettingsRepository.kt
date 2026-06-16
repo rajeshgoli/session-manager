@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
 import li.rajeshgo.sm.data.security.CloudflareDeviceCredentialManager
+import li.rajeshgo.sm.data.security.CloudflareDevicePrivateKeyProtector
 import li.rajeshgo.sm.util.LocalDefaults
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -17,7 +18,10 @@ import java.security.cert.X509Certificate
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "session_manager_android")
 
-class SettingsRepository(private val context: Context) {
+class SettingsRepository(
+    private val context: Context,
+    private val cloudflarePrivateKeyProtector: CloudflareDevicePrivateKeyProtector = CloudflareDevicePrivateKeyProtector(),
+) {
     private object Keys {
         val SERVER_URL = stringPreferencesKey("server_url")
         val ACCESS_TOKEN = stringPreferencesKey("access_token")
@@ -26,7 +30,9 @@ class SettingsRepository(private val context: Context) {
         val EXPIRES_AT = stringPreferencesKey("expires_at")
         val CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS = stringPreferencesKey("cloudflare_device_certificate_alias")
         val CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM = stringPreferencesKey("cloudflare_device_certificate_chain_pem")
-        val CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("cloudflare_device_private_key_pkcs8")
+        val LEGACY_CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("cloudflare_device_private_key_pkcs8")
+        val CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8_WRAPPED =
+            stringPreferencesKey("cloudflare_device_private_key_pkcs8_wrapped")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
     }
 
@@ -63,7 +69,7 @@ class SettingsRepository(private val context: Context) {
     val hasCloudflareDeviceCertificate: Flow<Boolean> = context.dataStore.data.map { prefs ->
         val alias = prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS]?.trim().orEmpty()
         val certificateChainPem = prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM]?.trim().orEmpty()
-        val privateKeyPkcs8 = prefs[Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
+        val privateKeyPkcs8 = cloudflareDevicePrivateKeyPkcs8FromPrefs(prefs)
         hasUsableCloudflareDeviceCredential(alias, certificateChainPem, privateKeyPkcs8)
     }
 
@@ -86,14 +92,27 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    suspend fun cloudflareDevicePrivateKeyPkcs8(): String =
-        context.dataStore.data.first()[Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
+    suspend fun cloudflareDevicePrivateKeyPkcs8(): String {
+        val prefs = context.dataStore.data.first()
+        val privateKeyPkcs8 = cloudflareDevicePrivateKeyPkcs8FromPrefs(prefs)
+        val legacyPrivateKeyPkcs8 = prefs[Keys.LEGACY_CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
+        if (privateKeyPkcs8.isNotBlank() && legacyPrivateKeyPkcs8.isNotBlank()) {
+            context.dataStore.edit { updatedPrefs ->
+                updatedPrefs[Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8_WRAPPED] =
+                    cloudflarePrivateKeyProtector.protect(privateKeyPkcs8)
+                updatedPrefs.remove(Keys.LEGACY_CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8)
+            }
+        }
+        return privateKeyPkcs8
+    }
 
     suspend fun saveCloudflareDeviceCredential(alias: String, certificateChainPem: String, privateKeyPkcs8: String) {
         context.dataStore.edit { prefs ->
             prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS] = alias.trim()
             prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM] = certificateChainPem.trim()
-            prefs[Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8] = privateKeyPkcs8.trim()
+            prefs[Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8_WRAPPED] =
+                cloudflarePrivateKeyProtector.protect(privateKeyPkcs8)
+            prefs.remove(Keys.LEGACY_CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8)
         }
     }
 
@@ -101,8 +120,24 @@ class SettingsRepository(private val context: Context) {
         context.dataStore.edit { prefs ->
             prefs.remove(Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS)
             prefs.remove(Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM)
-            prefs.remove(Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8)
+            prefs.remove(Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8_WRAPPED)
+            prefs.remove(Keys.LEGACY_CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8)
         }
+    }
+
+    suspend fun clearIncompleteCloudflareDeviceCredential(): String? {
+        var removedAlias: String? = null
+        context.dataStore.edit { prefs ->
+            val alias = prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS]?.trim().orEmpty()
+            val certificateChainPem = prefs[Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM]?.trim().orEmpty()
+            val privateKey = storedCloudflarePrivateKey(prefs)
+            if ((alias.isNotBlank() || certificateChainPem.isNotBlank()) && privateKey.isBlank()) {
+                removedAlias = alias.takeIf { it.isNotBlank() }
+                prefs.remove(Keys.CLOUDFLARE_DEVICE_CERTIFICATE_ALIAS)
+                prefs.remove(Keys.CLOUDFLARE_DEVICE_CERTIFICATE_CHAIN_PEM)
+            }
+        }
+        return removedAlias
     }
 
     suspend fun saveDismissedUpdateArtifactHash(artifactHash: String) {
@@ -143,4 +178,15 @@ class SettingsRepository(private val context: Context) {
                 leaf.publicKey.algorithm.equals("RSA", ignoreCase = true) &&
                 CloudflareDeviceCredentialManager().certificateChainMatchesPrivateKey(certificateChainPem, privateKeyPkcs8)
         }.getOrDefault(false)
+
+    private fun cloudflareDevicePrivateKeyPkcs8FromPrefs(prefs: Preferences): String {
+        val storedPrivateKey = storedCloudflarePrivateKey(prefs)
+        return cloudflarePrivateKeyProtector.unprotect(storedPrivateKey).orEmpty()
+    }
+
+    private fun storedCloudflarePrivateKey(prefs: Preferences): String =
+        prefs[Keys.CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8_WRAPPED]?.trim().orEmpty()
+            .ifBlank {
+                prefs[Keys.LEGACY_CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
+            }
 }

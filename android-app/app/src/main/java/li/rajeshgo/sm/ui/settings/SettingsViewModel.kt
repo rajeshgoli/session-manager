@@ -50,6 +50,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     init {
         viewModelScope.launch {
+            settingsRepository.clearIncompleteCloudflareDeviceCredential()?.let { staleAlias ->
+                cloudflareCredentialManager.deleteCredential(staleAlias)
+            }
             _uiState.value = _uiState.value.copy(
                 serverUrl = settingsRepository.serverUrl.first(),
                 userEmail = settingsRepository.userEmail.first(),
