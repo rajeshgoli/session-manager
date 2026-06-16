@@ -7,12 +7,15 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import java.io.ByteArrayInputStream
 import java.net.Socket
+import java.security.KeyFactory
 import java.security.KeyStore
 import java.security.Principal
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import java.security.spec.PKCS8EncodedKeySpec
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLEngine
@@ -55,11 +58,16 @@ class HttpClientFactory(
             ?.first()
             ?.trim()
             .orEmpty()
-        if (certificateAlias.isNotBlank() && certificateChainPem.isNotBlank()) {
+        val privateKeyPkcs8 = settingsRepository
+            ?.cloudflareDevicePrivateKeyPkcs8()
+            ?.trim()
+            .orEmpty()
+        if (certificateAlias.isNotBlank() && certificateChainPem.isNotBlank() && privateKeyPkcs8.isNotBlank()) {
             runCatching {
                 loadClientCertificate(
                     alias = certificateAlias,
                     certificateChainPem = certificateChainPem,
+                    privateKeyPkcs8 = privateKeyPkcs8,
                 )
             }
                 .onSuccess { sslConfig ->
@@ -78,14 +86,13 @@ class HttpClientFactory(
     private fun loadClientCertificate(
         alias: String,
         certificateChainPem: String,
+        privateKeyPkcs8: String,
     ): Pair<SSLSocketFactory, X509TrustManager>? {
         val certificateChain = decodeCertificates(certificateChainPem)
         if (certificateChain.isEmpty()) {
             return null
         }
-        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        val privateKey = runCatching { keyStore.getKey(alias, null) as? PrivateKey }.getOrNull()
-            ?: return null
+        val privateKey = decodePrivateKey(privateKeyPkcs8) ?: return null
 
         val keyManager = SingleAliasKeyManager(
             alias = alias,
@@ -118,9 +125,14 @@ class HttpClientFactory(
             .filterIsInstance<X509Certificate>()
     }
 
+    private fun decodePrivateKey(privateKeyPkcs8: String): PrivateKey? =
+        runCatching {
+            val keyBytes = Base64.getDecoder().decode(privateKeyPkcs8.trim())
+            KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(keyBytes))
+        }.getOrNull()
+
     private companion object {
         const val TAG = "HttpClientFactory"
-        const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 
     private class SingleAliasKeyManager(
