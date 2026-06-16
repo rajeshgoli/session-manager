@@ -168,9 +168,8 @@ Access JWTs, public-edge HMAC secret, or SM bearer/cookie needed for success
 checks. Summary: `1` passed, `5` blocked, `7` skipped. This is partial boundary
 evidence only, not full mobile auth smoke evidence.
 
-The local shell used for this refresh did not have the Cloudflare/mobile smoke
-secret inputs set, and the hostnames still need to be supplied with the runner
-flags:
+The local shell used for the post-#1025 smoke run did not have the
+Cloudflare/mobile proof inputs set. The hostnames were supplied:
 
 | Input | Status |
 | --- | --- |
@@ -179,13 +178,12 @@ flags:
 | `SM_PUBLIC_EDGE_SECRET` | unset |
 | `SM_DEVICE_BEARER_TOKEN` | unset |
 | `SM_COOKIE` | unset |
-| `--mobile-host` | not supplied in this refresh |
-| `--browser-host` | not supplied in this refresh |
+| `--mobile-host` | `sm-app.rajeshgo.li` |
+| `--browser-host` | `sm.rajeshgo.li` |
 
 Run the Cloudflare Access smoke runner after secret inputs are supplied through
-environment variables or secret files and hostnames are supplied with
-`--mobile-host` / `--browser-host`. Missing required mobile inputs are blockers
-by design and should not be recorded as passing evidence.
+environment variables or secret files. Missing required mobile inputs are
+blockers by design and should not be recorded as passing evidence.
 
 The fixture-filtered broad live Rust contract run now passes without synthetic
 fixture false failures:
