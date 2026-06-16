@@ -1967,13 +1967,7 @@ async fn get_latest_app_artifact(
     Path(app_name): Path<String>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email(&state.config, &request).as_deref(),
-    )?;
+    ensure_app_artifact_read_allowed(&state, &request)?;
     if !valid_app_name(&app_name) {
         return Err(ApiError::NotFound("Artifact not found"));
     }
@@ -2001,13 +1995,7 @@ async fn get_hashed_app_artifact(
     Path((app_name, artifact_file)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email(&state.config, &request).as_deref(),
-    )?;
+    ensure_app_artifact_read_allowed(&state, &request)?;
     let Some(artifact_hash) = artifact_file.strip_suffix(".apk") else {
         return Err(ApiError::NotFound("Artifact not found"));
     };
@@ -2043,13 +2031,7 @@ async fn get_app_artifact_metadata(
     Path(app_name): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email(&state.config, &request).as_deref(),
-    )?;
+    ensure_app_artifact_read_allowed(&state, &request)?;
     if !valid_app_name(&app_name) {
         return Err(ApiError::NotFound("Artifact metadata not found"));
     }
@@ -2063,13 +2045,7 @@ async fn get_legacy_apk_download(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email(&state.config, &request).as_deref(),
-    )?;
+    ensure_app_artifact_read_allowed(&state, &request)?;
     Ok((
         StatusCode::FOUND,
         [(LOCATION, "/apps/session-manager-android/latest.apk")],
@@ -7820,6 +7796,42 @@ fn ensure_mobile_cloudflare_access_device_enrolled_for_user(
     Ok(())
 }
 
+fn ensure_app_artifact_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
+    if request_cloudflare_access_application(state, request)
+        == Some(CloudflareAccessApplication::MobileApp)
+    {
+        ensure_mobile_cloudflare_access_for_request(state, request)?;
+        ensure_public_edge_assertion_for_request(state, request)?;
+        return Ok(());
+    }
+    ensure_session_read_allowed(state, request)?;
+    if cloudflare_access_has_enabled_app(&state.config.cloudflare_access)
+        && !state.config.google_auth.requested()
+        && !is_request_local_bypass(state, request)
+    {
+        return Err(cloudflare_access_required_application(Some(
+            CloudflareAccessApplication::MobileApp,
+        )));
+    }
+    ensure_public_edge_assertion_for_request(state, request)
+}
+
+fn request_cloudflare_access_application(
+    state: &AppState,
+    request: &Request,
+) -> Option<CloudflareAccessApplication> {
+    let hostname = request_hostname(request.headers())?;
+    cloudflare_access_application_for_host(&state.config.cloudflare_access, &hostname)
+}
+
+fn is_request_local_bypass(state: &AppState, request: &Request) -> bool {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    is_local_bypass_request(request.headers(), peer_addr, &state.config)
+}
+
 fn mobile_cloudflare_access_device_enrolled_for_user(
     state: &AppState,
     user_id: &str,
@@ -10448,6 +10460,18 @@ mod tests {
         }
     }
 
+    fn test_session_cookie(secret: &str, payload: Value) -> String {
+        let payload_b64 = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+        let timestamp_b64 =
+            URL_SAFE_NO_PAD.encode(OffsetDateTime::now_utc().unix_timestamp().to_be_bytes());
+        let value = format!("{payload_b64}.{timestamp_b64}");
+        let mut mac =
+            Hmac::<Sha1>::new_from_slice(&itsdangerous_django_concat_key(secret)).unwrap();
+        mac.update(value.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{value}.{signature}")
+    }
+
     fn syntactic_access_token_with_kid(kid: &str) -> String {
         let header = json!({
             "alg": "RS256",
@@ -11099,6 +11123,240 @@ mod tests {
                 "{uri}"
             );
         }
+
+        for request in [
+            public_request_with_host(
+                Method::GET,
+                "/apps/session-manager-android/meta.json",
+                Body::empty(),
+                "unmapped.example.com",
+            ),
+            public_request_without_host(
+                Method::GET,
+                "/apps/session-manager-android/meta.json",
+                Body::empty(),
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            let (status, body) = response_json(response).await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(
+                body["detail"],
+                "Cloudflare Access mobile app assertion is required",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_allows_app_artifacts_with_device_assertion_without_bearer() {
+        let artifact_root = env::temp_dir().join(format!(
+            "sm-rust-app-artifact-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        let app_dir = artifact_root.join("session-manager-android");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(app_dir.join("deadbeef.apk"), b"fixture apk").unwrap();
+        fs::write(
+            app_dir.join("meta.json"),
+            serde_json::to_vec(&json!({
+                "artifact_hash": "deadbeef",
+                "size_bytes": 11,
+                "uploaded_at": "2026-06-16T00:00:00Z",
+                "uploaded_by": "test",
+                "version_code": 1034,
+                "version_name": "0.1.2"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.app_artifacts.root_dir = artifact_root.display().to_string();
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+
+        let mut metadata_request = public_request_with_host(
+            Method::GET,
+            "/apps/session-manager-android/meta.json",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        metadata_request.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            test_mobile_access_assertion("test-device").parse().unwrap(),
+        );
+        let metadata_response = app.clone().oneshot(metadata_request).await.unwrap();
+        let (status, body) = response_json(metadata_response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["artifact_hash"], "deadbeef");
+        assert_eq!(body["version_code"], 1034);
+
+        let mut apk_request = public_request_with_host(
+            Method::GET,
+            "/apps/session-manager-android/deadbeef.apk",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        apk_request.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            test_mobile_access_assertion("test-device").parse().unwrap(),
+        );
+        let apk_response = app.oneshot(apk_request).await.unwrap();
+        assert_eq!(apk_response.status(), StatusCode::OK);
+        let apk_bytes = to_bytes(apk_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&apk_bytes[..], b"fixture apk");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_access_app_artifacts_preserve_public_edge_gate_when_enabled() {
+        let artifact_root = env::temp_dir().join(format!(
+            "sm-rust-app-artifact-edge-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        let app_dir = artifact_root.join("session-manager-android");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("meta.json"),
+            serde_json::to_vec(&json!({
+                "artifact_hash": "deadbeef",
+                "size_bytes": 11,
+                "uploaded_at": "2026-06-16T00:00:00Z",
+                "uploaded_by": "test",
+                "version_code": 1034,
+                "version_name": "0.1.2"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.public_edge = public_edge_config().public_edge;
+        config.app_artifacts.root_dir = artifact_root.display().to_string();
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+
+        let mut cert_only = public_request_with_host(
+            Method::GET,
+            "/apps/session-manager-android/meta.json",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        cert_only.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            test_mobile_access_assertion("test-device").parse().unwrap(),
+        );
+        let cert_only_response = app.clone().oneshot(cert_only).await.unwrap();
+        let (status, body) = response_json(cert_only_response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["detail"], "Public edge assertion is required");
+
+        let mut edge_proven = public_request_with_host(
+            Method::GET,
+            "/apps/session-manager-android/meta.json",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        edge_proven.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            test_mobile_access_assertion("test-device").parse().unwrap(),
+        );
+        add_public_edge_headers(
+            &mut edge_proven,
+            "edge-secret",
+            "GET",
+            "/apps/session-manager-android/meta.json",
+            "artifact-nonce",
+        );
+        let edge_proven_response = app.oneshot(edge_proven).await.unwrap();
+        let (status, body) = response_json(edge_proven_response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["artifact_hash"], "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn app_artifacts_preserve_public_edge_gate_for_session_auth_fallback() {
+        let artifact_root = env::temp_dir().join(format!(
+            "sm-rust-app-artifact-session-edge-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        let app_dir = artifact_root.join("session-manager-android");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("meta.json"),
+            serde_json::to_vec(&json!({
+                "artifact_hash": "deadbeef",
+                "size_bytes": 11,
+                "uploaded_at": "2026-06-16T00:00:00Z",
+                "uploaded_by": "test",
+                "version_code": 1034,
+                "version_name": "0.1.2"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.public_edge = public_edge_config().public_edge;
+        config.app_artifacts.root_dir = artifact_root.display().to_string();
+        let app = router(AppState::new(config));
+        let cookie = test_session_cookie(
+            "session-cookie-secret",
+            json!({
+                "google_authenticated": true,
+                "google_email": "rajeshgoli@gmail.com",
+                "google_name": "Rajesh"
+            }),
+        );
+
+        let mut session_only = public_request_with_host(
+            Method::GET,
+            "/apps/session-manager-android/meta.json",
+            Body::empty(),
+            "sm.example.com",
+        );
+        session_only.headers_mut().insert(
+            COOKIE,
+            format!("{SESSION_COOKIE_NAME}={cookie}").parse().unwrap(),
+        );
+        let session_only_response = app.clone().oneshot(session_only).await.unwrap();
+        let (status, body) = response_json(session_only_response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["detail"], "Public edge assertion is required");
+
+        let mut edge_proven = public_request_with_host(
+            Method::GET,
+            "/apps/session-manager-android/meta.json",
+            Body::empty(),
+            "sm.example.com",
+        );
+        edge_proven.headers_mut().insert(
+            COOKIE,
+            format!("{SESSION_COOKIE_NAME}={cookie}").parse().unwrap(),
+        );
+        add_public_edge_headers(
+            &mut edge_proven,
+            "edge-secret",
+            "GET",
+            "/apps/session-manager-android/meta.json",
+            "session-artifact-nonce",
+        );
+        let edge_proven_response = app.oneshot(edge_proven).await.unwrap();
+        let (status, body) = response_json(edge_proven_response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["artifact_hash"], "deadbeef");
     }
 
     #[tokio::test]

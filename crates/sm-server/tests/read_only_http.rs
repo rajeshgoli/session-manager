@@ -1793,8 +1793,23 @@ async fn app_artifact_upload_rejects_encoded_whitespace_app_name() {
 }
 
 #[tokio::test]
-async fn app_artifacts_reject_public_unauthenticated_access_when_auth_enabled() {
+async fn app_artifact_upload_rejects_public_unauthenticated_access_when_auth_enabled() {
     let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts-auth");
+    let artifact_dir = artifact_root.join("session-manager-android");
+    fs::create_dir_all(&artifact_dir).unwrap();
+    fs::write(
+        artifact_dir.join("meta.json"),
+        json!({
+            "artifact_hash": "deadbeef",
+            "size_bytes": 3,
+            "uploaded_at": "2026-06-16T00:00:00Z",
+            "uploaded_by": "test",
+            "version_code": 1034,
+            "version_name": "0.1.2",
+        })
+        .to_string(),
+    )
+    .unwrap();
     let state_file = unique_temp_path();
     fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
     let app = router(AppState::new(AppConfig {
