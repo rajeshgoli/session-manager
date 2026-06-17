@@ -1,20 +1,24 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #1039 accelerated Rust canary evidence
-mode, with issue #1040 adding Rust service cutover tooling/runbook.
+Status: implementation snapshot after PR #1041 Rust service cutover tooling was
+merged and used for the first Rust canary flip on 2026-06-17. Issue #1042 adds
+the public tunnel preflight that verifies `sm-app.rajeshgo.li` routes directly
+to the launchd-managed Rust service and legacy `sm.rajeshgo.li` does not route
+to origin.
+
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
 post-#1035 rehearsal proves state gates, live core contracts, read-only
 fixtures, mutating fixtures, and Rust baseline on isolated sidecars, but blocks
-on Python-origin availability during Python baseline and shadow. PRs #986-#1039
+on Python-origin availability during Python baseline and shadow. PRs #986-#1041
 added node restore fixtures, stopped-origin final backup gates, rehearsal
 final-backup integration, Cloudflare Access smoke evidence tooling, Rust
 mobile-device enrollment, Cloudflare mTLS CA automation, the Android Camera-app
-enrollment handoff, and Rust native Google device-auth bearer issuance, plus
-Android mTLS, artifact read fixes, and a larger live HTTP read budget. Public
-cutover still needs full Cloudflare policy/proof inputs and real mobile/browser
-smoke evidence. A stable Python-authoritative shadow window is preferred, but
-the explicit accelerated canary path may replace it when Python availability is
-the unstable component.
+enrollment handoff, Rust native Google device-auth bearer issuance, Android
+mTLS, artifact read fixes, a larger live HTTP read budget, accelerated Rust
+canary evidence mode, and reviewed launchd/service cutover tooling. The first
+live cutover stopped the Python launchd label, copied a stopped-origin final
+backup, started Rust on `127.0.0.1:8420`, enabled Rust core writes, verified the
+Android app path, and removed the legacy public tunnel route.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -117,7 +121,8 @@ not change retained or removed scope. Binding scope remains
 | #1035 | Android app artifacts can be read with cert-gated app auth while preserving edge/session fallbacks |
 | #1037 | Contract harness HTTP reads default to a larger budget for live `/client/sessions` payloads |
 | #1039 | Accelerated Rust canary evidence mode for Python-origin instability |
-| issue #1040 | Rust service launchd cutover tooling and first-canary runbook |
+| #1041 | Rust service launchd cutover tooling and first-canary runbook |
+| issue #1042 | Public tunnel preflight for the protected app hostname and legacy-host absence |
 
 ## Implemented Capability Groups
 
@@ -135,15 +140,31 @@ The Rust sidecar now has executable coverage for:
 | External fallback | Email/human fallback delivery and inbound email validation path are retained in the Rust track. |
 | Queue and nodes | Queue list/detail, CLI list/status, pending submit, simple execute/cancel, queue recovery, queue fixtures, node reads, and node HTTP routes are implemented; remaining work is final live/recovery cutover evidence and any retained node-agent remote-control gaps. |
 
-## Current Live Shadow And Contract State
+## Current Live Cutover And Contract State
 
-Live Python-authoritative Rust shadow mode is active in the local config:
+Rust is now the live local service owner:
 
-- Python origin: `:8420`;
-- Rust sidecar: `127.0.0.1:8421`;
-- shadow ledger: `~/.local/share/claude-sessions/rust_shadow.jsonl`;
-- config backup created by the activation helper:
-  `config.yaml.shadow-backup-20260612T023248Z`.
+- Rust launchd label: `com.rajeshgoli.session-manager-rust`;
+- Rust origin: `127.0.0.1:8420`;
+- final stopped-origin backup:
+  `.local/rust-final-backup-20260617T033653Z`;
+- protected app hostname: `sm-app.rajeshgo.li`;
+- legacy public hostname: `sm.rajeshgo.li` returns 404 from the tunnel and does
+  not route to origin;
+- local cloudflared ingress should route `sm-app.rajeshgo.li` directly to
+  `http://127.0.0.1:8420`, with a final `http_status:404` catch-all.
+
+The old Python-authoritative shadow mode remains historical evidence only. The
+manual `127.0.0.1:8421` sidecar is not part of the live target after the public
+tunnel is repointed to the launchd-managed Rust service.
+
+Validate the live tunnel shape with:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.public_tunnel_preflight \
+  --config .local/android-parity/cloudflared/config-http-only.yml \
+  --fail-on-blockers
+```
 
 The latest clean passive shadow report after #996 used
 `--last-minutes 30 --fail-on-blockers --json` and returned:

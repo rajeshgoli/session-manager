@@ -99,6 +99,47 @@ The helper writes:
 - stdout: `logs/rust-launchd.out.log`
 - stderr: `logs/rust-launchd.err.log`
 
+## Protected Public Tunnel
+
+After Rust owns `127.0.0.1:8420`, the Cloudflare tunnel should forward the
+protected app hostname directly to that launchd-managed Rust service. Do not
+leave `sm-app.rajeshgo.li` pointed at a manually started `8421` sidecar, and do
+not leave legacy `sm.rajeshgo.li` routed to origin.
+
+Validate the local cloudflared ingress shape:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.public_tunnel_preflight \
+  --config .local/android-parity/cloudflared/config-http-only.yml \
+  --fail-on-blockers
+```
+
+Expected post-cutover shape:
+
+```yaml
+ingress:
+  - hostname: sm-app.rajeshgo.li
+    service: http://127.0.0.1:8420
+  - service: http_status:404
+```
+
+Then validate cloudflared syntax and restart the tunnel:
+
+```bash
+cloudflared tunnel --config .local/android-parity/cloudflared/config-http-only.yml ingress validate
+launchctl kickstart -k gui/$(id -u)/com.rajesh.sm-android-tunnel
+```
+
+Public unauthenticated probes should show Cloudflare Access on the app host and
+no origin route on the legacy host:
+
+```bash
+curl -sS -o /tmp/sm-app-health-public.txt -w 'sm-app %{http_code}\n' https://sm-app.rajeshgo.li/health
+curl -sS -o /tmp/sm-legacy-health-public.txt -w 'legacy %{http_code}\n' https://sm.rajeshgo.li/health
+```
+
+Expected: `sm-app 403` from Cloudflare Access and `legacy 404`.
+
 ## First 15-Minute Smoke Checklist
 
 Run these immediately after Rust is listening:
