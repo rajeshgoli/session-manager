@@ -1,11 +1,11 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #1037 contract harness read-budget fix,
-with issue #1038 adding an accelerated Rust canary evidence path.
+Status: implementation snapshot after PR #1039 accelerated Rust canary evidence
+mode, with issue #1040 adding Rust service cutover tooling/runbook.
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
 post-#1035 rehearsal proves state gates, live core contracts, read-only
 fixtures, mutating fixtures, and Rust baseline on isolated sidecars, but blocks
-on Python-origin availability during Python baseline and shadow. PRs #986-#1037
+on Python-origin availability during Python baseline and shadow. PRs #986-#1039
 added node restore fixtures, stopped-origin final backup gates, rehearsal
 final-backup integration, Cloudflare Access smoke evidence tooling, Rust
 mobile-device enrollment, Cloudflare mTLS CA automation, the Android Camera-app
@@ -116,7 +116,8 @@ not change retained or removed scope. Binding scope remains
 | #1033 | Android Cloudflare mTLS uses a software RSA key with protected local storage |
 | #1035 | Android app artifacts can be read with cert-gated app auth while preserving edge/session fallbacks |
 | #1037 | Contract harness HTTP reads default to a larger budget for live `/client/sessions` payloads |
-| issue #1038 | Accelerated Rust canary evidence mode for Python-origin instability |
+| #1039 | Accelerated Rust canary evidence mode for Python-origin instability |
+| issue #1040 | Rust service launchd cutover tooling and first-canary runbook |
 
 ## Implemented Capability Groups
 
