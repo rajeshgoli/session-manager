@@ -1049,6 +1049,117 @@ impl SessionStore {
         Ok(registration)
     }
 
+    pub fn update_session_metadata(
+        &self,
+        session_id: &str,
+        request: UpdateSessionMetadataRequest,
+        reserved_human_names: &BTreeSet<String>,
+    ) -> Result<SessionMetadataOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        recover_missing_maintainer_registration_raw(&mut state)?;
+        prune_agent_registrations_raw(&mut state)?;
+
+        let snapshot = snapshot_from_raw_value(&state)?;
+        if !snapshot
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            return Ok(SessionMetadataOutcome::NotFound);
+        }
+        let primary_alias = snapshot
+            .alias_map()
+            .get(session_id)
+            .and_then(|aliases| aliases.iter().next().cloned());
+        if let Some(friendly_name) = request.friendly_name.as_deref() {
+            if let Some(error) = validate_friendly_name_update_raw(
+                &state,
+                session_id,
+                friendly_name,
+                &primary_alias,
+                reserved_human_names,
+            )? {
+                return Ok(SessionMetadataOutcome::BadRequest(error));
+            }
+        }
+
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        for candidate in sessions.iter_mut() {
+            let Some(candidate) = candidate.as_object_mut() else {
+                continue;
+            };
+            let is_target = candidate.get("id").and_then(Value::as_str) == Some(session_id);
+            if is_target {
+                if let Some(friendly_name) = request.friendly_name.as_deref() {
+                    candidate.insert(
+                        "friendly_name".to_owned(),
+                        Value::String(friendly_name.to_owned()),
+                    );
+                    candidate.insert("friendly_name_is_explicit".to_owned(), Value::Bool(true));
+                    candidate.insert(
+                        "friendly_name_updated_at_ns".to_owned(),
+                        Value::Number(serde_json::Number::from(now_unix_timestamp_nanos())),
+                    );
+                }
+                if let Some(is_em) = request.is_em {
+                    candidate.insert("is_em".to_owned(), Value::Bool(is_em));
+                    if is_em {
+                        candidate.insert("role".to_owned(), Value::String("em".to_owned()));
+                    } else if json_text(candidate.get("role")).as_deref() == Some("em") {
+                        candidate.insert("role".to_owned(), Value::Null);
+                    }
+                }
+            } else if request.is_em == Some(true)
+                && candidate.get("is_em").and_then(Value::as_bool) == Some(true)
+            {
+                candidate.insert("is_em".to_owned(), Value::Bool(false));
+                if json_text(candidate.get("role")).as_deref() == Some("em") {
+                    candidate.insert("role".to_owned(), Value::Null);
+                }
+            }
+        }
+
+        self.write_raw_json_value(&state)?;
+        let session = snapshot_from_raw_value(&state)?
+            .into_sessions()
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| anyhow::anyhow!("updated session {session_id} was not readable"))?;
+        Ok(SessionMetadataOutcome::Updated(session))
+    }
+
+    pub fn queue_provider_native_rename(
+        &self,
+        session: &SessionRecord,
+        friendly_name: &str,
+    ) -> Result<bool> {
+        if !is_safe_provider_native_rename_name(friendly_name)
+            || session.is_stopped()
+            || !matches!(session.provider.as_str(), "claude" | "codex-fork")
+            || session.tmux_session.trim().is_empty()
+        {
+            return Ok(false);
+        }
+        let Some(queue) = &self.queue_store else {
+            if session.native_title.as_deref().map(str::trim) == Some(friendly_name) {
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        queue.cancel_pending_messages_for_target_category(&session.id, "native_rename")?;
+        if session.native_title.as_deref().map(str::trim) == Some(friendly_name) {
+            return Ok(true);
+        }
+        queue.enqueue_message(
+            &session.id,
+            &format!("/rename {friendly_name}"),
+            "sequential",
+            Some("native_rename"),
+        )?;
+        Ok(true)
+    }
+
     pub fn register_agent_role(
         &self,
         session_id: &str,
@@ -2359,6 +2470,14 @@ pub struct RoleRegistrationRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct UpdateSessionMetadataRequest {
+    #[serde(default)]
+    pub friendly_name: Option<String>,
+    #[serde(default)]
+    pub is_em: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TaskCompleteRequest {
     pub requester_session_id: String,
 }
@@ -2571,6 +2690,13 @@ pub enum RegistryMutationOutcome {
 
 #[derive(Debug, Clone)]
 pub enum MaintainerMutationOutcome {
+    Updated(SessionRecord),
+    NotFound,
+    BadRequest(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionMetadataOutcome {
     Updated(SessionRecord),
     NotFound,
     BadRequest(String),
@@ -3212,6 +3338,54 @@ fn deliver_urgent_runtime_text_to_session_raw(
     Ok((status, delivered))
 }
 
+fn deliver_runtime_native_rename_to_session_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<(String, bool)> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let session = session_object_mut(sessions, session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    if normalized_status(&status) == "stopped" {
+        return Ok((status, false));
+    }
+    let Some(friendly_name) = extract_provider_native_rename_name(text) else {
+        return Ok((status, false));
+    };
+    let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+    let delivered = if provider.eq_ignore_ascii_case("codex-fork") {
+        match codex_fork_control_socket_path_for_session_raw(session_id, session, runtime).and_then(
+            |control_socket_path| codex_fork_set_thread_name(&control_socket_path, &friendly_name),
+        ) {
+            Ok(()) => {
+                clear_codex_fork_control_degraded_raw(session);
+                true
+            }
+            Err(error) => {
+                mark_codex_fork_control_degraded_raw(session, &error.to_string());
+                false
+            }
+        }
+    } else if provider.eq_ignore_ascii_case("claude") {
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        runtime
+            .for_socket_name(session_socket_name.as_deref())
+            .send_input(&tmux_session, &format!("/rename {friendly_name}"))?
+    } else {
+        false
+    };
+    if delivered {
+        session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
+    }
+    Ok((status, delivered))
+}
+
 fn deliver_codex_fork_control_text_to_session_raw(
     session_id: &str,
     session: &mut Map<String, Value>,
@@ -3291,6 +3465,35 @@ fn codex_fork_submit_message(control_socket_path: &Path, text: &str) -> Result<(
     ensure_codex_fork_response_ok(&response, "control command failed")
 }
 
+fn codex_fork_set_thread_name(control_socket_path: &Path, friendly_name: &str) -> Result<()> {
+    if !control_socket_path.exists() {
+        return Err(anyhow::anyhow!(
+            "control socket not found: {}",
+            control_socket_path.display()
+        ));
+    }
+
+    let mut epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+    let mut response = codex_fork_send_control_command_payload(
+        control_socket_path,
+        "set_thread_name",
+        &epoch,
+        json!({ "name": friendly_name }),
+    )?;
+    if !codex_fork_response_ok(&response)
+        && codex_fork_error_code(&response).as_deref() == Some("stale_epoch")
+    {
+        epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+        response = codex_fork_send_control_command_payload(
+            control_socket_path,
+            "set_thread_name",
+            &epoch,
+            json!({ "name": friendly_name }),
+        )?;
+    }
+    ensure_codex_fork_response_ok(&response, "control command failed")
+}
+
 fn codex_fork_refresh_control_epoch(control_socket_path: &Path) -> Result<String> {
     let request = json!({
         "request_id": codex_fork_control_request_id(),
@@ -3309,13 +3512,36 @@ fn codex_fork_send_control_command(
     expected_epoch: &str,
     message: &str,
 ) -> Result<Value> {
-    let request = json!({
-        "request_id": codex_fork_control_request_id(),
-        "expected_epoch": expected_epoch,
-        "command": command,
-        "message": message,
-    });
-    codex_fork_control_roundtrip(control_socket_path, &request)
+    codex_fork_send_control_command_payload(
+        control_socket_path,
+        command,
+        expected_epoch,
+        json!({ "message": message }),
+    )
+}
+
+fn codex_fork_send_control_command_payload(
+    control_socket_path: &Path,
+    command: &str,
+    expected_epoch: &str,
+    payload: Value,
+) -> Result<Value> {
+    let mut request = Map::new();
+    request.insert(
+        "request_id".to_owned(),
+        Value::String(codex_fork_control_request_id()),
+    );
+    request.insert(
+        "expected_epoch".to_owned(),
+        Value::String(expected_epoch.to_owned()),
+    );
+    request.insert("command".to_owned(), Value::String(command.to_owned()));
+    if let Some(payload) = payload.as_object() {
+        for (key, value) in payload {
+            request.insert(key.clone(), value.clone());
+        }
+    }
+    codex_fork_control_roundtrip(control_socket_path, &Value::Object(request))
         .with_context(|| "control command failed")
 }
 
@@ -3448,7 +3674,14 @@ fn drain_pending_runtime_messages_raw(
         let mut should_continue = true;
         for message in messages {
             let (next_status, delivered) =
-                if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
+                if message.message_category.as_deref() == Some("native_rename") {
+                    deliver_runtime_native_rename_to_session_raw(
+                        state,
+                        session_id,
+                        &message.text,
+                        runtime,
+                    )?
+                } else if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
                     deliver_urgent_runtime_text_to_session_raw(
                         state,
                         session_id,
@@ -3901,6 +4134,51 @@ fn sync_maintainer_alias_raw(state: &mut Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_friendly_name_update_raw(
+    state: &Value,
+    session_id: &str,
+    friendly_name: &str,
+    primary_alias: &Option<String>,
+    reserved_human_names: &BTreeSet<String>,
+) -> Result<Option<String>> {
+    if let Some(primary_alias) = primary_alias {
+        if friendly_name != primary_alias {
+            return Ok(Some(format!(
+                "Session identity is controlled by registry role \"{primary_alias}\""
+            )));
+        }
+    }
+
+    let normalized_name = normalize_role(friendly_name);
+    let mut reserved_aliases = BTreeSet::from(["maintainer".to_owned()]);
+    for registration in state
+        .get("agent_registrations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(raw_registration_record)
+    {
+        reserved_aliases.insert(registration.role);
+    }
+    if reserved_aliases.contains(&normalized_name)
+        && primary_alias.as_deref() != Some(normalized_name.as_str())
+    {
+        return Ok(Some(format!(
+            "Name \"{friendly_name}\" is reserved for registry identity \"{normalized_name}\""
+        )));
+    }
+    if reserved_human_names.contains(&normalized_name) {
+        return Ok(Some(format!(
+            "Name \"{friendly_name}\" is reserved for configured human recipient \"{normalized_name}\""
+        )));
+    }
+    if session_id.trim().is_empty() {
+        return Ok(Some("Session not found".to_owned()));
+    }
+    Ok(None)
+}
+
 fn recover_missing_maintainer_registration_raw(state: &mut Value) -> Result<bool> {
     if find_raw_registration(state, "maintainer")?.is_some() {
         return Ok(false);
@@ -4215,6 +4493,10 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn now_unix_timestamp_nanos() -> i64 {
+    i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(i64::MAX)
 }
 
 fn now_python_naive_iso() -> String {
@@ -4936,6 +5218,34 @@ fn normalize_role(role: &str) -> String {
         normalized.pop();
     }
     normalized
+}
+
+fn is_safe_provider_native_rename_name(friendly_name: &str) -> bool {
+    !friendly_name.is_empty()
+        && friendly_name.chars().count() <= 32
+        && friendly_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn extract_provider_native_rename_name(text: &str) -> Option<String> {
+    let text = text.trim();
+    let rest = text.strip_prefix("/rename")?;
+    if !rest
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace())
+    {
+        return None;
+    }
+    let friendly_name = rest.trim();
+    if friendly_name.split_whitespace().count() == 1
+        && is_safe_provider_native_rename_name(friendly_name)
+    {
+        Some(friendly_name.to_owned())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

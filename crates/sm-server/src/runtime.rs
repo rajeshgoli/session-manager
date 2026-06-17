@@ -379,6 +379,21 @@ impl TmuxRuntime {
         Ok(true)
     }
 
+    pub fn set_status_bar(&self, tmux_session: &str, friendly_name: &str) -> Result<bool> {
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
+        }
+        let status_left = format!("[{friendly_name}] ");
+        self.run_tmux([
+            "set-option",
+            "-t",
+            tmux_session,
+            "status-left",
+            status_left.as_str(),
+        ])?;
+        Ok(true)
+    }
+
     pub fn session_exists(&self, tmux_session: &str) -> Result<bool> {
         let output = self
             .tmux_command(["has-session", "-t", tmux_session])
@@ -873,6 +888,19 @@ mod tests {
         assert!(command.contains("unset CLAUDECODE"));
         assert!(command.contains("export ENABLE_TOOL_SEARCH=false"));
         assert!(command.ends_with("; claude"));
+    }
+
+    #[test]
+    fn set_status_bar_updates_tmux_status_left() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert!(runtime.set_status_bar("sm-test", "deskbar-name").unwrap());
+
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("has-session -t sm-test"));
+        assert!(log.contains("set-option -t sm-test status-left [deskbar-name]"));
     }
 
     #[test]

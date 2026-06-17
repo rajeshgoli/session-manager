@@ -24,6 +24,8 @@ use sm_server::{
         QueueRunnerConfig, RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
+    runtime::TmuxRuntime,
+    sessions::SessionStore,
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -89,6 +91,18 @@ async fn put_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, 
     json_request_with_headers_and_peer(
         app,
         "PUT",
+        uri,
+        payload,
+        &[],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await
+}
+
+async fn patch_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, Value) {
+    json_request_with_headers_and_peer(
+        app,
+        "PATCH",
         uri,
         payload,
         &[],
@@ -9115,6 +9129,344 @@ async fn fixture_registry_and_maintainer_endpoints_round_trip_state() {
 }
 
 #[tokio::test]
+async fn patch_session_metadata_updates_friendly_name_and_em_state() {
+    let state_file = unique_temp_path();
+    let queue_db = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+            ..SmSendConfig::default()
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    for (session_id, name) in [("rename1", "rename-one"), ("rename2", "rename-two")] {
+        let (status, _payload) = post_json(
+            app.clone(),
+            "/sessions",
+            json!({
+                "id": session_id,
+                "name": name,
+                "working_dir": "/repo",
+                "provider": "claude"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "rename-codex",
+            "name": "rename-codex",
+            "working_dir": "/repo",
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/rename1",
+        json!({
+            "friendly_name": "deskbar-name",
+            "is_em": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "rename1");
+    assert_eq!(payload["friendly_name"], "deskbar-name");
+    assert_eq!(payload["is_em"], true);
+    assert_eq!(payload["role"], "em");
+
+    let queue_conn = Connection::open(&queue_db).unwrap();
+    let queued_message: (String, String, String, String) = queue_conn
+        .query_row(
+            "SELECT target_session_id, text, delivery_mode, message_category FROM message_queue WHERE target_session_id = 'rename1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        queued_message,
+        (
+            "rename1".to_owned(),
+            "/rename deskbar-name".to_owned(),
+            "sequential".to_owned(),
+            "native_rename".to_owned()
+        )
+    );
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/rename-codex",
+        json!({ "friendly_name": "codex-display" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["friendly_name"], "codex-display");
+    let pending_codex_native_renames: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'rename-codex' AND message_category = 'native_rename' AND delivered_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_codex_native_renames, 0);
+
+    let state = fs::read_to_string(&state_file).unwrap();
+    let mut raw: Value = serde_json::from_str(&state).unwrap();
+    let sessions = raw["sessions"].as_array().unwrap();
+    let renamed = sessions
+        .iter()
+        .find(|session| session["id"] == "rename1")
+        .unwrap();
+    assert_eq!(renamed["friendly_name"], "deskbar-name");
+    assert_eq!(renamed["friendly_name_is_explicit"], true);
+    assert!(renamed["friendly_name_updated_at_ns"].as_i64().unwrap() > 0);
+
+    let rename1 = raw["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "rename1")
+        .unwrap();
+    rename1["native_title"] = json!("deskbar-current");
+    fs::write(&state_file, serde_json::to_string(&raw).unwrap()).unwrap();
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/rename1",
+        json!({ "friendly_name": "deskbar-current" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["friendly_name"], "deskbar-current");
+    let pending_native_renames: i64 = queue_conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'rename1' AND message_category = 'native_rename' AND delivered_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_native_renames, 0);
+
+    let (status, payload) =
+        patch_json(app.clone(), "/sessions/rename2", json!({ "is_em": true })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["is_em"], true);
+
+    let (status, payload) = get_json(app.clone(), "/sessions/rename1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["is_em"], false);
+    assert_eq!(payload["role"], Value::Null);
+}
+
+#[tokio::test]
+async fn patch_session_metadata_rejects_invalid_and_reserved_friendly_names() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        human_recipient_reserved_names: vec!["human-owner".to_owned()],
+        ..AppConfig::default()
+    }));
+
+    for (session_id, name) in [
+        ("registryowner", "registry-owner"),
+        ("otherowner", "other-owner"),
+    ] {
+        let (status, _payload) = post_json(
+            app.clone(),
+            "/sessions",
+            json!({
+                "id": session_id,
+                "name": name,
+                "working_dir": "/repo",
+                "provider": "claude"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/registryowner",
+        json!({ "friendly_name": "bad name" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "Invalid name: Name must be alphanumeric with - or _ only (no spaces)"
+    );
+
+    let (status, payload) = put_json(
+        app.clone(),
+        "/sessions/registryowner/maintainer",
+        json!({ "requester_session_id": "registryowner" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["aliases"], json!(["maintainer"]));
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/otherowner",
+        json!({ "friendly_name": "maintainer" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "Name \"maintainer\" is reserved for registry identity \"maintainer\""
+    );
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/registryowner",
+        json!({ "friendly_name": "not-maintainer" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "Session identity is controlled by registry role \"maintainer\""
+    );
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/otherowner",
+        json!({ "friendly_name": "human-owner" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "Name \"human-owner\" is reserved for configured human recipient \"human-owner\""
+    );
+}
+
+#[tokio::test]
+async fn patch_session_metadata_is_em_does_not_load_human_config() {
+    let state_file = unique_temp_path();
+    let bridge_config = unique_temp_path();
+    let log_dir = unique_temp_path();
+    fs::write(&bridge_config, "humans: [").unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        email: EmailConfig {
+            bridge_config: bridge_config.display().to_string(),
+            ..EmailConfig::default()
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "emonly",
+            "name": "em-only",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) =
+        patch_json(app.clone(), "/sessions/emonly", json!({ "is_em": true })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["is_em"], true);
+    assert_eq!(payload["role"], "em");
+}
+
+#[tokio::test]
+async fn shadow_http_predicts_patch_session_metadata_without_writing() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "shadowpatch",
+            "name": "shadow-patch",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/__shadow/http",
+        json!({
+            "request": {
+                "method": "PATCH",
+                "path": "/sessions/shadowpatch"
+            },
+            "python_response": {
+                "status": 200,
+                "body_sha256": "ignored"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["support_status"],
+        "implemented_retained_write_status_only"
+    );
+    assert_eq!(payload["comparison"], "status_match");
+    assert_eq!(payload["would_write"], false);
+
+    let (status, payload) = get_json(app.clone(), "/sessions/shadowpatch").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["friendly_name"], "shadow-patch");
+}
+
+#[tokio::test]
 async fn fixture_registry_prunes_stale_roles_and_updates_maintainer_alias() {
     let state_file = unique_temp_path();
     fs::write(
@@ -12364,6 +12716,49 @@ while true; do sleep 1; done
             retry_submit_request["message"],
             "control socket retry message"
         );
+
+        let rename_requests =
+            spawn_codex_fork_control_socket(control_path.clone(), "epoch-runtimefork-rename");
+        let (status, payload) = patch_json(
+            app.clone(),
+            "/sessions/runtimefork",
+            json!({ "friendly_name": "deskbar-rename" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["friendly_name"], "deskbar-rename");
+        let runtime = TmuxRuntime::from_app_config(&AppConfig {
+            rust_core: RustCoreConfig {
+                runtime_enabled: true,
+                log_dir: Some(log_dir.display().to_string()),
+                tmux_socket_name: Some(tmux_socket.clone()),
+                ..RustCoreConfig::default()
+            },
+            ..AppConfig::default()
+        });
+        SessionStore::new_with_queue(state_file.clone(), queue_db_path.clone())
+            .drain_runtime_pending_messages_for_session("runtimefork", &runtime)
+            .unwrap();
+        let rename_epoch_request = rename_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("codex-fork rename get_epoch request");
+        assert_eq!(rename_epoch_request["command"], "get_epoch");
+        let rename_request = rename_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("codex-fork set_thread_name request");
+        assert_eq!(rename_request["command"], "set_thread_name");
+        assert_eq!(rename_request["expected_epoch"], "epoch-runtimefork-rename");
+        assert_eq!(rename_request["name"], "deskbar-rename");
+        assert!(rename_request.get("message").is_none());
+        let delivered_native_renames: i64 = Connection::open(&queue_db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimefork' AND message_category = 'native_rename' AND delivered_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivered_native_renames, 1);
     }
 
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
@@ -13985,6 +14380,11 @@ fn spawn_codex_fork_control_socket(path: PathBuf, epoch: &'static str) -> mpsc::
                     "result": { "epoch": epoch }
                 }),
                 Some("submit_message") => json!({
+                    "ok": true,
+                    "epoch": epoch,
+                    "result": {}
+                }),
+                Some("set_thread_name") => json!({
                     "ok": true,
                     "epoch": epoch,
                     "result": {}

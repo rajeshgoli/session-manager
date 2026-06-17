@@ -106,10 +106,11 @@ use crate::sessions::{
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
     CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
     MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
-    SendCoreInputBatchRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path, ToolCallRow,
@@ -898,7 +899,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/review", post(spawn_review_session))
         .route("/sessions/context-monitor", get(get_context_monitor_status))
-        .route("/sessions/{session_id}", get(get_session))
+        .route(
+            "/sessions/{session_id}",
+            get(get_session).patch(update_session_metadata),
+        )
         .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
             "/sessions/{parent_session_id}/children",
@@ -3796,6 +3800,24 @@ fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
     }
 }
 
+fn reserved_human_names(config: &AppConfig) -> anyhow::Result<BTreeSet<String>> {
+    let mut names = config
+        .human_recipient_reserved_names
+        .iter()
+        .map(|alias| normalize_role_like_python(alias))
+        .filter(|alias| !alias.is_empty())
+        .collect::<BTreeSet<_>>();
+    names.extend(
+        EmailBridge::load(config)?
+            .list_humans()
+            .into_iter()
+            .flat_map(|human| human.aliases.into_iter())
+            .map(|alias| normalize_role_like_python(&alias))
+            .filter(|alias| !alias.is_empty()),
+    );
+    Ok(names)
+}
+
 async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -3806,6 +3828,55 @@ async fn get_session(
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(SessionResponse::from(session)))
+}
+
+async fn update_session_metadata(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateSessionMetadataRequest>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    if let Some(friendly_name) = payload.friendly_name.as_deref() {
+        validate_requested_friendly_name(friendly_name)?;
+    }
+    let requested_friendly_name = payload.friendly_name.clone();
+    let reserved_human_names = if requested_friendly_name.is_some() {
+        reserved_human_names(&state.config)?
+    } else {
+        BTreeSet::new()
+    };
+    match state.session_store.update_session_metadata(
+        &session_id,
+        payload,
+        &reserved_human_names,
+    )? {
+        SessionMetadataOutcome::Updated(session) => {
+            if let Some(friendly_name) = requested_friendly_name.as_deref() {
+                let _ = state
+                    .session_store
+                    .queue_provider_native_rename(&session, friendly_name);
+                if state.config.rust_core.runtime_enabled && !session.tmux_session.trim().is_empty()
+                {
+                    let runtime = TmuxRuntime::from_app_config(&state.config);
+                    let _ = runtime.set_status_bar(&session.tmux_session, friendly_name);
+                }
+            }
+            Ok(Json(SessionResponse::from(session)))
+        }
+        SessionMetadataOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        SessionMetadataOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+    }
 }
 
 async fn get_client_session(
@@ -6174,6 +6245,28 @@ fn shadow_predict_retained_write(
     method: &str,
     path: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
+    if method == "PATCH" {
+        if let Some(session_id) = path
+            .strip_prefix("/sessions/")
+            .filter(|value| !value.is_empty() && !value.contains('/'))
+        {
+            return match state.session_store.get_session(session_id)? {
+                Some(_) => Ok(Some(ShadowPrediction {
+                    status: StatusCode::OK.as_u16(),
+                    body_sha256: None,
+                    support_status: "implemented_retained_write_status_only",
+                })),
+                None => {
+                    let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+                    Ok(Some(ShadowPrediction {
+                        status: StatusCode::NOT_FOUND.as_u16(),
+                        body_sha256: Some(sha256_hex(&body)),
+                        support_status: "implemented_retained_write",
+                    }))
+                }
+            };
+        }
+    }
     if method == "POST"
         && (path == "/sessions/review" || session_review_path_session_id(path).is_some())
     {
@@ -8759,6 +8852,24 @@ fn validate_requested_friendly_name(name: &str) -> Result<(), ApiError> {
         }),
         None => Ok(()),
     }
+}
+
+fn normalize_role_like_python(role: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_dash = false;
+    for ch in role.trim().chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !normalized.is_empty() {
+            normalized.push('-');
+            last_was_dash = true;
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    normalized
 }
 
 fn is_auth_denial_status(status: u16) -> bool {
