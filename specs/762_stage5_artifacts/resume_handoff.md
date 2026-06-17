@@ -1,20 +1,22 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-16 after PR #1037 contract harness
-read-budget fix, with issue #1038 adding an accelerated Rust canary evidence
-path for Python-origin instability.
+Status: handoff snapshot from 2026-06-16 after PR #1039 accelerated Rust
+canary evidence mode. Issue #1040 adds the reviewed Rust service launchd
+cutover runbook/tooling for the first canary flip.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
 release gates in [gate_matrix.md](gate_matrix.md), and executable contract
 coverage in
 [`scripts/rust_migration/contracts_manifest.json`](../../scripts/rust_migration/contracts_manifest.json).
+Service cutover commands live in
+[rust_service_cutover_runbook.md](rust_service_cutover_runbook.md).
 
 ## Current Repository State
 
-- Branch: `main` after PR #1037.
-- Latest merged commit before this docs refresh: `68adc3b` (`Merge pull
-  request #1037`)
+- Branch: `main` after PR #1039.
+- Latest merged commit before this docs refresh: `c638d10` (`Merge pull
+  request #1039`)
 - Open PRs at handoff: none before this docs refresh PR.
 - Dirty worktree at handoff: only pre-existing untracked
   `.claude/settings.local.json`, `certs/`, `data/`, and the local
@@ -65,7 +67,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1035.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1039.
 - [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
   records the current Cloudflare Access origin-gate behavior and remaining
   operator setup/smoke evidence.
@@ -178,8 +180,10 @@ Merged Rust slices cover:
   while preserving Cloudflare edge and session-auth fallbacks.
 - PR #1037 raised the contract harness default HTTP read budget so large live
   `/client/sessions` JSON responses are not truncated before assertion checks.
-- Issue #1038 adds the accelerated Rust canary evidence mode for the case where
+- PR #1039 adds the accelerated Rust canary evidence mode for the case where
   Python-origin availability prevents sustained baseline/shadow evidence.
+- Issue #1040 adds the Rust service cutover helper and runbook for reviewed
+  launchd ownership transfer.
 - Current contract manifest size:
   - `134` checks total
   - `73` `python_and_rust`
@@ -256,7 +260,7 @@ post-#984 manifest:
   skipped;
 - Rust mutating fixture contracts: `35` passed, `0` failed, `0` skipped.
 
-PRs #986-#1037 added more cutover tooling and evidence gates after this focused
+PRs #986-#1039 added more cutover tooling and evidence gates after this focused
 run, including node restore fixtures, stopped-origin final backup, rehearsal
 final-backup integration, the Cloudflare Access mobile smoke runner, Rust
 mobile-device enrollment, Cloudflare mTLS CA automation, Android Camera-app
@@ -302,7 +306,7 @@ checks plus Rust/state/Cloudflare gates.
 
 ## Accelerated Rust Canary Evidence Path
 
-Issue #1038 adds an explicit path for rotating faster when Python-origin
+PR #1039 adds an explicit path for rotating faster when Python-origin
 availability is the blocker. This is not a silent shadow skip. The report must
 show:
 

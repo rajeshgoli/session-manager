@@ -267,7 +267,7 @@ def test_cloudflare_access_cutover_evidence_pins_policy_and_origin_gates():
         assert required in evidence
 
 
-def test_handoff_and_progress_are_current_through_canary_evidence_issue1038():
+def test_handoff_and_progress_are_current_through_rust_cutover_issue1040():
     progress = (STAGE5_DIR / "mvp_progress.md").read_text(encoding="utf-8")
     handoff = (STAGE5_DIR / "resume_handoff.md").read_text(encoding="utf-8")
     gate_matrix = (STAGE5_DIR / "gate_matrix.md").read_text(encoding="utf-8")
@@ -291,14 +291,16 @@ def test_handoff_and_progress_are_current_through_canary_evidence_issue1038():
         assert "#1025" in text
         assert "#1035" in text
         assert "#1037" in text
-        assert "issue #1038" in text
+        assert "#1039" in text
+        assert "issue #1040" in text.lower()
         assert "Cloudflare Access" in text
         assert "cloudflare_access_cutover_evidence.md" in text
         assert "python_canary_spot_checks" in text
         assert "cloudflare_access_smoke_report" in text
 
-    assert "Latest merged commit before this docs refresh: `68adc3b`" in handoff
-    assert "PR #1037" in handoff
+    assert "Latest merged commit before this docs refresh: `c638d10`" in handoff
+    assert "PR #1039" in handoff
+    assert "rust_service_cutover_runbook.md" in handoff
     assert "Camera-app" in handoff
     assert "deep-link enrollment" in handoff
     assert "app update artifact access works through the certificate-gated app path" in handoff
