@@ -166,6 +166,8 @@ def run_android_emulator_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
         _run_checked([args.adb, "-s", serial, "install", "-r", str(apk_path)])
         _host_step(report, "install_debug_apk", "passed")
+        _run_checked([args.adb, "-s", serial, "shell", "pm", "clear", args.app_id])
+        _host_step(report, "clear_app_data", "passed")
 
         token = build_device_access_token(
             session_cookie_secret=identity["session_cookie_secret"],

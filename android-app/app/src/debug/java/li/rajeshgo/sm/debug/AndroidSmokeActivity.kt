@@ -6,10 +6,14 @@ import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.ClientSession
+import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
 import li.rajeshgo.sm.data.remote.ApiService
 import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.repository.DeviceEnrollmentRepository
@@ -17,11 +21,16 @@ import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.security.DeviceKeyManager
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import retrofit2.Retrofit
 import java.io.File
 import java.time.Instant
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidSmokeActivity : ComponentActivity() {
     private val steps = JSONArray()
@@ -51,6 +60,8 @@ class AndroidSmokeActivity : ComponentActivity() {
         val deviceKeyManager = DeviceKeyManager()
         val sessionRepository = SessionManagerRepository(settingsRepository)
         var sessions: List<ClientSession> = emptyList()
+        var attachSession: ClientSession? = null
+        var attachTicket: MobileAttachTicketResponse? = null
 
         step("configure_settings") {
             settingsRepository.saveServerUrl(serverUrl)
@@ -76,7 +87,7 @@ class AndroidSmokeActivity : ComponentActivity() {
         }
 
         step("client_bootstrap") {
-            val payload = sessionRepository.fetchBootstrap(serverUrl)
+            val payload = retrySmokeRead { sessionRepository.fetchBootstrap(serverUrl) }
             JSONObject()
                 .put("auth_mode", payload.auth.mode)
                 .put("device_auth_endpoint", payload.auth.deviceAuthEndpoint)
@@ -120,6 +131,7 @@ class AndroidSmokeActivity : ComponentActivity() {
                     ?: return@step JSONObject()
                         .put("status_override", "skipped")
                         .put("reason", "no session advertises mobile_terminal.supported")
+                attachSession = supported
                 val path = sessionRepository.mobileAttachTicketPath(
                     baseUrl = serverUrl,
                     sessionId = supported.id,
@@ -134,12 +146,32 @@ class AndroidSmokeActivity : ComponentActivity() {
                 val ticket = sessionRepository
                     .createMobileAttachTicket(serverUrl, accessToken, supported.id, proof)
                     .getOrThrow()
+                attachTicket = ticket
                 JSONObject()
                     .put("session_id", supported.id)
                     .put("ticket_id_present", ticket.ticketId.isNotBlank())
                     .put("device_key_id", ticket.deviceKeyId)
                     .put("ws_url_host", hostFromUrl(ticket.wsUrl))
                     .put("expires_at", ticket.expiresAt)
+            }
+
+            step("mobile_terminal_socket") {
+                val supported = attachSession
+                    ?: return@step JSONObject()
+                        .put("status_override", "skipped")
+                        .put("reason", "mobile attach ticket was skipped")
+                val ticket = attachTicket
+                    ?: return@step JSONObject()
+                        .put("status_override", "skipped")
+                        .put("reason", "mobile attach ticket was not minted")
+                runMobileTerminalSocketSmoke(
+                    sessionRepository = sessionRepository,
+                    ticket = ticket,
+                    accessToken = accessToken,
+                    deviceKeyManager = deviceKeyManager,
+                    session = supported,
+                    actorEmail = userEmail,
+                )
             }
         }
 
@@ -206,6 +238,132 @@ class AndroidSmokeActivity : ComponentActivity() {
             .create(ApiService::class.java)
     }
 
+    private suspend fun <T> retrySmokeRead(block: suspend () -> T): T {
+        var lastError: Throwable? = null
+        repeat(SMOKE_READ_ATTEMPTS) { attempt ->
+            try {
+                return block()
+            } catch (error: Throwable) {
+                lastError = error
+                if (attempt < SMOKE_READ_ATTEMPTS - 1) {
+                    delay(SMOKE_READ_RETRY_DELAY_MS)
+                }
+            }
+        }
+        throw lastError ?: IllegalStateException("smoke read failed")
+    }
+
+    private suspend fun runMobileTerminalSocketSmoke(
+        sessionRepository: SessionManagerRepository,
+        ticket: MobileAttachTicketResponse,
+        accessToken: String,
+        deviceKeyManager: DeviceKeyManager,
+        session: ClientSession,
+        actorEmail: String,
+    ): JSONObject = withTimeout(SOCKET_SMOKE_TIMEOUT_MS) {
+        val completed = AtomicBoolean(false)
+        val result = CompletableDeferred<JSONObject>()
+        var socket: WebSocket? = null
+
+        fun finish(payload: JSONObject) {
+            if (completed.compareAndSet(false, true)) {
+                socket?.close(1000, "android smoke complete")
+                result.complete(payload)
+            }
+        }
+
+        fun fail(error: Throwable) {
+            if (completed.compareAndSet(false, true)) {
+                socket?.close(1000, "android smoke failed")
+                result.completeExceptionally(error)
+            }
+        }
+
+        val wsNonce = UUID.randomUUID().toString()
+        val wsSignature = deviceKeyManager.signWebSocketAuth(
+            ticketId = ticket.ticketId,
+            sessionId = session.id,
+            actorEmail = actorEmail,
+            deviceKeyId = ticket.deviceKeyId,
+            nonce = wsNonce,
+        )
+
+        socket = sessionRepository.openMobileTerminalSocket(
+            ticket = ticket,
+            accessToken = accessToken,
+            listener = object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    val authFrame = JSONObject()
+                        .put("type", "auth")
+                        .put("ticket_id", ticket.ticketId)
+                        .put("ticket_secret", ticket.ticketSecret)
+                        .put("device_key_id", ticket.deviceKeyId)
+                        .put("nonce", wsNonce)
+                        .put("signature", wsSignature)
+                    webSocket.send(authFrame.toString())
+                    webSocket.send(
+                        JSONObject()
+                            .put("type", "resize")
+                            .put("cols", 80)
+                            .put("rows", 24)
+                            .toString(),
+                    )
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val payload = runCatching { JSONObject(text) }.getOrNull() ?: return
+                    when (payload.optString("type")) {
+                        "status" -> finish(
+                            JSONObject()
+                                .put("session_id", session.id)
+                                .put("ws_url_host", hostFromUrl(ticket.wsUrl))
+                                .put("first_frame_type", "status")
+                                .put("state", payload.optString("state")),
+                        )
+                        "output" -> finish(
+                            JSONObject()
+                                .put("session_id", session.id)
+                                .put("ws_url_host", hostFromUrl(ticket.wsUrl))
+                                .put("first_frame_type", "output")
+                                .put("encoding", payload.optString("encoding"))
+                                .put("mode", payload.optString("mode"))
+                                .put("data_present", payload.optString("data").isNotBlank()),
+                        )
+                        "error" -> fail(
+                            IllegalStateException(
+                                payload.optString("message", "terminal socket returned error"),
+                            ),
+                        )
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    val detail = buildString {
+                        response?.let {
+                            append(it.message.ifBlank { "HTTP error" })
+                            append(" (")
+                            append(it.code)
+                            append("): ")
+                        }
+                        append(t.message ?: "Terminal socket failed")
+                    }
+                    fail(IllegalStateException(detail, t))
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    fail(IllegalStateException("Terminal socket closed before output ($code): $reason"))
+                }
+            },
+        )
+        try {
+            result.await()
+        } finally {
+            if (!completed.get()) {
+                socket?.close(1000, "android smoke cancelled")
+            }
+        }
+    }
+
     private fun requiredExtra(name: String, defaultValue: String? = null): String {
         val value = intent.getStringExtra(name)?.trim().orEmpty()
         if (value.isNotEmpty()) {
@@ -221,5 +379,8 @@ class AndroidSmokeActivity : ComponentActivity() {
         const val TAG = "SM_ADB_SMOKE"
         const val DEFAULT_REPORT_FILE = "android-smoke-report.json"
         const val MAX_DETAIL_CHARS = 500
+        const val SOCKET_SMOKE_TIMEOUT_MS = 10_000L
+        const val SMOKE_READ_ATTEMPTS = 6
+        const val SMOKE_READ_RETRY_DELAY_MS = 1_000L
     }
 }
