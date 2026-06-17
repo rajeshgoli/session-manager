@@ -4,7 +4,8 @@ Status: implementation snapshot after PR #1041 Rust service cutover tooling was
 merged and used for the first Rust canary flip on 2026-06-17. Issue #1042 adds
 the public tunnel preflight that verifies `sm-app.rajeshgo.li` routes directly
 to the launchd-managed Rust service and legacy `sm.rajeshgo.li` does not route
-to origin.
+to origin. Issue #1044 adds a non-mutating live canary report for the
+post-cutover Rust service.
 
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
 post-#1035 rehearsal proves state gates, live core contracts, read-only
@@ -123,6 +124,7 @@ not change retained or removed scope. Binding scope remains
 | #1039 | Accelerated Rust canary evidence mode for Python-origin instability |
 | #1041 | Rust service launchd cutover tooling and first-canary runbook |
 | issue #1042 | Public tunnel preflight for the protected app hostname and legacy-host absence |
+| issue #1044 | Live Rust canary evidence collector for launchd/local/public-tunnel post-cutover checks |
 
 ## Implemented Capability Groups
 
@@ -130,7 +132,7 @@ The Rust sidecar now has executable coverage for:
 
 | Group | Current state |
 | --- | --- |
-| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, stopped-origin final backup, freeze/drain evidence gates, Cloudflare Access smoke evidence runner, mobile-aware shadow observation gates, and accelerated Rust canary evidence mode exist. |
+| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, stopped-origin final backup, freeze/drain evidence gates, Cloudflare Access smoke evidence runner, mobile-aware shadow observation gates, accelerated Rust canary evidence mode, public tunnel preflight, and live Rust canary report exist. |
 | Retired-surface checks | Retired public/watch/summary/remind/job-watch/queue-policy checks are represented as Rust-target absence or denial fixtures. |
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent and retained review-route slices are merged, with shadow and contract fixtures covering the early cutover path. |
@@ -149,8 +151,8 @@ Rust is now the live local service owner:
 - final stopped-origin backup:
   `.local/rust-final-backup-20260617T033653Z`;
 - protected app hostname: `sm-app.rajeshgo.li`;
-- legacy public hostname: `sm.rajeshgo.li` returns 404 from the tunnel and does
-  not route to origin;
+- legacy public hostname: `sm.rajeshgo.li` returns a Cloudflare denial or tunnel
+  404 and does not route to origin;
 - local cloudflared ingress should route `sm-app.rajeshgo.li` directly to
   `http://127.0.0.1:8420`, with a final `http_status:404` catch-all.
 
@@ -165,6 +167,29 @@ Validate the live tunnel shape with:
   --config .local/android-parity/cloudflared/config-http-only.yml \
   --fail-on-blockers
 ```
+
+Collect the live Rust canary evidence bundle with:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.live_canary_report \
+  --output .local/rust-mvp-rehearsals/live-canary-$(date -u +%Y%m%dT%H%M%SZ).json \
+  --fail-on-blockers
+```
+
+The report is intentionally non-mutating. It records the Rust launchd label,
+local Rust health/bootstrap/session/analytics reads, `sm status`, the public
+tunnel preflight, unauthenticated `sm-app` Cloudflare Access denial, legacy
+public-host absence, and optional Cloudflare/mobile smoke evidence.
+
+Current live canary artifact:
+
+```text
+.local/rust-mvp-rehearsals/live-canary-20260617T192700Z.json
+```
+
+Summary: `10` passed, `0` blocked, `1` skipped. The skipped check is the
+optional supplied Cloudflare/mobile smoke report; all launchd, local Rust,
+tunnel, and public unauthenticated denial checks passed.
 
 The latest clean passive shadow report after #996 used
 `--last-minutes 30 --fail-on-blockers --json` and returned:
@@ -390,13 +415,13 @@ These are the next practical buckets before an MVP cutover trial:
 
 | Bucket | Why it remains |
 | --- | --- |
-| Shadow/canary observation window | Python-authoritative shadow mode is enabled and a short clean window has been recorded, but mobile gates from PR #942 still need real app/operator traffic. Prefer a longer agreed shadow window when Python stays healthy; otherwise use `--rust-canary-cutover` with Python spot checks plus Rust/state/Cloudflare gates and triage any blockers before Rust becomes the writer. |
+| Shadow/canary observation window | Python-authoritative shadow mode is now historical because Rust owns the live port. The live Rust canary report passes for launchd/local/tunnel/public-denial checks; remaining work is bounded app/operator smoke and any targeted comparison needed for specific bugs. If Python is restarted for comparison, use it only for targeted checks rather than broad hardening. |
 | Full fixture manifest execution | The MVP rehearsal now runs the current synthetic read-only and mutating fixture sets, including review-route fixtures. Remaining work is final live mobile/device fixture evidence and any additional retained fixture rows added by later slices. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
 | State ownership and migration tooling | Initial preflight, backup, restore, and freeze/drain evidence tools are merged and exercised by the rehearsal. Remaining work is live write-admission freeze/journal ownership and rollback accounting from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
 | Cloudflare Access deployment integration | Pair the merged Rust origin gate with the actual Cloudflare Access apps, mTLS/service-auth policies, device Common Name enrollment/revocation, app-host native auth smoke, browser OAuth smoke, and later node fallback tests. Current evidence lives in [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md). |
 | Node and queue writer completion | Basic node HTTP routes and narrow queue writer/recovery are implemented. Remaining work is final live/recovery cutover evidence, audit/rollback accounting, and any retained node-agent remote-control gaps. |
-| Service packaging and rollback | Exercise launchd/service cutover, non-destructive port ownership, health checks, rollback, and operator diagnostics. |
+| Service packaging and rollback | Launchd/service cutover has been exercised for the first Rust canary. Remaining work is continued live canary evidence, rollback rehearsal if needed, and operator diagnostics. |
 | Final native mobile smoke | Run bootstrap/session/attach/request-status/analytics/bug-report/app-artifact smoke checks against Rust using real mobile assumptions. |
 | Python-origin availability during evidence runs | Post-#1035 full rehearsal is blocked because Python watchdog-restarted during baseline/shadow. This does not call for broad Python hardening. Either collect the normal stable Python-authoritative window, or use the accelerated Rust canary evidence path with spot checks and Cloudflare/mobile smoke. |
 

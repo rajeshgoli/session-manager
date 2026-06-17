@@ -103,6 +103,22 @@ The default gate expects:
 This command only parses local YAML and prints evidence. It does not mutate
 Cloudflare account state or tunnel credentials.
 
+After Rust owns the live service port, collect the non-mutating live canary
+evidence bundle:
+
+```bash
+python -m scripts.rust_migration.live_canary_report \
+  --output .local/rust-mvp-rehearsals/live-canary-$(date -u +%Y%m%dT%H%M%SZ).json \
+  --fail-on-blockers
+```
+
+The report records launchd ownership, local Rust health/bootstrap/session and
+analytics reads, `sm status` against the live Rust origin, local cloudflared
+ingress shape, unauthenticated public `sm-app` Cloudflare Access denial, legacy
+public-host absence, and an optional supplied Cloudflare/mobile smoke report.
+It performs no writes and is intended as post-cutover evidence, not as a
+replacement for the state backup/freeze/rollback gates.
+
 Audit the retained/retired CLI cutover scope without running commands:
 
 ```bash
