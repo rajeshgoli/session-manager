@@ -8732,6 +8732,8 @@ async fn fixture_completion_endpoints_preserve_python_compatible_state() {
         .find(|session| session["id"] == "child001")
         .unwrap();
     assert!(child["agent_task_completed_at"].is_string());
+    assert_eq!(child["agent_status_text"], Value::Null);
+    assert_eq!(child["agent_status_at"], Value::Null);
     assert_eq!(
         state["retained_remind_registrations"][0]["is_active"],
         false
@@ -8768,6 +8770,26 @@ async fn fixture_completion_endpoints_preserve_python_compatible_state() {
             "important".to_owned()
         )
     );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child001/input",
+        json!({
+            "text": "follow-up work after completion",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "child001")
+        .unwrap();
+    assert_eq!(child["agent_task_completed_at"], Value::Null);
 
     let state_file = write_completion_fixture();
     let mut config = config_with_state_file_and_queue(&state_file);

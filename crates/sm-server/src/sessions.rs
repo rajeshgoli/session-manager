@@ -92,6 +92,25 @@ impl SessionStore {
         status_filter: Option<&str>,
         include_terminated: bool,
     ) -> Result<Vec<ChildSessionResponse>> {
+        Ok(self
+            .list_child_records(
+                parent_session_id,
+                recursive,
+                status_filter,
+                include_terminated,
+            )?
+            .into_iter()
+            .map(ChildSessionResponse::from)
+            .collect())
+    }
+
+    pub fn list_child_records(
+        &self,
+        parent_session_id: &str,
+        recursive: bool,
+        status_filter: Option<&str>,
+        include_terminated: bool,
+    ) -> Result<Vec<SessionRecord>> {
         let all_sessions = self.load_snapshot()?.into_sessions();
         let mut children = if recursive {
             let mut descendants = Vec::new();
@@ -122,10 +141,7 @@ impl SessionStore {
             children.retain(|session| session.completion_status.as_deref() != Some("killed"));
         }
 
-        Ok(children
-            .into_iter()
-            .map(ChildSessionResponse::from)
-            .collect())
+        Ok(children)
     }
 
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
@@ -296,7 +312,7 @@ impl SessionStore {
         let delivered = normalized_status(&status) != "stopped";
         if delivered {
             let now = now_rfc3339();
-            session.insert("last_activity".to_owned(), Value::String(now));
+            mark_session_followup_activity(session, &now);
             if let Some(log_file) = json_text(session.get("log_file")) {
                 append_log_line(&expand_home(&log_file), &request.text)?;
                 if let Some(seconds) = request.notify_after_seconds {
@@ -1509,6 +1525,8 @@ impl SessionStore {
             "agent_task_completed_at".to_owned(),
             Value::String(completed_at.clone()),
         );
+        session_object.insert("agent_status_text".to_owned(), Value::Null);
+        session_object.insert("agent_status_at".to_owned(), Value::Null);
 
         let mut em_notified = false;
         if let Some(em_session_id) = em_session_id {
@@ -3283,7 +3301,7 @@ fn deliver_runtime_text_to_session_raw(
         }
         let now = now_rfc3339();
         if delivered {
-            session.insert("last_activity".to_owned(), Value::String(now));
+            mark_session_followup_activity(session, &now);
         } else {
             status = "stopped".to_owned();
             session.insert("status".to_owned(), Value::String(status.clone()));
@@ -3327,7 +3345,7 @@ fn deliver_urgent_runtime_text_to_session_raw(
         }
         let now = now_rfc3339();
         if delivered {
-            session.insert("last_activity".to_owned(), Value::String(now));
+            mark_session_followup_activity(session, &now);
         } else {
             status = "stopped".to_owned();
             session.insert("status".to_owned(), Value::String(status.clone()));
@@ -4299,13 +4317,14 @@ fn agent_registration_response(
     created_at: Option<&str>,
 ) -> AgentRegistrationResponse {
     let status = normalized_status(&session.status);
+    let activity_state = projected_activity_state(session, status);
     AgentRegistrationResponse {
         role: normalize_role(role),
         session_id: session.id.clone(),
         friendly_name: session.cached_display_name(),
         provider: Some(non_empty_or(session.provider.clone(), "claude")),
         status: status.to_owned(),
-        activity_state: fallback_activity_state(status),
+        activity_state,
         created_at: created_at
             .map(ToOwned::to_owned)
             .unwrap_or_else(now_rfc3339),
@@ -4368,6 +4387,11 @@ fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     session.insert("completed_at".to_owned(), Value::Null);
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
     mark_review_dispatch_completed(session, now);
+}
+
+fn mark_session_followup_activity(session: &mut Map<String, Value>, now: &str) {
+    session.insert("agent_task_completed_at".to_owned(), Value::Null);
+    session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
 }
 
 fn mark_session_killed(session: &mut Map<String, Value>, now: &str) {
@@ -4954,6 +4978,7 @@ impl From<SessionRecord> for SessionResponse {
         let friendly_name = session.cached_display_name();
         let is_maintainer = session.aliases.iter().any(|alias| alias == "maintainer");
         let telegram_thread_id = session.resolved_telegram_thread_id();
+        let activity_state = projected_activity_state(&session, status);
         Self {
             id: session.id,
             name: session.name,
@@ -4985,7 +5010,7 @@ impl From<SessionRecord> for SessionResponse {
             agent_task_completed_at: session.agent_task_completed_at,
             is_em: session.is_em,
             role: session.role,
-            activity_state: fallback_activity_state(status),
+            activity_state,
             last_tool_call: session.last_tool_call,
             last_tool_name: session.last_tool_name,
             last_action_summary: None,
@@ -4996,6 +5021,12 @@ impl From<SessionRecord> for SessionResponse {
             aliases: session.aliases,
             is_maintainer,
         }
+    }
+}
+
+impl SessionResponse {
+    pub fn set_activity_state(&mut self, activity_state: impl Into<String>) {
+        self.activity_state = activity_state.into();
     }
 }
 
@@ -5027,12 +5058,13 @@ impl From<SessionRecord> for ChildSessionResponse {
             .spawned_at
             .clone()
             .or(Some(session.created_at.clone()));
+        let activity_state = projected_activity_state(&session, &status);
         Self {
             id: session.id,
             name: session.name,
             friendly_name,
             status: status.clone(),
-            activity_state: fallback_activity_state(&status),
+            activity_state,
             completion_status: session.completion_status,
             completion_message: session.completion_message,
             last_activity: session.last_activity,
@@ -5045,6 +5077,12 @@ impl From<SessionRecord> for ChildSessionResponse {
             provider: non_empty_or(session.provider, "claude"),
             activity_projection: None,
         }
+    }
+}
+
+impl ChildSessionResponse {
+    pub fn set_activity_state(&mut self, activity_state: impl Into<String>) {
+        self.activity_state = activity_state.into();
     }
 }
 
@@ -5086,6 +5124,12 @@ impl From<SessionRecord> for ClientSessionResponse {
     }
 }
 
+impl ClientSessionResponse {
+    pub fn set_activity_state(&mut self, activity_state: impl Into<String>) {
+        self.session.set_activity_state(activity_state);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AttachDescriptor {
     attach_supported: bool,
@@ -5117,6 +5161,29 @@ fn fallback_activity_state(status: &str) -> String {
         "running" => "working".to_owned(),
         _ => "idle".to_owned(),
     }
+}
+
+fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
+    let status = normalized_status(status);
+    if status == "stopped" {
+        return "stopped".to_owned();
+    }
+    if session.completion_status.as_deref() == Some("killed") {
+        return "stopped".to_owned();
+    }
+    if session.completion_status.is_some() {
+        return "waiting_input".to_owned();
+    }
+    if session.agent_task_completed_at.is_some() {
+        return "idle".to_owned();
+    }
+    if matches!(status, "running" | "working") {
+        return "working".to_owned();
+    }
+    if status == "idle" {
+        return "idle".to_owned();
+    }
+    fallback_activity_state(status)
 }
 
 fn non_empty_or(value: String, fallback: &str) -> String {
@@ -5326,6 +5393,60 @@ mod tests {
 
         assert_eq!(response.status, "idle");
         assert_eq!(response.activity_state, "idle");
+    }
+
+    #[test]
+    fn session_projection_keeps_stored_idle_until_live_projection() {
+        let mut status_session = session_record("idle");
+        status_session.agent_status_text = Some("Working on a review".to_owned());
+        status_session.agent_status_at = Some(now_rfc3339());
+        let response = SessionResponse::from(status_session.clone());
+        assert_eq!(response.activity_state, "idle");
+        let client_response = ClientSessionResponse::from(status_session);
+        assert_eq!(client_response.session.activity_state, "idle");
+
+        let mut stale_status_session = session_record("idle");
+        stale_status_session.agent_status_text = Some("old work".to_owned());
+        stale_status_session.agent_status_at = Some("2026-06-01T00:00:00Z".to_owned());
+        let response = SessionResponse::from(stale_status_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut completed_task_session = session_record("idle");
+        completed_task_session.agent_status_text = Some("recent but complete".to_owned());
+        completed_task_session.agent_status_at = Some(now_rfc3339());
+        completed_task_session.agent_task_completed_at = Some(now_rfc3339());
+        let response = SessionResponse::from(completed_task_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut local_status_session = session_record("idle");
+        local_status_session.agent_status_text = Some("local timestamp".to_owned());
+        local_status_session.agent_status_at = Some(now_python_naive_iso());
+        let response = SessionResponse::from(local_status_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut stale_task_session = session_record("idle");
+        stale_task_session.current_task = Some("reviewing".to_owned());
+        stale_task_session.last_activity = now_rfc3339();
+        let response = SessionResponse::from(stale_task_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut explicit_idle_session = session_record("idle");
+        explicit_idle_session.last_activity = now_rfc3339();
+        let response = SessionResponse::from(explicit_idle_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut recent_activity_session = session_record("paused");
+        recent_activity_session.last_activity = now_rfc3339();
+        let response = SessionResponse::from(recent_activity_session);
+        assert_eq!(response.activity_state, "idle");
+    }
+
+    #[test]
+    fn session_projection_uses_canonical_waiting_input_activity() {
+        let mut session = session_record("idle");
+        session.completion_status = Some("completed".to_owned());
+        let response = SessionResponse::from(session);
+        assert_eq!(response.activity_state, "waiting_input");
     }
 
     #[test]
