@@ -4974,6 +4974,158 @@ async fn tmux_client_hook_preserves_local_only_and_event_validation() {
 }
 
 #[tokio::test]
+async fn tmux_client_hook_revives_stopped_codex_fork_with_live_tmux_session() {
+    if !tmux_available() {
+        return;
+    }
+
+    let state_file = unique_temp_path();
+    let log_dir = unique_short_temp_dir("sm-rust-hook-revive");
+    let working_dir = unique_short_temp_dir("sm-rust-hook-revive-work");
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-hook-revive-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let tmux_session = "codex-fork-revive";
+    let status = Command::new("tmux")
+        .args([
+            "-L",
+            &tmux_socket,
+            "new-session",
+            "-d",
+            "-s",
+            tmux_session,
+            "sleep 60",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(tmux_session_exists(&tmux_socket, tmux_session));
+
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "remote-revive",
+                    "name": "remote-codex-fork-revive",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": tmux_session,
+                    "tmux_socket_name": tmux_socket,
+                    "provider": "codex-fork",
+                    "node": "macbook",
+                    "log_file": log_dir.join("remote-revive.log").display().to_string(),
+                    "provider_resume_id": "remote-thread-123",
+                    "friendly_name": "remote-hidden-agent",
+                    "status": "stopped",
+                    "stopped_at": "2026-06-17T20:16:56Z",
+                    "completion_status": "killed",
+                    "completion_message": "retry error",
+                    "completed_at": "2026-06-17T20:16:56Z",
+                    "error_message": "codex_fork_control_degraded: stale control socket",
+                    "created_at": "2026-06-17T19:00:00Z",
+                    "last_activity": "2026-06-17T20:16:56Z"
+                },
+                {
+                    "id": "revive1",
+                    "name": "codex-fork-revive",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": tmux_session,
+                    "tmux_socket_name": tmux_socket,
+                    "provider": "codex-fork",
+                    "log_file": log_dir.join("revive1.log").display().to_string(),
+                    "provider_resume_id": "provider-thread-123",
+                    "friendly_name": "hidden-live-agent",
+                    "status": "stopped",
+                    "stopped_at": "2026-06-17T20:16:56Z",
+                    "completion_status": "killed",
+                    "completion_message": "retry error",
+                    "completed_at": "2026-06-17T20:16:56Z",
+                    "error_message": "codex_fork_control_degraded: stale control socket",
+                    "created_at": "2026-06-17T19:00:00Z",
+                    "last_activity": "2026-06-17T20:16:56Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.runtime_enabled = true;
+    config.rust_core.tmux_socket_name = Some(tmux_socket.clone());
+    config.rust_core.log_dir = Some(log_dir.display().to_string());
+    let app = router(AppState::new(config));
+
+    let (status, payload) = get_json(app.clone(), "/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["sessions"].as_array().unwrap().is_empty());
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/tmux-client?event=client-detached&session=codex-fork-revive",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert!(payload.get("revived_session_id").is_none());
+
+    let (status, payload) = get_json(app.clone(), "/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["sessions"].as_array().unwrap().is_empty());
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/tmux-client?event=client-session-changed&session=&client_session=codex-fork-revive",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["revived_session_id"], "revive1");
+
+    let (status, payload) = get_json(app, "/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    let sessions = payload["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["id"], "revive1");
+    assert_eq!(sessions[0]["status"], "idle");
+    assert_eq!(sessions[0]["stopped_at"], Value::Null);
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let remote = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "remote-revive")
+        .unwrap();
+    assert_eq!(remote["status"], "stopped");
+    assert_eq!(remote["node"], "macbook");
+    let restored = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "revive1")
+        .unwrap();
+    assert_eq!(restored["status"], "idle");
+    assert_eq!(restored["stopped_at"], Value::Null);
+    assert_eq!(restored["completion_status"], Value::Null);
+    assert_eq!(restored["error_message"], Value::Null);
+}
+
+#[tokio::test]
 async fn shadow_http_reports_match_for_stable_read_only_route() {
     let app = router(AppState::new(AppConfig::default()));
     let python_body = serde_json::to_vec(&json!({ "status": "healthy" })).unwrap();
