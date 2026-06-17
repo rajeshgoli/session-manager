@@ -16,6 +16,7 @@ Status: converged after three sequential independent reviewer convergence signal
 | backup/restore | Pre-freeze safety backup and post-freeze final backup are created, verified, and restored in rehearsal. | Live cutover. |
 | rollback | Python service can be restored and smoke checks pass after Rust rehearsal writes copied state. | Live cutover. |
 | observability | Operator-visible health/status exists for auth, queue, mobile, nodes, Codex, summary, sensitive reads, migration, and slow requests. | Live cutover. |
+| accelerated Rust canary evidence | If Python-origin instability prevents sustained Python-authoritative shadow, `mvp_rehearsal --rust-canary-cutover` may replace the sustained Python baseline/shadow with short Python canary spot checks, Rust/state/fixture gates, Rust baseline, and a passed Cloudflare/mobile smoke report using real proof inputs. | Live cutover when the normal shadow gate is intentionally bypassed. |
 | user review | Every accepted breaking change, destructive migration, or operational risk is explicitly approved. | Implementing that change. |
 
 ## Baseline Workloads
@@ -87,6 +88,9 @@ Reviewers should verify:
 - Python/Rust coexistence has a single-writer model for must-preserve stores.
 - backups and rollback are concrete enough to execute against copied real state.
 - contract and baseline gates are measurable, not aspirational.
+- either the normal Python-authoritative shadow gate passes, or the accelerated
+  Rust canary gate explicitly records `python_canary_spot_checks`,
+  Rust/state/fixture gates, Rust baseline, and passed Cloudflare/mobile smoke.
 - launchd/service cutover avoids arbitrary process killing without ownership checks.
 - active sessions, queues, node agents, provider requests, and external notifiers are drained or explicitly risk-accepted before cutover.
 - observability covers failures an operator would need to diagnose rollback.

@@ -136,6 +136,16 @@ BASELINE_CHECK_IDS = (
     "http.api_sessions_absent",
 )
 
+PYTHON_CANARY_SPOT_CHECK_IDS = (
+    "http.health",
+    "http.auth_session",
+    "http.client_bootstrap",
+    "http.events_state",
+    "http.sessions",
+    "http.client_sessions",
+    "http.api_sessions_absent",
+)
+
 SHADOW_COMPARE_PATHS = (
     "/health",
     "/health/detailed",
@@ -162,6 +172,12 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             "rust_base_url": args.rust_base_url,
             "config": str(args.config),
             "local_env": str(args.local_env) if args.local_env else None,
+            "rust_canary_cutover": args.rust_canary_cutover,
+            "cloudflare_smoke_report": (
+                str(args.cloudflare_smoke_report)
+                if args.cloudflare_smoke_report
+                else None
+            ),
             "reuse_rust_sidecar": args.reuse_rust_sidecar,
             "include_gap_probes": not args.core_only,
             "skip_python_health": args.skip_python_health,
@@ -203,6 +219,23 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
                     "status": "skipped",
                     "detail": "Python liveness probe is superseded by stopped-origin final backup gate",
                 }
+            )
+
+        if args.rust_canary_cutover:
+            python_spot = _run_contract_group(
+                manifest,
+                name="python_canary_spot_checks",
+                target="python",
+                base_url=args.python_base_url,
+                sm_binary=args.sm_binary,
+                check_ids=set(PYTHON_CANARY_SPOT_CHECK_IDS),
+                timeout_seconds=args.timeout,
+            )
+            report["steps"].append(python_spot)
+            _add_contract_blockers(
+                report,
+                python_spot,
+                blocker_kind="python_canary_spot_check",
             )
 
         if args.skip_state_gate:
@@ -455,7 +488,37 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
             report["steps"].append(gap_contracts)
             _add_contract_blockers(report, gap_contracts, blocker_kind="mvp_gap")
 
-        if not args.skip_baseline:
+        if args.rust_canary_cutover and not args.skip_baseline:
+            baseline_dir = output_dir / "baseline"
+            baseline_dir.mkdir(parents=True, exist_ok=True)
+            report["steps"].append(
+                {
+                    "name": "python_baseline",
+                    "status": "skipped",
+                    "detail": (
+                        "accelerated Rust canary mode uses short Python spot "
+                        "checks instead of sustained Python baseline"
+                    ),
+                }
+            )
+            rust_pid = rust_process.pid if rust_process else None
+            rust_baseline = run_baseline(
+                target="rust",
+                base_url=args.rust_base_url,
+                sm_binary=args.sm_binary,
+                repetitions=args.baseline_repetitions,
+                output=baseline_dir / "rust-baseline.json",
+                server_pid=rust_pid,
+                check_ids=set(BASELINE_CHECK_IDS),
+            )
+            report["artifacts"]["rust_baseline"] = str(
+                baseline_dir / "rust-baseline.json"
+            )
+            rust_baseline_step = _baseline_step("rust_baseline", rust_baseline)
+            report["steps"].append(rust_baseline_step)
+            if rust_baseline_step["status"] != "passed":
+                _add_blocker(report, "rust_baseline", rust_baseline_step["detail"])
+        elif not args.skip_baseline:
             baseline_dir = output_dir / "baseline"
             baseline_dir.mkdir(parents=True, exist_ok=True)
             python_baseline = run_baseline(
@@ -488,7 +551,28 @@ def run_rehearsal(args: argparse.Namespace) -> dict[str, Any]:
                 if step["status"] != "passed":
                     _add_blocker(report, step["name"], step["detail"])
 
-        if not args.skip_shadow:
+        if args.rust_canary_cutover:
+            shadow_step = {
+                "name": "shadow_read_summary",
+                "status": "skipped",
+                "detail": (
+                    "accelerated Rust canary mode intentionally replaces "
+                    "sustained Python-authoritative shadow with Python spot "
+                    "checks plus Rust/state/Cloudflare gates"
+                ),
+            }
+            report["steps"].append(shadow_step)
+            cloudflare_step = _cloudflare_smoke_report_step(args.cloudflare_smoke_report)
+            report["steps"].append(cloudflare_step)
+            if cloudflare_step.get("artifact"):
+                report["artifacts"]["cloudflare_smoke_report"] = cloudflare_step["artifact"]
+            if cloudflare_step["status"] != "passed":
+                _add_blocker(
+                    report,
+                    "cloudflare_access_smoke",
+                    cloudflare_step.get("detail", "Cloudflare/mobile smoke failed"),
+                )
+        elif not args.skip_shadow:
             shadow_paths = _resolve_shadow_compare_paths(
                 python_base_url=args.python_base_url,
                 base_paths=SHADOW_COMPARE_PATHS,
@@ -529,6 +613,57 @@ def _finalize_report(
     report["artifacts"]["report"] = str(report_path)
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     return report
+
+
+def _cloudflare_smoke_report_step(report_path: Path | None) -> dict[str, Any]:
+    step: dict[str, Any] = {
+        "name": "cloudflare_access_smoke_report",
+    }
+    if report_path is None:
+        step.update(
+            {
+                "status": "failed",
+                "detail": (
+                    "accelerated Rust canary mode requires "
+                    "--cloudflare-smoke-report from cloudflare_access_smoke"
+                ),
+            }
+        )
+        return step
+    step["artifact"] = str(report_path)
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        step.update({"status": "failed", "detail": f"failed to read report: {exc}"})
+        return step
+    except json.JSONDecodeError as exc:
+        step.update({"status": "failed", "detail": f"invalid JSON report: {exc}"})
+        return step
+    status = payload.get("status")
+    summary = payload.get("summary")
+    blockers = payload.get("blockers")
+    step["summary"] = summary if isinstance(summary, dict) else {}
+    if isinstance(blockers, list):
+        step["blockers"] = blockers
+    if status == "passed" and isinstance(blockers, list) and not blockers:
+        step.update(
+            {
+                "status": "passed",
+                "detail": "Cloudflare/mobile smoke report passed",
+            }
+        )
+    else:
+        blocker_count = len(blockers) if isinstance(blockers, list) else "unknown"
+        step.update(
+            {
+                "status": "failed",
+                "detail": (
+                    f"Cloudflare/mobile smoke report status is {status!r} "
+                    f"with {blocker_count} blocker(s)"
+                ),
+            }
+        )
+    return step
 
 
 def _resolve_output_dir(raw: Path | None) -> Path:
@@ -1548,6 +1683,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     parser.add_argument("--local-env", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--rust-canary-cutover",
+        action="store_true",
+        help=(
+            "Use accelerated Rust canary evidence: short Python spot checks, "
+            "Rust/state/fixture gates, Rust baseline, and a required "
+            "Cloudflare/mobile smoke report instead of sustained Python "
+            "baseline/shadow"
+        ),
+    )
+    parser.add_argument(
+        "--cloudflare-smoke-report",
+        type=Path,
+        default=None,
+        help=(
+            "JSON output from scripts.rust_migration.cloudflare_access_smoke; "
+            "required when --rust-canary-cutover is used"
+        ),
+    )
     parser.add_argument("--reuse-rust-sidecar", action="store_true")
     parser.add_argument("--skip-python-health", action="store_true")
     parser.add_argument("--skip-state-gate", action="store_true")

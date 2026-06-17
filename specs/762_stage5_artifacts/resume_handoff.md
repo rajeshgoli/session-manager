@@ -1,7 +1,8 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-16 after PR #1035 Android artifact auth
-fix and the post-#1035 evidence refresh.
+Status: handoff snapshot from 2026-06-16 after PR #1037 contract harness
+read-budget fix, with issue #1038 adding an accelerated Rust canary evidence
+path for Python-origin instability.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -11,9 +12,9 @@ coverage in
 
 ## Current Repository State
 
-- Branch: `main` after PR #1035.
-- Latest merged commit before this docs refresh: `1f85ce9` (`Merge pull
-  request #1035`)
+- Branch: `main` after PR #1037.
+- Latest merged commit before this docs refresh: `68adc3b` (`Merge pull
+  request #1037`)
 - Open PRs at handoff: none before this docs refresh PR.
 - Dirty worktree at handoff: only pre-existing untracked
   `.claude/settings.local.json`, `certs/`, `data/`, and the local
@@ -175,6 +176,10 @@ Merged Rust slices cover:
   local storage.
 - PR #1035 allowed Android app artifacts to be read with cert-gated app auth
   while preserving Cloudflare edge and session-auth fallbacks.
+- PR #1037 raised the contract harness default HTTP read budget so large live
+  `/client/sessions` JSON responses are not truncated before assertion checks.
+- Issue #1038 adds the accelerated Rust canary evidence mode for the case where
+  Python-origin availability prevents sustained baseline/shadow evidence.
 - Current contract manifest size:
   - `134` checks total
   - `73` `python_and_rust`
@@ -251,12 +256,13 @@ post-#984 manifest:
   skipped;
 - Rust mutating fixture contracts: `35` passed, `0` failed, `0` skipped.
 
-PRs #986-#1035 added more cutover tooling and evidence gates after this focused
+PRs #986-#1037 added more cutover tooling and evidence gates after this focused
 run, including node restore fixtures, stopped-origin final backup, rehearsal
 final-backup integration, the Cloudflare Access mobile smoke runner, Rust
 mobile-device enrollment, Cloudflare mTLS CA automation, Android Camera-app
 enrollment, Android mTLS fixes, native device auth, and app artifact auth
-fixes. The latest post-#1035 rehearsal below is the current evidence snapshot.
+fixes, plus the larger live HTTP read budget. The latest post-#1035 rehearsal
+below is the current evidence snapshot.
 
 The latest post-#1035 full rehearsal attempts are blocked, not cutover evidence:
 
@@ -291,7 +297,48 @@ around the run show the Python watchdog reporting an event-loop freeze and
 killing the process for restart; after that, port `8420` stopped accepting
 connections. Do not treat the post-#1035 rehearsal as a clean MVP cutover
 artifact until Python-origin availability is stable for the baseline/shadow
-steps.
+steps, or until the accelerated Rust canary evidence path records passing spot
+checks plus Rust/state/Cloudflare gates.
+
+## Accelerated Rust Canary Evidence Path
+
+Issue #1038 adds an explicit path for rotating faster when Python-origin
+availability is the blocker. This is not a silent shadow skip. The report must
+show:
+
+- `python_canary_spot_checks` passed;
+- state preflight/backup/restore/freeze-drain gate passed;
+- Rust live core, synthetic read-only fixture, and mutating fixture contracts
+  passed;
+- Rust baseline passed;
+- `cloudflare_access_smoke_report` passed from a smoke report that used real
+  Cloudflare Access, public-edge, and SM auth proof inputs;
+- `python_baseline` and `shadow_read_summary` recorded as skipped because
+  `--rust-canary-cutover` was intentionally selected.
+
+Command shape:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.cloudflare_access_smoke \
+  --base-url http://127.0.0.1:8421 \
+  --mobile-host sm-app.rajeshgo.li \
+  --browser-host sm.rajeshgo.li \
+  --mobile-access-jwt-env CF_MOBILE_ACCESS_JWT \
+  --browser-access-jwt-env CF_BROWSER_ACCESS_JWT \
+  --public-edge-secret-env SM_PUBLIC_EDGE_SECRET \
+  --bearer-token-env SM_DEVICE_BEARER_TOKEN \
+  --output .local/rust-mvp-rehearsals/cloudflare-smoke.json \
+  --json \
+  --fail-on-blockers
+
+./venv/bin/python -m scripts.rust_migration.mvp_rehearsal \
+  --rust-canary-cutover \
+  --cloudflare-smoke-report .local/rust-mvp-rehearsals/cloudflare-smoke.json
+```
+
+A missing, blocked, or synthetic Cloudflare smoke report keeps the canary run
+blocked. Use this path only after the operator accepts that sustained Python
+shadow is being replaced because Python is the unstable component.
 
 ## Live Observation
 
@@ -390,8 +437,12 @@ needed for final cutover evidence.
 
 ### Near-Term Work
 
-1. Continue Python-authoritative shadow mode for a longer real observation
-   window and triage unexplained mismatches.
+1. Collect either the normal Python-authoritative shadow window or the
+   accelerated Rust canary evidence report.
+   - Normal path: keep shadow mode running for retained reads and triage
+     unexplained mismatches.
+   - Canary path: run `--rust-canary-cutover` with a passed
+     `--cloudflare-smoke-report` and treat any blocker as cutover-blocking.
 2. Continue expanding fixture/live evidence as new retained rows land.
    - The MVP rehearsal already runs the current synthetic read-only and
      mutating fixture sets, including review-route fixtures.
@@ -434,8 +485,10 @@ needed for final cutover evidence.
 Do not start Rust writer ownership or MVP cutover until:
 
 - retained manifest checks pass for Python and Rust on the selected fixture set;
-- shadow mode shows no unexplained retained-core mismatches for the agreed
-  observation window;
+- either shadow mode shows no unexplained retained-core mismatches for the
+  agreed observation window, or the accelerated Rust canary report records
+  passing `python_canary_spot_checks`, Rust/state/fixture gates, Rust baseline,
+  and Cloudflare/mobile smoke;
 - final backup happens after write admission is frozen or journaled;
 - public traffic has proof-of-possession before origin plus origin
   auth/capability checks;
@@ -448,8 +501,8 @@ Do not start Rust writer ownership or MVP cutover until:
 
 ## Recommended Resume Point
 
-Continue with Cloudflare Access deployment evidence, then return to the shadow
-observation gate:
+Continue with Cloudflare Access deployment evidence, then produce either normal
+shadow evidence or the accelerated Rust canary report:
 
 1. Provide the smoke runner proof inputs for the already configured Cloudflare
    Access apps: mobile/browser Access JWTs, public-edge HMAC secret, and SM
@@ -458,13 +511,16 @@ observation gate:
    [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md).
 3. Exercise the native app route class through the app hostname so mobile gates
    collect real traffic and smoke evidence.
-4. Keep Python-authoritative Rust shadow mode running for retained reads against
-   the local Rust sidecar.
-5. Let it observe real traffic for the agreed window.
-6. Summarize the shadow ledger by route, comparison class, and unexplained
-   mismatch.
-7. Convert any unexplained retained-surface mismatch into a bounded Rust slice.
+4. If Python remains stable, keep Python-authoritative Rust shadow running for
+   retained reads, let it observe real traffic for the agreed window, and
+   summarize the ledger by route/comparison/mismatch.
+5. If Python remains the unstable component, run `mvp_rehearsal
+   --rust-canary-cutover --cloudflare-smoke-report <passed-smoke-json>` and use
+   that report as the cutover-candidate evidence artifact.
+6. Convert any unexplained retained-surface mismatch or canary blocker into a
+   bounded Rust slice.
 
-This is the highest-signal next step because the Rust origin gate is now merged,
-but the public edge still needs actual Cloudflare policy and mobile/browser
-smoke evidence before it can count as cutover-ready.
+This is the highest-signal next step because the Rust origin gate is merged and
+the broad Python service is now the limiting factor. Do not do broad Python
+hardening; prove the Rust canary path or fix bounded Rust/Cloudflare/mobile
+blockers.
