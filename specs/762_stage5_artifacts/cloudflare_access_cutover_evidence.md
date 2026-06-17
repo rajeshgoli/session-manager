@@ -1,7 +1,7 @@
 # Cloudflare Access Cutover Evidence
 
-Status: implementation evidence after PR #1025 merged and the first post-#1025
-smoke-boundary run was recorded.
+Status: implementation evidence after public mTLS smoke was recorded for
+`sm-app.rajeshgo.li` on 2026-06-17.
 
 This artifact records the current Rust-side Cloudflare Access boundary for the
 Rust cutover track. It complements the design in
@@ -29,6 +29,7 @@ issuance:
 | #1012 | Android Camera-app QR handoff via `sm-enroll://enroll`, direct in-app certificate save, no camera permission, no in-app scanner, and no certificate material exposed in Settings. |
 | #1025 | Rust native Google device-auth success path for `/auth/device/google`, including Google JWKS verification, mobile Access actor binding, public-edge gate, and zero-skew temporal checks. |
 | #1026 | Post-#1025 smoke evidence slice; runner now records denial-path boundary evidence even when success-path proof inputs are missing. |
+| issue #1046 | Public mTLS smoke mode for the deployed app host, using an ephemeral client cert signed by the local mobile CA for an enrolled Common Name. |
 
 Current origin behavior:
 
@@ -88,20 +89,50 @@ Cloudflare tunnel requirements:
 - deny or 404 unmatched ingress;
 - record each Access application audience in SM config.
 
+## Current Public App-Host Evidence
+
+The public mTLS smoke runner recorded:
+
+```text
+.local/rust-mvp-rehearsals/public-mtls-smoke-20260617T202635Z.json
+```
+
+Summary: `4` passed, `0` blocked, `1` skipped. The passing checks prove:
+
+- `sm-app.rajeshgo.li` denies `/client/bootstrap` without a client certificate;
+- an ephemeral client certificate signed by the local mobile CA for the enrolled
+  Android Common Name reaches `/client/bootstrap`;
+- `/client/sessions` still returns SM-auth `401` without an SM bearer or
+  session cookie after mTLS succeeds;
+- app artifact metadata is reachable through the certificate-gated app host.
+
+The skipped check is optional authenticated `/client/sessions` because no SM
+bearer token or cookie was supplied to the smoke runner. The report redacts raw
+response JSON bodies and records no certificate material, private keys,
+Cloudflare cookies, Access tokens, bearer tokens, or SM cookies.
+
+The live canary report consumed that smoke report:
+
+```text
+.local/rust-mvp-rehearsals/live-canary-with-public-mtls-20260617T202645Z.json
+```
+
+Summary: `11` passed, `0` blocked, `0` skipped.
+
 ## Remaining Cutover Evidence
 
-The Rust origin gate and smoke runner are merged, but public cutover still
-needs operator-side Cloudflare and native-app evidence:
+The Rust origin gate and public app-host mTLS smoke are recorded, but public
+cutover still needs the remaining operator-side and native-app evidence:
 
 | Evidence | Required before public mobile cutover |
 | --- | --- |
-| Cloudflare policy setup | Prove each Access app exists with the expected hostname, audience, and no bypass/broad-certificate policy. |
-| Mobile device enrollment | Prove an enrolled phone certificate Common Name appears in the `sm-mobile-app` policy and in SM mobile device config. |
-| Revoked-device denial | Prove a removed/revoked device Common Name is denied by Cloudflare or origin and cannot use `/client/*`, `/apps/*`, `/apk`, or `/auth/device/google`. |
-| Native app smoke | Exercise `/client/bootstrap`, `/auth/device/google`, `/client/sessions`, `/client/sessions/{id}`, attach ticket, WebSocket auth, request-status, analytics, bug report, and app artifact metadata/download through the app hostname. |
+| Cloudflare policy setup | Prove each Access app exists with the expected hostname, audience, and no bypass/broad-certificate policy. The app-host policy has working mTLS behavior for the enrolled Common Name from the smoke above. |
+| Mobile device enrollment | Prove an enrolled phone certificate Common Name appears in the `sm-mobile-app` policy and in SM mobile device config. The public mTLS smoke used the current enrolled Common Name. |
+| revoked-device denial | Prove a removed/revoked device Common Name is denied by Cloudflare or origin and cannot use `/client/*`, `/apps/*`, `/apk`, or `/auth/device/google`. |
+| Native app smoke | Exercise `/auth/device/google`, authenticated `/client/sessions`, `/client/sessions/{id}`, attach ticket, WebSocket auth, request-status, analytics, bug report, and app artifact download through the app hostname. Bootstrap and app artifact metadata are already covered by the public mTLS smoke. |
 | Browser smoke | Exercise browser Access owner email login, SM Google OAuth callback, `/auth/session`, and authenticated/proofed watch diagnostics through the browser hostname. |
 | Node fallback smoke | Once node fallback is ported, prove LAN-first behavior and Cloudflare node certificate fallback for a registered node. |
-| Shadow/rehearsal | Record a clean shadow/rehearsal window that includes native app traffic or an explicit operator-driven mobile route exercise. |
+| Shadow/rehearsal | Record any targeted comparison needed for specific bugs. Broad Python-authoritative shadow is historical because Rust now owns the live port. |
 
 The smoke runner requires real deployment inputs. The post-#1025 run used
 `--mobile-host sm-app.rajeshgo.li` and `--browser-host sm.rajeshgo.li` against a
@@ -125,5 +156,6 @@ Camera-app enrollment handoff and direct internal credential storage, but that
 published artifact is not by itself full Cloudflare Access cutover evidence.
 
 Do not treat the Cloudflare Access design as complete cutover evidence until
-these setup and smoke checks are recorded. The revoked-device denial and native
-app smoke checks are release gates, not optional diagnostics.
+the remaining setup and smoke checks above are recorded. Revoked-device denial
+and fuller native app authenticated smoke remain release gates, not optional
+diagnostics.
