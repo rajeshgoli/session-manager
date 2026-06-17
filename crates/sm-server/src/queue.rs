@@ -1181,6 +1181,25 @@ impl RetainedQueueStore {
         })
     }
 
+    pub fn cancel_pending_messages_for_target_category(
+        &self,
+        target_session_id: &str,
+        message_category: &str,
+    ) -> Result<usize> {
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                r#"
+                DELETE FROM message_queue
+                WHERE target_session_id = ?1
+                  AND message_category = ?2
+                  AND delivered_at IS NULL
+                "#,
+                params![target_session_id, message_category],
+            )?;
+            Ok(changed)
+        })
+    }
+
     pub fn upsert_stop_notify(
         &self,
         session_id: &str,
