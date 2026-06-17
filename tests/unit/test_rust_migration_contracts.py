@@ -38,9 +38,11 @@ from scripts.rust_migration.mutating_fixture import (
 from scripts.rust_migration.mvp_rehearsal import (
     CORE_MUTATING_CHECK_IDS,
     DEFAULT_RUST_SM_BINARY,
+    PYTHON_CANARY_SPOT_CHECK_IDS,
     READ_ONLY_FIXTURE_CHECK_IDS,
     READ_ONLY_FIXTURE_VALUES,
     _build_parser,
+    _cloudflare_smoke_report_step,
     _default_read_only_fixture_rust_base_url,
     _default_mutating_rust_base_url,
     _ensure_rust_cli_available,
@@ -265,9 +267,19 @@ def test_cloudflare_access_cutover_evidence_pins_policy_and_origin_gates():
         assert required in evidence
 
 
-def test_handoff_and_progress_are_current_through_android_artifact_auth_pr1035():
+def test_handoff_and_progress_are_current_through_canary_evidence_issue1038():
     progress = (STAGE5_DIR / "mvp_progress.md").read_text(encoding="utf-8")
     handoff = (STAGE5_DIR / "resume_handoff.md").read_text(encoding="utf-8")
+    gate_matrix = (STAGE5_DIR / "gate_matrix.md").read_text(encoding="utf-8")
+    rollout_plan = (STAGE5_DIR / "rollout_plan.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "scripts/rust_migration/README.md").read_text(
+        encoding="utf-8"
+    )
+
+    for text in [progress, handoff, gate_matrix, rollout_plan, readme]:
+        assert "accelerated rust canary" in text.lower()
+        assert "--rust-canary-cutover" in text
+        assert "cloudflare" in text.lower()
 
     for text in [progress, handoff]:
         assert "#950" in text
@@ -278,14 +290,19 @@ def test_handoff_and_progress_are_current_through_android_artifact_auth_pr1035()
         assert "#1012" in text
         assert "#1025" in text
         assert "#1035" in text
+        assert "#1037" in text
+        assert "issue #1038" in text
         assert "Cloudflare Access" in text
         assert "cloudflare_access_cutover_evidence.md" in text
+        assert "python_canary_spot_checks" in text
+        assert "cloudflare_access_smoke_report" in text
 
-    assert "Latest merged commit before this docs refresh: `1f85ce9`" in handoff
-    assert "records the PR lineage through #1035" in handoff
+    assert "Latest merged commit before this docs refresh: `68adc3b`" in handoff
+    assert "PR #1037" in handoff
     assert "Camera-app" in handoff
     assert "deep-link enrollment" in handoff
     assert "app update artifact access works through the certificate-gated app path" in handoff
+    assert "--cloudflare-smoke-report" in readme
 
 
 def test_manifest_covers_rust_only_retired_http_surfaces():
@@ -662,6 +679,117 @@ def test_mvp_rehearsal_records_read_only_fixture_skip_step(tmp_path, monkeypatch
     )
     assert step["status"] == "skipped"
     assert report["summary"]["status"] == "passed"
+
+
+def test_mvp_rehearsal_canary_mode_uses_spot_checks_and_smoke_report(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SM_CLIENT_CONFIG", str(tmp_path / "missing-client.yaml"))
+    smoke_report = tmp_path / "cloudflare-smoke.json"
+    smoke_report.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "summary": {"passed": 3, "blocked": 0, "skipped": 0},
+                "blockers": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = _build_parser().parse_args(
+        [
+            "--rust-canary-cutover",
+            "--cloudflare-smoke-report",
+            str(smoke_report),
+            "--skip-state-gate",
+            "--skip-smoke",
+            "--skip-read-only-fixture-contracts",
+            "--skip-mutating-contracts",
+            "--core-only",
+            "--reuse-rust-sidecar",
+            "--output-dir",
+            str(tmp_path / "rehearsal"),
+        ]
+    )
+
+    def fake_run_contract_group(
+        _manifest,
+        *,
+        name,
+        target,
+        base_url,
+        sm_binary,
+        check_ids,
+        timeout_seconds,
+        **_kwargs,
+    ):
+        if name == "python_canary_spot_checks":
+            assert target == "python"
+            assert base_url == args.python_base_url
+            assert check_ids == set(PYTHON_CANARY_SPOT_CHECK_IDS)
+        if name == "rust_core_sidecar_contracts":
+            assert target == "rust"
+            assert base_url == args.rust_base_url
+        return {
+            "name": name,
+            "status": "passed",
+            "elapsed_ms": 1.0,
+            "summary": {"passed": len(check_ids), "failed": 0, "skipped": 0},
+            "results": [],
+        }
+
+    def fake_baseline(**kwargs):
+        assert kwargs["target"] == "rust"
+        return {
+            "elapsed_seconds": 0.01,
+            "memory": {"status": "measured"},
+            "latency": {"failed": {}, "skipped": {}, "summaries": {}},
+        }
+
+    with patch("scripts.rust_migration.mvp_rehearsal._probe_health") as probe:
+        probe.return_value = {
+            "status": "passed",
+            "elapsed_ms": 1.0,
+            "detail": "mock healthy",
+        }
+        with patch(
+            "scripts.rust_migration.mvp_rehearsal._run_contract_group",
+            side_effect=fake_run_contract_group,
+        ):
+            with patch(
+                "scripts.rust_migration.mvp_rehearsal.run_baseline",
+                side_effect=fake_baseline,
+            ):
+                report = run_rehearsal(args)
+
+    steps = {step["name"]: step for step in report["steps"]}
+    assert steps["python_canary_spot_checks"]["status"] == "passed"
+    assert steps["python_baseline"]["status"] == "skipped"
+    assert steps["rust_baseline"]["status"] == "passed"
+    assert steps["shadow_read_summary"]["status"] == "skipped"
+    assert steps["cloudflare_access_smoke_report"]["status"] == "passed"
+    assert report["artifacts"]["cloudflare_smoke_report"] == str(smoke_report)
+    assert report["summary"]["status"] == "passed"
+
+
+def test_mvp_rehearsal_canary_mode_requires_cloudflare_smoke_report():
+    step = _cloudflare_smoke_report_step(None)
+
+    assert step["status"] == "failed"
+    assert "--cloudflare-smoke-report" in step["detail"]
+
+
+def test_mvp_rehearsal_canary_mode_rejects_incomplete_smoke_report(tmp_path):
+    smoke_report = tmp_path / "cloudflare-smoke.json"
+    smoke_report.write_text(
+        json.dumps({"status": "passed", "summary": {"passed": 1}}),
+        encoding="utf-8",
+    )
+
+    step = _cloudflare_smoke_report_step(smoke_report)
+
+    assert step["status"] == "failed"
+    assert "unknown blocker" in step["detail"]
 
 
 def test_mvp_rehearsal_resolves_mobile_shadow_paths(monkeypatch):

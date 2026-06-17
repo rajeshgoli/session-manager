@@ -481,6 +481,39 @@ the loopback smoke report records those checks as skipped edge-only evidence.
 Use the JSON output as operator evidence alongside
 `specs/762_stage5_artifacts/cloudflare_access_cutover_evidence.md`.
 
+## Accelerated Rust Canary Evidence
+
+Normal cutover evidence still prefers Python-authoritative shadow for the
+agreed observation window. When the Python origin itself is the unstable part of
+the system, use the explicit Rust canary path instead of spending time on
+throwaway Python hardening:
+
+```bash
+python -m scripts.rust_migration.cloudflare_access_smoke \
+  --base-url http://127.0.0.1:8421 \
+  --mobile-host sm-app.rajeshgo.li \
+  --browser-host sm.rajeshgo.li \
+  --mobile-access-jwt-env CF_MOBILE_ACCESS_JWT \
+  --browser-access-jwt-env CF_BROWSER_ACCESS_JWT \
+  --public-edge-secret-env SM_PUBLIC_EDGE_SECRET \
+  --bearer-token-env SM_DEVICE_BEARER_TOKEN \
+  --output /tmp/sm-cloudflare-access-smoke.json \
+  --json \
+  --fail-on-blockers
+
+python -m scripts.rust_migration.mvp_rehearsal \
+  --rust-canary-cutover \
+  --cloudflare-smoke-report /tmp/sm-cloudflare-access-smoke.json
+```
+
+This mode still runs the state preflight/backup/restore/freeze-drain gate, Rust
+core contracts, synthetic read-only and mutating fixture contracts, and the Rust
+baseline. It replaces sustained Python baseline/shadow with
+`python_canary_spot_checks` for a small authority sanity set, then requires a
+passed Cloudflare/mobile smoke report as `cloudflare_access_smoke_report`.
+Reports produced this way are cutover-candidate evidence only when blockers are
+zero and the smoke report used real Access/public-edge/SM auth inputs.
+
 ## MVP Sidecar Rehearsal
 
 The MVP rehearsal gate starts Rust as a sidecar, keeps Python authoritative, and

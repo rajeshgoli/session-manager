@@ -37,6 +37,14 @@ The Rust migration should pause or narrow if:
 
 The comparison is against current Python as operated for retained workflows. Do not file Python hardening work as part of the Rust value gate unless the owner later reopens that decision.
 
+If the current Python origin cannot remain healthy through sustained
+Python-authoritative baseline/shadow, the owner-approved path is not broad
+Python hardening. Use the accelerated Rust canary evidence mode instead:
+`mvp_rehearsal --rust-canary-cutover` runs short Python canary spot checks, keeps
+the Rust/state/fixture gates and Rust baseline blocking, and requires a passed
+Cloudflare/mobile smoke report with real Access/public-edge/SM auth proof inputs
+before the run can count as cutover-candidate evidence.
+
 ## Cutover Sequence
 
 1. Build the contract harness from Stage 2/3/4 artifacts and run it against Python.
