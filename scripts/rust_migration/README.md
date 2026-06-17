@@ -518,6 +518,28 @@ the loopback smoke report records those checks as skipped edge-only evidence.
 Use the JSON output as operator evidence alongside
 `specs/762_stage5_artifacts/cloudflare_access_cutover_evidence.md`.
 
+## Android Emulator Native App Smoke
+
+After the public mobile Access policy and Rust origin are configured, run the
+native app smoke in a managed Android emulator instead of a plugged-in phone:
+
+```bash
+python -m scripts.rust_migration.android_emulator_smoke \
+  --server-url https://sm-app.rajeshgo.li \
+  --avd sm_mtls_api35 \
+  --config config.yaml \
+  --fail-on-blockers
+```
+
+The runner builds and installs the debug APK, starts an `sm enroll-device`
+pairing listener on `127.0.0.1`, exposes it to the emulator with
+`adb reverse tcp:<port> tcp:<port>`, advertises it to the app as
+`http://127.0.0.1:<port>`, and launches a debug-only app activity. The app uses
+its normal enrollment repository to save the Cloudflare client certificate, then
+performs HTTPS reads through the normal OkHttp/Retrofit stack with that saved
+client cert plus a short-lived SM device bearer. The report redacts bearer,
+pairing token, certificate, and key material.
+
 ## Accelerated Rust Canary Evidence
 
 Normal cutover evidence still prefers Python-authoritative shadow for the

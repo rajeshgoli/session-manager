@@ -5,7 +5,8 @@ merged and used for the first Rust canary flip on 2026-06-17. Issue #1042 adds
 the public tunnel preflight that verifies `sm-app.rajeshgo.li` routes directly
 to the launchd-managed Rust service and legacy `sm.rajeshgo.li` does not route
 to origin. Issue #1044 adds a non-mutating live canary report for the
-post-cutover Rust service.
+post-cutover Rust service. Issue #1048 adds an adb-managed Android emulator
+smoke for the native app enrollment/cert-auth path without a plugged-in phone.
 
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
 post-#1035 rehearsal proves state gates, live core contracts, read-only
@@ -125,6 +126,7 @@ not change retained or removed scope. Binding scope remains
 | #1041 | Rust service launchd cutover tooling and first-canary runbook |
 | issue #1042 | Public tunnel preflight for the protected app hostname and legacy-host absence |
 | issue #1044 | Live Rust canary evidence collector for launchd/local/public-tunnel post-cutover checks |
+| issue #1048 | Android emulator native app smoke for enrollment, cert-auth reads, and attach-ticket proof |
 
 ## Implemented Capability Groups
 
@@ -137,7 +139,7 @@ The Rust sidecar now has executable coverage for:
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent and retained review-route slices are merged, with shadow and contract fixtures covering the early cutover path. |
 | Codex retained reads | Codex event stream, pending request ledger reads, activity actions, review detail/list, and Claude/Codex tool-call projections are implemented and covered by manifest checks. |
-| Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, public-edge assertion validation, Android client-certificate storage, Rust `sm enroll-device`, Camera-app deep-link enrollment, and Rust Google device-auth bearer issuance are merged. |
+| Mobile | Native bootstrap/session support, attach-ticket proofing, terminal WebSocket auth/bridge, runtime disable, device revoke/list CLI support, public-edge assertion validation, Android client-certificate storage, Rust `sm enroll-device`, Camera-app deep-link enrollment, Rust Google device-auth bearer issuance, and adb-managed emulator smoke tooling are merged. |
 | Cloudflare Access origin gate | Config parsing, JWT/audience classification, host/app separation, public-host fail-closed behavior, mobile/app route gating, app artifact gating, device-token exchange, Google JWKS cache refresh/TTL behavior, mobile Access CN actor binding, Cloudflare mTLS CA upload/hostname association, per-device Common Name policy sync, and read-only smoke evidence collection are merged. |
 | External fallback | Email/human fallback delivery and inbound email validation path are retained in the Rust track. |
 | Queue and nodes | Queue list/detail, CLI list/status, pending submit, simple execute/cancel, queue recovery, queue fixtures, node reads, and node HTTP routes are implemented; remaining work is final live/recovery cutover evidence and any retained node-agent remote-control gaps. |
@@ -190,6 +192,18 @@ Current live canary artifact:
 Summary: `10` passed, `0` blocked, `1` skipped. The skipped check is the
 optional supplied Cloudflare/mobile smoke report; all launchd, local Rust,
 tunnel, and public unauthenticated denial checks passed.
+
+Current adb-managed Android emulator smoke artifact:
+
+```text
+.local/rust-mvp-rehearsals/android-emulator-smoke-20260617T205819Z.json
+```
+
+Summary: `16` passed, `0` blocked, `2` skipped. The host runner reused the
+booted `sm_mtls_api35` emulator, installed the debug APK, exposed the pairing
+listener over `adb reverse`, and the debug-only app activity passed enrollment,
+auth-session, client sessions, analytics, app artifact metadata, and
+attach-ticket proof through `https://sm-app.rajeshgo.li`.
 
 The latest clean passive shadow report after #996 used
 `--last-minutes 30 --fail-on-blockers --json` and returned:
