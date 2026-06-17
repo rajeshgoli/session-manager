@@ -82,6 +82,27 @@ For `--target rust`, CLI checks default to `target/debug/sm` so retired or
 Rust-only CLI contracts do not accidentally exercise the Python `sm` on PATH.
 Pass `--sm-binary <path>` when testing another Rust CLI build.
 
+## Public Tunnel Preflight
+
+After Rust owns the production service port, validate the local cloudflared
+ingress config before relying on the public app path:
+
+```bash
+python -m scripts.rust_migration.public_tunnel_preflight \
+  --config .local/android-parity/cloudflared/config-http-only.yml \
+  --fail-on-blockers
+```
+
+The default gate expects:
+
+- `sm-app.rajeshgo.li` routes to `http://127.0.0.1:8420`;
+- legacy `sm.rajeshgo.li` is absent;
+- wildcard SM hostnames are absent;
+- the final catch-all ingress row is `http_status:404`.
+
+This command only parses local YAML and prints evidence. It does not mutate
+Cloudflare account state or tunnel credentials.
+
 Audit the retained/retired CLI cutover scope without running commands:
 
 ```bash

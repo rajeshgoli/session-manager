@@ -1,8 +1,10 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-16 after PR #1039 accelerated Rust
-canary evidence mode. Issue #1040 adds the reviewed Rust service launchd
-cutover runbook/tooling for the first canary flip.
+Status: handoff snapshot from 2026-06-17 after PR #1041 merged the reviewed
+Rust service launchd cutover tooling and the first Rust canary flip moved local
+production traffic to Rust. Issue #1042 adds the public tunnel preflight that
+keeps `sm-app.rajeshgo.li` pointed at the launchd-managed Rust service and
+keeps legacy `sm.rajeshgo.li` off origin.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -14,19 +16,28 @@ Service cutover commands live in
 
 ## Current Repository State
 
-- Branch: `main` after PR #1039.
-- Latest merged commit before this docs refresh: `c638d10` (`Merge pull
-  request #1039`)
+- Branch: `main` after PR #1041.
+- Latest merged commit before this docs refresh: `f7e74af` (`Merge pull
+  request #1041`)
 - Open PRs at handoff: none before this docs refresh PR.
 - Dirty worktree at handoff: only pre-existing untracked
   `.claude/settings.local.json`, `certs/`, `data/`, and the local
   `config.yaml.shadow-backup-20260612T023248Z` created when enabling shadow
   mode.
-- Stale session-manager review agents from the overnight run and PR #932 were retired.
-- Unrelated non-session-manager agents were left alone.
-- Live Python-authoritative Rust shadow mode is enabled in `config.yaml`, with
-  Python serving on `:8420`, the Rust sidecar on `127.0.0.1:8421`, and the
-  ledger at `~/.local/share/claude-sessions/rust_shadow.jsonl`.
+- Rust is live on `127.0.0.1:8420` under launchd label
+  `com.rajeshgoli.session-manager-rust`.
+- Python launchd label `com.rajeshgoli.session-manager` was stopped before the
+  final backup.
+- Final stopped-origin backup:
+  `.local/rust-final-backup-20260617T033653Z`.
+- `sm-app.rajeshgo.li` is the protected public app hostname. It should route
+  through Cloudflare Access to `http://127.0.0.1:8420`.
+- Legacy `sm.rajeshgo.li` should not route to origin and should return 404 from
+  the tunnel.
+- The prior `127.0.0.1:8421` Rust sidecar was useful for shadow/rehearsal but
+  is not part of the live target after the tunnel is repointed to `8420`.
+- Validate the local public tunnel shape with
+  `./venv/bin/python -m scripts.rust_migration.public_tunnel_preflight --config .local/android-parity/cloudflared/config-http-only.yml --fail-on-blockers`.
 
 ## Completed Work
 
@@ -67,7 +78,7 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1039.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1041.
 - [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
   records the current Cloudflare Access origin-gate behavior and remaining
   operator setup/smoke evidence.
@@ -182,8 +193,11 @@ Merged Rust slices cover:
   `/client/sessions` JSON responses are not truncated before assertion checks.
 - PR #1039 adds the accelerated Rust canary evidence mode for the case where
   Python-origin availability prevents sustained baseline/shadow evidence.
-- Issue #1040 adds the Rust service cutover helper and runbook for reviewed
+- PR #1041 adds the Rust service cutover helper and runbook for reviewed
   launchd ownership transfer.
+- Issue #1042 adds the public tunnel preflight so the protected app hostname is
+  validated against `127.0.0.1:8420` and legacy public host routes are blocked
+  before relying on the app path.
 - Current contract manifest size:
   - `134` checks total
   - `73` `python_and_rust`
