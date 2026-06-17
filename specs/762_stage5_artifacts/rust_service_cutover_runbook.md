@@ -138,7 +138,22 @@ curl -sS -o /tmp/sm-app-health-public.txt -w 'sm-app %{http_code}\n' https://sm-
 curl -sS -o /tmp/sm-legacy-health-public.txt -w 'legacy %{http_code}\n' https://sm.rajeshgo.li/health
 ```
 
-Expected: `sm-app 403` from Cloudflare Access and `legacy 404`.
+Expected: `sm-app 403` from Cloudflare Access or another Cloudflare
+before-origin denial, and `legacy 403` or `legacy 404`. A `200` health response
+from either public hostname is a blocker because it means unauthenticated
+traffic reached origin.
+
+Collect the same checks as a single JSON evidence artifact:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.live_canary_report \
+  --output .local/rust-mvp-rehearsals/live-canary-$(date -u +%Y%m%dT%H%M%SZ).json \
+  --fail-on-blockers
+```
+
+This command is non-mutating. It records Rust launchd ownership, local Rust
+health/native-read checks, `sm status`, tunnel config shape, public Access
+denial, legacy-host absence, and optional Cloudflare/mobile smoke evidence.
 
 ## First 15-Minute Smoke Checklist
 

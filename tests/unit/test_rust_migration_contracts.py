@@ -267,7 +267,7 @@ def test_cloudflare_access_cutover_evidence_pins_policy_and_origin_gates():
         assert required in evidence
 
 
-def test_handoff_and_progress_are_current_through_public_tunnel_issue1042():
+def test_handoff_and_progress_are_current_through_live_canary_issue1044():
     progress = (STAGE5_DIR / "mvp_progress.md").read_text(encoding="utf-8")
     handoff = (STAGE5_DIR / "resume_handoff.md").read_text(encoding="utf-8")
     gate_matrix = (STAGE5_DIR / "gate_matrix.md").read_text(encoding="utf-8")
@@ -294,9 +294,11 @@ def test_handoff_and_progress_are_current_through_public_tunnel_issue1042():
         assert "#1039" in text
         assert "#1041" in text
         assert "issue #1042" in text.lower()
+        assert "issue #1044" in text.lower()
         assert "Cloudflare Access" in text
         assert "cloudflare_access_cutover_evidence.md" in text
         assert "public_tunnel_preflight" in text
+        assert "live_canary_report" in text
         assert "sm-app.rajeshgo.li" in text
         assert "python_canary_spot_checks" in text
         assert "cloudflare_access_smoke_report" in text
@@ -311,6 +313,7 @@ def test_handoff_and_progress_are_current_through_public_tunnel_issue1042():
     assert "app update artifact access works through the certificate-gated app path" in handoff
     assert "--cloudflare-smoke-report" in readme
     assert "public_tunnel_preflight" in readme
+    assert "live_canary_report" in readme
 
 
 def test_manifest_covers_rust_only_retired_http_surfaces():

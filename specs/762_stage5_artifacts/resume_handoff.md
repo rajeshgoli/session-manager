@@ -4,7 +4,8 @@ Status: handoff snapshot from 2026-06-17 after PR #1041 merged the reviewed
 Rust service launchd cutover tooling and the first Rust canary flip moved local
 production traffic to Rust. Issue #1042 adds the public tunnel preflight that
 keeps `sm-app.rajeshgo.li` pointed at the launchd-managed Rust service and
-keeps legacy `sm.rajeshgo.li` off origin.
+keeps legacy `sm.rajeshgo.li` off origin. Issue #1044 adds the post-cutover
+live Rust canary report.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -32,12 +33,14 @@ Service cutover commands live in
   `.local/rust-final-backup-20260617T033653Z`.
 - `sm-app.rajeshgo.li` is the protected public app hostname. It should route
   through Cloudflare Access to `http://127.0.0.1:8420`.
-- Legacy `sm.rajeshgo.li` should not route to origin and should return 404 from
-  the tunnel.
+- Legacy `sm.rajeshgo.li` should not route to origin. It may return Cloudflare
+  denial or tunnel 404, but must not return the Rust origin health response.
 - The prior `127.0.0.1:8421` Rust sidecar was useful for shadow/rehearsal but
   is not part of the live target after the tunnel is repointed to `8420`.
 - Validate the local public tunnel shape with
   `./venv/bin/python -m scripts.rust_migration.public_tunnel_preflight --config .local/android-parity/cloudflared/config-http-only.yml --fail-on-blockers`.
+- Collect live canary evidence with
+  `./venv/bin/python -m scripts.rust_migration.live_canary_report --output .local/rust-mvp-rehearsals/live-canary-$(date -u +%Y%m%dT%H%M%SZ).json --fail-on-blockers`.
 
 ## Completed Work
 
@@ -198,6 +201,9 @@ Merged Rust slices cover:
 - Issue #1042 adds the public tunnel preflight so the protected app hostname is
   validated against `127.0.0.1:8420` and legacy public host routes are blocked
   before relying on the app path.
+- Issue #1044 adds the live canary report that records launchd ownership, local
+  Rust health/native reads, `sm status`, public tunnel shape, public Access
+  denial, and legacy-host absence without mutating live state.
 - Current contract manifest size:
   - `134` checks total
   - `73` `python_and_rust`
@@ -401,6 +407,19 @@ assertion is present. It remains blocked because the shell did not have
 `SM_DEVICE_BEARER_TOKEN`, or `SM_COOKIE` set. Summary: `1` passed, `5`
 blocked, `7` skipped. This is partial boundary evidence only.
 
+Post-cutover live Rust canary evidence:
+
+```text
+.local/rust-mvp-rehearsals/live-canary-20260617T192700Z.json
+```
+
+Summary: `10` passed, `0` blocked, `1` skipped. The passing checks cover the
+Rust launchd label, local Rust health/detailed health/bootstrap/session
+list/native analytics reads, `sm status`, local public tunnel preflight,
+unauthenticated `sm-app` public denial before origin, and legacy public-host
+absence. The skipped check is the optional supplied Cloudflare/mobile smoke
+report.
+
 No newer clean full passive shadow or full Cloudflare/mobile smoke artifact has
 been recorded in this handoff. PR #1012 published Android artifact `cbb61798`
 (`versionCode=1013`, `versionName=0.1.0-enroll-ui-cleanup`) and operator
@@ -519,26 +538,24 @@ Do not start Rust writer ownership or MVP cutover until:
 
 ## Recommended Resume Point
 
-Continue with Cloudflare Access deployment evidence, then produce either normal
-shadow evidence or the accelerated Rust canary report:
+Continue with the live Rust canary report, then fill in any remaining bounded
+Cloudflare/mobile smoke gaps:
 
-1. Provide the smoke runner proof inputs for the already configured Cloudflare
+1. Keep `scripts.rust_migration.live_canary_report` passing against the live
+   Rust service and treat any new blocker as a bounded Rust/service/tunnel bug.
+2. Provide the smoke runner proof inputs for the already configured Cloudflare
    Access apps: mobile/browser Access JWTs, public-edge HMAC secret, and SM
    bearer/cookie.
-2. Configure or verify any remaining Cloudflare Access apps/policies described in
+3. Configure or verify any remaining Cloudflare Access apps/policies described in
    [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md).
-3. Exercise the native app route class through the app hostname so mobile gates
+4. Exercise the native app route class through the app hostname so mobile gates
    collect real traffic and smoke evidence.
-4. If Python remains stable, keep Python-authoritative Rust shadow running for
-   retained reads, let it observe real traffic for the agreed window, and
-   summarize the ledger by route/comparison/mismatch.
-5. If Python remains the unstable component, run `mvp_rehearsal
-   --rust-canary-cutover --cloudflare-smoke-report <passed-smoke-json>` and use
-   that report as the cutover-candidate evidence artifact.
+5. If Python is restarted for comparison, keep it to targeted checks or the
+   explicit `--rust-canary-cutover` path; do not do broad Python hardening.
 6. Convert any unexplained retained-surface mismatch or canary blocker into a
    bounded Rust slice.
 
 This is the highest-signal next step because the Rust origin gate is merged and
-the broad Python service is now the limiting factor. Do not do broad Python
-hardening; prove the Rust canary path or fix bounded Rust/Cloudflare/mobile
+the broad Python service is no longer the live owner. Do not do broad Python
+hardening; prove the Rust live canary path or fix bounded Rust/Cloudflare/mobile
 blockers.
