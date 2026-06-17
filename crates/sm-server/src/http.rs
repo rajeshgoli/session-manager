@@ -1137,10 +1137,40 @@ async fn tmux_client_hook(
             detail: "unsupported tmux client event".to_owned(),
         });
     }
-    Ok(Json(json!({
+    let revived_session_id = if state.config.rust_core.runtime_enabled
+        && matches!(event_name, "client-attached" | "client-session-changed")
+    {
+        query
+            .session
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                query
+                    .client_session
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .map(|tmux_session| {
+                let runtime = TmuxRuntime::from_app_config(&state.config);
+                state
+                    .session_store
+                    .revive_stopped_tmux_client_session(tmux_session, &runtime)
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let mut response = json!({
         "status": "ok",
         "tmux_client_event_version": 0,
-    })))
+    });
+    if let Some(session_id) = revived_session_id {
+        response["revived_session_id"] = Value::String(session_id);
+    }
+    Ok(Json(response))
 }
 
 async fn client_bootstrap(
@@ -9771,6 +9801,10 @@ struct IssuedDeviceAccessToken {
 #[derive(Debug, Deserialize)]
 struct TmuxClientHookQuery {
     event: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default, rename = "client_session")]
+    client_session: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -853,6 +853,78 @@ impl SessionStore {
         Ok(Some(CoreRestoreOutcome::Restored(restored)))
     }
 
+    pub fn revive_stopped_tmux_client_session(
+        &self,
+        tmux_session: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<Option<String>> {
+        let tmux_session = tmux_session.trim();
+        if tmux_session.is_empty() {
+            return Ok(None);
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session_index) = sessions.iter().position(|value| {
+            let Some(session) = value.as_object() else {
+                return false;
+            };
+            json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
+                && json_text(session.get("provider")).as_deref() == Some("codex-fork")
+                && json_text(session.get("node"))
+                    .as_deref()
+                    .is_none_or(is_primary_node)
+                && json_text(session.get("status"))
+                    .as_deref()
+                    .is_some_and(|status| normalized_status(status) == "stopped")
+        }) else {
+            return Ok(None);
+        };
+
+        let Some(session) = sessions[session_index].as_object() else {
+            return Ok(None);
+        };
+        let Some(session_id) = json_text(session.get("id")) else {
+            return Ok(None);
+        };
+        let session_runtime =
+            runtime.for_socket_name(json_text(session.get("tmux_socket_name")).as_deref());
+        if !session_runtime.session_exists(tmux_session)? {
+            return Ok(None);
+        }
+
+        let now = now_rfc3339();
+        let Some(session) = sessions[session_index].as_object_mut() else {
+            return Ok(None);
+        };
+        session.insert("status".to_owned(), Value::String("idle".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        session.insert("completion_status".to_owned(), Value::Null);
+        session.insert("completion_message".to_owned(), Value::Null);
+        session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        session.insert("error_message".to_owned(), Value::Null);
+        session.insert("last_activity".to_owned(), Value::String(now));
+        if let Some(socket_name) = session_runtime.socket_name() {
+            session.insert(
+                "tmux_socket_name".to_owned(),
+                Value::String(socket_name.to_owned()),
+            );
+        }
+
+        let spec = codex_fork_spec_for_session_raw(&session_id, session)?;
+        let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
+        self.write_raw_json_value(&state)?;
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor_from_current_end(
+                session_id.clone(),
+                artifacts.event_stream_path,
+            )?;
+        }
+        Ok(Some(session_id))
+    }
+
     pub fn set_context_monitor(
         &self,
         session_id: &str,
@@ -1662,6 +1734,26 @@ impl SessionStore {
         session_id: String,
         event_stream_path: PathBuf,
     ) -> Result<()> {
+        self.start_codex_fork_event_monitor_at_offset(session_id, event_stream_path, 0)
+    }
+
+    fn start_codex_fork_event_monitor_from_current_end(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+    ) -> Result<()> {
+        let initial_offset = fs::metadata(&event_stream_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        self.start_codex_fork_event_monitor_at_offset(session_id, event_stream_path, initial_offset)
+    }
+
+    fn start_codex_fork_event_monitor_at_offset(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+        initial_offset: u64,
+    ) -> Result<()> {
         let store = self.clone();
         let thread_session_id = format!(
             "{}-{}",
@@ -1670,13 +1762,20 @@ impl SessionStore {
         );
         thread::Builder::new()
             .name(format!("sm-codex-fork-events-{thread_session_id}"))
-            .spawn(move || store.monitor_codex_fork_event_stream(session_id, event_stream_path))
+            .spawn(move || {
+                store.monitor_codex_fork_event_stream(session_id, event_stream_path, initial_offset)
+            })
             .with_context(|| "failed to start codex-fork event monitor")?;
         Ok(())
     }
 
-    fn monitor_codex_fork_event_stream(&self, session_id: String, event_stream_path: PathBuf) {
-        let mut offset = 0;
+    fn monitor_codex_fork_event_stream(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+        initial_offset: u64,
+    ) {
+        let mut offset = initial_offset;
         let mut buffer = String::new();
         loop {
             match self.codex_fork_monitor_should_continue(&session_id) {
@@ -2029,11 +2128,29 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         | "item_completed"
         | "agent_message"
         | "exec_command_end" => Some("running"),
+        "error" if codex_fork_error_will_retry(event) => Some("running"),
         "error" | "shutdown" => Some("stopped"),
         "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
         other if other.ends_with("_begin") || other.ends_with("_delta") => Some("running"),
         _ => None,
     }
+}
+
+fn codex_fork_error_will_retry(event: &Map<String, Value>) -> bool {
+    event
+        .get("willRetry")
+        .or_else(|| event.get("will_retry"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            codex_fork_payload(event)
+                .and_then(|payload| {
+                    payload
+                        .get("willRetry")
+                        .or_else(|| payload.get("will_retry"))
+                })
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 fn codex_fork_event_type(event: &Map<String, Value>) -> Option<String> {
@@ -3125,13 +3242,24 @@ fn codex_fork_control_socket_path_for_session_raw(
     session: &Map<String, Value>,
     runtime: &TmuxRuntime,
 ) -> Result<PathBuf> {
+    let spec = codex_fork_spec_for_session_raw(session_id, session)?;
+    let artifacts = runtime
+        .codex_fork_runtime_artifacts(&spec)?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} is not a codex-fork session"))?;
+    Ok(artifacts.control_socket_path)
+}
+
+fn codex_fork_spec_for_session_raw(
+    session_id: &str,
+    session: &Map<String, Value>,
+) -> Result<TmuxSessionSpec> {
     let tmux_session = json_text(session.get("tmux_session"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
     let working_dir = json_text(session.get("working_dir"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing working_dir"))?;
     let log_file = json_text(session.get("log_file"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing log_file"))?;
-    let spec = TmuxSessionSpec {
+    Ok(TmuxSessionSpec {
         session_id: session_id.to_owned(),
         tmux_session,
         working_dir: expand_home(&working_dir).display().to_string(),
@@ -3139,11 +3267,7 @@ fn codex_fork_control_socket_path_for_session_raw(
         provider: "codex-fork".to_owned(),
         initial_message: None,
         model: json_text(session.get("model")),
-    };
-    let artifacts = runtime
-        .codex_fork_runtime_artifacts(&spec)?
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} is not a codex-fork session"))?;
-    Ok(artifacts.control_socket_path)
+    })
 }
 
 fn codex_fork_submit_message(control_socket_path: &Path, text: &str) -> Result<()> {
@@ -5041,6 +5165,33 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "tmux1");
+    }
+
+    #[test]
+    fn codex_fork_retry_error_events_are_not_terminal() {
+        let retry = json!({
+            "event_type": "error",
+            "payload": {
+                "willRetry": true,
+                "error": {
+                    "message": "Reconnecting... 1/5"
+                }
+            }
+        });
+        let retry_event = retry.as_object().unwrap();
+        assert_eq!(codex_fork_status_for_event(retry_event), Some("running"));
+
+        let terminal = json!({
+            "event_type": "error",
+            "payload": {
+                "willRetry": false,
+                "error": {
+                    "message": "Selected model is at capacity."
+                }
+            }
+        });
+        let terminal_event = terminal.as_object().unwrap();
+        assert_eq!(codex_fork_status_for_event(terminal_event), Some("stopped"));
     }
 
     #[test]
