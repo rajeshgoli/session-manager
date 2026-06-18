@@ -1,11 +1,12 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-17 after PR #1041 merged the reviewed
-Rust service launchd cutover tooling and the first Rust canary flip moved local
+Status: handoff snapshot from 2026-06-17 after PR #1045 merged the
+post-cutover live Rust canary report. The first Rust canary flip moved local
 production traffic to Rust. Issue #1042 adds the public tunnel preflight that
 keeps `sm-app.rajeshgo.li` pointed at the launchd-managed Rust service and
-keeps legacy `sm.rajeshgo.li` off origin. Issue #1044 adds the post-cutover
-live Rust canary report.
+keeps legacy `sm.rajeshgo.li` off origin. Issue #1046 adds public mTLS
+Cloudflare/mobile smoke evidence and a live canary artifact with that smoke
+supplied.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -17,9 +18,9 @@ Service cutover commands live in
 
 ## Current Repository State
 
-- Branch: `main` after PR #1041.
-- Latest merged commit before this docs refresh: `f7e74af` (`Merge pull
-  request #1041`)
+- Branch: `main` after PR #1045.
+- Latest merged commit before this docs refresh: `948e6ec` (`Merge pull
+  request #1045`)
 - Open PRs at handoff: none before this docs refresh PR.
 - Dirty worktree at handoff: only pre-existing untracked
   `.claude/settings.local.json`, `certs/`, `data/`, and the local
@@ -40,7 +41,7 @@ Service cutover commands live in
 - Validate the local public tunnel shape with
   `./venv/bin/python -m scripts.rust_migration.public_tunnel_preflight --config .local/android-parity/cloudflared/config-http-only.yml --fail-on-blockers`.
 - Collect live canary evidence with
-  `./venv/bin/python -m scripts.rust_migration.live_canary_report --output .local/rust-mvp-rehearsals/live-canary-$(date -u +%Y%m%dT%H%M%SZ).json --fail-on-blockers`.
+  `./venv/bin/python -m scripts.rust_migration.live_canary_report --cloudflare-smoke-report .local/rust-mvp-rehearsals/public-mtls-smoke-20260617T202635Z.json --output .local/rust-mvp-rehearsals/live-canary-$(date -u +%Y%m%dT%H%M%SZ).json --fail-on-blockers`.
 
 ## Completed Work
 
@@ -81,7 +82,8 @@ Merged Rust slices cover:
 
 ### Documentation And Manifest
 
-- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1041.
+- [mvp_progress.md](mvp_progress.md) records the PR lineage through #1045 and
+  issue #1046.
 - [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md)
   records the current Cloudflare Access origin-gate behavior and remaining
   operator setup/smoke evidence.
@@ -204,6 +206,11 @@ Merged Rust slices cover:
 - Issue #1044 adds the live canary report that records launchd ownership, local
   Rust health/native reads, `sm status`, public tunnel shape, public Access
   denial, and legacy-host absence without mutating live state.
+- PR #1045 merged the live canary report.
+- Issue #1046 adds a public mTLS mode to the Cloudflare smoke runner. It can
+  generate an ephemeral client certificate from the local mobile CA for the
+  enrolled Android Common Name, records no cert/key/token material, and produces
+  a smoke report accepted by the live canary gate.
 - Current contract manifest size:
   - `134` checks total
   - `73` `python_and_rust`
@@ -335,22 +342,23 @@ show:
 - Rust live core, synthetic read-only fixture, and mutating fixture contracts
   passed;
 - Rust baseline passed;
-- `cloudflare_access_smoke_report` passed from a smoke report that used real
-  Cloudflare Access, public-edge, and SM auth proof inputs;
+- `cloudflare_access_smoke_report` passed from a smoke report that used the
+  real public mTLS app host;
 - `python_baseline` and `shadow_read_summary` recorded as skipped because
   `--rust-canary-cutover` was intentionally selected.
 
 Command shape:
 
 ```bash
+cn=$(sqlite3 "$HOME/.local/share/claude-sessions/mobile_devices.db" \
+  "SELECT common_name FROM mobile_device_enrollments WHERE revoked_at IS NULL ORDER BY paired_at DESC LIMIT 1;")
+
 ./venv/bin/python -m scripts.rust_migration.cloudflare_access_smoke \
-  --base-url http://127.0.0.1:8421 \
-  --mobile-host sm-app.rajeshgo.li \
-  --browser-host sm.rajeshgo.li \
-  --mobile-access-jwt-env CF_MOBILE_ACCESS_JWT \
-  --browser-access-jwt-env CF_BROWSER_ACCESS_JWT \
-  --public-edge-secret-env SM_PUBLIC_EDGE_SECRET \
-  --bearer-token-env SM_DEVICE_BEARER_TOKEN \
+  --mode public-mtls \
+  --public-base-url https://sm-app.rajeshgo.li \
+  --client-cert-common-name "$cn" \
+  --device-ca-cert-file certs/sm-mobile-device-ca.pem \
+  --device-ca-key-file certs/sm-mobile-device-ca.key \
   --output .local/rust-mvp-rehearsals/cloudflare-smoke.json \
   --json \
   --fail-on-blockers
@@ -410,24 +418,36 @@ blocked, `7` skipped. This is partial boundary evidence only.
 Post-cutover live Rust canary evidence:
 
 ```text
-.local/rust-mvp-rehearsals/live-canary-20260617T192700Z.json
+.local/rust-mvp-rehearsals/live-canary-with-public-mtls-20260617T202645Z.json
 ```
 
-Summary: `10` passed, `0` blocked, `1` skipped. The passing checks cover the
+Summary: `11` passed, `0` blocked, `0` skipped. The passing checks cover the
 Rust launchd label, local Rust health/detailed health/bootstrap/session
 list/native analytics reads, `sm status`, local public tunnel preflight,
 unauthenticated `sm-app` public denial before origin, and legacy public-host
-absence. The skipped check is the optional supplied Cloudflare/mobile smoke
-report.
+absence. The final passing check is the supplied public mTLS Cloudflare/mobile
+smoke report.
 
-No newer clean full passive shadow or full Cloudflare/mobile smoke artifact has
-been recorded in this handoff. PR #1012 published Android artifact `cbb61798`
-(`versionCode=1013`, `versionName=0.1.0-enroll-ui-cleanup`) and operator
-testing confirmed the app reached "Client certificate saved" after Camera-app
-deep-link enrollment. After PR #1035, operator testing also confirmed Android
-app update artifact access works through the certificate-gated app path. The
-full Access smoke runner and sustained shadow window still need recorded
-artifacts.
+Public mTLS Cloudflare/mobile smoke evidence:
+
+```text
+.local/rust-mvp-rehearsals/public-mtls-smoke-20260617T202635Z.json
+```
+
+Summary: `4` passed, `0` blocked, `1` skipped. The passing checks prove
+Cloudflare denies `sm-app.rajeshgo.li/client/bootstrap` without a client cert,
+an ephemeral client cert signed by the local mobile CA for the enrolled Android
+Common Name reaches bootstrap, `/client/sessions` still stops at SM auth with
+`401` without an SM bearer/cookie, and app artifact metadata is reachable
+through the certificate-gated app host. The skipped check is optional
+authenticated `/client/sessions` because no SM bearer token or cookie was
+supplied to the smoke runner.
+
+No newer clean full passive shadow artifact has been recorded in this handoff.
+PR #1012 published Android artifact `cbb61798` (`versionCode=1013`,
+`versionName=0.1.0-enroll-ui-cleanup`) and operator testing confirmed the app
+reached "Client certificate saved" after Camera-app deep-link enrollment. After
+PR #1035, operator testing also confirmed Android app update artifact access works through the certificate-gated app path.
 
 The broad live Rust contract run now uses the fixture filter:
 

@@ -488,7 +488,39 @@ rehearsal gates, not by executing Rust against live state from shadow mode.
 ## Cloudflare Access Smoke Evidence
 
 After the Cloudflare Access apps and tunnel policies are configured, collect
-read-only origin-gate evidence with:
+read-only public mTLS evidence with:
+
+```bash
+cn=$(sqlite3 "$HOME/.local/share/claude-sessions/mobile_devices.db" \
+  "SELECT common_name FROM mobile_device_enrollments WHERE revoked_at IS NULL ORDER BY paired_at DESC LIMIT 1;")
+
+python -m scripts.rust_migration.cloudflare_access_smoke \
+  --mode public-mtls \
+  --public-base-url https://sm-app.rajeshgo.li \
+  --client-cert-common-name "$cn" \
+  --device-ca-cert-file certs/sm-mobile-device-ca.pem \
+  --device-ca-key-file certs/sm-mobile-device-ca.key \
+  --output /tmp/sm-cloudflare-access-smoke.json \
+  --json \
+  --fail-on-blockers
+```
+
+This public mode generates an ephemeral client certificate in a temporary
+directory from the local mobile CA and enrolled device Common Name. The report
+does not record certificate material, private keys, Cloudflare cookies, Access
+tokens, bearer tokens, or raw auth-sensitive response bodies. It proves:
+
+- the public app host denies `/client/bootstrap` without a client certificate;
+- a valid client certificate reaches `/client/bootstrap`;
+- `/client/sessions` still stops at the SM auth boundary without an SM bearer or
+  session cookie;
+- app artifact metadata is reachable through the certificate-gated app host.
+
+The optional authenticated `/client/sessions` check runs only when an SM bearer
+token or cookie is supplied.
+
+The older origin-gate mode remains available for synthetic header checks against
+a local origin:
 
 ```bash
 python -m scripts.rust_migration.cloudflare_access_smoke \
@@ -508,11 +540,8 @@ provided through `--*-env` or `--*-file` options so they do not appear in proces
 arguments or shell history. File inputs strip one trailing newline.
 
 The smoke runner does not configure Cloudflare and does not perform mutating
-native app flows by default. It records missing/provided Access proof behavior,
-mobile bootstrap, app artifact metadata, the mobile Access-to-SM-auth boundary,
-and optional authenticated native session reads when an SM bearer token or
-cookie is supplied. Mobile success probes reject redirects/login HTML by
-requiring the expected JSON response shape. Browser `/auth/session` Access
+native app flows by default. Mobile success probes reject redirects/login HTML
+by requiring the expected JSON response shape. Browser `/auth/session` Access
 denial is enforced by Cloudflare at the edge rather than by the Rust origin, so
 the loopback smoke report records those checks as skipped edge-only evidence.
 Use the JSON output as operator evidence alongside
@@ -526,14 +555,15 @@ the system, use the explicit Rust canary path instead of spending time on
 throwaway Python hardening:
 
 ```bash
+cn=$(sqlite3 "$HOME/.local/share/claude-sessions/mobile_devices.db" \
+  "SELECT common_name FROM mobile_device_enrollments WHERE revoked_at IS NULL ORDER BY paired_at DESC LIMIT 1;")
+
 python -m scripts.rust_migration.cloudflare_access_smoke \
-  --base-url http://127.0.0.1:8421 \
-  --mobile-host sm-app.rajeshgo.li \
-  --browser-host sm.rajeshgo.li \
-  --mobile-access-jwt-env CF_MOBILE_ACCESS_JWT \
-  --browser-access-jwt-env CF_BROWSER_ACCESS_JWT \
-  --public-edge-secret-env SM_PUBLIC_EDGE_SECRET \
-  --bearer-token-env SM_DEVICE_BEARER_TOKEN \
+  --mode public-mtls \
+  --public-base-url https://sm-app.rajeshgo.li \
+  --client-cert-common-name "$cn" \
+  --device-ca-cert-file certs/sm-mobile-device-ca.pem \
+  --device-ca-key-file certs/sm-mobile-device-ca.key \
   --output /tmp/sm-cloudflare-access-smoke.json \
   --json \
   --fail-on-blockers
@@ -549,7 +579,7 @@ baseline. It replaces sustained Python baseline/shadow with
 `python_canary_spot_checks` for a small authority sanity set, then requires a
 passed Cloudflare/mobile smoke report as `cloudflare_access_smoke_report`.
 Reports produced this way are cutover-candidate evidence only when blockers are
-zero and the smoke report used real Access/public-edge/SM auth inputs.
+zero and the smoke report used the real public mTLS app host.
 
 ## MVP Sidecar Rehearsal
 
