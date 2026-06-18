@@ -101,10 +101,11 @@ use crate::queue::{
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
-    expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
-    ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
-    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    expand_home, is_primary_node, AgentRegistrationResponse, AgentStatusRequest,
+    ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse, ClearSessionRequest,
+    ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest, CoreClearOutcome,
+    CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome,
+    CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
     MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
     SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
     SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
@@ -2127,7 +2128,7 @@ async fn list_sessions(
         .session_store
         .list_sessions(query.include_stopped)?
         .into_iter()
-        .map(SessionResponse::from)
+        .map(|session| session_response_with_live_activity(&state, session))
         .collect::<Vec<_>>();
     Ok(Json(SessionsEnvelope::from(sessions)))
 }
@@ -2139,12 +2140,17 @@ async fn list_children_sessions(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    let children = state.session_store.list_children(
-        &parent_session_id,
-        query.recursive,
-        query.status.as_deref(),
-        query.include_terminated,
-    )?;
+    let children = state
+        .session_store
+        .list_child_records(
+            &parent_session_id,
+            query.recursive,
+            query.status.as_deref(),
+            query.include_terminated,
+        )?
+        .into_iter()
+        .map(|session| child_session_response_with_live_activity(&state, session))
+        .collect::<Vec<_>>();
     Ok(Json(json!({
         "parent_session_id": parent_session_id,
         "children": children,
@@ -2170,7 +2176,7 @@ async fn create_session(
     } else {
         state.session_store.create_core_session(payload, log_dir)?
     };
-    Ok(Json(SessionResponse::from(session)))
+    Ok(Json(session_response_with_live_activity(&state, session)))
 }
 
 async fn spawn_session(
@@ -2827,7 +2833,9 @@ async fn restore_node_restore_candidate(
         state.session_store.restore_core_session(&session_id)?
     };
     match outcome {
-        Some(CoreRestoreOutcome::Restored(session)) => Ok(Json(SessionResponse::from(session))),
+        Some(CoreRestoreOutcome::Restored(session)) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         Some(CoreRestoreOutcome::NotStopped) => Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is not stopped".to_owned(),
@@ -3827,7 +3835,7 @@ async fn get_session(
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    Ok(Json(SessionResponse::from(session)))
+    Ok(Json(session_response_with_live_activity(&state, session)))
 }
 
 async fn update_session_metadata(
@@ -3869,7 +3877,7 @@ async fn update_session_metadata(
                     let _ = runtime.set_status_bar(&session.tmux_session, friendly_name);
                 }
             }
-            Ok(Json(SessionResponse::from(session)))
+            Ok(Json(session_response_with_live_activity(&state, session)))
         }
         SessionMetadataOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         SessionMetadataOutcome::BadRequest(detail) => Err(ApiError::Status {
@@ -5579,7 +5587,9 @@ async fn restore_session(
         return Err(ApiError::NotFound("Session not found"));
     };
     match outcome {
-        CoreRestoreOutcome::Restored(session) => Ok(Json(SessionResponse::from(session))),
+        CoreRestoreOutcome::Restored(session) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         CoreRestoreOutcome::NotStopped => Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is not stopped".to_owned(),
@@ -5774,7 +5784,9 @@ async fn set_maintainer(
         .session_store
         .set_maintainer_session(&session_id, payload)?
     {
-        MaintainerMutationOutcome::Updated(session) => Ok(Json(SessionResponse::from(session))),
+        MaintainerMutationOutcome::Updated(session) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -5801,7 +5813,9 @@ async fn clear_maintainer(
         .session_store
         .clear_maintainer_session(&session_id, payload)?
     {
-        MaintainerMutationOutcome::Updated(session) => Ok(Json(SessionResponse::from(session))),
+        MaintainerMutationOutcome::Updated(session) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -5815,7 +5829,12 @@ async fn list_agent_registry(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    let registrations = state.session_store.list_agent_registrations()?;
+    let registrations = state
+        .session_store
+        .list_agent_registrations()?
+        .into_iter()
+        .map(|registration| agent_registration_response_with_live_activity(&state, registration))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({ "registrations": registrations })))
 }
 
@@ -5831,6 +5850,7 @@ async fn lookup_agent_registry(
             detail: "Role not registered".to_owned(),
         });
     };
+    let registration = agent_registration_response_with_live_activity(&state, registration)?;
     Ok(Json(serde_json::to_value(registration)?))
 }
 
@@ -5849,6 +5869,7 @@ async fn register_agent_role(
     )?;
     ensure_core_writes_enabled(&state)?;
     registry_mutation_response(
+        &state,
         state
             .session_store
             .register_agent_role(&session_id, payload)?,
@@ -5870,17 +5891,21 @@ async fn unregister_agent_role(
     )?;
     ensure_core_writes_enabled(&state)?;
     registry_mutation_response(
+        &state,
         state
             .session_store
             .unregister_agent_role(&session_id, payload)?,
     )
 }
 
-fn registry_mutation_response(outcome: RegistryMutationOutcome) -> Result<Json<Value>, ApiError> {
+fn registry_mutation_response(
+    state: &AppState,
+    outcome: RegistryMutationOutcome,
+) -> Result<Json<Value>, ApiError> {
     match outcome {
-        RegistryMutationOutcome::Registered(registration) => {
-            Ok(Json(serde_json::to_value(registration)?))
-        }
+        RegistryMutationOutcome::Registered(registration) => Ok(Json(serde_json::to_value(
+            agent_registration_response_with_live_activity(state, registration)?,
+        )?)),
         RegistryMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         RegistryMutationOutcome::RoleNotRegistered => Err(ApiError::Status {
             status: StatusCode::NOT_FOUND,
@@ -5899,6 +5924,18 @@ fn registry_mutation_response(outcome: RegistryMutationOutcome) -> Result<Json<V
             detail,
         }),
     }
+}
+
+fn agent_registration_response_with_live_activity(
+    state: &AppState,
+    mut registration: AgentRegistrationResponse,
+) -> Result<AgentRegistrationResponse, ApiError> {
+    if let Some(session) = state.session_store.get_session(&registration.session_id)? {
+        if let Some(activity_state) = live_activity_state(state, &session) {
+            registration.activity_state = activity_state.to_owned();
+        }
+    }
+    Ok(registration)
 }
 
 async fn session_output(
@@ -6642,12 +6679,17 @@ fn shadow_predict_session_read(
         .strip_prefix("/sessions/")
         .and_then(|value| value.strip_suffix("/children"))
     {
-        let children = state.session_store.list_children(
-            parent_session_id,
-            query_bool(query_string, "recursive"),
-            query_value(query_string, "status"),
-            query_bool(query_string, "include_terminated"),
-        )?;
+        let children = state
+            .session_store
+            .list_child_records(
+                parent_session_id,
+                query_bool(query_string, "recursive"),
+                query_value(query_string, "status"),
+                query_bool(query_string, "include_terminated"),
+            )?
+            .into_iter()
+            .map(|session| child_session_response_with_live_activity(state, session))
+            .collect::<Vec<_>>();
         let body = serde_json::to_vec(&json!({
             "parent_session_id": parent_session_id,
             "children": children,
@@ -7012,8 +7054,11 @@ fn client_session_value(
     actor_email: Option<&str>,
     route_prefix: Option<&str>,
 ) -> Value {
-    let mut value = serde_json::to_value(ClientSessionResponse::from(session.clone()))
-        .unwrap_or_else(|_| json!({}));
+    let mut value = serde_json::to_value(client_session_response_with_live_activity(
+        state,
+        session.clone(),
+    ))
+    .unwrap_or_else(|_| json!({}));
     let attach_descriptor = attach_descriptor_payload(session.clone());
     value["attach_descriptor"] = attach_descriptor.clone();
     value["termux_attach"] = Value::Null;
@@ -7060,6 +7105,70 @@ fn mobile_primary_action(mobile_terminal: &Value, attach_descriptor: &Value) -> 
             "label": "View details",
         })
     }
+}
+
+fn session_response_with_live_activity(
+    state: &AppState,
+    session: SessionRecord,
+) -> SessionResponse {
+    let mut response = SessionResponse::from(session.clone());
+    if let Some(activity_state) = live_activity_state(state, &session) {
+        response.set_activity_state(activity_state);
+    }
+    response
+}
+
+fn client_session_response_with_live_activity(
+    state: &AppState,
+    session: SessionRecord,
+) -> ClientSessionResponse {
+    let mut response = ClientSessionResponse::from(session.clone());
+    if let Some(activity_state) = live_activity_state(state, &session) {
+        response.set_activity_state(activity_state);
+    }
+    response
+}
+
+fn child_session_response_with_live_activity(
+    state: &AppState,
+    session: SessionRecord,
+) -> ChildSessionResponse {
+    let mut response = ChildSessionResponse::from(session.clone());
+    if let Some(activity_state) = live_activity_state(state, &session) {
+        response.set_activity_state(activity_state);
+    }
+    response
+}
+
+fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'static str> {
+    if session.status.trim() == "stopped" || session.completion_status.is_some() {
+        return None;
+    }
+    if session.agent_task_completed_at.is_some() {
+        return None;
+    }
+    if session.provider.trim() != "codex-fork" || session.tmux_session.trim().is_empty() {
+        return None;
+    }
+    let runtime = TmuxRuntime::from_app_config(&state.config)
+        .for_socket_name(session.tmux_socket_name.as_deref());
+    let pane_title = runtime.pane_title(&session.tmux_session)?;
+    codex_fork_pane_title_indicates_working(&pane_title).then_some("working")
+}
+
+fn codex_fork_pane_title_indicates_working(pane_title: &str) -> bool {
+    let title = pane_title.trim();
+    let Some((first_token, _)) = title.split_once(' ') else {
+        return false;
+    };
+    let mut chars = first_token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    (0x2801..=0x28ff).contains(&(first as u32))
 }
 
 fn mobile_terminal_metadata(
@@ -9369,14 +9478,14 @@ fn bug_report_server_state(
         .session_store
         .list_sessions(false)?
         .into_iter()
-        .map(SessionResponse::from)
+        .map(|session| session_response_with_live_activity(state, session))
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()?;
     let selected_session = if let Some(session_id) = selected_session_id {
         match state.session_store.get_session(session_id)? {
             Some(session) => json!({
                 "found": true,
-                "session": ClientSessionResponse::from(session),
+                "session": client_session_response_with_live_activity(state, session),
             }),
             None => json!({
                 "id": session_id,
@@ -10375,6 +10484,23 @@ mod tests {
     use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
+
+    #[test]
+    fn codex_fork_pane_title_spinner_indicates_working() {
+        assert!(codex_fork_pane_title_indicates_working("⠏ session-manager"));
+        assert!(codex_fork_pane_title_indicates_working(
+            "  ⠇ fractal-algo-rust  "
+        ));
+        assert!(!codex_fork_pane_title_indicates_working(
+            "fractal-algo-rust"
+        ));
+        assert!(!codex_fork_pane_title_indicates_working(
+            "⠏\tfractal-algo-rust"
+        ));
+        assert!(!codex_fork_pane_title_indicates_working(
+            "⠏⠇ fractal-algo-rust"
+        ));
+    }
 
     fn write_session_state(session_id: &str, status: &str) -> String {
         let dir = env::temp_dir().join(format!(

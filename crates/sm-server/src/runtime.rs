@@ -427,6 +427,19 @@ impl TmuxRuntime {
         }
     }
 
+    pub fn pane_title(&self, tmux_session: &str) -> Option<String> {
+        let output = self
+            .tmux_command(["display-message", "-p", "-t", tmux_session, "#{pane_title}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
     fn exit_copy_mode_if_needed(&self, tmux_session: &str) {
         if self.pane_in_mode(tmux_session) == Some(1) {
             let _ = self.run_tmux(["send-keys", "-t", tmux_session, "-X", "cancel"]);
