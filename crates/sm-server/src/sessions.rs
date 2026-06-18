@@ -3321,19 +3321,27 @@ fn deliver_runtime_text_to_session_raw(
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
     let mut delivered = false;
+    let mut mark_stopped_on_failure = true;
     if normalized_status(&status) != "stopped" {
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
             Some(true) => {
                 delivered = true;
             }
-            _ => {
+            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
+                delivered = session_runtime.send_input(&tmux_session, text)?;
+            }
+            Some(false) => {
+                delivered = false;
+                mark_stopped_on_failure = false;
+            }
+            None => {
                 delivered = session_runtime.send_input(&tmux_session, text)?;
             }
         }
         let now = now_rfc3339();
         if delivered {
             mark_session_followup_activity(session, &now);
-        } else {
+        } else if mark_stopped_on_failure {
             status = "stopped".to_owned();
             session.insert("status".to_owned(), Value::String(status.clone()));
             session.insert("stopped_at".to_owned(), Value::String(now.clone()));
@@ -3361,12 +3369,24 @@ fn deliver_urgent_runtime_text_to_session_raw(
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
     let mut delivered = false;
+    let mut mark_stopped_on_failure = true;
     if normalized_status(&status) != "stopped" {
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
             Some(true) => {
                 delivered = true;
             }
-            _ => {
+            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
+                delivered = session_runtime.send_urgent_input(
+                    &tmux_session,
+                    text,
+                    provider.eq_ignore_ascii_case("claude"),
+                )?;
+            }
+            Some(false) => {
+                delivered = false;
+                mark_stopped_on_failure = false;
+            }
+            None => {
                 delivered = session_runtime.send_urgent_input(
                     &tmux_session,
                     text,
@@ -3377,7 +3397,7 @@ fn deliver_urgent_runtime_text_to_session_raw(
         let now = now_rfc3339();
         if delivered {
             mark_session_followup_activity(session, &now);
-        } else {
+        } else if mark_stopped_on_failure {
             status = "stopped".to_owned();
             session.insert("status".to_owned(), Value::String(status.clone()));
             session.insert("stopped_at".to_owned(), Value::String(now.clone()));
@@ -3416,7 +3436,17 @@ fn deliver_runtime_native_rename_to_session_raw(
             }
             Err(error) => {
                 mark_codex_fork_control_degraded_raw(session, &error.to_string());
-                false
+                if runtime.codex_fork_control_tmux_fallback_enabled() {
+                    let tmux_session = json_text(session.get("tmux_session")).ok_or_else(|| {
+                        anyhow::anyhow!("session {session_id} missing tmux_session")
+                    })?;
+                    let session_socket_name = json_text(session.get("tmux_socket_name"));
+                    runtime
+                        .for_socket_name(session_socket_name.as_deref())
+                        .send_input(&tmux_session, &format!("/rename {friendly_name}"))?
+                } else {
+                    false
+                }
             }
         }
     } else if provider.eq_ignore_ascii_case("claude") {
