@@ -515,6 +515,7 @@ fn run() -> Result<()> {
         Command::Spawn(args) => {
             let prompt = args.prompt.join(" ");
             let parent_session_id = optional_current_session_id();
+            let provider = launch_provider_for_alias(&args.provider)?;
             let payload = if let Some(parent_session_id) = parent_session_id {
                 client.post_json(
                     "/sessions/spawn",
@@ -526,7 +527,7 @@ fn run() -> Result<()> {
                         "wait": args.wait,
                         "model": args.model,
                         "working_dir": args.working_dir,
-                        "provider": args.provider,
+                        "provider": provider,
                         "node": args.node
                     }),
                 )?
@@ -537,7 +538,7 @@ fn run() -> Result<()> {
                         "id": args.id,
                         "name": args.name,
                         "working_dir": args.working_dir,
-                        "provider": args.provider,
+                        "provider": provider,
                         "node": args.node,
                         "initial_message": prompt,
                         "model": args.model,
@@ -3903,6 +3904,27 @@ mod tests {
         assert_eq!(top_level["provider"], "codex-fork");
         assert_eq!(top_level["parent_session_id"], Value::Null);
         assert_eq!(top_level["node"], Value::Null);
+    }
+
+    #[test]
+    fn spawn_cli_provider_aliases_match_launch_aliases() {
+        let cli = Cli::try_parse_from(["sm", "spawn", "codex", "review this"]).unwrap();
+        let Command::Spawn(args) = cli.command else {
+            panic!("expected spawn command");
+        };
+        assert_eq!(
+            launch_provider_for_alias(&args.provider).unwrap(),
+            "codex-fork"
+        );
+
+        let cli = Cli::try_parse_from(["sm", "spawn", "codex-2", "review this"]).unwrap();
+        let Command::Spawn(args) = cli.command else {
+            panic!("expected spawn command");
+        };
+        assert_eq!(
+            launch_provider_for_alias(&args.provider).unwrap(),
+            "codex-fork"
+        );
     }
 
     #[test]
