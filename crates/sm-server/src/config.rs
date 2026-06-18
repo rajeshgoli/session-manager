@@ -658,6 +658,7 @@ pub struct CodexForkLaunchConfig {
     pub args: Vec<String>,
     pub default_model: Option<String>,
     pub event_schema_version: u32,
+    pub control_tmux_fallback_enabled: bool,
 }
 
 impl Default for CodexForkLaunchConfig {
@@ -667,6 +668,7 @@ impl Default for CodexForkLaunchConfig {
             args: codex_fork_managed_args(Vec::new()),
             default_model: None,
             event_schema_version: 2,
+            control_tmux_fallback_enabled: true,
         }
     }
 }
@@ -1171,6 +1173,8 @@ struct RawCodexForkLaunchConfig {
     provider: RawProviderLaunchConfig,
     #[serde(default)]
     event_schema_version: Option<u32>,
+    #[serde(default)]
+    control_tmux_fallback_enabled: Option<YamlValue>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1256,6 +1260,10 @@ fn codex_fork_launch_config(
         args: codex_fork_managed_args(args),
         default_model,
         event_schema_version: raw.event_schema_version.unwrap_or(2),
+        control_tmux_fallback_enabled: coerce_rollout_flag(
+            raw.control_tmux_fallback_enabled.as_ref(),
+            true,
+        ),
     }
 }
 
@@ -2112,6 +2120,7 @@ codex:
   default_model: "gpt-5"
 codex_fork:
   event_schema_version: 7
+  control_tmux_fallback_enabled: "off"
 "#,
         )
         .unwrap();
@@ -2128,6 +2137,15 @@ codex_fork:
         );
         assert_eq!(config.codex_fork.default_model.as_deref(), Some("gpt-5"));
         assert_eq!(config.codex_fork.event_schema_version, 7);
+        assert!(!config.codex_fork.control_tmux_fallback_enabled);
+    }
+
+    #[test]
+    fn raw_config_defaults_codex_fork_control_tmux_fallback_enabled() {
+        let raw: RawConfig = serde_yaml::from_str("codex_fork: {}\n").unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(config.codex_fork.control_tmux_fallback_enabled);
     }
 
     #[test]

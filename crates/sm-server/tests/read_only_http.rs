@@ -25,7 +25,7 @@ use sm_server::{
     },
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
     runtime::TmuxRuntime,
-    sessions::SessionStore,
+    sessions::{SendCoreInputRequest, SessionStore},
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -12604,6 +12604,7 @@ while true; do sleep 1; done
             ],
             default_model: Some("gpt-default".to_owned()),
             event_schema_version: 7,
+            control_tmux_fallback_enabled: true,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -12781,6 +12782,67 @@ while true; do sleep 1; done
             )
             .unwrap();
         assert_eq!(delivered_native_renames, 1);
+
+        let _ = fs::remove_file(&control_path);
+        assert!(!control_path.exists());
+        let (status, payload) = post_json(
+            app.clone(),
+            "/sessions/runtimefork/input",
+            json!({
+                "text": "tmux fallback message",
+                "delivery_mode": "direct"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["delivered"], true);
+        let fallback_output =
+            wait_for_output_contains(app.clone(), "runtimefork", "tmux fallback message").await;
+        assert!(fallback_output["output"]
+            .as_str()
+            .unwrap()
+            .contains("tmux fallback message"));
+
+        let disabled_fallback_runtime = TmuxRuntime::from_app_config(&AppConfig {
+            codex_fork: CodexForkLaunchConfig {
+                control_tmux_fallback_enabled: false,
+                ..CodexForkLaunchConfig::default()
+            },
+            rust_core: RustCoreConfig {
+                runtime_enabled: true,
+                log_dir: Some(log_dir.display().to_string()),
+                tmux_socket_name: Some(tmux_socket.clone()),
+                ..RustCoreConfig::default()
+            },
+            ..AppConfig::default()
+        });
+        let (status, delivered) =
+            SessionStore::new_with_queue(state_file.clone(), queue_db_path.clone())
+                .send_core_input_with_runtime(
+                    "runtimefork",
+                    SendCoreInputRequest {
+                        text: "disabled fallback message".to_owned(),
+                        delivery_mode: "direct".to_owned(),
+                        sender_session_id: None,
+                        from_sm_send: false,
+                        timeout_seconds: None,
+                        notify_on_delivery: false,
+                        notify_after_seconds: None,
+                        notify_on_stop: false,
+                        remind_soft_threshold: None,
+                        remind_hard_threshold: None,
+                        remind_cancel_on_reply_session_id: None,
+                        parent_session_id: None,
+                    },
+                    &disabled_fallback_runtime,
+                )
+                .unwrap()
+                .map(|result| (result.status, result.delivered))
+                .unwrap();
+        assert_eq!(status, "idle");
+        assert!(!delivered);
+        let (_, still_running_session) = get_json(app.clone(), "/sessions/runtimefork").await;
+        assert_eq!(still_running_session["status"], "idle");
     }
 
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
@@ -12908,6 +12970,7 @@ while true; do sleep 1; done
             ],
             default_model: None,
             event_schema_version: 2,
+            control_tmux_fallback_enabled: true,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,

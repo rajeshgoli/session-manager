@@ -32,6 +32,7 @@ pub struct TmuxRuntime {
     codex_fork_args: Vec<String>,
     codex_fork_default_model: Option<String>,
     codex_fork_event_schema_version: u32,
+    codex_fork_control_tmux_fallback_enabled: bool,
     prompt_mode: String,
     start_settle_ms: u64,
     send_keys_settle_ms: f64,
@@ -86,6 +87,7 @@ impl TmuxRuntime {
             ],
             codex_fork_default_model: None,
             codex_fork_event_schema_version: 2,
+            codex_fork_control_tmux_fallback_enabled: true,
             prompt_mode: config
                 .runtime_prompt_mode
                 .as_deref()
@@ -137,11 +139,17 @@ impl TmuxRuntime {
         runtime.codex_fork_args = config.codex_fork.args.clone();
         runtime.codex_fork_default_model = config.codex_fork.default_model.clone();
         runtime.codex_fork_event_schema_version = config.codex_fork.event_schema_version;
+        runtime.codex_fork_control_tmux_fallback_enabled =
+            config.codex_fork.control_tmux_fallback_enabled;
         runtime
     }
 
     pub fn socket_name(&self) -> Option<&str> {
         self.socket_name.as_deref()
+    }
+
+    pub fn codex_fork_control_tmux_fallback_enabled(&self) -> bool {
+        self.codex_fork_control_tmux_fallback_enabled
     }
 
     pub fn startup_settle_duration(&self) -> Duration {
