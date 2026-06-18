@@ -2266,14 +2266,34 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         | "turn_delta"
         | "turn_diff"
         | "item_started"
-        | "item_completed"
         | "agent_message"
         | "exec_command_end" => Some("running"),
+        "item_completed" => codex_fork_item_completed_status(event),
         "error" if codex_fork_error_will_retry(event) => Some("running"),
         "error" | "shutdown" => Some("stopped"),
         "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
         other if other.ends_with("_begin") || other.ends_with("_delta") => Some("running"),
         _ => None,
+    }
+}
+
+fn codex_fork_item_completed_status(event: &Map<String, Value>) -> Option<&'static str> {
+    let payload = codex_fork_payload(event)?;
+    let item = payload
+        .get("item")
+        .and_then(Value::as_object)
+        .unwrap_or(payload);
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("kind").and_then(Value::as_str))
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+
+    match item_type.as_deref() {
+        Some("agentmessage" | "agent_message" | "message") => Some("idle"),
+        Some(_) => Some("running"),
+        None => Some("running"),
     }
 }
 
@@ -5726,6 +5746,22 @@ mod tests {
         assert_eq!(codex_fork_status_for_event_line(active), Some("running"));
         assert_eq!(codex_fork_status_for_event_line(idle), Some("idle"));
         assert_eq!(codex_fork_status_for_event_line(unknown), None);
+    }
+
+    #[test]
+    fn codex_fork_completed_agent_message_is_idle() {
+        let completed_agent_message =
+            r#"{"event_type":"item_completed","payload":{"item":{"type":"agentMessage"}}}"#;
+        let completed_command = r#"{"event_type":"item_completed","payload":{"item":{"type":"commandExecution","status":"completed"}}}"#;
+
+        assert_eq!(
+            codex_fork_status_for_event_line(completed_agent_message),
+            Some("idle")
+        );
+        assert_eq!(
+            codex_fork_status_for_event_line(completed_command),
+            Some("running")
+        );
     }
 
     #[test]

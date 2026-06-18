@@ -10621,6 +10621,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_fork_event_stream_activity_treats_completed_agent_message_as_idle() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-agent-message-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"event_type\":\"item/agentMessage/delta\",\"payload\":{}}\n",
+                "{\"event_type\":\"item_completed\",\"payload\":{\"item\":{\"type\":\"agentMessage\"}}}\n",
+                "{\"event_type\":\"thread/tokenUsage/updated\",\"payload\":{}}\n",
+                "{\"event_type\":\"account/rateLimits/updated\",\"payload\":{}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream),
+            Some("idle")
+        );
+    }
+
     fn write_session_state(session_id: &str, status: &str) -> String {
         let dir = env::temp_dir().join(format!(
             "sm-rust-mobile-ticket-{}-{}",
