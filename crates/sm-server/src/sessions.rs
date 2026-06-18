@@ -159,6 +159,115 @@ impl SessionStore {
             }))
     }
 
+    pub fn apply_claude_stop_hook(
+        &self,
+        session_id: &str,
+        last_message: Option<&str>,
+        native_title: Option<&str>,
+        native_title_mtime_ns: Option<i64>,
+        transcript_path: Option<&str>,
+    ) -> Result<bool> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(false);
+        };
+        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+            return Ok(false);
+        }
+
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("idle".to_owned()));
+        session.insert("last_activity".to_owned(), Value::String(now.clone()));
+        session.insert("agent_status_text".to_owned(), Value::Null);
+        session.insert("agent_status_at".to_owned(), Value::Null);
+        if let Some(last_message) = last_message {
+            session.insert(
+                "last_action_summary".to_owned(),
+                Value::String(last_message.to_owned()),
+            );
+        }
+        if let Some(transcript_path) = transcript_path {
+            session.insert(
+                "transcript_path".to_owned(),
+                Value::String(transcript_path.to_owned()),
+            );
+            let provider =
+                json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+            if provider == "claude" {
+                if let Some(resume_id) = provider_resume_id_from_transcript_path(transcript_path) {
+                    session.insert("provider_resume_id".to_owned(), Value::String(resume_id));
+                }
+            }
+        }
+        if let Some(native_title) = native_title {
+            let title_changed =
+                json_text(session.get("native_title")).as_deref() != Some(native_title);
+            session.insert(
+                "native_title".to_owned(),
+                Value::String(native_title.to_owned()),
+            );
+            if let Some(native_title_mtime_ns) = native_title_mtime_ns {
+                session.insert(
+                    "native_title_source_mtime_ns".to_owned(),
+                    json!(native_title_mtime_ns),
+                );
+                if title_changed {
+                    session.insert(
+                        "native_title_updated_at_ns".to_owned(),
+                        json!(native_title_mtime_ns),
+                    );
+                }
+            } else if title_changed {
+                session.insert(
+                    "native_title_updated_at_ns".to_owned(),
+                    json!(now_unix_timestamp_nanos()),
+                );
+            }
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(true)
+    }
+
+    pub fn apply_claude_pre_tool_use_hook(
+        &self,
+        session_id: &str,
+        tool_name: Option<&str>,
+    ) -> Result<bool> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(false);
+        };
+        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+            return Ok(false);
+        }
+
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("running".to_owned()));
+        session.insert("last_activity".to_owned(), Value::String(now.clone()));
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        if let Some(tool_name) = tool_name {
+            session.insert(
+                "last_tool_name".to_owned(),
+                Value::String(tool_name.to_owned()),
+            );
+            session.insert("last_tool_call".to_owned(), Value::String(now));
+        }
+        self.write_raw_json_value(&state)?;
+        Ok(true)
+    }
+
     pub fn capture_output(&self, session_id: &str, lines: usize) -> Result<Option<String>> {
         let Some(session) = self.get_session(session_id)? else {
             return Ok(None);
@@ -4526,6 +4635,15 @@ fn subagent_response_from_value(value: &Value) -> Result<SubagentResponse> {
         status: json_text(value.get("status")).unwrap_or_else(|| "running".to_owned()),
         summary: json_text(value.get("summary")),
     })
+}
+
+fn provider_resume_id_from_transcript_path(transcript_path: &str) -> Option<String> {
+    Path::new(transcript_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn append_log_line(path: &Path, line: &str) -> Result<()> {
