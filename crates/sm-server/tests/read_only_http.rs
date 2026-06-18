@@ -20,8 +20,8 @@ use sm_server::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
         CodexObservabilityConfig, CodexRequestsConfig, CodexRolloutConfig, EmailConfig,
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
-        MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, PathsConfig, ProviderLaunchConfig,
-        QueueRunnerConfig, RustCoreConfig, SmSendConfig, ToolLoggingConfig,
+        MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, NodeConfig, PathsConfig,
+        ProviderLaunchConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig, ToolLoggingConfig,
     },
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
     runtime::TmuxRuntime,
@@ -7134,6 +7134,419 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
         .unwrap()
         .iter()
         .all(|session| session["id"] != "stop1234"));
+}
+
+#[tokio::test]
+async fn claude_stop_hook_marks_session_idle_for_watch_clients() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "sm_last_message": "done with the turn",
+            "sm_native_title": "Review docs",
+            "sm_transcript_mtime_ns": 424242_i64
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "idle");
+    assert_eq!(payload["activity_state"], "idle");
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["last_action_summary"], "done with the turn");
+    assert_eq!(session["native_title"], "Review docs");
+    assert_eq!(session["native_title_source_mtime_ns"], 424242_i64);
+    assert_eq!(session["native_title_updated_at_ns"], 424242_i64);
+}
+
+#[tokio::test]
+async fn claude_stop_hook_reads_local_transcript_metadata_when_not_inlined() {
+    let state_file = write_session_fixture();
+    let transcript_path = unique_temp_path().with_extension("jsonl");
+    fs::write(
+        &transcript_path,
+        [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"old output"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"latest output"}]}}"#,
+            r#"{"type":"custom-title","customTitle":"Transcript Native Title"}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "transcript_path": transcript_path.display().to_string()
+        }),
+        &[("host", "localhost:8420")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "idle");
+    assert_eq!(payload["activity_state"], "idle");
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["last_action_summary"], "latest output");
+    assert_eq!(session["native_title"], "Transcript Native Title");
+    assert_eq!(
+        session["transcript_path"],
+        transcript_path.display().to_string()
+    );
+    assert_eq!(
+        session["provider_resume_id"],
+        transcript_path.file_stem().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        session["native_title_updated_at_ns"],
+        session["native_title_source_mtime_ns"]
+    );
+    assert!(session["native_title_updated_at_ns"].as_i64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn claude_stop_hook_retries_local_transcript_metadata_read() {
+    let state_file = write_session_fixture();
+    let transcript_path = unique_temp_path().with_extension("jsonl");
+    let delayed_path = transcript_path.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        fs::write(
+            delayed_path,
+            [
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"delayed output"}]}}"#,
+                r#"{"type":"agent-name","agentName":"Delayed Native Title"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+    });
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "transcript_path": transcript_path.display().to_string()
+        }),
+        &[("host", "localhost:8420")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["last_action_summary"], "delayed output");
+    assert_eq!(session["native_title"], "Delayed Native Title");
+    assert_eq!(
+        session["provider_resume_id"],
+        transcript_path.file_stem().unwrap().to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn tool_use_hook_marks_session_working_and_records_tool_name() {
+    let state_file = write_session_fixture();
+    let tool_db = unique_temp_path().with_extension("tool_usage.db");
+    let mut config = config_with_state_file(&state_file);
+    config.tool_logging = ToolLoggingConfig {
+        db_path: tool_db.display().to_string(),
+    };
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/tool-use",
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_manager_id": "oldstate",
+            "session_id": "claude-native-session",
+            "tool_use_id": "toolu_123",
+            "tool_name": "Bash",
+            "cwd": "/repo",
+            "tool_input": {
+                "command": "git branch -D stale"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "logged" }));
+
+    let (status, payload) = get_json(app, "/sessions/oldstate").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["activity_state"], "working");
+    assert_eq!(payload["last_tool_name"], "Bash");
+    assert!(payload["last_tool_call"].is_string());
+
+    let conn = Connection::open(&tool_db).unwrap();
+    let row = conn
+        .query_row(
+            "SELECT session_id, claude_session_id, hook_type, tool_name, tool_use_id, cwd, project_name, tool_input, bash_command, is_destructive, destructive_type FROM tool_usage",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, bool>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "oldstate".to_owned(),
+            "claude-native-session".to_owned(),
+            "PreToolUse".to_owned(),
+            "Bash".to_owned(),
+            "toolu_123".to_owned(),
+            "/repo".to_owned(),
+            "repo".to_owned(),
+            json!({ "command": "git branch -D stale" }).to_string(),
+            "git branch -D stale".to_owned(),
+            true,
+            "git_branch_delete".to_owned(),
+        )
+    );
+}
+
+#[tokio::test]
+async fn tool_use_hook_marks_session_working_before_audit_db_failure() {
+    let state_file = write_session_fixture();
+    let not_a_dir = unique_temp_path().with_extension("not-a-dir");
+    fs::write(&not_a_dir, "not a directory").unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.tool_logging = ToolLoggingConfig {
+        db_path: not_a_dir.join("tool_usage.db").display().to_string(),
+    };
+    let app = router(AppState::new(config));
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/hooks/tool-use",
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_manager_id": "oldstate",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "echo fixture"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let (status, payload) = get_json(app, "/sessions/oldstate").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["activity_state"], "working");
+    assert_eq!(payload["last_tool_name"], "Bash");
+}
+
+#[tokio::test]
+async fn claude_stop_hook_does_not_refresh_title_update_time_for_unchanged_title() {
+    let state_file = write_session_fixture();
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    session["native_title"] = json!("Same Native Title");
+    session["native_title_updated_at_ns"] = json!(2000_i64);
+    session["friendly_name"] = json!("Explicit Name");
+    session["friendly_name_is_explicit"] = json!(true);
+    session["friendly_name_updated_at_ns"] = json!(3000_i64);
+    fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "sm_native_title": "Same Native Title",
+            "sm_transcript_mtime_ns": 5000_i64
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["native_title_source_mtime_ns"], 5000_i64);
+    assert_eq!(session["native_title_updated_at_ns"], 2000_i64);
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["friendly_name"], "Explicit Name");
+}
+
+#[tokio::test]
+async fn remote_hook_secret_is_required_for_remote_node_sessions() {
+    let state_file = write_session_fixture();
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    session["node"] = json!("macbook");
+    fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
+
+    let mut config = config_with_state_file(&state_file);
+    config.nodes.registry.insert(
+        "macbook".to_owned(),
+        NodeConfig {
+            id: "macbook".to_owned(),
+            hook_secret: Some("secret-hook".to_owned()),
+            ..NodeConfig::default()
+        },
+    );
+    let app = router(AppState::new(config));
+
+    let remote_peer = Some(SocketAddr::from(([203, 0, 113, 8], 49152)));
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345"
+        }),
+        &[],
+        remote_peer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(payload, json!({ "detail": "Invalid hook secret" }));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345"
+        }),
+        &[("x-sm-hook-secret", "secret-hook")],
+        remote_peer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+}
+
+#[tokio::test]
+async fn primary_hooks_require_auth_from_public_remote_requests() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
+    let remote_peer = Some(SocketAddr::from(([203, 0, 113, 9], 49152)));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345"
+        }),
+        &[("host", "sm.example.com")],
+        remote_peer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        payload,
+        json!({
+            "detail": "Authentication required",
+            "login_url": "/auth/google/login?next=%2Fhooks%2Fclaude"
+        })
+    );
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/hooks/tool-use",
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_manager_id": "run12345",
+            "tool_name": "Bash"
+        }),
+        &[("host", "sm.example.com")],
+        remote_peer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        payload,
+        json!({
+            "detail": "Authentication required",
+            "login_url": "/auth/google/login?next=%2Fhooks%2Ftool-use"
+        })
+    );
 }
 
 #[tokio::test]

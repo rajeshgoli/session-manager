@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     net::SocketAddr,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
@@ -13,7 +13,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use axum::{
@@ -65,7 +65,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::app_artifacts::{
     hashed_path, meta_path, read_metadata, store_artifact, valid_app_name, valid_artifact_hash,
@@ -116,7 +116,8 @@ use crate::sessions::{
     UpdateSessionMetadataRequest,
 };
 use crate::tool_usage::{
-    list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path, ToolCallRow,
+    list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
+    log_tool_usage_to_path, ToolCallRow, ToolUsageEvent,
 };
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
@@ -840,6 +841,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
         .route("/auth/device/google", post(auth_device_google))
+        .route("/hooks/claude", post(claude_hook))
+        .route("/hooks/tool-use", post(tool_use_hook))
         .route("/hooks/tmux-client", post(tmux_client_hook))
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/analytics/summary", get(client_analytics_summary))
@@ -1179,6 +1182,329 @@ async fn tmux_client_hook(
         response["revived_session_id"] = Value::String(session_id);
     }
     Ok(Json(response))
+}
+
+async fn claude_hook(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Response, ApiError> {
+    let Some(session_id) = hook_session_id(&payload) else {
+        return Ok(Json(json!({ "status": "unknown_session" })).into_response());
+    };
+    let is_local_hook = is_local_bypass_request(&headers, Some(peer_addr), &state.config);
+    verify_hook_auth_or_secret(
+        &state,
+        &headers,
+        Some(peer_addr),
+        &session_id,
+        "/hooks/claude",
+    )?;
+
+    let hook_event = payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if hook_event == "Stop" {
+        let mut last_message = payload
+            .get("sm_last_message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut native_title = payload
+            .get("sm_native_title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut native_title_mtime_ns = payload_i64(payload.get("sm_transcript_mtime_ns"));
+        let transcript_path = payload
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let transcript_metadata = if is_local_hook
+            && transcript_path.is_some()
+            && (last_message.is_none() || native_title.is_none() || native_title_mtime_ns.is_none())
+        {
+            let first_read = transcript_path.and_then(read_claude_transcript_metadata);
+            if should_retry_local_stop_transcript_read(first_read.as_ref()) {
+                sleep(Duration::from_millis(500)).await;
+                let second_read = transcript_path.and_then(read_claude_transcript_metadata);
+                choose_newer_transcript_metadata(first_read, second_read)
+            } else {
+                first_read
+            }
+        } else {
+            None
+        };
+        if let Some(metadata) = transcript_metadata.as_ref() {
+            if last_message.is_none() {
+                last_message = metadata.last_message.as_deref();
+            }
+            if native_title.is_none() {
+                native_title = metadata.native_title.as_deref();
+            }
+            if native_title_mtime_ns.is_none() {
+                native_title_mtime_ns = metadata.mtime_ns;
+            }
+        }
+        state.session_store.apply_claude_stop_hook(
+            &session_id,
+            last_message,
+            native_title,
+            native_title_mtime_ns,
+            transcript_path,
+        )?;
+    }
+
+    Ok(Json(json!({ "status": "ok" })).into_response())
+}
+
+async fn tool_use_hook(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Response, ApiError> {
+    let Some(session_id) = hook_session_id(&payload) else {
+        return Ok(Json(json!({ "status": "unknown_session" })).into_response());
+    };
+    verify_hook_auth_or_secret(
+        &state,
+        &headers,
+        Some(peer_addr),
+        &session_id,
+        "/hooks/tool-use",
+    )?;
+
+    let hook_type = payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(hook_type);
+    let session = state.session_store.get_session(&session_id)?;
+    if hook_type == "PreToolUse" {
+        state
+            .session_store
+            .apply_claude_pre_tool_use_hook(&session_id, Some(tool_name))?;
+    }
+
+    let db_path = expand_home(&state.config.tool_logging.db_path);
+    log_tool_usage_to_path(
+        &db_path,
+        ToolUsageEvent {
+            session_id: Some(&session_id),
+            claude_session_id: payload
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            session_name: session.as_ref().map(|session| session.name.as_str()),
+            parent_session_id: session
+                .as_ref()
+                .and_then(|session| session.parent_session_id.as_deref()),
+            hook_type,
+            tool_name,
+            tool_input: payload.get("tool_input"),
+            tool_response: payload.get("tool_response"),
+            tool_use_id: payload
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            cwd: payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            agent_id: payload
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        },
+    )
+    .map_err(ApiError::Internal)?;
+
+    Ok(Json(json!({ "status": "logged" })).into_response())
+}
+
+fn hook_session_id(payload: &Value) -> Option<String> {
+    payload
+        .get("session_manager_id")
+        .or_else(|| payload.get("CLAUDE_SESSION_MANAGER_ID"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Default)]
+struct ClaudeTranscriptMetadata {
+    last_message: Option<String>,
+    native_title: Option<String>,
+    mtime_ns: Option<i64>,
+}
+
+fn read_claude_transcript_metadata(transcript_path: &str) -> Option<ClaudeTranscriptMetadata> {
+    let path = expand_home(transcript_path);
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok());
+    let file = fs::File::open(&path).ok()?;
+    let lines = BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .collect::<Vec<_>>();
+
+    let mut native_title = None;
+    let mut last_message = None;
+    let mut assistant_seen = false;
+    for line in lines.into_iter().rev() {
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if native_title.is_none() {
+            match entry.get("type").and_then(Value::as_str) {
+                Some("custom-title") => {
+                    native_title = non_empty_json_str(entry.get("customTitle"));
+                }
+                Some("agent-name") => {
+                    native_title = non_empty_json_str(entry.get("agentName"));
+                }
+                _ => {}
+            }
+        }
+        if !assistant_seen && entry.get("type").and_then(Value::as_str) == Some("assistant") {
+            assistant_seen = true;
+            last_message = assistant_message_text(&entry);
+        }
+        if native_title.is_some() && (last_message.is_some() || assistant_seen) {
+            break;
+        }
+    }
+
+    Some(ClaudeTranscriptMetadata {
+        last_message,
+        native_title,
+        mtime_ns,
+    })
+}
+
+fn should_retry_local_stop_transcript_read(metadata: Option<&ClaudeTranscriptMetadata>) -> bool {
+    metadata.is_none_or(|metadata| metadata.last_message.is_none())
+}
+
+fn choose_newer_transcript_metadata(
+    first: Option<ClaudeTranscriptMetadata>,
+    second: Option<ClaudeTranscriptMetadata>,
+) -> Option<ClaudeTranscriptMetadata> {
+    match (first, second) {
+        (None, second) => second,
+        (first, None) => first,
+        (Some(first), Some(second)) => {
+            if second.mtime_ns.unwrap_or_default() >= first.mtime_ns.unwrap_or_default()
+                && (second.last_message.is_some()
+                    || second.native_title.is_some()
+                    || second.mtime_ns.is_some())
+            {
+                Some(second)
+            } else {
+                Some(first)
+            }
+        }
+    }
+}
+
+fn assistant_message_text(entry: &Value) -> Option<String> {
+    let content = entry
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)?;
+    let text = content
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn non_empty_json_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn payload_i64(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Value::String(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .filter(|value| *value >= 0)
+}
+
+fn verify_hook_auth_or_secret(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    session_id: &str,
+    path: &str,
+) -> Result<(), ApiError> {
+    if is_local_bypass_request(headers, peer_addr, &state.config) {
+        return Ok(());
+    }
+
+    let Some(session) = state.session_store.get_session(session_id)? else {
+        return ensure_session_allowed_from_parts(&state.config, headers, peer_addr, path);
+    };
+    let node_id = session.node.trim();
+    if node_id.is_empty() || node_id == "primary" {
+        return ensure_session_allowed_from_parts(&state.config, headers, peer_addr, path);
+    }
+    let expected_secret = state
+        .config
+        .nodes
+        .registry
+        .get(node_id)
+        .and_then(|node| node.hook_secret.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(expected_secret) = expected_secret else {
+        return ensure_session_allowed_from_parts(&state.config, headers, peer_addr, path);
+    };
+    let actual_secret = headers
+        .get("x-sm-hook-secret")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if constant_time_eq(expected_secret.as_bytes(), actual_secret.as_bytes()) {
+        return Ok(());
+    }
+    Err(ApiError::Status {
+        status: StatusCode::FORBIDDEN,
+        detail: "Invalid hook secret".to_owned(),
+    })
 }
 
 async fn client_bootstrap(
