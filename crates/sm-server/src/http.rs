@@ -6,7 +6,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as StdPath, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -7541,7 +7541,22 @@ fn codex_fork_event_stream_path_for_session(
         .codex_fork_runtime_artifacts(&spec)
         .ok()
         .flatten()
-        .map(|artifacts| artifacts.event_stream_path)
+        .map(|artifacts| {
+            if artifacts.event_stream_path.exists() {
+                artifacts.event_stream_path
+            } else {
+                codex_fork_legacy_event_stream_path_from_log_file(&expand_home(log_file))
+                    .unwrap_or(artifacts.event_stream_path)
+            }
+        })
+}
+
+fn codex_fork_legacy_event_stream_path_from_log_file(log_file: &StdPath) -> Option<PathBuf> {
+    let stem = log_file.file_stem()?.to_str()?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    Some(log_file.with_file_name(format!("{stem}.codex-fork.events.jsonl")))
 }
 
 fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static str> {
@@ -10988,6 +11003,44 @@ mod tests {
         assert_eq!(
             codex_fork_event_stream_activity_from_path(event_stream),
             Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_keeps_idle_after_late_output_delta() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-late-output-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"event_type\":\"item/agentMessage/delta\",\"payload\":{}}\n",
+                "{\"event_type\":\"item_completed\",\"payload\":{\"item\":{\"type\":\"agentMessage\"}}}\n",
+                "{\"event_type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"idle\"}}}\n",
+                "{\"event_type\":\"turn_complete\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/commandExecution/outputDelta\",\"payload\":{\"delta\":\"hmr update\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_path_falls_back_to_legacy_log_stem() {
+        let log_file = StdPath::new("/tmp/claude-sessions/session-random.log");
+        assert_eq!(
+            codex_fork_legacy_event_stream_path_from_log_file(log_file),
+            Some(PathBuf::from(
+                "/tmp/claude-sessions/session-random.codex-fork.events.jsonl"
+            ))
         );
     }
 
