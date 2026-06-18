@@ -2230,9 +2230,21 @@ fn extract_codex_fork_thread_started(event: &Map<String, Value>) -> Option<Strin
         .or_else(|| payload.get("session_id").and_then(non_unknown_json_text))
 }
 
+pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static str> {
+    let raw = line.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let event = serde_json::from_str::<Value>(raw).ok()?;
+    let event = event.as_object()?;
+    codex_fork_status_for_event(event)
+}
+
 fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static str> {
-    let event_type = normalize_codex_fork_event_type(codex_fork_event_type(event)?.as_str());
+    let event_type =
+        normalize_codex_fork_event_type(&codex_fork_event_type(event)?.replace('/', "_"));
     match event_type.as_str() {
+        "thread_status_changed" => codex_fork_thread_status(event),
         "turn_started" => Some("running"),
         "turn_complete" => Some("idle"),
         "turn_aborted" => {
@@ -2261,6 +2273,25 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         "error" | "shutdown" => Some("stopped"),
         "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
         other if other.ends_with("_begin") || other.ends_with("_delta") => Some("running"),
+        _ => None,
+    }
+}
+
+fn codex_fork_thread_status(event: &Map<String, Value>) -> Option<&'static str> {
+    let payload = codex_fork_payload(event)?;
+    let status = payload
+        .get("status")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.as_object()?.get("type")?.as_str())
+                .or_else(|| value.as_object()?.get("status")?.as_str())
+        })?
+        .trim()
+        .to_ascii_lowercase();
+    match status.as_str() {
+        "active" | "running" | "working" => Some("running"),
+        "idle" => Some("idle"),
         _ => None,
     }
 }
@@ -5623,6 +5654,17 @@ mod tests {
         });
         let terminal_event = terminal.as_object().unwrap();
         assert_eq!(codex_fork_status_for_event(terminal_event), Some("stopped"));
+    }
+
+    #[test]
+    fn codex_fork_thread_status_events_drive_active_idle_status() {
+        let active = r#"{"type":"thread/status/changed","payload":{"status":{"type":"active"}}}"#;
+        let idle = r#"{"type":"thread/status/changed","payload":{"status":{"type":"idle"}}}"#;
+        let unknown = r#"{"type":"thread/status/changed","payload":{"status":{"type":"mystery"}}}"#;
+
+        assert_eq!(codex_fork_status_for_event_line(active), Some("running"));
+        assert_eq!(codex_fork_status_for_event_line(idle), Some("idle"));
+        assert_eq!(codex_fork_status_for_event_line(unknown), None);
     }
 
     #[test]
