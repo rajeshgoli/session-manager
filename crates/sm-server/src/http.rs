@@ -4,7 +4,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     fs,
+    io::{Read, Seek, SeekFrom},
     net::SocketAddr,
+    path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -101,11 +103,11 @@ use crate::queue::{
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
-    expand_home, is_primary_node, AgentRegistrationResponse, AgentStatusRequest,
-    ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse, ClearSessionRequest,
-    ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest, CoreClearOutcome,
-    CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome,
-    CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    codex_fork_status_for_event_line, expand_home, is_primary_node, AgentRegistrationResponse,
+    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
+    ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
+    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
+    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
     MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
     SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
     SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
@@ -120,6 +122,7 @@ use crate::tool_usage::{
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
+const CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES: u64 = 256 * 1024;
 const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
@@ -7150,10 +7153,82 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     if session.provider.trim() != "codex-fork" || session.tmux_session.trim().is_empty() {
         return None;
     }
+    if let Some(activity_state) = codex_fork_event_stream_activity(state, session) {
+        return Some(activity_state);
+    }
     let runtime = TmuxRuntime::from_app_config(&state.config)
         .for_socket_name(session.tmux_socket_name.as_deref());
     let pane_title = runtime.pane_title(&session.tmux_session)?;
     codex_fork_pane_title_indicates_working(&pane_title).then_some("working")
+}
+
+fn codex_fork_event_stream_activity(
+    state: &AppState,
+    session: &SessionRecord,
+) -> Option<&'static str> {
+    let event_stream_path = codex_fork_event_stream_path_for_session(state, session)?;
+    codex_fork_event_stream_activity_from_path(event_stream_path)
+}
+
+fn codex_fork_event_stream_path_for_session(
+    state: &AppState,
+    session: &SessionRecord,
+) -> Option<PathBuf> {
+    let log_file = session
+        .log_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let spec = crate::runtime::TmuxSessionSpec {
+        session_id: session.id.clone(),
+        tmux_session: session.tmux_session.clone(),
+        working_dir: expand_home(&session.working_dir).display().to_string(),
+        log_file: expand_home(log_file),
+        provider: session.provider.clone(),
+        initial_message: None,
+        model: session.model.clone(),
+    };
+    TmuxRuntime::from_app_config(&state.config)
+        .for_socket_name(session.tmux_socket_name.as_deref())
+        .codex_fork_runtime_artifacts(&spec)
+        .ok()
+        .flatten()
+        .map(|artifacts| artifacts.event_stream_path)
+}
+
+fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static str> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return None;
+    }
+    let mut chunk = String::new();
+    file.read_to_string(&mut chunk).ok()?;
+    if start > 0 {
+        if let Some((_, rest)) = chunk.split_once('\n') {
+            chunk = rest.to_owned();
+        } else {
+            return None;
+        }
+    }
+
+    let mut latest_activity = None;
+    for line in chunk.lines() {
+        latest_activity = codex_fork_status_for_event_line(line)
+            .and_then(codex_fork_activity_for_status)
+            .or(latest_activity);
+    }
+    latest_activity
+}
+
+fn codex_fork_activity_for_status(status: &str) -> Option<&'static str> {
+    match status {
+        "running" => Some("working"),
+        "idle" => Some("idle"),
+        "stopped" => Some("stopped"),
+        _ => None,
+    }
 }
 
 fn codex_fork_pane_title_indicates_working(pane_title: &str) -> bool {
@@ -10500,6 +10575,45 @@ mod tests {
         assert!(!codex_fork_pane_title_indicates_working(
             "⠏⠇ fractal-algo-rust"
         ));
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_uses_latest_lifecycle_event() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-activity-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"idle\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream.clone()),
+            Some("idle")
+        );
+
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"idle\"}}}\n",
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"type\":\"error\",\"payload\":{\"willRetry\":true}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream),
+            Some("working")
+        );
     }
 
     fn write_session_state(session_id: &str, status: &str) -> String {
