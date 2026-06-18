@@ -1,10 +1,28 @@
 # Session Manager
-## Dispatch teams of claude and codex agents
-**Distributed infrastructure for AI agent swarms.** Spawn Claude agents, orchestrate workflows, coordinate without burning tokens. Watch it all unfold from your phone.
+
+## Dispatch teams of Claude and Codex agents
+
+**Agent swarms without babysitting.** Spawn real Claude and Codex sessions,
+route work between them, keep every agent observable, and jump in from your
+terminal or phone when the swarm needs a nudge.
+
+Session Manager is built for the messy reality of running many agents at once:
+
+- **Fast enough to stay out of the way**: migration baselines show roughly
+  85-90% lower server memory and common read paths around 3x-20x faster than
+  the previous Python service.
+- **Ruggedized for real operations**: Rust owns the runtime, state stores have
+  backup/restore and freeze/drain gates, and cutover evidence is executable
+  instead of vibes.
+- **Secure on the public edge**: the mobile app path is designed for
+  Cloudflare Access mTLS first, then origin-side auth, then route-local shell
+  proofs before terminal attach.
+- **Remote when you need it**: the Android app is the on-the-go command center;
+  email/human-recipient delivery remains the fallback for replies and alerts.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         ORCHESTRATOR (EM)                       │
+│                         ORCHESTRATOR                            │
 │                    "Implement Epic #987"                        │
 └──────────────┬────────────────┬────────────────┬───────────────┘
                │                │                │
@@ -18,15 +36,14 @@
              │                │                │
              └────────────────┼────────────────┘
                               │
-                      sm send em-main
-                       "done: PR #42"
+                       sm send maintainer
+                        "done: PR #42"
                               │
               ┌───────────────┼───────────────┐
               ▼                               ▼
     ┌─────────────────┐             ┌─────────────────┐
-    │  EM wakes up,   │             │  📱 Telegram    │
-    │  routes to next │             │  YOU see it too │
-    │  agent          │             │                 │
+    │ Maintainer wakes│             │ Phone shows the │
+    │ and routes next │             │ swarm in flight │
     └─────────────────┘             └─────────────────┘
 ```
 
@@ -34,152 +51,178 @@
 
 ## Agent Nirvana
 
-**Let agents swarm loose on your problems while you sip tea on a beach.**
+**Let agents swarm loose on your problems while you do something better than
+watching terminals.**
 
-No more opaque subagents you can't follow. Every agent is a full Claude Code session. Full transparency:
+No more opaque subagents you cannot follow. Every agent is a full terminal
+session with durable state and a real lifecycle.
 
-- **Watch from anywhere** — Every `sm send` between agents auto-forwards to your Telegram
-- **Jump in anytime** — `sm attach engineer` opens the session in your terminal
-- **Or stay remote** — Reply to Telegram messages to inject commands
-- **Real sessions** — Not abstractions. Real tmux. Real Claude Code. `sm attach` and you're there.
+- **Watch from anywhere** — the Android app shows live sessions, activity, app
+  updates, analytics, and mobile terminal attach.
+- **Jump in anytime** — `sm attach engineer` opens the actual tmux session.
+- **Coordinate without polling** — `sm send`, parent wakes, stop notifications,
+  and queue-backed delivery keep work moving while coordinators sleep.
+- **Keep the fallback** — email/human-recipient delivery keeps a simple reply
+  path when the app is not the right tool.
+- **Real sessions** — not abstractions. Real tmux. Real Claude Code. Real
+  Codex. `sm attach` and you are there.
 
 ```
-📱 Your Phone                          🖥️ Your Agents
-─────────────                          ────────────────
-                                       EM: "Spawning engineer for #123"
-[EM spawned engineer-standby]    ←────
-                                       Engineer: *working*
-                                       Engineer: "done: PR #456 created"
-[engineer → EM: done: PR #456]   ←────
-                                       EM: "Routing to architect"
-[EM → architect: Review PR #456] ←────
-                                       Architect: *reviewing*
-[architect → EM: approved]       ←────
-                                       EM: "Merging..."
-[PR #456 merged to main]         ←────
+Your Phone                           Your Agents
+──────────                           ───────────
+                                     EM: "Spawning engineer for #123"
+[engineer spawned]             <────
+                                     Engineer: working
+                                     Engineer: "done: PR #456 created"
+[engineer -> EM: done]         <────
+                                     EM: "Routing to architect"
+[architect review requested]   <────
+                                     Architect: reviewing
+[architect: approved]          <────
+                                     EM: "Merging..."
+[PR #456 merged]               <────
 
-You: *sips tea* ☕
+You: not babysitting terminals
 ```
 
 ---
 
 ## Why This Exists
 
-**Problem:** Claude agents burn tokens while waiting. Spawn a worker, wait for completion, context grows, costs explode. And you can't see what subagents are doing.
+**Problem:** agents burn context while waiting, subagents are hard to inspect,
+and parallel work gets chaotic when every terminal is its own little island.
 
-**Solution:** A central manager that lets agents go idle and gives you full visibility. Spawn workers → go to sleep → wake on notification. Zero tokens burned while waiting. Every message mirrored to your Telegram.
+**Solution:** a central manager that lets agents go idle, wakes the right
+session when something happens, and keeps the whole swarm visible. Spawn
+workers, send them work, go to sleep, wake on signal, and attach only when you
+need to intervene.
 
-```bash
-# EM dispatches engineer, goes idle (no tokens burned)
-sm dispatch engineer --role engineer --urgent --task "Implement ticket #123"
-
-# Engineer works autonomously...
-# ...finishes, notifies EM (AND you get a Telegram message)
-sm send em-main "done: PR #456 created"
-
-# EM wakes up (via notify-on-stop), routes PR to architect
-sm dispatch architect --role architect --urgent --pr 456
-```
-
-**Result:** Complex multi-agent workflows at a fraction of the token cost. Full visibility from anywhere.
+**Result:** complex multi-agent workflows with less token waste, lower operator
+load, and a real control plane for agent work.
 
 ---
 
 ## What It Enables
 
 ### Agent Swarms
-Spawn specialized agents that work in parallel. Engineer implements while Architect reviews while Scout investigates. All visible to you.
+
+Spawn specialized agents that work in parallel. Engineer implements while
+Architect reviews while Scout investigates. You keep the graph, not every token.
 
 ### Full Transparency
-Every agent is a real Claude Code session. No black boxes. `sm attach` to any session. Or watch the conversation flow on Telegram.
+
+Every agent is a real Claude Code or Codex session. No black boxes. `sm attach`
+to any session. `sm tail` when you want the recent trail. Android when you are
+away from the desk.
 
 ### Async Orchestration
-The EM (Engineering Manager) pattern: spawn workers, dispatch tasks, collect results. Never wait synchronously.
+
+The maintainer pattern: spawn workers, route tasks, collect results, and wake
+only on useful state changes. Never wait synchronously unless you choose to.
 
 ### Remote Control
-On the go? Reply to Telegram messages to send input. Need to debug? `sm attach` from any terminal.
+
+On the go? Use the app. Need a low-friction fallback? Use email/human delivery.
+Need to debug? Attach from a terminal and take over the live pane.
 
 ### Workspace Coordination
-Auto-locking on file writes. Conflict detection. Multiple agents, one codebase, zero collisions.
 
-### Token Efficiency
-Agents sleep while waiting. Central manager handles coordination. Pay only for actual work.
+State, parent/child relationships, queue jobs, review requests, and runtime
+recovery are durable. Agents can swarm the same codebase without everything
+turning into terminal archaeology.
+
+---
+
+## Why The Rust Rewrite Matters
+
+The migration baseline in
+`.local/rust-mvp-rehearsals/20260612T-full-after-938/baseline/` measured:
+
+| Metric | Previous Python service | Rust service | Rounded improvement |
+| --- | ---: | ---: | ---: |
+| RSS | 154.7 MiB | 19.8 MiB | about 87% lower |
+| Physical footprint | 66.4 MiB | 6.7 MiB | about 90% lower |
+| `/health` median | 4.17 ms | 0.28 ms | about 15x faster |
+| `/client/bootstrap` median | 6.62 ms | 0.30 ms | about 20x faster |
+| `/sessions` median | 25.75 ms | 7.97 ms | about 3x faster |
+| `/client/sessions` median | 58.49 ms | 7.95 ms | about 7x faster |
+
+Current live Rust server RSS is around 24 MiB on the maintainer machine. Exact
+numbers depend on host load and retained state size, but the direction is not
+subtle: the daemon is smaller, faster, and easier to reason about under load.
 
 ---
 
 ## Quick Start
 
+Build the Rust service and CLI:
+
 ```bash
-# Install
 git clone https://github.com/rajeshgoli/session-manager
 cd session-manager
-./setup.sh
-
-# Configure (add your Telegram bot token!)
-cp config.yaml.example config.yaml
-vim config.yaml
-
-# Run
-source venv/bin/activate
-python -m src.server
+cargo build -p sm-server --release
 ```
 
-### Setting Up Telegram (Recommended)
+Create local config from the example and adjust host/auth/state paths:
 
-This is where the magic happens. 5 minutes to agent nirvana:
+```bash
+cp config.yaml.example config.yaml
+vim config.yaml
+```
 
-1. **Create a bot**: Message `@BotFather` on Telegram → `/newbot` → copy the token
-2. **Get your chat ID**: Message your bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates`
-3. **Configure**:
-   ```yaml
-   telegram:
-     token: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
-     allowed_chat_ids:
-       - 123456789  # Your chat ID
-   ```
-4. **Restart the server**
+Run the server directly:
 
-Now every agent message flows to your phone. Reply to inject commands. True remote control.
+```bash
+target/release/sm-server --host 127.0.0.1 --port 8420 --config config.yaml
+```
+
+Or install/start the launchd-managed Rust service:
+
+```bash
+./scripts/rust-service-cutover.sh plan
+./scripts/rust-service-cutover.sh start-rust --config "$PWD/config.yaml"
+./scripts/rust-service-cutover.sh status
+```
+
+Use the Rust CLI:
+
+```bash
+target/release/sm status
+target/release/sm spawn claude "say hello and exit" --name hello-agent
+target/release/sm all
+```
+
+If `target/release` is on your `PATH`, `sm` resolves to the Rust CLI.
 
 ---
 
-## The SM CLI
-
-Every managed session gets the `sm` command. This is how agents coordinate.
-
-### Core Commands
+## Core CLI
 
 | Command | Purpose |
-|---------|---------|
-| `sm spawn claude "<prompt>" --name X` | Spawn child agent |
-| `sm send <id> "<text>"` | Send message to agent (+ Telegram) |
-| `sm dispatch <id> --role X --task "..."` | Dispatch with auto-clear (primary EM command) |
-| `sm em [name]` | EM pre-flight: set name + enable context monitoring |
-| `sm clear <id>` | Clear agent context for reuse |
-| `sm attach <id>` | Open agent session in your terminal |
-| `sm children` | List your spawned agents |
-| `sm tail <id>` | Recent tool actions with timestamps |
-| `sm codex-tui <id>` | Live codex-app state/events + structured request controls |
-| `sm what <id>` | AI summary of what agent is doing |
-| `sm kill <id>` | Terminate an agent |
-| `sm output <id>` | See agent's recent output |
+| --- | --- |
+| `sm status` | Show your status and active sessions |
+| `sm me` | Show the current session identity |
+| `sm all` | List active sessions |
+| `sm spawn <provider> "<prompt>" --name <name>` | Start a new managed agent |
+| `sm send <id> "<text>"` | Send input to an agent |
+| `sm wait <id>` | Wait for a session state transition |
+| `sm attach <id>` | Attach to the live tmux session |
+| `sm tail <id>` | Show recent output/tool activity |
+| `sm output <id>` | Print recent terminal output |
+| `sm clear <id>` | Clear a session for a new task |
+| `sm retire <id>` | Stop and retire a session |
+| `sm restore <id>` | Restore a stopped/restorable session |
+| `sm children` | List child agents |
+| `sm task-complete` | Mark task completion and wake parent/maintainer |
+| `sm turn-complete` | Mark a turn boundary |
+| `sm queue list/status/run/cancel` | Manage retained queue jobs |
+| `sm review` | Run local synchronous PR review flows |
+| `sm request-codex-review` | Request async Codex review tracking |
+| `sm enroll-device` | Enroll an Android app device certificate |
+| `sm list-devices` | List enrolled mobile devices |
+| `sm remove-device <id>` | Revoke an enrolled mobile device |
 
-Model override semantics for `sm spawn --model`:
-- `provider=claude`: validates `opus|sonnet|haiku`
-- `provider=codex` or `provider=codex-app`: accepts provider model IDs (for example `codex-5.1`)
-
-### Coordination Commands
-
-| Command | Purpose |
-|---------|---------|
-| `sm name "<name>"` | Set your friendly name |
-| `sm status` | Your status + others + locks |
-| `sm alone` | Check if you're the only agent |
-| `sm others` | List other agents in workspace |
-| `sm lock "<reason>"` | Acquire workspace lock |
-| `sm unlock` | Release lock |
-
-### Message Delivery Modes
+Message delivery modes:
 
 ```bash
 sm send agent "message"              # Sequential: wait for idle
@@ -187,74 +230,64 @@ sm send agent "message" --important  # Queue behind current work
 sm send agent "message" --urgent     # Interrupt immediately
 ```
 
-All modes forward to Telegram. You always see what's happening.
+Retired surfaces are intentionally absent rather than half-supported. Use
+`sm tail --raw` or explicit `sm send` prompts instead of old summary helpers.
+Use `sm retire`, not legacy kill aliases.
 
 ---
 
-## The EM Pattern
+## Android App
 
-The Engineering Manager orchestrates without doing implementation work.
+The Android app is the supported remote operator surface. It can:
+
+- list sessions by repo and activity state;
+- show health, analytics, and app update status;
+- request session status updates;
+- attach to mobile terminal sessions when configured;
+- enroll and store a Cloudflare Access client certificate;
+- authenticate with Google at the origin after client-certificate proof.
+
+Publish a debug APK to the local artifact server:
 
 ```bash
-# 1. Pre-flight (run first — sets name, context monitoring, registers children)
-sm em epic-987
-
-# 2. Spawn standby agents if none exist
-sm spawn claude "As engineer, await tasks" --name engineer-standby
-sm spawn claude "As architect, await tasks" --name architect-standby
-
-# 3. Dispatch work (auto-clears before sending, arms periodic wake-up)
-sm dispatch engineer-standby --role engineer --urgent --task "Implement ticket #123"
-# EM goes idle — woken via notify-on-stop (done) or sm remind (still running, every ~210s)
-
-# 4. Wake on notification, route to next agent
-sm dispatch architect-standby --role architect --urgent --pr 456
-
-# 5. Repeat until workflow complete
+cd android-app
+SM_VERSION_CODE=1072 SM_VERSION_NAME=0.1.2 ./gradlew assembleDebug
+cd ..
+VERSION_CODE=1072 VERSION_NAME=0.1.2 ./scripts/deploy_android_app.sh
 ```
 
-**Key insight:** EM's context is preserved across worker completions. Workers are disposable; EM maintains state. No polling — the system pages you.
+The app checks:
+
+- `/apps/session-manager-android/meta.json`
+- `/apps/session-manager-android/latest.apk`
+- immutable `/apps/session-manager-android/{hash}.apk`
+
+Device enrollment flow:
+
+```bash
+sm enroll-device
+```
+
+Scan the generated QR with the phone camera. The deep link opens the app, the
+app submits a CSR, Session Manager issues a device certificate, and the device
+stores it internally. The certificate is not displayed in the app UI.
 
 ---
 
-## Telegram Commands
+## Public Access Model
 
-Control your swarm from anywhere.
+The hardened public path is layered:
 
-| Command | Action |
-|---------|--------|
-| `/new [path]` | Spawn new session |
-| `/list` | List active sessions |
-| `/status <id>` | Get session status |
-| `/kill <id>` | Terminate session |
-| `/open <id>` | Open in Terminal.app (macOS) |
-| Reply to message | Send input to that session |
+1. **Cloudflare Access mTLS** gates the app hostname before origin traffic is
+   allowed.
+2. **Origin auth** verifies Google/device identity for the Session Manager user.
+3. **Route-local proofs** gate sensitive shell attach flows.
+4. **Device revocation** removes a device from both Session Manager state and
+   the Cloudflare Access certificate policy.
 
-**Session lifecycle notifications:**
-- **Kill** → "Session stopped [id]" message sent to the thread, then topic closed (history preserved)
-- **Clear** → "Context cleared [id] — ready for new task" message sent; thread stays open for the new task
-
-**Pro tip:** Each session gets its own Telegram thread. Conversations stay organized even with 10 agents running.
-
----
-
-## Auto-Locking
-
-File writes automatically acquire workspace locks via Claude Code hooks.
-
-```json
-// .claude/settings.json
-{
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": { "tool_name": "write|edit" },
-      "hooks": [{ "type": "command", "command": "sm auto-lock" }]
-    }]
-  }
-}
-```
-
-Multiple agents, same repo, no conflicts. If another agent holds the lock, your write blocks until they release.
+The browser/operator hostname and app hostname should be isolated in Cloudflare
+Access policy. The app hostname should not expose unauthenticated origin
+responses to the public internet.
 
 ---
 
@@ -263,9 +296,10 @@ Multiple agents, same repo, no conflicts. If another agent holds the lock, your 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    SESSION MANAGER                          │
+│                                                             │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │   FastAPI   │  │   Message   │  │   Lock Manager      │  │
-│  │   Server    │  │   Queue     │  │   (workspace locks) │  │
+│  │ Rust HTTP   │  │ SQLite      │  │ tmux Runtime        │  │
+│  │ API/CLI     │  │ state/queue │  │ Claude/Codex panes  │  │
 │  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘  │
 │         │                │                    │             │
 │         └────────────────┼────────────────────┘             │
@@ -273,61 +307,63 @@ Multiple agents, same repo, no conflicts. If another agent holds the lock, your 
 │         ┌────────────────┼────────────────┐                 │
 │         ▼                ▼                ▼                 │
 │  ┌────────────┐   ┌────────────┐   ┌────────────┐          │
-│  │   tmux     │   │  Telegram  │   │   Output   │          │
-│  │ Controller │   │    Bot     │   │  Monitor   │          │
-│  └─────┬──────┘   └─────┬──────┘   └────────────┘          │
-└────────┼────────────────┼───────────────────────────────────┘
-         │                │
-         │                ▼
-         │          📱 Your Phone
-         │
-         ▼
-   ┌───────────────────────────────┐
-   │      tmux sessions            │
-   │  ┌─────────┐ ┌─────────┐     │
-   │  │ Claude  │ │ Claude  │ ... │
-   │  │ Agent 1 │ │ Agent 2 │     │
-   │  └─────────┘ └─────────┘     │
-   └───────────────────────────────┘
+│  │ Android    │   │ Email/     │   │ Cutover    │          │
+│  │ app API    │   │ human send │   │ gates      │          │
+│  └────────────┘   └────────────┘   └────────────┘          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Components:**
-- **FastAPI Server** — REST API for session control
-- **Message Queue** — SQLite-backed reliable delivery
-- **Lock Manager** — Workspace coordination
-- **tmux Controller** — Session lifecycle management
-- **Telegram Bot** — Remote visibility and control
-- **Output Monitor** — Detects idle, errors, permission prompts
+Key stores and surfaces:
+
+- session state JSON;
+- SQLite message queue;
+- queue runner state;
+- tool/audit log DB;
+- Codex events, requests, and observability DBs;
+- app artifact store;
+- bug report store;
+- Cloudflare/mobile device enrollment DB.
+
+Cutover tooling lives under `scripts/rust_migration/` and records preflight,
+backup, restore, freeze/drain, fixture, shadow, and canary evidence.
 
 ---
 
 ## API Reference
 
 | Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/sessions` | POST | Create session |
-| `/sessions` | GET | List sessions |
+| --- | --- | --- |
+| `/health` | GET | Health check |
+| `/health/detailed` | GET | Detailed service state |
+| `/sessions` | GET/POST | List/create sessions |
+| `/sessions/{id}` | GET/PATCH | Read/update session metadata |
 | `/sessions/{id}/input` | POST | Send input |
-| `/sessions/{id}/codex-events` | GET | Durable codex lifecycle event stream (cursor-based) |
-| `/sessions/{id}/codex-pending-requests` | GET | List pending codex structured requests |
-| `/sessions/{id}/codex-requests/{request_id}/respond` | POST | Resolve approval/user-input structured request |
-| `/sessions/{id}/activity-actions` | GET | Provider-neutral codex activity projection |
-| `/admin/rollout-flags` | GET | Active codex rollout gate values |
-| `/sessions/{id}/watch` | POST | Watch for completion |
-| `/sessions/{id}` | DELETE | Kill session |
-| `/health` | GET | Server health check |
+| `/sessions/{id}/output` | GET | Tail terminal output |
+| `/sessions/{id}/attach-descriptor` | GET | Describe attach support |
+| `/sessions/{id}/codex-events` | GET | Durable Codex lifecycle events |
+| `/sessions/{id}/codex-pending-requests` | GET | Structured request state |
+| `/sessions/{id}/activity-actions` | GET | Provider-neutral activity projection |
+| `/client/bootstrap` | GET | Native app bootstrap |
+| `/client/sessions` | GET | Native app session list |
+| `/client/request-status` | POST | Ask live agents for status |
+| `/auth/session` | GET | Auth/session status |
+| `/auth/device/google` | POST | Native Google ID-token exchange |
+| `/apps/{name}/meta.json` | GET | App artifact metadata |
+| `/apps/{name}/latest.apk` | GET | Latest APK redirect/download |
+| `/deploy/{name}` | POST | Local/authenticated app artifact upload |
+| `/queue-jobs` | GET/POST | Queue job list/create |
+| `/queue-jobs/{id}` | GET | Queue job detail |
+| `/codex-review-requests` | GET/POST | Codex review watch list/create |
+| `/nodes` | GET | Node registry projection |
 
-Full API docs at `http://localhost:8420/docs` when running.
-
-Codex structured request errors:
-- `409 pending_structured_request` on `POST /sessions/{id}/input` when unresolved approval/input requests exist and rollout gate is enabled
-- `404 request_not_found` when `request_id` does not exist
-- `404 request_unavailable` when request is already orphaned/unavailable
-- `503` when a codex rollout gate disables the requested surface
+Full docs are available from the running service at `http://127.0.0.1:8420/docs`
+when API docs are enabled.
 
 ---
 
 ## Configuration
+
+Start with `config.yaml.example`. Common sections:
 
 ```yaml
 server:
@@ -336,268 +372,82 @@ server:
 
 paths:
   state_file: "~/.claude-sessions/state.json"
+  app_artifacts_dir: "~/.local/share/claude-sessions/apps"
 
-monitor:
-  idle_timeout: 300      # Notify after 5min idle
-  poll_interval: 1.0
+rust_core:
+  runtime_enabled: true
 
-codex_rollout:
-  enable_durable_events: true
-  enable_structured_requests: true
-  enable_observability_projection: true
-  enable_codex_tui: true
-  provider_mapping_phase: "pre_cutover"  # pre_cutover | migration_window | post_cutover
+google_auth:
+  enabled: true
+  allowlist_emails:
+    - "you@example.com"
 
-codex_fork:
-  artifact_release: "v0.1.0-sm"
-  artifact_ref: "8f00aa11b22cc33dd44ee55ff66778899aabbccd"
-  artifact_platforms: ["darwin-arm64", "darwin-x86_64", "linux-x86_64"]
-  rollback_provider: "codex"
-  rollback_command: "sm codex"
-  event_schema_version: 2
+cloudflare_access:
+  mobile_app:
+    enabled: true
+    hostname: "sm-app.example.com"
 
-codex_events:
-  db_path: "~/.local/share/claude-sessions/codex_events.db"
-  retention_max_events_per_session: 5000
-  retention_max_age_days: 14
-
-codex_requests:
-  db_path: "~/.local/share/claude-sessions/codex_requests.db"
-
-codex_observability:
-  db_path: "~/.local/share/claude-sessions/codex_observability.db"
-  retention_max_age_days: 14
-  retention_tool_events_per_session: 20000
-  retention_turn_events_per_session: 5000
-  payload_max_chars: 4000
-  prune_interval_seconds: 3600
-
-telegram:
-  token: "BOT_TOKEN"           # From @BotFather
-  allowed_chat_ids: [123456789] # Your chat ID
+mobile_terminal:
+  enabled: true
 ```
 
-### Codex-App Rollout Runbook
-
-1. Enable durable events first:
-   - `enable_durable_events: true`
-   - Verify: `curl -s localhost:8420/sessions/<id>/codex-events?since_seq=0&limit=5`
-2. Enable structured request control plane:
-   - `enable_structured_requests: true`
-   - Verify pending queue: `curl -s localhost:8420/sessions/<id>/codex-pending-requests`
-   - Verify input gate behavior (expect `pending_structured_request` when queue is non-empty)
-3. Enable observability projection:
-   - `enable_observability_projection: true`
-   - Verify: `sm children` and `sm tail <id>` show codex projected actions
-4. Enable TUI:
-   - `enable_codex_tui: true`
-   - Verify: `sm codex-tui <id>`
-
-Rollback and recovery:
-- Persistence degradation window:
-  - `GET /sessions/{id}/codex-events` returns `history_gap=true` with `gap_reason=persistence_error`
-  - Continue operating; recover by restoring DB path permissions/disk and watch for resumed persisted events
-- Restart/orphan handling:
-  - Pending requests from prior process generation are marked `orphaned` with `error_code=server_restarted`
-  - Inspect with `GET /sessions/{id}/codex-pending-requests?include_orphaned=true`
-- Immediate rollback:
-  - Set relevant `codex_rollout` flag(s) to `false` and restart service
-  - Existing sessions continue, but gated APIs/CLI paths return explicit `503`/disabled errors
-
-### Codex-Fork Artifact Pin + Rollback Runbook
-
-1. Build/publish pinned artifacts:
-   - Use `scripts/codex_fork/release_artifacts.sh` from a checked-out codex-fork repo.
-   - Produce artifacts for `darwin-arm64`, `darwin-x86_64`, and `linux-x86_64`.
-2. Pin Session Manager to the released fork:
-   - Set `codex_fork.artifact_release` and immutable `codex_fork.artifact_ref` in `config.yaml`.
-   - Restart Session Manager to apply runtime metadata.
-3. Operator verification:
-   - Run `sm codex-fork-info` to confirm active pin + schema version.
-4. Rollback:
-   - Run the configured rollback command from `sm codex-fork-info` (default `sm codex`).
-   - If needed, update `codex_fork.artifact_ref` to the previous known-good release and restart.
-
-### Codex Launch Gate Checks
-
-Use `sm codex-rollout-gates` (or `--json`) to verify launch readiness gates:
-
-1. `a0_event_schema_contract` (schema compatibility floor)
-2. `launch_rollout_flags` (durable events + structured requests + projection enabled)
-3. `launch_artifact_pin` (immutable codex-fork ref configured)
-4. `launch_codex_app_drain` (no active codex-app sessions)
-5. `launch_provider_mapping_phase` (`migration_window` or `post_cutover`)
-
-### Post-Cutover codex-app Retirement Semantics
-
-When `codex_rollout.provider_mapping_phase=post_cutover`:
-
-1. Existing codex-app sessions are retired with reason `provider_retired_codex_app`.
-2. New codex-app session creation/spawn paths are rejected by API policy.
-3. Mutating actions (`input`, structured `respond`, `clear`) return `410` with migration guidance.
-4. Pending codex requests and queued message artifacts are cleaned with explicit retirement reason.
-
-### Codex-Fork Detached Runtime Reattach
-
-`sm attach` now uses `GET /sessions/{id}/attach-descriptor` to reattach to the same live codex-fork runtime.
-
-Descriptor payload includes:
-
-1. runtime ID and owner
-2. lifecycle state/cause snapshot
-3. control socket and event-stream paths
-4. attach transport metadata
-
-This keeps turn execution/control/event stream continuity while reattaching.
+Local/private config stays in `config.yaml` and optional local env overlays; do
+not commit secrets, Cloudflare tokens, Google client secrets, or device CA keys.
 
 ---
 
 ## Testing
 
-```bash
-# Run test suite (984 tests)
-pytest tests/ -v
+Rust server and CLI:
 
-# Run with coverage
-pytest tests/ --cov=src
+```bash
+cargo fmt --check
+cargo test -p sm-server
+```
+
+Migration contract harness:
+
+```bash
+./venv/bin/python -m pytest tests/unit/test_rust_migration_contracts.py
+./venv/bin/python -m scripts.rust_migration.contracts --target rust --base-url http://127.0.0.1:8420 --json
+```
+
+MVP rehearsal/cutover evidence:
+
+```bash
+./venv/bin/python -m scripts.rust_migration.mvp_rehearsal --output-dir .local/rust-mvp-rehearsals/$(date -u +%Y%m%dT%H%M%SZ)
+./venv/bin/python -m scripts.rust_migration.live_canary_report --fail-on-blockers --json
+```
+
+Android app:
+
+```bash
+cd android-app
+./gradlew testDebugUnitTest assembleDebug
 ```
 
 ---
 
-## Example Workflows (Add to Your CLAUDE.md)
+## Operator Notes
 
-Copy these patterns into your project's `CLAUDE.md` to enable agent swarms.
-
-### The EM (Engineering Manager) Pattern
-
-```markdown
-## Multi-Agent Workflows
-
-When asked to work "as EM" or orchestrate complex tasks, use the session manager.
-
-### Core Principle
-
-**Dispatch and go idle.** Spawn workers, go idle, wake on notification. Never poll.
-
-### Pre-Flight
-
-```bash
-sm em <epic>   # Mandatory first step: sets name, enables context monitoring for self + children
-sm children    # Check existing agents (reuse before spawning)
-```
-
-### Spawn Templates (only if no agent of that type exists)
-
-**Scout (Investigation):**
-```bash
-sm spawn claude "As scout, await tasks" --name "scout-<task>"
-sm dispatch scout-<task> --role scout --urgent \
-  --task "Investigate <problem>. Write findings to docs/working/<name>.md. Do NOT fix code." \
-  --repo <path>
-```
-
-**Engineer (Implementation):**
-```bash
-sm spawn claude "As engineer, await tasks" --name "engineer-ticket<N>"
-sm dispatch engineer-ticket<N> --role engineer --urgent \
-  --task "Implement ticket #<N>. Read spec at docs/working/<spec>.md." \
-  --repo <path> --spec docs/working/<spec>.md
-```
-
-**Architect (Review):**
-```bash
-sm spawn claude "As architect, await tasks" --name "architect-pr<N>"
-sm dispatch architect-pr<N> --role architect --urgent --pr <N> --repo <path>
-```
-
-`sm dispatch` handles clear-before-send automatically. EM goes idle after dispatch — woken via notify-on-stop (agent done) or sm remind (agent still running, ~210s intervals).
-
-### Workflow: Implement an Epic
-
-```
-"As EM, implement epic #<number>"
-```
-
-1. `sm em <epic>` — pre-flight
-2. Read epic to understand scope
-3. For each ticket (ONE AT A TIME):
-   - Dispatch Engineer → implement, create PR
-   - Dispatch Architect → review PR
-   - If changes needed → clear engineer, re-dispatch fresh with findings baked in
-   - If approved → Architect merges
-4. Close epic: `gh issue close <epic#> --comment "All sub-issues complete: ..."`
-
-### Workflow: Investigate and Spec
-
-```
-"As EM, investigate <problem> and create a spec"
-```
-
-1. `sm em <task>` — pre-flight
-2. Dispatch Scout → investigation, write spec at `docs/working/<n>_<name>.md`
-3. Scout sends spec to Architect agent for review via `sm send`
-4. Scout and Architect iterate directly (EM tiebreaks only if escalated)
-5. On convergence, Scout pushes spec, notifies EM
-6. Notify human: ready for review
-
-### Communication Patterns
-
-- **Status updates:** `sm send $EM_ID "done: PR #123 created"`
-- **Urgent corrections:** `sm send $ID "UPDATE: use X instead" --urgent`
-- **Reports go in files:** Write to `docs/working/`, then notify
-
-### Circuit Breaker
-
-Pause and alert human when:
-- Tests fail unexpectedly
-- Agent stuck in loop (multiple reminds, no progress)
-- Unclear how to proceed
-
-```
-EM: "Circuit breaker triggered. <reason>. Awaiting guidance."
-```
-```
-
-### Workspace Coordination
-
-Add to your `.claude/settings.json` for auto-locking:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": { "tool_name": "write|edit" },
-      "hooks": [{ "type": "command", "command": "sm auto-lock" }]
-    }]
-  }
-}
-```
-
-### Quick Reference
-
-| Command | When to Use |
-|---------|-------------|
-| `sm em [name]` | EM pre-flight: name + context monitoring |
-| `sm spawn claude "..." --name X` | Start a worker agent |
-| `sm dispatch <id> --role X --task "..."` | Dispatch task to agent (auto-clears) |
-| `sm send <id> "..." --urgent` | Manual send (follow-ups, one-liners) |
-| `sm clear <id>` | Reset agent for new task (sm dispatch does this) |
-| `sm children` | See your spawned agents + status |
-| `sm tail <id>` | Recent tool actions (fast, no haiku) |
-| `sm what <id>` | AI summary of agent activity (last resort) |
-| `sm attach <id>` | Jump into agent's session |
-| `sm output <id>` | See agent's recent output |
-| `sm kill <id>` | Terminate agent |
+- Prefer `sm status`, `sm all`, `sm tail`, and the Android app for live state.
+- Prefer explicit `sm send` prompts over summary helpers.
+- Use `sm retire` for lifecycle stop; avoid legacy kill terminology.
+- Keep app updates and Cloudflare mobile device policy changes auditable through
+  Session Manager commands.
+- If the public app path fails, check Cloudflare Access mTLS first, then origin
+  auth, then route-local attach proof.
 
 ---
 
 ## Requirements
 
-- macOS (Linux support planned)
-- Python 3.11+
-- tmux (`brew install tmux`)
-- Claude Code CLI
-- Telegram account (for remote visibility)
+- macOS with tmux
+- Rust toolchain
+- Claude Code and/or Codex CLI
+- Android app optional but recommended for mobile operation
+- Cloudflare Access optional for public mobile access, strongly recommended for
+  exposed app/browser hostnames
 
 ---
 
@@ -607,12 +457,5 @@ MIT
 
 ---
 
-## Contributing
-
-Issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
-
-**Built for the age of AI agents.** When one Claude isn't enough.
-
-*Let them swarm. Watch from anywhere. Jump in when needed. This is agent nirvana.* 🏖️
+**Built for the age of AI agents.** When one agent is not enough, let the swarm
+work while you stay in control.
