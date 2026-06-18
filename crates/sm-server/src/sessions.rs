@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -2015,17 +2016,16 @@ impl SessionStore {
         runtime_backed: bool,
         tmux_socket_name: Option<&str>,
     ) -> Result<SessionRecord> {
-        let session_id = request
+        let requested_session_id = request
             .id
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(generate_session_id);
-        if sessions
-            .iter()
-            .any(|value| value.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
-        {
+            .filter(|value| !value.is_empty());
+        let session_id = match requested_session_id {
+            Some(session_id) => session_id.to_owned(),
+            None => generate_unique_session_id(sessions)?,
+        };
+        if session_id_exists(sessions, &session_id) {
             anyhow::bail!("session already exists: {session_id}");
         }
         let parent_session = request.parent_session_id.as_deref().and_then(|parent_id| {
@@ -4540,8 +4540,30 @@ fn hex_char(value: u8) -> char {
 }
 
 fn generate_session_id() -> String {
-    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    format!("rs{:x}", nanos as u128)
+    let mut bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    let mut id = String::with_capacity(8);
+    for byte in bytes {
+        id.push(hex_char(byte >> 4));
+        id.push(hex_char(byte & 0x0f));
+    }
+    id
+}
+
+fn generate_unique_session_id(sessions: &[Value]) -> Result<String> {
+    for _ in 0..64 {
+        let session_id = generate_session_id();
+        if !session_id_exists(sessions, &session_id) {
+            return Ok(session_id);
+        }
+    }
+    anyhow::bail!("failed to generate unique session id after 64 attempts")
+}
+
+fn session_id_exists(sessions: &[Value], session_id: &str) -> bool {
+    sessions
+        .iter()
+        .any(|value| value.get("id").and_then(Value::as_str) == Some(session_id))
 }
 
 fn now_rfc3339() -> String {
@@ -5359,6 +5381,15 @@ mod tests {
         assert_eq!(expand_home("~"), home);
         assert_eq!(expand_home("~/work"), home.join("work"));
         assert_eq!(expand_home("/tmp/work"), PathBuf::from("/tmp/work"));
+    }
+
+    #[test]
+    fn generated_session_ids_match_python_short_hex_contract() {
+        let session_id = generate_session_id();
+
+        assert_eq!(session_id.len(), 8);
+        assert!(session_id.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(session_id, session_id.to_ascii_lowercase());
     }
 
     fn session_record(status: &str) -> SessionRecord {
