@@ -7158,13 +7158,30 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     if session.provider.trim() != "codex-fork" || session.tmux_session.trim().is_empty() {
         return None;
     }
-    if let Some(activity_state) = codex_fork_event_stream_activity(state, session) {
-        return Some(activity_state);
+    let event_activity = codex_fork_event_stream_activity(state, session);
+    if matches!(event_activity, Some("working" | "stopped")) {
+        return event_activity;
     }
     let runtime = TmuxRuntime::from_app_config(&state.config)
         .for_socket_name(session.tmux_socket_name.as_deref());
-    let pane_title = runtime.pane_title(&session.tmux_session)?;
-    codex_fork_pane_title_indicates_working(&pane_title).then_some("working")
+    let pane_title = runtime.pane_title(&session.tmux_session);
+    codex_fork_live_activity_from_signals(event_activity, pane_title.as_deref())
+}
+
+fn codex_fork_live_activity_from_signals(
+    event_activity: Option<&'static str>,
+    pane_title: Option<&str>,
+) -> Option<&'static str> {
+    if matches!(event_activity, Some("stopped" | "working")) {
+        return event_activity;
+    }
+    if pane_title
+        .map(codex_fork_pane_title_indicates_working)
+        .unwrap_or(false)
+    {
+        return Some("working");
+    }
+    event_activity
 }
 
 fn codex_fork_event_stream_activity(
@@ -10645,6 +10662,22 @@ mod tests {
         assert_eq!(
             codex_fork_event_stream_activity_from_path(event_stream),
             Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_fork_live_activity_prefers_spinner_over_idle_event() {
+        assert_eq!(
+            codex_fork_live_activity_from_signals(Some("idle"), Some("⠼ fractal-algo-rust")),
+            Some("working")
+        );
+        assert_eq!(
+            codex_fork_live_activity_from_signals(Some("idle"), Some("fractal-algo-rust")),
+            Some("idle")
+        );
+        assert_eq!(
+            codex_fork_live_activity_from_signals(Some("stopped"), Some("⠼ fractal-algo-rust")),
+            Some("stopped")
         );
     }
 
