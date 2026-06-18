@@ -1,12 +1,14 @@
 # Rust Port Resume Handoff
 
-Status: handoff snapshot from 2026-06-17 after PR #1045 merged the
-post-cutover live Rust canary report. The first Rust canary flip moved local
-production traffic to Rust. Issue #1042 adds the public tunnel preflight that
-keeps `sm-app.rajeshgo.li` pointed at the launchd-managed Rust service and
-keeps legacy `sm.rajeshgo.li` off origin. Issue #1046 adds public mTLS
-Cloudflare/mobile smoke evidence and a live canary artifact with that smoke
-supplied.
+Status: handoff snapshot from 2026-06-17 after PR #1049 added Android emulator
+smoke tooling. The first Rust canary flip moved local production traffic to
+Rust. Issue #1042 adds the public tunnel preflight that keeps
+`sm-app.rajeshgo.li` pointed at the launchd-managed Rust service and keeps
+legacy `sm.rajeshgo.li` off origin. Issue #1044 adds the post-cutover live Rust
+canary report. Issue #1046 adds public mTLS Cloudflare/mobile smoke evidence
+and a live canary artifact with that smoke supplied. Issue #1048 adds an
+adb-managed Android emulator smoke for native app enrollment/cert-auth evidence
+without a plugged-in phone.
 
 Use this file to resume the Rust cutover track without reconstructing state from
 chat history. Binding scope still lives in [cutover_scope.md](cutover_scope.md),
@@ -206,6 +208,10 @@ Merged Rust slices cover:
 - Issue #1044 adds the live canary report that records launchd ownership, local
   Rust health/native reads, `sm status`, public tunnel shape, public Access
   denial, and legacy-host absence without mutating live state.
+- Issue #1048 adds `scripts.rust_migration.android_emulator_smoke`, a
+  debug-APK/emulator smoke that enrolls the app over an `adb reverse` pairing
+  listener and verifies native HTTPS cert-auth reads through
+  `https://sm-app.rajeshgo.li`.
 - PR #1045 merged the live canary report.
 - Issue #1046 adds a public mTLS mode to the Cloudflare smoke runner. It can
   generate an ephemeral client certificate from the local mobile CA for the
@@ -443,11 +449,29 @@ through the certificate-gated app host. The skipped check is optional
 authenticated `/client/sessions` because no SM bearer token or cookie was
 supplied to the smoke runner.
 
-No newer clean full passive shadow artifact has been recorded in this handoff.
-PR #1012 published Android artifact `cbb61798` (`versionCode=1013`,
-`versionName=0.1.0-enroll-ui-cleanup`) and operator testing confirmed the app
-reached "Client certificate saved" after Camera-app deep-link enrollment. After
-PR #1035, operator testing also confirmed Android app update artifact access works through the certificate-gated app path.
+Post-#1048 adb-managed Android emulator smoke evidence:
+
+```text
+.local/rust-mvp-rehearsals/android-emulator-smoke-20260617T205819Z.json
+```
+
+Summary: `16` passed, `0` blocked, `2` skipped. The smoke reused booted AVD
+`sm_mtls_api35`, installed the debug APK, paired through a loopback
+`sm enroll-device` listener exposed with `adb reverse`, and the debug-only app
+activity passed certificate enrollment, device-bearer auth-session, client
+sessions, analytics, app artifact metadata, and attach-ticket proof through the
+public app hostname. The report excludes bearer, pairing token, certificate,
+and private-key material.
+
+No newer clean full passive shadow artifact or loopback-origin
+Cloudflare/mobile smoke artifact has been recorded in this handoff. PR #1012
+published Android artifact `cbb61798`
+(`versionCode=1013`, `versionName=0.1.0-enroll-ui-cleanup`) and operator
+testing confirmed the app reached "Client certificate saved" after Camera-app
+deep-link enrollment. After PR #1035, operator testing also confirmed Android
+app update artifact access works through the certificate-gated app path. The
+full Access smoke runner and sustained shadow window still need recorded
+artifacts.
 
 The broad live Rust contract run now uses the fixture filter:
 
