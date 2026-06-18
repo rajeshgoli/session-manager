@@ -205,7 +205,7 @@ If `target/release` is on your `PATH`, `sm` resolves to the Rust CLI.
 | `sm all` | List active sessions |
 | `sm spawn <provider> "<prompt>" --name <name>` | Start a new managed agent |
 | `sm send <id> "<text>"` | Send input to an agent |
-| `sm wait <id>` | Wait for a session state transition |
+| `sm wait <id> <seconds>` | Wait for a session state transition |
 | `sm attach <id>` | Attach to the live tmux session |
 | `sm tail <id>` | Show recent output/tool activity |
 | `sm output <id>` | Print recent terminal output |
@@ -377,10 +377,11 @@ paths:
 rust_core:
   runtime_enabled: true
 
-google_auth:
-  enabled: true
-  allowlist_emails:
-    - "you@example.com"
+auth:
+  google:
+    enabled: true
+    allowlist_emails:
+      - "you@example.com"
 
 cloudflare_access:
   mobile_app:
