@@ -36,14 +36,14 @@ Session Manager is built for the messy reality of running many agents at once:
              │                │                │
              └────────────────┼────────────────┘
                               │
-                       sm send maintainer
+                         sm send em
                         "done: PR #42"
                               │
               ┌───────────────┼───────────────┐
               ▼                               ▼
     ┌─────────────────┐             ┌─────────────────┐
-    │ Maintainer wakes│             │ Phone shows the │
-    │ and routes next │             │ swarm in flight │
+    │ Orchestrator    │             │ Phone shows the │
+    │ routes next     │             │ swarm in flight │
     └─────────────────┘             └─────────────────┘
 ```
 
@@ -117,8 +117,15 @@ away from the desk.
 
 ### Async Orchestration
 
-The maintainer pattern: spawn workers, route tasks, collect results, and wake
-only on useful state changes. Never wait synchronously unless you choose to.
+The Orchestrator/EM pattern: fan out known work, route tickets to the right
+agents, collect results, and wake only on useful state changes. Never wait
+synchronously unless you choose to.
+
+### Named Maintainers
+
+The Maintainer pattern is different: one named agent keeps infrastructure and
+long-running project state healthy. It is the session you page when the system
+itself needs attention.
 
 ### Remote Control
 
