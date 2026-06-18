@@ -61,15 +61,23 @@ private fun sessionPriority(session: ClientSession): Int {
 fun isActiveSession(session: ClientSession): Boolean = sessionPriority(session) == 0
 
 fun isOperationallyActive(session: ClientSession): Boolean {
-    val activity = activityLabel(session.activityState)
-    return session.status == "running" || activity == "working" || activity == "thinking" || activity == "waiting"
+    val rawActivity = session.activityState?.trim()
+    val activity = activityLabel(rawActivity)
+    return when {
+        activity == "working" || activity == "thinking" || activity == "waiting" -> true
+        !rawActivity.isNullOrEmpty() -> false
+        else -> session.status == "running"
+    }
 }
 
 fun projectedStatusLabel(session: ClientSession): String {
+    val rawActivity = session.activityState?.trim()
+    val activity = activityLabel(rawActivity)
     return when {
-        session.status == "running" -> "running"
         session.status == "stopped" -> "stopped"
-        isOperationallyActive(session) -> "active"
+        isOperationallyActive(session) -> activity
+        !rawActivity.isNullOrEmpty() -> activity
+        session.status == "running" -> "running"
         session.status.isNotBlank() -> session.status
         else -> "idle"
     }

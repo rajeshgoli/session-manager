@@ -21,7 +21,7 @@ class WatchModelsTest {
 
         assertTrue(isOperationallyActive(session))
         assertTrue(isActiveSession(session))
-        assertEquals("active", projectedStatusLabel(session))
+        assertEquals("working", projectedStatusLabel(session))
     }
 
     @Test
@@ -43,6 +43,22 @@ class WatchModelsTest {
         assertFalse(isOperationallyActive(session))
         assertFalse(isActiveSession(session))
         assertEquals("idle", projectedStatusLabel(session))
+    }
+
+    @Test
+    fun runningSessionWithIdleActivityProjectsAsIdle() {
+        val session = session(status = "running", activityState = "idle")
+        val sections = buildSections(listOf(session))
+
+        assertFalse(isOperationallyActive(session))
+        assertFalse(isActiveSession(session))
+        assertEquals("idle", projectedStatusLabel(session))
+
+        val runningSections = filterSections(sections, statusFilter = "running", query = "")
+        val idleSections = filterSections(sections, statusFilter = "idle", query = "")
+
+        assertTrue(runningSections.isEmpty())
+        assertEquals(listOf(session.id), idleSections.flatMap { it.roots }.map { it.session.id })
     }
 
     private fun session(
