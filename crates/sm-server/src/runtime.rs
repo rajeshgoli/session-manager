@@ -32,6 +32,7 @@ pub struct TmuxRuntime {
     codex_fork_args: Vec<String>,
     codex_fork_default_model: Option<String>,
     codex_fork_event_schema_version: u32,
+    codex_fork_control_tmux_fallback_enabled: bool,
     prompt_mode: String,
     start_settle_ms: u64,
     send_keys_settle_ms: f64,
@@ -86,6 +87,7 @@ impl TmuxRuntime {
             ],
             codex_fork_default_model: None,
             codex_fork_event_schema_version: 2,
+            codex_fork_control_tmux_fallback_enabled: true,
             prompt_mode: config
                 .runtime_prompt_mode
                 .as_deref()
@@ -137,11 +139,17 @@ impl TmuxRuntime {
         runtime.codex_fork_args = config.codex_fork.args.clone();
         runtime.codex_fork_default_model = config.codex_fork.default_model.clone();
         runtime.codex_fork_event_schema_version = config.codex_fork.event_schema_version;
+        runtime.codex_fork_control_tmux_fallback_enabled =
+            config.codex_fork.control_tmux_fallback_enabled;
         runtime
     }
 
     pub fn socket_name(&self) -> Option<&str> {
         self.socket_name.as_deref()
+    }
+
+    pub fn codex_fork_control_tmux_fallback_enabled(&self) -> bool {
+        self.codex_fork_control_tmux_fallback_enabled
     }
 
     pub fn startup_settle_duration(&self) -> Duration {
@@ -379,6 +387,21 @@ impl TmuxRuntime {
         Ok(true)
     }
 
+    pub fn set_status_bar(&self, tmux_session: &str, friendly_name: &str) -> Result<bool> {
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
+        }
+        let status_left = format!("[{friendly_name}] ");
+        self.run_tmux([
+            "set-option",
+            "-t",
+            tmux_session,
+            "status-left",
+            status_left.as_str(),
+        ])?;
+        Ok(true)
+    }
+
     pub fn session_exists(&self, tmux_session: &str) -> Result<bool> {
         let output = self
             .tmux_command(["has-session", "-t", tmux_session])
@@ -410,6 +433,19 @@ impl TmuxRuntime {
             "1" => Some(1),
             _ => None,
         }
+    }
+
+    pub fn pane_title(&self, tmux_session: &str) -> Option<String> {
+        let output = self
+            .tmux_command(["display-message", "-p", "-t", tmux_session, "#{pane_title}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
     fn exit_copy_mode_if_needed(&self, tmux_session: &str) {
@@ -873,6 +909,19 @@ mod tests {
         assert!(command.contains("unset CLAUDECODE"));
         assert!(command.contains("export ENABLE_TOOL_SEARCH=false"));
         assert!(command.ends_with("; claude"));
+    }
+
+    #[test]
+    fn set_status_bar_updates_tmux_status_left() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert!(runtime.set_status_bar("sm-test", "deskbar-name").unwrap());
+
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("has-session -t sm-test"));
+        assert!(log.contains("set-option -t sm-test status-left [deskbar-name]"));
     }
 
     #[test]

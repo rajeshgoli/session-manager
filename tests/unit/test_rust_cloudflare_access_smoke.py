@@ -580,3 +580,211 @@ def test_cloudflare_access_smoke_cli_resolves_secret_files(tmp_path, monkeypatch
 
     assert exit_code == 0
     assert captured["cookie"] == "session=abc"
+
+
+def test_cloudflare_access_smoke_public_mtls_records_public_boundary(tmp_path):
+    cert_file = tmp_path / "client.cert.pem"
+    key_file = tmp_path / "client.key.pem"
+    cert_file.write_text("cert", encoding="utf-8")
+    key_file.write_text("key", encoding="utf-8")
+    seen = []
+
+    def fake_urlopen(request, timeout):
+        seen.append((request.full_url, request.get_header("Authorization"), timeout))
+        path = request.full_url.removeprefix("https://sm-app.example.com")
+        if len(seen) == 1 and path == "/client/bootstrap":
+            raise urllib.error.HTTPError(
+                request.full_url,
+                403,
+                "forbidden",
+                {"content-type": "text/html"},
+                _BytesHandle(b"<html>Cloudflare Access</html>"),
+            )
+        if path == "/client/bootstrap":
+            return FakeResponse(200, b'{"auth":{},"external_access":{}}')
+        if path == "/client/sessions":
+            raise _http_error(
+                request.full_url,
+                401,
+                {"detail": "Authentication required"},
+            )
+        if path == "/apps/session-manager-android/meta.json":
+            return FakeResponse(
+                200,
+                b'{"artifact_hash":"deadbeef","version_code":1033}',
+            )
+        raise AssertionError(f"unexpected request path {path}")
+
+    report = build_smoke_report(
+        mode="public-mtls",
+        public_base_url="https://sm-app.example.com",
+        client_cert_file=cert_file,
+        client_key_file=key_file,
+        timeout_seconds=2.5,
+        urlopen=fake_urlopen,
+    )
+
+    assert report["status"] == "passed"
+    assert report["summary"] == {"passed": 4, "blocked": 0, "skipped": 1}
+    assert report["blockers"] == []
+    assert report["inputs"]["mode"] == "public-mtls"
+    assert report["inputs"]["client_cert_file_supplied"] is True
+    assert report["inputs"]["client_key_file_supplied"] is True
+    assert report["inputs"]["ephemeral_client_cert_generated"] is False
+    by_id = {check["id"]: check for check in report["checks"]}
+    assert by_id["public_mtls.bootstrap_requires_client_cert"]["status"] == "passed"
+    assert by_id["public_mtls.bootstrap_with_client_cert"]["status"] == "passed"
+    assert by_id["public_mtls.sessions_require_sm_auth"]["status"] == "passed"
+    assert by_id["public_mtls.app_artifact_metadata"]["status"] == "passed"
+    assert by_id["public_mtls.sessions_with_sm_auth"] == {
+        "id": "public_mtls.sessions_with_sm_auth",
+        "description": "public mobile API returns sessions after mTLS and SM auth",
+        "status": "skipped",
+        "detail": "SM bearer token or cookie was not supplied",
+        "required": False,
+    }
+    assert by_id["public_mtls.bootstrap_with_client_cert"]["response"][
+        "json_redacted"
+    ] is True
+    assert by_id["public_mtls.bootstrap_with_client_cert"]["response"]["json_keys"] == [
+        "auth",
+        "external_access",
+    ]
+    assert "json" not in by_id["public_mtls.bootstrap_with_client_cert"]["response"]
+    assert seen == [
+        ("https://sm-app.example.com/client/bootstrap", None, 2.5),
+        ("https://sm-app.example.com/client/bootstrap", None, 2.5),
+        ("https://sm-app.example.com/client/sessions", None, 2.5),
+        (
+            "https://sm-app.example.com/apps/session-manager-android/meta.json",
+            None,
+            2.5,
+        ),
+    ]
+
+
+def test_cloudflare_access_smoke_public_mtls_blocks_missing_cert_source():
+    report = build_smoke_report(
+        mode="public-mtls",
+        public_base_url="https://sm-app.example.com",
+    )
+
+    assert report["status"] == "blocked"
+    assert report["blockers"] == [
+        {
+            "check_id": "public_mtls.client_certificate_available",
+            "kind": "client_cert_missing",
+            "detail": (
+                "supply client cert/key files or client cert common name plus device CA "
+                "cert/key files"
+            ),
+        }
+    ]
+
+
+def test_cloudflare_access_smoke_public_mtls_uses_generated_ephemeral_cert(
+    tmp_path, monkeypatch
+):
+    ca_cert = tmp_path / "ca.cert.pem"
+    ca_key = tmp_path / "ca.key.pem"
+    client_cert = tmp_path / "generated.cert.pem"
+    client_key = tmp_path / "generated.key.pem"
+    ca_cert.write_text("ca cert", encoding="utf-8")
+    ca_key.write_text("ca key", encoding="utf-8")
+    client_cert.write_text("client cert", encoding="utf-8")
+    client_key.write_text("client key", encoding="utf-8")
+    captured = {}
+
+    def fake_generate(**kwargs):
+        captured.update(kwargs)
+        return {
+            "cert_file": client_cert,
+            "key_file": client_key,
+            "_tempdir": object(),
+        }
+
+    def fake_urlopen(request, timeout):
+        path = request.full_url.removeprefix("https://sm-app.example.com")
+        if path == "/client/bootstrap" and not hasattr(fake_urlopen, "denied"):
+            fake_urlopen.denied = True
+            raise urllib.error.HTTPError(
+                request.full_url,
+                403,
+                "forbidden",
+                {"content-type": "text/html"},
+                _BytesHandle(b"<html>Cloudflare Access</html>"),
+            )
+        if path == "/client/bootstrap":
+            return FakeResponse(200, b'{"auth":{}}')
+        if path == "/client/sessions":
+            raise _http_error(
+                request.full_url,
+                401,
+                {"detail": "Authentication required"},
+            )
+        if path == "/apps/session-manager-android/meta.json":
+            return FakeResponse(200, b'{"artifact_hash":"deadbeef"}')
+        raise AssertionError(f"unexpected request path {path}")
+
+    monkeypatch.setattr(
+        "scripts.rust_migration.cloudflare_access_smoke._generate_ephemeral_client_cert",
+        fake_generate,
+    )
+
+    report = build_smoke_report(
+        mode="public-mtls",
+        public_base_url="https://sm-app.example.com",
+        client_cert_common_name="android-c6c90c26d0d90faf",
+        device_ca_cert_file=ca_cert,
+        device_ca_key_file=ca_key,
+        urlopen=fake_urlopen,
+    )
+
+    assert report["status"] == "passed"
+    assert report["inputs"]["ephemeral_client_cert_generated"] is True
+    assert report["inputs"]["client_cert_common_name"] == "android-c6c90c26d0d90faf"
+    assert captured == {
+        "common_name": "android-c6c90c26d0d90faf",
+        "device_ca_cert_file": ca_cert,
+        "device_ca_key_file": ca_key,
+    }
+
+
+def test_cloudflare_access_smoke_cli_passes_public_mtls_args(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_report(**kwargs):
+        captured.update(kwargs)
+        return {
+            "status": "passed",
+            "summary": {"passed": 4, "blocked": 0, "skipped": 1},
+            "checks": [],
+            "blockers": [],
+        }
+
+    monkeypatch.setattr(
+        "scripts.rust_migration.cloudflare_access_smoke.build_smoke_report",
+        fake_report,
+    )
+
+    exit_code = main(
+        [
+            "--mode",
+            "public-mtls",
+            "--public-base-url",
+            "https://sm-app.example.com",
+            "--client-cert-common-name",
+            "android-c6c90c26d0d90faf",
+            "--device-ca-cert-file",
+            str(tmp_path / "ca.cert.pem"),
+            "--device-ca-key-file",
+            str(tmp_path / "ca.key.pem"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["mode"] == "public-mtls"
+    assert captured["public_base_url"] == "https://sm-app.example.com"
+    assert captured["client_cert_common_name"] == "android-c6c90c26d0d90faf"
+    assert captured["device_ca_cert_file"] == tmp_path / "ca.cert.pem"
+    assert captured["device_ca_key_file"] == tmp_path / "ca.key.pem"

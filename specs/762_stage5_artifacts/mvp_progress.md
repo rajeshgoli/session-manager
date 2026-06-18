@@ -1,26 +1,30 @@
 # Rust MVP Progress Snapshot
 
-Status: implementation snapshot after PR #1041 Rust service cutover tooling was
-merged and used for the first Rust canary flip on 2026-06-17. Issue #1042 adds
-the public tunnel preflight that verifies `sm-app.rajeshgo.li` routes directly
-to the launchd-managed Rust service and legacy `sm.rajeshgo.li` does not route
-to origin. Issue #1044 adds a non-mutating live canary report for the
-post-cutover Rust service. Issue #1048 adds an adb-managed Android emulator
-smoke for the native app enrollment/cert-auth path without a plugged-in phone.
+Status: implementation snapshot after PR #1049 Android emulator smoke tooling.
+The first Rust canary flip moved local production traffic to Rust on
+2026-06-17. Issue #1042 adds the public tunnel preflight that verifies
+`sm-app.rajeshgo.li` routes directly to the launchd-managed Rust service and
+legacy `sm.rajeshgo.li` does not route to origin. Issue #1044 adds a
+non-mutating live canary report for the post-cutover Rust service. Issue #1046
+adds a public mTLS smoke mode and a live canary artifact with
+Cloudflare/mobile smoke supplied. Issue #1048 adds an adb-managed Android
+emulator smoke for the native app enrollment/cert-auth path without a plugged-in
+phone.
 
 The last clean full real-state MVP rehearsal remains the post-#938 run; the
 post-#1035 rehearsal proves state gates, live core contracts, read-only
 fixtures, mutating fixtures, and Rust baseline on isolated sidecars, but blocks
-on Python-origin availability during Python baseline and shadow. PRs #986-#1041
+on Python-origin availability during Python baseline and shadow. PRs #986-#1045
 added node restore fixtures, stopped-origin final backup gates, rehearsal
 final-backup integration, Cloudflare Access smoke evidence tooling, Rust
 mobile-device enrollment, Cloudflare mTLS CA automation, the Android Camera-app
 enrollment handoff, Rust native Google device-auth bearer issuance, Android
 mTLS, artifact read fixes, a larger live HTTP read budget, accelerated Rust
-canary evidence mode, and reviewed launchd/service cutover tooling. The first
-live cutover stopped the Python launchd label, copied a stopped-origin final
-backup, started Rust on `127.0.0.1:8420`, enabled Rust core writes, verified the
-Android app path, and removed the legacy public tunnel route.
+canary evidence mode, reviewed launchd/service cutover tooling, and public mTLS
+Cloudflare smoke evidence. The first live cutover stopped the Python launchd
+label, copied a stopped-origin final backup, started Rust on `127.0.0.1:8420`,
+enabled Rust core writes, verified the Android app path, and removed the legacy
+public tunnel route.
 
 This file is a handoff aid for the Rust cutover implementation track. It does
 not change retained or removed scope. Binding scope remains
@@ -127,6 +131,8 @@ not change retained or removed scope. Binding scope remains
 | issue #1042 | Public tunnel preflight for the protected app hostname and legacy-host absence |
 | issue #1044 | Live Rust canary evidence collector for launchd/local/public-tunnel post-cutover checks |
 | issue #1048 | Android emulator native app smoke for enrollment, cert-auth reads, and attach-ticket proof |
+| #1045 | Merge of the live Rust canary evidence collector |
+| issue #1046 | Public mTLS Cloudflare/mobile smoke mode and live canary evidence with smoke supplied |
 
 ## Implemented Capability Groups
 
@@ -134,7 +140,7 @@ The Rust sidecar now has executable coverage for:
 
 | Group | Current state |
 | --- | --- |
-| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, stopped-origin final backup, freeze/drain evidence gates, Cloudflare Access smoke evidence runner, mobile-aware shadow observation gates, accelerated Rust canary evidence mode, public tunnel preflight, and live Rust canary report exist. |
+| Harness and baselines | Contract manifest, fixture assertions, minimal value baseline runner, shadow comparison, MVP rehearsal, synthetic read-only fixture sidecar, disposable mutating fixtures, Rust CLI build gating, state preflight/backup/restore, stopped-origin final backup, freeze/drain evidence gates, Cloudflare Access smoke evidence runner, public mTLS smoke mode, mobile-aware shadow observation gates, accelerated Rust canary evidence mode, public tunnel preflight, and live Rust canary report exist. |
 | Retired-surface checks | Retired public/watch/summary/remind/job-watch/queue-policy checks are represented as Rust-target absence or denial fixtures. |
 | Core reads | Health, auth session, bootstrap, session list/detail, client session list/detail, output, events state, SSE hello, nodes list, queue jobs list/detail, Codex review requests list/detail, and tool/audit read projections are implemented. |
 | Core runtime | Session/tmux/spawn/session-graph/message-queue/task-complete/input-batch/subagent and retained review-route slices are merged, with shadow and contract fixtures covering the early cutover path. |
@@ -174,6 +180,7 @@ Collect the live Rust canary evidence bundle with:
 
 ```bash
 ./venv/bin/python -m scripts.rust_migration.live_canary_report \
+  --cloudflare-smoke-report .local/rust-mvp-rehearsals/public-mtls-smoke-20260617T202635Z.json \
   --output .local/rust-mvp-rehearsals/live-canary-$(date -u +%Y%m%dT%H%M%SZ).json \
   --fail-on-blockers
 ```
@@ -181,17 +188,37 @@ Collect the live Rust canary evidence bundle with:
 The report is intentionally non-mutating. It records the Rust launchd label,
 local Rust health/bootstrap/session/analytics reads, `sm status`, the public
 tunnel preflight, unauthenticated `sm-app` Cloudflare Access denial, legacy
-public-host absence, and optional Cloudflare/mobile smoke evidence.
+public-host absence, and supplied Cloudflare/mobile smoke evidence.
+
+Current public mTLS smoke artifact:
+
+```text
+.local/rust-mvp-rehearsals/public-mtls-smoke-20260617T202635Z.json
+```
+
+Summary: `4` passed, `0` blocked, `1` skipped. The passed checks prove:
+
+- `sm-app.rajeshgo.li` denies `/client/bootstrap` without a client certificate;
+- an ephemeral client certificate signed by the local mobile CA for the enrolled
+  Android Common Name reaches `/client/bootstrap`;
+- `/client/sessions` still returns SM-auth `401` without an SM bearer or
+  session cookie after mTLS succeeds;
+- app artifact metadata is served through the certificate-gated app host.
+
+The skipped check is optional authenticated `/client/sessions` because no SM
+bearer token or cookie was supplied to the smoke runner.
 
 Current live canary artifact:
 
 ```text
-.local/rust-mvp-rehearsals/live-canary-20260617T192700Z.json
+.local/rust-mvp-rehearsals/live-canary-with-public-mtls-20260617T202645Z.json
 ```
 
-Summary: `10` passed, `0` blocked, `1` skipped. The skipped check is the
-optional supplied Cloudflare/mobile smoke report; all launchd, local Rust,
-tunnel, and public unauthenticated denial checks passed.
+Summary: `11` passed, `0` blocked, `0` skipped. The passing checks cover the
+Rust launchd label, local Rust health/detailed health/bootstrap/session
+list/native analytics reads, `sm status`, local public tunnel preflight,
+unauthenticated `sm-app` public denial before origin, legacy public-host
+absence, and the supplied public mTLS Cloudflare/mobile smoke report.
 
 Current adb-managed Android emulator smoke artifact:
 
@@ -392,14 +419,15 @@ normal full rehearsal and should be identified as such in reports.
 Required command shape:
 
 ```bash
+cn=$(sqlite3 "$HOME/.local/share/claude-sessions/mobile_devices.db" \
+  "SELECT common_name FROM mobile_device_enrollments WHERE revoked_at IS NULL ORDER BY paired_at DESC LIMIT 1;")
+
 ./venv/bin/python -m scripts.rust_migration.cloudflare_access_smoke \
-  --base-url http://127.0.0.1:8421 \
-  --mobile-host sm-app.rajeshgo.li \
-  --browser-host sm.rajeshgo.li \
-  --mobile-access-jwt-env CF_MOBILE_ACCESS_JWT \
-  --browser-access-jwt-env CF_BROWSER_ACCESS_JWT \
-  --public-edge-secret-env SM_PUBLIC_EDGE_SECRET \
-  --bearer-token-env SM_DEVICE_BEARER_TOKEN \
+  --mode public-mtls \
+  --public-base-url https://sm-app.rajeshgo.li \
+  --client-cert-common-name "$cn" \
+  --device-ca-cert-file certs/sm-mobile-device-ca.pem \
+  --device-ca-key-file certs/sm-mobile-device-ca.key \
   --output .local/rust-mvp-rehearsals/cloudflare-smoke.json \
   --json \
   --fail-on-blockers
@@ -415,8 +443,8 @@ Blocking evidence in this path:
 - state preflight, backup, restore rehearsal, and freeze/drain ledger;
 - Rust live core contracts and synthetic read-only/mutating fixture contracts;
 - Rust baseline;
-- `cloudflare_access_smoke_report` from a passed smoke report using real
-  Access/public-edge/SM auth inputs.
+- `cloudflare_access_smoke_report` from a passed smoke report using the real
+  public mTLS app host.
 
 The mode intentionally skips sustained `python_baseline` and
 `shadow_read_summary`; those steps must be recorded as skipped, not silently
@@ -429,14 +457,14 @@ These are the next practical buckets before an MVP cutover trial:
 
 | Bucket | Why it remains |
 | --- | --- |
-| Shadow/canary observation window | Python-authoritative shadow mode is now historical because Rust owns the live port. The live Rust canary report passes for launchd/local/tunnel/public-denial checks; remaining work is bounded app/operator smoke and any targeted comparison needed for specific bugs. If Python is restarted for comparison, use it only for targeted checks rather than broad hardening. |
+| Shadow/canary observation window | Python-authoritative shadow mode is now historical because Rust owns the live port. The live Rust canary report now passes with public mTLS Cloudflare/mobile smoke supplied; remaining work is targeted comparison only for specific bugs. If Python is restarted for comparison, use it only for targeted checks rather than broad hardening. |
 | Full fixture manifest execution | The MVP rehearsal now runs the current synthetic read-only and mutating fixture sets, including review-route fixtures. Remaining work is final live mobile/device fixture evidence and any additional retained fixture rows added by later slices. |
 | CLI cutover audit | Verify every retained CLI command in [cutover_scope.md](cutover_scope.md) is native Rust or intentionally routed, and every removed command is absent or explicitly retired. |
 | State ownership and migration tooling | Initial preflight, backup, restore, and freeze/drain evidence tools are merged and exercised by the rehearsal. Remaining work is live write-admission freeze/journal ownership and rollback accounting from [state_ownership_and_migration.md](state_ownership_and_migration.md). |
-| Cloudflare Access deployment integration | Pair the merged Rust origin gate with the actual Cloudflare Access apps, mTLS/service-auth policies, device Common Name enrollment/revocation, app-host native auth smoke, browser OAuth smoke, and later node fallback tests. Current evidence lives in [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md). |
+| Cloudflare Access deployment integration | Public app-host mTLS smoke now passes. Remaining work is browser OAuth smoke, any fuller native authenticated session/action smoke that needs a real SM bearer/cookie, and later node fallback tests. Current evidence lives in [cloudflare_access_cutover_evidence.md](cloudflare_access_cutover_evidence.md). |
 | Node and queue writer completion | Basic node HTTP routes and narrow queue writer/recovery are implemented. Remaining work is final live/recovery cutover evidence, audit/rollback accounting, and any retained node-agent remote-control gaps. |
 | Service packaging and rollback | Launchd/service cutover has been exercised for the first Rust canary. Remaining work is continued live canary evidence, rollback rehearsal if needed, and operator diagnostics. |
-| Final native mobile smoke | Run bootstrap/session/attach/request-status/analytics/bug-report/app-artifact smoke checks against Rust using real mobile assumptions. |
+| Final native mobile smoke | Public mTLS bootstrap/session-auth-boundary/app-artifact smoke is recorded. Remaining checks are authenticated mobile actions such as attach/request-status/analytics/bug-report when they need a real app bearer/session. |
 | Python-origin availability during evidence runs | Post-#1035 full rehearsal is blocked because Python watchdog-restarted during baseline/shadow. This does not call for broad Python hardening. Either collect the normal stable Python-authoritative window, or use the accelerated Rust canary evidence path with spot checks and Cloudflare/mobile smoke. |
 
 ## Stop Conditions For MVP Cutover

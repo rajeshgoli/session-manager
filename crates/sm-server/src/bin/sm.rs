@@ -515,6 +515,7 @@ fn run() -> Result<()> {
         Command::Spawn(args) => {
             let prompt = args.prompt.join(" ");
             let parent_session_id = optional_current_session_id();
+            let provider = launch_provider_for_alias(&args.provider)?;
             let payload = if let Some(parent_session_id) = parent_session_id {
                 client.post_json(
                     "/sessions/spawn",
@@ -526,7 +527,7 @@ fn run() -> Result<()> {
                         "wait": args.wait,
                         "model": args.model,
                         "working_dir": args.working_dir,
-                        "provider": args.provider,
+                        "provider": provider,
                         "node": args.node
                     }),
                 )?
@@ -537,7 +538,7 @@ fn run() -> Result<()> {
                         "id": args.id,
                         "name": args.name,
                         "working_dir": args.working_dir,
-                        "provider": args.provider,
+                        "provider": provider,
                         "node": args.node,
                         "initial_message": prompt,
                         "model": args.model,
@@ -606,6 +607,10 @@ fn run() -> Result<()> {
             }
             let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
             let targets = split_send_targets(&args.session_id);
+            let targets = targets
+                .iter()
+                .map(|target| resolve_send_target(&client, target))
+                .collect::<Result<Vec<_>>>()?;
             let mut payload = send_input_payload(text, delivery_mode, args.wait);
             if targets.len() > 1 {
                 payload["recipients"] = json!(targets);
@@ -2093,6 +2098,13 @@ fn split_send_targets(raw_value: &str) -> Vec<String> {
     identifiers
 }
 
+fn resolve_send_target(client: &ApiClient, identifier: &str) -> Result<String> {
+    match lookup_identifier(client, identifier)? {
+        Some(session_id) => Ok(session_id),
+        None => Ok(identifier.to_owned()),
+    }
+}
+
 fn send_input_payload(text: String, delivery_mode: &str, wait: Option<u64>) -> Value {
     let mut payload = json!({
         "text": text,
@@ -3093,11 +3105,48 @@ mod tests {
     use super::*;
     use std::{
         ffi::OsString,
+        net::TcpListener,
         sync::Mutex,
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn start_lookup_server<const N: usize>(
+        responses: [(&'static str, u16, &'static str); N],
+    ) -> (ApiClient, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for (expected_path, status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut buffer = [0_u8; 4096];
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let request_line = request.lines().next().unwrap_or_default();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                assert_eq!(method, "GET");
+                assert_eq!(path, expected_path);
+                paths.push(path.to_owned());
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            paths
+        });
+        let client = ApiClient::parse(&format!("http://{address}")).unwrap();
+        (client, server)
+    }
 
     #[test]
     fn resolve_api_url_uses_existing_default() {
@@ -3181,6 +3230,42 @@ mod tests {
         assert_eq!(payload["notify_after_seconds"], 7);
         assert_eq!(payload["from_sm_send"], true);
         assert_eq!(payload["sender_session_id"], "sender001");
+    }
+
+    #[test]
+    fn resolve_send_target_uses_friendly_name_lookup() {
+        let (client, server) = start_lookup_server([
+            (
+                "/registry/playback-spec",
+                404,
+                r#"{"detail":"Role not found"}"#,
+            ),
+            (
+                "/sessions/playback-spec",
+                404,
+                r#"{"detail":"Session not found"}"#,
+            ),
+            (
+                "/sessions",
+                200,
+                r#"{"sessions":[{"id":"rs18ba032e54229928","friendly_name":"playback-spec","name":"codex-fork-rs18ba032e54229928","aliases":[]}]}"#,
+            ),
+        ]);
+
+        assert_eq!(
+            resolve_send_target(&client, "playback-spec").unwrap(),
+            "rs18ba032e54229928"
+        );
+
+        let paths = server.join().unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "/registry/playback-spec",
+                "/sessions/playback-spec",
+                "/sessions"
+            ]
+        );
     }
 
     #[test]
@@ -3819,6 +3904,27 @@ mod tests {
         assert_eq!(top_level["provider"], "codex-fork");
         assert_eq!(top_level["parent_session_id"], Value::Null);
         assert_eq!(top_level["node"], Value::Null);
+    }
+
+    #[test]
+    fn spawn_cli_provider_aliases_match_launch_aliases() {
+        let cli = Cli::try_parse_from(["sm", "spawn", "codex", "review this"]).unwrap();
+        let Command::Spawn(args) = cli.command else {
+            panic!("expected spawn command");
+        };
+        assert_eq!(
+            launch_provider_for_alias(&args.provider).unwrap(),
+            "codex-fork"
+        );
+
+        let cli = Cli::try_parse_from(["sm", "spawn", "codex-2", "review this"]).unwrap();
+        let Command::Spawn(args) = cli.command else {
+            panic!("expected spawn command");
+        };
+        assert_eq!(
+            launch_provider_for_alias(&args.provider).unwrap(),
+            "codex-fork"
+        );
     }
 
     #[test]

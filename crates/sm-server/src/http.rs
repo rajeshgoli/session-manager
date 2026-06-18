@@ -4,7 +4,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     fs,
+    io::{Read, Seek, SeekFrom},
     net::SocketAddr,
+    path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -101,15 +103,17 @@ use crate::queue::{
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
-    expand_home, is_primary_node, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
+    codex_fork_status_for_event_line, expand_home, is_primary_node, AgentRegistrationResponse,
+    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
     ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
     CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
     MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
-    SendCoreInputBatchRequest, SendCoreInputRequest, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path, ToolCallRow,
@@ -118,6 +122,7 @@ use crate::tool_usage::{
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
+const CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES: u64 = 256 * 1024;
 const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
@@ -898,7 +903,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/review", post(spawn_review_session))
         .route("/sessions/context-monitor", get(get_context_monitor_status))
-        .route("/sessions/{session_id}", get(get_session))
+        .route(
+            "/sessions/{session_id}",
+            get(get_session).patch(update_session_metadata),
+        )
         .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
             "/sessions/{parent_session_id}/children",
@@ -1137,10 +1145,40 @@ async fn tmux_client_hook(
             detail: "unsupported tmux client event".to_owned(),
         });
     }
-    Ok(Json(json!({
+    let revived_session_id = if state.config.rust_core.runtime_enabled
+        && matches!(event_name, "client-attached" | "client-session-changed")
+    {
+        query
+            .session
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                query
+                    .client_session
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .map(|tmux_session| {
+                let runtime = TmuxRuntime::from_app_config(&state.config);
+                state
+                    .session_store
+                    .revive_stopped_tmux_client_session(tmux_session, &runtime)
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let mut response = json!({
         "status": "ok",
         "tmux_client_event_version": 0,
-    })))
+    });
+    if let Some(session_id) = revived_session_id {
+        response["revived_session_id"] = Value::String(session_id);
+    }
+    Ok(Json(response))
 }
 
 async fn client_bootstrap(
@@ -2093,7 +2131,7 @@ async fn list_sessions(
         .session_store
         .list_sessions(query.include_stopped)?
         .into_iter()
-        .map(SessionResponse::from)
+        .map(|session| session_response_with_live_activity(&state, session))
         .collect::<Vec<_>>();
     Ok(Json(SessionsEnvelope::from(sessions)))
 }
@@ -2105,12 +2143,17 @@ async fn list_children_sessions(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    let children = state.session_store.list_children(
-        &parent_session_id,
-        query.recursive,
-        query.status.as_deref(),
-        query.include_terminated,
-    )?;
+    let children = state
+        .session_store
+        .list_child_records(
+            &parent_session_id,
+            query.recursive,
+            query.status.as_deref(),
+            query.include_terminated,
+        )?
+        .into_iter()
+        .map(|session| child_session_response_with_live_activity(&state, session))
+        .collect::<Vec<_>>();
     Ok(Json(json!({
         "parent_session_id": parent_session_id,
         "children": children,
@@ -2136,7 +2179,7 @@ async fn create_session(
     } else {
         state.session_store.create_core_session(payload, log_dir)?
     };
-    Ok(Json(SessionResponse::from(session)))
+    Ok(Json(session_response_with_live_activity(&state, session)))
 }
 
 async fn spawn_session(
@@ -2793,7 +2836,9 @@ async fn restore_node_restore_candidate(
         state.session_store.restore_core_session(&session_id)?
     };
     match outcome {
-        Some(CoreRestoreOutcome::Restored(session)) => Ok(Json(SessionResponse::from(session))),
+        Some(CoreRestoreOutcome::Restored(session)) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         Some(CoreRestoreOutcome::NotStopped) => Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is not stopped".to_owned(),
@@ -3162,14 +3207,16 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
                     .is_none()
                 {
                     if let Err(error) =
-                        RetainedQueueStore::cancel_codex_review_request_with_error_in_path(
+                        RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
                             &queue_db_path,
                             &registration.id,
+                            &now_rfc3339(),
                             "Notify session no longer exists",
+                            None,
                         )
                     {
                         eprintln!(
-                            "Codex review request recovery failed to cancel {}: {error:#}",
+                            "Codex review request recovery failed to mark {} missing notify session: {error:#}",
                             registration.id
                         );
                     }
@@ -3235,9 +3282,12 @@ async fn run_codex_review_request_watcher(
             .map_err(|error| error.to_string())?
             .is_none()
         {
-            let _ = RetainedQueueStore::cancel_codex_review_request_in_path(
+            let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
                 &queue_db_path,
                 &request_id,
+                &now_rfc3339(),
+                "Notify session no longer exists",
+                None,
             )
             .map_err(|error| error.to_string())?;
             return Ok(());
@@ -3766,6 +3816,24 @@ fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
     }
 }
 
+fn reserved_human_names(config: &AppConfig) -> anyhow::Result<BTreeSet<String>> {
+    let mut names = config
+        .human_recipient_reserved_names
+        .iter()
+        .map(|alias| normalize_role_like_python(alias))
+        .filter(|alias| !alias.is_empty())
+        .collect::<BTreeSet<_>>();
+    names.extend(
+        EmailBridge::load(config)?
+            .list_humans()
+            .into_iter()
+            .flat_map(|human| human.aliases.into_iter())
+            .map(|alias| normalize_role_like_python(&alias))
+            .filter(|alias| !alias.is_empty()),
+    );
+    Ok(names)
+}
+
 async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -3775,7 +3843,56 @@ async fn get_session(
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    Ok(Json(SessionResponse::from(session)))
+    Ok(Json(session_response_with_live_activity(&state, session)))
+}
+
+async fn update_session_metadata(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateSessionMetadataRequest>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{session_id}"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    if let Some(friendly_name) = payload.friendly_name.as_deref() {
+        validate_requested_friendly_name(friendly_name)?;
+    }
+    let requested_friendly_name = payload.friendly_name.clone();
+    let reserved_human_names = if requested_friendly_name.is_some() {
+        reserved_human_names(&state.config)?
+    } else {
+        BTreeSet::new()
+    };
+    match state.session_store.update_session_metadata(
+        &session_id,
+        payload,
+        &reserved_human_names,
+    )? {
+        SessionMetadataOutcome::Updated(session) => {
+            if let Some(friendly_name) = requested_friendly_name.as_deref() {
+                let _ = state
+                    .session_store
+                    .queue_provider_native_rename(&session, friendly_name);
+                if state.config.rust_core.runtime_enabled && !session.tmux_session.trim().is_empty()
+                {
+                    let runtime = TmuxRuntime::from_app_config(&state.config);
+                    let _ = runtime.set_status_bar(&session.tmux_session, friendly_name);
+                }
+            }
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
+        SessionMetadataOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        SessionMetadataOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+    }
 }
 
 async fn get_client_session(
@@ -5478,7 +5595,9 @@ async fn restore_session(
         return Err(ApiError::NotFound("Session not found"));
     };
     match outcome {
-        CoreRestoreOutcome::Restored(session) => Ok(Json(SessionResponse::from(session))),
+        CoreRestoreOutcome::Restored(session) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         CoreRestoreOutcome::NotStopped => Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is not stopped".to_owned(),
@@ -5673,7 +5792,9 @@ async fn set_maintainer(
         .session_store
         .set_maintainer_session(&session_id, payload)?
     {
-        MaintainerMutationOutcome::Updated(session) => Ok(Json(SessionResponse::from(session))),
+        MaintainerMutationOutcome::Updated(session) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -5700,7 +5821,9 @@ async fn clear_maintainer(
         .session_store
         .clear_maintainer_session(&session_id, payload)?
     {
-        MaintainerMutationOutcome::Updated(session) => Ok(Json(SessionResponse::from(session))),
+        MaintainerMutationOutcome::Updated(session) => {
+            Ok(Json(session_response_with_live_activity(&state, session)))
+        }
         MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -5714,7 +5837,12 @@ async fn list_agent_registry(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    let registrations = state.session_store.list_agent_registrations()?;
+    let registrations = state
+        .session_store
+        .list_agent_registrations()?
+        .into_iter()
+        .map(|registration| agent_registration_response_with_live_activity(&state, registration))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({ "registrations": registrations })))
 }
 
@@ -5730,6 +5858,7 @@ async fn lookup_agent_registry(
             detail: "Role not registered".to_owned(),
         });
     };
+    let registration = agent_registration_response_with_live_activity(&state, registration)?;
     Ok(Json(serde_json::to_value(registration)?))
 }
 
@@ -5748,6 +5877,7 @@ async fn register_agent_role(
     )?;
     ensure_core_writes_enabled(&state)?;
     registry_mutation_response(
+        &state,
         state
             .session_store
             .register_agent_role(&session_id, payload)?,
@@ -5769,17 +5899,21 @@ async fn unregister_agent_role(
     )?;
     ensure_core_writes_enabled(&state)?;
     registry_mutation_response(
+        &state,
         state
             .session_store
             .unregister_agent_role(&session_id, payload)?,
     )
 }
 
-fn registry_mutation_response(outcome: RegistryMutationOutcome) -> Result<Json<Value>, ApiError> {
+fn registry_mutation_response(
+    state: &AppState,
+    outcome: RegistryMutationOutcome,
+) -> Result<Json<Value>, ApiError> {
     match outcome {
-        RegistryMutationOutcome::Registered(registration) => {
-            Ok(Json(serde_json::to_value(registration)?))
-        }
+        RegistryMutationOutcome::Registered(registration) => Ok(Json(serde_json::to_value(
+            agent_registration_response_with_live_activity(state, registration)?,
+        )?)),
         RegistryMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         RegistryMutationOutcome::RoleNotRegistered => Err(ApiError::Status {
             status: StatusCode::NOT_FOUND,
@@ -5798,6 +5932,18 @@ fn registry_mutation_response(outcome: RegistryMutationOutcome) -> Result<Json<V
             detail,
         }),
     }
+}
+
+fn agent_registration_response_with_live_activity(
+    state: &AppState,
+    mut registration: AgentRegistrationResponse,
+) -> Result<AgentRegistrationResponse, ApiError> {
+    if let Some(session) = state.session_store.get_session(&registration.session_id)? {
+        if let Some(activity_state) = live_activity_state(state, &session) {
+            registration.activity_state = activity_state.to_owned();
+        }
+    }
+    Ok(registration)
 }
 
 async fn session_output(
@@ -6144,6 +6290,28 @@ fn shadow_predict_retained_write(
     method: &str,
     path: &str,
 ) -> anyhow::Result<Option<ShadowPrediction>> {
+    if method == "PATCH" {
+        if let Some(session_id) = path
+            .strip_prefix("/sessions/")
+            .filter(|value| !value.is_empty() && !value.contains('/'))
+        {
+            return match state.session_store.get_session(session_id)? {
+                Some(_) => Ok(Some(ShadowPrediction {
+                    status: StatusCode::OK.as_u16(),
+                    body_sha256: None,
+                    support_status: "implemented_retained_write_status_only",
+                })),
+                None => {
+                    let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+                    Ok(Some(ShadowPrediction {
+                        status: StatusCode::NOT_FOUND.as_u16(),
+                        body_sha256: Some(sha256_hex(&body)),
+                        support_status: "implemented_retained_write",
+                    }))
+                }
+            };
+        }
+    }
     if method == "POST"
         && (path == "/sessions/review" || session_review_path_session_id(path).is_some())
     {
@@ -6519,12 +6687,17 @@ fn shadow_predict_session_read(
         .strip_prefix("/sessions/")
         .and_then(|value| value.strip_suffix("/children"))
     {
-        let children = state.session_store.list_children(
-            parent_session_id,
-            query_bool(query_string, "recursive"),
-            query_value(query_string, "status"),
-            query_bool(query_string, "include_terminated"),
-        )?;
+        let children = state
+            .session_store
+            .list_child_records(
+                parent_session_id,
+                query_bool(query_string, "recursive"),
+                query_value(query_string, "status"),
+                query_bool(query_string, "include_terminated"),
+            )?
+            .into_iter()
+            .map(|session| child_session_response_with_live_activity(state, session))
+            .collect::<Vec<_>>();
         let body = serde_json::to_vec(&json!({
             "parent_session_id": parent_session_id,
             "children": children,
@@ -6889,8 +7062,11 @@ fn client_session_value(
     actor_email: Option<&str>,
     route_prefix: Option<&str>,
 ) -> Value {
-    let mut value = serde_json::to_value(ClientSessionResponse::from(session.clone()))
-        .unwrap_or_else(|_| json!({}));
+    let mut value = serde_json::to_value(client_session_response_with_live_activity(
+        state,
+        session.clone(),
+    ))
+    .unwrap_or_else(|_| json!({}));
     let attach_descriptor = attach_descriptor_payload(session.clone());
     value["attach_descriptor"] = attach_descriptor.clone();
     value["termux_attach"] = Value::Null;
@@ -6937,6 +7113,142 @@ fn mobile_primary_action(mobile_terminal: &Value, attach_descriptor: &Value) -> 
             "label": "View details",
         })
     }
+}
+
+fn session_response_with_live_activity(
+    state: &AppState,
+    session: SessionRecord,
+) -> SessionResponse {
+    let mut response = SessionResponse::from(session.clone());
+    if let Some(activity_state) = live_activity_state(state, &session) {
+        response.set_activity_state(activity_state);
+    }
+    response
+}
+
+fn client_session_response_with_live_activity(
+    state: &AppState,
+    session: SessionRecord,
+) -> ClientSessionResponse {
+    let mut response = ClientSessionResponse::from(session.clone());
+    if let Some(activity_state) = live_activity_state(state, &session) {
+        response.set_activity_state(activity_state);
+    }
+    response
+}
+
+fn child_session_response_with_live_activity(
+    state: &AppState,
+    session: SessionRecord,
+) -> ChildSessionResponse {
+    let mut response = ChildSessionResponse::from(session.clone());
+    if let Some(activity_state) = live_activity_state(state, &session) {
+        response.set_activity_state(activity_state);
+    }
+    response
+}
+
+fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'static str> {
+    if session.status.trim() == "stopped" || session.completion_status.is_some() {
+        return None;
+    }
+    if session.agent_task_completed_at.is_some() {
+        return None;
+    }
+    if session.provider.trim() != "codex-fork" || session.tmux_session.trim().is_empty() {
+        return None;
+    }
+    if let Some(activity_state) = codex_fork_event_stream_activity(state, session) {
+        return Some(activity_state);
+    }
+    let runtime = TmuxRuntime::from_app_config(&state.config)
+        .for_socket_name(session.tmux_socket_name.as_deref());
+    let pane_title = runtime.pane_title(&session.tmux_session)?;
+    codex_fork_pane_title_indicates_working(&pane_title).then_some("working")
+}
+
+fn codex_fork_event_stream_activity(
+    state: &AppState,
+    session: &SessionRecord,
+) -> Option<&'static str> {
+    let event_stream_path = codex_fork_event_stream_path_for_session(state, session)?;
+    codex_fork_event_stream_activity_from_path(event_stream_path)
+}
+
+fn codex_fork_event_stream_path_for_session(
+    state: &AppState,
+    session: &SessionRecord,
+) -> Option<PathBuf> {
+    let log_file = session
+        .log_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let spec = crate::runtime::TmuxSessionSpec {
+        session_id: session.id.clone(),
+        tmux_session: session.tmux_session.clone(),
+        working_dir: expand_home(&session.working_dir).display().to_string(),
+        log_file: expand_home(log_file),
+        provider: session.provider.clone(),
+        initial_message: None,
+        model: session.model.clone(),
+    };
+    TmuxRuntime::from_app_config(&state.config)
+        .for_socket_name(session.tmux_socket_name.as_deref())
+        .codex_fork_runtime_artifacts(&spec)
+        .ok()
+        .flatten()
+        .map(|artifacts| artifacts.event_stream_path)
+}
+
+fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static str> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return None;
+    }
+    let mut chunk = String::new();
+    file.read_to_string(&mut chunk).ok()?;
+    if start > 0 {
+        if let Some((_, rest)) = chunk.split_once('\n') {
+            chunk = rest.to_owned();
+        } else {
+            return None;
+        }
+    }
+
+    let mut latest_activity = None;
+    for line in chunk.lines() {
+        latest_activity = codex_fork_status_for_event_line(line)
+            .and_then(codex_fork_activity_for_status)
+            .or(latest_activity);
+    }
+    latest_activity
+}
+
+fn codex_fork_activity_for_status(status: &str) -> Option<&'static str> {
+    match status {
+        "running" => Some("working"),
+        "idle" => Some("idle"),
+        "stopped" => Some("stopped"),
+        _ => None,
+    }
+}
+
+fn codex_fork_pane_title_indicates_working(pane_title: &str) -> bool {
+    let title = pane_title.trim();
+    let Some((first_token, _)) = title.split_once(' ') else {
+        return false;
+    };
+    let mut chars = first_token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    (0x2801..=0x28ff).contains(&(first as u32))
 }
 
 fn mobile_terminal_metadata(
@@ -8731,6 +9043,24 @@ fn validate_requested_friendly_name(name: &str) -> Result<(), ApiError> {
     }
 }
 
+fn normalize_role_like_python(role: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_dash = false;
+    for ch in role.trim().chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !normalized.is_empty() {
+            normalized.push('-');
+            last_was_dash = true;
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    normalized
+}
+
 fn is_auth_denial_status(status: u16) -> bool {
     matches!(status, 401 | 403 | 503)
 }
@@ -9228,14 +9558,14 @@ fn bug_report_server_state(
         .session_store
         .list_sessions(false)?
         .into_iter()
-        .map(SessionResponse::from)
+        .map(|session| session_response_with_live_activity(state, session))
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()?;
     let selected_session = if let Some(session_id) = selected_session_id {
         match state.session_store.get_session(session_id)? {
             Some(session) => json!({
                 "found": true,
-                "session": ClientSessionResponse::from(session),
+                "session": client_session_response_with_live_activity(state, session),
             }),
             None => json!({
                 "id": session_id,
@@ -9771,6 +10101,10 @@ struct IssuedDeviceAccessToken {
 #[derive(Debug, Deserialize)]
 struct TmuxClientHookQuery {
     event: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default, rename = "client_session")]
+    client_session: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10230,6 +10564,62 @@ mod tests {
     use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
+
+    #[test]
+    fn codex_fork_pane_title_spinner_indicates_working() {
+        assert!(codex_fork_pane_title_indicates_working("⠏ session-manager"));
+        assert!(codex_fork_pane_title_indicates_working(
+            "  ⠇ fractal-algo-rust  "
+        ));
+        assert!(!codex_fork_pane_title_indicates_working(
+            "fractal-algo-rust"
+        ));
+        assert!(!codex_fork_pane_title_indicates_working(
+            "⠏\tfractal-algo-rust"
+        ));
+        assert!(!codex_fork_pane_title_indicates_working(
+            "⠏⠇ fractal-algo-rust"
+        ));
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_uses_latest_lifecycle_event() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-activity-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"idle\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream.clone()),
+            Some("idle")
+        );
+
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"idle\"}}}\n",
+                "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"type\":\"error\",\"payload\":{\"willRetry\":true}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream),
+            Some("working")
+        );
+    }
 
     fn write_session_state(session_id: &str, status: &str) -> String {
         let dir = env::temp_dir().join(format!(

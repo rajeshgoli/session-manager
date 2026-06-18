@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub paths: PathsConfig,
+    pub human_recipient_reserved_names: Vec<String>,
     pub email: EmailConfig,
     pub mobile_analytics: MobileAnalyticsConfig,
     pub app_artifacts: AppArtifactsConfig,
@@ -42,6 +43,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             paths: PathsConfig::default(),
+            human_recipient_reserved_names: Vec::new(),
             email: EmailConfig::default(),
             mobile_analytics: MobileAnalyticsConfig::default(),
             app_artifacts: AppArtifactsConfig::default(),
@@ -656,6 +658,7 @@ pub struct CodexForkLaunchConfig {
     pub args: Vec<String>,
     pub default_model: Option<String>,
     pub event_schema_version: u32,
+    pub control_tmux_fallback_enabled: bool,
 }
 
 impl Default for CodexForkLaunchConfig {
@@ -665,6 +668,7 @@ impl Default for CodexForkLaunchConfig {
             args: codex_fork_managed_args(Vec::new()),
             default_model: None,
             event_schema_version: 2,
+            control_tmux_fallback_enabled: true,
         }
     }
 }
@@ -969,6 +973,8 @@ struct RawConfig {
     #[serde(default)]
     paths: RawPathsConfig,
     #[serde(default)]
+    humans: YamlValue,
+    #[serde(default)]
     email: EmailConfig,
     #[serde(default)]
     auth: RawAuthConfig,
@@ -1060,6 +1066,7 @@ impl From<RawConfig> for AppConfig {
             paths: PathsConfig {
                 state_file: paths.state_file,
             },
+            human_recipient_reserved_names: human_reserved_names_from_yaml(&raw.humans),
             email: raw.email,
             mobile_analytics: MobileAnalyticsConfig {
                 message_queue_db: paths.message_queue_db,
@@ -1166,6 +1173,8 @@ struct RawCodexForkLaunchConfig {
     provider: RawProviderLaunchConfig,
     #[serde(default)]
     event_schema_version: Option<u32>,
+    #[serde(default)]
+    control_tmux_fallback_enabled: Option<YamlValue>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1251,6 +1260,10 @@ fn codex_fork_launch_config(
         args: codex_fork_managed_args(args),
         default_model,
         event_schema_version: raw.event_schema_version.unwrap_or(2),
+        control_tmux_fallback_enabled: coerce_rollout_flag(
+            raw.control_tmux_fallback_enabled.as_ref(),
+            true,
+        ),
     }
 }
 
@@ -1355,6 +1368,44 @@ fn nodes_config_from_yaml(value: YamlValue) -> NodesConfig {
     };
 
     config
+}
+
+fn human_reserved_names_from_yaml(value: &YamlValue) -> Vec<String> {
+    let Some(root) = value.as_mapping() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for (raw_name, raw_spec) in root {
+        if let Some(name) = yaml_clean_optional(raw_name) {
+            names.push(name);
+        }
+        let Some(spec) = raw_spec.as_mapping() else {
+            continue;
+        };
+        if let Some(aliases) = yaml_mapping_get(spec, "aliases") {
+            names.extend(yaml_string_values(aliases));
+        }
+    }
+    dedupe_strings(names)
+}
+
+fn yaml_string_values(value: &YamlValue) -> Vec<String> {
+    match value {
+        YamlValue::Sequence(values) => values.iter().filter_map(yaml_clean_optional).collect(),
+        _ => yaml_clean_optional(value).into_iter().collect(),
+    }
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut result = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if !value.is_empty() && seen.insert(value.to_ascii_lowercase()) {
+            result.push(value.to_owned());
+        }
+    }
+    result
 }
 
 fn yaml_mapping_get<'a>(mapping: &'a YamlMapping, key: &str) -> Option<&'a YamlValue> {
@@ -1619,6 +1670,37 @@ sm_send:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.sm_send.db_path, "/tmp/custom-message-queue.db");
+    }
+
+    #[test]
+    fn raw_config_reads_top_level_human_names_and_aliases() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+humans:
+  rajesh:
+    aliases:
+      - rg
+      - "Rajesh Goli"
+  owner:
+    aliases: rg
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+        let names = config
+            .human_recipient_reserved_names
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "owner".to_owned(),
+                "Rajesh Goli".to_owned(),
+                "rajesh".to_owned(),
+                "rg".to_owned()
+            ])
+        );
     }
 
     #[test]
@@ -2038,6 +2120,7 @@ codex:
   default_model: "gpt-5"
 codex_fork:
   event_schema_version: 7
+  control_tmux_fallback_enabled: "off"
 "#,
         )
         .unwrap();
@@ -2054,6 +2137,15 @@ codex_fork:
         );
         assert_eq!(config.codex_fork.default_model.as_deref(), Some("gpt-5"));
         assert_eq!(config.codex_fork.event_schema_version, 7);
+        assert!(!config.codex_fork.control_tmux_fallback_enabled);
+    }
+
+    #[test]
+    fn raw_config_defaults_codex_fork_control_tmux_fallback_enabled() {
+        let raw: RawConfig = serde_yaml::from_str("codex_fork: {}\n").unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(config.codex_fork.control_tmux_fallback_enabled);
     }
 
     #[test]

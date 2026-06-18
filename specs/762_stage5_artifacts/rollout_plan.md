@@ -42,7 +42,7 @@ Python-authoritative baseline/shadow, the owner-approved path is not broad
 Python hardening. Use the accelerated Rust canary evidence mode instead:
 `mvp_rehearsal --rust-canary-cutover` runs short Python canary spot checks, keeps
 the Rust/state/fixture gates and Rust baseline blocking, and requires a passed
-Cloudflare/mobile smoke report with real Access/public-edge/SM auth proof inputs
+Cloudflare/mobile smoke report with real public app-host proof inputs
 before the run can count as cutover-candidate evidence.
 
 ## Cutover Sequence

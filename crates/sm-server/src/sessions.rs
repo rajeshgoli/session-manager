@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -92,6 +93,25 @@ impl SessionStore {
         status_filter: Option<&str>,
         include_terminated: bool,
     ) -> Result<Vec<ChildSessionResponse>> {
+        Ok(self
+            .list_child_records(
+                parent_session_id,
+                recursive,
+                status_filter,
+                include_terminated,
+            )?
+            .into_iter()
+            .map(ChildSessionResponse::from)
+            .collect())
+    }
+
+    pub fn list_child_records(
+        &self,
+        parent_session_id: &str,
+        recursive: bool,
+        status_filter: Option<&str>,
+        include_terminated: bool,
+    ) -> Result<Vec<SessionRecord>> {
         let all_sessions = self.load_snapshot()?.into_sessions();
         let mut children = if recursive {
             let mut descendants = Vec::new();
@@ -122,10 +142,7 @@ impl SessionStore {
             children.retain(|session| session.completion_status.as_deref() != Some("killed"));
         }
 
-        Ok(children
-            .into_iter()
-            .map(ChildSessionResponse::from)
-            .collect())
+        Ok(children)
     }
 
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
@@ -296,7 +313,7 @@ impl SessionStore {
         let delivered = normalized_status(&status) != "stopped";
         if delivered {
             let now = now_rfc3339();
-            session.insert("last_activity".to_owned(), Value::String(now));
+            mark_session_followup_activity(session, &now);
             if let Some(log_file) = json_text(session.get("log_file")) {
                 append_log_line(&expand_home(&log_file), &request.text)?;
                 if let Some(seconds) = request.notify_after_seconds {
@@ -853,6 +870,78 @@ impl SessionStore {
         Ok(Some(CoreRestoreOutcome::Restored(restored)))
     }
 
+    pub fn revive_stopped_tmux_client_session(
+        &self,
+        tmux_session: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<Option<String>> {
+        let tmux_session = tmux_session.trim();
+        if tmux_session.is_empty() {
+            return Ok(None);
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session_index) = sessions.iter().position(|value| {
+            let Some(session) = value.as_object() else {
+                return false;
+            };
+            json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
+                && json_text(session.get("provider")).as_deref() == Some("codex-fork")
+                && json_text(session.get("node"))
+                    .as_deref()
+                    .is_none_or(is_primary_node)
+                && json_text(session.get("status"))
+                    .as_deref()
+                    .is_some_and(|status| normalized_status(status) == "stopped")
+        }) else {
+            return Ok(None);
+        };
+
+        let Some(session) = sessions[session_index].as_object() else {
+            return Ok(None);
+        };
+        let Some(session_id) = json_text(session.get("id")) else {
+            return Ok(None);
+        };
+        let session_runtime =
+            runtime.for_socket_name(json_text(session.get("tmux_socket_name")).as_deref());
+        if !session_runtime.session_exists(tmux_session)? {
+            return Ok(None);
+        }
+
+        let now = now_rfc3339();
+        let Some(session) = sessions[session_index].as_object_mut() else {
+            return Ok(None);
+        };
+        session.insert("status".to_owned(), Value::String("idle".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        session.insert("completion_status".to_owned(), Value::Null);
+        session.insert("completion_message".to_owned(), Value::Null);
+        session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        session.insert("error_message".to_owned(), Value::Null);
+        session.insert("last_activity".to_owned(), Value::String(now));
+        if let Some(socket_name) = session_runtime.socket_name() {
+            session.insert(
+                "tmux_socket_name".to_owned(),
+                Value::String(socket_name.to_owned()),
+            );
+        }
+
+        let spec = codex_fork_spec_for_session_raw(&session_id, session)?;
+        let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
+        self.write_raw_json_value(&state)?;
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor_from_current_end(
+                session_id.clone(),
+                artifacts.event_stream_path,
+            )?;
+        }
+        Ok(Some(session_id))
+    }
+
     pub fn set_context_monitor(
         &self,
         session_id: &str,
@@ -975,6 +1064,117 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
         }
         Ok(registration)
+    }
+
+    pub fn update_session_metadata(
+        &self,
+        session_id: &str,
+        request: UpdateSessionMetadataRequest,
+        reserved_human_names: &BTreeSet<String>,
+    ) -> Result<SessionMetadataOutcome> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        recover_missing_maintainer_registration_raw(&mut state)?;
+        prune_agent_registrations_raw(&mut state)?;
+
+        let snapshot = snapshot_from_raw_value(&state)?;
+        if !snapshot
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            return Ok(SessionMetadataOutcome::NotFound);
+        }
+        let primary_alias = snapshot
+            .alias_map()
+            .get(session_id)
+            .and_then(|aliases| aliases.iter().next().cloned());
+        if let Some(friendly_name) = request.friendly_name.as_deref() {
+            if let Some(error) = validate_friendly_name_update_raw(
+                &state,
+                session_id,
+                friendly_name,
+                &primary_alias,
+                reserved_human_names,
+            )? {
+                return Ok(SessionMetadataOutcome::BadRequest(error));
+            }
+        }
+
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        for candidate in sessions.iter_mut() {
+            let Some(candidate) = candidate.as_object_mut() else {
+                continue;
+            };
+            let is_target = candidate.get("id").and_then(Value::as_str) == Some(session_id);
+            if is_target {
+                if let Some(friendly_name) = request.friendly_name.as_deref() {
+                    candidate.insert(
+                        "friendly_name".to_owned(),
+                        Value::String(friendly_name.to_owned()),
+                    );
+                    candidate.insert("friendly_name_is_explicit".to_owned(), Value::Bool(true));
+                    candidate.insert(
+                        "friendly_name_updated_at_ns".to_owned(),
+                        Value::Number(serde_json::Number::from(now_unix_timestamp_nanos())),
+                    );
+                }
+                if let Some(is_em) = request.is_em {
+                    candidate.insert("is_em".to_owned(), Value::Bool(is_em));
+                    if is_em {
+                        candidate.insert("role".to_owned(), Value::String("em".to_owned()));
+                    } else if json_text(candidate.get("role")).as_deref() == Some("em") {
+                        candidate.insert("role".to_owned(), Value::Null);
+                    }
+                }
+            } else if request.is_em == Some(true)
+                && candidate.get("is_em").and_then(Value::as_bool) == Some(true)
+            {
+                candidate.insert("is_em".to_owned(), Value::Bool(false));
+                if json_text(candidate.get("role")).as_deref() == Some("em") {
+                    candidate.insert("role".to_owned(), Value::Null);
+                }
+            }
+        }
+
+        self.write_raw_json_value(&state)?;
+        let session = snapshot_from_raw_value(&state)?
+            .into_sessions()
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| anyhow::anyhow!("updated session {session_id} was not readable"))?;
+        Ok(SessionMetadataOutcome::Updated(session))
+    }
+
+    pub fn queue_provider_native_rename(
+        &self,
+        session: &SessionRecord,
+        friendly_name: &str,
+    ) -> Result<bool> {
+        if !is_safe_provider_native_rename_name(friendly_name)
+            || session.is_stopped()
+            || !matches!(session.provider.as_str(), "claude" | "codex-fork")
+            || session.tmux_session.trim().is_empty()
+        {
+            return Ok(false);
+        }
+        let Some(queue) = &self.queue_store else {
+            if session.native_title.as_deref().map(str::trim) == Some(friendly_name) {
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        queue.cancel_pending_messages_for_target_category(&session.id, "native_rename")?;
+        if session.native_title.as_deref().map(str::trim) == Some(friendly_name) {
+            return Ok(true);
+        }
+        queue.enqueue_message(
+            &session.id,
+            &format!("/rename {friendly_name}"),
+            "sequential",
+            Some("native_rename"),
+        )?;
+        Ok(true)
     }
 
     pub fn register_agent_role(
@@ -1326,6 +1526,8 @@ impl SessionStore {
             "agent_task_completed_at".to_owned(),
             Value::String(completed_at.clone()),
         );
+        session_object.insert("agent_status_text".to_owned(), Value::Null);
+        session_object.insert("agent_status_at".to_owned(), Value::Null);
 
         let mut em_notified = false;
         if let Some(em_session_id) = em_session_id {
@@ -1662,6 +1864,26 @@ impl SessionStore {
         session_id: String,
         event_stream_path: PathBuf,
     ) -> Result<()> {
+        self.start_codex_fork_event_monitor_at_offset(session_id, event_stream_path, 0)
+    }
+
+    fn start_codex_fork_event_monitor_from_current_end(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+    ) -> Result<()> {
+        let initial_offset = fs::metadata(&event_stream_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        self.start_codex_fork_event_monitor_at_offset(session_id, event_stream_path, initial_offset)
+    }
+
+    fn start_codex_fork_event_monitor_at_offset(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+        initial_offset: u64,
+    ) -> Result<()> {
         let store = self.clone();
         let thread_session_id = format!(
             "{}-{}",
@@ -1670,13 +1892,20 @@ impl SessionStore {
         );
         thread::Builder::new()
             .name(format!("sm-codex-fork-events-{thread_session_id}"))
-            .spawn(move || store.monitor_codex_fork_event_stream(session_id, event_stream_path))
+            .spawn(move || {
+                store.monitor_codex_fork_event_stream(session_id, event_stream_path, initial_offset)
+            })
             .with_context(|| "failed to start codex-fork event monitor")?;
         Ok(())
     }
 
-    fn monitor_codex_fork_event_stream(&self, session_id: String, event_stream_path: PathBuf) {
-        let mut offset = 0;
+    fn monitor_codex_fork_event_stream(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+        initial_offset: u64,
+    ) {
+        let mut offset = initial_offset;
         let mut buffer = String::new();
         loop {
             match self.codex_fork_monitor_should_continue(&session_id) {
@@ -1787,17 +2016,16 @@ impl SessionStore {
         runtime_backed: bool,
         tmux_socket_name: Option<&str>,
     ) -> Result<SessionRecord> {
-        let session_id = request
+        let requested_session_id = request
             .id
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(generate_session_id);
-        if sessions
-            .iter()
-            .any(|value| value.get("id").and_then(Value::as_str) == Some(session_id.as_str()))
-        {
+            .filter(|value| !value.is_empty());
+        let session_id = match requested_session_id {
+            Some(session_id) => session_id.to_owned(),
+            None => generate_unique_session_id(sessions)?,
+        };
+        if session_id_exists(sessions, &session_id) {
             anyhow::bail!("session already exists: {session_id}");
         }
         let parent_session = request.parent_session_id.as_deref().and_then(|parent_id| {
@@ -2002,9 +2230,21 @@ fn extract_codex_fork_thread_started(event: &Map<String, Value>) -> Option<Strin
         .or_else(|| payload.get("session_id").and_then(non_unknown_json_text))
 }
 
+pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static str> {
+    let raw = line.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let event = serde_json::from_str::<Value>(raw).ok()?;
+    let event = event.as_object()?;
+    codex_fork_status_for_event(event)
+}
+
 fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static str> {
-    let event_type = normalize_codex_fork_event_type(codex_fork_event_type(event)?.as_str());
+    let event_type =
+        normalize_codex_fork_event_type(&codex_fork_event_type(event)?.replace('/', "_"));
     match event_type.as_str() {
+        "thread_status_changed" => codex_fork_thread_status(event),
         "turn_started" => Some("running"),
         "turn_complete" => Some("idle"),
         "turn_aborted" => {
@@ -2029,11 +2269,48 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         | "item_completed"
         | "agent_message"
         | "exec_command_end" => Some("running"),
+        "error" if codex_fork_error_will_retry(event) => Some("running"),
         "error" | "shutdown" => Some("stopped"),
         "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
         other if other.ends_with("_begin") || other.ends_with("_delta") => Some("running"),
         _ => None,
     }
+}
+
+fn codex_fork_thread_status(event: &Map<String, Value>) -> Option<&'static str> {
+    let payload = codex_fork_payload(event)?;
+    let status = payload
+        .get("status")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.as_object()?.get("type")?.as_str())
+                .or_else(|| value.as_object()?.get("status")?.as_str())
+        })?
+        .trim()
+        .to_ascii_lowercase();
+    match status.as_str() {
+        "active" | "running" | "working" => Some("running"),
+        "idle" => Some("idle"),
+        _ => None,
+    }
+}
+
+fn codex_fork_error_will_retry(event: &Map<String, Value>) -> bool {
+    event
+        .get("willRetry")
+        .or_else(|| event.get("will_retry"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            codex_fork_payload(event)
+                .and_then(|payload| {
+                    payload
+                        .get("willRetry")
+                        .or_else(|| payload.get("will_retry"))
+                })
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 fn codex_fork_event_type(event: &Map<String, Value>) -> Option<String> {
@@ -2239,6 +2516,14 @@ pub struct SetMaintainerRequest {
 pub struct RoleRegistrationRequest {
     pub requester_session_id: String,
     pub role: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateSessionMetadataRequest {
+    #[serde(default)]
+    pub friendly_name: Option<String>,
+    #[serde(default)]
+    pub is_em: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2454,6 +2739,13 @@ pub enum RegistryMutationOutcome {
 
 #[derive(Debug, Clone)]
 pub enum MaintainerMutationOutcome {
+    Updated(SessionRecord),
+    NotFound,
+    BadRequest(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionMetadataOutcome {
     Updated(SessionRecord),
     NotFound,
     BadRequest(String),
@@ -3029,19 +3321,27 @@ fn deliver_runtime_text_to_session_raw(
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
     let mut delivered = false;
+    let mut mark_stopped_on_failure = true;
     if normalized_status(&status) != "stopped" {
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
             Some(true) => {
                 delivered = true;
             }
-            _ => {
+            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
+                delivered = session_runtime.send_input(&tmux_session, text)?;
+            }
+            Some(false) => {
+                delivered = false;
+                mark_stopped_on_failure = false;
+            }
+            None => {
                 delivered = session_runtime.send_input(&tmux_session, text)?;
             }
         }
         let now = now_rfc3339();
         if delivered {
-            session.insert("last_activity".to_owned(), Value::String(now));
-        } else {
+            mark_session_followup_activity(session, &now);
+        } else if mark_stopped_on_failure {
             status = "stopped".to_owned();
             session.insert("status".to_owned(), Value::String(status.clone()));
             session.insert("stopped_at".to_owned(), Value::String(now.clone()));
@@ -3069,12 +3369,24 @@ fn deliver_urgent_runtime_text_to_session_raw(
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
     let mut delivered = false;
+    let mut mark_stopped_on_failure = true;
     if normalized_status(&status) != "stopped" {
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
             Some(true) => {
                 delivered = true;
             }
-            _ => {
+            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
+                delivered = session_runtime.send_urgent_input(
+                    &tmux_session,
+                    text,
+                    provider.eq_ignore_ascii_case("claude"),
+                )?;
+            }
+            Some(false) => {
+                delivered = false;
+                mark_stopped_on_failure = false;
+            }
+            None => {
                 delivered = session_runtime.send_urgent_input(
                     &tmux_session,
                     text,
@@ -3084,13 +3396,71 @@ fn deliver_urgent_runtime_text_to_session_raw(
         }
         let now = now_rfc3339();
         if delivered {
-            session.insert("last_activity".to_owned(), Value::String(now));
-        } else {
+            mark_session_followup_activity(session, &now);
+        } else if mark_stopped_on_failure {
             status = "stopped".to_owned();
             session.insert("status".to_owned(), Value::String(status.clone()));
             session.insert("stopped_at".to_owned(), Value::String(now.clone()));
             session.insert("last_activity".to_owned(), Value::String(now));
         }
+    }
+    Ok((status, delivered))
+}
+
+fn deliver_runtime_native_rename_to_session_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<(String, bool)> {
+    let sessions = ensure_sessions_array_mut(state)?;
+    let session = session_object_mut(sessions, session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    if normalized_status(&status) == "stopped" {
+        return Ok((status, false));
+    }
+    let Some(friendly_name) = extract_provider_native_rename_name(text) else {
+        return Ok((status, false));
+    };
+    let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+    let delivered = if provider.eq_ignore_ascii_case("codex-fork") {
+        match codex_fork_control_socket_path_for_session_raw(session_id, session, runtime).and_then(
+            |control_socket_path| codex_fork_set_thread_name(&control_socket_path, &friendly_name),
+        ) {
+            Ok(()) => {
+                clear_codex_fork_control_degraded_raw(session);
+                true
+            }
+            Err(error) => {
+                mark_codex_fork_control_degraded_raw(session, &error.to_string());
+                if runtime.codex_fork_control_tmux_fallback_enabled() {
+                    let tmux_session = json_text(session.get("tmux_session")).ok_or_else(|| {
+                        anyhow::anyhow!("session {session_id} missing tmux_session")
+                    })?;
+                    let session_socket_name = json_text(session.get("tmux_socket_name"));
+                    runtime
+                        .for_socket_name(session_socket_name.as_deref())
+                        .send_input(&tmux_session, &format!("/rename {friendly_name}"))?
+                } else {
+                    false
+                }
+            }
+        }
+    } else if provider.eq_ignore_ascii_case("claude") {
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        runtime
+            .for_socket_name(session_socket_name.as_deref())
+            .send_input(&tmux_session, &format!("/rename {friendly_name}"))?
+    } else {
+        false
+    };
+    if delivered {
+        session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
     }
     Ok((status, delivered))
 }
@@ -3125,13 +3495,24 @@ fn codex_fork_control_socket_path_for_session_raw(
     session: &Map<String, Value>,
     runtime: &TmuxRuntime,
 ) -> Result<PathBuf> {
+    let spec = codex_fork_spec_for_session_raw(session_id, session)?;
+    let artifacts = runtime
+        .codex_fork_runtime_artifacts(&spec)?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} is not a codex-fork session"))?;
+    Ok(artifacts.control_socket_path)
+}
+
+fn codex_fork_spec_for_session_raw(
+    session_id: &str,
+    session: &Map<String, Value>,
+) -> Result<TmuxSessionSpec> {
     let tmux_session = json_text(session.get("tmux_session"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
     let working_dir = json_text(session.get("working_dir"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing working_dir"))?;
     let log_file = json_text(session.get("log_file"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing log_file"))?;
-    let spec = TmuxSessionSpec {
+    Ok(TmuxSessionSpec {
         session_id: session_id.to_owned(),
         tmux_session,
         working_dir: expand_home(&working_dir).display().to_string(),
@@ -3139,11 +3520,7 @@ fn codex_fork_control_socket_path_for_session_raw(
         provider: "codex-fork".to_owned(),
         initial_message: None,
         model: json_text(session.get("model")),
-    };
-    let artifacts = runtime
-        .codex_fork_runtime_artifacts(&spec)?
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} is not a codex-fork session"))?;
-    Ok(artifacts.control_socket_path)
+    })
 }
 
 fn codex_fork_submit_message(control_socket_path: &Path, text: &str) -> Result<()> {
@@ -3167,6 +3544,35 @@ fn codex_fork_submit_message(control_socket_path: &Path, text: &str) -> Result<(
     ensure_codex_fork_response_ok(&response, "control command failed")
 }
 
+fn codex_fork_set_thread_name(control_socket_path: &Path, friendly_name: &str) -> Result<()> {
+    if !control_socket_path.exists() {
+        return Err(anyhow::anyhow!(
+            "control socket not found: {}",
+            control_socket_path.display()
+        ));
+    }
+
+    let mut epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+    let mut response = codex_fork_send_control_command_payload(
+        control_socket_path,
+        "set_thread_name",
+        &epoch,
+        json!({ "name": friendly_name }),
+    )?;
+    if !codex_fork_response_ok(&response)
+        && codex_fork_error_code(&response).as_deref() == Some("stale_epoch")
+    {
+        epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+        response = codex_fork_send_control_command_payload(
+            control_socket_path,
+            "set_thread_name",
+            &epoch,
+            json!({ "name": friendly_name }),
+        )?;
+    }
+    ensure_codex_fork_response_ok(&response, "control command failed")
+}
+
 fn codex_fork_refresh_control_epoch(control_socket_path: &Path) -> Result<String> {
     let request = json!({
         "request_id": codex_fork_control_request_id(),
@@ -3185,13 +3591,36 @@ fn codex_fork_send_control_command(
     expected_epoch: &str,
     message: &str,
 ) -> Result<Value> {
-    let request = json!({
-        "request_id": codex_fork_control_request_id(),
-        "expected_epoch": expected_epoch,
-        "command": command,
-        "message": message,
-    });
-    codex_fork_control_roundtrip(control_socket_path, &request)
+    codex_fork_send_control_command_payload(
+        control_socket_path,
+        command,
+        expected_epoch,
+        json!({ "message": message }),
+    )
+}
+
+fn codex_fork_send_control_command_payload(
+    control_socket_path: &Path,
+    command: &str,
+    expected_epoch: &str,
+    payload: Value,
+) -> Result<Value> {
+    let mut request = Map::new();
+    request.insert(
+        "request_id".to_owned(),
+        Value::String(codex_fork_control_request_id()),
+    );
+    request.insert(
+        "expected_epoch".to_owned(),
+        Value::String(expected_epoch.to_owned()),
+    );
+    request.insert("command".to_owned(), Value::String(command.to_owned()));
+    if let Some(payload) = payload.as_object() {
+        for (key, value) in payload {
+            request.insert(key.clone(), value.clone());
+        }
+    }
+    codex_fork_control_roundtrip(control_socket_path, &Value::Object(request))
         .with_context(|| "control command failed")
 }
 
@@ -3324,7 +3753,14 @@ fn drain_pending_runtime_messages_raw(
         let mut should_continue = true;
         for message in messages {
             let (next_status, delivered) =
-                if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
+                if message.message_category.as_deref() == Some("native_rename") {
+                    deliver_runtime_native_rename_to_session_raw(
+                        state,
+                        session_id,
+                        &message.text,
+                        runtime,
+                    )?
+                } else if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
                     deliver_urgent_runtime_text_to_session_raw(
                         state,
                         session_id,
@@ -3777,6 +4213,51 @@ fn sync_maintainer_alias_raw(state: &mut Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_friendly_name_update_raw(
+    state: &Value,
+    session_id: &str,
+    friendly_name: &str,
+    primary_alias: &Option<String>,
+    reserved_human_names: &BTreeSet<String>,
+) -> Result<Option<String>> {
+    if let Some(primary_alias) = primary_alias {
+        if friendly_name != primary_alias {
+            return Ok(Some(format!(
+                "Session identity is controlled by registry role \"{primary_alias}\""
+            )));
+        }
+    }
+
+    let normalized_name = normalize_role(friendly_name);
+    let mut reserved_aliases = BTreeSet::from(["maintainer".to_owned()]);
+    for registration in state
+        .get("agent_registrations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(raw_registration_record)
+    {
+        reserved_aliases.insert(registration.role);
+    }
+    if reserved_aliases.contains(&normalized_name)
+        && primary_alias.as_deref() != Some(normalized_name.as_str())
+    {
+        return Ok(Some(format!(
+            "Name \"{friendly_name}\" is reserved for registry identity \"{normalized_name}\""
+        )));
+    }
+    if reserved_human_names.contains(&normalized_name) {
+        return Ok(Some(format!(
+            "Name \"{friendly_name}\" is reserved for configured human recipient \"{normalized_name}\""
+        )));
+    }
+    if session_id.trim().is_empty() {
+        return Ok(Some("Session not found".to_owned()));
+    }
+    Ok(None)
+}
+
 fn recover_missing_maintainer_registration_raw(state: &mut Value) -> Result<bool> {
     if find_raw_registration(state, "maintainer")?.is_some() {
         return Ok(false);
@@ -3897,13 +4378,14 @@ fn agent_registration_response(
     created_at: Option<&str>,
 ) -> AgentRegistrationResponse {
     let status = normalized_status(&session.status);
+    let activity_state = projected_activity_state(session, status);
     AgentRegistrationResponse {
         role: normalize_role(role),
         session_id: session.id.clone(),
         friendly_name: session.cached_display_name(),
         provider: Some(non_empty_or(session.provider.clone(), "claude")),
         status: status.to_owned(),
-        activity_state: fallback_activity_state(status),
+        activity_state,
         created_at: created_at
             .map(ToOwned::to_owned)
             .unwrap_or_else(now_rfc3339),
@@ -3966,6 +4448,11 @@ fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     session.insert("completed_at".to_owned(), Value::Null);
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
     mark_review_dispatch_completed(session, now);
+}
+
+fn mark_session_followup_activity(session: &mut Map<String, Value>, now: &str) {
+    session.insert("agent_task_completed_at".to_owned(), Value::Null);
+    session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
 }
 
 fn mark_session_killed(session: &mut Map<String, Value>, now: &str) {
@@ -4083,14 +4570,40 @@ fn hex_char(value: u8) -> char {
 }
 
 fn generate_session_id() -> String {
-    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    format!("rs{:x}", nanos as u128)
+    let mut bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    let mut id = String::with_capacity(8);
+    for byte in bytes {
+        id.push(hex_char(byte >> 4));
+        id.push(hex_char(byte & 0x0f));
+    }
+    id
+}
+
+fn generate_unique_session_id(sessions: &[Value]) -> Result<String> {
+    for _ in 0..64 {
+        let session_id = generate_session_id();
+        if !session_id_exists(sessions, &session_id) {
+            return Ok(session_id);
+        }
+    }
+    anyhow::bail!("failed to generate unique session id after 64 attempts")
+}
+
+fn session_id_exists(sessions: &[Value], session_id: &str) -> bool {
+    sessions
+        .iter()
+        .any(|value| value.get("id").and_then(Value::as_str) == Some(session_id))
 }
 
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn now_unix_timestamp_nanos() -> i64 {
+    i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(i64::MAX)
 }
 
 fn now_python_naive_iso() -> String {
@@ -4548,6 +5061,7 @@ impl From<SessionRecord> for SessionResponse {
         let friendly_name = session.cached_display_name();
         let is_maintainer = session.aliases.iter().any(|alias| alias == "maintainer");
         let telegram_thread_id = session.resolved_telegram_thread_id();
+        let activity_state = projected_activity_state(&session, status);
         Self {
             id: session.id,
             name: session.name,
@@ -4579,7 +5093,7 @@ impl From<SessionRecord> for SessionResponse {
             agent_task_completed_at: session.agent_task_completed_at,
             is_em: session.is_em,
             role: session.role,
-            activity_state: fallback_activity_state(status),
+            activity_state,
             last_tool_call: session.last_tool_call,
             last_tool_name: session.last_tool_name,
             last_action_summary: None,
@@ -4590,6 +5104,12 @@ impl From<SessionRecord> for SessionResponse {
             aliases: session.aliases,
             is_maintainer,
         }
+    }
+}
+
+impl SessionResponse {
+    pub fn set_activity_state(&mut self, activity_state: impl Into<String>) {
+        self.activity_state = activity_state.into();
     }
 }
 
@@ -4621,12 +5141,13 @@ impl From<SessionRecord> for ChildSessionResponse {
             .spawned_at
             .clone()
             .or(Some(session.created_at.clone()));
+        let activity_state = projected_activity_state(&session, &status);
         Self {
             id: session.id,
             name: session.name,
             friendly_name,
             status: status.clone(),
-            activity_state: fallback_activity_state(&status),
+            activity_state,
             completion_status: session.completion_status,
             completion_message: session.completion_message,
             last_activity: session.last_activity,
@@ -4639,6 +5160,12 @@ impl From<SessionRecord> for ChildSessionResponse {
             provider: non_empty_or(session.provider, "claude"),
             activity_projection: None,
         }
+    }
+}
+
+impl ChildSessionResponse {
+    pub fn set_activity_state(&mut self, activity_state: impl Into<String>) {
+        self.activity_state = activity_state.into();
     }
 }
 
@@ -4680,6 +5207,12 @@ impl From<SessionRecord> for ClientSessionResponse {
     }
 }
 
+impl ClientSessionResponse {
+    pub fn set_activity_state(&mut self, activity_state: impl Into<String>) {
+        self.session.set_activity_state(activity_state);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AttachDescriptor {
     attach_supported: bool,
@@ -4711,6 +5244,29 @@ fn fallback_activity_state(status: &str) -> String {
         "running" => "working".to_owned(),
         _ => "idle".to_owned(),
     }
+}
+
+fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
+    let status = normalized_status(status);
+    if status == "stopped" {
+        return "stopped".to_owned();
+    }
+    if session.completion_status.as_deref() == Some("killed") {
+        return "stopped".to_owned();
+    }
+    if session.completion_status.is_some() {
+        return "waiting_input".to_owned();
+    }
+    if session.agent_task_completed_at.is_some() {
+        return "idle".to_owned();
+    }
+    if matches!(status, "running" | "working") {
+        return "working".to_owned();
+    }
+    if status == "idle" {
+        return "idle".to_owned();
+    }
+    fallback_activity_state(status)
 }
 
 fn non_empty_or(value: String, fallback: &str) -> String {
@@ -4814,6 +5370,34 @@ fn normalize_role(role: &str) -> String {
     normalized
 }
 
+fn is_safe_provider_native_rename_name(friendly_name: &str) -> bool {
+    !friendly_name.is_empty()
+        && friendly_name.chars().count() <= 32
+        && friendly_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn extract_provider_native_rename_name(text: &str) -> Option<String> {
+    let text = text.trim();
+    let rest = text.strip_prefix("/rename")?;
+    if !rest
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace())
+    {
+        return None;
+    }
+    let friendly_name = rest.trim();
+    if friendly_name.split_whitespace().count() == 1
+        && is_safe_provider_native_rename_name(friendly_name)
+    {
+        Some(friendly_name.to_owned())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4827,6 +5411,15 @@ mod tests {
         assert_eq!(expand_home("~"), home);
         assert_eq!(expand_home("~/work"), home.join("work"));
         assert_eq!(expand_home("/tmp/work"), PathBuf::from("/tmp/work"));
+    }
+
+    #[test]
+    fn generated_session_ids_match_python_short_hex_contract() {
+        let session_id = generate_session_id();
+
+        assert_eq!(session_id.len(), 8);
+        assert!(session_id.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(session_id, session_id.to_ascii_lowercase());
     }
 
     fn session_record(status: &str) -> SessionRecord {
@@ -4892,6 +5485,60 @@ mod tests {
 
         assert_eq!(response.status, "idle");
         assert_eq!(response.activity_state, "idle");
+    }
+
+    #[test]
+    fn session_projection_keeps_stored_idle_until_live_projection() {
+        let mut status_session = session_record("idle");
+        status_session.agent_status_text = Some("Working on a review".to_owned());
+        status_session.agent_status_at = Some(now_rfc3339());
+        let response = SessionResponse::from(status_session.clone());
+        assert_eq!(response.activity_state, "idle");
+        let client_response = ClientSessionResponse::from(status_session);
+        assert_eq!(client_response.session.activity_state, "idle");
+
+        let mut stale_status_session = session_record("idle");
+        stale_status_session.agent_status_text = Some("old work".to_owned());
+        stale_status_session.agent_status_at = Some("2026-06-01T00:00:00Z".to_owned());
+        let response = SessionResponse::from(stale_status_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut completed_task_session = session_record("idle");
+        completed_task_session.agent_status_text = Some("recent but complete".to_owned());
+        completed_task_session.agent_status_at = Some(now_rfc3339());
+        completed_task_session.agent_task_completed_at = Some(now_rfc3339());
+        let response = SessionResponse::from(completed_task_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut local_status_session = session_record("idle");
+        local_status_session.agent_status_text = Some("local timestamp".to_owned());
+        local_status_session.agent_status_at = Some(now_python_naive_iso());
+        let response = SessionResponse::from(local_status_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut stale_task_session = session_record("idle");
+        stale_task_session.current_task = Some("reviewing".to_owned());
+        stale_task_session.last_activity = now_rfc3339();
+        let response = SessionResponse::from(stale_task_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut explicit_idle_session = session_record("idle");
+        explicit_idle_session.last_activity = now_rfc3339();
+        let response = SessionResponse::from(explicit_idle_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut recent_activity_session = session_record("paused");
+        recent_activity_session.last_activity = now_rfc3339();
+        let response = SessionResponse::from(recent_activity_session);
+        assert_eq!(response.activity_state, "idle");
+    }
+
+    #[test]
+    fn session_projection_uses_canonical_waiting_input_activity() {
+        let mut session = session_record("idle");
+        session.completion_status = Some("completed".to_owned());
+        let response = SessionResponse::from(session);
+        assert_eq!(response.activity_state, "waiting_input");
     }
 
     #[test]
@@ -5041,6 +5688,44 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "tmux1");
+    }
+
+    #[test]
+    fn codex_fork_retry_error_events_are_not_terminal() {
+        let retry = json!({
+            "event_type": "error",
+            "payload": {
+                "willRetry": true,
+                "error": {
+                    "message": "Reconnecting... 1/5"
+                }
+            }
+        });
+        let retry_event = retry.as_object().unwrap();
+        assert_eq!(codex_fork_status_for_event(retry_event), Some("running"));
+
+        let terminal = json!({
+            "event_type": "error",
+            "payload": {
+                "willRetry": false,
+                "error": {
+                    "message": "Selected model is at capacity."
+                }
+            }
+        });
+        let terminal_event = terminal.as_object().unwrap();
+        assert_eq!(codex_fork_status_for_event(terminal_event), Some("stopped"));
+    }
+
+    #[test]
+    fn codex_fork_thread_status_events_drive_active_idle_status() {
+        let active = r#"{"type":"thread/status/changed","payload":{"status":{"type":"active"}}}"#;
+        let idle = r#"{"type":"thread/status/changed","payload":{"status":{"type":"idle"}}}"#;
+        let unknown = r#"{"type":"thread/status/changed","payload":{"status":{"type":"mystery"}}}"#;
+
+        assert_eq!(codex_fork_status_for_event_line(active), Some("running"));
+        assert_eq!(codex_fork_status_for_event_line(idle), Some("idle"));
+        assert_eq!(codex_fork_status_for_event_line(unknown), None);
     }
 
     #[test]
