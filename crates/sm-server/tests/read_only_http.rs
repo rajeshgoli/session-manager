@@ -2666,7 +2666,7 @@ async fn codex_review_request_recovery_spawns_active_watchers() {
 }
 
 #[tokio::test]
-async fn codex_review_request_recovery_cancels_missing_notify_session() {
+async fn codex_review_request_recovery_keeps_missing_notify_session_active() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-recover-missing-notify.db");
     fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
@@ -2695,8 +2695,8 @@ async fn codex_review_request_recovery_cancels_missing_notify_session() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(row.0, "cancelled");
-    assert_eq!(row.1, 0);
+    assert_eq!(row.0, "active");
+    assert_eq!(row.1, 1);
     assert_eq!(row.2.as_deref(), Some("Notify session no longer exists"));
 }
 

@@ -3207,14 +3207,16 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
                     .is_none()
                 {
                     if let Err(error) =
-                        RetainedQueueStore::cancel_codex_review_request_with_error_in_path(
+                        RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
                             &queue_db_path,
                             &registration.id,
+                            &now_rfc3339(),
                             "Notify session no longer exists",
+                            None,
                         )
                     {
                         eprintln!(
-                            "Codex review request recovery failed to cancel {}: {error:#}",
+                            "Codex review request recovery failed to mark {} missing notify session: {error:#}",
                             registration.id
                         );
                     }
@@ -3280,9 +3282,12 @@ async fn run_codex_review_request_watcher(
             .map_err(|error| error.to_string())?
             .is_none()
         {
-            let _ = RetainedQueueStore::cancel_codex_review_request_in_path(
+            let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
                 &queue_db_path,
                 &request_id,
+                &now_rfc3339(),
+                "Notify session no longer exists",
+                None,
             )
             .map_err(|error| error.to_string())?;
             return Ok(());
