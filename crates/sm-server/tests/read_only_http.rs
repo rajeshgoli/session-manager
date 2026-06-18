@@ -9,7 +9,7 @@ use base64::{
 };
 use futures_util::{future::join, StreamExt as _};
 use hmac::{Hmac, Mac};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -2578,6 +2578,132 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
         message,
         "[sm review] Codex comment for PR #967 is here. https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
     );
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_delivers_sequential_wake_to_runtime_session() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-review-wake-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "pull_review".to_owned(),
+        created_at: "2026-06-14T02:31:00Z".to_owned(),
+        id: Some(json!("PRR_kwRuntimeWake")),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/978#pullrequestreview-1".to_owned(),
+        ),
+    });
+    let app = router(
+        AppState::new(AppConfig {
+            paths: PathsConfig {
+                state_file: state_file.display().to_string(),
+            },
+            sm_send: SmSendConfig {
+                db_path: queue_db.display().to_string(),
+            },
+            rust_core: RustCoreConfig {
+                runtime_enabled: true,
+                log_dir: Some(log_dir.display().to_string()),
+                tmux_socket_name: Some(tmux_socket),
+                runtime_command: Some(
+                    r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; done'"#
+                        .to_owned(),
+                ),
+                runtime_prompt_mode: Some("stdin".to_owned()),
+                runtime_start_settle_ms: Some(100),
+                send_keys_settle_ms: Some(10.0),
+                send_keys_settle_max_ms: Some(50.0),
+                send_keys_max_chunk_chars: Some(128),
+                ..RustCoreConfig::default()
+            },
+            ..AppConfig::default()
+        })
+        .with_github_review_poster(Arc::new(poster)),
+    );
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "notifyruntime",
+            "name": "notify-runtime",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "review wake initial"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(app.clone(), "notifyruntime", "runtime:review wake initial").await;
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 978,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notifyruntime",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+    let expected_message = "[sm review] Codex review for PR #978 is here. https://github.com/rajeshgoli/session-manager/pull/978#pullrequestreview-1";
+
+    let mut completed = None;
+    for _ in 0..30 {
+        let conn = Connection::open(&queue_db).unwrap();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                r#"
+                SELECT state, review_url
+                FROM codex_review_request_registrations
+                WHERE id = ?1
+                "#,
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let delivered_at: Option<String> = match conn
+            .query_row(
+                "SELECT delivered_at FROM message_queue WHERE target_session_id = 'notifyruntime' AND text = ?1",
+                [expected_message],
+                |row| row.get(0),
+            )
+            .optional()
+        {
+            Ok(value) => value.flatten(),
+            Err(error) if error.to_string().contains("no such table: message_queue") => None,
+            Err(error) => panic!("failed to query review wake message: {error}"),
+        };
+        if row.0 == "completed" && delivered_at.is_some() {
+            completed = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let completed = completed.expect("watcher should complete and deliver retained request");
+    assert_eq!(
+        completed.1.as_deref(),
+        Some("https://github.com/rajeshgoli/session-manager/pull/978#pullrequestreview-1")
+    );
+    wait_for_output_contains(app, "notifyruntime", expected_message).await;
 }
 
 #[tokio::test]
@@ -7123,7 +7249,7 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(payload["sessions"][0]["id"], "run12345");
     assert_eq!(payload["sessions"][0]["friendly_name"], "Runner Native");
-    assert_eq!(payload["sessions"][0]["activity_state"], "working");
+    assert_eq!(payload["sessions"][0]["activity_state"], "idle");
     assert_eq!(payload["sessions"][0]["provider"], "claude");
     assert_eq!(payload["sessions"][1]["id"], "oldstate");
     assert_eq!(payload["sessions"][1]["friendly_name"], "claude-oldstate");
@@ -7643,7 +7769,7 @@ async fn session_detail_returns_one_projected_session() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "run12345");
     assert_eq!(payload["friendly_name"], "Runner Native");
-    assert_eq!(payload["activity_state"], "working");
+    assert_eq!(payload["activity_state"], "idle");
     assert_eq!(payload["provider"], "claude");
 }
 
