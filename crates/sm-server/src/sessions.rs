@@ -2381,7 +2381,7 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         "error" if codex_fork_error_will_retry(event) => Some("running"),
         "error" | "shutdown" => Some("stopped"),
         "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
-        other if other.ends_with("_begin") || other.ends_with("_delta") => Some("running"),
+        other if other.ends_with("_begin") => Some("running"),
         _ => None,
     }
 }
@@ -5871,6 +5871,7 @@ mod tests {
         let completed_agent_message =
             r#"{"event_type":"item_completed","payload":{"item":{"type":"agentMessage"}}}"#;
         let completed_command = r#"{"event_type":"item_completed","payload":{"item":{"type":"commandExecution","status":"completed"}}}"#;
+        let late_command_output_delta = r#"{"event_type":"item/commandExecution/outputDelta","payload":{"delta":"hmr update\n"}}"#;
 
         assert_eq!(
             codex_fork_status_for_event_line(completed_agent_message),
@@ -5879,6 +5880,10 @@ mod tests {
         assert_eq!(
             codex_fork_status_for_event_line(completed_command),
             Some("running")
+        );
+        assert_eq!(
+            codex_fork_status_for_event_line(late_command_output_delta),
+            None
         );
     }
 
