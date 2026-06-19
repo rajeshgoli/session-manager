@@ -493,10 +493,28 @@ pub struct MobileTerminalDeviceKeyConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TmuxConfig {
     #[serde(default)]
     pub socket_name: Option<String>,
+    #[serde(default = "default_true")]
+    pub native_scrollback: bool,
+    #[serde(default = "default_tmux_history_limit")]
+    pub history_limit: Option<u64>,
+}
+
+fn default_tmux_history_limit() -> Option<u64> {
+    Some(100000)
+}
+
+impl Default for TmuxConfig {
+    fn default() -> Self {
+        Self {
+            socket_name: None,
+            native_scrollback: default_true(),
+            history_limit: default_tmux_history_limit(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -951,6 +969,10 @@ pub struct RustCoreConfig {
     #[serde(default)]
     pub tmux_socket_name: Option<String>,
     #[serde(default)]
+    pub tmux_native_scrollback: Option<bool>,
+    #[serde(default)]
+    pub tmux_history_limit: Option<u64>,
+    #[serde(default)]
     pub runtime_command: Option<String>,
     #[serde(default)]
     pub runtime_prompt_mode: Option<String>,
@@ -1041,6 +1063,12 @@ impl From<RawConfig> for AppConfig {
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
         if trimmed(&rust_core.tmux_socket_name).is_none() {
             rust_core.tmux_socket_name = trimmed(&raw.tmux.socket_name);
+        }
+        if rust_core.tmux_native_scrollback.is_none() {
+            rust_core.tmux_native_scrollback = Some(raw.tmux.native_scrollback);
+        }
+        if rust_core.tmux_history_limit.is_none() {
+            rust_core.tmux_history_limit = raw.tmux.history_limit.filter(|value| *value > 0);
         }
         let tmux_timeouts = raw.timeouts.tmux;
         if rust_core.send_keys_settle_ms.is_none() {
