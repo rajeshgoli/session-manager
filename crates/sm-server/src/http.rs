@@ -3667,6 +3667,7 @@ async fn run_codex_review_request_watcher(
         {
             Ok(Some(review_match)) => {
                 complete_codex_review_request(
+                    &state,
                     &queue_db_path,
                     &request_id,
                     &registration,
@@ -3791,6 +3792,7 @@ async fn github_post_review_request(
 }
 
 fn complete_codex_review_request(
+    state: &AppState,
     queue_db_path: &std::path::Path,
     request_id: &str,
     registration: &CodexReviewRequestRegistration,
@@ -3802,6 +3804,18 @@ fn complete_codex_review_request(
     queue
         .enqueue_message(&registration.notify_session_id, &text, "sequential", None)
         .map_err(|error| error.to_string())?;
+    if state.config.rust_core.runtime_enabled {
+        let runtime = TmuxRuntime::from_app_config(&state.config);
+        if let Err(error) = state
+            .session_store
+            .drain_runtime_pending_messages_for_session(&registration.notify_session_id, &runtime)
+        {
+            eprintln!(
+                "failed to immediately deliver Codex review completion message {request_id} to {}: {error:#}",
+                registration.notify_session_id
+            );
+        }
+    }
     RetainedQueueStore::complete_codex_review_request_in_path(
         queue_db_path,
         request_id,

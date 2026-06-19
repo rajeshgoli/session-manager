@@ -17,7 +17,10 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
+use time::{
+    format_description::well_known::Rfc3339, macros::format_description, Duration as TimeDuration,
+    OffsetDateTime, PrimitiveDateTime,
+};
 
 use crate::queue::{
     followup_notification_text, PendingMessage, QueueMessageMetadata, RetainedQueueStore,
@@ -5399,12 +5402,48 @@ fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
         return "idle".to_owned();
     }
     if matches!(status, "running" | "working") {
-        return "working".to_owned();
+        if session_activity_is_recent(&session.last_activity) {
+            return "working".to_owned();
+        }
+        return "idle".to_owned();
     }
     if status == "idle" {
         return "idle".to_owned();
     }
     fallback_activity_state(status)
+}
+
+fn session_activity_is_recent(last_activity: &str) -> bool {
+    let now_utc = OffsetDateTime::now_utc();
+    if let Ok(parsed) = OffsetDateTime::parse(last_activity.trim(), &Rfc3339) {
+        return now_utc - parsed < TimeDuration::seconds(30);
+    }
+    let now_local = local_now_naive(now_utc);
+    parse_python_naive_datetime(last_activity)
+        .is_some_and(|last_activity| now_local - last_activity < TimeDuration::seconds(30))
+}
+
+fn parse_python_naive_datetime(value: &str) -> Option<PrimitiveDateTime> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    PrimitiveDateTime::parse(
+        value,
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]"),
+    )
+    .or_else(|_| {
+        PrimitiveDateTime::parse(
+            value,
+            format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"),
+        )
+    })
+    .ok()
+}
+
+fn local_now_naive(now_utc: OffsetDateTime) -> PrimitiveDateTime {
+    let local = OffsetDateTime::now_local().unwrap_or(now_utc);
+    PrimitiveDateTime::new(local.date(), local.time())
 }
 
 fn non_empty_or(value: String, fallback: &str) -> String {
@@ -5669,6 +5708,20 @@ mod tests {
         recent_activity_session.last_activity = now_rfc3339();
         let response = SessionResponse::from(recent_activity_session);
         assert_eq!(response.activity_state, "idle");
+
+        let stale_running_session = session_record("running");
+        let response = SessionResponse::from(stale_running_session);
+        assert_eq!(response.activity_state, "idle");
+
+        let mut recent_running_session = session_record("running");
+        recent_running_session.last_activity = now_rfc3339();
+        let response = SessionResponse::from(recent_running_session);
+        assert_eq!(response.activity_state, "working");
+
+        let mut recent_naive_running_session = session_record("running");
+        recent_naive_running_session.last_activity = now_python_naive_iso();
+        let response = SessionResponse::from(recent_naive_running_session);
+        assert_eq!(response.activity_state, "working");
     }
 
     #[test]
