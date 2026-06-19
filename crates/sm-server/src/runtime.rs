@@ -485,7 +485,7 @@ impl TmuxRuntime {
         }
     }
 
-    fn capture_pane_last_line(&self, tmux_session: &str) -> Option<String> {
+    pub fn capture_pane_text(&self, tmux_session: &str) -> Option<String> {
         let output = self
             .tmux_command(["capture-pane", "-p", "-t", tmux_session])
             .stdout(Stdio::piped())
@@ -495,8 +495,12 @@ impl TmuxRuntime {
         if !output.status.success() {
             return None;
         }
-        String::from_utf8_lossy(&output.stdout)
-            .trim_end_matches('\n')
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn capture_pane_last_line(&self, tmux_session: &str) -> Option<String> {
+        let text = self.capture_pane_text(tmux_session)?;
+        text.trim_end_matches('\n')
             .split('\n')
             .last()
             .map(str::trim)

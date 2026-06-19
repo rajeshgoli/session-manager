@@ -7492,10 +7492,22 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     if session.status.trim() == "stopped" || session.completion_status.is_some() {
         return None;
     }
+    if session.tmux_session.trim().is_empty() {
+        return None;
+    }
+    if session.provider.trim() == "claude" {
+        if !is_primary_node(&session.node) {
+            return None;
+        }
+        let runtime = TmuxRuntime::from_app_config(&state.config)
+            .for_socket_name(session.tmux_socket_name.as_deref());
+        let pane_text = runtime.capture_pane_text(&session.tmux_session);
+        return claude_live_activity_state(session, pane_text.as_deref());
+    }
     if session.agent_task_completed_at.is_some() {
         return None;
     }
-    if session.provider.trim() != "codex-fork" || session.tmux_session.trim().is_empty() {
+    if session.provider.trim() != "codex-fork" {
         return None;
     }
     let event_activity = codex_fork_event_stream_activity(state, session);
@@ -7506,6 +7518,83 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         .for_socket_name(session.tmux_socket_name.as_deref());
     let pane_title = runtime.pane_title(&session.tmux_session);
     codex_fork_live_activity_from_signals(event_activity, pane_title.as_deref())
+}
+
+fn claude_live_activity_state(
+    session: &SessionRecord,
+    pane_text: Option<&str>,
+) -> Option<&'static str> {
+    if !is_primary_node(&session.node) {
+        return None;
+    }
+    claude_live_activity_from_pane(pane_text)
+}
+
+fn claude_live_activity_from_pane(pane_text: Option<&str>) -> Option<&'static str> {
+    let pane_text = pane_text?;
+    let mut relevant_lines = Vec::new();
+    for line in pane_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        relevant_lines.push(line);
+        if relevant_lines.len() > 40 {
+            relevant_lines.remove(0);
+        }
+    }
+    for line in relevant_lines.iter().rev().take(30) {
+        if claude_line_indicates_completed(line) {
+            return Some("idle");
+        }
+        if claude_line_indicates_working(line) {
+            return Some("working");
+        }
+    }
+    None
+}
+
+fn claude_line_indicates_completed(line: &str) -> bool {
+    line.trim().contains("Brewed for")
+}
+
+fn claude_line_indicates_working(line: &str) -> bool {
+    let line = line.trim();
+    if claude_line_indicates_completed(line) {
+        return false;
+    }
+    if claude_spinner_status_line_indicates_working(line) {
+        return true;
+    }
+    line.contains("Orbiting…")
+        || line.contains("Thinking…")
+        || line.contains("Bashing…")
+        || line.contains("Reading…")
+        || line.contains("Writing…")
+        || line.contains("Editing…")
+        || line.contains("Searching…")
+        || line.contains("Running…")
+        || line.contains("Reviewing…")
+        || line.contains("Herding…")
+}
+
+fn claude_spinner_status_line_indicates_working(line: &str) -> bool {
+    let mut chars = line.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(0x2700..=0x27bf).contains(&(first as u32)) {
+        return false;
+    }
+    let rest = chars.as_str().trim_start();
+    let Some((status, _)) = rest.split_once('…') else {
+        return false;
+    };
+    !status.trim().is_empty()
+        && status
+            .trim()
+            .chars()
+            .all(|ch| ch.is_alphabetic() || ch == '-' || ch == ' ')
 }
 
 fn codex_fork_live_activity_from_signals(
@@ -10952,6 +11041,86 @@ mod tests {
         assert!(!codex_fork_pane_title_indicates_working(
             "⠏⠇ fractal-algo-rust"
         ));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_active_status_after_prompt() {
+        let pane = r#"
+⏺ Round-3 found 2 more P1s + 1 P2.
+❯ ok can you package everything you have done so far
+⏺ Reading 1 file…
+✢ Orbiting… (1m 14s · ↑ 3.8k tokens)
+  ⎿  ◻ Triage round-3 Codex review
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_generic_spinner_status() {
+        let pane = r#"
+⏺ Reading 1 file…
+✽ Incubating… (3m 3s · ↓ 9.9k tokens · thinking with xhigh effort)
+  ⎿  ◻ Fix P2: prune/finalization bars fold causally
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_ignores_completed_status_before_idle_prompt() {
+        let pane = r#"
+✢ Orbiting… (1m 14s · ↑ 3.8k tokens)
+✻ Brewed for 3m 11s
+⏺ Type-checks clean.
+❯
+────────────────────────────────────────
+        ⏵⏵ auto mode on · PR #48
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("idle"));
+    }
+
+    #[test]
+    fn claude_pane_activity_overrides_stale_task_complete() {
+        let session: SessionRecord = serde_json::from_value(json!({
+            "id": "claudetaskdone",
+            "name": "claude-claudetaskdone",
+            "working_dir": "/repo",
+            "tmux_session": "claudetaskdone",
+            "node": "primary",
+            "provider": "claude",
+            "status": "running",
+            "created_at": "2026-06-01T00:00:00",
+            "last_activity": "2026-06-01T00:00:00",
+            "agent_task_completed_at": "2026-06-01T00:01:00Z"
+        }))
+        .unwrap();
+        let pane = r#"
+⏺ Reading 1 file…
+✽ Incubating… (3m 3s · ↓ 9.9k tokens · thinking with xhigh effort)
+"#;
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn live_activity_skips_local_pane_capture_for_remote_claude_sessions() {
+        let state = AppState::new(AppConfig::default());
+        let session: SessionRecord = serde_json::from_value(json!({
+            "id": "remoteclaude",
+            "name": "claude-remoteclaude",
+            "working_dir": "/repo",
+            "tmux_session": "locally-existing-but-remote-owned",
+            "node": "macbook",
+            "provider": "claude",
+            "status": "running",
+            "created_at": "2026-06-01T00:00:00",
+            "last_activity": "2026-06-01T00:00:00"
+        }))
+        .unwrap();
+
+        assert_eq!(live_activity_state(&state, &session), None);
     }
 
     #[test]
