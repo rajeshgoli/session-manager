@@ -8537,6 +8537,8 @@ fn runtime_core_inherits_existing_tmux_socket_config() {
         r#"
 tmux:
   socket_name: "session-manager"
+  native_scrollback: true
+  history_limit: 100000
 timeouts:
   tmux:
     send_keys_settle_seconds: 0.25
@@ -8555,6 +8557,8 @@ rust_core:
         config.rust_core.tmux_socket_name.as_deref(),
         Some("session-manager")
     );
+    assert_eq!(config.rust_core.tmux_native_scrollback, Some(true));
+    assert_eq!(config.rust_core.tmux_history_limit, Some(100000));
     assert_eq!(config.rust_core.send_keys_settle_ms, Some(250.0));
     assert_eq!(config.rust_core.send_keys_settle_max_ms, Some(1250.0));
     assert_eq!(config.rust_core.send_keys_settle_per_ki_ms, Some(70.0));
@@ -8572,6 +8576,8 @@ tmux:
 rust_core:
   runtime_enabled: true
   tmux_socket_name: "rust-core-only"
+  tmux_native_scrollback: false
+  tmux_history_limit: 50000
 "#,
     )
     .unwrap();
@@ -8581,6 +8587,45 @@ rust_core:
         config.rust_core.tmux_socket_name.as_deref(),
         Some("rust-core-only")
     );
+    assert_eq!(config.rust_core.tmux_native_scrollback, Some(false));
+    assert_eq!(config.rust_core.tmux_history_limit, Some(50000));
+
+    fs::write(
+        &config_path,
+        r#"
+tmux:
+  socket_name: "session-manager"
+rust_core:
+  runtime_enabled: true
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&missing_env_path)).unwrap();
+    assert_eq!(
+        config.rust_core.tmux_socket_name.as_deref(),
+        Some("session-manager")
+    );
+    assert_eq!(config.rust_core.tmux_native_scrollback, Some(true));
+    assert_eq!(config.rust_core.tmux_history_limit, Some(100000));
+
+    fs::write(
+        &config_path,
+        r#"
+rust_core:
+  runtime_enabled: true
+  tmux_socket_name: "session-manager"
+"#,
+    )
+    .unwrap();
+    let config =
+        AppConfig::load_from_path_with_local_env(&config_path, Some(&missing_env_path)).unwrap();
+    assert_eq!(
+        config.rust_core.tmux_socket_name.as_deref(),
+        Some("session-manager")
+    );
+    assert_eq!(config.rust_core.tmux_native_scrollback, Some(true));
+    assert_eq!(config.rust_core.tmux_history_limit, Some(100000));
 }
 
 #[tokio::test]

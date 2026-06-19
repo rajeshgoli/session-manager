@@ -33,6 +33,8 @@ pub struct TmuxRuntime {
     codex_fork_default_model: Option<String>,
     codex_fork_event_schema_version: u32,
     codex_fork_control_tmux_fallback_enabled: bool,
+    tmux_native_scrollback: bool,
+    tmux_history_limit: Option<u64>,
     prompt_mode: String,
     start_settle_ms: u64,
     send_keys_settle_ms: f64,
@@ -88,6 +90,8 @@ impl TmuxRuntime {
             codex_fork_default_model: None,
             codex_fork_event_schema_version: 2,
             codex_fork_control_tmux_fallback_enabled: true,
+            tmux_native_scrollback: config.tmux_native_scrollback.unwrap_or(false),
+            tmux_history_limit: config.tmux_history_limit.filter(|value| *value > 0),
             prompt_mode: config
                 .runtime_prompt_mode
                 .as_deref()
@@ -121,6 +125,12 @@ impl TmuxRuntime {
 
     pub fn from_app_config(config: &AppConfig) -> Self {
         let mut runtime = Self::from_config(&config.rust_core);
+        if config.rust_core.tmux_native_scrollback.is_none() {
+            runtime.tmux_native_scrollback = config.tmux.native_scrollback;
+        }
+        if config.rust_core.tmux_history_limit.is_none() {
+            runtime.tmux_history_limit = config.tmux.history_limit.filter(|value| *value > 0);
+        }
         if config
             .rust_core
             .runtime_command
@@ -200,19 +210,41 @@ impl TmuxRuntime {
         if prompt_mode != "argv" && prompt_mode != "stdin" {
             bail!("unsupported runtime prompt mode: {}", self.prompt_mode);
         }
+        let has_initial_stdin_prompt = prompt_mode == "stdin"
+            && spec
+                .initial_message
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
 
         let mut command = self.launch_command(spec, &prompt_mode)?;
         command = managed_session_command(&command, &spec.session_id);
 
-        self.run_tmux([
-            "new-session",
-            "-d",
-            "-s",
-            spec.tmux_session.as_str(),
-            "-c",
-            spec.working_dir.as_str(),
-            command.as_str(),
-        ])?;
+        let create_result = if self.tmux_history_limit.is_some()
+            || (self.socket_name.is_some() && self.tmux_native_scrollback)
+        {
+            self.create_session_with_bootstrap(spec, &command)
+        } else {
+            let result = self.run_tmux([
+                "new-session",
+                "-d",
+                "-s",
+                spec.tmux_session.as_str(),
+                "-c",
+                spec.working_dir.as_str(),
+                command.as_str(),
+            ]);
+            if result.is_ok() {
+                self.ensure_server_options();
+            }
+            result
+        };
+        if let Err(error) = create_result {
+            if has_initial_stdin_prompt && is_tmux_session_gone_error(&error) {
+                bail!("tmux session exited before initial prompt could be delivered");
+            }
+            return Err(error);
+        }
 
         if let Err(error) = self.attach_session_log(spec, &prompt_mode) {
             let _ = self.kill_session(&spec.tmux_session);
@@ -410,6 +442,82 @@ impl TmuxRuntime {
             .output()
             .with_context(|| "failed to run tmux has-session")?;
         Ok(output.status.success())
+    }
+
+    fn create_session_with_bootstrap(&self, spec: &TmuxSessionSpec, command: &str) -> Result<()> {
+        self.run_tmux([
+            "new-session",
+            "-d",
+            "-s",
+            spec.tmux_session.as_str(),
+            "-c",
+            spec.working_dir.as_str(),
+            "-n",
+            "__sm_bootstrap",
+        ])?;
+
+        let result = (|| {
+            self.ensure_server_options();
+            if let Some(history_limit) = self.tmux_history_limit {
+                let history_limit = history_limit.to_string();
+                self.run_tmux([
+                    "set-option",
+                    "-t",
+                    spec.tmux_session.as_str(),
+                    "history-limit",
+                    history_limit.as_str(),
+                ])?;
+            }
+            self.run_tmux([
+                "new-window",
+                "-d",
+                "-t",
+                spec.tmux_session.as_str(),
+                "-n",
+                "main",
+                "-c",
+                spec.working_dir.as_str(),
+                command,
+            ])?;
+            let bootstrap_window = format!("{}:__sm_bootstrap", spec.tmux_session);
+            self.run_tmux(["kill-window", "-t", bootstrap_window.as_str()])?;
+            let main_window = format!("{}:main", spec.tmux_session);
+            self.run_tmux(["select-window", "-t", main_window.as_str()])?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = self.kill_session(&spec.tmux_session);
+        }
+        result
+    }
+
+    fn ensure_server_options(&self) {
+        if self.socket_name.is_none() {
+            return;
+        }
+        let _ = self.run_tmux(["set-option", "-g", "focus-events", "on"]);
+        if !self.tmux_native_scrollback {
+            return;
+        }
+        let current = self
+            .tmux_command(["show-options", "-gqv", "terminal-overrides"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+            .unwrap_or_default();
+        if current.contains("smcup@:rmcup@") {
+            return;
+        }
+        let _ = self.run_tmux([
+            "set-option",
+            "-as",
+            "terminal-overrides",
+            ",*:smcup@:rmcup@",
+        ]);
     }
 
     fn pane_in_mode(&self, tmux_session: &str) -> Option<i32> {
@@ -699,7 +807,9 @@ fn duration_from_seconds(seconds: f64) -> Duration {
 
 fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
-    message.contains("no server running") || message.contains("can't find session")
+    message.contains("no server running")
+        || message.contains("can't find session")
+        || message.contains("server exited unexpectedly")
 }
 
 fn shell_quote_path(path: &Path) -> String {
@@ -929,6 +1039,146 @@ mod tests {
     }
 
     #[test]
+    fn create_session_applies_native_scrollback_and_history_before_provider_window() {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary_with_has_session(false);
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some("session-manager".to_owned()),
+            tmux_native_scrollback: Some(true),
+            tmux_history_limit: Some(100000),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        let working_dir = temp_dir.join("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let spec = TmuxSessionSpec {
+            session_id: "abc12345".to_owned(),
+            tmux_session: "sm-test".to_owned(),
+            working_dir: working_dir.display().to_string(),
+            log_file: temp_dir.join("session.log"),
+            provider: "claude".to_owned(),
+            initial_message: None,
+            model: None,
+        };
+
+        runtime.create_session(&spec).unwrap();
+
+        let log = fs::read_to_string(log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        let bootstrap = position_after(&lines, "-L session-manager new-session -d -s sm-test", 0);
+        let focus_events = position_after(
+            &lines,
+            "-L session-manager set-option -g focus-events on",
+            bootstrap + 1,
+        );
+        let terminal_overrides = position_after(
+            &lines,
+            "-L session-manager set-option -as terminal-overrides ,*:smcup@:rmcup@",
+            focus_events + 1,
+        );
+        let history_limit = position_after(
+            &lines,
+            "-L session-manager set-option -t sm-test history-limit 100000",
+            terminal_overrides + 1,
+        );
+        let provider_window = position_after(
+            &lines,
+            "-L session-manager new-window -d -t sm-test -n main",
+            history_limit + 1,
+        );
+        let pipe_pane = position_after(
+            &lines,
+            "-L session-manager pipe-pane -t sm-test",
+            provider_window + 1,
+        );
+
+        assert!(bootstrap < focus_events);
+        assert!(focus_events < terminal_overrides);
+        assert!(terminal_overrides < history_limit);
+        assert!(history_limit < provider_window);
+        assert!(provider_window < pipe_pane);
+    }
+
+    #[test]
+    fn runtime_from_default_app_config_uses_tmux_defaults() {
+        let runtime = TmuxRuntime::from_app_config(&AppConfig::default());
+
+        assert!(runtime.tmux_native_scrollback);
+        assert_eq!(runtime.tmux_history_limit, Some(100000));
+    }
+
+    #[test]
+    fn create_session_initializes_socket_options_without_bootstrap() {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary_with_has_session(false);
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some("session-manager".to_owned()),
+            tmux_native_scrollback: Some(false),
+            tmux_history_limit: None,
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        let working_dir = temp_dir.join("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let spec = TmuxSessionSpec {
+            session_id: "abc12345".to_owned(),
+            tmux_session: "sm-test".to_owned(),
+            working_dir: working_dir.display().to_string(),
+            log_file: temp_dir.join("session.log"),
+            provider: "claude".to_owned(),
+            initial_message: None,
+            model: None,
+        };
+
+        runtime.create_session(&spec).unwrap();
+
+        let log = fs::read_to_string(log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        let direct_session =
+            position_after(&lines, "-L session-manager new-session -d -s sm-test", 0);
+        let focus_events = position_after(
+            &lines,
+            "-L session-manager set-option -g focus-events on",
+            direct_session + 1,
+        );
+
+        assert!(direct_session < focus_events);
+        assert!(!log.contains("__sm_bootstrap"));
+        assert!(!log.contains("terminal-overrides ,*:smcup@:rmcup@"));
+        assert!(!log.contains("history-limit"));
+    }
+
+    #[test]
+    fn create_session_does_not_mutate_default_tmux_server_options() {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary_with_has_session(false);
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: None,
+            tmux_native_scrollback: Some(true),
+            tmux_history_limit: None,
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        let working_dir = temp_dir.join("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let spec = TmuxSessionSpec {
+            session_id: "abc12345".to_owned(),
+            tmux_session: "sm-test".to_owned(),
+            working_dir: working_dir.display().to_string(),
+            log_file: temp_dir.join("session.log"),
+            provider: "claude".to_owned(),
+            initial_message: None,
+            model: None,
+        };
+
+        runtime.create_session(&spec).unwrap();
+
+        let log = fs::read_to_string(log_path).unwrap();
+
+        assert!(log.contains("new-session -d -s sm-test"));
+        assert!(!log.contains("set-option -g focus-events on"));
+        assert!(!log.contains("terminal-overrides ,*:smcup@:rmcup@"));
+        assert!(!log.contains("-L session-manager"));
+    }
+
+    #[test]
     fn clear_session_interrupts_waits_and_prompts_before_success() {
         let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
         let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
@@ -999,6 +1249,10 @@ mod tests {
     }
 
     fn fake_tmux_binary() -> (PathBuf, PathBuf, PathBuf) {
+        fake_tmux_binary_with_has_session(true)
+    }
+
+    fn fake_tmux_binary_with_has_session(has_session: bool) -> (PathBuf, PathBuf, PathBuf) {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1015,14 +1269,19 @@ mod tests {
             format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> "{}"
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
 case "$1" in
-  has-session) exit 0 ;;
+  has-session) exit {} ;;
   display-message) echo 0; exit 0 ;;
   capture-pane) printf 'ready\n>\n'; exit 0 ;;
+  show-options) exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
-                log_path.display()
+                log_path.display(),
+                if has_session { 0 } else { 1 }
             ),
         )
         .unwrap();

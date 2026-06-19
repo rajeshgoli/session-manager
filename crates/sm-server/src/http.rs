@@ -63,7 +63,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
-use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
+use time::{
+    format_description::well_known::Rfc3339, macros::format_description, Duration as TimeDuration,
+    OffsetDateTime, PrimitiveDateTime,
+};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::{sleep, timeout};
 
@@ -7504,20 +7507,32 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         let pane_text = runtime.capture_pane_text(&session.tmux_session);
         return claude_live_activity_state(session, pane_text.as_deref());
     }
-    if session.agent_task_completed_at.is_some() {
-        return None;
-    }
     if session.provider.trim() != "codex-fork" {
         return None;
     }
-    let event_activity = codex_fork_event_stream_activity(state, session);
-    if matches!(event_activity, Some("working" | "stopped")) {
-        return event_activity;
+    let task_completed_at =
+        codex_fork_task_completed_at(session.agent_task_completed_at.as_deref());
+    let event_activity = codex_fork_event_stream_activity(state, session)
+        .filter(|signal| codex_fork_signal_is_newer_than_task_complete(signal, task_completed_at));
+    if matches!(
+        event_activity.as_ref().map(|signal| signal.activity),
+        Some("working" | "stopped")
+    ) {
+        return event_activity.map(|signal| signal.activity);
+    }
+    if matches!(
+        task_completed_at,
+        Some(CodexForkTaskCompletion::Known(_)) | Some(CodexForkTaskCompletion::Unknown)
+    ) {
+        return event_activity.map(|signal| signal.activity);
     }
     let runtime = TmuxRuntime::from_app_config(&state.config)
         .for_socket_name(session.tmux_socket_name.as_deref());
     let pane_title = runtime.pane_title(&session.tmux_session);
-    codex_fork_live_activity_from_signals(event_activity, pane_title.as_deref())
+    codex_fork_live_activity_from_signals(
+        event_activity.as_ref().map(|signal| signal.activity),
+        pane_title.as_deref(),
+    )
 }
 
 fn claude_live_activity_state(
@@ -7613,12 +7628,76 @@ fn codex_fork_live_activity_from_signals(
     event_activity
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CodexForkActivitySignal {
+    activity: &'static str,
+    observed_at: Option<OffsetDateTime>,
+    undated_status_is_latest_event: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodexForkTaskCompletion {
+    Known(OffsetDateTime),
+    Unknown,
+}
+
+fn codex_fork_task_completed_at(value: Option<&str>) -> Option<CodexForkTaskCompletion> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    parse_github_datetime(value)
+        .or_else(|| parse_python_naive_datetime_local(value))
+        .map(CodexForkTaskCompletion::Known)
+        .or(Some(CodexForkTaskCompletion::Unknown))
+}
+
+fn codex_fork_signal_is_newer_than_task_complete(
+    signal: &CodexForkActivitySignal,
+    task_completed_at: Option<CodexForkTaskCompletion>,
+) -> bool {
+    let Some(task_completed_at) = task_completed_at else {
+        return true;
+    };
+    let CodexForkTaskCompletion::Known(task_completed_at) = task_completed_at else {
+        return false;
+    };
+    signal
+        .observed_at
+        .is_some_and(|observed_at| observed_at > task_completed_at)
+        || (signal.observed_at.is_none() && signal.undated_status_is_latest_event)
+}
+
+fn parse_python_naive_datetime_local(value: &str) -> Option<OffsetDateTime> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    PrimitiveDateTime::parse(
+        value,
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]"),
+    )
+    .or_else(|_| {
+        PrimitiveDateTime::parse(
+            value,
+            format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"),
+        )
+    })
+    .ok()
+    .map(|parsed| {
+        let local_offset = OffsetDateTime::now_local()
+            .unwrap_or_else(|_| OffsetDateTime::now_utc())
+            .offset();
+        parsed.assume_offset(local_offset)
+    })
+}
+
 fn codex_fork_event_stream_activity(
     state: &AppState,
     session: &SessionRecord,
-) -> Option<&'static str> {
+) -> Option<CodexForkActivitySignal> {
     let event_stream_path = codex_fork_event_stream_path_for_session(state, session)?;
-    codex_fork_event_stream_activity_from_path(event_stream_path)
+    codex_fork_event_stream_signal_from_path(event_stream_path)
 }
 
 fn codex_fork_event_stream_path_for_session(
@@ -7645,12 +7724,11 @@ fn codex_fork_event_stream_path_for_session(
         .ok()
         .flatten()
         .map(|artifacts| {
-            if artifacts.event_stream_path.exists() {
-                artifacts.event_stream_path
-            } else {
-                codex_fork_legacy_event_stream_path_from_log_file(&expand_home(log_file))
-                    .unwrap_or(artifacts.event_stream_path)
-            }
+            codex_fork_newest_event_stream_path(
+                &session.id,
+                &expand_home(log_file),
+                &artifacts.event_stream_path,
+            )
         })
 }
 
@@ -7662,9 +7740,39 @@ fn codex_fork_legacy_event_stream_path_from_log_file(log_file: &StdPath) -> Opti
     Some(log_file.with_file_name(format!("{stem}.codex-fork.events.jsonl")))
 }
 
+fn codex_fork_newest_event_stream_path(
+    _session_id: &str,
+    log_file: &StdPath,
+    derived_path: &StdPath,
+) -> PathBuf {
+    let mut candidates = Vec::new();
+    candidates.push(derived_path.to_path_buf());
+    if let Some(legacy_path) = codex_fork_legacy_event_stream_path_from_log_file(log_file) {
+        candidates.push(legacy_path);
+    }
+
+    candidates
+        .iter()
+        .filter_map(|path| {
+            path.metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|modified| (modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path.to_path_buf())
+        .unwrap_or_else(|| derived_path.to_path_buf())
+}
+
+#[cfg(test)]
 fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static str> {
+    codex_fork_event_stream_signal_from_path(path).map(|signal| signal.activity)
+}
+
+fn codex_fork_event_stream_signal_from_path(path: PathBuf) -> Option<CodexForkActivitySignal> {
     let mut file = fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    let metadata = file.metadata().ok()?;
+    let len = metadata.len();
     let start = len.saturating_sub(CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES);
     if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
         return None;
@@ -7679,13 +7787,46 @@ fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static 
         }
     }
 
-    let mut latest_activity = None;
+    let mut latest_activity: Option<CodexForkActivitySignal> = None;
     for line in chunk.lines() {
-        latest_activity = codex_fork_status_for_event_line(line)
-            .and_then(codex_fork_activity_for_status)
-            .or(latest_activity);
+        if codex_fork_event_line_is_json(line) {
+            if let Some(signal) = latest_activity.as_mut() {
+                signal.undated_status_is_latest_event = false;
+            }
+        }
+        if let Some(activity) =
+            codex_fork_status_for_event_line(line).and_then(codex_fork_activity_for_status)
+        {
+            latest_activity = Some(CodexForkActivitySignal {
+                activity,
+                observed_at: codex_fork_event_line_timestamp(line),
+                undated_status_is_latest_event: true,
+            });
+        }
     }
     latest_activity
+}
+
+fn codex_fork_event_line_is_json(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    event.as_object().is_some()
+}
+
+fn codex_fork_event_line_timestamp(line: &str) -> Option<OffsetDateTime> {
+    let event = serde_json::from_str::<Value>(line.trim()).ok()?;
+    let event = event.as_object()?;
+    for key in ["ts", "timestamp", "created_at"] {
+        if let Some(parsed) = event
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(parse_github_datetime)
+        {
+            return Some(parsed);
+        }
+    }
+    None
 }
 
 fn codex_fork_activity_for_status(status: &str) -> Option<&'static str> {
@@ -7699,9 +7840,13 @@ fn codex_fork_activity_for_status(status: &str) -> Option<&'static str> {
 
 fn codex_fork_pane_title_indicates_working(pane_title: &str) -> bool {
     let title = pane_title.trim();
-    let Some((first_token, _)) = title.split_once(' ') else {
+    let mut tokens = title.split_whitespace();
+    let Some(first_token) = tokens.next() else {
         return false;
     };
+    if tokens.next().is_none() {
+        return false;
+    }
     let mut chars = first_token.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -11032,11 +11177,11 @@ mod tests {
         assert!(codex_fork_pane_title_indicates_working(
             "  ⠇ fractal-algo-rust  "
         ));
-        assert!(!codex_fork_pane_title_indicates_working(
-            "fractal-algo-rust"
+        assert!(codex_fork_pane_title_indicates_working(
+            "⠏\tfractal-algo-rust"
         ));
         assert!(!codex_fork_pane_title_indicates_working(
-            "⠏\tfractal-algo-rust"
+            "fractal-algo-rust"
         ));
         assert!(!codex_fork_pane_title_indicates_working(
             "⠏⠇ fractal-algo-rust"
@@ -11121,6 +11266,217 @@ mod tests {
         .unwrap();
 
         assert_eq!(live_activity_state(&state, &session), None);
+    }
+
+    #[test]
+    fn codex_fork_live_activity_overrides_stale_task_complete() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-stale-task-complete-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("codex-fork-abc12345.log");
+        let session: SessionRecord = serde_json::from_value(json!({
+            "id": "abc12345",
+            "name": "codex-fork-abc12345",
+            "working_dir": "/repo",
+            "tmux_session": "codex-fork-abc12345",
+            "provider": "codex-fork",
+            "status": "running",
+            "created_at": "2026-06-01T00:00:00",
+            "last_activity": "2026-06-01T00:00:00",
+            "agent_task_completed_at": "2026-06-01T00:01:00Z",
+            "log_file": log_file.display().to_string()
+        }))
+        .unwrap();
+        let spec = crate::runtime::TmuxSessionSpec {
+            session_id: session.id.clone(),
+            tmux_session: session.tmux_session.clone(),
+            working_dir: session.working_dir.clone(),
+            log_file: log_file.clone(),
+            provider: session.provider.clone(),
+            initial_message: None,
+            model: session.model.clone(),
+        };
+        let event_stream = TmuxRuntime::from_app_config(&AppConfig::default())
+            .codex_fork_runtime_artifacts(&spec)
+            .unwrap()
+            .unwrap()
+            .event_stream_path;
+        fs::write(
+            &event_stream,
+            "{\"ts\":\"2026-06-01T00:02:00Z\",\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            live_activity_state(&AppState::new(AppConfig::default()), &session),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn codex_fork_stale_live_activity_does_not_override_task_complete() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-completed-before-event-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("codex-fork-abc12345.log");
+        let session: SessionRecord = serde_json::from_value(json!({
+            "id": "abc12345",
+            "name": "codex-fork-abc12345",
+            "working_dir": "/repo",
+            "tmux_session": "codex-fork-abc12345",
+            "provider": "codex-fork",
+            "status": "running",
+            "created_at": "2026-06-01T00:00:00",
+            "last_activity": "2026-06-01T00:00:00",
+            "agent_task_completed_at": "2099-06-01T00:01:00Z",
+            "log_file": log_file.display().to_string()
+        }))
+        .unwrap();
+        let spec = crate::runtime::TmuxSessionSpec {
+            session_id: session.id.clone(),
+            tmux_session: session.tmux_session.clone(),
+            working_dir: session.working_dir.clone(),
+            log_file: log_file.clone(),
+            provider: session.provider.clone(),
+            initial_message: None,
+            model: session.model.clone(),
+        };
+        let event_stream = TmuxRuntime::from_app_config(&AppConfig::default())
+            .codex_fork_runtime_artifacts(&spec)
+            .unwrap()
+            .unwrap()
+            .event_stream_path;
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"ts\":\"2026-06-01T00:00:30Z\",\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"ts\":\"2099-06-01T00:02:00Z\",\"event_type\":\"thread/tokenUsage/updated\",\"payload\":{}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            live_activity_state(&AppState::new(AppConfig::default()), &session),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_fork_latest_undated_status_overrides_task_complete() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-latest-undated-status-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("codex-fork-abc12345.log");
+        let session: SessionRecord = serde_json::from_value(json!({
+            "id": "abc12345",
+            "name": "codex-fork-abc12345",
+            "working_dir": "/repo",
+            "tmux_session": "codex-fork-abc12345",
+            "provider": "codex-fork",
+            "status": "running",
+            "created_at": "2026-06-01T00:00:00",
+            "last_activity": "2026-06-01T00:00:00",
+            "agent_task_completed_at": "2026-06-01T00:01:00",
+            "log_file": log_file.display().to_string()
+        }))
+        .unwrap();
+        let spec = crate::runtime::TmuxSessionSpec {
+            session_id: session.id.clone(),
+            tmux_session: session.tmux_session.clone(),
+            working_dir: session.working_dir.clone(),
+            log_file: log_file.clone(),
+            provider: session.provider.clone(),
+            initial_message: None,
+            model: session.model.clone(),
+        };
+        let event_stream = TmuxRuntime::from_app_config(&AppConfig::default())
+            .codex_fork_runtime_artifacts(&spec)
+            .unwrap()
+            .unwrap()
+            .event_stream_path;
+        fs::write(
+            &event_stream,
+            "{\"type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            live_activity_state(&AppState::new(AppConfig::default()), &session),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn codex_fork_completion_fence_parses_python_naive_timestamps() {
+        let task_completed_at = codex_fork_task_completed_at(Some("2026-06-01T00:01:00")).unwrap();
+        let CodexForkTaskCompletion::Known(task_completed_instant) = task_completed_at else {
+            panic!("expected parsed local task completion timestamp");
+        };
+        let local_offset = OffsetDateTime::now_local()
+            .unwrap_or_else(|_| OffsetDateTime::now_utc())
+            .offset();
+        let expected_local = PrimitiveDateTime::parse(
+            "2026-06-01T00:01:00",
+            format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"),
+        )
+        .unwrap()
+        .assume_offset(local_offset);
+        assert_eq!(
+            task_completed_instant.unix_timestamp(),
+            expected_local.unix_timestamp()
+        );
+
+        let older = CodexForkActivitySignal {
+            activity: "working",
+            observed_at: Some(task_completed_instant - TimeDuration::seconds(1)),
+            undated_status_is_latest_event: false,
+        };
+        let newer = CodexForkActivitySignal {
+            activity: "working",
+            observed_at: Some(task_completed_instant + TimeDuration::seconds(1)),
+            undated_status_is_latest_event: false,
+        };
+        let undated_latest = CodexForkActivitySignal {
+            activity: "working",
+            observed_at: None,
+            undated_status_is_latest_event: true,
+        };
+        let undated_not_latest = CodexForkActivitySignal {
+            activity: "working",
+            observed_at: None,
+            undated_status_is_latest_event: false,
+        };
+        let unknown = codex_fork_task_completed_at(Some("not-a-timestamp")).unwrap();
+
+        assert!(!codex_fork_signal_is_newer_than_task_complete(
+            &older,
+            Some(task_completed_at)
+        ));
+        assert!(codex_fork_signal_is_newer_than_task_complete(
+            &newer,
+            Some(task_completed_at)
+        ));
+        assert!(codex_fork_signal_is_newer_than_task_complete(
+            &undated_latest,
+            Some(task_completed_at)
+        ));
+        assert!(!codex_fork_signal_is_newer_than_task_complete(
+            &undated_not_latest,
+            Some(task_completed_at)
+        ));
+        assert!(!codex_fork_signal_is_newer_than_task_complete(
+            &newer,
+            Some(unknown)
+        ));
     }
 
     #[test]
@@ -11224,6 +11580,27 @@ mod tests {
             Some(PathBuf::from(
                 "/tmp/claude-sessions/session-random.codex-fork.events.jsonl"
             ))
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_path_prefers_newer_derived_over_legacy() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-newest-stream-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("codex-fork-abc12345.log");
+        let legacy = dir.join("codex-fork-abc12345.codex-fork.events.jsonl");
+        let derived = dir.join("abc12345-safehash.codex-fork.events.jsonl");
+        fs::write(&legacy, "old\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&derived, "new\n").unwrap();
+
+        assert_eq!(
+            codex_fork_newest_event_stream_path("abc12345", &log_file, &derived),
+            derived
         );
     }
 
