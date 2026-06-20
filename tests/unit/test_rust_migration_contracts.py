@@ -127,6 +127,7 @@ def test_manifest_covers_core_retained_cli_help_surfaces():
         "cli.spawn_help",
         "cli.fork_help",
         "cli.new_help",
+        "cli.name_help",
         "cli.children_help",
         "cli.retire_help",
         "cli.restore_help",
