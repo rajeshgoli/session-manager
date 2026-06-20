@@ -243,12 +243,27 @@
       return true;
     }
 
+    function sendTerminalPageScroll(lines) {
+      if (!ready || !Number.isFinite(lines) || lines === 0) {
+        return false;
+      }
+      const sequence = lines < 0 ? "\x1b[5~" : "\x1b[6~";
+      const count = Math.min(Math.max(1, Math.ceil(Math.abs(lines) / 6)), 3);
+      for (let i = 0; i < count; i += 1) {
+        bridgeCall("input", sequence);
+      }
+      return true;
+    }
+
     function scrollTerminalByLines(lines, clientX, clientY) {
       if (!ready || !Number.isFinite(lines) || lines === 0) {
         return false;
       }
-      if (terminalUsesAlternateBuffer() && terminalMouseTrackingEnabled()) {
-        return sendTerminalWheel(lines, clientX, clientY);
+      if (terminalUsesAlternateBuffer()) {
+        if (terminalMouseTrackingEnabled()) {
+          return sendTerminalWheel(lines, clientX, clientY);
+        }
+        return sendTerminalPageScroll(lines);
       }
       term.scrollLines(lines);
       return true;

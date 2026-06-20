@@ -66,6 +66,9 @@ def test_terminal_asset_forwards_alternate_screen_scroll_as_wheel_input():
     assert "term.modes.mouseTrackingMode !== \"none\"" in source
     assert "function terminalCellFromClient(clientX, clientY)" in source
     assert "function sendTerminalWheel(lines, clientX, clientY)" in source
+    assert "function sendTerminalPageScroll(lines)" in source
+    assert "const sequence = lines < 0 ? \"\\x1b[5~\" : \"\\x1b[6~\";" in source
+    assert "Math.ceil(Math.abs(lines) / 6)" in source
     assert "function wheelDeltaPixels(event)" in source
     assert "event.deltaMode === WheelEvent.DOM_DELTA_LINE" in source
     assert "event.deltaMode === WheelEvent.DOM_DELTA_PAGE" in source
@@ -76,6 +79,7 @@ def test_terminal_asset_forwards_alternate_screen_scroll_as_wheel_input():
     assert "bridgeCall(\"input\", sequence)" in source
     assert "event.stopPropagation()" in source
     assert "scrollTerminalByPixels(wheelDeltaPixels(event), event.clientX, event.clientY)" in source
+    assert "return sendTerminalPageScroll(lines);" in source
     assert "return scrollTerminalByLines(lines, clientX, clientY);" in source
     assert "return scrollTerminalByLines(parsed, Number(clientX), Number(clientY));" in source
 
