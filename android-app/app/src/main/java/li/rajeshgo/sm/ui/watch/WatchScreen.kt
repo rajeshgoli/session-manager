@@ -590,7 +590,10 @@ private fun TerminalWebView(
             .pointerInput(Unit) {
                 detectVerticalDragGestures { change, dragAmount ->
                     change.consume()
-                    webViewRef?.evaluateJavascript("window.smScrollPixels(${-dragAmount});", null)
+                    webViewRef?.evaluateJavascript(
+                        "window.smScrollPixels(${-dragAmount}, ${change.position.x}, ${change.position.y});",
+                        null,
+                    )
                 }
             },
         factory = { context ->
