@@ -75,6 +75,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -576,6 +577,7 @@ private fun TerminalWebView(
     var deliveredCopyRequest by remember { mutableStateOf(0L) }
     var terminalReady by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    val density = LocalDensity.current.density
 
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
@@ -587,11 +589,14 @@ private fun TerminalWebView(
     AndroidView(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(Unit) {
+            .pointerInput(density) {
                 detectVerticalDragGestures { change, dragAmount ->
                     change.consume()
+                    val cssDelta = -dragAmount / density
+                    val cssX = change.position.x / density
+                    val cssY = change.position.y / density
                     webViewRef?.evaluateJavascript(
-                        "window.smScrollPixels(${-dragAmount}, ${change.position.x}, ${change.position.y});",
+                        "window.smScrollPixels($cssDelta, $cssX, $cssY);",
                         null,
                     )
                 }
