@@ -4225,6 +4225,13 @@ async fn update_session_metadata(
                 if state.config.rust_core.runtime_enabled && !session.tmux_session.trim().is_empty()
                 {
                     let runtime = TmuxRuntime::from_app_config(&state.config);
+                    let _ = state
+                        .session_store
+                        .drain_runtime_pending_messages_for_session_category(
+                            &session.id,
+                            &runtime,
+                            Some("native_rename"),
+                        );
                     let _ = runtime.set_status_bar(&session.tmux_session, friendly_name);
                 }
             }

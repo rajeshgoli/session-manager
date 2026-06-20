@@ -9881,6 +9881,102 @@ async fn patch_session_metadata_updates_friendly_name_and_em_state() {
 }
 
 #[tokio::test]
+async fn patch_session_metadata_drains_native_rename_when_runtime_enabled() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-name-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path.display().to_string(),
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket),
+            runtime_command: Some(
+                r#"/bin/sh -lc 'while IFS= read -r line; do printf "line:%s\n" "$line"; done'"#
+                    .to_owned(),
+            ),
+            runtime_prompt_mode: Some("stdin".to_owned()),
+            runtime_start_settle_ms: Some(100),
+            send_keys_settle_ms: Some(10.0),
+            send_keys_settle_max_ms: Some(50.0),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "rename-runtime",
+            "name": "rename-runtime",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let queue = RetainedQueueStore::new(queue_db_path.clone());
+    queue
+        .enqueue_message(
+            "rename-runtime",
+            "ordinary queued input",
+            "sequential",
+            None,
+        )
+        .unwrap();
+
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/rename-runtime",
+        json!({ "friendly_name": "runtime-name" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["friendly_name"], "runtime-name");
+
+    wait_for_output_contains(app.clone(), "rename-runtime", "line:/rename runtime-name").await;
+    let delivered_native_renames: i64 = Connection::open(&queue_db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'rename-runtime' AND message_category = 'native_rename' AND delivered_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered_native_renames, 1);
+    let pending_ordinary_messages: i64 = Connection::open(&queue_db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'rename-runtime' AND message_category IS NULL AND delivered_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_ordinary_messages, 1);
+}
+
+#[tokio::test]
 async fn patch_session_metadata_rejects_invalid_and_reserved_friendly_names() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();

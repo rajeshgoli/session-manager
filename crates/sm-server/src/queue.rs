@@ -1044,6 +1044,74 @@ impl RetainedQueueStore {
         })
     }
 
+    pub fn pending_messages_for_target_by_category(
+        &self,
+        target_session_id: &str,
+        message_category: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingMessage>> {
+        self.with_connection(|conn| {
+            expire_pending_messages_for_target(conn, target_session_id)?;
+            let mut statement = conn.prepare(
+                r#"
+                SELECT id, target_session_id, text, delivery_mode,
+                    CASE WHEN
+                        notify_on_delivery != 0
+                        OR notify_after_seconds IS NOT NULL
+                        OR notify_on_stop != 0
+                        OR remind_soft_threshold IS NOT NULL
+                        OR remind_hard_threshold IS NOT NULL
+                        OR (
+                            remind_cancel_on_reply_session_id IS NOT NULL
+                            AND trim(remind_cancel_on_reply_session_id) != ''
+                        )
+                        OR (
+                            parent_session_id IS NOT NULL
+                            AND trim(parent_session_id) != ''
+                        )
+                    THEN 1 ELSE 0 END AS has_delivery_side_effects,
+                    sender_session_id, sender_name, from_sm_send, notify_on_delivery,
+                    notify_after_seconds, notify_on_stop, remind_soft_threshold,
+                    remind_hard_threshold, remind_cancel_on_reply_session_id,
+                    parent_session_id, message_category, response_relay_source
+                FROM message_queue
+                WHERE target_session_id = ?1
+                    AND message_category = ?2
+                    AND delivered_at IS NULL
+                ORDER BY queued_at ASC, id ASC
+                LIMIT ?3
+                "#,
+            )?;
+            let rows = statement
+                .query_map(
+                    params![target_session_id, message_category, limit.max(1) as i64],
+                    |row| {
+                        Ok(PendingMessage {
+                            id: row.get(0)?,
+                            target_session_id: row.get(1)?,
+                            text: row.get(2)?,
+                            delivery_mode: row.get(3)?,
+                            has_delivery_side_effects: row.get::<_, i64>(4)? != 0,
+                            sender_session_id: row.get(5)?,
+                            sender_name: row.get(6)?,
+                            from_sm_send: row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                            notify_on_delivery: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+                            notify_after_seconds: row.get::<_, Option<i64>>(9)?.map(i64_to_u64),
+                            notify_on_stop: row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
+                            remind_soft_threshold: row.get::<_, Option<i64>>(11)?.map(i64_to_u64),
+                            remind_hard_threshold: row.get::<_, Option<i64>>(12)?.map(i64_to_u64),
+                            remind_cancel_on_reply_session_id: row.get(13)?,
+                            parent_session_id: row.get(14)?,
+                            message_category: row.get(15)?,
+                            response_relay_source: row.get(16)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     pub fn mark_delivered(&self, message_id: &str) -> Result<()> {
         self.with_connection(|conn| {
             let _ = mark_delivered_conn(conn, message_id)?;
