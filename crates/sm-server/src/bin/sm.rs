@@ -37,6 +37,7 @@ enum Command {
     Spawn(SpawnArgs),
     Fork(ForkArgs),
     New(NewArgs),
+    Name(NameArgs),
     Children(ChildrenArgs),
     Tail(TailArgs),
     Retire(SessionIdArgs),
@@ -133,6 +134,12 @@ struct ForkArgs {
     self_: bool,
     #[arg(long)]
     attach: bool,
+}
+
+#[derive(Args)]
+struct NameArgs {
+    name_or_session: String,
+    new_name: Option<String>,
 }
 
 #[derive(Args)]
@@ -570,6 +577,7 @@ fn run() -> Result<()> {
             args.working_dir,
             args.node,
         )?,
+        Command::Name(args) => rename_session(&client, args)?,
         Command::Claude(args) => launch_provider_session(
             &client,
             launch_provider_for_alias("claude")?,
@@ -2193,6 +2201,109 @@ fn create_launch_session_payload(
     })
 }
 
+fn rename_session(client: &ApiClient, args: NameArgs) -> Result<()> {
+    let requester_session_id = current_session_id()?;
+    let (target_session_id, friendly_name) = match args.new_name {
+        None => (requester_session_id.clone(), args.name_or_session),
+        Some(new_name) => {
+            let target_identifier = args.name_or_session;
+            let Some((target_session_id, target_session)) =
+                resolve_name_target(client, &target_identifier)?
+            else {
+                bail!("Session '{target_identifier}' not found");
+            };
+            let parent_id = target_session["parent_session_id"].as_str();
+            if parent_id != Some(requester_session_id.as_str()) {
+                bail!(
+                    "Not authorized. You can only rename your child sessions.\nTarget session parent: {}",
+                    parent_id.unwrap_or("none")
+                );
+            }
+            (target_session_id, new_name)
+        }
+    };
+    validate_friendly_name(&friendly_name)?;
+    let payload = client.patch_json(
+        &format!("/sessions/{}", encode_path_segment(&target_session_id)),
+        json!({ "friendly_name": friendly_name }),
+    )?;
+    if let Some(error) = payload["error"]
+        .as_str()
+        .or_else(|| payload["detail"].as_str())
+    {
+        bail!("{error}");
+    }
+    let session_id = payload["id"].as_str().unwrap_or(&target_session_id);
+    let name = payload["friendly_name"].as_str().unwrap_or(&friendly_name);
+    println!("Name set: {name} ({session_id})");
+    Ok(())
+}
+
+fn resolve_name_target(client: &ApiClient, identifier: &str) -> Result<Option<(String, Value)>> {
+    let session_path = format!("/sessions/{}", encode_path_segment(identifier));
+    let response = client.request("GET", &session_path, None)?;
+    if (200..300).contains(&response.status) {
+        let payload = response.into_json()?;
+        let session_id = payload["id"].as_str().unwrap_or(identifier).to_owned();
+        return Ok(Some((session_id, payload)));
+    }
+    if response.status != 404 {
+        return Err(response.into_status_error());
+    }
+
+    let payload = client.get_json("/sessions")?;
+    let sessions = payload["sessions"].as_array().cloned().unwrap_or_default();
+    Ok(resolve_exact_session_identifier_from_sessions(
+        identifier, &sessions,
+    ))
+}
+
+fn resolve_exact_session_identifier_from_sessions(
+    identifier: &str,
+    sessions: &[Value],
+) -> Option<(String, Value)> {
+    sessions
+        .iter()
+        .find(|session| {
+            session["aliases"].as_array().is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .any(|alias| alias.as_str() == Some(identifier))
+            })
+        })
+        .and_then(|session| {
+            session["id"]
+                .as_str()
+                .map(|session_id| (session_id.to_owned(), session.clone()))
+        })
+        .or_else(|| {
+            sessions
+                .iter()
+                .find(|session| session["friendly_name"].as_str() == Some(identifier))
+                .and_then(|session| {
+                    session["id"]
+                        .as_str()
+                        .map(|session_id| (session_id.to_owned(), session.clone()))
+                })
+        })
+}
+
+fn validate_friendly_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("Name cannot be empty");
+    }
+    if name.chars().count() > 32 {
+        bail!("Name too long (max 32 chars)");
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        bail!("Name must be alphanumeric with - or _ only (no spaces)");
+    }
+    Ok(())
+}
+
 fn resolve_launch_working_dir(working_dir: Option<String>, node: Option<&str>) -> Result<String> {
     let raw = match working_dir {
         Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
@@ -2724,6 +2835,11 @@ impl ApiClient {
         response.into_json()
     }
 
+    fn patch_json(&self, path: &str, body: Value) -> Result<Value> {
+        let response = self.request("PATCH", path, Some(body))?;
+        response.into_json()
+    }
+
     fn delete_json(&self, path: &str, body: Value) -> Result<Value> {
         let response = self.request("DELETE", path, Some(body))?;
         response.into_json()
@@ -2778,6 +2894,11 @@ impl ApiClient {
                 .send(body_bytes.as_slice()),
             "PUT" => agent
                 .put(&url)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .send(body_bytes.as_slice()),
+            "PATCH" => agent
+                .patch(&url)
                 .header("Accept", "application/json")
                 .header("Content-Type", "application/json")
                 .send(body_bytes.as_slice()),
@@ -3218,6 +3339,21 @@ mod tests {
     }
 
     #[test]
+    fn api_client_https_supports_patch_requests() {
+        let client = ApiClient::parse("https://127.0.0.1:1").unwrap();
+        let error = match client.request(
+            "PATCH",
+            "/sessions/abc123",
+            Some(json!({"friendly_name": "deskbar"})),
+        ) {
+            Ok(_) => panic!("expected connection failure"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(!error.contains("unsupported HTTP method PATCH"));
+    }
+
+    #[test]
     fn send_input_payload_includes_sm_send_sender_metadata() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
@@ -3334,6 +3470,56 @@ mod tests {
         };
         assert_eq!(remove_args.device_id, "android-1");
         assert_eq!(remove_args.user_id.as_deref(), Some("local_bypass"));
+    }
+
+    #[test]
+    fn name_cli_parses_self_and_child_rename_forms() {
+        let self_cli = Cli::try_parse_from(["sm", "name", "maintainer"]).unwrap();
+        let Command::Name(self_args) = self_cli.command else {
+            panic!("expected name command");
+        };
+        assert_eq!(self_args.name_or_session, "maintainer");
+        assert!(self_args.new_name.is_none());
+
+        let child_cli = Cli::try_parse_from(["sm", "name", "child-session", "worker_1"]).unwrap();
+        let Command::Name(child_args) = child_cli.command else {
+            panic!("expected name command");
+        };
+        assert_eq!(child_args.name_or_session, "child-session");
+        assert_eq!(child_args.new_name.as_deref(), Some("worker_1"));
+    }
+
+    #[test]
+    fn name_target_resolution_uses_exact_alias_or_friendly_name_only() {
+        let sessions = vec![
+            json!({
+                "id": "child-a",
+                "aliases": ["worker-a"],
+                "friendly_name": "api-worker",
+                "name": "codex-api-worker"
+            }),
+            json!({
+                "id": "child-b",
+                "aliases": [],
+                "friendly_name": "worker-b",
+                "name": "codex-worker-b"
+            }),
+        ];
+
+        assert_eq!(
+            resolve_exact_session_identifier_from_sessions("worker-a", &sessions)
+                .map(|(session_id, _)| session_id),
+            Some("child-a".to_owned())
+        );
+        assert_eq!(
+            resolve_exact_session_identifier_from_sessions("worker-b", &sessions)
+                .map(|(session_id, _)| session_id),
+            Some("child-b".to_owned())
+        );
+        assert!(resolve_exact_session_identifier_from_sessions("api", &sessions).is_none());
+        assert!(
+            resolve_exact_session_identifier_from_sessions("codex-api-worker", &sessions).is_none()
+        );
     }
 
     #[test]

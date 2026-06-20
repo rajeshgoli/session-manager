@@ -1149,12 +1149,9 @@ mod tests {
     #[test]
     fn create_session_does_not_mutate_default_tmux_server_options() {
         let (tmux_binary, log_path, temp_dir) = fake_tmux_binary_with_has_session(false);
-        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
-            tmux_socket_name: None,
-            tmux_native_scrollback: Some(true),
-            tmux_history_limit: None,
-            ..RustCoreConfig::default()
-        });
+        let mut config = RustCoreConfig::default();
+        config.tmux_native_scrollback = Some(true);
+        let mut runtime = TmuxRuntime::from_config(&config);
         runtime.tmux_binary = tmux_binary.display().to_string();
         let working_dir = temp_dir.join("repo");
         fs::create_dir_all(&working_dir).unwrap();

@@ -708,6 +708,18 @@
       "source": "specs/762_stage5_artifacts/cutover_scope.md:32"
     },
     {
+      "id": "cli.name_help",
+      "surface": "cli",
+      "classification": "retained",
+      "target": "python_and_rust",
+      "safety": "read_only",
+      "command": ["name", "--help"],
+      "expected_exit": [0],
+      "expected_output_contains_all": ["NAME_OR_SESSION", "NEW_NAME"],
+      "preconditions": ["sm_cli"],
+      "source": "src/cli/commands.py:478"
+    },
+    {
       "id": "cli.children_help",
       "surface": "cli",
       "classification": "retained",
