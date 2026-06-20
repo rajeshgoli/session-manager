@@ -11,6 +11,20 @@ TERMINAL_ASSET = (
     / "sm_terminal"
     / "terminal.html"
 )
+WATCH_SCREEN = (
+    Path(__file__).resolve().parents[2]
+    / "android-app"
+    / "app"
+    / "src"
+    / "main"
+    / "java"
+    / "li"
+    / "rajeshgo"
+    / "sm"
+    / "ui"
+    / "watch"
+    / "WatchScreen.kt"
+)
 
 
 def test_terminal_asset_waits_for_layout_before_reporting_ready():
@@ -52,8 +66,26 @@ def test_terminal_asset_forwards_alternate_screen_scroll_as_wheel_input():
     assert "term.modes.mouseTrackingMode !== \"none\"" in source
     assert "function terminalCellFromClient(clientX, clientY)" in source
     assert "function sendTerminalWheel(lines, clientX, clientY)" in source
+    assert "function wheelDeltaPixels(event)" in source
+    assert "event.deltaMode === WheelEvent.DOM_DELTA_LINE" in source
+    assert "event.deltaMode === WheelEvent.DOM_DELTA_PAGE" in source
+    assert "return event.deltaY * terminalCellHeight();" in source
+    assert "return event.deltaY * terminalViewport().clientHeight;" in source
     assert "const buttonCode = lines < 0 ? 64 : 65;" in source
     assert "const sequence = `\\x1b[<${buttonCode};${cell.col};${cell.row}M`;" in source
     assert "bridgeCall(\"input\", sequence)" in source
+    assert "event.stopPropagation()" in source
+    assert "scrollTerminalByPixels(wheelDeltaPixels(event), event.clientX, event.clientY)" in source
     assert "return scrollTerminalByLines(lines, clientX, clientY);" in source
     assert "return scrollTerminalByLines(parsed, Number(clientX), Number(clientY));" in source
+
+
+def test_terminal_webview_converts_compose_drag_coordinates_to_css_pixels():
+    source = WATCH_SCREEN.read_text()
+
+    assert "import androidx.compose.ui.platform.LocalDensity" in source
+    assert "val density = LocalDensity.current.density" in source
+    assert "val cssDelta = -dragAmount / density" in source
+    assert "val cssX = change.position.x / density" in source
+    assert "val cssY = change.position.y / density" in source
+    assert "\"window.smScrollPixels($cssDelta, $cssX, $cssY);\"" in source

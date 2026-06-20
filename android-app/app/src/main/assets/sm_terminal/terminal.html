@@ -268,14 +268,27 @@
       return scrollTerminalByLines(lines, clientX, clientY);
     }
 
+    function wheelDeltaPixels(event) {
+      if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+        return event.deltaY * terminalCellHeight();
+      }
+      if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+        return event.deltaY * terminalViewport().clientHeight;
+      }
+      return event.deltaY;
+    }
+
     function installScrollHandlers() {
       if (scrollHandlersInstalled || !opened) {
         return;
       }
       const target = terminalElement;
       const onWheel = (event) => {
-        if (scrollTerminalByPixels(event.deltaY, event.clientX, event.clientY)) {
+        if (scrollTerminalByPixels(wheelDeltaPixels(event), event.clientX, event.clientY)) {
           event.preventDefault();
+          if (terminalUsesAlternateBuffer() && terminalMouseTrackingEnabled()) {
+            event.stopPropagation();
+          }
         }
       };
       const onTouchStart = (event) => {
