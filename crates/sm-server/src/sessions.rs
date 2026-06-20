@@ -513,6 +513,7 @@ impl SessionStore {
                         } else {
                             None
                         },
+                        None,
                         Some(&message_id),
                     )?
                 };
@@ -740,11 +741,27 @@ impl SessionStore {
         session_id: &str,
         runtime: &TmuxRuntime,
     ) -> Result<()> {
+        self.drain_runtime_pending_messages_for_session_category(session_id, runtime, None)
+    }
+
+    pub fn drain_runtime_pending_messages_for_session_category(
+        &self,
+        session_id: &str,
+        runtime: &TmuxRuntime,
+        message_category: Option<&str>,
+    ) -> Result<()> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         if let Some(queue) = &self.queue_store {
             drain_pending_runtime_messages_raw(
-                self, &mut state, session_id, runtime, queue, None, None,
+                self,
+                &mut state,
+                session_id,
+                runtime,
+                queue,
+                None,
+                message_category,
+                None,
             )?;
             self.write_raw_json_value(&state)?;
         }
@@ -1667,6 +1684,7 @@ impl SessionStore {
                                 runtime,
                                 queue,
                                 Some("important"),
+                                None,
                                 Some(&message_id),
                             )?;
                             if drain
@@ -3866,17 +3884,21 @@ fn drain_pending_runtime_messages_raw(
     runtime: &TmuxRuntime,
     queue: &RetainedQueueStore,
     delivery_mode_filter: Option<&str>,
+    message_category_filter: Option<&str>,
     stop_after_message_id: Option<&str>,
 ) -> Result<QueueDrainResult> {
     let mut status =
         runtime_session_status_raw(state, session_id)?.unwrap_or_else(|| "stopped".to_owned());
     let mut delivered_message_ids = Vec::new();
     loop {
-        let messages = match delivery_mode_filter {
-            Some(delivery_mode) => {
+        let messages = match (delivery_mode_filter, message_category_filter) {
+            (_, Some(message_category)) => {
+                queue.pending_messages_for_target_by_category(session_id, message_category, 10)?
+            }
+            (Some(delivery_mode), None) => {
                 queue.pending_messages_for_target_by_mode(session_id, delivery_mode, 10)?
             }
-            None => queue.pending_messages_for_target(session_id, 10)?,
+            (None, None) => queue.pending_messages_for_target(session_id, 10)?,
         };
         if messages.is_empty() {
             break;
@@ -4004,6 +4026,7 @@ fn complete_runtime_message_delivery_raw(
                 runtime,
                 queue,
                 Some("sequential"),
+                None,
                 None,
             )?;
         }
@@ -4143,6 +4166,7 @@ fn enqueue_stop_notification_raw(
             runtime,
             queue,
             Some("important"),
+            None,
             None,
         )?;
     }
