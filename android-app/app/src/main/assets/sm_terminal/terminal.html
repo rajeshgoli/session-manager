@@ -193,7 +193,68 @@
       return byRows > 0 ? byRows : 16;
     }
 
-    function scrollTerminalByPixels(deltaPixels) {
+    function terminalCellWidth() {
+      const viewport = terminalViewport();
+      const byCols = term.cols > 0 ? viewport.clientWidth / term.cols : 0;
+      return byCols > 0 ? byCols : 8;
+    }
+
+    function terminalUsesAlternateBuffer() {
+      const buffers = term && term.buffer ? term.buffer : null;
+      const activeBuffer = buffers ? buffers.active : null;
+      return Boolean(activeBuffer && (
+        activeBuffer.type === "alternate"
+        || (buffers.alternate && activeBuffer === buffers.alternate)
+      ));
+    }
+
+    function terminalMouseTrackingEnabled() {
+      return Boolean(term && term.modes && term.modes.mouseTrackingMode !== "none");
+    }
+
+    function terminalCellFromClient(clientX, clientY) {
+      const rect = terminalElement.getBoundingClientRect();
+      const fallbackX = rect.left + (rect.width / 2);
+      const fallbackY = rect.top + (rect.height / 2);
+      const x = Number.isFinite(clientX) ? clientX : fallbackX;
+      const y = Number.isFinite(clientY) ? clientY : fallbackY;
+      const col = Math.floor((x - rect.left) / terminalCellWidth()) + 1;
+      const row = Math.floor((y - rect.top) / terminalCellHeight()) + 1;
+      return {
+        col: Math.max(1, Math.min(term.cols || 1, col)),
+        row: Math.max(1, Math.min(term.rows || 1, row))
+      };
+    }
+
+    function sendTerminalWheel(lines, clientX, clientY) {
+      if (!ready || !Number.isFinite(lines) || lines === 0) {
+        return false;
+      }
+      if (!terminalMouseTrackingEnabled()) {
+        return false;
+      }
+      const buttonCode = lines < 0 ? 64 : 65;
+      const count = Math.min(Math.abs(lines), 12);
+      const cell = terminalCellFromClient(clientX, clientY);
+      const sequence = `\x1b[<${buttonCode};${cell.col};${cell.row}M`;
+      for (let i = 0; i < count; i += 1) {
+        bridgeCall("input", sequence);
+      }
+      return true;
+    }
+
+    function scrollTerminalByLines(lines, clientX, clientY) {
+      if (!ready || !Number.isFinite(lines) || lines === 0) {
+        return false;
+      }
+      if (terminalUsesAlternateBuffer() && terminalMouseTrackingEnabled()) {
+        return sendTerminalWheel(lines, clientX, clientY);
+      }
+      term.scrollLines(lines);
+      return true;
+    }
+
+    function scrollTerminalByPixels(deltaPixels, clientX, clientY) {
       if (!ready || !Number.isFinite(deltaPixels)) {
         return false;
       }
@@ -204,8 +265,7 @@
       if (lines === 0) {
         return true;
       }
-      term.scrollLines(lines);
-      return true;
+      return scrollTerminalByLines(lines, clientX, clientY);
     }
 
     function installScrollHandlers() {
@@ -214,7 +274,7 @@
       }
       const target = terminalElement;
       const onWheel = (event) => {
-        if (scrollTerminalByPixels(event.deltaY)) {
+        if (scrollTerminalByPixels(event.deltaY, event.clientX, event.clientY)) {
           event.preventDefault();
         }
       };
@@ -234,7 +294,7 @@
         const currentY = event.touches[0].clientY;
         const deltaY = lastTouchY - currentY;
         lastTouchY = currentY;
-        if (scrollTerminalByPixels(deltaY)) {
+        if (scrollTerminalByPixels(deltaY, event.touches[0].clientX, currentY)) {
           event.preventDefault();
         }
       };
@@ -388,17 +448,17 @@
       ensureTerminalOpen();
     };
 
-    window.smScrollPixels = function(deltaPixels) {
-      return scrollTerminalByPixels(Number(deltaPixels) || 0);
+    window.smScrollPixels = function(deltaPixels, clientX, clientY) {
+      return scrollTerminalByPixels(
+        Number(deltaPixels) || 0,
+        Number(clientX),
+        Number(clientY)
+      );
     };
 
-    window.smScrollLines = function(lines) {
+    window.smScrollLines = function(lines, clientX, clientY) {
       const parsed = Number(lines) || 0;
-      if (!ready || parsed === 0) {
-        return false;
-      }
-      term.scrollLines(parsed);
-      return true;
+      return scrollTerminalByLines(parsed, Number(clientX), Number(clientY));
     };
 
     window.smCopySelection = function() {

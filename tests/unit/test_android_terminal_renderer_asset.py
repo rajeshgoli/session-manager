@@ -41,3 +41,19 @@ def test_terminal_asset_reports_write_acks_and_renderer_errors():
     assert "bridgeCall(\"written\", String(frame.sequence), byteCount)" in source
     assert "bridgeCall(\"error\", message)" in source
     assert "Terminal write failed" in source
+
+
+def test_terminal_asset_forwards_alternate_screen_scroll_as_wheel_input():
+    source = TERMINAL_ASSET.read_text()
+
+    assert "function terminalUsesAlternateBuffer()" in source
+    assert "activeBuffer.type === \"alternate\"" in source
+    assert "function terminalMouseTrackingEnabled()" in source
+    assert "term.modes.mouseTrackingMode !== \"none\"" in source
+    assert "function terminalCellFromClient(clientX, clientY)" in source
+    assert "function sendTerminalWheel(lines, clientX, clientY)" in source
+    assert "const buttonCode = lines < 0 ? 64 : 65;" in source
+    assert "const sequence = `\\x1b[<${buttonCode};${cell.col};${cell.row}M`;" in source
+    assert "bridgeCall(\"input\", sequence)" in source
+    assert "return scrollTerminalByLines(lines, clientX, clientY);" in source
+    assert "return scrollTerminalByLines(parsed, Number(clientX), Number(clientY));" in source
