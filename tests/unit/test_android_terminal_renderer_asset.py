@@ -89,7 +89,14 @@ def test_terminal_webview_converts_compose_drag_coordinates_to_css_pixels():
 
     assert "import androidx.compose.ui.platform.LocalDensity" in source
     assert "val density = LocalDensity.current.density" in source
+    assert "val claudeDirectPageScroll = terminal.provider == \"claude\"" in source
+    assert "onDragStart = { claudePageScrollRemainder = 0f }" in source
+    assert "onDragEnd = { claudePageScrollRemainder = 0f }" in source
+    assert "onDragCancel = { claudePageScrollRemainder = 0f }" in source
     assert "val cssDelta = -dragAmount / density" in source
+    assert "claudePageScrollRemainder += cssDelta" in source
+    assert "onPageScroll(true)" in source
+    assert "onPageScroll(false)" in source
     assert "val cssX = change.position.x / density" in source
     assert "val cssY = change.position.y / density" in source
     assert "\"window.smScrollPixels($cssDelta, $cssX, $cssY);\"" in source

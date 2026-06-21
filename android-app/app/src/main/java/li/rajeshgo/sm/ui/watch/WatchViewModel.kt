@@ -27,6 +27,7 @@ import li.rajeshgo.sm.data.security.DeviceKeyManager
 data class TerminalUiState(
     val sessionId: String,
     val title: String,
+    val provider: String? = null,
     val status: String = "connecting",
     val rendererCols: Int = 0,
     val rendererRows: Int = 0,
@@ -274,6 +275,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 terminal = TerminalUiState(
                     sessionId = session.id,
                     title = sessionDisplayName(session),
+                    provider = session.provider,
                     status = "requesting ticket",
                 )
             )
@@ -510,6 +512,10 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendTerminalKey(key: String) {
         terminalSocket?.send(JSONObject().put("type", "key").put("key", key).toString())
+    }
+
+    fun sendTerminalPageScroll(up: Boolean) {
+        sendTerminalData(if (up) "\u001b[5~" else "\u001b[6~")
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
