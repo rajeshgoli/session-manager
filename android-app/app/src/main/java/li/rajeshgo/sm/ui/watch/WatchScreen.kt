@@ -396,6 +396,7 @@ fun WatchScreen(
                 onEnter = { viewModel.sendTerminalKey("enter") },
                 onTerminalInput = viewModel::sendTerminalData,
                 onTerminalResize = viewModel::resizeTerminal,
+                onTerminalPageScroll = viewModel::sendTerminalPageScroll,
                 onRendererStatus = viewModel::markTerminalRendererStatus,
                 onRendererReady = viewModel::markTerminalRendererReady,
                 onRendererError = viewModel::markTerminalRendererError,
@@ -422,6 +423,7 @@ private fun MobileTerminalOverlay(
     onEnter: () -> Unit,
     onTerminalInput: (String) -> Unit,
     onTerminalResize: (cols: Int, rows: Int) -> Unit,
+    onTerminalPageScroll: (up: Boolean) -> Unit,
     onRendererStatus: (String) -> Unit,
     onRendererReady: (cols: Int, rows: Int) -> Unit,
     onRendererError: (String) -> Unit,
@@ -503,6 +505,7 @@ private fun MobileTerminalOverlay(
                     copyRequest = copyRequest,
                     onInput = onTerminalInput,
                     onResize = onTerminalResize,
+                    onPageScroll = onTerminalPageScroll,
                     onRendererStatus = onRendererStatus,
                     onRendererReady = onRendererReady,
                     onRendererError = onRendererError,
@@ -567,6 +570,7 @@ private fun TerminalWebView(
     copyRequest: Long,
     onInput: (String) -> Unit,
     onResize: (cols: Int, rows: Int) -> Unit,
+    onPageScroll: (up: Boolean) -> Unit,
     onRendererStatus: (String) -> Unit,
     onRendererReady: (cols: Int, rows: Int) -> Unit,
     onRendererError: (String) -> Unit,
@@ -577,7 +581,9 @@ private fun TerminalWebView(
     var deliveredCopyRequest by remember { mutableStateOf(0L) }
     var terminalReady by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var claudePageScrollRemainder by remember { mutableStateOf(0f) }
     val density = LocalDensity.current.density
+    val claudeDirectPageScroll = terminal.provider == "claude"
 
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
@@ -589,16 +595,32 @@ private fun TerminalWebView(
     AndroidView(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(density) {
-                detectVerticalDragGestures { change, dragAmount ->
-                    change.consume()
-                    val cssDelta = -dragAmount / density
-                    val cssX = change.position.x / density
-                    val cssY = change.position.y / density
-                    webViewRef?.evaluateJavascript(
-                        "window.smScrollPixels($cssDelta, $cssX, $cssY);",
-                        null,
-                    )
+            .pointerInput(density, claudeDirectPageScroll) {
+                detectVerticalDragGestures(
+                    onDragStart = { claudePageScrollRemainder = 0f },
+                    onDragEnd = { claudePageScrollRemainder = 0f },
+                    onDragCancel = { claudePageScrollRemainder = 0f },
+                ) { change, dragAmount ->
+                        change.consume()
+                        val cssDelta = -dragAmount / density
+                        if (claudeDirectPageScroll) {
+                            claudePageScrollRemainder += cssDelta
+                            val threshold = 72f
+                            if (claudePageScrollRemainder <= -threshold) {
+                                onPageScroll(true)
+                                claudePageScrollRemainder = 0f
+                            } else if (claudePageScrollRemainder >= threshold) {
+                                onPageScroll(false)
+                                claudePageScrollRemainder = 0f
+                            }
+                            return@detectVerticalDragGestures
+                        }
+                        val cssX = change.position.x / density
+                        val cssY = change.position.y / density
+                        webViewRef?.evaluateJavascript(
+                            "window.smScrollPixels($cssDelta, $cssX, $cssY);",
+                            null,
+                        )
                 }
             },
         factory = { context ->
