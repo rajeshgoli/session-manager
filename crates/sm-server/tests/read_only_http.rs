@@ -5088,7 +5088,7 @@ async fn tmux_client_hook_preserves_local_only_and_event_validation() {
 
     let (status, payload) = post_json_with_headers_and_peer(
         app.clone(),
-        "/hooks/tmux-client?event=client-session-changed&session=tmux-test",
+        "/hooks/tmux-client?event=client-session-changed&session=tmux-test&tty=%2Fdev%2Fttys008&client_pid=123",
         json!({}),
         &[("host", "127.0.0.1:8421")],
         Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
@@ -5096,7 +5096,38 @@ async fn tmux_client_hook_preserves_local_only_and_event_validation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["tmux_client_event_version"], 0);
+    assert_eq!(payload["tmux_client_event_version"], 1);
+
+    let (status, payload) = get_json(app.clone(), "/events/state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tmux_client_event_version"], 1);
+    assert_eq!(
+        payload["last_tmux_client_event"]["type"],
+        "tmux_client_event"
+    );
+    assert_eq!(
+        payload["last_tmux_client_event"]["event"],
+        "client-session-changed"
+    );
+    assert_eq!(
+        payload["last_tmux_client_event"]["tmux_session"],
+        "tmux-test"
+    );
+    assert_eq!(payload["last_tmux_client_event"]["tty"], "/dev/ttys008");
+    assert_eq!(payload["last_tmux_client_event"]["client_pid"], "123");
+    assert_eq!(payload["last_tmux_client_event"]["version"], 1);
+    assert!(payload["last_tmux_client_event"]["received_at"].is_string());
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/tmux-client?event=client-detached&session=tmux-test",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tmux_client_event_version"], 2);
 
     let (status, payload) = post_json_with_headers_and_peer(
         app,
@@ -7177,6 +7208,7 @@ async fn events_stream_emits_hello_frame_with_sse_headers() {
     let app = router(AppState::new(AppConfig::default()));
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/events")
@@ -7218,6 +7250,111 @@ async fn events_stream_emits_hello_frame_with_sse_headers() {
             .await
             .is_err(),
         "SSE stream closed before the keepalive interval"
+    );
+}
+
+#[tokio::test]
+async fn events_stream_broadcasts_tmux_client_hook_events() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body_stream = response.into_body().into_data_stream();
+    let first_chunk = body_stream.next().await.unwrap().unwrap();
+    assert_eq!(
+        String::from_utf8(first_chunk.to_vec()).unwrap(),
+        "event: hello\ndata: {\"tmux_client_event_version\":0,\"last_tmux_client_event\":null}\n\n"
+    );
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/hooks/tmux-client?event=client-attached&session=tmux-live&tty=%2Fdev%2Fttys008&client_pid=456",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tmux_client_event_version"], 1);
+
+    let event_chunk = tokio::time::timeout(Duration::from_secs(1), body_stream.next())
+        .await
+        .expect("timed out waiting for tmux client event")
+        .unwrap()
+        .unwrap();
+    let event_text = String::from_utf8(event_chunk.to_vec()).unwrap();
+    assert!(
+        event_text.starts_with("event: tmux_client_event\n"),
+        "{event_text}"
+    );
+    assert!(
+        event_text.contains("\"event\":\"client-attached\""),
+        "{event_text}"
+    );
+    assert!(
+        event_text.contains("\"tmux_session\":\"tmux-live\""),
+        "{event_text}"
+    );
+    assert!(
+        event_text.contains("\"tty\":\"/dev/ttys008\""),
+        "{event_text}"
+    );
+    assert!(
+        event_text.contains("\"client_pid\":\"456\""),
+        "{event_text}"
+    );
+    assert!(event_text.contains("\"version\":1"), "{event_text}");
+}
+
+#[tokio::test]
+async fn events_stream_hello_includes_latest_tmux_client_event_state() {
+    let app = router(AppState::new(AppConfig::default()));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/hooks/tmux-client?event=client-attached&session=tmux-before-stream",
+        json!({}),
+        &[("host", "127.0.0.1:8421")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tmux_client_event_version"], 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body_stream = response.into_body().into_data_stream();
+    let first_chunk = body_stream.next().await.unwrap().unwrap();
+    let hello_text = String::from_utf8(first_chunk.to_vec()).unwrap();
+    assert!(hello_text.starts_with("event: hello\n"), "{hello_text}");
+    assert!(
+        hello_text.contains("\"tmux_client_event_version\":1"),
+        "{hello_text}"
+    );
+    assert!(
+        hello_text.contains("\"event\":\"client-attached\""),
+        "{hello_text}"
+    );
+    assert!(
+        hello_text.contains("\"tmux_session\":\"tmux-before-stream\""),
+        "{hello_text}"
     );
 }
 
