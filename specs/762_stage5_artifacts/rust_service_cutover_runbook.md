@@ -11,7 +11,8 @@ freeze/drain ledger, Rust launchd ownership, and rollback commands explicit.
 
 - Rust owns the service port (`127.0.0.1:8420`) through launchd label
   `com.rajeshgoli.session-manager-rust`.
-- Python launchd labels are stopped only by label, not by arbitrary port kill.
+- Python launchd labels are disabled/stopped only by label, not by arbitrary
+  port kill.
 - Rust refuses to start when the target port is already occupied.
 - Final backup is copied only after Python is stopped and the health probe is
   connection-refused for the configured hold window.
@@ -63,7 +64,7 @@ stopped-origin final backup.
 
 ## Stop Python And Create Final Backup
 
-Stop only known Python Session Manager launchd labels:
+Disable and stop only known Python Session Manager launchd labels:
 
 ```bash
 ./scripts/rust-service-cutover.sh stop-python
@@ -82,7 +83,9 @@ Create the final stopped-origin backup and ledger:
 ```
 
 Do not start Rust if this command blocks. Fix the blocker or restart Python
-with `./scripts/rust-service-cutover.sh rollback-python`.
+with `./scripts/rust-service-cutover.sh rollback-python`. The stop command
+persists the Python label disablement so a reboot does not bring Python up
+beside Rust.
 
 ## Start Rust
 
@@ -98,6 +101,9 @@ The helper writes:
 - plist: `~/Library/LaunchAgents/com.rajeshgoli.session-manager-rust.plist`
 - stdout: `logs/rust-launchd.out.log`
 - stderr: `logs/rust-launchd.err.log`
+
+`start-rust` refuses to proceed while any known Python Session Manager launchd
+label is still loaded, even if Rust could bind the configured host/port.
 
 ## Protected Public Tunnel
 

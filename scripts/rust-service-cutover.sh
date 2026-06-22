@@ -51,8 +51,8 @@ Commands:
   plan             Show Rust service command, launchd paths, port owners, and blockers.
   render-plist     Print the Rust launchd plist to stdout.
   write-plist      Write the Rust launchd plist, but do not load it.
-  stop-python      Unload known Python Session Manager launchd labels, then verify the port is free.
-  start-rust       Write/load the Rust launchd plist. Refuses if the port is occupied.
+  stop-python      Disable/unload known Python Session Manager launchd labels, then verify the port is free.
+  start-rust       Write/load the Rust launchd plist. Refuses if the port is occupied or Python is loaded.
   stop-rust        Unload the Rust launchd label.
   restart-rust     stop-rust then start-rust.
   rollback-python  Stop Rust and bootstrap the existing Python launchd plist if present.
@@ -192,6 +192,46 @@ collect_blockers() {
   printf '%s\n' "${blockers[@]}"
 }
 
+loaded_python_labels() {
+  for label in "${PYTHON_LABELS[@]}"; do
+    if launchctl_print_label "$label"; then
+      printf '%s\n' "$label"
+    fi
+  done
+}
+
+is_label_disabled() {
+  local label="$1"
+  launchctl print-disabled "$DOMAIN" 2>/dev/null \
+    | grep -F "\"$label\" => disabled" >/dev/null
+}
+
+disable_python_label() {
+  local label="$1"
+  if ! launchctl disable "$DOMAIN/$label"; then
+    echo "failed to disable $label in $DOMAIN" >&2
+    exit 1
+  fi
+  if ! is_label_disabled "$label"; then
+    echo "failed to verify disabled override for $label in $DOMAIN" >&2
+    exit 1
+  fi
+}
+
+require_no_python_labels() {
+  local labels
+  labels="$(loaded_python_labels)"
+  if [[ -n "$labels" ]]; then
+    echo "known Python Session Manager launchd labels are still loaded:" >&2
+    while IFS= read -r label; do
+      [[ -z "$label" ]] && continue
+      echo "  - $label" >&2
+    done <<< "$labels"
+    echo "run: $0 stop-python" >&2
+    exit 1
+  fi
+}
+
 print_plan() {
   echo "Rust Session Manager service cutover plan"
   echo "repo_root: $REPO_ROOT"
@@ -299,6 +339,7 @@ stop_rust() {
 
 start_rust() {
   require_no_blockers
+  require_no_python_labels
   write_plist
   if launchctl_print_label "$RUST_LABEL"; then
     launchctl bootout "$DOMAIN/$RUST_LABEL" || true
@@ -310,9 +351,12 @@ start_rust() {
 
 stop_python() {
   for label in "${PYTHON_LABELS[@]}"; do
+    disable_python_label "$label"
     if launchctl_print_label "$label"; then
       launchctl bootout "$DOMAIN/$label" || true
-      echo "stopped $label"
+      echo "disabled and stopped $label"
+    else
+      echo "disabled $label"
     fi
   done
   sleep 1
@@ -341,9 +385,10 @@ rollback_python() {
     echo "no Python Session Manager plist found in ~/Library/LaunchAgents" >&2
     exit 1
   fi
-  launchctl bootstrap "$DOMAIN" "$python_plist" 2>/dev/null || true
   local label
   label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$python_plist")"
+  launchctl enable "$DOMAIN/$label" 2>/dev/null || true
+  launchctl bootstrap "$DOMAIN" "$python_plist" 2>/dev/null || true
   launchctl kickstart -k "$DOMAIN/$label" || true
   echo "bootstrapped Python service from $python_plist"
 }
