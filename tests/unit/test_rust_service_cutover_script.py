@@ -87,3 +87,14 @@ def test_rust_service_cutover_render_plist_uses_rust_binary_and_config(tmp_path)
         str(config),
     ]
     assert plist["WorkingDirectory"] == str(REPO_ROOT)
+
+
+def test_rust_service_cutover_persistently_disables_python_and_reenables_on_rollback():
+    script = SCRIPT.read_text(encoding="utf-8")
+
+    assert 'launchctl disable "$DOMAIN/$label"; then' in script
+    assert 'is_label_disabled "$label"' in script
+    assert 'failed to verify disabled override for $label' in script
+    assert 'echo "disabled and stopped $label"' in script
+    assert 'require_no_python_labels' in script
+    assert 'launchctl enable "$DOMAIN/$label"' in script
