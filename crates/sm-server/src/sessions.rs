@@ -936,14 +936,8 @@ impl SessionStore {
                 record.provider,
             )));
         }
-        if record.provider == "codex-fork"
-            && record
-                .provider_resume_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-        {
+        let provider_resume_id = provider_resume_id_for_restore(&record);
+        if provider_resume_id.is_none() {
             return Ok(Some(CoreRestoreOutcome::MissingProviderResumeId(
                 record.provider,
             )));
@@ -971,11 +965,7 @@ impl SessionStore {
             model: record.model.clone(),
         };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
-        session_runtime.restore_session(
-            &spec,
-            &record.provider,
-            record.provider_resume_id.as_deref(),
-        )?;
+        session_runtime.restore_session(&spec, &record.provider, provider_resume_id.as_deref())?;
 
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("running".to_owned()));
@@ -990,6 +980,20 @@ impl SessionStore {
                 "tmux_socket_name".to_owned(),
                 Value::String(socket_name.to_owned()),
             );
+        }
+        if record
+            .provider_resume_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            != provider_resume_id.as_deref()
+        {
+            if let Some(provider_resume_id) = provider_resume_id {
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id),
+                );
+            }
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
@@ -4673,6 +4677,24 @@ fn provider_resume_id_from_transcript_path(transcript_path: &str) -> Option<Stri
         .map(ToOwned::to_owned)
 }
 
+fn provider_resume_id_for_restore(record: &SessionRecord) -> Option<String> {
+    if record.provider == "claude" {
+        if let Some(resume_id) = record
+            .transcript_path
+            .as_deref()
+            .and_then(provider_resume_id_from_transcript_path)
+        {
+            return Some(resume_id);
+        }
+    }
+    record
+        .provider_resume_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn append_log_line(path: &Path, line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -6078,6 +6100,43 @@ mod tests {
 
         assert!(stale.aliases.is_empty());
         assert_eq!(restorable.aliases, vec!["restorable-role"]);
+    }
+
+    #[test]
+    fn claude_restore_resume_id_falls_back_to_transcript_stem() {
+        let mut session = session_record("stopped");
+        session.provider = "claude".to_owned();
+        session.provider_resume_id = None;
+        session.transcript_path =
+            Some("/Users/rajesh/.claude/projects/repo/resume-uuid.jsonl".to_owned());
+
+        assert_eq!(
+            provider_resume_id_for_restore(&session).as_deref(),
+            Some("resume-uuid")
+        );
+    }
+
+    #[test]
+    fn claude_transcript_path_wins_over_stale_provider_resume_id() {
+        let mut session = session_record("stopped");
+        session.provider = "claude".to_owned();
+        session.provider_resume_id = Some("stale-id".to_owned());
+        session.transcript_path = Some("/tmp/transcript-id.jsonl".to_owned());
+
+        assert_eq!(
+            provider_resume_id_for_restore(&session).as_deref(),
+            Some("transcript-id")
+        );
+    }
+
+    #[test]
+    fn claude_restore_resume_id_is_missing_without_resume_metadata() {
+        let mut session = session_record("stopped");
+        session.provider = "claude".to_owned();
+        session.provider_resume_id = None;
+        session.transcript_path = None;
+
+        assert_eq!(provider_resume_id_for_restore(&session), None);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

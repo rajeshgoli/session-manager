@@ -263,11 +263,8 @@ impl TmuxRuntime {
         if let Some(resume_id) = resume_id.map(str::trim).filter(|value| !value.is_empty()) {
             match provider {
                 "claude" => {
-                    runtime.claude_command = format!(
-                        "{} --resume {}",
-                        runtime.claude_command,
-                        shell_quote(resume_id)
-                    );
+                    runtime.claude_args.push("--resume".to_owned());
+                    runtime.claude_args.push(resume_id.to_owned());
                 }
                 "codex-fork" => {
                     runtime.codex_fork_args =
@@ -1173,6 +1170,49 @@ mod tests {
         assert!(!log.contains("set-option -g focus-events on"));
         assert!(!log.contains("terminal-overrides ,*:smcup@:rmcup@"));
         assert!(!log.contains("-L session-manager"));
+    }
+
+    #[test]
+    fn restore_claude_session_preserves_configured_args_before_resume() {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary_with_has_session(false);
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        runtime.claude_command = "claude".to_owned();
+        runtime.claude_args = vec![
+            "--dangerously-skip-permissions".to_owned(),
+            "--some flag".to_owned(),
+        ];
+        let working_dir = temp_dir.join("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let spec = TmuxSessionSpec {
+            session_id: "abc12345".to_owned(),
+            tmux_session: "sm-test".to_owned(),
+            working_dir: working_dir.display().to_string(),
+            log_file: temp_dir.join("session.log"),
+            provider: "claude".to_owned(),
+            initial_message: None,
+            model: None,
+        };
+
+        runtime
+            .restore_session(&spec, "claude", Some("resume'id"))
+            .unwrap();
+
+        let log = fs::read_to_string(log_path).unwrap();
+        let command_line = log
+            .lines()
+            .find(|line| line.contains("claude") && line.contains("SESSION_MANAGER_ID"))
+            .unwrap_or_else(|| panic!("missing claude restore launch in log: {log}"));
+        let dangerous = command_line
+            .find("'--dangerously-skip-permissions'")
+            .expect(command_line);
+        let custom_arg = command_line.find("'--some flag'").expect(command_line);
+        let resume_flag = command_line.find("'--resume'").expect(command_line);
+        let resume_id = command_line.find("'resume'\\''id'").expect(command_line);
+
+        assert!(dangerous < custom_arg);
+        assert!(custom_arg < resume_flag);
+        assert!(resume_flag < resume_id);
     }
 
     #[test]
