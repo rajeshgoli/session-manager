@@ -67,7 +67,7 @@ use time::{
     format_description::well_known::Rfc3339, macros::format_description, Duration as TimeDuration,
     OffsetDateTime, PrimitiveDateTime,
 };
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tokio::time::{sleep, timeout};
 
 use crate::app_artifacts::{
@@ -340,6 +340,8 @@ pub struct AppState {
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
+    tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
+    tmux_client_event_tx: broadcast::Sender<Value>,
     mobile_terminal_tickets: Arc<Mutex<BTreeMap<String, MobileTerminalTicket>>>,
     mobile_terminal_active_attaches: Arc<Mutex<BTreeMap<String, MobileTerminalActiveAttach>>>,
     mobile_terminal_proof_nonces: Arc<Mutex<BTreeMap<String, i64>>>,
@@ -358,12 +360,15 @@ impl AppState {
         let session_store = SessionStore::new_with_queue(state_file, queue_db_path);
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
+        let (tmux_client_event_tx, _) = broadcast::channel(128);
         Self {
             config,
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
             codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
+            tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),
+            tmux_client_event_tx,
             mobile_terminal_tickets: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_active_attaches: Arc::new(Mutex::new(BTreeMap::new())),
             mobile_terminal_proof_nonces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1177,9 +1182,39 @@ async fn tmux_client_hook(
     } else {
         None
     };
+    let tmux_session = query
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            query
+                .client_session
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    let event_payload = state.record_tmux_client_event(
+        event_name,
+        tmux_session,
+        query
+            .tty
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        query
+            .client_pid
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        revived_session_id.as_deref(),
+    );
     let mut response = json!({
         "status": "ok",
-        "tmux_client_event_version": 0,
+        "tmux_client_event_version": event_payload
+            .get("version")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
     });
     if let Some(session_id) = revived_session_id {
         response["revived_session_id"] = Value::String(session_id);
@@ -2425,7 +2460,7 @@ async fn events_state(
     request: Request,
 ) -> Result<Json<EventStateResponse>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    Ok(Json(event_state_payload()))
+    Ok(Json(state.event_state_payload()))
 }
 
 async fn events_stream(
@@ -2433,12 +2468,33 @@ async fn events_stream(
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    let data = serde_json::to_string(&event_state_payload())?;
+    let receiver = state.tmux_client_event_tx.subscribe();
+    let data = serde_json::to_string(&state.event_state_payload())?;
+    let updates = stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(payload) => {
+                    let event_type = payload
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("message")
+                        .to_owned();
+                    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                    return Some((
+                        Ok::<Event, Infallible>(Event::default().event(event_type).data(data)),
+                        receiver,
+                    ));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
     let stream =
         stream::once(
             async move { Ok::<Event, Infallible>(Event::default().event("hello").data(data)) },
         )
-        .chain(stream::pending());
+        .chain(updates);
     Ok((
         [("x-accel-buffering", "no")],
         Sse::new(stream).keep_alive(
@@ -10721,6 +10777,10 @@ struct TmuxClientHookQuery {
     session: Option<String>,
     #[serde(default, rename = "client_session")]
     client_session: Option<String>,
+    #[serde(default)]
+    tty: Option<String>,
+    #[serde(default)]
+    client_pid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -11069,10 +11129,53 @@ struct EventStateResponse {
     last_tmux_client_event: Option<Value>,
 }
 
-fn event_state_payload() -> EventStateResponse {
-    EventStateResponse {
-        tmux_client_event_version: 0,
-        last_tmux_client_event: None,
+#[derive(Default)]
+struct TmuxClientEventState {
+    version: i64,
+    last_event: Option<Value>,
+}
+
+impl AppState {
+    fn record_tmux_client_event(
+        &self,
+        event_name: &str,
+        tmux_session: Option<&str>,
+        tty: Option<&str>,
+        client_pid: Option<&str>,
+        revived_session_id: Option<&str>,
+    ) -> Value {
+        let mut state = self
+            .tmux_client_event_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.version += 1;
+        let mut payload = json!({
+            "type": "tmux_client_event",
+            "event": event_name,
+            "tmux_session": tmux_session,
+            "tty": tty,
+            "client_pid": client_pid,
+            "version": state.version,
+            "received_at": now_rfc3339(),
+        });
+        if let Some(session_id) = revived_session_id {
+            payload["revived_session_id"] = Value::String(session_id.to_owned());
+        }
+        state.last_event = Some(payload.clone());
+        drop(state);
+        let _ = self.tmux_client_event_tx.send(payload.clone());
+        payload
+    }
+
+    fn event_state_payload(&self) -> EventStateResponse {
+        let state = self
+            .tmux_client_event_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        EventStateResponse {
+            tmux_client_event_version: state.version,
+            last_tmux_client_event: state.last_event.clone(),
+        }
     }
 }
 
