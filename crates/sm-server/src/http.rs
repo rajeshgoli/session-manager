@@ -7861,6 +7861,9 @@ fn codex_fork_pane_title_indicates_working(pane_title: &str) -> bool {
     if chars.next().is_some() {
         return false;
     }
+    if first == '_' {
+        return true;
+    }
     (0x2801..=0x28ff).contains(&(first as u32))
 }
 
@@ -11187,6 +11190,7 @@ mod tests {
         assert!(codex_fork_pane_title_indicates_working(
             "⠏\tfractal-algo-rust"
         ));
+        assert!(codex_fork_pane_title_indicates_working("_ session-manager"));
         assert!(!codex_fork_pane_title_indicates_working(
             "fractal-algo-rust"
         ));
