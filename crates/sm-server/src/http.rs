@@ -7654,6 +7654,7 @@ fn claude_line_indicates_working(line: &str) -> bool {
         || line.contains("Running…")
         || line.contains("Reviewing…")
         || line.contains("Herding…")
+        || line.contains("still thinking with")
 }
 
 fn claude_spinner_status_line_indicates_working(line: &str) -> bool {
@@ -11320,6 +11321,24 @@ mod tests {
 ⏺ Reading 1 file…
 ✽ Incubating… (3m 3s · ↓ 9.9k tokens · thinking with xhigh effort)
   ⎿  ◻ Fix P2: prune/finalization bars fold causally
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_still_thinking_status() {
+        let pane = r#"
+⏺ Running 1 shell command…
+  ⎿  $ cd /Users/rajesh/projects/fractal-algo-rust
+
+· Get detector geometry for 4 target legs… (4m 2s · ↓ 15.3k tokens · still thinking with high effort)
+  ⎿  ◼ Get detector geometry for 4 target legs
+     ◻ Sweep resident playback for operative-over-time
+     ◻ Resolve status+cause for each of the 4 legs
+     ◻ Write the leg-behavior spec doc
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── leg-behavior-spec ──
+❯
 "#;
         assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
     }
