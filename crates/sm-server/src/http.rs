@@ -7654,7 +7654,7 @@ fn claude_line_indicates_working(line: &str) -> bool {
         || line.contains("Running…")
         || line.contains("Reviewing…")
         || line.contains("Herding…")
-        || line.contains("still thinking with")
+        || line.contains("thinking with")
 }
 
 fn claude_spinner_status_line_indicates_working(line: &str) -> bool {
@@ -11339,6 +11339,22 @@ mod tests {
 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── leg-behavior-spec ──
 ❯
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_thinking_status_with_task_punctuation() {
+        let pane = r#"
+  4 tasks (3 done, 1 in progress, 0 open)
+  ✔ Verify claims 1-4 (guard removal + index leak) against code
+  ✔ Item-5 broader audit: other close-without-cleanup leaks
+  ✔ Update fib_journey_spec.md (§2.7 dual-role + index lifecycle)
+  ◼ Converge spec changes with reviewer 72a27cdb; advise 176448dc
+
+✽ Converge spec changes with reviewer 72a27cdb; advise 176448dc… (2m 10s · ↓ 8.5k tokens · thinking with high effort)
+  ⎿  ✔ Verify claims 1-4 (guard removal + index leak) against code
+     ◼ Converge spec changes with reviewer 72a27cdb; advise 176448dc
 "#;
         assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
     }
