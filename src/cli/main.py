@@ -762,6 +762,11 @@ def main():
         default=None,
         help="In --restore mode, browse a specific node's local restore history",
     )
+    watch_parser.add_argument(
+        "--all-nodes",
+        action="store_true",
+        help="In --restore mode, browse stopped sessions from all nodes",
+    )
 
     # sm tail <session> [-n N] [--raw] [--db-path PATH]
     tail_parser = subparsers.add_parser(
@@ -1316,6 +1321,7 @@ def main():
             top_level=args.top_level,
             restore_sort=args.sort,
             restore_node=args.node,
+            restore_all_nodes=args.all_nodes,
         ))
     elif args.command == "tail":
         sys.exit(commands.cmd_tail(

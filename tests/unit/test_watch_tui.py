@@ -23,7 +23,12 @@ from src.cli.watch_tui import (
     build_restore_rows,
     build_watch_rows,
     can_attach_session,
+    filter_restore_sessions_for_node,
     filter_sessions,
+    restore_navigation_keys,
+    restore_node_scope,
+    restore_selection_from_key,
+    restore_selection_key,
 )
 
 
@@ -974,6 +979,51 @@ def test_build_restore_rows_collapsed_repo_hides_sessions_but_keeps_header():
     assert any(row.text.startswith("[+] repo-a/") and "1 hidden" in row.text for row in repo_rows)
     assert any(row.session_id == "b1" for row in rows)
     assert all(row.session_id != "a1" for row in rows)
+
+
+def test_restore_navigation_includes_collapsed_repo_rows():
+    repo_a = str(Path("/tmp/repo-a").resolve())
+    sessions = [
+        _session("a1", "agent-a", "/tmp/repo-a", status="stopped"),
+        _session("b1", "agent-b", "/tmp/repo-b", status="stopped"),
+    ]
+
+    rows, selectable, _ = build_restore_rows(
+        sessions,
+        collapsed_repo_keys={repo_a},
+        sort_mode="name",
+    )
+
+    assert selectable == ["b1"]
+    assert restore_navigation_keys(rows) == [f"repo:{repo_a}", "session:b1"]
+    assert restore_selection_key(None, repo_a) == f"repo:{repo_a}"
+    assert restore_selection_from_key(f"repo:{repo_a}") == (None, repo_a)
+    assert restore_selection_from_key("session:b1") == ("b1", None)
+
+
+def test_restore_node_scope_defaults_to_local_node_unless_all_nodes():
+    class _Client:
+        local_node = "studio"
+        default_node = "macbook"
+
+    client = _Client()
+
+    assert restore_node_scope(client, None, False) == "studio"
+    assert restore_node_scope(client, "macbook", False) == "macbook"
+    assert restore_node_scope(client, None, True) is None
+
+
+def test_filter_restore_sessions_for_node_treats_missing_node_as_primary():
+    sessions = [
+        _session("primary1", "primary", "/tmp/repo", status="stopped"),
+        _session("remote1", "remote", "/tmp/repo", status="stopped"),
+    ]
+    sessions[1]["node"] = "macbook"
+
+    assert [s["id"] for s in filter_restore_sessions_for_node(sessions, "primary")] == ["primary1"]
+    assert [s["id"] for s in filter_restore_sessions_for_node(sessions, "macbook")] == ["remote1"]
+    assert [s["id"] for s in filter_restore_sessions_for_node(sessions, None)] == ["primary1", "remote1"]
+
 
 def test_can_attach_session_supports_tmux_backed_codex_only():
     assert can_attach_session(_session("c1", "codex", "/tmp", provider="codex"))

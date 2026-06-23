@@ -932,6 +932,63 @@ def build_restore_rows(
 
     return rows, selectable, len(groups)
 
+
+def restore_navigation_keys(rows: list[WatchRow]) -> list[str]:
+    """Return keyboard navigation keys for restore-mode rows."""
+    keys: list[str] = []
+    for row in rows:
+        if row.kind == "session" and row.session_id:
+            keys.append(f"session:{row.session_id}")
+        elif row.kind == "repo" and row.repo_key and row.text.startswith("[+]"):
+            keys.append(f"repo:{row.repo_key}")
+    return keys
+
+
+def restore_selection_key(
+    selected_session_id: Optional[str],
+    selected_repo_key: Optional[str],
+) -> Optional[str]:
+    """Return the restore navigation key for the current selection."""
+    if selected_session_id:
+        return f"session:{selected_session_id}"
+    if selected_repo_key:
+        return f"repo:{selected_repo_key}"
+    return None
+
+
+def restore_selection_from_key(key: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Split a restore navigation key into session/repo selection state."""
+    if not key:
+        return None, None
+    kind, _, value = key.partition(":")
+    if not value:
+        return None, None
+    if kind == "session":
+        return value, None
+    if kind == "repo":
+        return None, value
+    return None, None
+
+
+def restore_node_scope(client, restore_node: Optional[str], restore_all_nodes: bool) -> Optional[str]:
+    """Return the node whose restore history should be shown, or None for all nodes."""
+    if restore_all_nodes:
+        return None
+    if restore_node:
+        return restore_node
+    return getattr(client, "local_node", None) or getattr(client, "default_node", None) or "primary"
+
+
+def filter_restore_sessions_for_node(sessions: list[dict], node: Optional[str]) -> list[dict]:
+    """Filter restore candidates to one node unless all-node browsing is requested."""
+    if not node:
+        return sessions
+    return [
+        session
+        for session in sessions
+        if (session.get("node") or "primary") == node
+    ]
+
 def _truncate(text: str, width: int, align: str = "left") -> str:
     if width <= 0:
         return ""
@@ -1332,6 +1389,7 @@ def _render(
     stdscr,
     rows: list[WatchRow],
     selected_session_id: Optional[str],
+    selected_repo_key: Optional[str],
     scroll_offset: int,
     total_sessions: int,
     repo_count: int,
@@ -1376,7 +1434,12 @@ def _render(
                 attr = base_attr | curses.A_REVERSE | curses.A_BOLD
             stdscr.addnstr(y, 0, f"{marker} {_session_line(row, widths, column_specs)}", _render_columns(width, 0), attr)
         elif row.kind == "repo":
-            stdscr.addnstr(y, 2, row.text, _render_columns(width, 2), curses.A_BOLD | palette["repo"])
+            is_selected = restore_mode and row.repo_key == selected_repo_key
+            marker = ">" if is_selected else " "
+            attr = curses.A_BOLD | palette["repo"]
+            if is_selected:
+                attr |= curses.A_REVERSE
+            stdscr.addnstr(y, 0, f"{marker} {row.text}", _render_columns(width, 0), attr)
         elif row.kind == "repo_ref":
             stdscr.addnstr(y, 4, row.text, _render_columns(width, 4), curses.A_BOLD)
         elif row.kind == "status":
@@ -1396,7 +1459,7 @@ def _render(
         )
 
     if restore_mode:
-        footer = f"j/k: move  Enter: restore+attach  o: sort={restore_sort}  R: hide repo  U: show repos  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
+        footer = f"j/k: move  Enter: restore/expand  o: sort={restore_sort}  R: hide repo  U: show repos  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
     else:
         footer = "j/k: move  +: create  F: fork  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
@@ -1412,6 +1475,7 @@ def run_watch_tui(
     top_level: bool = False,
     restore_sort: str = "retired",
     restore_node: Optional[str] = None,
+    restore_all_nodes: bool = False,
 ) -> int:
     """Run the sm watch curses UI."""
 
@@ -1430,6 +1494,7 @@ def run_watch_tui(
 
         try:
             selected_session_id: Optional[str] = None
+            selected_repo_key: Optional[str] = None
             text_filter: Optional[str] = None
             flash_message: Optional[str] = None
             flash_until = 0.0
@@ -1442,11 +1507,11 @@ def run_watch_tui(
             collapsed_repo_keys: set[str] = set()
             restore_tree_collapsed = top_level
             restore_sort_mode = restore_sort
-            effective_restore_node = restore_node
-            if restore_mode and not effective_restore_node:
-                default_node = getattr(client, "default_node", None)
-                if default_node and default_node != "primary":
-                    effective_restore_node = default_node
+            effective_restore_node = (
+                restore_node_scope(client, restore_node, restore_all_nodes)
+                if restore_mode
+                else restore_node
+            )
             repo_count = 0
             total_sessions = 0
             spinner_index = 0
@@ -1457,10 +1522,15 @@ def run_watch_tui(
             while True:
                 now = time.monotonic()
                 if now >= next_refresh:
-                    if restore_mode and effective_restore_node:
+                    if restore_mode and effective_restore_node and effective_restore_node != "primary":
                         listed = client.list_node_restore_sessions(effective_restore_node)
                     else:
                         listed = client.list_sessions(include_stopped=restore_mode)
+                        if restore_mode:
+                            listed = filter_restore_sessions_for_node(
+                                listed or [],
+                                effective_restore_node,
+                            )
                     if listed is None:
                         flash_message = "Session manager unavailable"
                         flash_until = now + 2.5
@@ -1484,6 +1554,11 @@ def run_watch_tui(
                                 top_level_only=restore_tree_collapsed,
                                 sort_mode=restore_sort_mode,
                             )
+                            restore_keys = restore_navigation_keys(rows)
+                            selected_key = restore_selection_key(selected_session_id, selected_repo_key)
+                            if selected_key not in restore_keys:
+                                selected_key = restore_keys[0] if restore_keys else None
+                            selected_session_id, selected_repo_key = restore_selection_from_key(selected_key)
                         else:
                             latest_sessions = filtered
                             latest_by_id = {s.get("id", ""): s for s in latest_sessions if s.get("id")}
@@ -1507,7 +1582,7 @@ def run_watch_tui(
                                 session = latest_by_id.get(sid)
                                 if session and detail_worker:
                                     detail_worker.request(session)
-                        if selected_session_id not in selectable:
+                        if not restore_mode and selected_session_id not in selectable:
                             selected_session_id = selectable[0] if selectable else None
 
                     next_refresh = now + max(0.2, interval)
@@ -1524,6 +1599,11 @@ def run_watch_tui(
                         if row.kind == "session" and row.session_id == selected_session_id:
                             selected_row_idx = idx
                             break
+                elif selected_repo_key:
+                    for idx, row in enumerate(rows):
+                        if row.kind == "repo" and row.repo_key == selected_repo_key:
+                            selected_row_idx = idx
+                            break
                 if selected_row_idx is not None and max_rows > 0:
                     if selected_row_idx < scroll_offset:
                         scroll_offset = selected_row_idx
@@ -1538,6 +1618,7 @@ def run_watch_tui(
                     stdscr,
                     rows=rows,
                     selected_session_id=selected_session_id,
+                    selected_repo_key=selected_repo_key,
                     scroll_offset=scroll_offset,
                     total_sessions=total_sessions,
                     repo_count=repo_count,
@@ -1561,13 +1642,29 @@ def run_watch_tui(
                     retire_confirmation = None
 
                 if key in (ord("j"), curses.KEY_DOWN):
-                    if selectable:
+                    if restore_mode:
+                        restore_keys = restore_navigation_keys(rows)
+                        selected_key = restore_selection_key(selected_session_id, selected_repo_key)
+                        if restore_keys:
+                            current_idx = restore_keys.index(selected_key) if selected_key in restore_keys else 0
+                            selected_session_id, selected_repo_key = restore_selection_from_key(
+                                restore_keys[min(current_idx + 1, len(restore_keys) - 1)]
+                            )
+                    elif selectable:
                         current_idx = selectable.index(selected_session_id) if selected_session_id in selectable else 0
                         selected_session_id = selectable[min(current_idx + 1, len(selectable) - 1)]
                     continue
 
                 if key in (ord("k"), curses.KEY_UP):
-                    if selectable:
+                    if restore_mode:
+                        restore_keys = restore_navigation_keys(rows)
+                        selected_key = restore_selection_key(selected_session_id, selected_repo_key)
+                        if restore_keys:
+                            current_idx = restore_keys.index(selected_key) if selected_key in restore_keys else 0
+                            selected_session_id, selected_repo_key = restore_selection_from_key(
+                                restore_keys[max(current_idx - 1, 0)]
+                            )
+                    elif selectable:
                         current_idx = selectable.index(selected_session_id) if selected_session_id in selectable else 0
                         selected_session_id = selectable[max(current_idx - 1, 0)]
                     continue
@@ -1592,6 +1689,11 @@ def run_watch_tui(
                     continue
 
                 if key == 9:  # Tab
+                    if restore_mode and selected_repo_key:
+                        collapsed_repo_keys.discard(selected_repo_key)
+                        selected_repo_key = None
+                        next_refresh = 0.0
+                        continue
                     if not selected_session_id:
                         continue
                     if restore_mode:
@@ -1638,14 +1740,19 @@ def run_watch_tui(
                     continue
 
                 if restore_mode and key in (ord("R"),):
-                    if selected:
+                    if selected_repo_key:
+                        collapsed_repo_keys.add(selected_repo_key)
+                        next_refresh = 0.0
+                    elif selected:
                         collapsed_repo_keys.add(_repo_key(selected.get("working_dir", "")))
                         selected_session_id = None
+                        selected_repo_key = _repo_key(selected.get("working_dir", ""))
                         next_refresh = 0.0
                     continue
 
                 if restore_mode and key in (ord("U"),):
                     collapsed_repo_keys.clear()
+                    selected_repo_key = None
                     next_refresh = 0.0
                     continue
 
@@ -1846,6 +1953,11 @@ def run_watch_tui(
                     continue
 
                 if key in (10, 13, curses.KEY_ENTER):
+                    if restore_mode and selected_repo_key:
+                        collapsed_repo_keys.discard(selected_repo_key)
+                        selected_repo_key = None
+                        next_refresh = 0.0
+                        continue
                     if not selected:
                         flash_message = "No session selected"
                         flash_until = time.monotonic() + 2.0
