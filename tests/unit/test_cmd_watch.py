@@ -32,6 +32,7 @@ def test_cmd_watch_delegates_to_watch_tui():
         top_level=False,
         restore_sort="retired",
         restore_node=None,
+        restore_all_nodes=False,
     )
 
 
@@ -54,6 +55,22 @@ def test_main_watch_rejects_managed_session_before_dispatch():
     assert exc_info.value.code == 1
     mock_cmd_watch.assert_not_called()
 
+
+def test_main_watch_passes_restore_all_nodes_to_command():
+    client = MagicMock()
+    with patch.dict(os.environ, {"CLAUDE_SESSION_MANAGER_ID": ""}, clear=False):
+        with patch("sys.argv", ["sm", "watch", "--restore", "--all-nodes"]):
+            with patch("src.cli.main.SessionManagerClient", return_value=client):
+                with patch("src.cli.main.commands.cmd_watch", return_value=0) as mock_cmd_watch:
+                    with pytest.raises(SystemExit) as exc_info:
+                        main()
+
+    assert exc_info.value.code == 0
+    mock_cmd_watch.assert_called_once()
+    assert mock_cmd_watch.call_args.kwargs["restore_mode"] is True
+    assert mock_cmd_watch.call_args.kwargs["restore_all_nodes"] is True
+
+
 def test_cmd_watch_delegates_restore_mode_to_watch_tui():
     client = MagicMock()
     with patch.dict(os.environ, {"CLAUDE_SESSION_MANAGER_ID": ""}, clear=False):
@@ -67,6 +84,7 @@ def test_cmd_watch_delegates_restore_mode_to_watch_tui():
                 top_level=True,
                 restore_sort="last-active",
                 restore_node="macbook",
+                restore_all_nodes=True,
             )
 
     assert rc == 0
@@ -79,4 +97,5 @@ def test_cmd_watch_delegates_restore_mode_to_watch_tui():
         top_level=True,
         restore_sort="last-active",
         restore_node="macbook",
+        restore_all_nodes=True,
     )

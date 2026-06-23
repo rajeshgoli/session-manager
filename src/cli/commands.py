@@ -3951,6 +3951,7 @@ def cmd_watch(
     top_level: bool = False,
     restore_sort: str = "retired",
     restore_node: Optional[str] = None,
+    restore_all_nodes: bool = False,
 ) -> int:
     """Launch interactive watch dashboard."""
     if os.environ.get("CLAUDE_SESSION_MANAGER_ID"):
@@ -3976,6 +3977,7 @@ def cmd_watch(
         top_level=top_level,
         restore_sort=restore_sort,
         restore_node=restore_node,
+        restore_all_nodes=restore_all_nodes,
     )
 
 
