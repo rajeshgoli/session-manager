@@ -2213,7 +2213,7 @@ fn rename_session(client: &ApiClient, args: NameArgs) -> Result<()> {
                 bail!("Session '{target_identifier}' not found");
             };
             let parent_id = target_session["parent_session_id"].as_str();
-            if parent_id != Some(requester_session_id.as_str()) {
+            if !can_rename_target(&requester_session_id, &target_session_id, parent_id) {
                 bail!(
                     "Not authorized. You can only rename your child sessions.\nTarget session parent: {}",
                     parent_id.unwrap_or("none")
@@ -2237,6 +2237,15 @@ fn rename_session(client: &ApiClient, args: NameArgs) -> Result<()> {
     let name = payload["friendly_name"].as_str().unwrap_or(&friendly_name);
     println!("Name set: {name} ({session_id})");
     Ok(())
+}
+
+fn can_rename_target(
+    requester_session_id: &str,
+    target_session_id: &str,
+    target_parent_session_id: Option<&str>,
+) -> bool {
+    target_session_id == requester_session_id
+        || target_parent_session_id == Some(requester_session_id)
 }
 
 fn resolve_name_target(client: &ApiClient, identifier: &str) -> Result<Option<(String, Value)>> {
@@ -3487,6 +3496,18 @@ mod tests {
         };
         assert_eq!(child_args.name_or_session, "child-session");
         assert_eq!(child_args.new_name.as_deref(), Some("worker_1"));
+    }
+
+    #[test]
+    fn name_authorization_allows_self_and_child_targets() {
+        assert!(can_rename_target("session-a", "session-a", None));
+        assert!(can_rename_target("session-a", "child-a", Some("session-a")));
+        assert!(!can_rename_target("session-a", "session-b", None));
+        assert!(!can_rename_target(
+            "session-a",
+            "child-b",
+            Some("session-b")
+        ));
     }
 
     #[test]
