@@ -9,7 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -919,15 +919,18 @@ impl SessionStore {
     ) -> Result<Option<CoreRestoreOutcome>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
+        let snapshot = snapshot_from_raw_value(&state)?;
+        let Some(mut record) = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
             return Ok(None);
         };
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        if normalized_status(&status) != "stopped" {
+        if normalized_status(&record.status) != "stopped" {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
-        let record = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         if !is_primary_node(&record.node) {
             return Ok(Some(CoreRestoreOutcome::UnsupportedNode(record.node)));
         }
@@ -936,8 +939,21 @@ impl SessionStore {
                 record.provider,
             )));
         }
+        if record.provider == "claude"
+            && record
+                .transcript_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+        {
+            record.transcript_path = discover_claude_transcript_path(&record, &snapshot.sessions);
+        }
         let provider_resume_id = provider_resume_id_for_restore(&record);
-        if provider_resume_id.is_none() {
+        let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
+        if provider_resume_id.is_none()
+            && !session_runtime.allows_restore_without_resume_id(&record.provider)
+        {
             return Ok(Some(CoreRestoreOutcome::MissingProviderResumeId(
                 record.provider,
             )));
@@ -951,7 +967,6 @@ impl SessionStore {
         else {
             return Err(anyhow::anyhow!("session {session_id} missing log_file"));
         };
-        let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
         if session_runtime.session_exists(&record.tmux_session)? {
             let _ = session_runtime.kill_session(&record.tmux_session)?;
         }
@@ -967,6 +982,10 @@ impl SessionStore {
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
         session_runtime.restore_session(&spec, &record.provider, provider_resume_id.as_deref())?;
 
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(None);
+        };
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("running".to_owned()));
         session.insert("stopped_at".to_owned(), Value::Null);
@@ -994,6 +1013,17 @@ impl SessionStore {
                     Value::String(provider_resume_id),
                 );
             }
+        }
+        if let Some(transcript_path) = record
+            .transcript_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            session.insert(
+                "transcript_path".to_owned(),
+                Value::String(transcript_path.to_owned()),
+            );
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
@@ -4695,6 +4725,153 @@ fn provider_resume_id_for_restore(record: &SessionRecord) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[derive(Debug, Default)]
+struct ClaudeTranscriptMetadata {
+    mtime_ns: i128,
+    started_at_ns: Option<i128>,
+    cwd: Option<String>,
+}
+
+fn discover_claude_transcript_path(
+    record: &SessionRecord,
+    sessions: &[SessionRecord],
+) -> Option<String> {
+    if record.provider != "claude" || !has_text(Some(record.working_dir.as_str())) {
+        return record.transcript_path.clone();
+    }
+    if has_text(record.transcript_path.as_deref()) {
+        return record.transcript_path.clone();
+    }
+
+    let project_dir =
+        expand_home("~/.claude/projects").join(claude_project_dir_name(&record.working_dir));
+    if !project_dir.is_dir() {
+        return None;
+    }
+    let resolved_working_dir = resolve_path_lossy(expand_home(&record.working_dir));
+    let claimed_paths = sessions
+        .iter()
+        .filter(|session| session.id != record.id)
+        .filter_map(|session| session.transcript_path.as_deref())
+        .filter(|path| has_text(Some(path)))
+        .map(|path| resolve_path_lossy(expand_home(path)))
+        .collect::<BTreeSet<_>>();
+    let target_time_ns = session_time_ns(record)
+        .or_else(|| file_mtime_ns(expand_home(&record.log_file.clone().unwrap_or_default())).ok())
+        .unwrap_or(0);
+
+    let mut candidates: Vec<(i128, i128, i128, String)> = Vec::new();
+    let Ok(entries) = fs::read_dir(&project_dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let resolved_transcript = resolve_path_lossy(path.clone());
+        if claimed_paths.contains(&resolved_transcript) {
+            continue;
+        }
+        let metadata = read_claude_transcript_metadata(&path).unwrap_or_default();
+        if let Some(cwd) = metadata.cwd.as_deref() {
+            if cwd != resolved_working_dir {
+                continue;
+            }
+        }
+        let comparison_time = if metadata.mtime_ns > 0 {
+            metadata.mtime_ns
+        } else {
+            metadata.started_at_ns.unwrap_or(0)
+        };
+        let distance = (target_time_ns - comparison_time).abs();
+        let start_distance = metadata
+            .started_at_ns
+            .map(|started_at_ns| (target_time_ns - started_at_ns).abs())
+            .unwrap_or(distance);
+        candidates.push((
+            distance,
+            start_distance,
+            -metadata.mtime_ns,
+            resolved_transcript,
+        ));
+    }
+
+    candidates.sort();
+    candidates.into_iter().next().map(|(_, _, _, path)| path)
+}
+
+fn read_claude_transcript_metadata(path: &Path) -> Result<ClaudeTranscriptMetadata> {
+    let mtime_ns = file_mtime_ns(path)?;
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut metadata = ClaudeTranscriptMetadata {
+        mtime_ns,
+        ..ClaudeTranscriptMetadata::default()
+    };
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) == Some("user") && metadata.cwd.is_none() {
+            if let Some(cwd) = object
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                metadata.cwd = Some(resolve_path_lossy(expand_home(cwd)));
+            }
+            metadata.started_at_ns = object
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp_ns);
+        }
+    }
+    Ok(metadata)
+}
+
+fn claude_project_dir_name(working_dir: &str) -> String {
+    resolve_path_lossy(expand_home(working_dir)).replace(std::path::MAIN_SEPARATOR, "-")
+}
+
+fn resolve_path_lossy(path: PathBuf) -> String {
+    path.canonicalize()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn session_time_ns(record: &SessionRecord) -> Option<i128> {
+    [record.last_activity.as_str(), record.created_at.as_str()]
+        .into_iter()
+        .filter_map(parse_timestamp_ns)
+        .max()
+}
+
+fn parse_timestamp_ns(value: &str) -> Option<i128> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = OffsetDateTime::parse(value, &Rfc3339) {
+        return Some(parsed.unix_timestamp_nanos());
+    }
+    parse_python_naive_datetime(value).map(|parsed| parsed.assume_utc().unix_timestamp_nanos())
+}
+
+fn file_mtime_ns(path: impl AsRef<Path>) -> Result<i128> {
+    let modified = fs::metadata(path)?.modified()?;
+    let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+    Ok(i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX))
+}
+
 fn append_log_line(path: &Path, line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -5625,6 +5802,34 @@ fn extract_provider_native_rename_name(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarRestore {
+        key: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self {
+                key,
+                value: previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.value.as_ref() {
+                env::set_var(self.key, value);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn expand_home_handles_bare_home_and_home_relative_paths() {
         let Some(home) = env::var_os("HOME") else {
@@ -6137,6 +6342,63 @@ mod tests {
         session.transcript_path = None;
 
         assert_eq!(provider_resume_id_for_restore(&session), None);
+    }
+
+    #[test]
+    fn claude_restore_discovers_missing_transcript_path_from_project_history() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let temp_dir = unique_temp_path("claude-transcript-discovery");
+        let home = temp_dir.join("home");
+        let working_dir = temp_dir.join("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let _home_restore = EnvVarRestore::set("HOME", &home);
+
+        let transcript_id = "49d072b4-4080-4702-9215-b6e7f04aa2c8";
+        let project_dir = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(working_dir.to_str().unwrap()));
+        fs::create_dir_all(&project_dir).unwrap();
+        let transcript_path = project_dir.join(format!("{transcript_id}.jsonl"));
+        fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "custom-title",
+                    "customTitle": "UI-fixer",
+                    "sessionId": transcript_id
+                }),
+                json!({
+                    "type": "user",
+                    "cwd": working_dir.display().to_string(),
+                    "timestamp": "2026-06-23T01:20:00Z"
+                })
+            ),
+        )
+        .unwrap();
+
+        let mut session = session_record("stopped");
+        session.id = "c1b1b826".to_owned();
+        session.provider = "claude".to_owned();
+        session.working_dir = working_dir.display().to_string();
+        session.provider_resume_id = None;
+        session.transcript_path = None;
+        session.last_activity = "2026-06-23T01:27:23Z".to_owned();
+
+        let discovered = discover_claude_transcript_path(&session, &[session.clone()]);
+
+        assert_eq!(
+            discovered.as_deref(),
+            Some(transcript_path.canonicalize().unwrap().to_str().unwrap())
+        );
+        session.transcript_path = discovered;
+        assert_eq!(
+            provider_resume_id_for_restore(&session).as_deref(),
+            Some(transcript_id)
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {
