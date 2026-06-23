@@ -23,6 +23,7 @@ const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 4096;
 pub struct TmuxRuntime {
     socket_name: Option<String>,
     tmux_binary: String,
+    custom_runtime_command: bool,
     claude_command: String,
     claude_args: Vec<String>,
     codex_command: String,
@@ -71,6 +72,12 @@ impl TmuxRuntime {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
             tmux_binary: "tmux".to_owned(),
+            custom_runtime_command: config
+                .runtime_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some(),
             claude_command: config
                 .runtime_command
                 .as_deref()
@@ -160,6 +167,10 @@ impl TmuxRuntime {
 
     pub fn codex_fork_control_tmux_fallback_enabled(&self) -> bool {
         self.codex_fork_control_tmux_fallback_enabled
+    }
+
+    pub fn allows_restore_without_resume_id(&self, provider: &str) -> bool {
+        provider == "claude" && self.custom_runtime_command
     }
 
     pub fn startup_settle_duration(&self) -> Duration {
