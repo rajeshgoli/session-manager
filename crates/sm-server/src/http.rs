@@ -7641,6 +7641,9 @@ fn claude_line_indicates_working(line: &str) -> bool {
     if claude_line_indicates_completed(line) {
         return false;
     }
+    if claude_line_indicates_background_work(line) {
+        return true;
+    }
     if claude_spinner_status_line_indicates_working(line) {
         return true;
     }
@@ -7655,6 +7658,32 @@ fn claude_line_indicates_working(line: &str) -> bool {
         || line.contains("Reviewing…")
         || line.contains("Herding…")
         || line.contains("thinking with")
+}
+
+fn claude_line_indicates_background_work(line: &str) -> bool {
+    let line = line.trim();
+    if !line.contains("shell") && !line.contains("monitor") {
+        return false;
+    }
+    line.split('·')
+        .flat_map(|segment| segment.split(','))
+        .any(claude_background_segment_has_active_count)
+}
+
+fn claude_background_segment_has_active_count(segment: &str) -> bool {
+    let segment = segment.trim();
+    if !(segment.contains("shell") || segment.contains("monitor")) {
+        return false;
+    }
+    let digits: String = segment
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits
+        .parse::<u64>()
+        .map(|count| count > 0)
+        .unwrap_or(false)
 }
 
 fn claude_spinner_status_line_indicates_working(line: &str) -> bool {
@@ -11353,6 +11382,38 @@ mod tests {
 ❯
 "#;
         assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_background_shell_monitor_work_at_prompt() {
+        let pane = r#"
+⏺ Building/running. Let me wait for the monitor to surface the serve session-create number.
+
+✻ Churned for 9m 15s · 1 shell, 1 monitor still running
+
+  6 tasks (1 done, 1 in progress, 4 open)
+  ◼ Prove operative membership byte-identical (fixture + real window)
+  ◻ sm send membership+speed results to 648c91ae BEFORE finalizing
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Opus 4.8 (1M context)  [█████░░░░░░░░░░░░░░░] 27%
+  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← for agents
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_does_not_override_idle_prompt_without_background_work() {
+        let pane = r#"
+✻ Churned for 9m 15s
+⏺ Type-checks clean.
+❯
+────────────────────────────────────────
+  ⏵⏵ bypass permissions on · ← for agents
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), None);
     }
 
     #[test]
