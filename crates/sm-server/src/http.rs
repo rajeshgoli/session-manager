@@ -7662,18 +7662,14 @@ fn claude_spinner_status_line_indicates_working(line: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    if !(0x2700..=0x27bf).contains(&(first as u32)) {
+    if first != '·' && !(0x2700..=0x27bf).contains(&(first as u32)) {
         return false;
     }
     let rest = chars.as_str().trim_start();
     let Some((status, _)) = rest.split_once('…') else {
         return false;
     };
-    !status.trim().is_empty()
-        && status
-            .trim()
-            .chars()
-            .all(|ch| ch.is_alphabetic() || ch == '-' || ch == ' ')
+    status.trim().chars().any(|ch| ch.is_alphabetic())
 }
 
 fn codex_fork_live_activity_from_signals(
@@ -11338,6 +11334,22 @@ mod tests {
      ◻ Write the leg-behavior spec doc
 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── leg-behavior-spec ──
+❯
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_middle_dot_spinner_status() {
+        let pane = r#"
+⏺ Running 1 shell command…
+  ⎿  $ cd /Users/rajesh/projects/fractal-algo-rust-rule-t12
+
+· Proving membership byte-identical + measuring speed… (4m 16s · ↓ 8.2k tokens)
+  ⎿  ◼ Prove operative membership byte-identical (fixture + real window)
+     ◻ sm send membership+speed results to 648c91ae BEFORE finalizing
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯
 "#;
         assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
