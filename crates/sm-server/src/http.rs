@@ -7633,7 +7633,11 @@ fn claude_live_activity_from_pane(pane_text: Option<&str>) -> Option<&'static st
 }
 
 fn claude_line_indicates_completed(line: &str) -> bool {
-    line.trim().contains("Brewed for")
+    let line = line.trim();
+    !claude_line_indicates_background_work(line)
+        && (line.contains("Brewed for")
+            || line.contains("Baked for")
+            || line.contains("Churned for"))
 }
 
 fn claude_line_indicates_working(line: &str) -> bool {
@@ -11405,7 +11409,40 @@ mod tests {
     }
 
     #[test]
-    fn claude_pane_activity_does_not_override_idle_prompt_without_background_work() {
+    fn claude_pane_activity_detects_baked_background_work_at_prompt() {
+        let pane = r#"
+⏺ Report delivered to the orchestrator.
+
+✻ Baked for 24m 12s · 1 shell still running
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_newer_baked_idle_overrides_stale_background_work() {
+        let pane = r#"
+✻ Baked for 24m 12s · 1 shell still running
+
+⏺ Background command "Search for existing export artifacts" completed (exit code 0)
+
+⏺ That notification is a leftover background search from early in the investigation. Nothing further to do.
+
+✻ Baked for 5s
+                                                                                                                  new task? /clear to save 286.2k tokens
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ spot-check SF-8 on the chart
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Opus 4.8 (1M context)  [█████░░░░░░░░░░░░░░░] 29%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("idle"));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_churned_idle_without_background_work() {
         let pane = r#"
 ✻ Churned for 9m 15s
 ⏺ Type-checks clean.
@@ -11413,7 +11450,7 @@ mod tests {
 ────────────────────────────────────────
   ⏵⏵ bypass permissions on · ← for agents
 "#;
-        assert_eq!(claude_live_activity_from_pane(Some(pane)), None);
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("idle"));
     }
 
     #[test]
