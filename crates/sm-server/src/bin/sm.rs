@@ -615,12 +615,12 @@ fn run() -> Result<()> {
             }
             let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
             let targets = split_send_targets(&args.session_id);
-            let targets = targets
-                .iter()
-                .map(|target| resolve_send_target(&client, target))
-                .collect::<Result<Vec<_>>>()?;
-            let mut payload = send_input_payload(text, delivery_mode, args.wait);
+            let mut payload = send_input_payload(text.clone(), delivery_mode, args.wait);
             if targets.len() > 1 {
+                let targets = targets
+                    .iter()
+                    .map(|target| resolve_send_target(&client, target))
+                    .collect::<Result<Vec<_>>>()?;
                 payload["recipients"] = json!(targets);
                 let payload = client.post_json("/sessions/input-batch", payload)?;
                 print_batch_send_result(&payload)?;
@@ -632,15 +632,25 @@ fn run() -> Result<()> {
                     .first()
                     .map(String::as_str)
                     .unwrap_or(args.session_id.as_str());
-                let payload = client.post_json(&format!("/sessions/{target}/input"), payload)?;
-                println!(
-                    "{}",
-                    if payload["delivered"].as_bool().unwrap_or(false) {
-                        "delivered"
-                    } else {
-                        "not delivered"
+                if let Some(session_id) = lookup_identifier_exact(&client, target)? {
+                    let payload =
+                        client.post_json(&format!("/sessions/{session_id}/input"), payload)?;
+                    println!(
+                        "{}",
+                        if payload["delivered"].as_bool().unwrap_or(false) {
+                            "delivered"
+                        } else {
+                            "not delivered"
+                        }
+                    );
+                } else {
+                    if args.urgent || args.wait.is_some() {
+                        bail!(
+                            "email fallback only supports plain sequential sends without --wait/--urgent"
+                        );
                     }
-                );
+                    send_registered_email_fallback(&client, target, &text)?;
+                }
             }
         }
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
@@ -813,7 +823,9 @@ fn run() -> Result<()> {
         }
         Command::Lookup(args) => {
             let identifier = required_positional(args.role, "role")?;
-            if let Some(session_id) = lookup_identifier(&client, &identifier)? {
+            if let Some(human) = lookup_human(&client, &identifier)? {
+                print_human_lookup(&human);
+            } else if let Some(session_id) = lookup_identifier(&client, &identifier)? {
                 println!("{session_id}");
             } else {
                 bail!("Role not registered");
@@ -2126,6 +2138,59 @@ fn send_input_payload(text: String, delivery_mode: &str, wait: Option<u64>) -> V
     payload
 }
 
+fn send_registered_email_fallback(client: &ApiClient, recipient: &str, text: &str) -> Result<()> {
+    let requester_session_id = optional_current_session_id()
+        .ok_or_else(|| anyhow!("Managed sender session is required for email fallback"))?;
+    let human_response = client.request(
+        "GET",
+        &format!("/humans/{}", encode_path_segment(recipient)),
+        None,
+    )?;
+    if (200..300).contains(&human_response.status) {
+        let human = human_response.into_json()?;
+        let canonical = human["recipient"].as_str().unwrap_or(recipient);
+        let payload = client.post_json(
+            &format!("/humans/{}/email", encode_path_segment(canonical)),
+            json!({
+                "requester_session_id": requester_session_id,
+                "text": text,
+                "auto_subject": true
+            }),
+        )?;
+        println!(
+            "Email sent to {}",
+            payload["recipient"].as_str().unwrap_or(canonical)
+        );
+        return Ok(());
+    }
+    if human_response.status != 404 {
+        return Err(human_response.into_status_error());
+    }
+    let payload = client.post_json(
+        "/email/send",
+        json!({
+            "requester_session_id": requester_session_id,
+            "recipients": [recipient],
+            "cc": [],
+            "body_text": text,
+            "auto_subject": true
+        }),
+    )?;
+    let recipient_summary = payload["to"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["username"].as_str().or_else(|| item["email"].as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| recipient.to_owned());
+    println!("Email sent to {recipient_summary}");
+    Ok(())
+}
+
 fn launch_provider_for_alias(alias: &str) -> Result<&'static str> {
     match alias {
         "new" | "claude" => Ok("claude"),
@@ -2414,6 +2479,32 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
 }
 
 fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
+    if let Some(session_id) = lookup_identifier_exact(client, identifier)? {
+        return Ok(Some(session_id));
+    }
+
+    let payload = client.get_json("/sessions")?;
+    let sessions = payload["sessions"].as_array().cloned().unwrap_or_default();
+    let needle = identifier.to_ascii_lowercase();
+    let matches = sessions
+        .iter()
+        .filter(|session| {
+            ["friendly_name", "name"].iter().any(|field| {
+                session[*field]
+                    .as_str()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches[0]["id"].as_str().map(ToOwned::to_owned)),
+        count if count > 1 => bail_ambiguous_lookup(identifier, &matches),
+        _ => Ok(None),
+    }
+}
+
+fn lookup_identifier_exact(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
     let registry_path = format!("/registry/{}", encode_path_segment(identifier));
     let response = client.request("GET", &registry_path, None)?;
     if (200..300).contains(&response.status) {
@@ -2459,23 +2550,7 @@ fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<Stri
         return bail_ambiguous_lookup(identifier, &exact_matches);
     }
 
-    let needle = identifier.to_ascii_lowercase();
-    let matches = sessions
-        .iter()
-        .filter(|session| {
-            ["friendly_name", "name"].iter().any(|field| {
-                session[*field]
-                    .as_str()
-                    .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    match matches.len() {
-        1 => Ok(matches[0]["id"].as_str().map(ToOwned::to_owned)),
-        count if count > 1 => bail_ambiguous_lookup(identifier, &matches),
-        _ => Ok(None),
-    }
+    Ok(None)
 }
 
 fn bail_ambiguous_lookup(identifier: &str, matches: &[Value]) -> Result<Option<String>> {
@@ -2506,34 +2581,128 @@ fn print_roster(client: &ApiClient) -> Result<()> {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    if registrations.is_empty() {
+    let humans_payload = client.get_json("/humans")?;
+    let humans = humans_payload["humans"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if registrations.is_empty() && humans.is_empty() {
         println!("No registered roles or humans.");
         return Ok(());
     }
 
-    println!("Agents");
-    let rows = registrations
-        .iter()
-        .map(|entry| {
-            vec![
-                json_string(entry, "role"),
-                json_string(entry, "session_id"),
-                json_string(entry, "friendly_name"),
-                json_string(entry, "provider"),
-                entry["activity_state"]
-                    .as_str()
-                    .or_else(|| entry["status"].as_str())
-                    .unwrap_or("")
-                    .to_owned(),
-            ]
-        })
-        .collect::<Vec<_>>();
-    print_table(&["Role", "Session ID", "Name", "Provider", "State"], &rows);
+    if !registrations.is_empty() {
+        println!("Agents");
+        let rows = registrations
+            .iter()
+            .map(|entry| {
+                vec![
+                    json_string(entry, "role"),
+                    json_string(entry, "session_id"),
+                    json_string(entry, "friendly_name"),
+                    json_string(entry, "provider"),
+                    entry["activity_state"]
+                        .as_str()
+                        .or_else(|| entry["status"].as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["Role", "Session ID", "Name", "Provider", "State"], &rows);
+    }
+
+    if !humans.is_empty() {
+        if !registrations.is_empty() {
+            println!();
+        }
+        println!("Humans");
+        let rows = humans.iter().map(human_roster_row).collect::<Vec<_>>();
+        print_table(
+            &["Name", "Display", "Aliases", "Default", "Channels"],
+            &rows,
+        );
+    }
     Ok(())
 }
 
 fn json_string(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or("").to_owned()
+}
+
+fn lookup_human(client: &ApiClient, identifier: &str) -> Result<Option<Value>> {
+    let response = client.request(
+        "GET",
+        &format!("/humans/{}", encode_path_segment(identifier)),
+        None,
+    )?;
+    if (200..300).contains(&response.status) {
+        return Ok(Some(response.into_json()?));
+    }
+    if response.status == 404 {
+        return Ok(None);
+    }
+    Err(response.into_status_error())
+}
+
+fn print_human_lookup(payload: &Value) {
+    let recipient = payload["recipient"].as_str().unwrap_or("<unknown>");
+    let aliases = payload["aliases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|alias| *alias != recipient)
+        .collect::<Vec<_>>();
+    println!("Human recipient: {recipient}");
+    if !aliases.is_empty() {
+        println!("Aliases: {}", aliases.join(", "));
+    }
+    println!(
+        "Default delivery: {}",
+        payload["default_channel"].as_str().unwrap_or("unknown")
+    );
+    let channels = payload["available_channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if !channels.is_empty() {
+        println!("Available delivery: {}", channels.join(", "));
+    }
+    if channels.contains(&"telegram") {
+        println!("Telegram delivery posts into the sending agent's SM-managed Telegram thread.");
+    }
+    if channels.contains(&"email") {
+        println!("Email is available as fallback/explicit only; use email sparingly.");
+    }
+}
+
+fn human_roster_row(entry: &Value) -> Vec<String> {
+    let recipient = json_string(entry, "recipient");
+    let aliases = entry["aliases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|alias| *alias != recipient)
+        .collect::<Vec<_>>()
+        .join(",");
+    let channels = entry["available_channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        recipient,
+        json_string(entry, "display_name"),
+        aliases,
+        json_string(entry, "default_channel"),
+        channels,
+    ]
 }
 
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
@@ -3235,6 +3404,7 @@ mod tests {
     use super::*;
     use std::{
         ffi::OsString,
+        io::{BufRead, BufReader},
         net::TcpListener,
         sync::Mutex,
         thread,
@@ -3276,6 +3446,34 @@ mod tests {
         });
         let client = ApiClient::parse(&format!("http://{address}")).unwrap();
         (client, server)
+    }
+
+    fn read_test_request(stream: &mut std::net::TcpStream) -> (String, String, String) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_owned();
+        let path = parts.next().unwrap_or_default().to_owned();
+        let mut content_length = 0_usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+        }
+        let mut body = vec![0_u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body).unwrap();
+        }
+        (method, path, String::from_utf8(body).unwrap())
     }
 
     #[test]
@@ -3375,6 +3573,160 @@ mod tests {
         assert_eq!(payload["notify_after_seconds"], 7);
         assert_eq!(payload["from_sm_send"], true);
         assert_eq!(payload["sender_session_id"], "sender001");
+    }
+
+    #[test]
+    fn send_registered_email_fallback_posts_auto_subject_payload() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "sender001");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let (method, path, _) = read_test_request(&mut stream);
+            assert_eq!(method, "GET");
+            assert_eq!(path, "/humans/teammate");
+            let response_body = r#"{"detail":"Human recipient not configured"}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let (method, path, body) = read_test_request(&mut stream);
+            assert_eq!(method, "POST");
+            assert_eq!(path, "/email/send");
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["requester_session_id"], "sender001");
+            assert_eq!(payload["recipients"], json!(["teammate"]));
+            assert_eq!(payload["cc"], json!([]));
+            assert_eq!(payload["body_text"], "hello via fallback");
+            assert_eq!(payload["auto_subject"], true);
+
+            let response_body =
+                r#"{"to":[{"username":"teammate","email":"teammate@example.test"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let client = ApiClient::parse(&format!("http://{address}")).unwrap();
+
+        send_registered_email_fallback(&client, "teammate", "hello via fallback").unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_registered_email_fallback_uses_human_email_endpoint() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "sender001");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (method, path, _) = read_test_request(&mut stream);
+            assert_eq!(method, "GET");
+            assert_eq!(path, "/humans/rajeshgoli");
+            let response_body = r#"{"recipient":"rajesh"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let (method, path, body) = read_test_request(&mut stream);
+            assert_eq!(method, "POST");
+            assert_eq!(path, "/humans/rajesh/email");
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["requester_session_id"], "sender001");
+            assert_eq!(payload["text"], "hello human fallback");
+            assert_eq!(payload["auto_subject"], true);
+
+            let response_body = r#"{"recipient":"rajesh","status":"sent"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            drop(stream);
+        });
+        let client = ApiClient::parse(&format!("http://{address}")).unwrap();
+
+        send_registered_email_fallback(&client, "rajeshgoli", "hello human fallback").unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lookup_human_resolves_configured_alias() {
+        let (client, server) = start_lookup_server([(
+            "/humans/rajeshgoli",
+            200,
+            r#"{"recipient":"rajesh","display_name":"Human operator","aliases":["rajesh","rajeshgoli"],"default_channel":"telegram","available_channels":["email","telegram"]}"#,
+        )]);
+
+        let human = lookup_human(&client, "rajeshgoli").unwrap().unwrap();
+
+        assert_eq!(human["recipient"], "rajesh");
+        assert_eq!(human["default_channel"], "telegram");
+        assert_eq!(server.join().unwrap(), vec!["/humans/rajeshgoli"]);
+    }
+
+    #[test]
+    fn lookup_identifier_exact_ignores_fuzzy_session_name_match() {
+        let (client, server) = start_lookup_server([
+            ("/registry/rajesh", 404, r#"{"detail":"Role not found"}"#),
+            ("/sessions/rajesh", 404, r#"{"detail":"Session not found"}"#),
+            (
+                "/sessions",
+                200,
+                r#"{"sessions":[{"id":"helper001","friendly_name":"rajesh-helper","name":"codex-fork-helper001","aliases":[]}]}"#,
+            ),
+        ]);
+
+        assert_eq!(lookup_identifier_exact(&client, "rajesh").unwrap(), None);
+        assert_eq!(
+            server.join().unwrap(),
+            vec!["/registry/rajesh", "/sessions/rajesh", "/sessions"]
+        );
+    }
+
+    #[test]
+    fn human_roster_row_formats_aliases_and_channels() {
+        let row = human_roster_row(&json!({
+            "recipient": "rajesh",
+            "display_name": "Human operator",
+            "aliases": ["rajesh", "rajeshgoli", "user"],
+            "default_channel": "telegram",
+            "available_channels": ["email", "telegram"]
+        }));
+
+        assert_eq!(
+            row,
+            vec![
+                "rajesh".to_owned(),
+                "Human operator".to_owned(),
+                "rajeshgoli,user".to_owned(),
+                "telegram".to_owned(),
+                "email,telegram".to_owned(),
+            ]
+        );
     }
 
     #[test]

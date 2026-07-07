@@ -1466,6 +1466,92 @@ async fn human_lookup_lists_capabilities_without_email_addresses() {
 }
 
 #[tokio::test]
+async fn human_lookup_hides_unsupported_telegram_delivery_in_rust() {
+    let state_file = write_session_fixture();
+    let bridge_config = write_email_bridge_config(None, None);
+    fs::write(
+        &bridge_config,
+        r#"resend:
+  api_key: "test-api-key"
+  domain: "example.com"
+  reply_address: "reply@example.com"
+humans:
+  rajesh:
+    display_name: "Human operator"
+    aliases: ["rajeshgoli"]
+    default_channel: "telegram"
+    channels:
+      telegram:
+        enabled: true
+        delivery: "sender_session_topic"
+      email:
+        enabled: true
+        address: "operator@example.com"
+        use: "fallback_only"
+users:
+  rajesh:
+    email: "operator@example.com"
+    name: "Human operator"
+email_bridge:
+  authorized_senders: ["operator@example.com"]
+  webhook_path: "/api/email-inbound"
+"#,
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file_and_email(
+        &state_file,
+        &bridge_config,
+        false,
+    )));
+
+    let (status, payload) = get_json(app, "/humans/rajeshgoli").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["recipient"], "rajesh");
+    assert_eq!(payload["default_channel"], "email");
+    assert_eq!(payload["available_channels"], json!(["email"]));
+    assert_eq!(payload["telegram_delivery"], Value::Null);
+}
+
+#[tokio::test]
+async fn human_lookup_uses_empty_default_when_no_supported_channels_exist() {
+    let state_file = write_session_fixture();
+    let bridge_config = write_email_bridge_config(None, None);
+    fs::write(
+        &bridge_config,
+        r#"resend:
+  api_key: "test-api-key"
+  domain: "example.com"
+  reply_address: "reply@example.com"
+humans:
+  rajesh:
+    display_name: "Human operator"
+    aliases: ["rajeshgoli"]
+    default_channel: "telegram"
+    channels:
+      telegram:
+        enabled: true
+        delivery: "sender_session_topic"
+email_bridge:
+  webhook_path: "/api/email-inbound"
+"#,
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file_and_email(
+        &state_file,
+        &bridge_config,
+        false,
+    )));
+
+    let (status, payload) = get_json(app, "/humans/rajesh").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["default_channel"], "");
+    assert_eq!(payload["available_channels"], json!([]));
+    assert_eq!(payload["telegram_delivery"], Value::Null);
+}
+
+#[tokio::test]
 async fn registered_email_send_posts_resend_payload_with_routing_footer() {
     let (resend_url, request_rx) = spawn_resend_server(200, r#"{"id":"email_123"}"#);
     let state_file = write_session_fixture();
