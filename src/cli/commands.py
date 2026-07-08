@@ -2059,7 +2059,12 @@ def _try_send_human_telegram(
 
     sender = getattr(client, "send_human_telegram_result", None)
     if not callable(sender):
-        return None
+        return _try_send_human_email_fallback(
+            client,
+            identifier,
+            text,
+            sender_session_id=sender_session_id,
+        )
     result = sender(
         requester_session_id=sender_session_id,
         recipient=identifier,
@@ -2072,12 +2077,53 @@ def _try_send_human_telegram(
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
+        if result.get("status_code") in (404, 405, 503):
+            email_rc = _try_send_human_email_fallback(
+                client,
+                identifier,
+                text,
+                sender_session_id=sender_session_id,
+            )
+            if email_rc is not None:
+                return email_rc
         print(f"Error: {result.get('detail') or 'Failed to send Telegram message'}", file=sys.stderr)
         return 1
 
     payload = result.get("data") or {}
     print(f"Telegram sent to {payload.get('recipient') or identifier}")
     print(f"Thread: {payload.get('thread') or 'sender session topic'}")
+    return 0
+
+
+def _try_send_human_email_fallback(
+    client: SessionManagerClient,
+    identifier: str,
+    text: str,
+    *,
+    sender_session_id: Optional[str],
+) -> Optional[int]:
+    """Send to a configured human recipient through explicit email fallback."""
+    sender = getattr(client, "send_human_email_result", None)
+    if not callable(sender):
+        return None
+    result = sender(
+        requester_session_id=sender_session_id,
+        recipient=identifier,
+        text=text,
+        auto_subject=True,
+    )
+    if not isinstance(result, dict):
+        print("Error: Failed to send human email fallback", file=sys.stderr)
+        return 1
+    if result.get("unavailable"):
+        print(UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
+    if not result.get("ok"):
+        print(f"Error: {result.get('detail') or 'Failed to send human email fallback'}", file=sys.stderr)
+        return 1
+
+    payload = result.get("data") or {}
+    print(f"Email sent to {payload.get('recipient') or identifier}")
     return 0
 
 

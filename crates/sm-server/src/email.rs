@@ -25,7 +25,7 @@ pub struct EmailBridge {
 impl EmailBridge {
     pub fn load(config: &AppConfig) -> Result<Self> {
         let path = expand_email_config_path(&config.email.bridge_config);
-        let config = match fs::read_to_string(&path) {
+        let mut bridge_config = match fs::read_to_string(&path) {
             Ok(content) => serde_yaml::from_str(&content).with_context(|| {
                 format!("failed to parse email bridge config {}", path.display())
             })?,
@@ -38,11 +38,50 @@ impl EmailBridge {
                 })
             }
         };
-        Ok(Self { path, config })
+        for (username, user_config) in &config.mobile_terminal.allowed_users {
+            let Some(email) = trimmed(&user_config.email) else {
+                continue;
+            };
+            bridge_config
+                .users
+                .entry(username.clone())
+                .or_insert_with(|| {
+                    UserSpec::Details(UserDetails {
+                        email: Some(email),
+                        name: Some(username.clone()),
+                        aliases: StringList::Many(user_config.aliases.clone()),
+                    })
+                });
+        }
+        Ok(Self {
+            path,
+            config: bridge_config,
+        })
     }
 
     pub fn bridge_is_available(&self) -> bool {
         self.api_key().is_some() && self.domain().is_some()
+    }
+
+    pub fn availability_error_detail(&self) -> String {
+        let mut missing = Vec::new();
+        if !self.path.exists() {
+            missing.push(format!("config file {} not found", self.path.display()));
+        }
+        if self.api_key().is_none() {
+            missing.push("resend.api_key".to_owned());
+        }
+        if self.domain().is_none() {
+            missing.push("resend.domain".to_owned());
+        }
+        if missing.is_empty() {
+            "Email bridge is unavailable".to_owned()
+        } else {
+            format!(
+                "Email bridge is unavailable: missing {}",
+                missing.join(", ")
+            )
+        }
     }
 
     pub fn webhook_path(&self) -> String {
@@ -175,10 +214,7 @@ impl EmailBridge {
 
     pub fn send_agent_email(&self, request: SendAgentEmailRequest) -> Result<SentEmail> {
         if !self.bridge_is_available() {
-            bail!(
-                "Email bridge config is unavailable at {}",
-                self.path.display()
-            );
+            bail!("{}", self.availability_error_detail());
         }
         let sender_session_id = request.sender_session_id.trim();
         if sender_session_id.is_empty() {
@@ -327,18 +363,23 @@ pub struct HumanRecipientResponse {
 
 impl From<HumanRecipient> for HumanRecipientResponse {
     fn from(human: HumanRecipient) -> Self {
-        let telegram_delivery = human
-            .channel("telegram")
-            .and_then(|channel| channel.delivery);
         let email_use = human.channel("email").and_then(|channel| channel.use_);
-        let available_channels = human.available_channels();
+        let available_channels = human.supported_available_channels();
+        let default_channel = if available_channels
+            .iter()
+            .any(|channel| channel == &human.default_channel)
+        {
+            human.default_channel
+        } else {
+            available_channels.first().cloned().unwrap_or_default()
+        };
         Self {
             recipient: human.name,
             display_name: human.display_name,
             aliases: human.aliases,
-            default_channel: human.default_channel,
+            default_channel,
             available_channels,
-            telegram_delivery,
+            telegram_delivery: None,
             email_use,
         }
     }
@@ -401,6 +442,13 @@ impl HumanRecipient {
             .values()
             .filter(|channel| channel.enabled)
             .map(|channel| channel.name.clone())
+            .collect()
+    }
+
+    fn supported_available_channels(&self) -> Vec<String> {
+        self.available_channels()
+            .into_iter()
+            .filter(|channel| channel == "email")
             .collect()
     }
 }

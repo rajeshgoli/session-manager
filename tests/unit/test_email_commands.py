@@ -106,6 +106,42 @@ def test_cmd_send_human_alias_defaults_to_telegram(capsys):
     assert "Thread: sender session topic" in output
 
 
+def test_cmd_send_human_alias_falls_back_to_email_when_telegram_unavailable(capsys):
+    client = Mock()
+    client.session_id = "sender123"
+    client.get_session.return_value = None
+    client.list_sessions.return_value = []
+    client.lookup_human.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": _human_lookup_payload(),
+    }
+    client.send_human_telegram_result.return_value = {
+        "ok": False,
+        "unavailable": False,
+        "status_code": 503,
+        "detail": "Telegram delivery unavailable",
+    }
+    client.send_human_email_result.return_value = {
+        "ok": True,
+        "unavailable": False,
+        "data": {"recipient": "rajesh", "status": "sent"},
+    }
+
+    rc = cmd_send(client, "user", "status for the human")
+
+    assert rc == 0
+    client.send_human_email_result.assert_called_once_with(
+        requester_session_id="sender123",
+        recipient="user",
+        text="status for the human",
+        auto_subject=True,
+    )
+    client.ensure_role.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Email sent to rajesh" in output
+
+
 @pytest.mark.parametrize(
     "session_identity",
     [

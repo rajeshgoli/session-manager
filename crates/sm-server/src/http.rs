@@ -2208,7 +2208,7 @@ fn email_bridge_or_503(config: &AppConfig) -> Result<EmailBridge, ApiError> {
     if !bridge.bridge_is_available() {
         return Err(ApiError::Status {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            detail: "Email bridge is unavailable".to_owned(),
+            detail: bridge.availability_error_detail(),
         });
     }
     Ok(bridge)
