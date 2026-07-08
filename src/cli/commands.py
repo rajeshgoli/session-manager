@@ -2077,7 +2077,7 @@ def _try_send_human_telegram(
         print(UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
     if not result.get("ok"):
-        if result.get("status_code") in (404, 405, 503):
+        if _should_try_human_email_fallback(result):
             email_rc = _try_send_human_email_fallback(
                 client,
                 identifier,
@@ -2093,6 +2093,17 @@ def _try_send_human_telegram(
     print(f"Telegram sent to {payload.get('recipient') or identifier}")
     print(f"Thread: {payload.get('thread') or 'sender session topic'}")
     return 0
+
+
+def _should_try_human_email_fallback(result: dict) -> bool:
+    """Return True when Telegram failure means human email fallback may still work."""
+    status_code = result.get("status_code")
+    if status_code in (404, 405, 503):
+        return True
+    if status_code != 400:
+        return False
+    detail = str(result.get("detail") or "").lower()
+    return "no enabled telegram channel" in detail
 
 
 def _try_send_human_email_fallback(
