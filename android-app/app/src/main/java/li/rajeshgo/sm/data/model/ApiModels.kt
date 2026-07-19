@@ -124,6 +124,23 @@ data class AppArtifactMetadata(
 )
 
 @Serializable
+data class StudioSshToggleRequest(
+    val enabled: Boolean,
+)
+
+@Serializable
+data class StudioSshStatusResponse(
+    val enabled: Boolean = false,
+    val status: String = "off",
+    val host: String = "",
+    @SerialName("sshd_listening")
+    val sshdListening: Boolean = false,
+    @SerialName("tunnel_running")
+    val tunnelRunning: Boolean = false,
+    val error: String? = null,
+)
+
+@Serializable
 data class SessionListResponse(
     val sessions: List<ClientSession> = emptyList(),
 )

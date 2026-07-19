@@ -18,6 +18,7 @@ import li.rajeshgo.sm.data.model.EnsureMaintainerResponse
 import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
 import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.data.model.StudioSshStatusResponse
 import li.rajeshgo.sm.data.model.ToolCallRow
 import li.rajeshgo.sm.data.remote.ApiService
 import li.rajeshgo.sm.data.remote.HttpClientFactory
@@ -269,6 +270,16 @@ class SessionManagerRepository(
     suspend fun requestStatus(baseUrl: String, token: String): Result<RequestStatusResponse> = withContext(Dispatchers.IO) {
         runCatching {
             api(baseUrl, token).requestStatus()
+        }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun fetchStudioSshStatus(baseUrl: String, token: String): StudioSshStatusResponse = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getStudioSshStatus() }
+    }
+
+    suspend fun setStudioSsh(baseUrl: String, token: String, enabled: Boolean): Result<StudioSshStatusResponse> = withContext(Dispatchers.IO) {
+        runCatching {
+            api(baseUrl, token).setStudioSsh(li.rajeshgo.sm.data.model.StudioSshToggleRequest(enabled))
         }.mapFailure(::classifyWriteFailure)
     }
 

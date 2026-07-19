@@ -61,6 +61,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -172,10 +173,12 @@ fun WatchScreen(
             return@LaunchedEffect
         }
         viewModel.refresh()
+        viewModel.refreshStudioSshStatus()
         updateViewModel.refresh()
         while (coroutineContext.isActive) {
             delay(WATCH_AUTO_REFRESH_MS)
             viewModel.refresh()
+            viewModel.refreshStudioSshStatus()
         }
     }
 
@@ -224,6 +227,21 @@ fun WatchScreen(
                         }
                     },
                     onOpenSettings = onNavigateToSettings,
+                )
+            }
+
+            item {
+                StudioSshToggleCard(
+                    enabled = state.studioSshEnabled,
+                    status = state.studioSshStatus,
+                    host = state.studioSshHost,
+                    busy = state.studioSshBusy,
+                    error = state.studioSshError,
+                    onToggle = { desired ->
+                        viewModel.toggleStudioSsh(desired) { result ->
+                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
+                        }
+                    },
                 )
             }
 
@@ -808,6 +826,87 @@ private class TerminalJavascriptBridge(
 }
 
 private fun jsString(value: String): String = JSONObject.quote(value)
+
+@Composable
+private fun StudioSshToggleCard(
+    enabled: Boolean,
+    status: String,
+    host: String,
+    busy: Boolean,
+    error: String?,
+    onToggle: (Boolean) -> Unit,
+) {
+    val displayHost = host.ifBlank { "studio-ssh.rajeshgo.li" }
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = Panel,
+        border = androidx.compose.foundation.BorderStroke(1.dp, Border),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(9.dp).background(studioSshStatusTint(status), CircleShape))
+                    Spacer(Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Studio SSH",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = displayHost,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextMuted,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    StatusChip(label = status, tint = studioSshStatusTint(status))
+                    Spacer(Modifier.width(10.dp))
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { desired -> if (!busy) onToggle(desired) },
+                        enabled = !busy,
+                    )
+                }
+            }
+            Text(
+                text = "ssh studio-away",
+                style = MaterialTheme.typography.labelSmall,
+                color = Cyan,
+                fontFamily = FontFamily.Monospace,
+            )
+            error?.let { message ->
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Rose,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+private fun studioSshStatusTint(status: String): Color = when (status.lowercase()) {
+    "on" -> Emerald
+    "starting" -> Amber
+    "error" -> Rose
+    else -> TextMuted
+}
 
 @Composable
 private fun HeaderBar(
