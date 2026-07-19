@@ -126,26 +126,30 @@ fn enable_agent(uid: u32, label: &str) -> Result<(), String> {
     // `enable` clears a prior `disable`; it is idempotent, so ignore its exit.
     let _ = run_launchctl(&["enable", &target]);
 
-    // `bootstrap` loads the agent. Booting an already-loaded agent exits nonzero
-    // (typically "5: Input/output error" / "service already loaded") — benign.
+    // `bootstrap` loads + starts the agent (RunAtLoad). Its exit code is NOT a
+    // reliable success signal: it returns nonzero both for the benign
+    // "already loaded" case and for genuine failures (a malformed or unreadable
+    // plist) — both of which can surface as "5: Input/output error". So we do not
+    // trust the exit here; the authoritative check is `agent_loaded` below.
     let bootstrap = run_launchctl(&["bootstrap", &domain, &plist_str]);
-    if !bootstrap.success && !is_benign_bootstrap(&bootstrap.stderr) {
-        return Err(format!(
-            "launchctl bootstrap {label} failed: {}",
-            describe(&bootstrap)
-        ));
-    }
 
-    // `kickstart -k` (re)starts the running instance. If the agent is not loaded
-    // ("No such process") treat it as benign — status() will report reality.
-    let kickstart = run_launchctl(&["kickstart", "-k", &target]);
-    if !kickstart.success && !is_benign_kickstart(&kickstart.stderr) {
-        return Err(format!(
-            "launchctl kickstart {label} failed: {}",
-            describe(&kickstart)
-        ));
+    // `kickstart -k` force-restarts an already-loaded agent. It is best-effort:
+    // `bootstrap` already started the service, and kickstart can legitimately time
+    // out while a slow child (cloudflared) shuts down before respawning. Never
+    // fail `enable` on kickstart alone — a bootstrapped agent is up regardless.
+    let _ = run_launchctl(&["kickstart", "-k", &target]);
+
+    // Authoritative success signal: the agent is actually loaded. This surfaces a
+    // genuine bootstrap failure (plist problem => not loaded) while tolerating the
+    // benign already-loaded and kickstart-timeout cases.
+    if agent_loaded(uid, label) {
+        Ok(())
+    } else {
+        Err(format!(
+            "launchctl bootstrap {label} did not load the agent: {}",
+            describe(&bootstrap)
+        ))
     }
-    Ok(())
 }
 
 fn disable_agent(uid: u32, label: &str) -> Result<(), String> {
@@ -161,9 +165,17 @@ fn disable_agent(uid: u32, label: &str) -> Result<(), String> {
         ));
     }
 
-    // `disable` persists the off state so it will not RunAtLoad on next login.
-    // Idempotent; ignore its exit.
-    let _ = run_launchctl(&["disable", &target]);
+    // `disable` persists the off state so the agent will NOT RunAtLoad on next
+    // login. This is the step that makes "off" durable across reboots, so a
+    // failure here matters: report it rather than claiming the toggle is off while
+    // the RunAtLoad agent could return after a reboot.
+    let disable = run_launchctl(&["disable", &target]);
+    if !disable.success {
+        return Err(format!(
+            "launchctl disable {label} failed: {}",
+            describe(&disable)
+        ));
+    }
     Ok(())
 }
 
@@ -302,18 +314,6 @@ fn run_command_with_timeout(
     }
 }
 
-fn is_benign_bootstrap(stderr: &str) -> bool {
-    let text = stderr.to_ascii_lowercase();
-    text.contains("already")
-        || text.contains("input/output error")
-        || text.contains("service is already loaded")
-}
-
-fn is_benign_kickstart(stderr: &str) -> bool {
-    let text = stderr.to_ascii_lowercase();
-    text.contains("no such process") || text.contains("could not find")
-}
-
 fn is_benign_bootout(stderr: &str) -> bool {
     let text = stderr.to_ascii_lowercase();
     text.contains("no such process")
@@ -389,24 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn benign_launchctl_errors_are_recognized() {
-        assert!(is_benign_bootstrap(
-            "Bootstrap failed: 5: Input/output error"
-        ));
-        assert!(is_benign_bootstrap("service already bootstrapped"));
-        assert!(!is_benign_bootstrap(
-            "Bootstrap failed: 2: No such file or directory"
-        ));
-
+    fn benign_bootout_errors_are_recognized() {
+        // bootout of an agent that is not loaded is benign (nothing to unload).
         assert!(is_benign_bootout("Boot-out failed: 3: No such process"));
         assert!(is_benign_bootout("Could not find specified service"));
+        // a real permission failure is NOT benign and must surface.
         assert!(!is_benign_bootout(
             "Boot-out failed: 1: Operation not permitted"
-        ));
-
-        assert!(is_benign_kickstart("Could not find service"));
-        assert!(!is_benign_kickstart(
-            "kickstart failed: 1: Operation not permitted"
         ));
     }
 
