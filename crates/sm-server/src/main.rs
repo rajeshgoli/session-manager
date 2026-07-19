@@ -74,11 +74,11 @@ async fn main() -> Result<()> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if !studio_ssh_flag.load(Ordering::SeqCst) {
-                continue;
-            }
+            // Drive toward the desired state in BOTH directions so "off" is
+            // enforced too (a stray enable that raced a disable gets corrected).
+            let desired = studio_ssh_flag.load(Ordering::SeqCst);
             let config = studio_ssh_config.clone();
-            match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config)).await {
+            match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config, desired)).await {
                 Ok(status) if status.status == "error" => {
                     eprintln!("studio-ssh reconcile error: {:?}", status.error);
                 }

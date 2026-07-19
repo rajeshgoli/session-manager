@@ -96,17 +96,29 @@ pub fn disable(cfg: &StudioSshConfig) -> Result<StudioSshStatus, String> {
     Ok(status(cfg))
 }
 
-/// Repair toward the enabled state. Intended to be called only when the desired
-/// flag is on. Re-runs the enable steps whenever the toggle is not fully `"on"`.
-/// Never flips the desired flag.
-pub fn reconcile(cfg: &StudioSshConfig) -> StudioSshStatus {
+/// Repair toward the `desired` state. Called on every reconcile tick, so it drives
+/// BOTH directions: when `desired` is true it re-enables a toggle that drifted off
+/// (e.g. a crashed agent); when `desired` is false it re-disables one that drifted
+/// on (e.g. a stray enable that raced a disable). This makes the in-memory desired
+/// flag authoritative — "off" stays off. Never flips the desired flag itself.
+pub fn reconcile(cfg: &StudioSshConfig, desired: bool) -> StudioSshStatus {
     let current = status(cfg);
-    if current.status == STATUS_ON {
-        return current;
-    }
-    match enable(cfg) {
-        Ok(status) => status,
-        Err(error) => error_status(cfg, error),
+    if desired {
+        if current.status == STATUS_ON {
+            return current;
+        }
+        match enable(cfg) {
+            Ok(status) => status,
+            Err(error) => error_status(cfg, error),
+        }
+    } else {
+        if current.status == STATUS_OFF {
+            return current;
+        }
+        match disable(cfg) {
+            Ok(status) => status,
+            Err(error) => error_status(cfg, error),
+        }
     }
 }
 
