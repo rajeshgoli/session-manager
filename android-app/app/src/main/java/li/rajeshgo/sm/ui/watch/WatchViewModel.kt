@@ -60,6 +60,11 @@ data class WatchUiState(
     val refreshing: Boolean = false,
     val requestingStatus: Boolean = false,
     val ensuringMaintainer: Boolean = false,
+    val studioSshEnabled: Boolean = false,
+    val studioSshStatus: String = "off",
+    val studioSshHost: String = "",
+    val studioSshBusy: Boolean = false,
+    val studioSshError: String? = null,
     val terminal: TerminalUiState? = null,
     val lastSync: String? = null,
     val error: String? = null,
@@ -686,6 +691,83 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             } finally {
                 _uiState.value = _uiState.value.copy(ensuringMaintainer = false)
             }
+        }
+    }
+
+    fun refreshStudioSshStatus() {
+        viewModelScope.launch {
+            val serverUrl = settingsRepository.serverUrl.first()
+            val accessToken = settingsRepository.accessToken.first()
+            if (serverUrl.isBlank() || accessToken.isBlank()) {
+                return@launch
+            }
+            if (_uiState.value.studioSshBusy) {
+                return@launch
+            }
+            runCatching { sessionRepository.fetchStudioSshStatus(serverUrl, accessToken) }
+                .onSuccess { status ->
+                    // A user toggle may have started while the read was in flight; don't stomp it.
+                    if (_uiState.value.studioSshBusy) {
+                        return@onSuccess
+                    }
+                    _uiState.value = _uiState.value.copy(
+                        studioSshEnabled = status.enabled,
+                        studioSshStatus = status.status,
+                        studioSshHost = status.host.ifBlank { _uiState.value.studioSshHost },
+                        studioSshError = status.error,
+                    )
+                }
+        }
+    }
+
+    fun toggleStudioSsh(enabled: Boolean, onComplete: (Result<String>) -> Unit) {
+        viewModelScope.launch {
+            if (_uiState.value.studioSshBusy) {
+                return@launch
+            }
+            val serverUrl = settingsRepository.serverUrl.first()
+            val accessToken = settingsRepository.accessToken.first()
+            if (serverUrl.isBlank() || accessToken.isBlank()) {
+                onComplete(Result.failure(IllegalStateException("Sign in to toggle Studio SSH")))
+                return@launch
+            }
+            // Optimistic: reflect the desired state immediately.
+            _uiState.value = _uiState.value.copy(
+                studioSshBusy = true,
+                studioSshEnabled = enabled,
+                studioSshStatus = if (enabled) "starting" else "off",
+                studioSshError = null,
+            )
+            val result = sessionRepository.setStudioSsh(serverUrl, accessToken, enabled)
+                .map { status ->
+                    _uiState.value = _uiState.value.copy(
+                        studioSshEnabled = status.enabled,
+                        studioSshStatus = status.status,
+                        studioSshHost = status.host.ifBlank { _uiState.value.studioSshHost },
+                        studioSshError = status.error,
+                    )
+                    if (enabled) "Studio SSH starting" else "Studio SSH off"
+                }
+            if (result.exceptionOrNull() is SessionManagerAuthException) {
+                settingsRepository.clearAuth()
+                _uiState.value = _uiState.value.copy(
+                    sessions = emptyList(),
+                    expandedSessionIds = emptySet(),
+                    detailsBySessionId = emptyMap(),
+                    lastSync = null,
+                    userEmail = "",
+                )
+            }
+            result.onFailure { error ->
+                // Revert the optimistic desired state; the next poll reconciles from the server.
+                _uiState.value = _uiState.value.copy(
+                    studioSshEnabled = !enabled,
+                    studioSshStatus = "error",
+                    studioSshError = error.message,
+                )
+            }
+            _uiState.value = _uiState.value.copy(studioSshBusy = false)
+            onComplete(result)
         }
     }
 }

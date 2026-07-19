@@ -17,6 +17,8 @@ import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
 import li.rajeshgo.sm.data.model.OutputResponse
 import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionListResponse
+import li.rajeshgo.sm.data.model.StudioSshStatusResponse
+import li.rajeshgo.sm.data.model.StudioSshToggleRequest
 import li.rajeshgo.sm.data.model.ToolCallsResponse
 import retrofit2.http.Body
 import retrofit2.http.GET
@@ -56,6 +58,12 @@ interface ApiService {
         @Header("X-SM-Device-Signature") signature: String,
         @Body request: MobileAttachTicketRequest = MobileAttachTicketRequest(),
     ): MobileAttachTicketResponse
+
+    @GET("admin/studio-ssh")
+    suspend fun getStudioSshStatus(): StudioSshStatusResponse
+
+    @POST("admin/studio-ssh")
+    suspend fun setStudioSsh(@Body request: StudioSshToggleRequest): StudioSshStatusResponse
 
     @POST("client/request-status")
     suspend fun requestStatus(): RequestStatusResponse
