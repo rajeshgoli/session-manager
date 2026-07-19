@@ -105,6 +105,17 @@ export interface EnsureMaintainerResponse {
   session: Session;
 }
 
+export type StudioSshState = 'off' | 'starting' | 'on' | 'error';
+
+export interface StudioSshStatus {
+  enabled: boolean;
+  status: StudioSshState;
+  host: string;
+  sshd_listening: boolean;
+  tunnel_running: boolean;
+  error?: string | null;
+}
+
 export interface WatchSection {
   repoKey: string;
   repoLabel: string;
