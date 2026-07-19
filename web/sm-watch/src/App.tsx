@@ -608,6 +608,7 @@ export default function App() {
                 <TerminalSquare size={13} className="text-cyan-200" />
                 <span className={`h-2 w-2 rounded-full ${studioSshDotClass}`} />
                 studio ssh - {studioSshState}
+                {studioSshError ? <span className="text-amber-300" title={studioSshError}>(stale)</span> : null}
                 <button
                   type="button"
                   onClick={() => void handleToggleStudioSsh()}
@@ -653,6 +654,7 @@ export default function App() {
               <span>sshd {studioSsh.sshd_listening ? 'listening' : 'down'}</span>
               <span>tunnel {studioSsh.tunnel_running ? 'running' : 'down'}</span>
               {studioSsh.error ? <span className="text-rose-300">{studioSsh.error}</span> : null}
+              {studioSshError ? <span className="text-amber-300">{studioSshError} (showing last known)</span> : null}
             </div>
           ) : studioSshError ? (
             <div className="mt-3 border-t border-zinc-800/70 pt-3 text-[11px] text-zinc-500">{studioSshError}</div>
