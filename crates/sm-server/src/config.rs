@@ -322,6 +322,51 @@ pub struct ExternalAccessConfig {
     pub ssh_username: Option<String>,
     #[serde(default)]
     pub ssh_proxy_command: Option<String>,
+    #[serde(default)]
+    pub studio_ssh: StudioSshConfig,
+}
+
+/// Configuration for the on-demand "Studio SSH" toggle. The public toggle drives
+/// two per-user LaunchAgents (a dedicated loopback sshd and a cloudflared tunnel)
+/// via `launchctl`. Plist paths derive from `~/Library/LaunchAgents/<label>.plist`
+/// at runtime.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StudioSshConfig {
+    #[serde(default = "default_studio_ssh_hostname")]
+    pub hostname: String,
+    #[serde(default = "default_studio_ssh_local_sshd_port")]
+    pub local_sshd_port: u16,
+    #[serde(default = "default_studio_ssh_sshd_launch_agent_label")]
+    pub sshd_launch_agent_label: String,
+    #[serde(default = "default_studio_ssh_tunnel_launch_agent_label")]
+    pub tunnel_launch_agent_label: String,
+}
+
+impl Default for StudioSshConfig {
+    fn default() -> Self {
+        Self {
+            hostname: default_studio_ssh_hostname(),
+            local_sshd_port: default_studio_ssh_local_sshd_port(),
+            sshd_launch_agent_label: default_studio_ssh_sshd_launch_agent_label(),
+            tunnel_launch_agent_label: default_studio_ssh_tunnel_launch_agent_label(),
+        }
+    }
+}
+
+fn default_studio_ssh_hostname() -> String {
+    "studio-ssh.rajeshgo.li".to_owned()
+}
+
+fn default_studio_ssh_local_sshd_port() -> u16 {
+    22222
+}
+
+fn default_studio_ssh_sshd_launch_agent_label() -> String {
+    "com.rajesh.sm-studio-ssh-sshd".to_owned()
+}
+
+fn default_studio_ssh_tunnel_launch_agent_label() -> String {
+    "com.rajesh.sm-studio-ssh-tunnel".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

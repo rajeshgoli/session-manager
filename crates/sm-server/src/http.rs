@@ -118,6 +118,7 @@ use crate::sessions::{
     SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
     UpdateSessionMetadataRequest,
 };
+use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
     log_tool_usage_to_path, ToolCallRow, ToolUsageEvent,
@@ -350,6 +351,7 @@ pub struct AppState {
     google_id_token_jwks_cache: Arc<Mutex<Option<GoogleIdTokenJwksCacheEntry>>>,
     mobile_terminal_revoked_keys: Arc<Mutex<BTreeSet<(String, String)>>>,
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
+    studio_ssh_enabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
 }
 
@@ -361,6 +363,7 @@ impl AppState {
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
+        let studio_ssh_enabled = studio_ssh::status(&config.external_access.studio_ssh).enabled;
         Self {
             config,
             session_store,
@@ -377,6 +380,7 @@ impl AppState {
             google_id_token_jwks_cache: Arc::new(Mutex::new(None)),
             mobile_terminal_revoked_keys: Arc::new(Mutex::new(BTreeSet::new())),
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
+            studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
         }
     }
@@ -384,6 +388,16 @@ impl AppState {
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
         self.github_review_poster = poster;
         self
+    }
+
+    /// Shared handle to the Studio SSH desired-state flag, for the reconcile loop.
+    pub fn studio_ssh_enabled_flag(&self) -> Arc<AtomicBool> {
+        self.studio_ssh_enabled.clone()
+    }
+
+    /// Read-only access to the loaded configuration (used to launch background tasks).
+    pub fn config(&self) -> &AppConfig {
+        &self.config
     }
 }
 
@@ -862,6 +876,10 @@ pub fn router(state: AppState) -> Router {
             post(disable_mobile_terminal),
         )
         .route(
+            "/admin/studio-ssh",
+            get(get_studio_ssh).post(set_studio_ssh),
+        )
+        .route(
             "/client/mobile-terminal/devices",
             get(list_mobile_terminal_devices),
         )
@@ -998,7 +1016,7 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy" }))
 }
 
-async fn health_detailed() -> Json<HealthDetailedResponse> {
+async fn health_detailed(State(state): State<Arc<AppState>>) -> Json<HealthDetailedResponse> {
     let mut checks = BTreeMap::new();
     checks.insert(
         "rust_server".to_owned(),
@@ -1014,6 +1032,29 @@ async fn health_detailed() -> Json<HealthDetailedResponse> {
             message: Some("No durable state ownership in this scaffold".to_owned()),
         },
     );
+
+    let studio_cfg = state.config.external_access.studio_ssh.clone();
+    let studio = tokio::task::spawn_blocking(move || studio_ssh::status(&studio_cfg))
+        .await
+        .ok();
+    let studio_check = match studio {
+        Some(status) => HealthCheck {
+            status: if status.status == "error" {
+                "error"
+            } else {
+                "ok"
+            },
+            message: Some(format!(
+                "studio ssh {} (enabled={}, sshd_listening={}, tunnel_running={})",
+                status.status, status.enabled, status.sshd_listening, status.tunnel_running
+            )),
+        },
+        None => HealthCheck {
+            status: "error",
+            message: Some("studio ssh status probe failed".to_owned()),
+        },
+    };
+    checks.insert("studio_ssh".to_owned(), studio_check);
 
     Json(HealthDetailedResponse {
         status: "healthy",
@@ -1558,6 +1599,7 @@ async fn client_bootstrap(
     Ok(Json(client_bootstrap_response(
         &state.config,
         mobile_terminal_runtime_disabled(&state),
+        state.studio_ssh_enabled.load(Ordering::SeqCst),
     )))
 }
 
@@ -4563,6 +4605,111 @@ async fn disable_mobile_terminal(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct StudioSshToggleRequest {
+    enabled: bool,
+}
+
+/// Authorize a Studio SSH admin request. Loopback requests skip Access entirely
+/// (local curl tests / internal callers). Non-local requests must satisfy the
+/// exact same gate as `disable_mobile_terminal`: mobile Cloudflare Access +
+/// public-edge assertion + an allowlisted owner who can disable mobile terminal.
+fn ensure_studio_ssh_admin(state: &Arc<AppState>, request: &Request) -> Result<(), ApiError> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
+        return Ok(());
+    }
+    let access_context = ensure_mobile_cloudflare_access_for_request(state, request)?;
+    ensure_public_edge_assertion_for_request(state, request)?;
+    let actor_email =
+        request_actor_email(&state.config, request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required".to_owned(),
+        })?;
+    ensure_mobile_cloudflare_access_context_matches_actor(
+        state,
+        access_context.as_ref(),
+        &actor_email,
+    )?;
+    let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to manage studio ssh".to_owned(),
+        });
+    };
+    if !user_config.interactive_shell_access || !mobile_terminal_user_can_disable(user_config) {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "User is not allowed to manage studio ssh".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn studio_ssh_error_status(config: &AppConfig, error: String) -> StudioSshStatus {
+    StudioSshStatus {
+        enabled: false,
+        status: "error".to_owned(),
+        host: config.external_access.studio_ssh.hostname.clone(),
+        sshd_listening: false,
+        tunnel_running: false,
+        error: Some(error),
+    }
+}
+
+async fn get_studio_ssh(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<StudioSshStatus>, ApiError> {
+    ensure_studio_ssh_admin(&state, &request)?;
+    let cfg = state.config.external_access.studio_ssh.clone();
+    let status = tokio::task::spawn_blocking(move || studio_ssh::status(&cfg))
+        .await
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: format!("studio ssh status task failed: {error}"),
+        })?;
+    Ok(Json(status))
+}
+
+async fn set_studio_ssh(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<StudioSshStatus>, ApiError> {
+    ensure_studio_ssh_admin(&state, &request)?;
+    let Json(payload) = Json::<StudioSshToggleRequest>::from_request(request, &state)
+        .await
+        .map_err(|error| ApiError::Status {
+            status: error.status(),
+            detail: error.body_text(),
+        })?;
+    let desired = payload.enabled;
+    let cfg = state.config.external_access.studio_ssh.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if desired {
+            studio_ssh::enable(&cfg)
+        } else {
+            studio_ssh::disable(&cfg)
+        }
+    })
+    .await
+    .map_err(|error| ApiError::Status {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: format!("studio ssh toggle task failed: {error}"),
+    })?;
+    // Record the desired state so the reconcile loop repairs toward it, even if
+    // this individual launchctl call reported a benign nonzero exit.
+    state.studio_ssh_enabled.store(desired, Ordering::SeqCst);
+    match result {
+        Ok(status) => Ok(Json(status)),
+        Err(error) => Ok(Json(studio_ssh_error_status(&state.config, error))),
+    }
+}
+
 async fn list_mobile_terminal_devices(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -7385,6 +7532,7 @@ fn shadow_predict_session_read(
 fn client_bootstrap_response(
     config: &AppConfig,
     mobile_terminal_runtime_disabled: bool,
+    studio_ssh_enabled: bool,
 ) -> ClientBootstrapResponse {
     let auth = &config.google_auth;
     let external = &config.external_access;
@@ -7413,6 +7561,8 @@ fn client_bootstrap_response(
             termux_attach_supported: false,
             mobile_terminal_supported,
             mobile_terminal_ws_url,
+            studio_ssh_enabled,
+            studio_ssh_host: external.studio_ssh.hostname.clone(),
         },
         session_open_defaults: SessionOpenDefaults {
             preferred_action: if mobile_terminal_supported {
@@ -10282,6 +10432,7 @@ fn bug_report_server_state(
         "bootstrap": client_bootstrap_response(
             &state.config,
             mobile_terminal_runtime_disabled(state),
+            state.studio_ssh_enabled.load(Ordering::SeqCst),
         ),
         "health": {
             "status": "healthy",
@@ -11287,6 +11438,8 @@ struct BootstrapExternalAccess {
     termux_attach_supported: bool,
     mobile_terminal_supported: bool,
     mobile_terminal_ws_url: Option<String>,
+    studio_ssh_enabled: bool,
+    studio_ssh_host: String,
 }
 
 #[derive(Serialize)]

@@ -7182,7 +7182,9 @@ async fn bootstrap_preserves_native_schema_without_termux_or_terminal_when_disab
                 "ssh_username": "rajesh",
                 "termux_attach_supported": false,
                 "mobile_terminal_supported": false,
-                "mobile_terminal_ws_url": null
+                "mobile_terminal_ws_url": null,
+                "studio_ssh_enabled": false,
+                "studio_ssh_host": "studio-ssh.rajeshgo.li"
             },
             "session_open_defaults": {
                 "preferred_action": "details",
