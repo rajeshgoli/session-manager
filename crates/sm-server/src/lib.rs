@@ -13,4 +13,5 @@ pub mod mobile_devices;
 pub mod queue;
 pub mod runtime;
 pub mod sessions;
+pub mod studio_ssh;
 pub mod tool_usage;

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, thread};
+use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering, thread, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -7,8 +7,12 @@ use sm_server::{
     http::{router, AppState},
     queue::{QueueAdmissionPolicy, QueueRecoverySummary, RetainedQueueStore},
     sessions::expand_home,
+    studio_ssh,
 };
 use tokio::net::TcpListener;
+
+/// How often the Studio SSH reconcile loop repairs toward the desired state.
+const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust Session Manager server scaffold")]
@@ -59,10 +63,35 @@ async fn main() -> Result<()> {
         );
     }
 
+    let state = AppState::new(config);
+
+    // Repair the Studio SSH LaunchAgents toward the desired state every 30s while
+    // the toggle is on. launchctl is synchronous, so run it on a blocking thread.
+    let studio_ssh_flag = state.studio_ssh_enabled_flag();
+    let studio_ssh_config = state.config().external_access.studio_ssh.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STUDIO_SSH_RECONCILE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            // Drive toward the desired state in BOTH directions so "off" is
+            // enforced too (a stray enable that raced a disable gets corrected).
+            let desired = studio_ssh_flag.load(Ordering::SeqCst);
+            let config = studio_ssh_config.clone();
+            match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config, desired)).await {
+                Ok(status) if status.status == "error" => {
+                    eprintln!("studio-ssh reconcile error: {:?}", status.error);
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("studio-ssh reconcile task failed: {error}"),
+            }
+        }
+    });
+
     eprintln!("sm-server listening on http://{address}");
     axum::serve(
         listener,
-        router(AppState::new(config)).into_make_service_with_connect_info::<SocketAddr>(),
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
     Ok(())
