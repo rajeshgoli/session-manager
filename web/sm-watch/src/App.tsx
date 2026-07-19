@@ -4,16 +4,19 @@ import {
   Bug,
   Cable,
   Layers3,
+  Loader2,
   Pause,
   Play,
+  Power,
   Search,
   Shield,
   Sparkles,
+  TerminalSquare,
   Wifi,
   WifiOff,
   X,
 } from 'lucide-react';
-import { Session, SessionDetail, ToolCallRow, ActivityActionRow, EnsureMaintainerResponse } from './types';
+import { Session, SessionDetail, ToolCallRow, ActivityActionRow, EnsureMaintainerResponse, StudioSshStatus } from './types';
 import {
   StatusFilter,
   ageFromIso,
@@ -32,6 +35,7 @@ const DETAIL_STALE_MS = 12000;
 const KILL_PATH = '/sessions/{id}/kill';
 const BUG_REPORT_PATH = '/client/bug-reports';
 const MAINTAINER_ENSURE_PATH = '/maintainer/ensure';
+const STUDIO_SSH_PATH = '/admin/studio-ssh';
 
 async function fetchJson<T>(paths: string[]): Promise<T | null> {
   for (const path of paths) {
@@ -51,6 +55,18 @@ async function fetchJson<T>(paths: string[]): Promise<T | null> {
     }
   }
   return null;
+}
+
+async function fetchStudioSshStatus(): Promise<StudioSshStatus | null> {
+  try {
+    const response = await fetch(STUDIO_SSH_PATH, { cache: 'no-store' });
+    if (!response.ok) {
+      return null;
+    }
+    return (await response.json()) as StudioSshStatus;
+  } catch {
+    return null;
+  }
 }
 
 function summarizeActionRows(session: Session, payload: { tool_calls?: ToolCallRow[]; actions?: ActivityActionRow[] } | null): string[] {
@@ -154,6 +170,19 @@ export default function App() {
   const [bugReportSessionId, setBugReportSessionId] = useState<string | null>(null);
   const [isSubmittingBugReport, setIsSubmittingBugReport] = useState(false);
   const [isEnsuringMaintainer, setIsEnsuringMaintainer] = useState(false);
+  const [studioSsh, setStudioSsh] = useState<StudioSshStatus | null>(null);
+  const [studioSshBusy, setStudioSshBusy] = useState(false);
+  const [studioSshError, setStudioSshError] = useState<string | null>(null);
+
+  const refreshStudioSsh = async () => {
+    const status = await fetchStudioSshStatus();
+    if (status) {
+      setStudioSsh(status);
+      setStudioSshError(null);
+    } else {
+      setStudioSshError('Studio SSH status unavailable.');
+    }
+  };
 
   const pollSessions = async () => {
     if (isPaused) {
@@ -173,8 +202,10 @@ export default function App() {
 
   useEffect(() => {
     void pollSessions();
+    void refreshStudioSsh();
     const timer = window.setInterval(() => {
       void pollSessions();
+      void refreshStudioSsh();
     }, POLL_MS);
     return () => window.clearInterval(timer);
   }, [isPaused]);
@@ -478,6 +509,60 @@ export default function App() {
     }
   };
 
+  const handleToggleStudioSsh = async () => {
+    if (studioSshBusy) {
+      return;
+    }
+    const desired = !(studioSsh?.enabled ?? false);
+    setStudioSshBusy(true);
+    setStudioSsh((prev) =>
+      prev ? { ...prev, enabled: desired, status: desired ? 'starting' : 'off' } : prev,
+    );
+    try {
+      const response = await fetch(STUDIO_SSH_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: desired }),
+      });
+
+      if (response.status === 401) {
+        const nextPath = window.location.pathname || '/watch/';
+        window.location.assign(`/auth/google/login?next=${encodeURIComponent(nextPath)}`);
+        return;
+      }
+
+      if (!response.ok) {
+        showToast(`Studio SSH ${desired ? 'enable' : 'disable'} rejected (${response.status}).`);
+        void refreshStudioSsh();
+        return;
+      }
+
+      const payload = (await response.json()) as StudioSshStatus;
+      setStudioSsh(payload);
+      setStudioSshError(null);
+      showToast(`Studio SSH ${desired ? 'enabling' : 'disabling'}: ${payload.status}.`);
+    } catch {
+      showToast('Studio SSH request failed.');
+      void refreshStudioSsh();
+    } finally {
+      setStudioSshBusy(false);
+    }
+  };
+
+  const studioSshState = studioSsh?.status ?? 'off';
+  const studioSshEnabled = studioSsh?.enabled ?? false;
+  const studioSshDotClass = {
+    off: 'bg-zinc-500',
+    starting: 'bg-amber-400 animate-pulse',
+    on: 'bg-emerald-400',
+    error: 'bg-rose-400',
+  }[studioSshState];
+  const studioSshTitle = studioSsh
+    ? `${studioSsh.host} - sshd ${studioSsh.sshd_listening ? 'listening' : 'down'}, tunnel ${
+        studioSsh.tunnel_running ? 'running' : 'down'
+      }${studioSsh.error ? ` - ${studioSsh.error}` : ''}`
+    : studioSshError || 'Studio SSH status unavailable';
+
   const bugReportSession = bugReportSessionId ? sessionsById.get(bugReportSessionId) || null : null;
 
   return (
@@ -516,6 +601,27 @@ export default function App() {
                 {isPaused ? <Play size={13} /> : <Pause size={13} />}
                 {isPaused ? 'resume polling' : 'pause polling'}
               </button>
+              <div
+                title={studioSshTitle}
+                className="inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-300"
+              >
+                <TerminalSquare size={13} className="text-cyan-200" />
+                <span className={`h-2 w-2 rounded-full ${studioSshDotClass}`} />
+                studio ssh - {studioSshState}
+                <button
+                  type="button"
+                  onClick={() => void handleToggleStudioSsh()}
+                  disabled={studioSshBusy}
+                  className={`ml-1 inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                    studioSshEnabled
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:border-emerald-400/60'
+                      : 'border-zinc-700 bg-zinc-900 text-zinc-300 hover:border-cyan-400/40 hover:text-cyan-100'
+                  }`}
+                >
+                  {studioSshBusy ? <Loader2 size={12} className="animate-spin" /> : <Power size={12} />}
+                  {studioSshEnabled ? 'on' : 'off'}
+                </button>
+              </div>
               <button
                 type="button"
                 onClick={() => void handleEnsureMaintainer()}
@@ -535,6 +641,22 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {studioSsh ? (
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-zinc-800/70 pt-3 text-[11px] text-zinc-400">
+              <span className="inline-flex items-center gap-1.5 font-semibold uppercase tracking-[0.18em] text-zinc-500">
+                <TerminalSquare size={12} className="text-cyan-200" />
+                Studio SSH
+              </span>
+              <span className="font-mono text-zinc-200">{studioSsh.host}</span>
+              <span className="rounded-md bg-zinc-900/80 px-2 py-0.5 font-mono text-cyan-200">ssh studio-away</span>
+              <span>sshd {studioSsh.sshd_listening ? 'listening' : 'down'}</span>
+              <span>tunnel {studioSsh.tunnel_running ? 'running' : 'down'}</span>
+              {studioSsh.error ? <span className="text-rose-300">{studioSsh.error}</span> : null}
+            </div>
+          ) : studioSshError ? (
+            <div className="mt-3 border-t border-zinc-800/70 pt-3 text-[11px] text-zinc-500">{studioSshError}</div>
+          ) : null}
         </header>
 
         <section className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
