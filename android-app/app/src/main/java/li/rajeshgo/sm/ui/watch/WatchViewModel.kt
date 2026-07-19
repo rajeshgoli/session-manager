@@ -79,6 +79,9 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private val sessionRepository = SessionManagerRepository(settingsRepository)
     private val deviceKeyManager = DeviceKeyManager()
     private var refreshJob: Job? = null
+    // Bumped on every Studio SSH toggle so status reads that began before the
+    // latest toggle can be discarded instead of applying stale pre-toggle data.
+    private var studioSshStatusGeneration = 0
     private var terminalSocket: WebSocket? = null
     private var terminalAttachToken: String? = null
     private var pendingTerminalResize: Pair<Int, Int>? = null
@@ -704,10 +707,12 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             if (_uiState.value.studioSshBusy) {
                 return@launch
             }
+            val generation = studioSshStatusGeneration
             runCatching { sessionRepository.fetchStudioSshStatus(serverUrl, accessToken) }
                 .onSuccess { status ->
-                    // A user toggle may have started while the read was in flight; don't stomp it.
-                    if (_uiState.value.studioSshBusy) {
+                    // A user toggle may have started (and possibly finished) while this
+                    // read was in flight; discard responses older than the latest toggle.
+                    if (_uiState.value.studioSshBusy || studioSshStatusGeneration != generation) {
                         return@onSuccess
                     }
                     _uiState.value = _uiState.value.copy(
@@ -731,6 +736,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                 onComplete(Result.failure(IllegalStateException("Sign in to toggle Studio SSH")))
                 return@launch
             }
+            // Invalidate any status read already in flight so its (pre-toggle) result is dropped.
+            studioSshStatusGeneration++
             // Optimistic: reflect the desired state immediately.
             _uiState.value = _uiState.value.copy(
                 studioSshBusy = true,
