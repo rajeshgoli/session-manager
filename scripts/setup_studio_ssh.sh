@@ -101,6 +101,14 @@ mkdirp() {
   fi
 }
 
+# Print the UUID of the `studio-ssh` tunnel, or empty if it does not exist.
+# Read-only; safe in dry-run. cloudflared returns JSON `null` when nothing matches.
+tunnel_uuid() {
+  command -v "${CLOUDFLARED_BIN}" >/dev/null 2>&1 || return 0
+  "${CLOUDFLARED_BIN}" tunnel list --name "${TUNNEL_NAME}" --output json 2>/dev/null \
+    | jq -r 'if type=="array" then (.[0].id // "") else "" end' 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Step 1 — cloudflared tunnel + config.yml
 # ---------------------------------------------------------------------------
@@ -109,13 +117,9 @@ setup_tunnel() {
   mkdirp "${CF_DIR}"
 
   local uuid=""
-  # Look up an existing tunnel by name (works in both real + dry-run).
-  if command -v "${CLOUDFLARED_BIN}" >/dev/null 2>&1; then
-    uuid="$("${CLOUDFLARED_BIN}" tunnel list --name "${TUNNEL_NAME}" --output json 2>/dev/null \
-              | /usr/bin/python3 -c 'import sys,json;
-d=json.load(sys.stdin);
-print(d[0]["id"] if d else "")' 2>/dev/null || true)"
-  fi
+  # Look up an existing tunnel by name (works in both real + dry-run). cloudflared
+  # returns `null` (not `[]`) when no tunnel matches, hence the array-type guard.
+  uuid="$(tunnel_uuid || true)"
 
   if [[ -n "${uuid}" ]]; then
     log "Tunnel '${TUNNEL_NAME}' already exists: ${uuid}"
@@ -126,8 +130,7 @@ print(d[0]["id"] if d else "")' 2>/dev/null || true)"
     else
       log "Creating tunnel '${TUNNEL_NAME}'..."
       "${CLOUDFLARED_BIN}" tunnel create "${TUNNEL_NAME}"
-      uuid="$("${CLOUDFLARED_BIN}" tunnel list --name "${TUNNEL_NAME}" --output json 2>/dev/null \
-                | /usr/bin/python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["id"] if d else "")')"
+      uuid="$(tunnel_uuid || true)"
       if [[ -z "${uuid}" ]]; then
         warn "Could not determine tunnel UUID after create"; exit 1
       fi
