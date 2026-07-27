@@ -56,15 +56,17 @@ function attachCommand(session: Session): string | null {
   return `ssh -t ${target} 'tmux attach-session -t ${quotedTmux}'`;
 }
 
-function activityTone(activityState?: string): string {
-  switch (activityState) {
+/** Takes a `stateLabel()` result, not a raw `activity_state`. */
+function activityTone(activityLabel?: string): string {
+  switch (activityLabel) {
     case 'working':
       return 'text-emerald-300';
     case 'thinking':
       return 'text-sky-300';
+    // Stopped, but background shells/monitors are still running.
+    case 'bg-wait':
+      return 'text-violet-300';
     case 'waiting':
-    case 'waiting_input':
-    case 'waiting_permission':
       return 'text-amber-300';
     case 'node-unreachable':
       return 'text-orange-300';

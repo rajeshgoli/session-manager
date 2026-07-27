@@ -106,17 +106,17 @@ use crate::queue::{
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
-    codex_fork_status_for_event_line, expand_home, is_primary_node, AgentRegistrationResponse,
-    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
-    ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
-    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
-    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
-    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
-    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
-    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
-    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
-    UpdateSessionMetadataRequest,
+    claude_hook_gate, codex_fork_status_for_event_line, expand_home, is_primary_node,
+    AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
+    ChildSessionResponse, ClaudeHookGate, ClearSessionRequest, ClientSessionResponse,
+    ContextMonitorOutcome, ContextMonitorRequest, CoreClearOutcome, CoreInputBatchResponse,
+    CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
+    CreateCoreSessionRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
+    RegistryMutationOutcome, RoleRegistrationRequest, SendCoreInputBatchRequest,
+    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
+    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
+    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
+    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
@@ -1285,7 +1285,18 @@ async fn claude_hook(
         .get("hook_event_name")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    // Stamped by the hook script before it detached its curl, so it describes when
+    // the event happened rather than when it reached us.
+    let emitted_at = hook_emitted_at(&payload);
+    if hook_event == "UserPromptSubmit" {
+        state
+            .session_store
+            .apply_claude_user_prompt_submit_hook(&session_id, emitted_at)?;
+    }
     if hook_event == "Stop" {
+        // Stamped before the transcript retry sleep below, so a turn-start that
+        // lands during that wait is recognised as the newer signal.
+        let received_at = now_rfc3339();
         let mut last_message = payload
             .get("sm_last_message")
             .and_then(Value::as_str)
@@ -1334,10 +1345,22 @@ async fn claude_hook(
             native_title,
             native_title_mtime_ns,
             transcript_path,
+            Some(&received_at),
+            emitted_at,
         )?;
     }
 
     Ok(Json(json!({ "status": "ok" })).into_response())
+}
+
+/// Emission stamp taken by `hooks/notify_server.sh` before it detached the curl
+/// that delivered this payload. Absent for hook scripts predating that change.
+fn hook_emitted_at(payload: &Value) -> Option<&str> {
+    payload
+        .get("sm_hook_emitted_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 async fn tool_use_hook(
@@ -7712,6 +7735,16 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         return None;
     }
     if session.provider.trim() == "claude" {
+        // Hook state is posted to the primary from every node, so it is answered
+        // before the node check — only the pane is node-local.
+        if claude_hook_gate(session) == ClaudeHookGate::TurnRunning {
+            // Hooks bracket the turn, so a fresh "turn in flight" signal is
+            // authoritative. Skip the pane capture entirely and state the answer
+            // outright — the default projection would otherwise call this idle
+            // once `last_activity` is 30s old, which is exactly what happens
+            // during a long tool-free response.
+            return Some("working");
+        }
         if !is_primary_node(&session.node) {
             return None;
         }
@@ -7752,14 +7785,76 @@ fn claude_live_activity_state(
     session: &SessionRecord,
     pane_text: Option<&str>,
 ) -> Option<&'static str> {
+    let gate = claude_hook_gate(session);
+    // Hooks reach the primary from every node, and the hook signal outranks both
+    // the pane and the default projection's 30s `last_activity` heuristic. Answer
+    // it before the node check so remote sessions are not stranded on the default
+    // projection for the rest of the freshness window.
+    if gate == ClaudeHookGate::TurnRunning {
+        return Some("working");
+    }
+    // Everything below needs the pane, which only the owning node can capture.
     if !is_primary_node(&session.node) {
         return None;
     }
-    claude_live_activity_from_pane(pane_text)
+    match gate {
+        ClaudeHookGate::TurnRunning => Some("working"),
+        // The Stop hook is authoritative: the agent's turn is over. Outstanding
+        // background work may only downgrade idle -> waiting, never upgrade to
+        // working.
+        ClaudeHookGate::TurnStopped => claude_pane_observation(pane_text)
+            .background_work
+            .then_some("waiting"),
+        // Last resort: the hook signal is missing or stale, so re-derive the
+        // state from the pane.
+        ClaudeHookGate::Untracked | ClaudeHookGate::Stale => {
+            claude_live_activity_from_pane(pane_text)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudePaneTurn {
+    Completed,
+    Working,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudePaneObservation {
+    turn: Option<ClaudePaneTurn>,
+    background_work: bool,
 }
 
 fn claude_live_activity_from_pane(pane_text: Option<&str>) -> Option<&'static str> {
-    let pane_text = pane_text?;
+    let observation = claude_pane_observation(pane_text);
+    let Some(turn) = observation.turn else {
+        // No status line left in the window — the completion line has scrolled
+        // away. The footer's "N shell" count is still live, and the spinner would
+        // sit just above that footer if the agent were generating, so its absence
+        // plus outstanding background work is exactly the `waiting` shape.
+        return observation.background_work.then_some("waiting");
+    };
+    match turn {
+        ClaudePaneTurn::Completed => Some(if observation.background_work {
+            "waiting"
+        } else {
+            "idle"
+        }),
+        ClaudePaneTurn::Working => Some("working"),
+    }
+}
+
+/// Classifies the tail of the tmux pane into a turn state plus an
+/// outstanding-background-work flag.
+///
+/// Background work is only read from the newest status line and the chrome
+/// below it (the footer mode line). Older status lines scroll up with stale
+/// "N shell still running" segments attached, and counting those would resurrect
+/// long-finished background work.
+fn claude_pane_observation(pane_text: Option<&str>) -> ClaudePaneObservation {
+    let Some(pane_text) = pane_text else {
+        return ClaudePaneObservation::default();
+    };
     let mut relevant_lines = Vec::new();
     for line in pane_text
         .lines()
@@ -7771,32 +7866,99 @@ fn claude_live_activity_from_pane(pane_text: Option<&str>) -> Option<&'static st
             relevant_lines.remove(0);
         }
     }
-    for line in relevant_lines.iter().rev().take(30) {
+
+    let window_start = relevant_lines.len().saturating_sub(30);
+    let window = &relevant_lines[window_start..];
+    // When no status line is visible at all, `turn_index` stays at 0 so the whole
+    // window is searched for background work — the footer mode line still carries
+    // a reliable "N shell, N monitor" count.
+    let mut turn = None;
+    let mut turn_index = 0;
+    for (index, line) in window.iter().enumerate().rev() {
         if claude_line_indicates_completed(line) {
-            return Some("idle");
+            turn = Some(ClaudePaneTurn::Completed);
+            turn_index = index;
+            break;
         }
         if claude_line_indicates_working(line) {
-            return Some("working");
+            turn = Some(ClaudePaneTurn::Working);
+            turn_index = index;
+            break;
         }
     }
-    None
+
+    let background_work = window[turn_index..]
+        .iter()
+        .any(|line| claude_line_indicates_background_work(line));
+
+    ClaudePaneObservation {
+        turn,
+        background_work,
+    }
 }
 
+/// Structural match for a finished turn: a status glyph, a single completion
+/// verb, `for`, and a duration — with no spinner ellipsis and no interrupt hint.
+///
+/// Deliberately verb-agnostic. Claude cycles through a large and growing set of
+/// completion verbs (Brewed, Baked, Churned, Crunched, Cooked, Simmered, …), and
+/// an allowlist silently fails to detect idle on every verb it has not seen.
 fn claude_line_indicates_completed(line: &str) -> bool {
     let line = line.trim();
-    !claude_line_indicates_background_work(line)
-        && (line.contains("Brewed for")
-            || line.contains("Baked for")
-            || line.contains("Churned for"))
+    if line.contains('…') || line.contains("esc to interrupt") {
+        return false;
+    }
+    let Some(rest) = claude_strip_status_glyph(line) else {
+        return false;
+    };
+    let mut tokens = rest.split_whitespace();
+    let Some(verb) = tokens.next() else {
+        return false;
+    };
+    if !verb.chars().all(char::is_alphabetic)
+        || !verb.chars().next().is_some_and(char::is_uppercase)
+    {
+        return false;
+    }
+    if tokens.next() != Some("for") {
+        return false;
+    }
+    tokens.next().is_some_and(claude_duration_token)
+}
+
+/// Strips the leading status glyph (`·` or the dingbat block Claude draws its
+/// spinner from), returning the remainder of the line.
+///
+/// Todo/checkbox glyphs live in the same block, so they are rejected explicitly:
+/// a todo entry such as `✔ Waited for 30s` must not read as a finished turn.
+fn claude_strip_status_glyph(line: &str) -> Option<&str> {
+    const TODO_GLYPHS: [char; 6] = ['✔', '✗', '✘', '✓', '❯', '❮'];
+    let mut chars = line.chars();
+    let first = chars.next()?;
+    if TODO_GLYPHS.contains(&first) {
+        return None;
+    }
+    if first != '·' && !(0x2700..=0x27bf).contains(&(first as u32)) {
+        return None;
+    }
+    Some(chars.as_str().trim_start())
+}
+
+/// `41s`, `9m`, `1h` — the duration segments Claude prints after `for`.
+fn claude_duration_token(token: &str) -> bool {
+    let digits_end = token
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(token.len());
+    if digits_end == 0 {
+        return false;
+    }
+    matches!(&token[digits_end..], "s" | "m" | "h" | "ms")
 }
 
 fn claude_line_indicates_working(line: &str) -> bool {
     let line = line.trim();
     if claude_line_indicates_completed(line) {
         return false;
-    }
-    if claude_line_indicates_background_work(line) {
-        return true;
     }
     if claude_spinner_status_line_indicates_working(line) {
         return true;
@@ -11542,7 +11704,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_pane_activity_detects_background_shell_monitor_work_at_prompt() {
+    fn claude_pane_activity_waits_on_background_shell_monitor_work_at_prompt() {
         let pane = r#"
 ⏺ Building/running. Let me wait for the monitor to surface the serve session-create number.
 
@@ -11558,11 +11720,11 @@ mod tests {
   Opus 4.8 (1M context)  [█████░░░░░░░░░░░░░░░] 27%
   ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← for agents
 "#;
-        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("waiting"));
     }
 
     #[test]
-    fn claude_pane_activity_detects_baked_background_work_at_prompt() {
+    fn claude_pane_activity_waits_on_baked_background_work_at_prompt() {
         let pane = r#"
 ⏺ Report delivered to the orchestrator.
 
@@ -11571,7 +11733,7 @@ mod tests {
 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯
 "#;
-        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("waiting"));
     }
 
     #[test]
@@ -11633,6 +11795,249 @@ mod tests {
         ⏵⏵ auto mode on · PR #48
 "#;
         assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("idle"));
+    }
+
+    #[test]
+    fn claude_pane_activity_detects_unlisted_completion_verbs() {
+        // "Crunched" (and every other verb Claude cycles through) was invisible
+        // to the old three-verb allowlist, so idle was never detected.
+        for verb in ["Crunched", "Cooked", "Simmered", "Sautéed", "Percolated"] {
+            let pane = format!(
+                "⏺ Type-checks clean.\n✻ {verb} for 41s\n❯\n────────\n  ⏵⏵ bypass permissions on · ← for agents\n"
+            );
+            assert_eq!(
+                claude_live_activity_from_pane(Some(&pane)),
+                Some("idle"),
+                "expected idle for completion verb {verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_pane_activity_ignores_completion_shaped_todo_entries() {
+        // Todo glyphs live in the same dingbat block as the status glyph; a todo
+        // entry that happens to read like a completion must not end the turn.
+        let pane = r#"
+  ✔ Waited for 30s
+✽ Incubating… (3m 3s · ↓ 9.9k tokens)
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_reports_waiting_when_only_the_footer_remains() {
+        // The completion line has scrolled out of the window, but the footer's
+        // shell count is still live. Background work must not vanish just because
+        // the status line it was attached to is gone.
+        let mut pane = String::new();
+        for index in 0..40 {
+            pane.push_str(&format!("⏺ Background command {index} completed\n"));
+        }
+        pane.push_str(
+            "─────────────\n❯\n  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← for agents\n",
+        );
+
+        assert_eq!(claude_live_activity_from_pane(Some(&pane)), Some("waiting"));
+    }
+
+    #[test]
+    fn claude_pane_activity_stays_unknown_without_a_turn_line_or_background_work() {
+        let mut pane = String::new();
+        for index in 0..40 {
+            pane.push_str(&format!("⏺ Background command {index} completed\n"));
+        }
+        pane.push_str("─────────────\n❯\n  ⏵⏵ bypass permissions on · ← for agents\n");
+
+        assert_eq!(claude_live_activity_from_pane(Some(&pane)), None);
+    }
+
+    #[test]
+    fn claude_pane_activity_ignores_interrupted_completion_line() {
+        let pane = r#"
+✻ Crunching for 41s (esc to interrupt)
+"#;
+        assert_eq!(claude_live_activity_from_pane(Some(pane)), None);
+    }
+
+    #[test]
+    fn claude_live_activity_trusts_fresh_turn_running_hook_over_pane() {
+        let session = claude_session_with_hook_state("running", Some(&now_rfc3339()));
+        let pane = "✻ Crunched for 41s\n";
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_recovers_working_when_a_turn_start_hook_is_lost() {
+        // notify_server.sh posts through a detached curl with no retry, so a
+        // UserPromptSubmit can simply never arrive. The preceding Stop then
+        // leaves a stored idle behind; once it ages out the pane has to be able
+        // to recognise the live turn, or the session reads idle for the whole of
+        // it. This is the original bug relocated from Stop to the turn-start.
+        let session = claude_session_with_hook_state("idle", Some("2026-06-01T00:00:00Z"));
+        let pane = "✽ Incubating… (3m 3s · ↓ 9.9k tokens)\n";
+
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_keeps_a_fresh_stopped_turn_conclusive() {
+        // The flip side: while the Stop signal is fresh it still outranks the
+        // pane, so a spinner mid-redraw cannot resurrect a finished turn.
+        let session = claude_session_with_hook_state("idle", Some(&now_rfc3339()));
+        let pane = "✽ Incubating… (3m 3s · ↓ 9.9k tokens)\n";
+
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnStopped);
+        assert_eq!(claude_live_activity_state(&session, Some(pane)), None);
+    }
+
+    #[test]
+    fn claude_live_activity_reports_working_for_remote_sessions_from_hook_state() {
+        // Hooks are posted to the primary from every node; only the pane is
+        // node-local. A remote session must not be stranded on the default
+        // projection, which calls it idle 30s in.
+        let mut session = claude_session_with_hook_state("running", Some(&now_rfc3339()));
+        session.node = "macbook".to_owned();
+        session.last_activity = "2026-06-01T00:00:00Z".to_owned();
+
+        assert_eq!(claude_live_activity_state(&session, None), Some("working"));
+        assert_eq!(
+            live_activity_state(&AppState::new(AppConfig::default()), &session),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_holds_working_through_a_long_tool_free_response() {
+        // `last_activity` is only refreshed by hooks, and none fire during a
+        // tool-free response. The default projection calls a running session idle
+        // after 30s, so the fresh turn-start hook has to say `working` outright.
+        let mut session = claude_session_with_hook_state("running", Some(&now_rfc3339()));
+        session.last_activity = "2026-06-01T00:00:00Z".to_owned();
+        assert_eq!(
+            projected_activity_state_for_test(&session),
+            "idle",
+            "precondition: the default projection has already gone stale"
+        );
+
+        assert_eq!(claude_live_activity_state(&session, None), Some("working"));
+    }
+
+    /// The default projection, read back off the serialized response so the test
+    /// does not need `SessionResponse`'s private fields widened.
+    fn projected_activity_state_for_test(session: &SessionRecord) -> String {
+        serde_json::to_value(SessionResponse::from(session.clone())).unwrap()["activity_state"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn claude_live_activity_recovers_idle_when_turn_running_hook_goes_stale() {
+        // The Stop hook is lossy (restarts, event-loop stalls, watchdog kills).
+        // Once the "turn in flight" signal ages out, the pane has to correct it.
+        let session = claude_session_with_hook_state("running", Some("2026-06-01T00:00:00Z"));
+        let pane = "✻ Crunched for 41s\n❯\n";
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_downgrades_stopped_turn_to_waiting_on_background_work() {
+        let session = claude_session_with_hook_state("idle", Some(&now_rfc3339()));
+        let pane = "✻ Baked for 24m 12s · 1 shell still running\n❯\n";
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("waiting")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_keeps_stopped_turn_idle_without_background_work() {
+        let session = claude_session_with_hook_state("idle", Some(&now_rfc3339()));
+        let pane = "✻ Baked for 24m 12s\n❯\n";
+
+        assert_eq!(claude_live_activity_state(&session, Some(pane)), None);
+    }
+
+    #[test]
+    fn claude_live_activity_never_upgrades_stopped_turn_to_working() {
+        // Bug 2: a background-work segment used to flip a correct hook-idle back
+        // to active. It may only ever downgrade idle -> waiting.
+        let session = claude_session_with_hook_state("idle", Some(&now_rfc3339()));
+        let pane = "✽ Incubating… (3m 3s · ↓ 9.9k tokens)\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n";
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("waiting")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_falls_back_to_pane_when_hooks_were_never_observed() {
+        let session = claude_session_with_hook_state("running", None);
+        let pane = "✻ Crunched for 41s\n❯\n";
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("idle")
+        );
+    }
+
+    /// Both ends of the turn are hooked — the fully wired case.
+    fn claude_session_with_hook_state(
+        status: &str,
+        activity_hook_at: Option<&str>,
+    ) -> SessionRecord {
+        let mut session = claude_session_with_stop_hook_only(status, activity_hook_at);
+        session.activity_turn_start_hook_at = activity_hook_at.map(str::to_owned);
+        session
+    }
+
+    /// Only the `Stop` hook is wired — a session running outside a repo that
+    /// installs `UserPromptSubmit`.
+    fn claude_session_with_stop_hook_only(
+        status: &str,
+        activity_hook_at: Option<&str>,
+    ) -> SessionRecord {
+        serde_json::from_value(json!({
+            "id": "claudehooked",
+            "name": "claude-claudehooked",
+            "working_dir": "/repo",
+            "tmux_session": "claudehooked",
+            "node": "primary",
+            "provider": "claude",
+            "status": status,
+            "created_at": "2026-06-01T00:00:00",
+            "last_activity": "2026-06-01T00:00:00",
+            "activity_hook_at": activity_hook_at
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn claude_live_activity_still_reads_the_pane_when_only_the_stop_hook_is_wired() {
+        // With no turn-start hook, a stored idle cannot be trusted to still hold:
+        // the next turn produces no signal until the first PreToolUse, and a
+        // tool-free response produces none at all. The pane has to stay in play.
+        let session = claude_session_with_stop_hook_only("idle", Some(&now_rfc3339()));
+        let pane = "✽ Incubating… (3m 3s · ↓ 9.9k tokens)\n";
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
     }
 
     #[test]
