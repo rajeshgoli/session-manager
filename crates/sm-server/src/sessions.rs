@@ -162,6 +162,11 @@ impl SessionStore {
             }))
     }
 
+    /// `received_at` is stamped when the hook request arrives, *before* the
+    /// handler's transcript retry sleep. `hooks/notify_server.sh` dispatches every
+    /// lifecycle hook through a detached curl, so a `Stop` that waited on its
+    /// retry can land after the next turn's `UserPromptSubmit`. Comparing against
+    /// `received_at` keeps the older signal from overwriting the newer one.
     pub fn apply_claude_stop_hook(
         &self,
         session_id: &str,
@@ -169,6 +174,7 @@ impl SessionStore {
         native_title: Option<&str>,
         native_title_mtime_ns: Option<i64>,
         transcript_path: Option<&str>,
+        received_at: Option<&str>,
     ) -> Result<bool> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -184,12 +190,22 @@ impl SessionStore {
             return Ok(false);
         }
 
+        // A lifecycle hook newer than this request already decided the state.
+        // The turn transition is superseded, but the transcript metadata this
+        // Stop carries is still the freshest we have, so it is applied either way.
+        let superseded = received_at.is_some_and(|received_at| {
+            json_text(session.get("activity_hook_at"))
+                .is_some_and(|stored| timestamp_is_after(&stored, received_at))
+        });
+
         let now = now_rfc3339();
-        session.insert("status".to_owned(), Value::String("idle".to_owned()));
-        session.insert("last_activity".to_owned(), Value::String(now.clone()));
-        session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
-        session.insert("agent_status_text".to_owned(), Value::Null);
-        session.insert("agent_status_at".to_owned(), Value::Null);
+        if !superseded {
+            session.insert("status".to_owned(), Value::String("idle".to_owned()));
+            session.insert("last_activity".to_owned(), Value::String(now.clone()));
+            session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
+            session.insert("agent_status_text".to_owned(), Value::Null);
+            session.insert("agent_status_at".to_owned(), Value::Null);
+        }
         if let Some(last_message) = last_message {
             session.insert(
                 "last_action_summary".to_owned(),
@@ -235,7 +251,7 @@ impl SessionStore {
             }
         }
         self.write_raw_json_value(&state)?;
-        Ok(true)
+        Ok(!superseded)
     }
 
     pub fn apply_claude_pre_tool_use_hook(
@@ -294,7 +310,10 @@ impl SessionStore {
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("running".to_owned()));
         session.insert("last_activity".to_owned(), Value::String(now.clone()));
-        session.insert("activity_hook_at".to_owned(), Value::String(now));
+        session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
+        // Records that turn-start hooks are actually wired for this session. Only
+        // then is a stored idle strong enough to suppress the pane fallback.
+        session.insert("activity_turn_start_hook_at".to_owned(), Value::String(now));
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         self.write_raw_json_value(&state)?;
         Ok(true)
@@ -2312,6 +2331,7 @@ impl SessionStore {
             created_at: now.clone(),
             last_activity: now,
             activity_hook_at: None,
+            activity_turn_start_hook_at: None,
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
@@ -5301,6 +5321,11 @@ pub struct SessionRecord {
     /// stored activity state is fresh enough to trust without scraping the pane.
     #[serde(default)]
     pub activity_hook_at: Option<String>,
+    /// Timestamp of the most recent `UserPromptSubmit`. Its presence is the only
+    /// evidence that turn-start hooks are wired for this session, which decides
+    /// whether a stored idle may suppress the pane fallback.
+    #[serde(default)]
+    pub activity_turn_start_hook_at: Option<String>,
     #[serde(default)]
     pub last_tool_call: Option<String>,
     #[serde(default)]
@@ -5685,6 +5710,26 @@ fn timestamp_is_within(value: &str, seconds: i64) -> bool {
     parse_python_naive_datetime(value).is_some_and(|parsed| now_local - parsed < window)
 }
 
+/// True when `value` is strictly newer than `other`. Both timestamps are written
+/// by `now_rfc3339()`, but older records may still carry the Python-era naive
+/// format, so both encodings are accepted. Returns false when either side is
+/// unparseable — an unknown ordering must never supersede anything.
+fn timestamp_is_after(value: &str, other: &str) -> bool {
+    if let (Ok(value), Ok(other)) = (
+        OffsetDateTime::parse(value.trim(), &Rfc3339),
+        OffsetDateTime::parse(other.trim(), &Rfc3339),
+    ) {
+        return value > other;
+    }
+    match (
+        parse_python_naive_datetime(value),
+        parse_python_naive_datetime(other),
+    ) {
+        (Some(value), Some(other)) => value > other,
+        _ => false,
+    }
+}
+
 /// How long a "turn in flight" hook signal is trusted before the pane scraper is
 /// allowed to second-guess it. Long enough to cover a slow tool call or a long
 /// stretch of pure thinking (no `PreToolUse` fires during either).
@@ -5698,7 +5743,8 @@ pub(crate) enum ClaudeHookGate {
     /// pane is the only signal available.
     Untracked,
     /// The `Stop` hook fired and no turn has started since. Authoritative: the
-    /// agent's turn is over.
+    /// agent's turn is over. Only reachable once a `UserPromptSubmit` has been
+    /// seen, so both ends of the turn are known to be observable.
     TurnStopped,
     /// A turn is in flight and the hook signal is recent enough to trust.
     TurnRunning,
@@ -5716,8 +5762,17 @@ pub(crate) fn claude_hook_gate(session: &SessionRecord) -> ClaudeHookGate {
     else {
         return ClaudeHookGate::Untracked;
     };
+    // A stored idle is only conclusive when the *start* of a turn is observable
+    // too. With only the Stop hook wired — the common case for sessions outside a
+    // repo that installs both — the first Stop would otherwise pin the session to
+    // idle for every later turn, right through a tool-free response.
+    let turn_start_hook_wired = session
+        .activity_turn_start_hook_at
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
     match normalized_status(session.status.trim()) {
-        "idle" => ClaudeHookGate::TurnStopped,
+        "idle" if turn_start_hook_wired => ClaudeHookGate::TurnStopped,
         "running" if timestamp_is_within(hook_at, CLAUDE_HOOK_STATE_FRESH_SECONDS) => {
             ClaudeHookGate::TurnRunning
         }
@@ -5977,6 +6032,7 @@ mod tests {
             created_at: "2026-06-01T00:00:00".to_owned(),
             last_activity: "2026-06-01T00:01:00".to_owned(),
             activity_hook_at: None,
+            activity_turn_start_hook_at: None,
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
@@ -6145,7 +6201,7 @@ mod tests {
         // memory a restart would revert a finished session to stale active.
         let store = store_with_running_claude_session("stopdurable");
         assert!(store
-            .apply_claude_stop_hook("stopdurable", None, None, None, None)
+            .apply_claude_stop_hook("stopdurable", None, None, None, None, None)
             .unwrap());
 
         // A fresh store over the same state file stands in for a restarted server.
@@ -6157,14 +6213,99 @@ mod tests {
 
         assert_eq!(session.status, "idle");
         assert_eq!(projected_activity_state(&session, &session.status), "idle");
+    }
+
+    #[test]
+    fn claude_stop_hook_alone_does_not_suppress_the_pane_fallback() {
+        // Without a turn-start hook the next turn is invisible until its first
+        // PreToolUse, so a stored idle must not gate the pane off.
+        let store = store_with_running_claude_session("stoponly");
+        assert!(store
+            .apply_claude_stop_hook("stoponly", None, None, None, None, None)
+            .unwrap());
+
+        let session = store.get_session("stoponly").unwrap().unwrap();
+
+        assert!(session.activity_turn_start_hook_at.is_none());
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
+    }
+
+    #[test]
+    fn claude_stop_hook_is_conclusive_once_both_ends_of_the_turn_are_hooked() {
+        let store = store_with_running_claude_session("bothends");
+        assert!(store
+            .apply_claude_user_prompt_submit_hook("bothends")
+            .unwrap());
+        assert!(store
+            .apply_claude_stop_hook("bothends", None, None, None, None, None)
+            .unwrap());
+
+        let session = store.get_session("bothends").unwrap().unwrap();
+
+        assert_eq!(session.status, "idle");
         assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnStopped);
+    }
+
+    #[test]
+    fn stale_stop_hook_does_not_overwrite_a_newer_turn_start() {
+        // notify_server.sh dispatches detached curls and the Stop path can sleep
+        // on its transcript retry, so a Stop received before the next prompt can
+        // still land after that prompt's UserPromptSubmit.
+        let store = store_with_running_claude_session("raced");
+        let stop_received_at = now_rfc3339();
+        assert!(store.apply_claude_user_prompt_submit_hook("raced").unwrap());
+
+        assert!(!store
+            .apply_claude_stop_hook(
+                "raced",
+                Some("summary from the previous turn"),
+                None,
+                None,
+                None,
+                Some(&stop_received_at)
+            )
+            .unwrap());
+
+        let session = store.get_session("raced").unwrap().unwrap();
+
+        assert_eq!(session.status, "running");
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnRunning);
+
+        let raw = store.load_raw_json_value().unwrap();
+        let sessions = raw["sessions"].as_array().unwrap();
+        let raw_session = sessions
+            .iter()
+            .find(|session| session["id"] == "raced")
+            .unwrap();
+        assert_eq!(
+            raw_session["last_action_summary"], "summary from the previous turn",
+            "a superseded Stop still carries the freshest transcript metadata"
+        );
+    }
+
+    #[test]
+    fn stop_hook_applies_normally_when_no_newer_lifecycle_hook_raced_it() {
+        let store = store_with_running_claude_session("unraced");
+        assert!(store
+            .apply_claude_user_prompt_submit_hook("unraced")
+            .unwrap());
+        let stop_received_at = now_rfc3339();
+
+        assert!(store
+            .apply_claude_stop_hook("unraced", None, None, None, None, Some(&stop_received_at))
+            .unwrap());
+
+        assert_eq!(
+            store.get_session("unraced").unwrap().unwrap().status,
+            "idle"
+        );
     }
 
     #[test]
     fn claude_user_prompt_submit_hook_marks_the_turn_running() {
         let store = store_with_running_claude_session("turnstart");
         assert!(store
-            .apply_claude_stop_hook("turnstart", None, None, None, None)
+            .apply_claude_stop_hook("turnstart", None, None, None, None, None)
             .unwrap());
         assert!(store
             .apply_claude_user_prompt_submit_hook("turnstart")

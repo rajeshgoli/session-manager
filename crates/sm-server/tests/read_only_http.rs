@@ -7535,6 +7535,37 @@ async fn claude_user_prompt_submit_hook_marks_session_working_at_turn_start() {
         .unwrap();
     assert_eq!(session["status"], "running");
     assert!(session["activity_hook_at"].is_string());
+    assert!(session["activity_turn_start_hook_at"].is_string());
+}
+
+#[tokio::test]
+async fn claude_stop_hook_alone_leaves_the_pane_fallback_in_charge() {
+    // A session outside a repo that installs UserPromptSubmit only ever sees
+    // Stop. Its stored idle must not be treated as conclusive, or every later
+    // turn would read idle until the first PreToolUse.
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["status"], "idle");
+    assert!(session["activity_turn_start_hook_at"].is_null());
 }
 
 #[tokio::test]

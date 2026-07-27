@@ -40,6 +40,25 @@ active/idle no longer depends on spinners or completion verbs.
 `Untracked` keeps sessions on nodes without hook wiring working exactly as
 before, so this is a safe rollout rather than a flag day.
 
+`TurnStopped` additionally requires `activity_turn_start_hook_at` — evidence
+that a `UserPromptSubmit` has actually been observed for this session. A stored
+idle is only conclusive when the *start* of a turn is observable too. Sessions
+run in arbitrary working directories and never load this repo's project-scoped
+settings, so a session with only the global `Stop` hook would otherwise be
+pinned to idle for every later turn, right through a tool-free response. Without
+that evidence the gate falls through to `Stale` and the pane stays in play.
+
+## Hook ordering
+
+`hooks/notify_server.sh` dispatches every lifecycle hook through a detached
+curl, and the `Stop` handler may sleep on its transcript retry before applying
+state. A `Stop` received before the next prompt can therefore land *after* that
+prompt's `UserPromptSubmit`. The handler stamps `received_at` when the request
+arrives, before the retry sleep; `apply_claude_stop_hook` skips the turn
+transition when the stored `activity_hook_at` is newer than that stamp. The
+transcript metadata the superseded `Stop` carries is still the freshest
+available, so it is applied either way.
+
 **The fallback no longer lies.** Completion detection is structural instead of
 an allowlist: a status glyph, one capitalised verb, `for`, and a duration, with
 no `…` spinner and no `(esc to interrupt)`. Todo glyphs (`✔`, `✗`, `❯`, …) share
@@ -63,10 +82,15 @@ to `working` — that was bug 2.
 
 ## Wiring
 
-`.claude/settings.json` routes both `UserPromptSubmit` and `Stop` to
-`hooks/notify_server.sh`, which posts to `/hooks/claude`. The script skips its
-transcript `tail | jq` pass for `UserPromptSubmit` (no transcript payload there,
-and it runs before every single turn).
+`scripts/install_notify_server_hook.sh` registers both `UserPromptSubmit` and
+`Stop` in `~/.claude/settings.json` (merging into whatever is already there, and
+idempotent on re-run). That user-level registration is what covers sessions in
+arbitrary working directories; this repo's `.claude/settings.json` carries the
+same two entries so the repo is self-contained.
+
+Both route to `hooks/notify_server.sh`, which posts to `/hooks/claude`. The
+script skips its transcript `tail | jq` pass for `UserPromptSubmit` (no
+transcript payload there, and it runs before every single turn).
 
 ## Clients
 

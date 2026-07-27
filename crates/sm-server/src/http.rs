@@ -1291,6 +1291,9 @@ async fn claude_hook(
             .apply_claude_user_prompt_submit_hook(&session_id)?;
     }
     if hook_event == "Stop" {
+        // Stamped before the transcript retry sleep below, so a turn-start that
+        // lands during that wait is recognised as the newer signal.
+        let received_at = now_rfc3339();
         let mut last_message = payload
             .get("sm_last_message")
             .and_then(Value::as_str)
@@ -1339,6 +1342,7 @@ async fn claude_hook(
             native_title,
             native_title_mtime_ns,
             transcript_path,
+            Some(&received_at),
         )?;
     }
 
@@ -11858,7 +11862,19 @@ mod tests {
         );
     }
 
+    /// Both ends of the turn are hooked — the fully wired case.
     fn claude_session_with_hook_state(
+        status: &str,
+        activity_hook_at: Option<&str>,
+    ) -> SessionRecord {
+        let mut session = claude_session_with_stop_hook_only(status, activity_hook_at);
+        session.activity_turn_start_hook_at = activity_hook_at.map(str::to_owned);
+        session
+    }
+
+    /// Only the `Stop` hook is wired — a session running outside a repo that
+    /// installs `UserPromptSubmit`.
+    fn claude_session_with_stop_hook_only(
         status: &str,
         activity_hook_at: Option<&str>,
     ) -> SessionRecord {
@@ -11875,6 +11891,20 @@ mod tests {
             "activity_hook_at": activity_hook_at
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn claude_live_activity_still_reads_the_pane_when_only_the_stop_hook_is_wired() {
+        // With no turn-start hook, a stored idle cannot be trusted to still hold:
+        // the next turn produces no signal until the first PreToolUse, and a
+        // tool-free response produces none at all. The pane has to stay in play.
+        let session = claude_session_with_stop_hook_only("idle", Some(&now_rfc3339()));
+        let pane = "✽ Incubating… (3m 3s · ↓ 9.9k tokens)\n";
+
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
     }
 
     #[test]
