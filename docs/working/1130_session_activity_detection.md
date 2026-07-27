@@ -32,13 +32,20 @@ active/idle no longer depends on spinners or completion verbs.
 
 | Gate          | Meaning                                            | Pane consulted?              |
 | ------------- | -------------------------------------------------- | ---------------------------- |
-| `TurnRunning` | turn in flight, hook signal fresh (< 180s)          | no — capture skipped entirely |
+| `TurnRunning` | turn in flight, hook signal fresh (< 180s)          | no — overlays `working` outright |
 | `TurnStopped` | `Stop` fired, no turn started since                 | background-work signal only  |
 | `Stale`       | turn reported in flight but the signal aged out     | yes — last resort            |
 | `Untracked`   | no lifecycle hook ever seen for this session        | yes — legacy behaviour        |
 
 `Untracked` keeps sessions on nodes without hook wiring working exactly as
 before, so this is a safe rollout rather than a flag day.
+
+`TurnRunning` states `working` outright rather than deferring to the default
+projection. `projected_activity_state` calls a `running` session idle once
+`last_activity` is 30s old, and `last_activity` is only refreshed by hooks — so
+a long tool-free response (no `PreToolUse` fires) would otherwise read idle from
+second 30 through second 180, exactly the window the fresh hook is supposed to
+cover.
 
 `TurnStopped` additionally requires `activity_turn_start_hook_at` — evidence
 that a `UserPromptSubmit` has actually been observed for this session. A stored

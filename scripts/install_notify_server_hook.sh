@@ -57,10 +57,21 @@ if not added:
     sys.exit(0)
 
 os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+
+# Settings can hold hook credentials and environment values. Writing a fresh
+# temp file and replacing would hand the result whatever the umask says
+# (commonly 0644), silently widening a 0600 file, so carry the original mode
+# across — and default a brand-new file to owner-only.
+try:
+    mode = os.stat(settings_path).st_mode & 0o777
+except FileNotFoundError:
+    mode = 0o600
+
 tmp_path = f"{settings_path}.tmp"
 with open(tmp_path, "w") as handle:
     json.dump(settings, handle, indent=2)
     handle.write("\n")
+os.chmod(tmp_path, mode)
 os.replace(tmp_path, settings_path)
 print(f"Registered notify_server for {', '.join(added)} in {settings_path}")
 PY

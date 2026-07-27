@@ -7726,8 +7726,11 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         }
         if claude_hook_gate(session) == ClaudeHookGate::TurnRunning {
             // Hooks bracket the turn, so a fresh "turn in flight" signal is
-            // authoritative. Skip the pane capture entirely.
-            return None;
+            // authoritative. Skip the pane capture entirely and state the answer
+            // outright — the default projection would otherwise call this idle
+            // once `last_activity` is 30s old, which is exactly what happens
+            // during a long tool-free response.
+            return Some("working");
         }
         let runtime = TmuxRuntime::from_app_config(&state.config)
             .for_socket_name(session.tmux_socket_name.as_deref());
@@ -7770,8 +7773,9 @@ fn claude_live_activity_state(
         return None;
     }
     match claude_hook_gate(session) {
-        // Hooks bracket the turn; the stored state already says what it needs to.
-        ClaudeHookGate::TurnRunning => None,
+        // Hooks bracket the turn, and the hook signal outranks both the pane and
+        // the default projection's 30s `last_activity` heuristic.
+        ClaudeHookGate::TurnRunning => Some("working"),
         // The Stop hook is authoritative: the agent's turn is over. Outstanding
         // background work may only downgrade idle -> waiting, never upgrade to
         // working.
@@ -11803,7 +11807,35 @@ mod tests {
         let session = claude_session_with_hook_state("running", Some(&now_rfc3339()));
         let pane = "✻ Crunched for 41s\n";
 
-        assert_eq!(claude_live_activity_state(&session, Some(pane)), None);
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_holds_working_through_a_long_tool_free_response() {
+        // `last_activity` is only refreshed by hooks, and none fire during a
+        // tool-free response. The default projection calls a running session idle
+        // after 30s, so the fresh turn-start hook has to say `working` outright.
+        let mut session = claude_session_with_hook_state("running", Some(&now_rfc3339()));
+        session.last_activity = "2026-06-01T00:00:00Z".to_owned();
+        assert_eq!(
+            projected_activity_state_for_test(&session),
+            "idle",
+            "precondition: the default projection has already gone stale"
+        );
+
+        assert_eq!(claude_live_activity_state(&session, None), Some("working"));
+    }
+
+    /// The default projection, read back off the serialized response so the test
+    /// does not need `SessionResponse`'s private fields widened.
+    fn projected_activity_state_for_test(session: &SessionRecord) -> String {
+        serde_json::to_value(SessionResponse::from(session.clone())).unwrap()["activity_state"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     #[test]
