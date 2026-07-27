@@ -7539,6 +7539,42 @@ async fn claude_user_prompt_submit_hook_marks_session_working_at_turn_start() {
 }
 
 #[tokio::test]
+async fn claude_stop_hook_delivered_after_the_next_turn_does_not_reset_it_to_idle() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_manager_id": "run12345",
+            "sm_hook_emitted_at": "2026-06-01T00:00:11.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The previous turn's Stop finally arrives, emitted a second earlier.
+    let (status, _) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "sm_hook_emitted_at": "2026-06-01T00:00:10.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["activity_state"], "working");
+}
+
+#[tokio::test]
 async fn claude_stop_hook_alone_leaves_the_pane_fallback_in_charge() {
     // A session outside a repo that installs UserPromptSubmit only ever sees
     // Stop. Its stored idle must not be treated as conclusive, or every later

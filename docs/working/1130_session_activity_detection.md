@@ -40,6 +40,11 @@ active/idle no longer depends on spinners or completion verbs.
 `Untracked` keeps sessions on nodes without hook wiring working exactly as
 before, so this is a safe rollout rather than a flag day.
 
+`TurnRunning` is answered *before* the primary-node check. Hooks are posted to
+the primary from every node; only the pane is node-local. Gating hook state on
+the node check would strand remote sessions on the default projection for the
+rest of the freshness window.
+
 `TurnRunning` states `working` outright rather than deferring to the default
 projection. `projected_activity_state` calls a `running` session idle once
 `last_activity` is 30s old, and `last_activity` is only refreshed by hooks — so
@@ -57,14 +62,30 @@ that evidence the gate falls through to `Stale` and the pane stays in play.
 
 ## Hook ordering
 
-`hooks/notify_server.sh` dispatches every lifecycle hook through a detached
-curl, and the `Stop` handler may sleep on its transcript retry before applying
-state. A `Stop` received before the next prompt can therefore land *after* that
-prompt's `UserPromptSubmit`. The handler stamps `received_at` when the request
-arrives, before the retry sleep; `apply_claude_stop_hook` skips the turn
-transition when the stored `activity_hook_at` is newer than that stamp. The
-transcript metadata the superseded `Stop` carries is still the freshest
-available, so it is applied either way.
+`hooks/notify_server.sh` dispatches every lifecycle hook through its own
+detached curl, so neither HTTP arrival order nor handler completion order
+matches the order the events actually happened in. An older `Stop` overwriting a
+newer turn-start would park a live session at idle for the rest of the turn, so
+two independent guards prevent it:
+
+- **Emission ordering** (authoritative). The hook script stamps
+  `sm_hook_emitted_at` before detaching, and the server compares it against the
+  turn-start's own emission stamp. This catches a `Stop` whose curl was delayed
+  past the next turn's `UserPromptSubmit` entirely. Both stamps come from the
+  node that owns the session, so they are always compared on one clock.
+- **Arrival ordering** (fallback). `received_at` is stamped when the request
+  arrives, before the handler's transcript retry sleep. This catches a `Stop`
+  that arrived first but applied late, and covers hook scripts too old to send
+  an emission stamp.
+
+Sub-second resolution matters — a `Stop` and the next turn's `UserPromptSubmit`
+routinely land in the same second. The script uses `date -u +…%N` where
+available and falls back to perl's `Time::HiRes` on BSD `date`, which has no
+`%N`. Both shapes (9 and 6 fractional digits) are pinned by a test, because an
+unparseable stamp would silently disable the guard rather than fail loudly.
+
+The transcript metadata a superseded `Stop` carries is still the freshest
+available, so it is applied either way — only the turn transition is skipped.
 
 **The fallback no longer lies.** Completion detection is structural instead of
 an allowlist: a status glyph, one capitalised verb, `for`, and a duration, with

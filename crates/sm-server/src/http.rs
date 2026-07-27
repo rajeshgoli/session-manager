@@ -1285,10 +1285,13 @@ async fn claude_hook(
         .get("hook_event_name")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    // Stamped by the hook script before it detached its curl, so it describes when
+    // the event happened rather than when it reached us.
+    let emitted_at = hook_emitted_at(&payload);
     if hook_event == "UserPromptSubmit" {
         state
             .session_store
-            .apply_claude_user_prompt_submit_hook(&session_id)?;
+            .apply_claude_user_prompt_submit_hook(&session_id, emitted_at)?;
     }
     if hook_event == "Stop" {
         // Stamped before the transcript retry sleep below, so a turn-start that
@@ -1343,10 +1346,21 @@ async fn claude_hook(
             native_title_mtime_ns,
             transcript_path,
             Some(&received_at),
+            emitted_at,
         )?;
     }
 
     Ok(Json(json!({ "status": "ok" })).into_response())
+}
+
+/// Emission stamp taken by `hooks/notify_server.sh` before it detached the curl
+/// that delivered this payload. Absent for hook scripts predating that change.
+fn hook_emitted_at(payload: &Value) -> Option<&str> {
+    payload
+        .get("sm_hook_emitted_at")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 async fn tool_use_hook(
@@ -7721,9 +7735,8 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         return None;
     }
     if session.provider.trim() == "claude" {
-        if !is_primary_node(&session.node) {
-            return None;
-        }
+        // Hook state is posted to the primary from every node, so it is answered
+        // before the node check — only the pane is node-local.
         if claude_hook_gate(session) == ClaudeHookGate::TurnRunning {
             // Hooks bracket the turn, so a fresh "turn in flight" signal is
             // authoritative. Skip the pane capture entirely and state the answer
@@ -7731,6 +7744,9 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
             // once `last_activity` is 30s old, which is exactly what happens
             // during a long tool-free response.
             return Some("working");
+        }
+        if !is_primary_node(&session.node) {
+            return None;
         }
         let runtime = TmuxRuntime::from_app_config(&state.config)
             .for_socket_name(session.tmux_socket_name.as_deref());
@@ -7769,12 +7785,19 @@ fn claude_live_activity_state(
     session: &SessionRecord,
     pane_text: Option<&str>,
 ) -> Option<&'static str> {
+    let gate = claude_hook_gate(session);
+    // Hooks reach the primary from every node, and the hook signal outranks both
+    // the pane and the default projection's 30s `last_activity` heuristic. Answer
+    // it before the node check so remote sessions are not stranded on the default
+    // projection for the rest of the freshness window.
+    if gate == ClaudeHookGate::TurnRunning {
+        return Some("working");
+    }
+    // Everything below needs the pane, which only the owning node can capture.
     if !is_primary_node(&session.node) {
         return None;
     }
-    match claude_hook_gate(session) {
-        // Hooks bracket the turn, and the hook signal outranks both the pane and
-        // the default projection's 30s `last_activity` heuristic.
+    match gate {
         ClaudeHookGate::TurnRunning => Some("working"),
         // The Stop hook is authoritative: the agent's turn is over. Outstanding
         // background work may only downgrade idle -> waiting, never upgrade to
@@ -11809,6 +11832,22 @@ mod tests {
 
         assert_eq!(
             claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_reports_working_for_remote_sessions_from_hook_state() {
+        // Hooks are posted to the primary from every node; only the pane is
+        // node-local. A remote session must not be stranded on the default
+        // projection, which calls it idle 30s in.
+        let mut session = claude_session_with_hook_state("running", Some(&now_rfc3339()));
+        session.node = "macbook".to_owned();
+        session.last_activity = "2026-06-01T00:00:00Z".to_owned();
+
+        assert_eq!(claude_live_activity_state(&session, None), Some("working"));
+        assert_eq!(
+            live_activity_state(&AppState::new(AppConfig::default()), &session),
             Some("working")
         );
     }

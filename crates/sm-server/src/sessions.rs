@@ -162,11 +162,18 @@ impl SessionStore {
             }))
     }
 
-    /// `received_at` is stamped when the hook request arrives, *before* the
-    /// handler's transcript retry sleep. `hooks/notify_server.sh` dispatches every
-    /// lifecycle hook through a detached curl, so a `Stop` that waited on its
-    /// retry can land after the next turn's `UserPromptSubmit`. Comparing against
-    /// `received_at` keeps the older signal from overwriting the newer one.
+    /// `hooks/notify_server.sh` dispatches every lifecycle hook through its own
+    /// detached curl, so neither HTTP arrival order nor handler completion order
+    /// matches the order the events actually happened in. Two independent guards
+    /// keep an older `Stop` from overwriting a newer turn-start:
+    ///
+    /// - `emitted_at` — stamped in the hook script before it detaches, and
+    ///   compared against the turn-start's own emission stamp. This is the
+    ///   authoritative ordering, and it catches a `Stop` whose curl was delayed
+    ///   past the next turn's `UserPromptSubmit` entirely.
+    /// - `received_at` — stamped on arrival, before the handler's transcript
+    ///   retry sleep. This catches a `Stop` that arrived first but applied late,
+    ///   and covers hooks emitted by a script too old to send `emitted_at`.
     pub fn apply_claude_stop_hook(
         &self,
         session_id: &str,
@@ -175,6 +182,7 @@ impl SessionStore {
         native_title_mtime_ns: Option<i64>,
         transcript_path: Option<&str>,
         received_at: Option<&str>,
+        emitted_at: Option<&str>,
     ) -> Result<bool> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -190,19 +198,36 @@ impl SessionStore {
             return Ok(false);
         }
 
-        // A lifecycle hook newer than this request already decided the state.
-        // The turn transition is superseded, but the transcript metadata this
-        // Stop carries is still the freshest we have, so it is applied either way.
-        let superseded = received_at.is_some_and(|received_at| {
+        // A lifecycle hook newer than this one already decided the state. The
+        // turn transition is superseded, but the transcript metadata this Stop
+        // carries is still the freshest we have, so it is applied either way.
+        //
+        // Emission stamps come from the node that owns the session, so a turn
+        // start and its Stop are always compared on a single clock.
+        let superseded_by_emission = match (
+            emitted_at,
+            json_text(session.get("activity_hook_emitted_at")),
+        ) {
+            (Some(emitted_at), Some(stored)) => timestamp_is_after(&stored, emitted_at),
+            _ => false,
+        };
+        let superseded_by_arrival = received_at.is_some_and(|received_at| {
             json_text(session.get("activity_hook_at"))
                 .is_some_and(|stored| timestamp_is_after(&stored, received_at))
         });
+        let superseded = superseded_by_emission || superseded_by_arrival;
 
         let now = now_rfc3339();
         if !superseded {
             session.insert("status".to_owned(), Value::String("idle".to_owned()));
             session.insert("last_activity".to_owned(), Value::String(now.clone()));
             session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
+            session.insert(
+                "activity_hook_emitted_at".to_owned(),
+                emitted_at.map_or(Value::Null, |emitted_at| {
+                    Value::String(emitted_at.to_owned())
+                }),
+            );
             session.insert("agent_status_text".to_owned(), Value::Null);
             session.insert("agent_status_at".to_owned(), Value::Null);
         }
@@ -292,7 +317,11 @@ impl SessionStore {
     /// `UserPromptSubmit` brackets the start of a turn. Together with the `Stop`
     /// hook it makes active/idle a pure function of hook signals, so the pane
     /// scraper never has to guess from spinners or completion verbs.
-    pub fn apply_claude_user_prompt_submit_hook(&self, session_id: &str) -> Result<bool> {
+    pub fn apply_claude_user_prompt_submit_hook(
+        &self,
+        session_id: &str,
+        emitted_at: Option<&str>,
+    ) -> Result<bool> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
             return Ok(false);
@@ -314,6 +343,14 @@ impl SessionStore {
         // Records that turn-start hooks are actually wired for this session. Only
         // then is a stored idle strong enough to suppress the pane fallback.
         session.insert("activity_turn_start_hook_at".to_owned(), Value::String(now));
+        // The stamp the hook script took before detaching. A Stop carrying an
+        // older emission stamp is recognised as belonging to the previous turn.
+        session.insert(
+            "activity_hook_emitted_at".to_owned(),
+            emitted_at.map_or(Value::Null, |emitted_at| {
+                Value::String(emitted_at.to_owned())
+            }),
+        );
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         self.write_raw_json_value(&state)?;
         Ok(true)
@@ -6201,7 +6238,7 @@ mod tests {
         // memory a restart would revert a finished session to stale active.
         let store = store_with_running_claude_session("stopdurable");
         assert!(store
-            .apply_claude_stop_hook("stopdurable", None, None, None, None, None)
+            .apply_claude_stop_hook("stopdurable", None, None, None, None, None, None)
             .unwrap());
 
         // A fresh store over the same state file stands in for a restarted server.
@@ -6221,7 +6258,7 @@ mod tests {
         // PreToolUse, so a stored idle must not gate the pane off.
         let store = store_with_running_claude_session("stoponly");
         assert!(store
-            .apply_claude_stop_hook("stoponly", None, None, None, None, None)
+            .apply_claude_stop_hook("stoponly", None, None, None, None, None, None)
             .unwrap());
 
         let session = store.get_session("stoponly").unwrap().unwrap();
@@ -6234,10 +6271,10 @@ mod tests {
     fn claude_stop_hook_is_conclusive_once_both_ends_of_the_turn_are_hooked() {
         let store = store_with_running_claude_session("bothends");
         assert!(store
-            .apply_claude_user_prompt_submit_hook("bothends")
+            .apply_claude_user_prompt_submit_hook("bothends", None)
             .unwrap());
         assert!(store
-            .apply_claude_stop_hook("bothends", None, None, None, None, None)
+            .apply_claude_stop_hook("bothends", None, None, None, None, None, None)
             .unwrap());
 
         let session = store.get_session("bothends").unwrap().unwrap();
@@ -6253,7 +6290,9 @@ mod tests {
         // still land after that prompt's UserPromptSubmit.
         let store = store_with_running_claude_session("raced");
         let stop_received_at = now_rfc3339();
-        assert!(store.apply_claude_user_prompt_submit_hook("raced").unwrap());
+        assert!(store
+            .apply_claude_user_prompt_submit_hook("raced", None)
+            .unwrap());
 
         assert!(!store
             .apply_claude_stop_hook(
@@ -6262,7 +6301,8 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(&stop_received_at)
+                Some(&stop_received_at),
+                None
             )
             .unwrap());
 
@@ -6284,15 +6324,105 @@ mod tests {
     }
 
     #[test]
+    fn hook_emission_stamps_from_both_shell_clock_paths_are_comparable() {
+        // notify_server.sh emits 9 fractional digits via GNU-style `date +%N` and
+        // 6 via the perl Time::HiRes fallback. An unparseable stamp makes
+        // `timestamp_is_after` return false, silently disabling the ordering
+        // guard rather than failing loudly — so both shapes are pinned here.
+        let nanos = "2026-07-27T18:30:55.266446000Z";
+        let micros = "2026-07-27T18:30:55.266447Z";
+
+        assert!(timestamp_is_after(micros, nanos));
+        assert!(!timestamp_is_after(nanos, micros));
+        assert!(!timestamp_is_after(nanos, nanos));
+        // Mixed resolutions across the two paths must still order correctly.
+        assert!(timestamp_is_after(
+            "2026-07-27T18:30:56.000001Z",
+            "2026-07-27T18:30:55.999999999Z"
+        ));
+        // An unparseable side must never supersede anything.
+        assert!(!timestamp_is_after("not-a-timestamp", nanos));
+        assert!(!timestamp_is_after(nanos, "not-a-timestamp"));
+    }
+
+    #[test]
+    fn stop_hook_delivered_after_the_next_turn_is_ordered_by_emission_time() {
+        // Each hook gets its own detached curl, so a Stop can be delayed until
+        // after the next turn's UserPromptSubmit has already been delivered. By
+        // arrival order the Stop looks newest; only the emission stamps, taken
+        // before either curl detached, reveal the real order.
+        let store = store_with_running_claude_session("latecurl");
+        let stop_emitted_at = "2026-06-01T00:00:10.000000Z";
+        let turn_start_emitted_at = "2026-06-01T00:00:11.000000Z";
+
+        assert!(store
+            .apply_claude_user_prompt_submit_hook("latecurl", Some(turn_start_emitted_at))
+            .unwrap());
+
+        // Arrival is now, i.e. after the turn start was stored, so the arrival
+        // guard alone would let this stale Stop through.
+        let stop_received_at = now_rfc3339();
+        assert!(!store
+            .apply_claude_stop_hook(
+                "latecurl",
+                None,
+                None,
+                None,
+                None,
+                Some(&stop_received_at),
+                Some(stop_emitted_at)
+            )
+            .unwrap());
+
+        let session = store.get_session("latecurl").unwrap().unwrap();
+
+        assert_eq!(session.status, "running");
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnRunning);
+    }
+
+    #[test]
+    fn stop_hook_emitted_after_the_last_turn_start_still_applies() {
+        let store = store_with_running_claude_session("orderok");
+        assert!(store
+            .apply_claude_user_prompt_submit_hook("orderok", Some("2026-06-01T00:00:10.000000Z"))
+            .unwrap());
+
+        assert!(store
+            .apply_claude_stop_hook(
+                "orderok",
+                None,
+                None,
+                None,
+                None,
+                Some(&now_rfc3339()),
+                Some("2026-06-01T00:00:11.000000Z")
+            )
+            .unwrap());
+
+        assert_eq!(
+            store.get_session("orderok").unwrap().unwrap().status,
+            "idle"
+        );
+    }
+
+    #[test]
     fn stop_hook_applies_normally_when_no_newer_lifecycle_hook_raced_it() {
         let store = store_with_running_claude_session("unraced");
         assert!(store
-            .apply_claude_user_prompt_submit_hook("unraced")
+            .apply_claude_user_prompt_submit_hook("unraced", None)
             .unwrap());
         let stop_received_at = now_rfc3339();
 
         assert!(store
-            .apply_claude_stop_hook("unraced", None, None, None, None, Some(&stop_received_at))
+            .apply_claude_stop_hook(
+                "unraced",
+                None,
+                None,
+                None,
+                None,
+                Some(&stop_received_at),
+                None
+            )
             .unwrap());
 
         assert_eq!(
@@ -6305,10 +6435,10 @@ mod tests {
     fn claude_user_prompt_submit_hook_marks_the_turn_running() {
         let store = store_with_running_claude_session("turnstart");
         assert!(store
-            .apply_claude_stop_hook("turnstart", None, None, None, None, None)
+            .apply_claude_stop_hook("turnstart", None, None, None, None, None, None)
             .unwrap());
         assert!(store
-            .apply_claude_user_prompt_submit_hook("turnstart")
+            .apply_claude_user_prompt_submit_hook("turnstart", None)
             .unwrap());
 
         let session = store.get_session("turnstart").unwrap().unwrap();
@@ -6331,7 +6461,7 @@ mod tests {
         }
 
         assert!(!store
-            .apply_claude_user_prompt_submit_hook("stoppedsess")
+            .apply_claude_user_prompt_submit_hook("stoppedsess", None)
             .unwrap());
         assert_eq!(
             store.get_session("stoppedsess").unwrap().unwrap().status,

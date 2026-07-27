@@ -7,6 +7,34 @@ HOOK_BASE_URL="${SM_HOOK_BASE_URL:-http://localhost:8420}"
 HOOK_URL="${SM_HOOK_URL:-${HOOK_BASE_URL%/}/hooks/claude}"
 HOOK_LOG_PATH="${CLAUDE_HOOK_LOG_PATH:-/tmp/claude-hooks.log}"
 
+# Emission timestamp, stamped before the curl is detached. Lifecycle hooks are
+# posted from independent background processes, so HTTP arrival order does not
+# match the order the events actually happened in; the server orders Stop against
+# the newest turn-start using these stamps. Sub-second resolution matters: a Stop
+# and the next turn's UserPromptSubmit routinely land in the same second.
+hook_emitted_at() {
+  local stamp
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%S.%N 2>/dev/null || true)
+  case "$stamp" in
+    *%N*|'')
+      # BSD date without %N. Time::HiRes ships with every stock perl.
+      stamp=$(perl -MTime::HiRes=time -e '
+        my $t = time;
+        my @g = gmtime(int($t));
+        printf("%04d-%02d-%02dT%02d:%02d:%02d.%06dZ",
+          $g[5]+1900, $g[4]+1, $g[3], $g[2], $g[1], $g[0], ($t-int($t))*1000000);
+      ' 2>/dev/null || true)
+      ;;
+    *)
+      stamp="${stamp}Z"
+      ;;
+  esac
+  if [ -z "$stamp" ]; then
+    stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+  fi
+  printf '%s' "$stamp"
+}
+
 extract_transcript_metadata() {
   local transcript_path="$1"
   if [ -z "$transcript_path" ] || [ ! -f "$transcript_path" ]; then
@@ -70,6 +98,11 @@ if [ -z "$INPUT" ]; then
   exit 0
 fi
 
+# Stamped here, before the transcript retry sleeps below. Those sleeps are
+# precisely what lets a Stop land after the next turn's UserPromptSubmit, so the
+# stamp has to predate them to describe when the event actually happened.
+EMITTED_AT="$(hook_emitted_at)"
+
 # Inline transcript metadata for remote delivery. When the hook is posting to a
 # non-local primary, that primary cannot safely read the node-local transcript.
 # UserPromptSubmit is a turn-start signal only and carries no transcript payload,
@@ -99,10 +132,14 @@ if [ -n "$SM_HOOK_BASE_URL" ] || [ -n "$SM_HOOK_URL" ]; then
   fi
 fi
 
-# If CLAUDE_SESSION_MANAGER_ID is set (from environment), inject it into the payload.
-if [ -n "$CLAUDE_SESSION_MANAGER_ID" ]; then
-  INPUT=$(echo "$INPUT" | jq -c --arg sid "$CLAUDE_SESSION_MANAGER_ID" '. + {session_manager_id: $sid}')
-fi
+# Attach the emission stamp, plus CLAUDE_SESSION_MANAGER_ID when the environment
+# provides it. Done in one jq pass to keep this off the per-turn hot path.
+INPUT=$(jq -c \
+  --arg sid "${CLAUDE_SESSION_MANAGER_ID:-}" \
+  --arg emitted "$EMITTED_AT" \
+  '. + (if $emitted != "" then {sm_hook_emitted_at: $emitted} else {} end)
+     + (if $sid != "" then {session_manager_id: $sid} else {} end)' \
+  <<< "$INPUT" 2>/dev/null || echo "$INPUT")
 
 # Post to local server asynchronously (don't block Claude).
 # Close inherited FDs so Claude Code does not keep waiting on the background curl.
