@@ -2,7 +2,10 @@ import { Session, SessionDetail, WatchRepoRef, WatchRow, WatchSection, WatchSess
 
 export type StatusFilter = 'all' | Session['status'];
 
-const WAITING_STATES = new Set(['waiting', 'waiting_permission', 'waiting_input']);
+// `waiting` means "the agent's turn stopped but background shells/monitors are
+// still running" — it is not the same thing as waiting on a human, so it gets
+// its own label and colour.
+const INPUT_WAITING_STATES = new Set(['waiting_permission', 'waiting_input']);
 
 function sortSessions(left: Session, right: Session): number {
   return sessionDisplayName(left).localeCompare(sessionDisplayName(right), undefined, { sensitivity: 'base' })
@@ -133,7 +136,10 @@ export function stateLabel(activityState?: string | null): string {
   if (!activityState) {
     return 'idle';
   }
-  if (WAITING_STATES.has(activityState)) {
+  if (activityState === 'waiting') {
+    return 'bg-wait';
+  }
+  if (INPUT_WAITING_STATES.has(activityState)) {
     return 'waiting';
   }
   return activityState;

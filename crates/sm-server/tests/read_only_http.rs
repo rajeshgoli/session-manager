@@ -7488,6 +7488,56 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
 }
 
 #[tokio::test]
+async fn claude_user_prompt_submit_hook_marks_session_working_at_turn_start() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["activity_state"], "idle");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_manager_id": "run12345",
+            "prompt": "please review the diff"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["activity_state"], "working");
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["status"], "running");
+    assert!(session["activity_hook_at"].is_string());
+}
+
+#[tokio::test]
 async fn claude_stop_hook_marks_session_idle_for_watch_clients() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));

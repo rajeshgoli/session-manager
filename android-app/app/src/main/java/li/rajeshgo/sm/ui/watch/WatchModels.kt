@@ -64,7 +64,7 @@ fun isOperationallyActive(session: ClientSession): Boolean {
     val rawActivity = session.activityState?.trim()
     val activity = activityLabel(rawActivity)
     return when {
-        activity == "working" || activity == "thinking" || activity == "waiting" -> true
+        activity == "working" || activity == "thinking" || activity == "waiting" || activity == "bg-wait" -> true
         !rawActivity.isNullOrEmpty() -> false
         else -> session.status == "running"
     }
@@ -267,7 +267,10 @@ fun formatDateTime(value: String?): String {
 
 fun activityLabel(state: String?): String {
     return when (state) {
-        "waiting_permission", "waiting_input", "waiting" -> "waiting"
+        // The agent's turn stopped but background shells/monitors are still
+        // running — distinct from waiting on a human.
+        "waiting" -> "bg-wait"
+        "waiting_permission", "waiting_input" -> "waiting"
         null, "" -> "idle"
         else -> state
     }

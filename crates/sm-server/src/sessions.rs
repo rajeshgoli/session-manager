@@ -187,6 +187,7 @@ impl SessionStore {
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("idle".to_owned()));
         session.insert("last_activity".to_owned(), Value::String(now.clone()));
+        session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
         session.insert("agent_status_text".to_owned(), Value::Null);
         session.insert("agent_status_at".to_owned(), Value::Null);
         if let Some(last_message) = last_message {
@@ -259,6 +260,7 @@ impl SessionStore {
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("running".to_owned()));
         session.insert("last_activity".to_owned(), Value::String(now.clone()));
+        session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         if let Some(tool_name) = tool_name {
             session.insert(
@@ -267,6 +269,33 @@ impl SessionStore {
             );
             session.insert("last_tool_call".to_owned(), Value::String(now));
         }
+        self.write_raw_json_value(&state)?;
+        Ok(true)
+    }
+
+    /// `UserPromptSubmit` brackets the start of a turn. Together with the `Stop`
+    /// hook it makes active/idle a pure function of hook signals, so the pane
+    /// scraper never has to guess from spinners or completion verbs.
+    pub fn apply_claude_user_prompt_submit_hook(&self, session_id: &str) -> Result<bool> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(false);
+        };
+        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+            return Ok(false);
+        }
+
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("running".to_owned()));
+        session.insert("last_activity".to_owned(), Value::String(now.clone()));
+        session.insert("activity_hook_at".to_owned(), Value::String(now));
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
         self.write_raw_json_value(&state)?;
         Ok(true)
     }
@@ -2282,6 +2311,7 @@ impl SessionStore {
             spawned_at: Some(now.clone()),
             created_at: now.clone(),
             last_activity: now,
+            activity_hook_at: None,
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
@@ -5266,6 +5296,11 @@ pub struct SessionRecord {
     pub spawned_at: Option<String>,
     pub created_at: String,
     pub last_activity: String,
+    /// Timestamp of the most recent authoritative Claude lifecycle hook
+    /// (`UserPromptSubmit`, `PreToolUse`, `Stop`). Used to decide whether the
+    /// stored activity state is fresh enough to trust without scraping the pane.
+    #[serde(default)]
+    pub activity_hook_at: Option<String>,
     #[serde(default)]
     pub last_tool_call: Option<String>,
     #[serde(default)]
@@ -5637,13 +5672,57 @@ fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
 }
 
 fn session_activity_is_recent(last_activity: &str) -> bool {
+    timestamp_is_within(last_activity, 30)
+}
+
+fn timestamp_is_within(value: &str, seconds: i64) -> bool {
+    let window = TimeDuration::seconds(seconds);
     let now_utc = OffsetDateTime::now_utc();
-    if let Ok(parsed) = OffsetDateTime::parse(last_activity.trim(), &Rfc3339) {
-        return now_utc - parsed < TimeDuration::seconds(30);
+    if let Ok(parsed) = OffsetDateTime::parse(value.trim(), &Rfc3339) {
+        return now_utc - parsed < window;
     }
     let now_local = local_now_naive(now_utc);
-    parse_python_naive_datetime(last_activity)
-        .is_some_and(|last_activity| now_local - last_activity < TimeDuration::seconds(30))
+    parse_python_naive_datetime(value).is_some_and(|parsed| now_local - parsed < window)
+}
+
+/// How long a "turn in flight" hook signal is trusted before the pane scraper is
+/// allowed to second-guess it. Long enough to cover a slow tool call or a long
+/// stretch of pure thinking (no `PreToolUse` fires during either).
+const CLAUDE_HOOK_STATE_FRESH_SECONDS: i64 = 180;
+
+/// How much the hook-derived activity state can be trusted, and therefore
+/// whether the tmux pane needs to be consulted at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeHookGate {
+    /// No Claude lifecycle hook has ever been recorded for this session, so the
+    /// pane is the only signal available.
+    Untracked,
+    /// The `Stop` hook fired and no turn has started since. Authoritative: the
+    /// agent's turn is over.
+    TurnStopped,
+    /// A turn is in flight and the hook signal is recent enough to trust.
+    TurnRunning,
+    /// A turn was reported in flight but the hook signal has gone stale — the
+    /// `Stop` hook was probably lost (restart, event-loop stall, watchdog kill).
+    Stale,
+}
+
+pub(crate) fn claude_hook_gate(session: &SessionRecord) -> ClaudeHookGate {
+    let Some(hook_at) = session
+        .activity_hook_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return ClaudeHookGate::Untracked;
+    };
+    match normalized_status(session.status.trim()) {
+        "idle" => ClaudeHookGate::TurnStopped,
+        "running" if timestamp_is_within(hook_at, CLAUDE_HOOK_STATE_FRESH_SECONDS) => {
+            ClaudeHookGate::TurnRunning
+        }
+        _ => ClaudeHookGate::Stale,
+    }
 }
 
 fn parse_python_naive_datetime(value: &str) -> Option<PrimitiveDateTime> {
@@ -5897,6 +5976,7 @@ mod tests {
             spawned_at: Some("2026-06-01T00:00:00".to_owned()),
             created_at: "2026-06-01T00:00:00".to_owned(),
             last_activity: "2026-06-01T00:01:00".to_owned(),
+            activity_hook_at: None,
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
@@ -6033,6 +6113,105 @@ mod tests {
         let response = SessionResponse::from(session);
 
         assert_eq!(response.friendly_name.as_deref(), Some("abc12345"));
+    }
+
+    fn store_with_running_claude_session(session_id: &str) -> SessionStore {
+        let state_file = unique_temp_path(session_id);
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": session_id,
+                        "name": format!("claude-{session_id}"),
+                        "working_dir": "/repo",
+                        "tmux_session": format!("claude-{session_id}"),
+                        "log_file": format!("/tmp/{session_id}.log"),
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+    }
+
+    #[test]
+    fn claude_stop_hook_idle_survives_a_server_restart() {
+        // The Stop hook is the authoritative idle signal; if it only lived in
+        // memory a restart would revert a finished session to stale active.
+        let store = store_with_running_claude_session("stopdurable");
+        assert!(store
+            .apply_claude_stop_hook("stopdurable", None, None, None, None)
+            .unwrap());
+
+        // A fresh store over the same state file stands in for a restarted server.
+        let restarted = SessionStore::new_with_legacy_fallback(
+            store.state_file.clone(),
+            store.state_file.clone(),
+        );
+        let session = restarted.get_session("stopdurable").unwrap().unwrap();
+
+        assert_eq!(session.status, "idle");
+        assert_eq!(projected_activity_state(&session, &session.status), "idle");
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnStopped);
+    }
+
+    #[test]
+    fn claude_user_prompt_submit_hook_marks_the_turn_running() {
+        let store = store_with_running_claude_session("turnstart");
+        assert!(store
+            .apply_claude_stop_hook("turnstart", None, None, None, None)
+            .unwrap());
+        assert!(store
+            .apply_claude_user_prompt_submit_hook("turnstart")
+            .unwrap());
+
+        let session = store.get_session("turnstart").unwrap().unwrap();
+
+        assert_eq!(session.status, "running");
+        assert!(session.agent_task_completed_at.is_none());
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnRunning);
+    }
+
+    #[test]
+    fn claude_user_prompt_submit_hook_leaves_stopped_sessions_alone() {
+        let store = store_with_running_claude_session("stoppedsess");
+        {
+            let mut state = store.load_raw_json_value().unwrap();
+            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+            session_object_mut(sessions, "stoppedsess")
+                .unwrap()
+                .insert("status".to_owned(), Value::String("stopped".to_owned()));
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        assert!(!store
+            .apply_claude_user_prompt_submit_hook("stoppedsess")
+            .unwrap());
+        assert_eq!(
+            store.get_session("stoppedsess").unwrap().unwrap().status,
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn claude_hook_gate_falls_back_to_the_pane_when_hooks_were_never_observed() {
+        let session = session_record("running");
+
+        assert!(session.activity_hook_at.is_none());
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Untracked);
+    }
+
+    #[test]
+    fn claude_hook_gate_goes_stale_when_a_running_turn_signal_ages_out() {
+        let mut session = session_record("running");
+        session.activity_hook_at = Some("2026-06-01T00:01:00Z".to_owned());
+
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
     }
 
     #[test]

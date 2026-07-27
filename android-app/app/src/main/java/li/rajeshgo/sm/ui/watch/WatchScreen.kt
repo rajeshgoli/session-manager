@@ -1436,6 +1436,7 @@ private fun statusTint(session: ClientSession): Color = when (projectedStatusLab
 private fun activityTint(state: String?): Color = when (activityLabel(state)) {
     "working" -> Emerald
     "thinking" -> Cyan
+    "bg-wait" -> Violet
     "waiting" -> Amber
     "stopped" -> Rose
     else -> TextSecondary

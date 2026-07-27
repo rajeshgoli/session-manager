@@ -72,9 +72,14 @@ fi
 
 # Inline transcript metadata for remote delivery. When the hook is posting to a
 # non-local primary, that primary cannot safely read the node-local transcript.
+# UserPromptSubmit is a turn-start signal only and carries no transcript payload,
+# so skip the tail+jq work there — it runs before every single turn.
 if [ -n "$SM_HOOK_BASE_URL" ] || [ -n "$SM_HOOK_URL" ]; then
   TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
   HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
+  if [ "$HOOK_EVENT" = "UserPromptSubmit" ]; then
+    TRANSCRIPT_PATH=""
+  fi
   if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
     METADATA=$(extract_transcript_metadata "$TRANSCRIPT_PATH" || true)
     if [ "$HOOK_EVENT" = "Stop" ]; then

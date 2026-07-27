@@ -25,6 +25,21 @@ class WatchModelsTest {
     }
 
     @Test
+    fun backgroundWaitIsLabelledDistinctlyFromWaitingOnAHuman() {
+        assertEquals("bg-wait", activityLabel("waiting"))
+        assertEquals("waiting", activityLabel("waiting_input"))
+        assertEquals("waiting", activityLabel("waiting_permission"))
+    }
+
+    @Test
+    fun backgroundWaitCountsAsOperationallyActive() {
+        val session = session(status = "idle", activityState = "waiting")
+
+        assertTrue(isOperationallyActive(session))
+        assertEquals("bg-wait", projectedStatusLabel(session))
+    }
+
+    @Test
     fun runningFilterIncludesOperationallyActiveIdleSession() {
         val session = session(status = "idle", activityState = "working")
         val sections = buildSections(listOf(session))
