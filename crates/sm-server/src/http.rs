@@ -7827,7 +7827,14 @@ struct ClaudePaneObservation {
 
 fn claude_live_activity_from_pane(pane_text: Option<&str>) -> Option<&'static str> {
     let observation = claude_pane_observation(pane_text);
-    match observation.turn? {
+    let Some(turn) = observation.turn else {
+        // No status line left in the window — the completion line has scrolled
+        // away. The footer's "N shell" count is still live, and the spinner would
+        // sit just above that footer if the agent were generating, so its absence
+        // plus outstanding background work is exactly the `waiting` shape.
+        return observation.background_work.then_some("waiting");
+    };
+    match turn {
         ClaudePaneTurn::Completed => Some(if observation.background_work {
             "waiting"
         } else {
@@ -11815,6 +11822,33 @@ mod tests {
 ✽ Incubating… (3m 3s · ↓ 9.9k tokens)
 "#;
         assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_pane_activity_reports_waiting_when_only_the_footer_remains() {
+        // The completion line has scrolled out of the window, but the footer's
+        // shell count is still live. Background work must not vanish just because
+        // the status line it was attached to is gone.
+        let mut pane = String::new();
+        for index in 0..40 {
+            pane.push_str(&format!("⏺ Background command {index} completed\n"));
+        }
+        pane.push_str(
+            "─────────────\n❯\n  ⏵⏵ bypass permissions on · 1 shell, 1 monitor · ← for agents\n",
+        );
+
+        assert_eq!(claude_live_activity_from_pane(Some(&pane)), Some("waiting"));
+    }
+
+    #[test]
+    fn claude_pane_activity_stays_unknown_without_a_turn_line_or_background_work() {
+        let mut pane = String::new();
+        for index in 0..40 {
+            pane.push_str(&format!("⏺ Background command {index} completed\n"));
+        }
+        pane.push_str("─────────────\n❯\n  ⏵⏵ bypass permissions on · ← for agents\n");
+
+        assert_eq!(claude_live_activity_from_pane(Some(&pane)), None);
     }
 
     #[test]
