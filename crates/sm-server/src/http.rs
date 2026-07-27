@@ -11837,6 +11837,34 @@ mod tests {
     }
 
     #[test]
+    fn claude_live_activity_recovers_working_when_a_turn_start_hook_is_lost() {
+        // notify_server.sh posts through a detached curl with no retry, so a
+        // UserPromptSubmit can simply never arrive. The preceding Stop then
+        // leaves a stored idle behind; once it ages out the pane has to be able
+        // to recognise the live turn, or the session reads idle for the whole of
+        // it. This is the original bug relocated from Stop to the turn-start.
+        let session = claude_session_with_hook_state("idle", Some("2026-06-01T00:00:00Z"));
+        let pane = "✽ Incubating… (3m 3s · ↓ 9.9k tokens)\n";
+
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
+        assert_eq!(
+            claude_live_activity_state(&session, Some(pane)),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn claude_live_activity_keeps_a_fresh_stopped_turn_conclusive() {
+        // The flip side: while the Stop signal is fresh it still outranks the
+        // pane, so a spinner mid-redraw cannot resurrect a finished turn.
+        let session = claude_session_with_hook_state("idle", Some(&now_rfc3339()));
+        let pane = "✽ Incubating… (3m 3s · ↓ 9.9k tokens)\n";
+
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnStopped);
+        assert_eq!(claude_live_activity_state(&session, Some(pane)), None);
+    }
+
+    #[test]
     fn claude_live_activity_reports_working_for_remote_sessions_from_hook_state() {
         // Hooks are posted to the primary from every node; only the pane is
         // node-local. A remote session must not be stranded on the default

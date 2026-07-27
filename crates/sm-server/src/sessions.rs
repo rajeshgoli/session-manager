@@ -317,6 +317,13 @@ impl SessionStore {
     /// `UserPromptSubmit` brackets the start of a turn. Together with the `Stop`
     /// hook it makes active/idle a pure function of hook signals, so the pane
     /// scraper never has to guess from spinners or completion verbs.
+    ///
+    /// `emitted_at` orders this against the newest lifecycle signal already
+    /// stored, mirroring the `Stop` path. Each hook rides its own detached curl,
+    /// so a turn-start delayed past its own turn's `Stop` would otherwise
+    /// resurrect a finished turn as active. Only emission order is checked here:
+    /// this handler applies on arrival with no intervening sleep, so an
+    /// arrival-time comparison could never fire.
     pub fn apply_claude_user_prompt_submit_hook(
         &self,
         session_id: &str,
@@ -333,6 +340,19 @@ impl SessionStore {
             return Ok(false);
         };
         if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+            return Ok(false);
+        }
+
+        // A newer lifecycle signal already decided the state; this turn-start
+        // belongs to a turn that has since finished.
+        let superseded = match (
+            emitted_at,
+            json_text(session.get("activity_hook_emitted_at")),
+        ) {
+            (Some(emitted_at), Some(stored)) => timestamp_is_after(&stored, emitted_at),
+            _ => false,
+        };
+        if superseded {
             return Ok(false);
         }
 
@@ -5767,10 +5787,23 @@ fn timestamp_is_after(value: &str, other: &str) -> bool {
     }
 }
 
-/// How long a "turn in flight" hook signal is trusted before the pane scraper is
-/// allowed to second-guess it. Long enough to cover a slow tool call or a long
-/// stretch of pure thinking (no `PreToolUse` fires during either).
+/// How long a hook-derived state is trusted before the pane is allowed to
+/// second-guess it. Long enough to cover a slow tool call or a long stretch of
+/// pure thinking (no `PreToolUse` fires during either).
+///
+/// This bounds *both* directions. Every lifecycle hook is delivered by a
+/// detached, un-retried curl, so `UserPromptSubmit` is exactly as losable as
+/// `Stop` — the very lossiness this ticket exists to work around. Treating
+/// either as conclusive forever just relocates the original bug.
 const CLAUDE_HOOK_STATE_FRESH_SECONDS: i64 = 180;
+
+/// Sessions owned by another node have no pane to reconcile against, so this
+/// window is the *only* bound on a lost hook. It is sized to outlast any
+/// plausible turn: for a remote session the realistic failure is reporting idle
+/// while a long turn is still running, whereas reporting working requires an
+/// actual lost `Stop`. Past this window the session degrades to the default
+/// projection, which is where remote sessions sat before hooks were introduced.
+const CLAUDE_HOOK_STATE_FRESH_SECONDS_WITHOUT_PANE: i64 = 900;
 
 /// How much the hook-derived activity state can be trusted, and therefore
 /// whether the tmux pane needs to be consulted at all.
@@ -5808,11 +5841,20 @@ pub(crate) fn claude_hook_gate(session: &SessionRecord) -> ClaudeHookGate {
         .as_deref()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
+    // Only the owning node can capture the pane, so a remote session has nothing
+    // to reconcile against and has to lean on the hook signal for longer.
+    let fresh_seconds = if is_primary_node(&session.node) {
+        CLAUDE_HOOK_STATE_FRESH_SECONDS
+    } else {
+        CLAUDE_HOOK_STATE_FRESH_SECONDS_WITHOUT_PANE
+    };
+    let hook_state_is_fresh = timestamp_is_within(hook_at, fresh_seconds);
     match normalized_status(session.status.trim()) {
-        "idle" if turn_start_hook_wired => ClaudeHookGate::TurnStopped,
-        "running" if timestamp_is_within(hook_at, CLAUDE_HOOK_STATE_FRESH_SECONDS) => {
-            ClaudeHookGate::TurnRunning
-        }
+        // Conclusive only while fresh. A turn-start lost in transit would
+        // otherwise pin the session to idle for the whole of the next turn, with
+        // the pane unable to say anything but `waiting`.
+        "idle" if turn_start_hook_wired && hook_state_is_fresh => ClaudeHookGate::TurnStopped,
+        "running" if hook_state_is_fresh => ClaudeHookGate::TurnRunning,
         _ => ClaudeHookGate::Stale,
     }
 }
@@ -6378,6 +6420,74 @@ mod tests {
 
         assert_eq!(session.status, "running");
         assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnRunning);
+    }
+
+    #[test]
+    fn turn_start_delivered_after_its_own_stop_does_not_resurrect_the_turn() {
+        // Mirror of the delayed-Stop case: each hook has its own detached curl,
+        // so a turn-start can also lose the race against the Stop that ended it.
+        let store = store_with_running_claude_session("lateprompt");
+        assert!(store
+            .apply_claude_stop_hook(
+                "lateprompt",
+                None,
+                None,
+                None,
+                None,
+                Some(&now_rfc3339()),
+                Some("2026-06-01T00:00:11.000000Z")
+            )
+            .unwrap());
+
+        assert!(!store
+            .apply_claude_user_prompt_submit_hook("lateprompt", Some("2026-06-01T00:00:10.000000Z"))
+            .unwrap());
+
+        assert_eq!(
+            store.get_session("lateprompt").unwrap().unwrap().status,
+            "idle"
+        );
+    }
+
+    #[test]
+    fn turn_start_emitted_after_the_last_stop_still_applies() {
+        let store = store_with_running_claude_session("nextturn");
+        assert!(store
+            .apply_claude_stop_hook(
+                "nextturn",
+                None,
+                None,
+                None,
+                None,
+                Some(&now_rfc3339()),
+                Some("2026-06-01T00:00:10.000000Z")
+            )
+            .unwrap());
+
+        assert!(store
+            .apply_claude_user_prompt_submit_hook("nextturn", Some("2026-06-01T00:00:11.000000Z"))
+            .unwrap());
+
+        assert_eq!(
+            store.get_session("nextturn").unwrap().unwrap().status,
+            "running"
+        );
+    }
+
+    #[test]
+    fn remote_sessions_trust_a_running_hook_past_the_pane_reconciliation_window() {
+        // A remote session has no pane to reconcile against, so the shorter
+        // primary-node window would drop it onto the default projection — which
+        // calls a running session idle after 30s — mid-turn.
+        let stale_for_primary = OffsetDateTime::now_utc() - TimeDuration::seconds(300);
+        let mut session = session_record("running");
+        session.node = "macbook".to_owned();
+        session.activity_hook_at = Some(stale_for_primary.format(&Rfc3339).unwrap());
+
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnRunning);
+
+        session.node = "primary".to_owned();
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
     }
 
     #[test]

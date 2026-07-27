@@ -60,6 +60,29 @@ settings, so a session with only the global `Stop` hook would otherwise be
 pinned to idle for every later turn, right through a tool-free response. Without
 that evidence the gate falls through to `Stale` and the pane stays in play.
 
+## Nothing is conclusive forever
+
+The freshness window bounds **both** directions, not just `running`.
+
+Every lifecycle hook is delivered by a detached curl with no retry, so
+`UserPromptSubmit` is exactly as losable as `Stop` — the lossiness this ticket
+exists to work around. Treating a stored idle as conclusive indefinitely would
+just relocate the original bug: one dropped turn-start, and the session reports
+idle for the entire next turn while the pane, restricted to the background-work
+signal, is unable to say otherwise. So `TurnStopped` expires too, and the pane
+reconciles afterwards.
+
+That reconciliation is safe now in a way it was not before: background work no
+longer implies `working`, so letting the pane speak again cannot resurrect bug 2.
+
+Sessions owned by another node have no pane, so for them the window is the only
+bound on a lost hook and is correspondingly longer
+(`CLAUDE_HOOK_STATE_FRESH_SECONDS_WITHOUT_PANE`). For a remote session the
+realistic failure is reporting idle during a long live turn, whereas reporting
+working requires an actual lost `Stop`. Past that window a remote session
+degrades to the default projection — where it sat before hooks existed. Fully
+closing that gap needs node-side pane capture, which is out of scope here.
+
 ## Hook ordering
 
 `hooks/notify_server.sh` dispatches every lifecycle hook through its own
@@ -70,9 +93,11 @@ two independent guards prevent it:
 
 - **Emission ordering** (authoritative). The hook script stamps
   `sm_hook_emitted_at` before detaching, and the server compares it against the
-  turn-start's own emission stamp. This catches a `Stop` whose curl was delayed
+  newest stored lifecycle stamp. This catches a `Stop` whose curl was delayed
   past the next turn's `UserPromptSubmit` entirely. Both stamps come from the
-  node that owns the session, so they are always compared on one clock.
+  node that owns the session, so they are always compared on one clock. The
+  check is symmetric — a turn-start delayed past its own turn's `Stop` is
+  rejected the same way, so neither hook can resurrect the other's turn.
 - **Arrival ordering** (fallback). `received_at` is stamped when the request
   arrives, before the handler's transcript retry sleep. This catches a `Stop`
   that arrived first but applied late, and covers hook scripts too old to send
