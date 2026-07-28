@@ -7578,7 +7578,11 @@ async fn context_usage_hook_rejects_a_sample_emitted_before_the_current_cycle() 
     let (status, _) = post_json(
         app.clone(),
         "/hooks/context-usage",
-        json!({ "session_id": "run12345", "event": "context_reset" }),
+        json!({
+            "session_id": "run12345",
+            "event": "context_reset",
+            "sm_hook_emitted_at": "2026-01-01T00:00:00.000000Z"
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

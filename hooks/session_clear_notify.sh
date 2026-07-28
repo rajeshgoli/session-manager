@@ -19,8 +19,16 @@ if [ -z "${CLAUDE_SESSION_MANAGER_ID:-}" ] || ! command -v jq >/dev/null 2>&1; t
   exit 0
 fi
 
+# The stamp marks where the new accumulation cycle begins. It is taken on this
+# host, and the status-line samples it is compared against are too, so a node
+# whose clock trails the primary cannot have its fresh samples read as stale.
 BODY=$(jq -c -n --arg sid "$CLAUDE_SESSION_MANAGER_ID" \
-  '{session_id: $sid, event: "context_reset"}' 2>/dev/null) || exit 0
+  'def stamp:
+     now as $t | ($t | floor) as $s
+     | ($s | strftime("%Y-%m-%dT%H:%M:%S"))
+       + "." + (("000000" + ((($t - $s) * 1000000) | floor | tostring))[-6:])
+       + "Z";
+   {session_id: $sid, event: "context_reset", sm_hook_emitted_at: stamp}' 2>/dev/null) || exit 0
 
 HEADERS=(-H "Content-Type: application/json")
 if [ -n "${SM_HOOK_SECRET:-}" ]; then

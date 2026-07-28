@@ -115,7 +115,10 @@ sqlite3 ~/.local/share/claude-sessions/tool_usage.db "SELECT * FROM tool_usage L
 
 ## Specs
 
-Design docs in `docs/working/`:
+Specs and working docs go in `specs/<ticket#>_<descriptive_name>.md`, per AGENTS.md.
+`docs/working/` holds the older docs and is not where new ones belong.
+
+Earlier design docs:
 - `sm-new-and-attach.md` - CLI session commands
 - `tool-usage-logging.md` - Security audit logging
 

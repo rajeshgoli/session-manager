@@ -84,15 +84,32 @@ context the agent had already been told about. They are now
 `context_warning_sent` / `context_critical_sent` on the session record. The cycle
 ends at a compaction or an explicit reset, not at a process boundary.
 
-**Samples are ordered against cycle boundaries.** The status-line post rides a
-detached curl, so a render that races a `/clear` or a compaction can arrive
-*after* the lifecycle hook while still describing the context that was just
-discarded. Applying it would restore the stale token count, re-latch the flags
-the reset had just cleared, and silence the next real warning for a whole cycle.
-Every re-arm point stamps `context_cycle_reset_at`, the hook stamps
-`sm_hook_emitted_at` before detaching, and a sample older than the current cycle
-is dropped. Samples with no stamp are still accepted — the same tolerance the
-lifecycle hooks apply to scripts too old to send one.
+**Samples are ordered against cycle boundaries, in the producer's clock.** The
+status-line post rides a detached curl, so a render that races a `/clear` or a
+compaction can arrive *after* the lifecycle hook while still describing the
+context that was just discarded. Applying it would restore the stale token count,
+re-latch the flags the reset had just cleared, and silence the next real warning
+for a whole cycle.
+
+All three producer hooks stamp `sm_hook_emitted_at` before their curl leaves, the
+compaction and context-reset events record theirs as
+`context_cycle_reset_emitted_at`, and a sample older than that boundary is
+dropped. Both sides of the comparison are therefore produced on the session's own
+host — never the server's. Comparing a producer stamp against the server clock
+would mean a remote node whose clock trails the primary had its *fresh* samples
+read as stale, freezing the monitor for the length of the skew after every reset.
+This is the same shape as the lifecycle hooks, which compare one emission stamp
+against another rather than against the server.
+
+Server-originated resets (`sm clear`, enabling monitoring) record no boundary, so
+they never gate producer samples. For Claude those resets also produce a stamped
+hook event, which is what actually carries the guard; for codex there is no
+detached sample to race in the first place. What those paths do instead is cancel
+the queued alerts describing the discarded cycle, so a warning about context that
+no longer exists cannot be delivered late.
+
+Samples with no stamp are still accepted — the same tolerance the lifecycle hooks
+apply to scripts too old to send one.
 
 **Enabling monitoring re-arms the latches.** A persisted latch outlives the
 registration that set it, so a monitor registering against a session whose context

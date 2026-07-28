@@ -85,6 +85,16 @@ impl SessionStore {
         self
     }
 
+    /// Drop context alerts this session raised about context it no longer has.
+    /// An undelivered warning describes the discarded cycle, so delivering it
+    /// after a clear tells the monitor about a problem that no longer exists.
+    fn cancel_context_monitor_alerts(&self, session_id: &str) -> Result<()> {
+        if let Some(queue) = &self.queue_store {
+            queue.cancel_pending_messages_from_sender_category(session_id, "context_monitor")?;
+        }
+        Ok(())
+    }
+
     /// Runtime used to deliver messages queued from background threads, which
     /// have no request to piggyback a drain on.
     pub fn with_delivery_runtime(mut self, runtime: Option<TmuxRuntime>) -> Self {
@@ -938,6 +948,7 @@ impl SessionStore {
         }
         let now = now_rfc3339();
         reset_session_after_clear(session, &now);
+        self.cancel_context_monitor_alerts(session_id)?;
         if let Some(log_file) = json_text(session.get("log_file")) {
             append_log_line(&expand_home(&log_file), "[sm-rust] fixture context cleared")?;
             if let Some(prompt) = request
@@ -1004,6 +1015,7 @@ impl SessionStore {
         }
         let now = now_rfc3339();
         reset_session_after_clear(session, &now);
+        self.cancel_context_monitor_alerts(session_id)?;
         self.write_raw_json_value(&state)?;
         Ok(CoreClearOutcome::Cleared(CoreClearResult {
             status: "cleared".to_owned(),
@@ -1319,9 +1331,12 @@ impl SessionStore {
         if raw_session_object(&state, session_id).is_none() {
             return Ok(ContextUsageOutcome::UnknownSession);
         }
+        let emitted_at = event.emitted_at.as_deref();
 
         match event.event.as_deref().map(str::trim).unwrap_or("") {
-            "compaction" => self.apply_compaction_event(&mut state, session_id, runtime),
+            "compaction" => {
+                self.apply_compaction_event(&mut state, session_id, emitted_at, runtime)
+            }
             // No `_is_compacting` equivalent exists on the Rust side yet, so the
             // acknowledgement itself is a no-op. It carries the handoff path
             // back, though: the recovery hook needs it to reinject the doc, and
@@ -1334,7 +1349,7 @@ impl SessionStore {
                 last_handoff_path: raw_session_object(&state, session_id)
                     .and_then(|session| json_text(session.get("last_handoff_path"))),
             }),
-            "context_reset" => self.apply_context_reset_event(&mut state, session_id),
+            "context_reset" => self.apply_context_reset_event(&mut state, session_id, emitted_at),
             _ => self.apply_context_usage_update(&mut state, session_id, event, runtime),
         }
     }
@@ -1343,6 +1358,7 @@ impl SessionStore {
         &self,
         state: &mut Value,
         session_id: &str,
+        emitted_at: Option<&str>,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<ContextUsageOutcome> {
         let (notify_target, label) = {
@@ -1355,6 +1371,7 @@ impl SessionStore {
             // back under the warning threshold would not work: post-compaction
             // context can legitimately land above it.
             reset_context_oneshot_flags(session);
+            set_context_cycle_boundary(session, emitted_at);
             let notify_target = json_text(session.get("context_monitor_notify"))
                 // Fall back to the parent so an unregistered child still reports
                 // its own context loss upward (#210).
@@ -1385,6 +1402,7 @@ impl SessionStore {
         &self,
         state: &mut Value,
         session_id: &str,
+        emitted_at: Option<&str>,
     ) -> Result<ContextUsageOutcome> {
         {
             let sessions = ensure_sessions_array_mut(state)?;
@@ -1392,14 +1410,13 @@ impl SessionStore {
                 return Ok(ContextUsageOutcome::UnknownSession);
             };
             reset_context_oneshot_flags(session);
+            set_context_cycle_boundary(session, emitted_at);
             // The discarded context is what the previous status was describing.
             session.insert("agent_status_text".to_owned(), Value::Null);
             session.insert("agent_status_at".to_owned(), Value::Null);
             session.insert("agent_task_completed_at".to_owned(), Value::Null);
         }
-        if let Some(queue) = &self.queue_store {
-            queue.cancel_pending_messages_from_sender_category(session_id, "context_monitor")?;
-        }
+        self.cancel_context_monitor_alerts(session_id)?;
         self.write_raw_json_value(state)?;
         Ok(ContextUsageOutcome::FlagsReset)
     }
@@ -1420,14 +1437,16 @@ impl SessionStore {
             return Ok(ContextUsageOutcome::NotRegistered);
         }
         // A sample emitted before the current cycle began describes context that
-        // no longer exists. Samples from a hook too old to stamp themselves are
-        // still accepted — the same tolerance the lifecycle hooks apply.
-        let cycle_reset_at =
-            session_snapshot.and_then(|session| json_text(session.get("context_cycle_reset_at")));
-        if let (Some(emitted_at), Some(cycle_reset_at)) =
-            (event.emitted_at.as_deref(), cycle_reset_at.as_deref())
+        // no longer exists. Both stamps come from the session's own host, so this
+        // never compares clocks across machines. Samples from a hook too old to
+        // stamp themselves are still accepted — the same tolerance the lifecycle
+        // hooks apply.
+        let cycle_boundary = session_snapshot
+            .and_then(|session| json_text(session.get("context_cycle_reset_emitted_at")));
+        if let (Some(emitted_at), Some(cycle_boundary)) =
+            (event.emitted_at.as_deref(), cycle_boundary.as_deref())
         {
-            if !timestamp_is_after(emitted_at, cycle_reset_at) {
+            if !timestamp_is_after(emitted_at, cycle_boundary) {
                 return Ok(ContextUsageOutcome::StaleSample);
             }
         }
@@ -3690,19 +3709,35 @@ fn clear_stop_notify_raw(state: &mut Value, session_id: &str) -> Result<()> {
 
 /// Re-arm the one-shot latches and open a new accumulation cycle.
 ///
-/// The stamp is what lets a usage sample be placed on one side of the boundary
-/// or the other. Status-line samples ride a detached curl, so a render that
-/// races a reset can arrive after it while still describing the context that was
-/// just discarded; applying that sample would restore the stale token count and
-/// re-latch the flags this call cleared, silencing the next real warning for a
-/// whole cycle.
+/// Clears the cycle boundary stamp. Only a reset reported by a producer hook can
+/// set one — see [`set_context_cycle_boundary`] — because the boundary is only
+/// ever compared against another stamp from that same producer.
 fn reset_context_oneshot_flags(session: &mut Map<String, Value>) {
     session.insert("context_warning_sent".to_owned(), Value::Bool(false));
     session.insert("context_critical_sent".to_owned(), Value::Bool(false));
-    session.insert(
-        "context_cycle_reset_at".to_owned(),
-        Value::String(now_rfc3339()),
-    );
+    session.insert("context_cycle_reset_emitted_at".to_owned(), Value::Null);
+}
+
+/// Record where the new cycle begins, in the producer's own clock.
+///
+/// Status-line samples ride a detached curl, so a render that races a reset can
+/// arrive after it while still describing the context that was just discarded.
+/// Applying that sample would restore the stale token count and re-latch the
+/// flags the reset cleared, silencing the next real warning for a whole cycle.
+///
+/// The stamp deliberately comes from the hook rather than from the server clock.
+/// Both sides of the comparison are then produced on the session's own host, so
+/// a remote node whose clock trails the primary cannot have its fresh samples
+/// misread as stale — which would freeze the monitor for the length of the skew
+/// after every reset. This mirrors the lifecycle hooks, which likewise compare
+/// one emission stamp against another rather than against the server's clock.
+fn set_context_cycle_boundary(session: &mut Map<String, Value>, emitted_at: Option<&str>) {
+    if let Some(emitted_at) = emitted_at {
+        session.insert(
+            "context_cycle_reset_emitted_at".to_owned(),
+            Value::String(emitted_at.to_owned()),
+        );
+    }
 }
 
 fn flag_is_set(session: &Map<String, Value>, key: &str) -> bool {
@@ -7696,14 +7731,15 @@ mod tests {
             .apply_context_usage_event(&usage_event("child001", 20.0, 40_000), None)
             .unwrap();
 
-        let sampled_at = now_rfc3339();
-        thread::sleep(Duration::from_millis(5));
-        store
-            .apply_context_usage_event(&lifecycle_event("child001", "context_reset"), None)
-            .unwrap();
+        // Both stamps come from the producer host: the reset hook's and the
+        // sample's. The server clock is never in the comparison.
+        let sampled_at = "2026-06-01T00:00:10.000000Z";
+        let mut reset = lifecycle_event("child001", "context_reset");
+        reset.emitted_at = Some("2026-06-01T00:00:11.000000Z".to_owned());
+        store.apply_context_usage_event(&reset, None).unwrap();
 
         let mut late = usage_event("child001", 70.0, 140_000);
-        late.emitted_at = Some(sampled_at);
+        late.emitted_at = Some(sampled_at.to_owned());
         assert_eq!(
             store.apply_context_usage_event(&late, None).unwrap(),
             ContextUsageOutcome::StaleSample
@@ -7716,9 +7752,60 @@ mod tests {
 
         // The next sample of the new cycle still warns.
         let mut fresh = usage_event("child001", 70.0, 140_000);
-        fresh.emitted_at = Some(now_rfc3339());
+        fresh.emitted_at = Some("2026-06-01T00:00:12.000000Z".to_owned());
         store.apply_context_usage_event(&fresh, None).unwrap();
         assert_eq!(context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn a_producer_clock_behind_the_server_still_reports() {
+        // The boundary is the reset hook's own stamp, so a node whose clock
+        // trails the primary is compared only against itself. Comparing against
+        // the server clock would freeze the monitor for the length of the skew
+        // after every reset.
+        let store = store_with_monitored_child("ctxskew", true, Some("parent01"));
+
+        let mut reset = lifecycle_event("child001", "context_reset");
+        reset.emitted_at = Some("2000-01-01T00:00:00.000000Z".to_owned());
+        store.apply_context_usage_event(&reset, None).unwrap();
+
+        let mut sample = usage_event("child001", 70.0, 140_000);
+        sample.emitted_at = Some("2000-01-01T00:00:01.000000Z".to_owned());
+
+        assert_eq!(
+            store.apply_context_usage_event(&sample, None).unwrap(),
+            ContextUsageOutcome::Recorded {
+                used_percentage: 70.0
+            }
+        );
+        assert_eq!(context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn a_server_side_clear_does_not_gate_producer_samples() {
+        // sm clear has no producer stamp to compare against, so no boundary is
+        // recorded and samples are not second-guessed. The queued alerts from
+        // the discarded cycle are dropped instead.
+        let store = store_with_monitored_child("ctxserverclear", true, Some("parent01"));
+        store
+            .clear_core_session(
+                "child001",
+                ClearSessionRequest {
+                    prompt: None,
+                    requester_session_id: Some("parent01".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let mut sample = usage_event("child001", 70.0, 140_000);
+        sample.emitted_at = Some("2000-01-01T00:00:00.000000Z".to_owned());
+
+        assert_eq!(
+            store.apply_context_usage_event(&sample, None).unwrap(),
+            ContextUsageOutcome::Recorded {
+                used_percentage: 70.0
+            }
+        );
     }
 
     #[test]
