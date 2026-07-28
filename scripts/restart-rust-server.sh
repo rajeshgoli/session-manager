@@ -49,8 +49,14 @@ SM_CUTOVER="${SM_CUTOVER:-$REPO_ROOT/scripts/rust-service-cutover.sh}"
 SM_CONFIG="${SM_CONFIG:-$REPO_ROOT/config.yaml}"
 SM_LOCAL_ENV="${SM_LOCAL_ENV:-}"
 SM_PLIST="${SM_PLIST:-$HOME/Library/LaunchAgents/$SM_LABEL.plist}"
-# Space-separated; must match the labels rust-service-cutover.sh refuses to start alongside.
-SM_PYTHON_LABELS="${SM_PYTHON_LABELS:-com.rajeshgoli.session-manager com.claude.session-manager}"
+# The set rust-service-cutover.sh enforces in start_rust. It is hard-coded there
+# with no CLI override, so it is always checked here no matter what
+# SM_PYTHON_LABELS says: otherwise a narrowed override would let the preflight
+# pass, the service be stopped, and start-rust then refuse - leaving it down.
+# tests/unit/test_restart_rust_server.py guards this against drift.
+CUTOVER_PYTHON_LABELS="com.rajeshgoli.session-manager com.claude.session-manager"
+# Space-separated extra labels to check on top of the set above.
+SM_PYTHON_LABELS="${SM_PYTHON_LABELS:-}"
 # Host/port are owned here and forwarded to the cutover, so the endpoint we
 # health-check is by construction the one the service was told to listen on.
 SM_HOST="${SM_HOST:-127.0.0.1}"
@@ -96,7 +102,7 @@ Options:
 
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
 SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, SM_PORT,
-SM_PYTHON_LABELS, SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
+SM_PYTHON_LABELS (extra labels), SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
 SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
 
 SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, and SM_PORT are
@@ -358,7 +364,7 @@ step "Preflight: checking what the restart will require"
 if [[ -n "$SM_LOCAL_ENV" && ! -r "$SM_LOCAL_ENV" ]]; then
   fail "local env overlay not readable: $SM_LOCAL_ENV - the running service was not touched"
 fi
-for label in $SM_PYTHON_LABELS; do
+for label in $CUTOVER_PYTHON_LABELS $SM_PYTHON_LABELS; do
   if launchctl print "$DOMAIN/$label" >/dev/null 2>&1; then
     fail "Python service label $label is still loaded; start-rust would refuse to
        start Rust after stopping it. Run '$SM_CUTOVER stop-python' first.
@@ -417,6 +423,16 @@ echo "preconditions ok"
 
 if [[ "$ADOPT" -eq 1 ]]; then
   step "Adopting the existing build (--adopt, no rebuild)"
+  # Adoption only makes sense while the service still runs from cargo's output.
+  # Repeated afterwards it would install whatever stale artifact is left in the
+  # target directory - a silent downgrade that every check below would pass.
+  if ! registration_runs_cargo_output; then
+    fail "--adopt is only for a service still registered against cargo's output.
+       This one already runs from $SM_BINARY, so adopting would install whatever
+       build happens to be left at $SM_CARGO_OUTPUT, which may be older than what
+       is running. Use a normal restart instead.
+       The running service was not touched."
+  fi
   # Read-only source: the binary the live registration is already running.
   [[ -x "$SM_CARGO_OUTPUT" ]] \
     || fail "nothing to adopt at $SM_CARGO_OUTPUT - the running service was not touched"

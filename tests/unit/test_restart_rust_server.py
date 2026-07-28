@@ -205,7 +205,7 @@ def _make_runner(bin_dir, cutover, installed, cargo_output, config, plist):
             "SM_PLIST": str(plist),
             "SM_CUTOVER": str(cutover),
             "SM_CONFIG": str(config),
-            "SM_PYTHON_LABELS": "com.example.legacy-python",
+            "SM_PYTHON_LABELS": "com.example.legacy-python",  # extra, on top of the enforced set
             "SM_HOST": "127.0.0.1",
             "SM_PORT": "9",
             "SM_HEALTH_TIMEOUT": "3",
@@ -345,6 +345,8 @@ def test_adopt_installs_the_running_build_without_rebuilding(env):
     env["plist"].write_text(
         f"<plist><array><string>{env['cargo_output']}</string></array></plist>\n"
     )
+    # The genuine pre-migration state: the loaded job runs cargo's output.
+    (env["state"] / "job_program").write_text(str(env["cargo_output"]))
     _write(env["cargo_output"], "ALREADY_RUNNING", executable=True)
 
     result = env["run"]("--adopt", "--allow-plist-change")
@@ -353,6 +355,20 @@ def test_adopt_installs_the_running_build_without_rebuilding(env):
     assert "cargo build" not in calls(env)
     assert env["installed"].read_text() == "ALREADY_RUNNING"
     assert "[registered=ORIGINAL]" in cutover_line(env, "stop-rust")
+
+
+def test_adopt_refused_once_already_migrated(env):
+    """Repeating --adopt would install whatever stale artifact is left in the
+    target directory - a silent downgrade that every later check would pass."""
+    _write(env["cargo_output"], "STALE_OLD_BUILD", executable=True)
+    # job_program already points at the installed binary (the migrated state)
+
+    result = env["run"]("--adopt")
+
+    assert result.returncode != 0
+    assert "only for a service still registered against cargo's output" in result.stderr
+    assert env["installed"].read_text() == "ORIGINAL"
+    assert_service_untouched(env)
 
 
 def test_adopt_and_skip_build_conflict(env):
@@ -366,6 +382,7 @@ def test_adopt_with_nothing_to_adopt(env):
     env["plist"].write_text(
         f"<plist><array><string>{env['cargo_output']}</string></array></plist>\n"
     )
+    (env["state"] / "job_program").write_text(str(env["cargo_output"]))
 
     result = env["run"]("--adopt", "--allow-plist-change")
 
@@ -689,6 +706,38 @@ def test_lingering_python_label_blocks_before_anything_stops(env):
     assert result.returncode != 0
     assert "com.example.legacy-python is still loaded" in result.stderr
     assert_service_untouched(env)
+
+
+def test_cutover_enforced_python_labels_are_checked_even_when_overridden(env):
+    """SM_PYTHON_LABELS cannot narrow the set that matters: the cutover enforces
+    its own hard-coded list in start-rust, after it has already stopped us."""
+    (env["state"] / "loaded_labels").write_text(
+        f"{LABEL}\ncom.rajeshgoli.session-manager\n"
+    )
+
+    result = env["run"](SM_PYTHON_LABELS="com.example.something-else")
+
+    assert result.returncode != 0
+    assert "com.rajeshgoli.session-manager is still loaded" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_enforced_python_label_list_matches_the_cutover():
+    """Drift guard: if the cutover's list changes, this script must follow, or the
+    preflight silently stops covering what start-rust will reject."""
+    import re
+
+    cutover = (REPO_ROOT / "scripts" / "rust-service-cutover.sh").read_text()
+    declared = re.search(r"^PYTHON_LABELS=\((.*?)\)$", cutover, re.M).group(1)
+    enforced = set(re.findall(r'"([^"]+)"', declared))
+
+    script = SCRIPT.read_text()
+    ours = re.search(r'^CUTOVER_PYTHON_LABELS="([^"]*)"$', script, re.M).group(1)
+
+    assert set(ours.split()) == enforced, (
+        f"restart-rust-server.sh checks {sorted(set(ours.split()))} but "
+        f"rust-service-cutover.sh enforces {sorted(enforced)}"
+    )
 
 
 def test_unreadable_config_leaves_service_untouched(env):

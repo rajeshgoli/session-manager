@@ -193,6 +193,24 @@ mode, including `--skip-build` and `--adopt`: a run that does not build must
 still not leave the service registered against cargo's output, or the next
 ordinary `cargo build` replaces the live binary.
 
+### Preflight the labels the cutover actually enforces
+
+`start_rust` refuses to start alongside a set of Python labels that is hard-coded
+in the cutover with no CLI override. So the preflight always checks that set,
+regardless of `SM_PYTHON_LABELS` - which is additive, not a replacement. A
+narrowed override would otherwise let the preflight pass, the Rust job be
+stopped, and `start-rust` then reject the launch, leaving the service down: the
+exact outcome the preflight exists to avoid. A test parses both scripts and fails
+if the two lists drift apart.
+
+### `--adopt` is only valid before migration
+
+Repeating `--adopt` after the registration already points at the installed binary
+would deploy whatever artifact happens to remain in the target directory, which
+may be older than what is running - and health, pid, and session-count checks
+would all pass over that silent downgrade. Adoption is therefore refused unless
+the service really is still registered against cargo's output.
+
 ### `bootout` failures are silent
 
 `stop_rust` in the cutover runs `launchctl bootout ... || true` and prints
