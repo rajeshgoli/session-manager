@@ -5626,6 +5626,12 @@ def cmd_context_monitor(
             return 1
 
         if enabled:
+            if (data or {}).get("enabled") is False:
+                print(
+                    "Context monitoring is FYI only for Codex agents; "
+                    "they manage compaction inline."
+                )
+                return 0
             if target and target != session_id:
                 print(f"Context monitoring enabled for {target} — notifications → {session_id}")
             else:

@@ -625,7 +625,81 @@ class TestSessionResponseLastHandoffPath:
 
 
 # ---------------------------------------------------------------------------
-# 8. Registration gate (#206)
+# 8. Codex informational context
+# ---------------------------------------------------------------------------
+
+
+class TestCodexInformationalContext:
+    """Codex usage remains visible without Session Manager compaction prompts."""
+
+    @pytest.mark.parametrize("provider", ["codex", "codex-fork", "codex-app"])
+    def test_usage_caches_snapshot_without_alerts(
+        self, client, mock_session_manager, session, provider
+    ):
+        session.provider = provider
+        session.context_monitor_enabled = True
+        session.context_monitor_notify = session.id
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=75,
+            total_input_tokens=150_000,
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert session.context_used_percentage == 75
+        assert session.context_total_input_tokens == 150_000
+        assert session._context_warning_sent is False
+        assert session._context_critical_sent is False
+        assert session.context_monitor_enabled is False
+        assert session.context_monitor_notify is None
+        assert not mock_session_manager.message_queue_manager.queue_message.called
+        snapshot = client.get(f"/sessions/{session.id}/context").json()
+        assert snapshot["context_monitor_enabled"] is False
+        assert snapshot["notify_session_id"] is None
+        cancel = (
+            mock_session_manager.message_queue_manager
+            .cancel_context_monitor_messages_from
+        )
+        cancel.assert_called_once_with(session.id)
+        cancel.reset_mock()
+
+        _post_context(
+            client,
+            session.id,
+            used_pct=75,
+            total_input_tokens=150_000,
+        )
+
+        cancel.assert_not_called()
+
+    @pytest.mark.parametrize("provider", ["codex", "codex-fork", "codex-app"])
+    def test_compaction_does_not_notify_self_or_parent(
+        self, client, mock_session_manager, session, provider
+    ):
+        session.provider = provider
+        session.parent_session_id = "parent-abc"
+        session.context_monitor_notify = session.id
+
+        resp = _post_event(client, session.id, "compaction", trigger="auto")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "compaction_logged"
+        assert session._is_compacting is True
+        assert session.context_monitor_enabled is False
+        assert session.context_monitor_notify is None
+        assert not mock_session_manager.message_queue_manager.queue_message.called
+        cancel = (
+            mock_session_manager.message_queue_manager
+            .cancel_context_monitor_messages_from
+        )
+        cancel.assert_called_once_with(session.id)
+
+
+# ---------------------------------------------------------------------------
+# 9. Registration gate (#206)
 # ---------------------------------------------------------------------------
 
 
@@ -788,6 +862,31 @@ class TestRegistrationEndpoint:
         assert session.context_monitor_notify is None
         mock_session_manager._save_state.assert_called()
 
+    @pytest.mark.parametrize("provider", ["codex", "codex-fork", "codex-app"])
+    def test_codex_enable_is_informational_only(
+        self, client, mock_session_manager, session, provider
+    ):
+        session.provider = provider
+        session._context_warning_sent = True
+        session._context_critical_sent = True
+
+        resp = client.post(
+            f"/sessions/{session.id}/context-monitor",
+            json=self._reg_payload(session.id),
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok", "enabled": False}
+        assert session.context_monitor_enabled is False
+        assert session.context_monitor_notify is None
+        assert session._context_warning_sent is False
+        assert session._context_critical_sent is False
+        cancel = (
+            mock_session_manager.message_queue_manager
+            .cancel_context_monitor_messages_from
+        )
+        cancel.assert_called_once_with(session.id)
+
     def test_enable_without_notify_session_id_returns_422(self, client, session):
         payload = {"enabled": True, "requester_session_id": session.id}
         resp = client.post(f"/sessions/{session.id}/context-monitor", json=payload)
@@ -922,6 +1021,19 @@ class TestStatusEndpoint:
         client = TestClient(app)
 
         resp = client.get("/sessions/context-monitor")
+        assert resp.status_code == 200
+        assert resp.json()["monitored"] == []
+
+    def test_status_hides_stale_codex_registration(self, mock_session_manager, session):
+        session.provider = "codex-fork"
+        session.context_monitor_enabled = True
+        mock_session_manager.sessions = {session.id: session}
+
+        app = create_app(session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = client.get("/sessions/context-monitor")
+
         assert resp.status_code == 200
         assert resp.json()["monitored"] == []
 

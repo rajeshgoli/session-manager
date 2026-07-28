@@ -518,6 +518,11 @@ def _normalize_provider(provider: Optional[str]) -> str:
     raise HTTPException(status_code=400, detail=f"Invalid provider: {provider}")
 
 
+def _provider_manages_context_inline(provider: Optional[str]) -> bool:
+    """Return whether the provider handles compaction without SM prompts."""
+    return str(provider or "").strip().lower() in {"codex", "codex-fork", "codex-app"}
+
+
 class RequestTimingMiddleware(BaseHTTPMiddleware):
     """Log slow requests for debugging."""
 
@@ -2257,8 +2262,9 @@ def create_app(
                 except Exception as exc:
                     _append_warning("failed to register EM auto-remind", exc)
 
-        child_session.context_monitor_enabled = True
-        child_session.context_monitor_notify = parent_id
+        context_monitor_enabled = not _provider_manages_context_inline(child_session.provider)
+        child_session.context_monitor_enabled = context_monitor_enabled
+        child_session.context_monitor_notify = parent_id if context_monitor_enabled else None
         child_session._context_warning_sent = False
         child_session._context_critical_sent = False
 
@@ -5746,7 +5752,7 @@ def create_app(
                 "notify_session_id": s.context_monitor_notify,
             }
             for s in app.state.session_manager.sessions.values()
-            if s.context_monitor_enabled
+            if s.context_monitor_enabled and not _provider_manages_context_inline(s.provider)
         ]
         return {"monitored": monitored}
 
@@ -5776,6 +5782,7 @@ def create_app(
             state = "normal"
 
         sampled_at = getattr(session, "context_sampled_at", None)
+        informational_only = _provider_manages_context_inline(session.provider)
         return ContextSnapshotResponse(
             session_id=session.id,
             friendly_name=_effective_session_name(session, sync_native_title=False),
@@ -5786,8 +5793,15 @@ def create_app(
             state=state,
             warning_percentage=warning_pct,
             critical_percentage=critical_pct,
-            context_monitor_enabled=bool(getattr(session, "context_monitor_enabled", False)),
-            notify_session_id=getattr(session, "context_monitor_notify", None),
+            context_monitor_enabled=(
+                bool(getattr(session, "context_monitor_enabled", False))
+                and not informational_only
+            ),
+            notify_session_id=(
+                None
+                if informational_only
+                else getattr(session, "context_monitor_notify", None)
+            ),
             compaction_active=bool(getattr(session, "_is_compacting", False)),
             last_handoff_path=getattr(session, "last_handoff_path", None),
         )
@@ -6323,8 +6337,10 @@ def create_app(
                     detail=f"notify_session_id {request.notify_session_id!r} not found",
                 )
 
-        session.context_monitor_enabled = request.enabled
-        session.context_monitor_notify = request.notify_session_id if request.enabled else None
+        informational_only = _provider_manages_context_inline(session.provider)
+        effective_enabled = request.enabled and not informational_only
+        session.context_monitor_enabled = effective_enabled
+        session.context_monitor_notify = request.notify_session_id if effective_enabled else None
 
         # Re-arm one-shot flags when enabling so warnings fire fresh in the new cycle.
         # If re-enabled after a period of being disabled (during which compaction may have
@@ -6332,6 +6348,10 @@ def create_app(
         if request.enabled:
             session._context_warning_sent = False
             session._context_critical_sent = False
+        if informational_only and app.state.session_manager.message_queue_manager:
+            app.state.session_manager.message_queue_manager.cancel_context_monitor_messages_from(
+                session_id
+            )
 
         app.state.session_manager._save_state()
         return {"status": "ok", "enabled": session.context_monitor_enabled}
@@ -9019,7 +9039,15 @@ Provide ONLY the summary, no preamble or questions."""
             session._context_critical_sent = False
             # Notify via context_monitor_notify; fall back to parent_session_id so
             # unregistered children still alert their parent on context loss (#210).
-            notify_target = session.context_monitor_notify or session.parent_session_id
+            notify_target = None
+            informational_only = _provider_manages_context_inline(session.provider)
+            if not informational_only:
+                notify_target = session.context_monitor_notify or session.parent_session_id
+            else:
+                session.context_monitor_enabled = False
+                session.context_monitor_notify = None
+                if queue_mgr:
+                    queue_mgr.cancel_context_monitor_messages_from(session_id)
             if notify_target and queue_mgr:
                 msg = (
                     f"[sm context] Compaction fired for {_effective_session_name(session)}. "
@@ -9115,8 +9143,26 @@ Provide ONLY the summary, no preamble or questions."""
             session.context_sampled_at = sampled_at
             session._is_compacting = False
 
-        # Gate: skip unregistered sessions for warning/critical alerts (#206).
-        if not session.context_monitor_enabled:
+        # Codex providers report usage as FYI telemetry and compact inline.
+        informational_only = _provider_manages_context_inline(session.provider)
+        if informational_only:
+            had_alert_state = bool(
+                session.context_monitor_enabled
+                or session.context_monitor_notify
+                or session._context_warning_sent
+                or session._context_critical_sent
+            )
+            if had_alert_state:
+                session.context_monitor_enabled = False
+                session.context_monitor_notify = None
+                session._context_warning_sent = False
+                session._context_critical_sent = False
+                changed = True
+                if queue_mgr:
+                    queue_mgr.cancel_context_monitor_messages_from(session_id)
+
+        # Gate: skip unregistered and informational-only sessions for alerts (#206).
+        if not session.context_monitor_enabled or informational_only:
             if changed:
                 await _save_session_manager_state(app.state.session_manager)
             return {"status": "not_registered", "used_percentage": used_pct}

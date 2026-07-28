@@ -15,6 +15,8 @@ use sm_server::{config::AppConfig, mobile_devices};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
+const CODEX_CONTEXT_MONITOR_FYI: &str =
+    "Context monitoring is FYI only for Codex agents; they manage compaction inline.";
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
 
@@ -2769,7 +2771,7 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
         ContextMonitorCommand::Enable { target } => {
             let requester = current_session_id()?;
             let target = target.unwrap_or_else(|| requester.clone());
-            client.post_json(
+            let response = client.post_json(
                 &format!("/sessions/{target}/context-monitor"),
                 json!({
                     "enabled": true,
@@ -2777,6 +2779,10 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
                     "notify_session_id": requester
                 }),
             )?;
+            if context_monitor_is_informational(&response) {
+                println!("{CODEX_CONTEXT_MONITOR_FYI}");
+                return Ok(());
+            }
             if target == requester {
                 println!("Context monitoring enabled - notifications -> self ({requester})");
             } else {
@@ -2798,6 +2804,10 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
         }
     }
     Ok(())
+}
+
+fn context_monitor_is_informational(response: &Value) -> bool {
+    response["enabled"].as_bool() == Some(false)
 }
 
 fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
@@ -5035,6 +5045,20 @@ mod tests {
         assert_eq!(format_context_percentage(Some(&json!(43.5))), "43.5%");
         assert_eq!(format_context_percentage(Some(&Value::Null)), "unknown");
         assert_eq!(format_context_percentage(None), "unknown");
+    }
+
+    #[test]
+    fn context_monitor_false_response_uses_codex_fyi_contract() {
+        assert!(context_monitor_is_informational(
+            &json!({"status": "ok", "enabled": false})
+        ));
+        assert!(!context_monitor_is_informational(
+            &json!({"status": "ok", "enabled": true})
+        ));
+        assert_eq!(
+            CODEX_CONTEXT_MONITOR_FYI,
+            "Context monitoring is FYI only for Codex agents; they manage compaction inline."
+        );
     }
 
     #[test]

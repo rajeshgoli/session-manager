@@ -9655,6 +9655,24 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
 
     let (status, payload) = post_json(
         app.clone(),
+        "/sessions/graphcodexapp/context-monitor",
+        json!({
+            "enabled": true,
+            "requester_session_id": "graphcodexapp",
+            "notify_session_id": "graphcodexapp"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok", "enabled": false }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/context-monitor").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["monitored"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["monitored"][0]["session_id"], "graphchild");
+
+    let (status, payload) = post_json(
+        app.clone(),
         "/sessions/graphchild/agent-status",
         json!({ "text": "old task state" }),
     )
