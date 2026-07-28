@@ -1017,6 +1017,21 @@ class TestCompactionSuppressRemind:
         _post_event(client, session.id, event="compaction", trigger="auto")
         assert session._is_compacting is True
 
+    def test_compaction_persists_cycle_boundary(self, client, mock_session_manager, session):
+        """compaction event saves the reset watermark before returning."""
+        resp = _post_event(
+            client,
+            session.id,
+            event="compaction",
+            trigger="auto",
+            sm_hook_emitted_at="2026-07-28T10:01:00Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "compaction_logged"
+        assert session.context_cycle_reset_emitted_at is not None
+        mock_session_manager._save_state.assert_called_once()
+
     def test_compaction_complete_clears_is_compacting_flag(self, client, session):
         """compaction_complete event clears _is_compacting=False on session."""
         session._is_compacting = True

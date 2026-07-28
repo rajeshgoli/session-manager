@@ -2450,7 +2450,7 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
             anyhow!("sm context requires a managed session or explicit session target")
         })?,
     };
-    let payload = client.get_json(&format!("/sessions/{target}/context"))?;
+    let payload = client.get_json(&session_context_path(&target))?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -2507,6 +2507,10 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
     );
     println!("Session: {label} [{session_id}] {provider}");
     Ok(())
+}
+
+fn session_context_path(target: &str) -> String {
+    format!("/sessions/{}/context", encode_path_segment(target))
 }
 
 fn format_context_percentage(value: Option<&Value>) -> String {
@@ -4772,6 +4776,14 @@ mod tests {
         assert_eq!(format_context_percentage(Some(&json!(43.5))), "43.5%");
         assert_eq!(format_context_percentage(Some(&Value::Null)), "unknown");
         assert_eq!(format_context_percentage(None), "unknown");
+    }
+
+    #[test]
+    fn context_target_path_segments_are_encoded() {
+        assert_eq!(
+            session_context_path("Runner Native/1"),
+            "/sessions/Runner%20Native%2F1/context"
+        );
     }
 
     fn write_temp_config(content: &str) -> PathBuf {

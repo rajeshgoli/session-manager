@@ -9032,6 +9032,7 @@ Provide ONLY the summary, no preamble or questions."""
                     sender_session_id=session_id,
                     message_category="context_monitor",
                 )
+            await _save_session_manager_state(app.state.session_manager)
             return {"status": "compaction_logged"}
 
         # Handle compaction_complete event (from post_compact_recovery.sh SessionStart hook)
