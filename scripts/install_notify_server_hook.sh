@@ -125,6 +125,12 @@ if not invokes(existing_command, context_monitor):
             handle.write(existing_command + "\n")
         os.chmod(delegate_file, 0o600)
         changes.append(f"statusLine delegate ({existing_command})")
+    elif os.path.exists(delegate_file):
+        # Nothing configured to preserve. A delegate captured by an earlier run
+        # would otherwise keep rendering the status line the user has since
+        # removed.
+        os.remove(delegate_file)
+        changes.append("statusLine delegate (cleared)")
     settings["statusLine"] = {"type": "command", "command": context_monitor}
     changes.append("statusLine")
 

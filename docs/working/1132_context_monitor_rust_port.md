@@ -67,11 +67,14 @@ hand-edited delegate cannot reintroduce the recursion.
   context *loss*, and a parent wants to know regardless (#210).
 - **context_reset** — re-arms the latches, clears stale agent status, and drops
   undelivered `context_monitor` messages this session raised about itself (#241).
-- **compaction_complete** — acknowledged only. The Python server used it to clear
-  an `_is_compacting` flag and reset the remind timer (#249); neither exists on
-  the Rust side yet. It is routed rather than rejected because
-  `post_compact_recovery.sh` posts here and a 404 surfaces as a hook failure in
-  live panes.
+- **compaction_complete** — the acknowledgement itself is a no-op: the Python
+  server used it to clear an `_is_compacting` flag and reset the remind timer
+  (#249), and neither exists on the Rust side yet. The response carries
+  `last_handoff_path` so `post_compact_recovery.sh` can reinject the handoff doc
+  without a second request. That matters for remote nodes: `/sessions/{id}` is an
+  ordinary API route behind Google auth, which a hook cannot satisfy — it holds a
+  node hook secret and nothing else, and only `/hooks/*` accepts one. Answering
+  on the request the hook is already making is both authenticated and cheaper.
 
 ### Two deliberate departures from the Python reference
 

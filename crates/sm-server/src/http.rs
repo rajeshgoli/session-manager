@@ -1421,10 +1421,21 @@ async fn context_usage_hook(
         .apply_context_usage_event(&event, runtime.as_ref())?;
 
     let mut body = json!({ "status": outcome.status() });
-    if let ContextUsageOutcome::Recorded { used_percentage } = outcome {
-        body["used_percentage"] = json!(used_percentage);
-    } else if matches!(outcome, ContextUsageOutcome::NoUsage) {
-        body["used_percentage"] = Value::Null;
+    match &outcome {
+        ContextUsageOutcome::Recorded { used_percentage } => {
+            body["used_percentage"] = json!(used_percentage);
+        }
+        ContextUsageOutcome::NoUsage => {
+            body["used_percentage"] = Value::Null;
+        }
+        // Answered here so the recovery hook does not need a second read that a
+        // remote node could not authenticate.
+        ContextUsageOutcome::CompactionCompleteLogged { last_handoff_path } => {
+            body["last_handoff_path"] = last_handoff_path
+                .as_deref()
+                .map_or(Value::Null, |path| Value::String(path.to_owned()));
+        }
+        _ => {}
     }
     Ok(Json(body).into_response())
 }

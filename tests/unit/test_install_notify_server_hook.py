@@ -121,6 +121,29 @@ def test_preserves_unrelated_settings_and_file_mode(tmp_path):
     assert settings_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_removing_the_status_line_clears_a_captured_delegate(tmp_path):
+    # Capture a delegate, then let the user drop statusLine entirely. Leaving the
+    # delegate behind would keep rendering the status line they removed.
+    write_settings(
+        tmp_path,
+        {"statusLine": {"type": "command", "command": "bash ~/.claude/statusline.sh"}},
+    )
+    run_installer(tmp_path)
+    delegate_file = tmp_path / ".claude" / "hooks" / "context_monitor_delegate"
+    assert delegate_file.exists()
+
+    settings = read_settings(tmp_path)
+    del settings["statusLine"]
+    write_settings(tmp_path, settings)
+    run_installer(tmp_path)
+
+    assert not delegate_file.exists()
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    assert read_settings(tmp_path)["statusLine"]["command"] == str(
+        hooks_dir / "context_monitor.sh"
+    )
+
+
 def legacy_settings(home: Path) -> dict:
     """What the deleted install_context_hooks.sh left behind: the same scripts,
     registered by their `~/.claude/...` spelling rather than an absolute path."""

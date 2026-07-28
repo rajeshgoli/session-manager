@@ -1322,11 +1322,18 @@ impl SessionStore {
 
         match event.event.as_deref().map(str::trim).unwrap_or("") {
             "compaction" => self.apply_compaction_event(&mut state, session_id, runtime),
-            // No `_is_compacting` equivalent exists on the Rust side yet, so this
-            // is an acknowledgement only. It is still routed rather than rejected
-            // because `post_compact_recovery.sh` is already installed and posts
-            // here; a 404 would show up as a hook failure in live panes.
-            "compaction_complete" => Ok(ContextUsageOutcome::CompactionCompleteLogged),
+            // No `_is_compacting` equivalent exists on the Rust side yet, so the
+            // acknowledgement itself is a no-op. It carries the handoff path
+            // back, though: the recovery hook needs it to reinject the doc, and
+            // answering here means it never has to make a second, unauthenticated
+            // read. `/sessions/{id}` is an ordinary API route behind Google auth,
+            // which a hook on a remote node cannot satisfy — it has a node hook
+            // secret and nothing else, and this route already accepts exactly
+            // that.
+            "compaction_complete" => Ok(ContextUsageOutcome::CompactionCompleteLogged {
+                last_handoff_path: raw_session_object(&state, session_id)
+                    .and_then(|session| json_text(session.get("last_handoff_path"))),
+            }),
             "context_reset" => self.apply_context_reset_event(&mut state, session_id),
             _ => self.apply_context_usage_update(&mut state, session_id, event, runtime),
         }
@@ -3208,7 +3215,7 @@ pub struct ContextUsageEvent {
 pub enum ContextUsageOutcome {
     UnknownSession,
     CompactionLogged,
-    CompactionCompleteLogged,
+    CompactionCompleteLogged { last_handoff_path: Option<String> },
     FlagsReset,
     NotRegistered,
     NoUsage,
@@ -3221,7 +3228,7 @@ impl ContextUsageOutcome {
         match self {
             Self::UnknownSession => "unknown_session",
             Self::CompactionLogged => "compaction_logged",
-            Self::CompactionCompleteLogged => "compaction_complete_logged",
+            Self::CompactionCompleteLogged { .. } => "compaction_complete_logged",
             Self::FlagsReset => "flags_reset",
             Self::NotRegistered => "not_registered",
             Self::StaleSample => "stale_sample",

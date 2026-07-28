@@ -7530,6 +7530,45 @@ async fn context_usage_hook_is_served_and_records_tokens() {
 }
 
 #[tokio::test]
+async fn compaction_complete_returns_the_handoff_path_for_reinjection() {
+    // post_compact_recovery.sh reads the path off this response rather than from
+    // /sessions/{id}: that route sits behind Google auth, which a hook on a
+    // remote node cannot satisfy — it carries only a node hook secret, and only
+    // /hooks/* accepts one.
+    let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let handoff = unique_temp_path();
+    fs::write(&handoff, "handoff contents").unwrap();
+    state["sessions"][0]["last_handoff_path"] = json!(handoff.display().to_string());
+    fs::write(&state_file, state.to_string()).unwrap();
+
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({ "session_id": "run12345", "event": "compaction_complete" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "compaction_complete_logged");
+    assert_eq!(
+        payload["last_handoff_path"],
+        json!(handoff.display().to_string())
+    );
+
+    // A session that never ran a handoff reports null rather than omitting it.
+    let (status, payload) = post_json(
+        app,
+        "/hooks/context-usage",
+        json!({ "session_id": "oldstate", "event": "compaction_complete" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["last_handoff_path"].is_null());
+}
+
+#[tokio::test]
 async fn context_usage_hook_rejects_a_sample_emitted_before_the_current_cycle() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
