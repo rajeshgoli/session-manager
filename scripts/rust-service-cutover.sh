@@ -47,6 +47,12 @@ usage() {
   cat <<EOF
 Usage: scripts/rust-service-cutover.sh <command> [options]
 
+NOTE: to bring the Rust service up, prefer scripts/restart-rust-server.sh. It
+drives start-rust/stop-rust below in the one safe order and registers launchd
+against an installed copy. Calling start-rust directly with the default --binary
+registers cargo's output, so a later 'cargo build' can replace the executable
+launchd is running. See specs/1134_rust_restart_procedure.md.
+
 Commands:
   plan             Show Rust service command, launchd paths, port owners, and blockers.
   render-plist     Print the Rust launchd plist to stdout.

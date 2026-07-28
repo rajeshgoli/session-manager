@@ -28,6 +28,7 @@ Multi-agent orchestration system for Claude Code. Manages sessions, enables pare
 - `hooks/log_tool_use.sh` - Claude Code hook for tool logging
 - `hooks/context_monitor.sh` - statusLine hook feeding `/hooks/context-usage` (delegates rendering to the previously configured status line)
 - `scripts/install_notify_server_hook.sh` - installs and registers every hook in `hooks/`
+- `scripts/restart-rust-server.sh` - the only supported way to rebuild and restart the live Rust server
 
 ## sm CLI Commands
 
@@ -89,6 +90,20 @@ codex_rollout:
 # Or use the CLI
 ./venv/bin/sm status
 ```
+
+### Restarting the live Rust server
+
+```bash
+./scripts/restart-rust-server.sh
+```
+
+Always use this script. Hand-rolling `cargo build` + `launchctl kickstart -k`
+has taken the service down: launchd can pin a launch constraint into the job
+registration, and only re-registering the job clears it.
+
+The service runs from an installed copy at `.local/bin/sm-server`, not from
+`target/release/sm-server`, so an ordinary `cargo build` never disturbs the
+running server. See `specs/1134_rust_restart_procedure.md`.
 
 ### Testing
 
