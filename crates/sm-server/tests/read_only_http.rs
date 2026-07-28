@@ -13337,6 +13337,7 @@ async fn runtime_core_restores_codex_session() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["provider"], "codex");
+    let created_at = payload["created_at"].as_str().unwrap().to_owned();
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
     wait_for_output_contains(app.clone(), "runtimecodex", "stock codex initial prompt").await;
 
@@ -13345,14 +13346,34 @@ async fn runtime_core_restores_codex_session() {
     assert_eq!(payload["status"], "killed");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
 
-    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    state["sessions"][0]["provider_resume_id"] = json!("stock-thread-123");
-    fs::write(&state_file, state.to_string()).unwrap();
+    let day_dir = state_file
+        .with_extension("codex-home")
+        .join("sessions")
+        .join(&created_at[0..4])
+        .join(&created_at[5..7])
+        .join(&created_at[8..10]);
+    fs::create_dir_all(&day_dir).unwrap();
+    fs::write(
+        day_dir.join("rollout-stock-thread-123.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "stock-thread-123",
+                    "cwd": working_dir.display().to_string(),
+                    "timestamp": created_at
+                }
+            })
+        ),
+    )
+    .unwrap();
 
     let (status, payload) =
         post_json(app.clone(), "/sessions/runtimecodex/restore", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["provider"], "codex");
+    assert_eq!(payload["provider_resume_id"], "stock-thread-123");
     assert_eq!(payload["status"], "running");
     assert!(tmux_session_exists(&tmux_socket, &tmux_session));
     let (status, payload) = post_json(
@@ -15764,6 +15785,13 @@ fn runtime_app_with_command(
             command: runtime_command.to_owned(),
             args: Vec::new(),
             default_model: None,
+            session_index_path: Some(
+                state_file
+                    .with_extension("codex-home")
+                    .join("session_index.jsonl")
+                    .display()
+                    .to_string(),
+            ),
         },
         ..AppConfig::default()
     }))

@@ -66,8 +66,14 @@ impl Default for AppConfig {
                 "claude".to_owned(),
                 Vec::new(),
                 Some("sonnet".to_owned()),
+                None,
             ),
-            codex: ProviderLaunchConfig::new("codex".to_owned(), Vec::new(), None),
+            codex: ProviderLaunchConfig::new(
+                "codex".to_owned(),
+                Vec::new(),
+                None,
+                Some("~/.codex/session_index.jsonl".to_owned()),
+            ),
             codex_review: CodexReviewConfig::default(),
             codex_fork: CodexForkLaunchConfig::default(),
             nodes: NodesConfig::default(),
@@ -660,21 +666,33 @@ pub struct ProviderLaunchConfig {
     pub command: String,
     pub args: Vec<String>,
     pub default_model: Option<String>,
+    pub session_index_path: Option<String>,
 }
 
 impl ProviderLaunchConfig {
-    fn new(command: String, args: Vec<String>, default_model: Option<String>) -> Self {
+    fn new(
+        command: String,
+        args: Vec<String>,
+        default_model: Option<String>,
+        session_index_path: Option<String>,
+    ) -> Self {
         Self {
             command,
             args,
             default_model,
+            session_index_path,
         }
     }
 }
 
 impl Default for ProviderLaunchConfig {
     fn default() -> Self {
-        Self::new("claude".to_owned(), Vec::new(), Some("sonnet".to_owned()))
+        Self::new(
+            "claude".to_owned(),
+            Vec::new(),
+            Some("sonnet".to_owned()),
+            None,
+        )
     }
 }
 
@@ -1134,9 +1152,15 @@ impl From<RawConfig> for AppConfig {
             codex_observability_config(raw.codex_observability, &paths.state_file);
         let codex_requests = codex_requests_config(raw.codex_requests, &paths.state_file);
         let codex_events = codex_events_config(raw.codex_events, &paths.state_file);
-        let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new());
+        let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new(), None);
         let codex_review = raw.codex.review;
-        let codex = provider_launch_config(raw.codex.provider, "codex", None, Vec::new());
+        let codex = provider_launch_config(
+            raw.codex.provider,
+            "codex",
+            None,
+            Vec::new(),
+            Some("~/.codex/session_index.jsonl"),
+        );
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
         if trimmed(&rust_core.tmux_socket_name).is_none() {
             rust_core.tmux_socket_name = trimmed(&raw.tmux.socket_name);
@@ -1263,6 +1287,8 @@ struct RawProviderLaunchConfig {
     args: Option<Vec<String>>,
     #[serde(default)]
     default_model: Option<String>,
+    #[serde(default)]
+    session_index_path: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1326,6 +1352,7 @@ fn provider_launch_config(
     default_command: &str,
     default_model: Option<&str>,
     default_args: Vec<String>,
+    default_session_index_path: Option<&str>,
 ) -> ProviderLaunchConfig {
     ProviderLaunchConfig::new(
         raw.command
@@ -1341,6 +1368,10 @@ fn provider_launch_config(
             .as_ref()
             .and_then(|value| trimmed(&Some(value.clone())))
             .or_else(|| default_model.map(ToOwned::to_owned)),
+        raw.session_index_path
+            .as_ref()
+            .and_then(|value| trimmed(&Some(value.clone())))
+            .or_else(|| default_session_index_path.map(ToOwned::to_owned)),
     )
 }
 
@@ -2262,6 +2293,7 @@ codex:
   command: "/opt/bin/codex"
   args: ["--dangerously-bypass-approvals-and-sandbox"]
   default_model: "gpt-5"
+  session_index_path: "/tmp/codex/session_index.jsonl"
   review:
     default_wait: 42
     menu_settle_seconds: 0.25
@@ -2278,6 +2310,10 @@ codex:
             vec!["--dangerously-bypass-approvals-and-sandbox"]
         );
         assert_eq!(config.codex.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            config.codex.session_index_path.as_deref(),
+            Some("/tmp/codex/session_index.jsonl")
+        );
         assert_eq!(config.codex_review.default_wait, 42);
         assert_eq!(config.codex_review.menu_settle_seconds, 0.25);
         assert_eq!(config.codex_review.branch_settle_seconds, 0.5);
