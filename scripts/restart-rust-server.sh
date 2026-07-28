@@ -398,6 +398,20 @@ if [[ "$SKIP_BUILD" -eq 0 ]] && registration_runs_cargo_output; then
        then restart normally. The running service was not touched."
 fi
 
+# start-rust rewrites the plist, and it does so after the service has been
+# stopped, so a destination we cannot write would leave it down.
+plist_dir="$(dirname "$SM_PLIST")"
+mkdir -p "$plist_dir" 2>/dev/null || true
+[[ -d "$plist_dir" && -w "$plist_dir" ]] \
+  || fail "cannot write the launchd plist directory $plist_dir; start-rust would fail
+       after the service had already been stopped. The running service was not
+       touched."
+if [[ -e "$SM_PLIST" && ! -w "$SM_PLIST" ]]; then
+  fail "launchd plist is not writable: $SM_PLIST; start-rust rewrites it after the
+       service has been stopped, so this would leave it down. The running service
+       was not touched."
+fi
+
 # Restarting rewrites the plist. Anything in the live plist that we would not
 # regenerate is a deployment setting about to be silently dropped - a custom
 # --local-env carrying auth secrets, for instance.
@@ -465,6 +479,23 @@ step "Verifying signature"
 codesign --verify --strict "$SM_STAGING" \
   || fail "signature verification failed - the running service was not touched"
 echo "signature ok: $(codesign -dvvv "$SM_STAGING" 2>&1 | awk -F= '/^Identifier=/{print $2}')"
+
+step "Validating the configuration with the new binary"
+# Readability is not validity. A malformed config.yaml or local-env overlay would
+# let the old process keep running on what it parsed at startup, and only fail
+# once the new one starts - after the service has been stopped, which KeepAlive
+# turns into a crash loop until the health timeout. --check-config runs the same
+# loader the server uses and exits before binding or touching any state.
+check_config_args=(--check-config --config "$SM_CONFIG")
+[[ -n "$SM_LOCAL_ENV" ]] && check_config_args+=(--local-env "$SM_LOCAL_ENV")
+if "$SM_STAGING" --help 2>&1 | grep -q -- '--check-config'; then
+  "$SM_STAGING" "${check_config_args[@]}" \
+    || fail "the new binary rejected the configuration; fix $SM_CONFIG before
+       restarting. The running service was not touched."
+else
+  # --skip-build/--adopt can be deploying a build from before the flag existed.
+  echo "WARNING: this binary has no --check-config, so the configuration was not validated" >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Phase 2: from here on the service is affected.

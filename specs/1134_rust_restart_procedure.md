@@ -211,6 +211,30 @@ may be older than what is running - and health, pid, and session-count checks
 would all pass over that silent downgrade. Adoption is therefore refused unless
 the service really is still registered against cargo's output.
 
+### Readable is not valid
+
+The preflight originally checked only that `config.yaml` and the local-env
+overlay were *readable*. A malformed or semantically invalid file passes that: the
+running process keeps serving on what it parsed at startup, and the failure only
+appears once the new server starts - after the bootout, which `KeepAlive` turns
+into a crash loop until the health timeout expires.
+
+Guessing at the format from the shell would not be authoritative, and starting a
+second server to find out would touch live state. So `sm-server` gained a
+`--check-config` flag: it runs `AppConfig::load_from_path_with_local_env` - the
+same loader the server uses - and returns before binding a port or opening
+anything. The script runs it against the *staged, newly built* binary, so the
+config is validated by the code about to be deployed. When `--skip-build` or
+`--adopt` is deploying a build from before the flag existed, the check is skipped
+with a warning rather than failing.
+
+### The plist has to be writable before the service is stopped
+
+`start-rust` rewrites the plist, and it does that after the bootout. A plist that
+is readable but not writable, or absent with an uncreatable parent, would render
+and diff fine in phase 1 and then fail in the cutover's `write_plist` - leaving
+the old registration unloaded and the service down. Both are checked up front.
+
 ### `bootout` failures are silent
 
 `stop_rust` in the cutover runs `launchctl bootout ... || true` and prints

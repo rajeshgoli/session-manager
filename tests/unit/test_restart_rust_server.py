@@ -29,6 +29,33 @@ def _write(path: Path, body: str, executable: bool = False) -> Path:
     return path
 
 
+def fake_binary(state: Path, marker: str) -> str:
+    """A runnable stand-in for sm-server.
+
+    The marker line is how tests tell which build is sitting at a given path.
+    --help advertises --check-config only when the knob says so, so the
+    older-build path can be exercised too.
+    """
+    return f"""#!/bin/bash
+# MARKER={marker}
+if [[ "$1" == "--help" ]]; then
+  echo "Usage: sm-server [OPTIONS]"
+  if [[ "$(cat "{state}/supports_check_config")" == "1" ]]; then
+    echo "      --check-config"
+  fi
+  exit 0
+fi
+if [[ "$1" == "--check-config" ]]; then
+  exit "$(cat "{state}/check_config_rc")"
+fi
+exit 0
+"""
+
+
+def _fake(env, marker: str) -> str:
+    return fake_binary(env["state"], marker)
+
+
 @pytest.fixture
 def env(tmp_path):
     """A sandbox with stubbed cargo, codesign, launchctl, curl, and cutover."""
@@ -37,8 +64,11 @@ def env(tmp_path):
     state.mkdir(parents=True, exist_ok=True)
 
     # The installed binary launchd is registered against, kept deliberately
-    # separate from cargo's output just as the real deployment now is.
-    installed = _write(tmp_path / "installed" / "sm-server", "ORIGINAL", executable=True)
+    # separate from cargo's output just as the real deployment now is. These have
+    # to be runnable: the script execs them to validate the configuration.
+    installed = _write(
+        tmp_path / "installed" / "sm-server", fake_binary(state, "ORIGINAL"), executable=True
+    )
     cargo_output = tmp_path / "cargo-out" / "sm-server"
 
     # Defaults; individual tests overwrite these knobs.
@@ -61,10 +91,17 @@ def env(tmp_path):
     (state / "job_state").write_text("running")
     (state / "loaded_labels").write_text(f"{LABEL}\n")
     (state / "job_program").write_text(str(installed))
+    (state / "supports_check_config").write_text("1")
+    (state / "check_config_rc").write_text("0")
+    # What a successful `cargo build` drops at the cargo output path.
+    _write(state / "rebuilt-binary", fake_binary(state, "REBUILT"))
 
     log = state / CALLS
-    # Every stub records what is at the registered path when it runs.
-    reg = f'reg="ABSENT"; [[ -f "{installed}" ]] && reg="$(cat "{installed}")"'
+    # Every stub records which build is at the registered path when it runs.
+    reg = (
+        f'reg="ABSENT"; [[ -f "{installed}" ]] '
+        f"""&& reg="$(sed -n 's/^# MARKER=//p' "{installed}")\""""
+    )
 
     _write(
         bin_dir / "cargo",
@@ -74,7 +111,7 @@ echo "cargo $* [registered=$reg]" >> "{log}"
 rc="$(cat "{state}/cargo_rc")"
 if [[ "$rc" == "0" ]]; then
   mkdir -p "$(dirname "{cargo_output}")"
-  printf 'REBUILT' > "{cargo_output}"
+  cp "{state}/rebuilt-binary" "{cargo_output}"
   chmod 755 "{cargo_output}"
 fi
 exit "$rc"
@@ -245,7 +282,7 @@ def assert_service_untouched(env):
         assert f"cutover {mutating}" not in text, f"service was touched:\n{text}"
     for mutating in ("bootout", "bootstrap", "kickstart", "unload", "load"):
         assert f"launchctl {mutating}" not in text, f"launchd was mutated:\n{text}"
-    assert env["installed"].read_text() == "ORIGINAL", "the registered binary was written"
+    assert "MARKER=ORIGINAL" in env["installed"].read_text(), "the registered binary was written"
 
 
 # --- the ordering guarantee -------------------------------------------------
@@ -347,27 +384,27 @@ def test_adopt_installs_the_running_build_without_rebuilding(env):
     )
     # The genuine pre-migration state: the loaded job runs cargo's output.
     (env["state"] / "job_program").write_text(str(env["cargo_output"]))
-    _write(env["cargo_output"], "ALREADY_RUNNING", executable=True)
+    _write(env["cargo_output"], _fake(env, "ALREADY_RUNNING"), executable=True)
 
     result = env["run"]("--adopt", "--allow-plist-change")
 
     assert result.returncode == 0, result.stderr
     assert "cargo build" not in calls(env)
-    assert env["installed"].read_text() == "ALREADY_RUNNING"
+    assert "MARKER=ALREADY_RUNNING" in env["installed"].read_text()
     assert "[registered=ORIGINAL]" in cutover_line(env, "stop-rust")
 
 
 def test_adopt_refused_once_already_migrated(env):
     """Repeating --adopt would install whatever stale artifact is left in the
     target directory - a silent downgrade that every later check would pass."""
-    _write(env["cargo_output"], "STALE_OLD_BUILD", executable=True)
+    _write(env["cargo_output"], _fake(env, "STALE_OLD_BUILD"), executable=True)
     # job_program already points at the installed binary (the migrated state)
 
     result = env["run"]("--adopt")
 
     assert result.returncode != 0
     assert "only for a service still registered against cargo's output" in result.stderr
-    assert env["installed"].read_text() == "ORIGINAL"
+    assert "MARKER=ORIGINAL" in env["installed"].read_text()
     assert_service_untouched(env)
 
 
@@ -465,7 +502,7 @@ def test_lock_is_released_after_a_failure(env):
 
 def test_symlink_alias_of_cargo_output_is_rejected(env):
     """A string compare would pass while launchd still execs cargo's artifact."""
-    _write(env["cargo_output"], "REBUILT", executable=True)
+    _write(env["cargo_output"], _fake(env, "REBUILT"), executable=True)
     alias = env["tmp"] / "alias-sm-server"
     alias.symlink_to(env["cargo_output"])
 
@@ -500,7 +537,7 @@ def test_relative_overrides_resolve_against_the_repo_root(env):
 def test_cargo_output_registration_is_rejected_in_every_mode(env, mode):
     """A run that does not build must still not leave the service registered
     against cargo's output, or the next ordinary build replaces the live binary."""
-    _write(env["cargo_output"], "SOMETHING", executable=True)
+    _write(env["cargo_output"], _fake(env, "SOMETHING"), executable=True)
 
     result = env["run"](*mode, SM_BINARY=str(env["cargo_output"]))
 
@@ -552,7 +589,7 @@ def test_binary_is_installed_only_while_the_job_is_stopped(env):
     assert "[registered=ORIGINAL]" in cutover_line(env, "stop-rust")
     # ...and only replaced once nothing can exec it.
     assert "[registered=REBUILT]" in cutover_line(env, "start-rust")
-    assert env["installed"].read_text() == "REBUILT"
+    assert "MARKER=REBUILT" in env["installed"].read_text()
 
 
 def test_job_still_loaded_after_stop_aborts_before_install(env):
@@ -564,7 +601,7 @@ def test_job_still_loaded_after_stop_aborts_before_install(env):
 
     assert result.returncode != 0
     assert "still loaded" in result.stderr
-    assert env["installed"].read_text() == "ORIGINAL"
+    assert "MARKER=ORIGINAL" in env["installed"].read_text()
     assert "cutover start-rust" not in calls(env)
 
 
@@ -575,7 +612,7 @@ def test_stop_failure_leaves_the_previous_binary_in_place(env):
 
     assert result.returncode != 0
     assert "could not stop" in result.stderr
-    assert env["installed"].read_text() == "ORIGINAL"
+    assert "MARKER=ORIGINAL" in env["installed"].read_text()
     assert "cutover start-rust" not in calls(env)
 
 
@@ -601,7 +638,7 @@ def test_deployment_overrides_reach_the_cutover(env):
     non-default deployment must be forwarded or we would sign one service and
     restart another - in the worst case, production."""
     other = env["tmp"] / "other" / "sm-server"
-    _write(other, "ORIGINAL", executable=True)
+    _write(other, _fake(env, "ORIGINAL"), executable=True)
     other_config = _write(env["tmp"] / "other.yaml", "server: {}\n")
 
     result = env["run"](
@@ -740,6 +777,63 @@ def test_enforced_python_label_list_matches_the_cutover():
     )
 
 
+def test_invalid_config_blocks_before_the_service_is_stopped(env):
+    """Readable is not valid. A malformed config would only fail once the new
+    server started - after bootout, which KeepAlive turns into a crash loop."""
+    (env["state"] / "check_config_rc").write_text("1")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "rejected the configuration" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_config_validation_is_skipped_on_a_binary_without_the_flag(env):
+    """--skip-build/--adopt can deploy a build from before --check-config."""
+    (env["state"] / "supports_check_config").write_text("0")
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert "no --check-config" in result.stderr
+
+
+def test_config_validation_passes_the_local_env_overlay(env):
+    overlay = _write(env["tmp"] / "local.env", "SECRET=1\n")
+
+    result = env["run"](SM_LOCAL_ENV=str(overlay))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_unwritable_plist_blocks_before_the_service_is_stopped(env):
+    """start-rust rewrites the plist after bootout, so this would leave it down."""
+    env["plist"].chmod(0o444)
+    try:
+        result = env["run"]()
+    finally:
+        env["plist"].chmod(0o644)
+
+    assert result.returncode != 0
+    assert "not writable" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_unwritable_plist_directory_blocks_before_the_service_is_stopped(env):
+    unwritable = env["tmp"] / "locked"
+    unwritable.mkdir()
+    unwritable.chmod(0o500)
+    try:
+        result = env["run"](SM_PLIST=str(unwritable / "svc.plist"))
+    finally:
+        unwritable.chmod(0o700)
+
+    assert result.returncode != 0
+    assert "cannot write the launchd plist directory" in result.stderr
+    assert_service_untouched(env)
+
+
 def test_unreadable_config_leaves_service_untouched(env):
     result = env["run"](SM_CONFIG=str(env["tmp"] / "missing.yaml"))
 
@@ -871,4 +965,4 @@ def test_skip_build_reinstalls_the_installed_binary(env):
     text = calls(env)
     assert "cargo build" not in text
     assert "codesign --force" in text
-    assert env["installed"].read_text() == "ORIGINAL"
+    assert "MARKER=ORIGINAL" in env["installed"].read_text()
