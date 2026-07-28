@@ -640,6 +640,40 @@ class TestCodexCommandRouting:
         assert mock_cmd_new.call_args.kwargs["provider"] == "codex"
 
 
+class TestContextCommandRouting:
+    """Tests for user-facing context command routing."""
+
+    def test_main_context_with_explicit_target_does_not_require_session(self):
+        mock_client = MagicMock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["sm", "context", "agent-1"]):
+                with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                    with patch("src.cli.main.commands.cmd_context", return_value=0) as mock_cmd:
+                        with pytest.raises(SystemExit) as exc_info:
+                            main()
+
+        assert exc_info.value.code == 0
+        mock_cmd.assert_called_once()
+        assert mock_cmd.call_args.args[1] is None
+        assert mock_cmd.call_args.kwargs["target"] == "agent-1"
+
+    def test_main_ctx_alias_with_explicit_target_does_not_require_session(self):
+        mock_client = MagicMock()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["sm", "ctx", "agent-1"]):
+                with patch("src.cli.main.SessionManagerClient", return_value=mock_client):
+                    with patch("src.cli.main.commands.cmd_context", return_value=0) as mock_cmd:
+                        with pytest.raises(SystemExit) as exc_info:
+                            main()
+
+        assert exc_info.value.code == 0
+        mock_cmd.assert_called_once()
+        assert mock_cmd.call_args.args[1] is None
+        assert mock_cmd.call_args.kwargs["target"] == "agent-1"
+
+
 class TestWatchCommand:
     """Tests for 'sm watch' parsing."""
 

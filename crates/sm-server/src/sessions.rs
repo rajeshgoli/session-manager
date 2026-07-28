@@ -187,13 +187,40 @@ impl SessionStore {
         if session_id.is_empty() {
             return Ok(None);
         }
-        Ok(self
-            .load_snapshot()?
-            .into_sessions()
-            .into_iter()
-            .find(|session| {
-                session.id == session_id || session.aliases.iter().any(|alias| alias == session_id)
-            }))
+        let sessions = self.load_snapshot()?.into_sessions();
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        {
+            return Ok(Some(session));
+        }
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.aliases.iter().any(|alias| alias == session_id))
+            .cloned()
+        {
+            return Ok(Some(session));
+        }
+        Ok(sessions.into_iter().find(|session| {
+            session.cached_display_name().as_deref() == Some(session_id)
+                || session.friendly_name.as_deref() == Some(session_id)
+                || session.native_title.as_deref() == Some(session_id)
+                || session.name == session_id
+        }))
+    }
+
+    pub fn get_context_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ContextSnapshotResponse>> {
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(ContextSnapshotResponse::from_session(
+            session,
+            &self.context_monitor,
+        )))
     }
 
     /// `hooks/notify_server.sh` dispatches every lifecycle hook through its own
@@ -1346,8 +1373,17 @@ impl SessionStore {
             // secret and nothing else, and this route already accepts exactly
             // that.
             "compaction_complete" => Ok(ContextUsageOutcome::CompactionCompleteLogged {
-                last_handoff_path: raw_session_object(&state, session_id)
-                    .and_then(|session| json_text(session.get("last_handoff_path"))),
+                last_handoff_path: {
+                    let sessions = ensure_sessions_array_mut(&mut state)?;
+                    let Some(session) = session_object_mut(sessions, session_id) else {
+                        return Ok(ContextUsageOutcome::UnknownSession);
+                    };
+                    session.insert("context_compaction_active".to_owned(), Value::Bool(false));
+                    clear_context_snapshot(session);
+                    let last_handoff_path = json_text(session.get("last_handoff_path"));
+                    self.write_raw_json_value(&state)?;
+                    last_handoff_path
+                },
             }),
             "context_reset" => self.apply_context_reset_event(&mut state, session_id, emitted_at),
             _ => self.apply_context_usage_update(&mut state, session_id, event, runtime),
@@ -1372,6 +1408,7 @@ impl SessionStore {
             // context can legitimately land above it.
             reset_context_oneshot_flags(session);
             set_context_cycle_boundary(session, emitted_at);
+            session.insert("context_compaction_active".to_owned(), Value::Bool(true));
             let notify_target = json_text(session.get("context_monitor_notify"))
                 // Fall back to the parent so an unregistered child still reports
                 // its own context loss upward (#210).
@@ -1411,6 +1448,8 @@ impl SessionStore {
             };
             reset_context_oneshot_flags(session);
             set_context_cycle_boundary(session, emitted_at);
+            session.insert("context_compaction_active".to_owned(), Value::Bool(false));
+            clear_context_snapshot(session);
             // The discarded context is what the previous status was describing.
             session.insert("agent_status_text".to_owned(), Value::Null);
             session.insert("agent_status_at".to_owned(), Value::Null);
@@ -1433,9 +1472,6 @@ impl SessionStore {
             .and_then(|session| session.get("context_monitor_enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !enabled {
-            return Ok(ContextUsageOutcome::NotRegistered);
-        }
         // A sample emitted before the current cycle began describes context that
         // no longer exists. Both stamps come from the session's own host, so this
         // never compares clocks across machines. Samples from a hook too old to
@@ -1450,20 +1486,63 @@ impl SessionStore {
                 return Ok(ContextUsageOutcome::StaleSample);
             }
         }
+        let stored_sample_at =
+            session_snapshot.and_then(|session| json_text(session.get("context_sampled_at")));
+        if let (Some(emitted_at), Some(stored_sample_at)) =
+            (event.emitted_at.as_deref(), stored_sample_at.as_deref())
+        {
+            if !timestamp_is_after(emitted_at, stored_sample_at) {
+                return Ok(ContextUsageOutcome::StaleSample);
+            }
+        }
         // Null until the first API call of a session — nothing to record yet.
         let Some(used_percentage) = event.used_percentage else {
             return Ok(ContextUsageOutcome::NoUsage);
         };
 
-        let (alert, mut changed) = {
+        let (alert, changed) = {
             let sessions = ensure_sessions_array_mut(state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(ContextUsageOutcome::UnknownSession);
             };
             let tokens_used = event.total_input_tokens.unwrap_or(0);
-            let changed = session.get("tokens_used").and_then(Value::as_i64) != Some(tokens_used);
+            let sampled_at = event
+                .emitted_at
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(now_rfc3339);
+            let previous_used = session.get("tokens_used").and_then(Value::as_i64);
+            let previous_pct = session
+                .get("context_used_percentage")
+                .and_then(Value::as_f64);
+            let previous_context_tokens = session
+                .get("context_total_input_tokens")
+                .and_then(Value::as_i64);
+            let previous_compaction_active = session
+                .get("context_compaction_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let changed = previous_used != Some(tokens_used)
+                || previous_pct != Some(used_percentage)
+                || previous_context_tokens != Some(tokens_used)
+                || json_text(session.get("context_sampled_at")).is_none()
+                || event.emitted_at.is_some()
+                    && json_text(session.get("context_sampled_at")).as_deref()
+                        != Some(sampled_at.as_str())
+                || previous_compaction_active;
             if changed {
                 session.insert("tokens_used".to_owned(), json!(tokens_used));
+                session.insert("context_used_percentage".to_owned(), json!(used_percentage));
+                session.insert("context_total_input_tokens".to_owned(), json!(tokens_used));
+                session.insert("context_sampled_at".to_owned(), Value::String(sampled_at));
+                session.insert("context_compaction_active".to_owned(), Value::Bool(false));
+            }
+            if !enabled {
+                if changed {
+                    self.write_raw_json_value(state)?;
+                }
+                return Ok(ContextUsageOutcome::NotRegistered);
             }
             (
                 self.latch_context_alert(session, session_id, used_percentage, tokens_used),
@@ -1471,6 +1550,7 @@ impl SessionStore {
             )
         };
 
+        let mut changed = changed;
         if let Some(alert) = alert {
             self.queue_context_monitor_message(
                 state,
@@ -2613,13 +2693,38 @@ impl SessionStore {
 
         // Codex reports token usage on its own event rather than through a
         // status line, so this is the codex-fork equivalent of the Claude
-        // `/hooks/context-usage` usage update — same gate, same thresholds,
-        // same one-shot latches.
+        // `/hooks/context-usage` usage update. The snapshot is always cached;
+        // the registration gate only controls warning/critical alerts.
         let mut context_alert = None;
         if let Some(usage) = codex_fork_context_usage(event) {
-            if flag_is_set(session, "context_monitor_enabled") {
+            let previous_used = session.get("tokens_used").and_then(Value::as_i64);
+            let previous_pct = session
+                .get("context_used_percentage")
+                .and_then(Value::as_f64);
+            let previous_context_tokens = session
+                .get("context_total_input_tokens")
+                .and_then(Value::as_i64);
+            let snapshot_changed = previous_used != Some(usage.tokens_used)
+                || previous_pct != Some(usage.used_percentage)
+                || previous_context_tokens != Some(usage.tokens_used)
+                || json_text(session.get("context_sampled_at")).is_none();
+            if snapshot_changed {
                 session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
+                session.insert(
+                    "context_used_percentage".to_owned(),
+                    json!(usage.used_percentage),
+                );
+                session.insert(
+                    "context_total_input_tokens".to_owned(),
+                    json!(usage.tokens_used),
+                );
+                session.insert(
+                    "context_sampled_at".to_owned(),
+                    Value::String(now_rfc3339()),
+                );
                 changed = true;
+            }
+            if flag_is_set(session, "context_monitor_enabled") {
                 context_alert = self.latch_context_alert(
                     session,
                     session_id,
@@ -2767,6 +2872,10 @@ impl SessionStore {
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
+            context_used_percentage: None,
+            context_total_input_tokens: None,
+            context_sampled_at: None,
+            context_compaction_active: false,
             context_monitor_enabled: false,
             context_monitor_notify: None,
             context_warning_sent: false,
@@ -3463,6 +3572,61 @@ pub struct ContextMonitorStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ContextSnapshotResponse {
+    pub session_id: String,
+    pub friendly_name: Option<String>,
+    pub provider: Option<String>,
+    pub used_percentage: Option<f64>,
+    pub total_input_tokens: Option<i64>,
+    pub sampled_at: Option<String>,
+    pub state: String,
+    pub warning_percentage: f64,
+    pub critical_percentage: f64,
+    pub context_monitor_enabled: bool,
+    pub notify_session_id: Option<String>,
+    pub compaction_active: bool,
+    pub last_handoff_path: Option<String>,
+}
+
+impl ContextSnapshotResponse {
+    fn from_session(session: SessionRecord, config: &ContextMonitorConfig) -> Self {
+        let used_percentage = session.context_used_percentage;
+        let compaction_active = session.context_compaction_active;
+        let friendly_name = session.cached_display_name();
+        let state = if compaction_active {
+            "compacting"
+        } else if let Some(used_percentage) = used_percentage {
+            if used_percentage >= config.critical_percentage {
+                "critical"
+            } else if used_percentage >= config.warning_percentage {
+                "warning"
+            } else {
+                "normal"
+            }
+        } else {
+            "unknown"
+        }
+        .to_owned();
+
+        Self {
+            session_id: session.id,
+            friendly_name,
+            provider: Some(non_empty_or(session.provider, "claude")),
+            used_percentage,
+            total_input_tokens: session.context_total_input_tokens,
+            sampled_at: session.context_sampled_at,
+            state,
+            warning_percentage: config.warning_percentage,
+            critical_percentage: config.critical_percentage,
+            context_monitor_enabled: session.context_monitor_enabled,
+            notify_session_id: session.context_monitor_notify,
+            compaction_active,
+            last_handoff_path: session.last_handoff_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ContextMonitorResult {
     pub status: String,
     pub enabled: bool,
@@ -3716,6 +3880,12 @@ fn reset_context_oneshot_flags(session: &mut Map<String, Value>) {
     session.insert("context_warning_sent".to_owned(), Value::Bool(false));
     session.insert("context_critical_sent".to_owned(), Value::Bool(false));
     session.insert("context_cycle_reset_emitted_at".to_owned(), Value::Null);
+}
+
+fn clear_context_snapshot(session: &mut Map<String, Value>) {
+    session.insert("context_used_percentage".to_owned(), Value::Null);
+    session.insert("context_total_input_tokens".to_owned(), Value::Null);
+    session.insert("context_sampled_at".to_owned(), Value::Null);
 }
 
 /// Record where the new cycle begins, in the producer's own clock.
@@ -5126,7 +5296,7 @@ fn recover_missing_maintainer_registration_raw(state: &mut Value) -> Result<bool
         let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
             continue;
         };
-        if !session.is_restorable_for_registry() {
+        if !session.is_live_for_registry() {
             continue;
         }
         if !from_legacy_field && !session_has_maintainer_identity(session) {
@@ -5153,10 +5323,10 @@ fn session_has_maintainer_identity(session: &SessionRecord) -> bool {
 }
 
 fn prune_agent_registrations_raw(state: &mut Value) -> Result<bool> {
-    let restorable_session_ids = snapshot_from_raw_value(state)?
+    let live_session_ids = snapshot_from_raw_value(state)?
         .into_sessions()
         .into_iter()
-        .filter(SessionRecord::is_restorable_for_registry)
+        .filter(SessionRecord::is_live_for_registry)
         .map(|session| session.id)
         .collect::<BTreeSet<_>>();
     let mut removed = Vec::<AgentRegistrationRecord>::new();
@@ -5166,7 +5336,7 @@ fn prune_agent_registrations_raw(state: &mut Value) -> Result<bool> {
             let Some(registration) = raw_registration_record(entry) else {
                 return false;
             };
-            if restorable_session_ids.contains(&registration.session_id) {
+            if live_session_ids.contains(&registration.session_id) {
                 return true;
             }
             removed.push(registration);
@@ -5283,6 +5453,8 @@ fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     // this a cleared codex session's latches would stay set and suppress every
     // warning in the new cycle.
     reset_context_oneshot_flags(session);
+    clear_context_snapshot(session);
+    session.insert("context_compaction_active".to_owned(), Value::Bool(false));
     session.insert("agent_status_text".to_owned(), Value::Null);
     session.insert("agent_status_at".to_owned(), Value::Null);
     session.insert("agent_task_completed_at".to_owned(), Value::Null);
@@ -5730,7 +5902,7 @@ impl StateSnapshot {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .filter(|session_id| self.session_is_restorable_for_registry(session_id))
+            .filter(|session_id| self.session_is_live_for_registry(session_id))
         {
             aliases
                 .entry(session_id.to_owned())
@@ -5743,7 +5915,7 @@ impl StateSnapshot {
             if role.is_empty() || session_id.is_empty() {
                 continue;
             }
-            if !self.session_is_restorable_for_registry(session_id) {
+            if !self.session_is_live_for_registry(session_id) {
                 continue;
             }
             aliases
@@ -5754,11 +5926,11 @@ impl StateSnapshot {
         aliases
     }
 
-    fn session_is_restorable_for_registry(&self, session_id: &str) -> bool {
+    fn session_is_live_for_registry(&self, session_id: &str) -> bool {
         self.sessions
             .iter()
             .find(|session| session.id == session_id)
-            .is_some_and(SessionRecord::is_restorable_for_registry)
+            .is_some_and(SessionRecord::is_live_for_registry)
     }
 
     fn pending_proposal_map(
@@ -5936,6 +6108,14 @@ pub struct SessionRecord {
     #[serde(default)]
     pub tokens_used: i64,
     #[serde(default)]
+    pub context_used_percentage: Option<f64>,
+    #[serde(default)]
+    pub context_total_input_tokens: Option<i64>,
+    #[serde(default)]
+    pub context_sampled_at: Option<String>,
+    #[serde(default)]
+    pub context_compaction_active: bool,
+    #[serde(default)]
     pub context_monitor_enabled: bool,
     #[serde(default)]
     pub context_monitor_notify: Option<String>,
@@ -5958,17 +6138,8 @@ impl SessionRecord {
         normalized_status(&self.status) == "stopped"
     }
 
-    fn is_restorable_for_registry(&self) -> bool {
-        if !self.is_stopped() {
-            return true;
-        }
-        let has_provider_resume_id = has_text(self.provider_resume_id.as_deref());
-        match self.provider.as_str() {
-            "claude" => has_provider_resume_id || has_text(self.transcript_path.as_deref()),
-            "codex-app" => has_provider_resume_id || has_text(self.codex_thread_id.as_deref()),
-            "codex" | "codex-fork" => has_provider_resume_id,
-            _ => has_provider_resume_id,
-        }
+    fn is_live_for_registry(&self) -> bool {
+        !self.is_stopped()
     }
 
     pub(crate) fn cached_display_name(&self) -> Option<String> {
@@ -6326,16 +6497,7 @@ fn timestamp_is_within(value: &str, seconds: i64) -> bool {
 /// format, so both encodings are accepted. Returns false when either side is
 /// unparseable — an unknown ordering must never supersede anything.
 fn timestamp_is_after(value: &str, other: &str) -> bool {
-    if let (Ok(value), Ok(other)) = (
-        OffsetDateTime::parse(value.trim(), &Rfc3339),
-        OffsetDateTime::parse(other.trim(), &Rfc3339),
-    ) {
-        return value > other;
-    }
-    match (
-        parse_python_naive_datetime(value),
-        parse_python_naive_datetime(other),
-    ) {
+    match (parse_timestamp_ns(value), parse_timestamp_ns(other)) {
         (Some(value), Some(other)) => value > other,
         _ => false,
     }
@@ -6669,6 +6831,10 @@ mod tests {
             last_tool_call: None,
             last_tool_name: None,
             tokens_used: 0,
+            context_used_percentage: None,
+            context_total_input_tokens: None,
+            context_sampled_at: None,
+            context_compaction_active: false,
             context_monitor_enabled: false,
             context_monitor_notify: None,
             context_warning_sent: false,
@@ -6937,6 +7103,16 @@ mod tests {
         assert!(timestamp_is_after(
             "2026-07-27T18:30:56.000001Z",
             "2026-07-27T18:30:55.999999999Z"
+        ));
+        // Python-era state may have a naive ISO stamp while newer hooks carry
+        // RFC3339. Both accepted encodings must compare on one timeline.
+        assert!(timestamp_is_after(
+            "2026-07-27T18:30:56.000001Z",
+            "2026-07-27T18:30:55.999999"
+        ));
+        assert!(!timestamp_is_after(
+            "2026-07-27T18:30:55.999999",
+            "2026-07-27T18:30:56.000001Z"
         ));
         // An unparseable side must never supersede anything.
         assert!(!timestamp_is_after("not-a-timestamp", nanos));
@@ -7378,7 +7554,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_prunes_stale_aliases_but_keeps_restorable_stopped_aliases() {
+    fn snapshot_prunes_stopped_aliases_even_when_restorable() {
         let snapshot = StateSnapshot {
             sessions: vec![
                 SessionRecord {
@@ -7420,7 +7596,7 @@ mod tests {
             .unwrap();
 
         assert!(stale.aliases.is_empty());
-        assert_eq!(restorable.aliases, vec!["restorable-role"]);
+        assert!(restorable.aliases.is_empty());
     }
 
     #[test]
@@ -7570,6 +7746,18 @@ mod tests {
         }
     }
 
+    fn usage_event_at(
+        session_id: &str,
+        used_percentage: f64,
+        tokens: i64,
+        emitted_at: &str,
+    ) -> ContextUsageEvent {
+        ContextUsageEvent {
+            emitted_at: Some(emitted_at.to_owned()),
+            ..usage_event(session_id, used_percentage, tokens)
+        }
+    }
+
     fn lifecycle_event(session_id: &str, event: &str) -> ContextUsageEvent {
         ContextUsageEvent {
             session_id: session_id.to_owned(),
@@ -7617,9 +7805,33 @@ mod tests {
 
         let session = store.get_session("child001").unwrap().unwrap();
         assert_eq!(session.tokens_used, 120_000);
+        assert_eq!(session.context_used_percentage, Some(60.0));
+        assert_eq!(session.context_total_input_tokens, Some(120_000));
+        assert!(session.context_sampled_at.is_some());
         assert!(session.context_warning_sent);
         assert!(!session.context_critical_sent);
         assert_eq!(context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn context_snapshot_reports_latest_cached_usage() {
+        let store = store_with_monitored_child("ctxsnapshot", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 43.0, 86_214), None)
+            .unwrap();
+
+        let snapshot = store.get_context_snapshot("child001").unwrap().unwrap();
+
+        assert_eq!(snapshot.session_id, "child001");
+        assert_eq!(snapshot.friendly_name.as_deref(), Some("worker"));
+        assert_eq!(snapshot.used_percentage, Some(43.0));
+        assert_eq!(snapshot.total_input_tokens, Some(86_214));
+        assert_eq!(snapshot.state, "normal");
+        assert_eq!(snapshot.warning_percentage, 50.0);
+        assert_eq!(snapshot.critical_percentage, 65.0);
+        assert!(snapshot.context_monitor_enabled);
+        assert_eq!(snapshot.notify_session_id.as_deref(), Some("parent01"));
+        assert!(!snapshot.compaction_active);
     }
 
     #[test]
@@ -7652,6 +7864,68 @@ mod tests {
         assert_eq!(
             store.get_session("child001").unwrap().unwrap().tokens_used,
             42_000
+        );
+    }
+
+    #[test]
+    fn out_of_order_usage_samples_do_not_regress_the_cached_snapshot() {
+        let store = store_with_monitored_child("ctxoldsample", false, Some("parent01"));
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 60.0, 120_000, "2026-07-28T10:01:00.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(
+                    &usage_event_at("child001", 45.0, 90_000, "2026-07-28T10:00:30.000000Z",),
+                    None,
+                )
+                .unwrap(),
+            ContextUsageOutcome::StaleSample
+        );
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.context_used_percentage, Some(60.0));
+        assert_eq!(session.context_total_input_tokens, Some(120_000));
+        assert_eq!(session.tokens_used, 120_000);
+    }
+
+    #[test]
+    fn identical_stamped_usage_samples_advance_the_ordering_watermark() {
+        let store = store_with_monitored_child("ctxsamewatermark", false, Some("parent01"));
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 60.0, 120_000, "2026-07-28T10:00:00.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 60.0, 120_000, "2026-07-28T10:01:00.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(
+                    &usage_event_at("child001", 45.0, 90_000, "2026-07-28T10:00:30.000000Z",),
+                    None,
+                )
+                .unwrap(),
+            ContextUsageOutcome::StaleSample
+        );
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.context_used_percentage, Some(60.0));
+        assert_eq!(session.context_total_input_tokens, Some(120_000));
+        assert_eq!(
+            session.context_sampled_at.as_deref(),
+            Some("2026-07-28T10:01:00.000000Z")
         );
     }
 
@@ -7872,7 +8146,7 @@ mod tests {
 
     #[test]
     fn context_usage_is_suppressed_for_unregistered_sessions() {
-        // #206: usage reporting is opt-in.
+        // #206: alerting is opt-in, but cached context readout is passive.
         let store = store_with_monitored_child("ctxgate", false, None);
 
         assert_eq!(
@@ -7883,7 +8157,18 @@ mod tests {
         );
 
         let session = store.get_session("child001").unwrap().unwrap();
-        assert_eq!(session.tokens_used, 0);
+        assert_eq!(session.tokens_used, 180_000);
+        assert_eq!(session.context_used_percentage, Some(90.0));
+        assert_eq!(session.context_total_input_tokens, Some(180_000));
+        assert!(session.context_sampled_at.is_some());
+        assert_eq!(
+            store
+                .get_context_snapshot("child001")
+                .unwrap()
+                .unwrap()
+                .state,
+            "critical"
+        );
         assert!(context_monitor_messages(&store).is_empty());
     }
 
@@ -7932,6 +8217,30 @@ mod tests {
             .unwrap();
         // compaction notice + the two warnings
         assert_eq!(context_monitor_messages(&store).len(), 3);
+    }
+
+    #[test]
+    fn fresh_usage_sample_clears_stale_compaction_state() {
+        let store = store_with_monitored_child("ctxcompactfresh", true, Some("parent01"));
+        let mut compaction = lifecycle_event("child001", "compaction");
+        compaction.emitted_at = Some("2026-07-28T10:00:00.000000Z".to_owned());
+        store.apply_context_usage_event(&compaction, None).unwrap();
+
+        let compacting = store.get_context_snapshot("child001").unwrap().unwrap();
+        assert_eq!(compacting.state, "compacting");
+        assert!(compacting.compaction_active);
+
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 43.0, 86_214, "2026-07-28T10:00:01.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        let snapshot = store.get_context_snapshot("child001").unwrap().unwrap();
+        assert_eq!(snapshot.state, "normal");
+        assert!(!snapshot.compaction_active);
+        assert_eq!(snapshot.used_percentage, Some(43.0));
     }
 
     #[test]
@@ -8029,6 +8338,9 @@ mod tests {
 
         let session = store.get_session("codex001").unwrap().unwrap();
         assert_eq!(session.tokens_used, 181_000);
+        assert_eq!(session.context_total_input_tokens, Some(181_000));
+        assert!((session.context_used_percentage.unwrap() - 70.046_439_628_482_98).abs() < 1e-9);
+        assert!(session.context_sampled_at.is_some());
         // 181000/258400 = 70%, past the default 65% critical line.
         assert!(session.context_critical_sent);
         assert_eq!(context_monitor_messages(&store).len(), 1);
@@ -8039,7 +8351,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_token_usage_respects_the_registration_gate() {
+    fn codex_token_usage_caches_snapshot_without_registration() {
         let state_file = unique_temp_path("ctxcodexgate");
         fs::write(
             &state_file,
@@ -8068,10 +8380,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            store.get_session("codex001").unwrap().unwrap().tokens_used,
-            0
-        );
+        let session = store.get_session("codex001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 181_000);
+        assert_eq!(session.context_total_input_tokens, Some(181_000));
+        assert!((session.context_used_percentage.unwrap() - 70.046_439_628_482_98).abs() < 1e-9);
+        assert!(session.context_sampled_at.is_some());
         assert!(context_monitor_messages(&store).is_empty());
     }
 

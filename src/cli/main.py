@@ -292,6 +292,27 @@ def main():
         help='Self-report status text (e.g., sm status "investigating bug")',
     )
 
+    # sm context [session] [--details|--detailed] [--json]
+    context_parser = subparsers.add_parser("context", aliases=["ctx"], help="Show current context usage")
+    context_parser.add_argument(
+        "session",
+        nargs="?",
+        default=None,
+        help="Session ID, friendly name, or registry alias (default: self)",
+    )
+    context_detail_group = context_parser.add_mutually_exclusive_group()
+    context_detail_group.add_argument(
+        "--details",
+        action="store_true",
+        help="Show detailed context snapshot",
+    )
+    context_detail_group.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Alias for --details",
+    )
+    context_parser.add_argument("--json", action="store_true", help="Output JSON")
+
     # sm subagent-start (called by SubagentStart hook)
     subparsers.add_parser("subagent-start", help="Register subagent start (called by hook)")
 
@@ -949,7 +970,7 @@ def main():
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "retire", "restore", "unkill", "fork", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server", "nodes", "node",
-        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
+        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context", "ctx", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
     ]
     # Commands that require session_id: self-directed managed-session actions
     requires_session_id = ["spawn", "adopt", "maintainer", "register", "unregister"]
@@ -1004,6 +1025,14 @@ def main():
             sys.exit(commands.cmd_agent_status(client, session_id, args.text))
         else:
             sys.exit(commands.cmd_status(client, session_id))
+    elif args.command in ("context", "ctx"):
+        sys.exit(commands.cmd_context(
+            client,
+            session_id,
+            target=args.session,
+            details=bool(args.details or args.detailed),
+            json_output=bool(args.json),
+        ))
     elif args.command == "subagent-start":
         sys.exit(commands.cmd_subagent_start(client, session_id))
     elif args.command == "subagent-stop":

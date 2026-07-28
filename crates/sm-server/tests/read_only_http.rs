@@ -7512,6 +7512,14 @@ async fn context_usage_hook_is_served_and_records_tokens() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["tokens_used"], json!(83_000));
 
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/context").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(payload["used_percentage"], json!(41.5));
+    assert_eq!(payload["total_input_tokens"], json!(83_000));
+    assert_eq!(payload["state"], "normal");
+    assert_eq!(payload["context_monitor_enabled"], true);
+
     // Before the first API call Claude reports a null percentage on every
     // render; that must not clobber the last real reading.
     let (status, payload) = post_json(
@@ -8290,6 +8298,18 @@ async fn session_detail_returns_one_projected_session() {
 }
 
 #[tokio::test]
+async fn session_detail_resolves_exact_friendly_name() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/Runner").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "run12345");
+    assert_eq!(payload["friendly_name"], "Runner Native");
+}
+
+#[tokio::test]
 async fn session_detail_returns_404_for_unknown_session() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -8397,6 +8417,21 @@ async fn session_output_tails_fixture_log_file() {
 }
 
 #[tokio::test]
+async fn session_output_resolves_exact_friendly_name() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/Runner/output?lines=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(
+        payload["output"],
+        "fixture log line 2\nfixture log line 3\n"
+    );
+}
+
+#[tokio::test]
 async fn session_tool_calls_reads_pre_tool_use_rows() {
     let state_file = write_session_fixture();
     let tool_db = unique_temp_path();
@@ -8411,7 +8446,7 @@ async fn session_tool_calls_reads_pre_tool_use_rows() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/sessions/run12345/tool-calls?limit=2").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/tool-calls?limit=2").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["session_id"], "run12345");
@@ -8430,6 +8465,12 @@ async fn session_tool_calls_reads_pre_tool_use_rows() {
             }
         ])
     );
+
+    let (status, payload) = get_json(app, "/sessions/Runner/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(payload["tool_calls"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -8450,7 +8491,8 @@ async fn session_tool_calls_projects_codex_fork_observability_rows() {
                     "log_file": "/tmp/forktools.log",
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "fork-tools"
                 }
             ]
         })
@@ -8469,7 +8511,7 @@ async fn session_tool_calls_projects_codex_fork_observability_rows() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/sessions/forktools/tool-calls?limit=2").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/forktools/tool-calls?limit=2").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["session_id"], "forktools");
@@ -8488,6 +8530,12 @@ async fn session_tool_calls_projects_codex_fork_observability_rows() {
             }
         ])
     );
+
+    let (status, payload) = get_json(app, "/sessions/fork-tools/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "forktools");
+    assert_eq!(payload["tool_calls"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -8551,7 +8599,7 @@ async fn session_activity_actions_projects_codex_observability_rows() {
     }));
 
     let (status, payload) = get_json(
-        app,
+        app.clone(),
         "/sessions/codexproj/activity-actions?limit=%32&limit=3",
     )
     .await;
@@ -8590,6 +8638,16 @@ async fn session_activity_actions_projects_codex_observability_rows() {
         "Approval decision: accept"
     );
     assert_eq!(payload["actions"][2]["status"], "completed");
+
+    let (status, payload) = get_json(
+        app,
+        "/sessions/codex-app-codexproj/activity-actions?limit=3",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["actions"].as_array().unwrap().len(), 3);
+    assert_eq!(payload["actions"][0]["session_id"], "codexproj");
 }
 
 #[tokio::test]
@@ -8651,7 +8709,7 @@ async fn session_codex_events_reads_recent_events_with_python_cursor_shape() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/sessions/codexapp1/codex-events?limit=2").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/codexapp1/codex-events?limit=2").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["earliest_seq"], 1);
@@ -8682,6 +8740,14 @@ async fn session_codex_events_reads_recent_events_with_python_cursor_shape() {
             }
         ])
     );
+
+    let (status, payload) =
+        get_json(app, "/sessions/codex-app-codexapp1/codex-events?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["latest_seq"], 4);
+    assert_eq!(payload["events"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["events"][0]["session_id"], "codexapp1");
 }
 
 #[tokio::test]
@@ -8906,7 +8972,7 @@ async fn session_codex_pending_requests_reads_pending_and_optional_orphaned_rows
     );
 
     let (status, payload) = get_json(
-        app,
+        app.clone(),
         "/sessions/codexpending/codex-pending-requests?include_orphaned=false&include_orphaned=%74",
     )
     .await;
@@ -8918,6 +8984,16 @@ async fn session_codex_pending_requests_reads_pending_and_optional_orphaned_rows
     assert_eq!(requests[1]["status"], "orphaned");
     assert_eq!(requests[1]["resolution_source"], "policy");
     assert_eq!(requests[1]["error_code"], "server_restarted");
+
+    let (status, payload) = get_json(
+        app,
+        "/sessions/codex-app-codexpending/codex-pending-requests",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let requests = payload["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["session_id"], "codexpending");
 }
 
 #[tokio::test]
@@ -10760,9 +10836,13 @@ async fn fixture_registry_prunes_stale_roles_and_updates_maintainer_alias() {
         .iter()
         .map(|entry| entry["role"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(roles, vec!["live-role", "restorable-role"]);
+    assert_eq!(roles, vec!["live-role"]);
 
     let (status, payload) = get_json(app.clone(), "/registry/stale-role").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Role not registered" }));
+
+    let (status, payload) = get_json(app.clone(), "/registry/restorable-role").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload, json!({ "detail": "Role not registered" }));
 
@@ -10772,11 +10852,15 @@ async fn fixture_registry_prunes_stale_roles_and_updates_maintainer_alias() {
         raw_state["agent_role_last_session_ids"]["stale-role"],
         "staleagent"
     );
+    assert_eq!(
+        raw_state["agent_role_last_session_ids"]["restorable-role"],
+        "restorable"
+    );
     assert!(raw_state["agent_registrations"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|entry| entry["role"] != "stale-role"));
+        .all(|entry| entry["role"] != "stale-role" && entry["role"] != "restorable-role"));
 }
 
 #[tokio::test]
@@ -11422,6 +11506,14 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/runtimesmsend",
+        json!({"friendly_name": "runtime-sm-send"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["friendly_name"], "runtime-sm-send");
     let (status, _payload) = post_json(
         app.clone(),
         "/sessions",
@@ -11439,7 +11531,7 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/runtimesmsend/input",
+        "/sessions/runtime-sm-send/input",
         json!({
             "text": "ordinary sm send metadata delivered",
             "sender_session_id": "runtimesender",
@@ -11486,6 +11578,7 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
                    response_relay_source, delivered_at
             FROM message_queue
             WHERE target_session_id = 'runtimesmsend'
+              AND text LIKE '%ordinary sm send metadata delivered'
             "#,
             [],
             |row| {

@@ -1777,6 +1777,14 @@ class SessionManagerClient:
             return data.get("monitored", [])
         return None
 
+    def get_context_snapshot(self, session_id: str) -> Optional[dict]:
+        """Get the latest cached context usage snapshot for a session."""
+        session_path = urllib.parse.quote(session_id, safe="")
+        data, success, unavailable = self._request("GET", f"/sessions/{session_path}/context")
+        if unavailable or not success or not data:
+            return None
+        return data
+
     def get_rollout_flags(self) -> Optional[dict]:
         """Get server rollout feature flags."""
         data, success, unavailable = self._request("GET", "/admin/rollout-flags")

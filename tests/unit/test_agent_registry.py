@@ -100,7 +100,7 @@ def test_load_state_recovers_missing_maintainer_registration_from_live_last_hold
     assert state_data["agent_registrations"][0]["session_id"] == session.id
 
 
-def test_load_state_recovers_missing_maintainer_registration_for_restorable_holder(tmp_path):
+def test_load_state_does_not_recover_missing_maintainer_registration_for_stopped_holder(tmp_path):
     session = _session("maint123", tmp_path)
     session.friendly_name = "maintainer"
     session.status = SessionStatus.STOPPED
@@ -126,8 +126,12 @@ def test_load_state_recovers_missing_maintainer_registration_for_restorable_hold
     )
 
     registration = manager.lookup_agent_registration("maintainer")
-    assert registration is not None
-    assert registration.session_id == session.id
+    assert registration is None
+    assert manager.maintainer_session_id is None
+
+    state_data = json.loads(state_path.read_text())
+    assert state_data["agent_registrations"] == []
+    assert state_data["maintainer_session_id"] is None
 
 
 def test_explicit_unregister_clears_last_role_hint(tmp_path):

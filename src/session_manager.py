@@ -3902,7 +3902,7 @@ done
         return session
 
     def get_session(self, session_id: str) -> Optional[Session]:
-        """Get a session by ID."""
+        """Get a session by canonical ID."""
         return self.sessions.get(session_id)
 
     def _default_fork_friendly_name(self, source: Session) -> str:
@@ -4128,24 +4128,11 @@ done
         self.maintainer_session_id = registration.session_id if registration else None
 
     def _get_live_registered_session(self, session_id: str) -> Optional[Session]:
-        """Return the owning session when it is still usable for registry purposes."""
+        """Return the owning session when it is still live for registry purposes."""
         session = self.sessions.get(session_id)
-        if not session or not self._session_is_restorable_for_registry(session):
+        if not session or session.status == SessionStatus.STOPPED:
             return None
         return session
-
-    @staticmethod
-    def _session_is_restorable_for_registry(session: Session) -> bool:
-        """Return whether a stopped session still has enough provider state to restore."""
-        if session.status != SessionStatus.STOPPED:
-            return True
-        if session.provider == "claude":
-            return bool(session.provider_resume_id or session.transcript_path)
-        if session.provider == "codex-app":
-            return bool(session.codex_thread_id or session.provider_resume_id)
-        if session.provider in {"codex", "codex-fork"}:
-            return bool(session.provider_resume_id)
-        return bool(session.provider_resume_id)
 
     def _recover_missing_maintainer_registration(self) -> bool:
         """Recover a missing maintainer role when persisted history still points to it."""
@@ -4161,7 +4148,7 @@ done
             if not session_id:
                 continue
             session = self.sessions.get(session_id)
-            if not session or not self._session_is_restorable_for_registry(session):
+            if not session or session.status == SessionStatus.STOPPED:
                 continue
             session_identity = {
                 str(session.friendly_name or "").strip().lower(),

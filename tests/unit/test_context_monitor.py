@@ -49,6 +49,7 @@ def mock_session_manager(session):
     mock = MagicMock()
     mock.sessions = {session.id: session}
     mock.get_session = MagicMock(return_value=session)
+    mock._save_state_async = None
     mock._save_state = MagicMock()
     mock.message_queue_manager = MagicMock()
     return mock
@@ -115,6 +116,189 @@ class TestWarningThreshold:
         queue_mgr = mock_session_manager.message_queue_manager
         assert not queue_mgr.queue_message.called
         assert session._context_warning_sent is False
+
+
+class TestContextSnapshot:
+    """Cached context snapshot read path."""
+
+    def test_context_usage_is_cached_even_when_monitor_disabled(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert session.context_used_percentage == 43
+        assert session.context_total_input_tokens == 86_214
+        assert session.context_sampled_at is not None
+        mock_session_manager._save_state.assert_called_once()
+        assert not mock_session_manager.message_queue_manager.queue_message.called
+
+        context_resp = client.get(f"/sessions/{session.id}/context")
+        assert context_resp.status_code == 200
+        payload = context_resp.json()
+        assert payload["session_id"] == session.id
+        assert payload["used_percentage"] == 43
+        assert payload["total_input_tokens"] == 86_214
+        assert payload["state"] == "normal"
+        assert payload["context_monitor_enabled"] is False
+
+    def test_context_snapshot_unknown_before_first_sample(self, client, session):
+        resp = client.get(f"/sessions/{session.id}/context")
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["used_percentage"] is None
+        assert payload["total_input_tokens"] is None
+        assert payload["sampled_at"] is None
+        assert payload["state"] == "unknown"
+
+    def test_context_reset_clears_cached_snapshot(self, client, session):
+        _post_context(client, session.id, used_pct=55, total_input_tokens=110_000)
+
+        resp = _post_event(client, session.id, "context_reset")
+
+        assert resp.status_code == 200
+        assert session.context_used_percentage is None
+        assert session.context_total_input_tokens is None
+        assert session.context_sampled_at is None
+
+    def test_context_usage_unstamped_unchanged_sample_is_not_resaved(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+
+        _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+        mock_session_manager._save_state.reset_mock()
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        mock_session_manager._save_state.assert_not_called()
+
+    def test_context_usage_unchanged_sample_advances_watermark(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+
+        _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+        first_sampled_at = session.context_sampled_at
+        mock_session_manager._save_state.reset_mock()
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:30Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert session.context_sampled_at > first_sampled_at
+        mock_session_manager._save_state.assert_called_once()
+
+    def test_context_usage_before_latest_reset_is_ignored(self, client, mock_session_manager, session):
+        _post_context(
+            client,
+            session.id,
+            used_pct=55,
+            total_input_tokens=110_000,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+
+        resp = _post_event(
+            client,
+            session.id,
+            "context_reset",
+            sm_hook_emitted_at="2026-07-28T10:01:00Z",
+        )
+        assert resp.status_code == 200
+        mock_session_manager._save_state.reset_mock()
+
+        stale_resp = _post_context(
+            client,
+            session.id,
+            used_pct=60,
+            total_input_tokens=120_000,
+            sm_hook_emitted_at="2026-07-28T10:00:30Z",
+        )
+
+        assert stale_resp.status_code == 200
+        assert stale_resp.json()["status"] == "stale_sample"
+        assert session.context_used_percentage is None
+        assert session.context_total_input_tokens is None
+        assert session.context_sampled_at is None
+        mock_session_manager._save_state.assert_not_called()
+
+    def test_out_of_order_context_usage_sample_is_ignored(self, client, mock_session_manager, session):
+        _post_context(
+            client,
+            session.id,
+            used_pct=60,
+            total_input_tokens=120_000,
+            sm_hook_emitted_at="2026-07-28T10:01:00Z",
+        )
+        mock_session_manager._save_state.reset_mock()
+
+        stale_resp = _post_context(
+            client,
+            session.id,
+            used_pct=45,
+            total_input_tokens=90_000,
+            sm_hook_emitted_at="2026-07-28T10:00:30Z",
+        )
+
+        assert stale_resp.status_code == 200
+        assert stale_resp.json()["status"] == "stale_sample"
+        assert session.context_used_percentage == 60
+        assert session.context_total_input_tokens == 120_000
+        assert session.tokens_used == 120_000
+        mock_session_manager._save_state.assert_not_called()
+
+    def test_context_usage_clears_stale_compaction_state(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+        session._is_compacting = True
+        session.context_cycle_reset_emitted_at = None
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert session._is_compacting is False
+        mock_session_manager._save_state.assert_called_once()
+
+        context_resp = client.get(f"/sessions/{session.id}/context")
+        assert context_resp.status_code == 200
+        payload = context_resp.json()
+        assert payload["state"] == "normal"
+        assert payload["compaction_active"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -857,10 +1041,31 @@ class TestCompactionSuppressRemind:
         _post_event(client, session.id, event="compaction", trigger="auto")
         assert session._is_compacting is True
 
+    def test_compaction_persists_cycle_boundary(self, client, mock_session_manager, session):
+        """compaction event saves the reset watermark before returning."""
+        resp = _post_event(
+            client,
+            session.id,
+            event="compaction",
+            trigger="auto",
+            sm_hook_emitted_at="2026-07-28T10:01:00Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "compaction_logged"
+        assert session.context_cycle_reset_emitted_at is not None
+        mock_session_manager._save_state.assert_called_once()
+
     def test_compaction_complete_clears_is_compacting_flag(self, client, session):
         """compaction_complete event clears _is_compacting=False on session."""
         session._is_compacting = True
         _post_event(client, session.id, event="compaction_complete")
+        assert session._is_compacting is False
+
+    def test_context_reset_clears_is_compacting_flag(self, client, session):
+        """context_reset event clears stale compaction state."""
+        session._is_compacting = True
+        _post_event(client, session.id, event="context_reset")
         assert session._is_compacting is False
 
     def test_compaction_complete_resets_remind_timer(self, client, mock_session_manager, session):
@@ -869,6 +1074,7 @@ class TestCompactionSuppressRemind:
         _post_event(client, session.id, event="compaction_complete")
         queue_mgr = mock_session_manager.message_queue_manager
         queue_mgr.reset_remind.assert_called_once_with(session.id, force_tracked=True)
+        mock_session_manager._save_state.assert_called_once()
 
     def test_compaction_complete_returns_logged_status(self, client, session):
         """compaction_complete returns compaction_complete_logged status."""
