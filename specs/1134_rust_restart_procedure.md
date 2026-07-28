@@ -92,16 +92,45 @@ nothing in it touches the service.
 
 ```
 Phase 1 (service untouched on any failure)
-  record /health and session count
+  record /health and session count (a healthy server must yield a baseline)
+  preflight: config readable, local-env readable, no lingering Python label,
+             SM_BINARY is cargo's output, plist would not be rewritten
+  snapshot the registered binary        <- rollback armed
   cargo build --release -p sm-server
   codesign --force --sign - --identifier com.rajeshgoli.sm-server <binary>
   codesign --verify --strict <binary>
-Phase 2
-  scripts/rust-service-cutover.sh restart-rust    # bootout -> bootstrap -> kickstart -k
+Phase 2                                 <- rollback disarmed; the new binary stays
+  scripts/rust-service-cutover.sh restart-rust <forwarded deployment args>
   poll /health until healthy (timeout -> nonzero)
   require state=running and an unchanged pid for 20s
   require session count not to have dropped
 ```
+
+### "Untouched" has to include the binary on disk
+
+The obvious reading of the acceptance criterion - a failing build or sign leaves
+the running service alone - is not enough. A build replaces the registered
+executable while the old process keeps running from its own inode, so a failure
+*after* the build leaves a process that is alive now but whose next KeepAlive
+respawn would use a build the live registration never accepted. That is the
+outage, just deferred to whenever the service next restarts.
+
+Phase 1 therefore snapshots the binary before the build and restores it if
+anything fails before the restart commits. Verified live: with signing forced to
+pass and verification forced to fail, the cdhash was restored byte-identical
+(`b06ed8fc...` before and after), the pid was unchanged, and no backup file was
+left behind.
+
+### A plist rewrite is a silent config change
+
+`restart-rust` regenerates the plist, so any setting in the live plist that the
+script would not regenerate is about to be dropped - a custom `--local-env`
+carrying auth secrets being the dangerous case. Rather than enumerate settings,
+phase 1 renders the plist the restart *would* write and diffs it against the
+live one, aborting on any difference (`--allow-plist-change` to override after
+reading the diff). `SM_LOCAL_ENV` is supported and forwarded so the operator can
+make the two match. On the current deployment the rendered and live plists are
+byte-identical, so the guard is silent in normal use.
 
 Notes on specific choices:
 
@@ -126,6 +155,15 @@ Notes on specific choices:
   the same reason the health URL is built from `SM_HOST`/`SM_PORT` rather than
   being independently settable: the endpoint polled is by construction the one
   the service was told to listen on.
+- **A healthy server must yield a session baseline.** If `/health` answers but
+  `/sessions` does not, phase 1 aborts rather than continuing with an empty
+  baseline - otherwise the post-restart comparison is skipped and a restart that
+  dropped the whole registry still reports success. Only a genuinely down server
+  (a recovery restart) is allowed to proceed without one.
+- **`SM_BINARY` must be cargo's output when building.** `cargo build` writes its
+  own path, so signing and restarting some other `SM_BINARY` would deploy stale
+  code while reporting a fresh build. Mismatch aborts; `--skip-build` is the
+  supported way to deploy a prebuilt binary from elsewhere.
 - **Session-count drops fail the run** (`--allow-drop N` to tolerate expected
   churn). Sessions do retire on their own - the count moved 13 -> 12 during this
   investigation with no restart - so the escape hatch exists, but the default is

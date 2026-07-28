@@ -5,6 +5,13 @@
 # the build and the signature must BOTH fully succeed before anything stops the
 # running service, so a broken build can never take the server offline.
 #
+# "Untouched" has to include the binary on disk, not just the running process.
+# A rebuild replaces the registered executable while the old process keeps
+# running from its own inode, so a later failure would leave a process that is
+# alive now but whose next KeepAlive respawn uses an executable the current
+# registration may reject. Phase 1 therefore snapshots the binary and restores
+# it if anything fails before the restart commits.
+#
 # Why the restart is bootout -> bootstrap -> kickstart and not `kickstart -k`:
 # launchd can pin a launch constraint into the job registration. When it has,
 # a rebuilt binary no longer satisfies it and the job is SIGKILLed at exec with
@@ -28,8 +35,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Overridable for tests and non-default deployments.
 SM_LABEL="${SM_LABEL:-com.rajeshgoli.session-manager-rust}"
 SM_BINARY="${SM_BINARY:-$REPO_ROOT/target/release/sm-server}"
+SM_CARGO_OUTPUT="${SM_CARGO_OUTPUT:-$REPO_ROOT/target/release/sm-server}"
 SM_CUTOVER="${SM_CUTOVER:-$REPO_ROOT/scripts/rust-service-cutover.sh}"
 SM_CONFIG="${SM_CONFIG:-$REPO_ROOT/config.yaml}"
+SM_LOCAL_ENV="${SM_LOCAL_ENV:-}"
+SM_PLIST="${SM_PLIST:-$HOME/Library/LaunchAgents/$SM_LABEL.plist}"
 # Space-separated; must match the labels rust-service-cutover.sh refuses to start alongside.
 SM_PYTHON_LABELS="${SM_PYTHON_LABELS:-com.rajeshgoli.session-manager com.claude.session-manager}"
 # Host/port are owned here and forwarded to the cutover, so the endpoint we
@@ -45,33 +55,43 @@ DOMAIN="gui/$(id -u)"
 
 usage() {
   cat <<EOF
-Usage: scripts/restart-rust-server.sh [--allow-drop N] [--skip-build] [-h]
+Usage: scripts/restart-rust-server.sh [options]
 
 Rebuilds, signs, and restarts the Rust Session Manager, then verifies it.
-A failing build or a failing signature leaves the running service untouched.
+A failing build or a failing signature leaves the running service untouched,
+including the binary on disk.
 
 Options:
-  --allow-drop N   Tolerate N fewer sessions after the restart (default: 0).
-                   Sessions can retire on their own between the before and
-                   after samples; raise this only if that is expected.
-  --skip-build     Reuse the existing binary. Still signs and verifies.
-  -h, --help       Show this help.
+  --allow-drop N        Tolerate N fewer sessions after the restart (default: 0).
+                        Sessions can retire on their own between the before and
+                        after samples; raise this only if that is expected.
+  --allow-plist-change  Proceed even though restarting would rewrite the launchd
+                        plist with different contents. Read the printed diff
+                        first: this is how a deployment setting gets dropped.
+  --skip-build          Reuse the existing binary. Still signs and verifies.
+  -h, --help            Show this help.
 
-Environment overrides: SM_LABEL, SM_BINARY, SM_CUTOVER, SM_CONFIG, SM_HOST,
-SM_PORT, SM_PYTHON_LABELS, SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
-SM_PID_SETTLE_SECONDS, SM_ALLOW_SESSION_DROP.
+Environment overrides: SM_LABEL, SM_BINARY, SM_CARGO_OUTPUT, SM_CUTOVER,
+SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, SM_PORT, SM_PYTHON_LABELS,
+SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT, SM_PID_SETTLE_SECONDS,
+SM_ALLOW_SESSION_DROP.
 
-SM_LABEL, SM_BINARY, SM_CONFIG, SM_HOST, and SM_PORT are forwarded to the
-cutover script, so both phases always act on the same deployment.
+SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_HOST, and SM_PORT are forwarded
+to the cutover script, so both phases always act on the same deployment.
 EOF
 }
 
 SKIP_BUILD=0
+ALLOW_PLIST_CHANGE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --allow-drop)
       SM_ALLOW_SESSION_DROP="${2:?missing --allow-drop value}"
       shift 2
+      ;;
+    --allow-plist-change)
+      ALLOW_PLIST_CHANGE=1
+      shift
       ;;
     --skip-build)
       SKIP_BUILD=1
@@ -96,6 +116,39 @@ fi
 
 step() { printf '\n==> %s\n' "$1"; }
 fail() { echo "ERROR: $1" >&2; exit 1; }
+
+# Every deployment value the cutover needs. It initialises its own defaults and
+# reads none of our variables, so anything not forwarded here silently reverts
+# to the default (production) deployment.
+cutover_args=(
+  --label "$SM_LABEL"
+  --binary "$SM_BINARY"
+  --config "$SM_CONFIG"
+  --host "$SM_HOST"
+  --port "$SM_PORT"
+)
+[[ -n "$SM_LOCAL_ENV" ]] && cutover_args+=(--local-env "$SM_LOCAL_ENV")
+
+# --- binary rollback --------------------------------------------------------
+# Armed before the build, disarmed once the restart is committed.
+BINARY_BACKUP=""
+RESTORE_BINARY=0
+RENDERED_PLIST=""
+
+cleanup() {
+  local rc=$?
+  if [[ "$RESTORE_BINARY" -eq 1 && -n "$BINARY_BACKUP" && -f "$BINARY_BACKUP" && $rc -ne 0 ]]; then
+    if mv -f "$BINARY_BACKUP" "$SM_BINARY"; then
+      echo "rolled back $SM_BINARY to the previously registered build" >&2
+    else
+      echo "WARNING: could not restore $SM_BINARY from $BINARY_BACKUP" >&2
+    fi
+  fi
+  [[ -n "$BINARY_BACKUP" ]] && rm -f "$BINARY_BACKUP"
+  [[ -n "$RENDERED_PLIST" ]] && rm -f "$RENDERED_PLIST"
+  return $rc
+}
+trap cleanup EXIT
 
 health_ok() {
   curl -sf --connect-timeout 2 --max-time 5 "$SM_BASE_URL/health" >/dev/null 2>&1
@@ -126,7 +179,8 @@ launchctl_field() {
 
 # ---------------------------------------------------------------------------
 # Phase 1: everything that can fail without consequence.
-# Nothing below this line may touch the running service.
+# Nothing below this line may touch the running service, and anything it
+# changes on disk must be undone by cleanup().
 # ---------------------------------------------------------------------------
 
 step "Recording pre-restart state"
@@ -135,7 +189,13 @@ BEFORE_SESSIONS=""
 if health_ok; then
   BEFORE_HEALTHY=1
   BEFORE_SESSIONS="$(session_count || true)"
-  echo "service is up; sessions before: ${BEFORE_SESSIONS:-<unavailable>}"
+  # Without a baseline the post-restart comparison would be silently skipped,
+  # so a restart that dropped the whole registry would still report success.
+  [[ -n "$BEFORE_SESSIONS" ]] \
+    || fail "server is healthy but its session list could not be read; refusing to
+       restart without a baseline to compare against. The running service was
+       not touched."
+  echo "service is up; sessions before: $BEFORE_SESSIONS"
 else
   echo "service is not answering /health; treating this as a recovery restart"
 fi
@@ -145,6 +205,9 @@ step "Preflight: checking what the restart will require"
 # start-rust's preconditions, so a precondition that fails there leaves the
 # server down. Check the same things here, while stopping nothing.
 [[ -r "$SM_CONFIG" ]] || fail "config not readable: $SM_CONFIG - the running service was not touched"
+if [[ -n "$SM_LOCAL_ENV" && ! -r "$SM_LOCAL_ENV" ]]; then
+  fail "local env overlay not readable: $SM_LOCAL_ENV - the running service was not touched"
+fi
 for label in $SM_PYTHON_LABELS; do
   if launchctl print "$DOMAIN/$label" >/dev/null 2>&1; then
     fail "Python service label $label is still loaded; start-rust would refuse to
@@ -152,7 +215,45 @@ for label in $SM_PYTHON_LABELS; do
        The running service was not touched."
   fi
 done
+
+if [[ "$SKIP_BUILD" -eq 0 && "$SM_BINARY" != "$SM_CARGO_OUTPUT" ]]; then
+  fail "SM_BINARY is $SM_BINARY but cargo builds $SM_CARGO_OUTPUT, so a build would
+       not produce the binary we are about to sign and restart - the run would
+       deploy stale code while reporting a fresh build. Re-run with --skip-build
+       to deploy the existing binary. The running service was not touched."
+fi
+
+# Restarting rewrites the plist. Anything in the live plist that we would not
+# regenerate is a deployment setting about to be silently dropped - a custom
+# --local-env carrying auth secrets, for instance.
+if [[ -f "$SM_PLIST" ]]; then
+  RENDERED_PLIST="$(mktemp)"
+  "$SM_CUTOVER" render-plist "${cutover_args[@]}" > "$RENDERED_PLIST" \
+    || fail "could not render the plist for comparison - the running service was not touched"
+  if ! diff -u "$SM_PLIST" "$RENDERED_PLIST" > "$RENDERED_PLIST.diff" 2>&1; then
+    echo "--- live plist vs what the restart would write ---" >&2
+    cat "$RENDERED_PLIST.diff" >&2
+    rm -f "$RENDERED_PLIST.diff"
+    if [[ "$ALLOW_PLIST_CHANGE" -eq 0 ]]; then
+      fail "restarting would rewrite $SM_PLIST with different contents (diff above).
+       Pass the missing settings (for example SM_LOCAL_ENV) so the rendered plist
+       matches, or re-run with --allow-plist-change to accept the rewrite.
+       The running service was not touched."
+    fi
+    echo "WARNING: proceeding with a plist rewrite because --allow-plist-change was given" >&2
+  fi
+  rm -f "$RENDERED_PLIST.diff"
+fi
 echo "preconditions ok"
+
+# Arm the rollback before anything writes to the registered binary. Both the
+# build and the signature replace it, and either can be followed by a failure.
+if [[ -e "$SM_BINARY" ]]; then
+  BINARY_BACKUP="$SM_BINARY.restart-backup.$$"
+  cp -p "$SM_BINARY" "$BINARY_BACKUP" \
+    || fail "could not snapshot $SM_BINARY before rebuilding - the running service was not touched"
+  RESTORE_BINARY=1
+fi
 
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   step "Skipping build (--skip-build)"
@@ -177,21 +278,14 @@ codesign --verify --strict "$SM_BINARY" \
 echo "signature ok: $(codesign -dvvv "$SM_BINARY" 2>&1 | awk -F= '/^Identifier=/{print $2}')"
 
 # ---------------------------------------------------------------------------
-# Phase 2: from here on the service is affected.
+# Phase 2: from here on the service is affected, and the new binary stays.
 # ---------------------------------------------------------------------------
+
+RESTORE_BINARY=0
 
 step "Restarting service (bootout -> bootstrap -> kickstart)"
 [[ -x "$SM_CUTOVER" ]] || fail "cutover script not executable: $SM_CUTOVER"
-# Forward every deployment value explicitly. The cutover script initialises its
-# own defaults and reads none of these variables, so omitting them would let this
-# script sign and verify one deployment while restarting a different (default,
-# i.e. production) one.
-"$SM_CUTOVER" restart-rust \
-  --label "$SM_LABEL" \
-  --binary "$SM_BINARY" \
-  --config "$SM_CONFIG" \
-  --host "$SM_HOST" \
-  --port "$SM_PORT" \
+"$SM_CUTOVER" restart-rust "${cutover_args[@]}" \
   || fail "restart failed - see output above; service may be down"
 
 step "Waiting for /health (timeout ${SM_HEALTH_TIMEOUT}s)"

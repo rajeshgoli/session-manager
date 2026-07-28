@@ -43,15 +43,25 @@ def env(tmp_path):
     (state / "after_health").write_text("0")
     (state / "before_sessions").write_text("12")
     (state / "after_sessions").write_text("12")
+    (state / "before_sessions_rc").write_text("0")
+    (state / "after_sessions_rc").write_text("0")
+    (state / "rendered_plist").write_text("<plist>canned</plist>\n")
     (state / "pids").write_text("4242")  # whitespace-separated; last value repeats
     (state / "pid_index").write_text("0")
     (state / "job_state").write_text("running")
 
     log = state / CALLS
 
+    # A real build replaces the registered binary, which is what makes a later
+    # phase-1 failure dangerous; the stub reproduces that.
     _write(
         bin_dir / "cargo",
-        f'#!/bin/bash\necho "cargo $*" >> "{log}"\nexit "$(cat "{state}/cargo_rc")"\n',
+        f"""#!/bin/bash
+echo "cargo $*" >> "{log}"
+rc="$(cat "{state}/cargo_rc")"
+[[ "$rc" == "0" ]] && printf 'REBUILT' > "{tmp_path}/sm-server"
+exit "$rc"
+""",
         executable=True,
     )
     _write(
@@ -103,6 +113,8 @@ case "$url" in
   */sessions)
     rc="$(cat "{state}/${{phase}}_health")"
     [[ "$rc" != "0" ]] && exit "$rc"
+    rc="$(cat "{state}/${{phase}}_sessions_rc")"
+    [[ "$rc" != "0" ]] && exit "$rc"
     n="$(cat "{state}/${{phase}}_sessions")"
     printf '{{"sessions":['
     for ((i = 0; i < n; i++)); do
@@ -118,28 +130,41 @@ exit 0
     )
     cutover = _write(
         tmp_path / "cutover.sh",
-        f'#!/bin/bash\necho "cutover $*" >> "{log}"\necho after > "{state}/phase"\n'
-        f'exit "$(cat "{state}/cutover_rc")"\n',
+        f"""#!/bin/bash
+echo "cutover $*" >> "{log}"
+if [[ "$1" == "render-plist" ]]; then
+  cat "{state}/rendered_plist"
+  exit 0
+fi
+echo after > "{state}/phase"
+exit "$(cat "{state}/cutover_rc")"
+""",
         executable=True,
     )
 
-    binary = _write(tmp_path / "sm-server", "#!/bin/bash\ntrue\n", executable=True)
+    binary = _write(tmp_path / "sm-server", "ORIGINAL", executable=True)
     config = _write(tmp_path / "config.yaml", "server:\n  port: 8420\n")
+    # Matches the stub's render-plist output, so there is no divergence by default.
+    plist = _write(tmp_path / "service.plist", "<plist>canned</plist>\n")
 
     return {
         "tmp": tmp_path,
         "state": state,
         "log": log,
-        "run": _make_runner(bin_dir, cutover, binary, config),
+        "binary": binary,
+        "plist": plist,
+        "run": _make_runner(bin_dir, cutover, binary, config, plist),
     }
 
 
-def _make_runner(bin_dir: Path, cutover: Path, binary: Path, config: Path):
+def _make_runner(bin_dir: Path, cutover: Path, binary: Path, config: Path, plist: Path):
     def run(*args, **overrides):
         environ = {
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "SM_BINARY": str(binary),
+            "SM_CARGO_OUTPUT": str(binary),
+            "SM_PLIST": str(plist),
             "SM_CUTOVER": str(cutover),
             "SM_CONFIG": str(config),
             "SM_PYTHON_LABELS": "com.example.legacy-python",
@@ -166,11 +191,13 @@ def calls(env) -> str:
 def assert_service_untouched(env):
     """No restart, and no launchd call that could change service state.
 
-    Read-only `launchctl print` is allowed: the preflight uses it to check
-    preconditions before anything is stopped.
+    Read-only calls are allowed: the preflight uses `launchctl print` and
+    `cutover render-plist` to check preconditions before anything is stopped.
     """
     text = calls(env)
-    assert "cutover" not in text, f"restart was attempted:\n{text}"
+    assert "cutover restart-rust" not in text, f"restart was attempted:\n{text}"
+    assert "cutover start-rust" not in text, f"restart was attempted:\n{text}"
+    assert "cutover stop-rust" not in text, f"service was stopped:\n{text}"
     for mutating in ("bootout", "bootstrap", "kickstart", "unload", "load"):
         assert f"launchctl {mutating}" not in text, f"launchd was mutated:\n{text}"
 
@@ -209,11 +236,123 @@ def test_verify_failure_leaves_service_untouched(env):
 
 
 def test_missing_binary_leaves_service_untouched(env):
-    result = env["run"](SM_BINARY=str(env["tmp"] / "nope"))
+    missing = str(env["tmp"] / "nope")
+
+    result = env["run"](SM_BINARY=missing, SM_CARGO_OUTPUT=missing)
 
     assert result.returncode != 0
     assert "binary not found" in result.stderr
     assert_service_untouched(env)
+
+
+def test_binary_is_rolled_back_when_signing_fails(env):
+    """A build replaces the registered executable while the old process runs on.
+    If a later phase-1 step fails, the on-disk binary must go back, or the next
+    KeepAlive respawn boots a build the live registration never accepted."""
+    (env["state"] / "codesign_sign_rc").write_text("1")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert env["binary"].read_text() == "ORIGINAL"
+    assert "rolled back" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_binary_is_rolled_back_when_verification_fails(env):
+    (env["state"] / "codesign_verify_rc").write_text("1")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert env["binary"].read_text() == "ORIGINAL"
+
+
+def test_successful_run_keeps_the_new_binary(env):
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert env["binary"].read_text() == "REBUILT"
+
+
+def test_no_backup_file_is_left_behind(env):
+    env["run"]()
+
+    leftovers = list(env["tmp"].glob("sm-server.restart-backup*"))
+    assert leftovers == []
+
+
+def test_cargo_output_mismatch_blocks_before_any_restart(env):
+    """cargo builds its own path; signing a different SM_BINARY would deploy
+    stale code while claiming a fresh build."""
+    other = _write(env["tmp"] / "elsewhere", "STALE", executable=True)
+
+    result = env["run"](SM_BINARY=str(other))
+
+    assert result.returncode != 0
+    assert "cargo builds" in result.stderr
+    assert other.read_text() == "STALE"
+    assert_service_untouched(env)
+
+
+def test_cargo_output_mismatch_is_allowed_with_skip_build(env):
+    other = _write(env["tmp"] / "elsewhere", "PREBUILT", executable=True)
+
+    result = env["run"]("--skip-build", SM_BINARY=str(other))
+
+    assert result.returncode == 0, result.stderr
+
+
+# --- deployment settings that a plist rewrite would drop --------------------
+
+
+def test_plist_divergence_blocks_before_any_restart(env):
+    """Restarting rewrites the plist; anything we would not regenerate is a
+    setting about to be silently dropped."""
+    env["plist"].write_text("<plist>has --local-env with secrets</plist>\n")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "would rewrite" in result.stderr
+    assert "live plist vs what the restart would write" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_allow_plist_change_proceeds_with_a_warning(env):
+    env["plist"].write_text("<plist>different</plist>\n")
+
+    result = env["run"]("--allow-plist-change")
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stderr
+
+
+def test_local_env_is_forwarded_to_the_cutover(env):
+    overlay = _write(env["tmp"] / "local.env", "SECRET=1\n")
+
+    result = env["run"](SM_LOCAL_ENV=str(overlay))
+
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in calls(env).splitlines() if l.startswith("cutover restart-rust"))
+    assert f"--local-env {overlay}" in line
+
+
+def test_unreadable_local_env_blocks_before_any_restart(env):
+    result = env["run"](SM_LOCAL_ENV=str(env["tmp"] / "missing.env"))
+
+    assert result.returncode != 0
+    assert "local env overlay not readable" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_missing_plist_is_not_a_divergence(env):
+    """A first-time bootstrap has no plist to compare against."""
+    env["plist"].unlink()
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_lingering_python_label_blocks_before_anything_stops(env):
@@ -276,6 +415,7 @@ def test_deployment_overrides_reach_the_cutover(env):
     result = env["run"](
         SM_LABEL="com.example.other",
         SM_BINARY=str(other),
+        SM_CARGO_OUTPUT=str(other),
         SM_CONFIG=str(other_config),
         SM_PORT="10",
     )
@@ -368,6 +508,18 @@ def test_session_growth_is_not_a_failure(env):
     result = env["run"]()
 
     assert result.returncode == 0, result.stderr
+
+
+def test_healthy_server_with_unreadable_session_list_aborts(env):
+    """Otherwise `|| true` turns a transient /sessions failure into an empty
+    baseline, and the post-restart comparison is silently skipped."""
+    (env["state"] / "before_sessions_rc").write_text("7")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "refusing to" in result.stderr
+    assert_service_untouched(env)
 
 
 def test_recovery_restart_when_server_was_down(env):
