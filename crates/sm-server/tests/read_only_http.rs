@@ -8298,6 +8298,18 @@ async fn session_detail_returns_one_projected_session() {
 }
 
 #[tokio::test]
+async fn session_detail_resolves_exact_friendly_name() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/Runner").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "run12345");
+    assert_eq!(payload["friendly_name"], "Runner Native");
+}
+
+#[tokio::test]
 async fn session_detail_returns_404_for_unknown_session() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -8395,6 +8407,21 @@ async fn session_output_tails_fixture_log_file() {
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
     let (status, payload) = get_json(app, "/sessions/run12345/output?lines=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(
+        payload["output"],
+        "fixture log line 2\nfixture log line 3\n"
+    );
+}
+
+#[tokio::test]
+async fn session_output_resolves_exact_friendly_name() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/Runner/output?lines=2").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["session_id"], "run12345");
@@ -11438,6 +11465,14 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let (status, payload) = patch_json(
+        app.clone(),
+        "/sessions/runtimesmsend",
+        json!({"friendly_name": "runtime-sm-send"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["friendly_name"], "runtime-sm-send");
     let (status, _payload) = post_json(
         app.clone(),
         "/sessions",
@@ -11455,7 +11490,7 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/runtimesmsend/input",
+        "/sessions/runtime-sm-send/input",
         json!({
             "text": "ordinary sm send metadata delivered",
             "sender_session_id": "runtimesender",
@@ -11502,6 +11537,7 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
                    response_relay_source, delivered_at
             FROM message_queue
             WHERE target_session_id = 'runtimesmsend'
+              AND text LIKE '%ordinary sm send metadata delivered'
             "#,
             [],
             |row| {

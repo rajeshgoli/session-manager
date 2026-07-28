@@ -5902,14 +5902,17 @@ async fn send_session_input(
             detail: "text is required".to_owned(),
         });
     }
+    let Some(session) = state.session_store.get_session(&session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
     let result = if state.config.rust_core.runtime_enabled {
-        ensure_core_runtime_session_node_supported(&state, &session_id)?;
+        ensure_core_runtime_session_node_supported(&state, &session.id)?;
         let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
-            .send_core_input_with_runtime(&session_id, payload, &runtime)?
+            .send_core_input_with_runtime(&session.id, payload, &runtime)?
     } else {
-        state.session_store.send_core_input(&session_id, payload)?
+        state.session_store.send_core_input(&session.id, payload)?
     };
     let Some(result) = result else {
         return Err(ApiError::NotFound("Session not found"));
@@ -6633,13 +6636,16 @@ async fn session_output(
     request: Request,
 ) -> Result<Json<SessionOutputResponse>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    if state.session_store.get_session(&session_id)?.is_none() {
+    let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
-    }
+    };
     let output = state
         .session_store
-        .capture_output(&session_id, query.lines.unwrap_or(50))?;
-    Ok(Json(SessionOutputResponse { session_id, output }))
+        .capture_output(&session.id, query.lines.unwrap_or(50))?;
+    Ok(Json(SessionOutputResponse {
+        session_id: session.id,
+        output,
+    }))
 }
 
 async fn session_tool_calls(

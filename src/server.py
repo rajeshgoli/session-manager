@@ -170,6 +170,15 @@ async def _save_session_manager_state(session_manager: object) -> bool:
     return False
 
 
+def _parse_hook_emitted_at(value: object) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _is_valid_app_artifact_hash(artifact_hash: str) -> bool:
     return bool(APP_ARTIFACT_HASH_PATTERN.fullmatch(artifact_hash))
 
@@ -8974,6 +8983,9 @@ Provide ONLY the summary, no preamble or questions."""
             logger.warning(
                 f"Compaction fired for {_effective_session_name(session)} (trigger={trigger})"
             )
+            session.context_cycle_reset_emitted_at = _parse_hook_emitted_at(
+                data.get("sm_hook_emitted_at")
+            )
             # Set compaction flag — suppress remind delivery until compaction_complete (#249).
             session._is_compacting = True
             # Reset one-shot flags — PreCompact fires before context is refreshed,
@@ -9019,6 +9031,9 @@ Provide ONLY the summary, no preamble or questions."""
         # Must be before the registration gate — unregistered sessions still receive
         # compaction notifications and need cancellation on context reset (#241).
         if data.get("event") == "context_reset":
+            session.context_cycle_reset_emitted_at = _parse_hook_emitted_at(
+                data.get("sm_hook_emitted_at")
+            )
             # Re-arm one-shot flags so warnings fire correctly in the new cycle.
             # Covers: TUI /clear and sm clear CLI (both trigger SessionStart source=clear).
             session._context_warning_sent = False
@@ -9042,20 +9057,29 @@ Provide ONLY the summary, no preamble or questions."""
             return {"status": "ok", "used_percentage": None}
 
         total_input_tokens = data.get("total_input_tokens", 0)
-        session.tokens_used = total_input_tokens
-        session.context_used_percentage = used_pct
-        session.context_total_input_tokens = total_input_tokens
         emitted_at = data.get("sm_hook_emitted_at")
-        sampled_at = datetime.now()
-        if emitted_at:
-            try:
-                sampled_at = datetime.fromisoformat(str(emitted_at).replace("Z", "+00:00"))
-            except ValueError:
-                sampled_at = datetime.now()
-        session.context_sampled_at = sampled_at
+        parsed_emitted_at = _parse_hook_emitted_at(emitted_at)
+        reset_boundary = getattr(session, "context_cycle_reset_emitted_at", None)
+        if parsed_emitted_at and reset_boundary and parsed_emitted_at <= reset_boundary:
+            return {"status": "stale_sample"}
+
+        sampled_at = parsed_emitted_at or datetime.now()
+        changed = (
+            session.tokens_used != total_input_tokens
+            or session.context_used_percentage != used_pct
+            or session.context_total_input_tokens != total_input_tokens
+            or session.context_sampled_at is None
+        )
+        if changed:
+            session.tokens_used = total_input_tokens
+            session.context_used_percentage = used_pct
+            session.context_total_input_tokens = total_input_tokens
+            session.context_sampled_at = sampled_at
 
         # Gate: skip unregistered sessions for warning/critical alerts (#206).
         if not session.context_monitor_enabled:
+            if changed:
+                await _save_session_manager_state(app.state.session_manager)
             return {"status": "not_registered", "used_percentage": used_pct}
 
         config = (app.state.config or {}).get("context_monitor", {})
@@ -9065,6 +9089,7 @@ Provide ONLY the summary, no preamble or questions."""
         if used_pct >= critical_pct:
             if not session._context_critical_sent:
                 session._context_critical_sent = True
+                changed = True
                 if queue_mgr:
                     is_self_alert = (session.context_monitor_notify == session.id)
                     if is_self_alert:
@@ -9089,6 +9114,7 @@ Provide ONLY the summary, no preamble or questions."""
         elif used_pct >= warning_pct:
             if not session._context_warning_sent:
                 session._context_warning_sent = True
+                changed = True
                 if queue_mgr:
                     is_self_alert = (session.context_monitor_notify == session.id)
                     if is_self_alert:
@@ -9107,6 +9133,9 @@ Provide ONLY the summary, no preamble or questions."""
                         sender_session_id=session_id,
                         message_category="context_monitor",
                     )
+
+        if changed:
+            await _save_session_manager_state(app.state.session_manager)
 
         return {"status": "ok", "used_percentage": used_pct}
 

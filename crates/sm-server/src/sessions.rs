@@ -187,13 +187,27 @@ impl SessionStore {
         if session_id.is_empty() {
             return Ok(None);
         }
-        Ok(self
-            .load_snapshot()?
-            .into_sessions()
-            .into_iter()
-            .find(|session| {
-                session.id == session_id || session.aliases.iter().any(|alias| alias == session_id)
-            }))
+        let sessions = self.load_snapshot()?.into_sessions();
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        {
+            return Ok(Some(session));
+        }
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.aliases.iter().any(|alias| alias == session_id))
+            .cloned()
+        {
+            return Ok(Some(session));
+        }
+        Ok(sessions.into_iter().find(|session| {
+            session.cached_display_name().as_deref() == Some(session_id)
+                || session.friendly_name.as_deref() == Some(session_id)
+                || session.native_title.as_deref() == Some(session_id)
+                || session.name == session_id
+        }))
     }
 
     pub fn get_context_snapshot(
@@ -2661,13 +2675,38 @@ impl SessionStore {
 
         // Codex reports token usage on its own event rather than through a
         // status line, so this is the codex-fork equivalent of the Claude
-        // `/hooks/context-usage` usage update — same gate, same thresholds,
-        // same one-shot latches.
+        // `/hooks/context-usage` usage update. The snapshot is always cached;
+        // the registration gate only controls warning/critical alerts.
         let mut context_alert = None;
         if let Some(usage) = codex_fork_context_usage(event) {
-            if flag_is_set(session, "context_monitor_enabled") {
+            let previous_used = session.get("tokens_used").and_then(Value::as_i64);
+            let previous_pct = session
+                .get("context_used_percentage")
+                .and_then(Value::as_f64);
+            let previous_context_tokens = session
+                .get("context_total_input_tokens")
+                .and_then(Value::as_i64);
+            let snapshot_changed = previous_used != Some(usage.tokens_used)
+                || previous_pct != Some(usage.used_percentage)
+                || previous_context_tokens != Some(usage.tokens_used)
+                || json_text(session.get("context_sampled_at")).is_none();
+            if snapshot_changed {
                 session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
+                session.insert(
+                    "context_used_percentage".to_owned(),
+                    json!(usage.used_percentage),
+                );
+                session.insert(
+                    "context_total_input_tokens".to_owned(),
+                    json!(usage.tokens_used),
+                );
+                session.insert(
+                    "context_sampled_at".to_owned(),
+                    Value::String(now_rfc3339()),
+                );
                 changed = true;
+            }
+            if flag_is_set(session, "context_monitor_enabled") {
                 context_alert = self.latch_context_alert(
                     session,
                     session_id,
@@ -8182,6 +8221,9 @@ mod tests {
 
         let session = store.get_session("codex001").unwrap().unwrap();
         assert_eq!(session.tokens_used, 181_000);
+        assert_eq!(session.context_total_input_tokens, Some(181_000));
+        assert!((session.context_used_percentage.unwrap() - 70.046_439_628_482_98).abs() < 1e-9);
+        assert!(session.context_sampled_at.is_some());
         // 181000/258400 = 70%, past the default 65% critical line.
         assert!(session.context_critical_sent);
         assert_eq!(context_monitor_messages(&store).len(), 1);
@@ -8192,7 +8234,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_token_usage_respects_the_registration_gate() {
+    fn codex_token_usage_caches_snapshot_without_registration() {
         let state_file = unique_temp_path("ctxcodexgate");
         fs::write(
             &state_file,
@@ -8221,10 +8263,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            store.get_session("codex001").unwrap().unwrap().tokens_used,
-            0
-        );
+        let session = store.get_session("codex001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 181_000);
+        assert_eq!(session.context_total_input_tokens, Some(181_000));
+        assert!((session.context_used_percentage.unwrap() - 70.046_439_628_482_98).abs() < 1e-9);
+        assert!(session.context_sampled_at.is_some());
         assert!(context_monitor_messages(&store).is_empty());
     }
 

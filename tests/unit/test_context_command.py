@@ -34,6 +34,21 @@ def test_context_default_prints_terse_percentage(capsys):
     client.get_context_snapshot.assert_called_once_with("abc12345")
 
 
+def test_context_explicit_target_resolves_friendly_name(capsys):
+    client = Mock()
+    client.get_session.return_value = None
+    client.list_sessions.return_value = [
+        {"id": "abc12345", "friendly_name": "agent-1", "aliases": []}
+    ]
+    client.get_context_snapshot.return_value = _snapshot()
+
+    rc = cmd_context(client, None, target="agent-1")
+
+    assert rc == 0
+    assert capsys.readouterr().out == "43%\n"
+    client.get_context_snapshot.assert_called_once_with("abc12345")
+
+
 def test_context_default_prints_unknown_without_sample(capsys):
     client = Mock()
     client.get_context_snapshot.return_value = _snapshot(used_percentage=None)
@@ -80,4 +95,3 @@ def test_context_requires_target_without_session_context(capsys):
     assert rc == 2
     assert "requires a managed session or explicit session target" in capsys.readouterr().err
     client.get_context_snapshot.assert_not_called()
-

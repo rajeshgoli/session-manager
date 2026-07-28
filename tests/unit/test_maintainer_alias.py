@@ -79,6 +79,21 @@ def test_get_session_resolves_maintainer_alias(tmp_path):
     assert payload["aliases"] == ["maintainer"]
 
 
+def test_get_session_resolves_friendly_name(tmp_path):
+    manager = _manager(tmp_path)
+    session = _session("arch1234", tmp_path)
+    session.friendly_name = "arch-orch-4"
+    manager.sessions[session.id] = session
+
+    assert manager.get_session("arch-orch-4") is session
+
+    client = TestClient(create_app(session_manager=manager))
+    response = client.get("/sessions/arch-orch-4")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "arch1234"
+
+
 def test_get_client_session_resolves_maintainer_alias(tmp_path):
     manager = _manager(tmp_path)
     session = _session("maint123", tmp_path)

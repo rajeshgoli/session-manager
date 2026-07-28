@@ -5691,6 +5691,13 @@ def cmd_context(
         print("Error: sm context requires a managed session or explicit session target", file=sys.stderr)
         return 2
 
+    if target:
+        target_session_id, _ = resolve_session_id(client, target)
+        if not target_session_id:
+            print("Error: Session manager unavailable, request timed out, or session not found", file=sys.stderr)
+            return 1
+        resolved_target = target_session_id
+
     snapshot = client.get_context_snapshot(resolved_target)
     if snapshot is None:
         print("Error: Session manager unavailable, request timed out, or session not found", file=sys.stderr)

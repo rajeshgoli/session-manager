@@ -355,6 +355,7 @@ class Session:
     context_used_percentage: Optional[float] = None  # Last statusLine context usage percentage
     context_total_input_tokens: Optional[int] = None  # Last statusLine input token count
     context_sampled_at: Optional[datetime] = None  # When the last context usage sample was emitted
+    context_cycle_reset_emitted_at: Optional[datetime] = None  # Latest reset hook emission time
     # Runtime-only flags — not persisted (reset to False on server restart / new cycle)
     _context_warning_sent: bool = field(default=False, init=False, repr=False)
     _context_critical_sent: bool = field(default=False, init=False, repr=False)
@@ -452,6 +453,7 @@ class Session:
             "context_used_percentage": self.context_used_percentage,
             "context_total_input_tokens": self.context_total_input_tokens,
             "context_sampled_at": self.context_sampled_at.isoformat() if self.context_sampled_at else None,
+            "context_cycle_reset_emitted_at": self.context_cycle_reset_emitted_at.isoformat() if self.context_cycle_reset_emitted_at else None,
             # Context monitor registration (#206)
             "context_monitor_enabled": self.context_monitor_enabled,
             "context_monitor_notify": self.context_monitor_notify,
@@ -554,6 +556,7 @@ class Session:
             context_used_percentage=data.get("context_used_percentage"),
             context_total_input_tokens=data.get("context_total_input_tokens"),
             context_sampled_at=datetime.fromisoformat(data["context_sampled_at"]) if data.get("context_sampled_at") else None,
+            context_cycle_reset_emitted_at=datetime.fromisoformat(data["context_cycle_reset_emitted_at"]) if data.get("context_cycle_reset_emitted_at") else None,
             # Context monitor registration (#206)
             context_monitor_enabled=data.get("context_monitor_enabled", False),
             context_monitor_notify=data.get("context_monitor_notify"),

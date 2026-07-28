@@ -49,6 +49,7 @@ def mock_session_manager(session):
     mock = MagicMock()
     mock.sessions = {session.id: session}
     mock.get_session = MagicMock(return_value=session)
+    mock._save_state_async = None
     mock._save_state = MagicMock()
     mock.message_queue_manager = MagicMock()
     return mock
@@ -136,6 +137,7 @@ class TestContextSnapshot:
         assert session.context_used_percentage == 43
         assert session.context_total_input_tokens == 86_214
         assert session.context_sampled_at is not None
+        mock_session_manager._save_state.assert_called_once()
         assert not mock_session_manager.message_queue_manager.queue_message.called
 
         context_resp = client.get(f"/sessions/{session.id}/context")
@@ -166,6 +168,63 @@ class TestContextSnapshot:
         assert session.context_used_percentage is None
         assert session.context_total_input_tokens is None
         assert session.context_sampled_at is None
+
+    def test_context_usage_unchanged_sample_is_not_resaved(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+
+        _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+        mock_session_manager._save_state.reset_mock()
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:30Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        mock_session_manager._save_state.assert_not_called()
+
+    def test_context_usage_before_latest_reset_is_ignored(self, client, mock_session_manager, session):
+        _post_context(
+            client,
+            session.id,
+            used_pct=55,
+            total_input_tokens=110_000,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+
+        resp = _post_event(
+            client,
+            session.id,
+            "context_reset",
+            sm_hook_emitted_at="2026-07-28T10:01:00Z",
+        )
+        assert resp.status_code == 200
+        mock_session_manager._save_state.reset_mock()
+
+        stale_resp = _post_context(
+            client,
+            session.id,
+            used_pct=60,
+            total_input_tokens=120_000,
+            sm_hook_emitted_at="2026-07-28T10:00:30Z",
+        )
+
+        assert stale_resp.status_code == 200
+        assert stale_resp.json()["status"] == "stale_sample"
+        assert session.context_used_percentage is None
+        assert session.context_total_input_tokens is None
+        assert session.context_sampled_at is None
+        mock_session_manager._save_state.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
