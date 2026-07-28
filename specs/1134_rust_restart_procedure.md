@@ -121,6 +121,14 @@ pass and verification forced to fail, the cdhash was restored byte-identical
 (`b06ed8fc...` before and after), the pid was unchanged, and no backup file was
 left behind.
 
+The invariant is that SM_BINARY ends up exactly as it started, *including having
+been absent*. After a `cargo clean` the registered path is empty while launchd's
+process runs on from its open inode; a build then creates a binary, and if
+phase 1 fails that unverified binary is removed rather than left for the next
+respawn to execute. Relatedly, `--target-dir` is passed explicitly to cargo (it
+outranks `CARGO_TARGET_DIR` and `build.target-dir`), so a redirected target dir
+cannot put the new build elsewhere while we sign and restart a stale one.
+
 ### A plist rewrite is a silent config change
 
 `restart-rust` regenerates the plist, so any setting in the live plist that the

@@ -35,7 +35,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Overridable for tests and non-default deployments.
 SM_LABEL="${SM_LABEL:-com.rajeshgoli.session-manager-rust}"
 SM_BINARY="${SM_BINARY:-$REPO_ROOT/target/release/sm-server}"
-SM_CARGO_OUTPUT="${SM_CARGO_OUTPUT:-$REPO_ROOT/target/release/sm-server}"
+# Passed to cargo as --target-dir, which outranks CARGO_TARGET_DIR and
+# build.target-dir. Without pinning it, a redirected target dir would put the
+# new build somewhere else while we signed and restarted a stale binary here.
+SM_TARGET_DIR="${SM_TARGET_DIR:-$REPO_ROOT/target}"
+SM_CARGO_OUTPUT="${SM_CARGO_OUTPUT:-$SM_TARGET_DIR/release/sm-server}"
 SM_CUTOVER="${SM_CUTOVER:-$REPO_ROOT/scripts/rust-service-cutover.sh}"
 SM_CONFIG="${SM_CONFIG:-$REPO_ROOT/config.yaml}"
 SM_LOCAL_ENV="${SM_LOCAL_ENV:-}"
@@ -71,10 +75,10 @@ Options:
   --skip-build          Reuse the existing binary. Still signs and verifies.
   -h, --help            Show this help.
 
-Environment overrides: SM_LABEL, SM_BINARY, SM_CARGO_OUTPUT, SM_CUTOVER,
-SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, SM_PORT, SM_PYTHON_LABELS,
-SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT, SM_PID_SETTLE_SECONDS,
-SM_ALLOW_SESSION_DROP.
+Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
+SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, SM_PORT,
+SM_PYTHON_LABELS, SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
+SM_PID_SETTLE_SECONDS, SM_ALLOW_SESSION_DROP.
 
 SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_HOST, and SM_PORT are forwarded
 to the cutover script, so both phases always act on the same deployment.
@@ -135,16 +139,28 @@ cutover_args=(
 # --- binary rollback --------------------------------------------------------
 # Armed before the build, disarmed once the restart is committed.
 BINARY_BACKUP=""
+BINARY_WAS_ABSENT=0
 RESTORE_BINARY=0
 RENDERED_PLIST=""
 
+# Restore SM_BINARY to exactly what it was before this run - including having
+# been absent. Leaving a newly built but unverified binary behind is the same
+# deferred outage as leaving a modified one: the next KeepAlive respawn runs it.
 cleanup() {
   local rc=$?
-  if [[ "$RESTORE_BINARY" -eq 1 && -n "$BINARY_BACKUP" && -f "$BINARY_BACKUP" && $rc -ne 0 ]]; then
-    if mv -f "$BINARY_BACKUP" "$SM_BINARY"; then
-      echo "rolled back $SM_BINARY to the previously registered build" >&2
-    else
-      echo "WARNING: could not restore $SM_BINARY from $BINARY_BACKUP" >&2
+  if [[ "$RESTORE_BINARY" -eq 1 && $rc -ne 0 ]]; then
+    if [[ -n "$BINARY_BACKUP" && -f "$BINARY_BACKUP" ]]; then
+      if mv -f "$BINARY_BACKUP" "$SM_BINARY"; then
+        echo "rolled back $SM_BINARY to the previously registered build" >&2
+      else
+        echo "WARNING: could not restore $SM_BINARY from $BINARY_BACKUP" >&2
+      fi
+    elif [[ "$BINARY_WAS_ABSENT" -eq 1 && -e "$SM_BINARY" ]]; then
+      if rm -f "$SM_BINARY"; then
+        echo "removed the unverified binary this run created at $SM_BINARY" >&2
+      else
+        echo "WARNING: could not remove the unverified binary at $SM_BINARY" >&2
+      fi
     fi
   fi
   [[ -n "$BINARY_BACKUP" ]] && rm -f "$BINARY_BACKUP"
@@ -259,14 +275,19 @@ if [[ -e "$SM_BINARY" ]]; then
   BINARY_BACKUP="$SM_BINARY.restart-backup.$$"
   cp -p "$SM_BINARY" "$BINARY_BACKUP" \
     || fail "could not snapshot $SM_BINARY before rebuilding - the running service was not touched"
-  RESTORE_BINARY=1
+else
+  # Nothing to snapshot, but the build is about to create one. If phase 1 then
+  # fails, that unverified binary has to go rather than sit in the registered
+  # path waiting for the next respawn.
+  BINARY_WAS_ABSENT=1
 fi
+RESTORE_BINARY=1
 
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   step "Skipping build (--skip-build)"
 else
   step "Building sm-server (service still running)"
-  cargo build --release -p sm-server \
+  cargo build --release -p sm-server --target-dir "$SM_TARGET_DIR" \
     || fail "build failed - the running service was not touched"
 fi
 

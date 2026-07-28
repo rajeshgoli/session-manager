@@ -59,7 +59,10 @@ def env(tmp_path):
         f"""#!/bin/bash
 echo "cargo $*" >> "{log}"
 rc="$(cat "{state}/cargo_rc")"
-[[ "$rc" == "0" ]] && printf 'REBUILT' > "{tmp_path}/sm-server"
+if [[ "$rc" == "0" ]]; then
+  printf 'REBUILT' > "{tmp_path}/sm-server"
+  chmod 755 "{tmp_path}/sm-server"
+fi
 exit "$rc"
 """,
         executable=True,
@@ -164,6 +167,7 @@ def _make_runner(bin_dir: Path, cutover: Path, binary: Path, config: Path, plist
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "SM_BINARY": str(binary),
             "SM_CARGO_OUTPUT": str(binary),
+            "SM_TARGET_DIR": str(binary.parent / "target"),
             "SM_PLIST": str(plist),
             "SM_CUTOVER": str(cutover),
             "SM_CONFIG": str(config),
@@ -273,6 +277,41 @@ def test_successful_run_keeps_the_new_binary(env):
 
     assert result.returncode == 0, result.stderr
     assert env["binary"].read_text() == "REBUILT"
+
+
+def test_new_binary_is_removed_when_none_existed_before(env):
+    """After a `cargo clean` the registered path is empty while launchd's process
+    runs on from its open inode. A build then creates a binary, and if phase 1
+    fails it must not be left there for the next respawn to execute."""
+    env["binary"].unlink()
+    (env["state"] / "codesign_sign_rc").write_text("1")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert not env["binary"].exists()
+    assert "removed the unverified binary" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_new_binary_is_kept_when_none_existed_and_the_run_succeeds(env):
+    env["binary"].unlink()
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert env["binary"].read_text() == "REBUILT"
+
+
+def test_cargo_target_dir_is_pinned(env):
+    """A redirected target dir would put the new build elsewhere while we signed
+    and restarted a stale binary at the expected path."""
+    result = env["run"](CARGO_TARGET_DIR=str(env["tmp"] / "redirected"))
+
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in calls(env).splitlines() if l.startswith("cargo build"))
+    assert f"--target-dir {env['tmp'] / 'target'}" in line
+    assert str(env["tmp"] / "redirected") not in line
 
 
 def test_no_backup_file_is_left_behind(env):
