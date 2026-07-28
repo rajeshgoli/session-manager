@@ -51,6 +51,10 @@ pub struct SessionStore {
     /// event monitor threads evaluate the same thresholds and have no access to
     /// the HTTP layer's `AppConfig`.
     context_monitor: ContextMonitorConfig,
+    /// Same reason: those threads enqueue context alerts, and nothing drains the
+    /// message queue on a timer, so a message queued without a runtime waits for
+    /// an unrelated request to happen to flush it.
+    delivery_runtime: Option<TmuxRuntime>,
 }
 
 impl SessionStore {
@@ -66,6 +70,7 @@ impl SessionStore {
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
+            delivery_runtime: None,
         }
     }
 
@@ -80,6 +85,13 @@ impl SessionStore {
         self
     }
 
+    /// Runtime used to deliver messages queued from background threads, which
+    /// have no request to piggyback a drain on.
+    pub fn with_delivery_runtime(mut self, runtime: Option<TmuxRuntime>) -> Self {
+        self.delivery_runtime = runtime;
+        self
+    }
+
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
         Self {
@@ -88,6 +100,7 @@ impl SessionStore {
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
+            delivery_runtime: None,
         }
     }
 
@@ -2578,13 +2591,18 @@ impl SessionStore {
         }
 
         if let Some(alert) = context_alert {
+            // Nothing drains the queue on a timer, and this thread has no
+            // request behind it, so an alert queued without a runtime would sit
+            // until some unrelated operation flushed the recipient — quite
+            // possibly after the compaction it was warning about.
+            let runtime = self.delivery_runtime.clone();
             self.queue_context_monitor_message(
                 &mut state,
                 session_id,
                 &alert.notify_target,
                 &alert.text,
                 alert.delivery_mode,
-                None,
+                runtime.as_ref(),
             )?;
             changed = true;
         }
@@ -5186,6 +5204,11 @@ fn collect_descendants_preorder(
 }
 
 fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
+    // A clear starts a new accumulation cycle. Claude also reports this through
+    // its SessionStart(clear) hook, but codex has no equivalent hook, so without
+    // this a cleared codex session's latches would stay set and suppress every
+    // warning in the new cycle.
+    reset_context_oneshot_flags(session);
     session.insert("agent_status_text".to_owned(), Value::Null);
     session.insert("agent_status_at".to_owned(), Value::Null);
     session.insert("agent_task_completed_at".to_owned(), Value::Null);
@@ -7590,6 +7613,38 @@ mod tests {
     }
 
     #[test]
+    fn clearing_a_session_rearms_the_latches() {
+        // Claude reports a clear through its SessionStart(clear) hook, but codex
+        // has no equivalent, so a cleared codex session would carry its latches
+        // into the new cycle and never warn again.
+        let store = store_with_monitored_child("ctxclear", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 70.0, 140_000), None)
+            .unwrap();
+        assert!(
+            store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .context_critical_sent
+        );
+
+        store
+            .clear_core_session(
+                "child001",
+                ClearSessionRequest {
+                    prompt: None,
+                    requester_session_id: Some("parent01".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert!(!session.context_warning_sent);
+        assert!(!session.context_critical_sent);
+    }
+
+    #[test]
     fn context_warning_does_not_refire_after_a_restart() {
         // The Python server kept these latches in memory, so every restart
         // re-alerted the parent about context it had already been told about.
@@ -7744,6 +7799,96 @@ mod tests {
             store.get_session("child001").unwrap().unwrap().tokens_used,
             0
         );
+    }
+
+    #[test]
+    fn codex_token_usage_event_populates_tokens_and_alerts() {
+        let state_file = unique_temp_path("ctxcodex");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "parent01",
+                        "name": "claude-parent01",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-parent01",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    },
+                    {
+                        "id": "codex001",
+                        "name": "codex-codex001",
+                        "provider": "codex-fork",
+                        "working_dir": "/repo",
+                        "tmux_session": "codex-codex001",
+                        "parent_session_id": "parent01",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00",
+                        "context_monitor_enabled": true,
+                        "context_monitor_notify": "parent01"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        let line = r#"{"event_type":"thread/tokenUsage/updated","payload":{"tokenUsage":{
+            "total":{"totalTokens":900000},
+            "last":{"totalTokens":181000},
+            "modelContextWindow":258400}}}"#;
+        store.apply_codex_fork_event_line("codex001", line).unwrap();
+
+        let session = store.get_session("codex001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 181_000);
+        // 181000/258400 = 70%, past the default 65% critical line.
+        assert!(session.context_critical_sent);
+        assert_eq!(context_monitor_messages(&store).len(), 1);
+
+        // Same one-shot contract as the Claude path.
+        store.apply_codex_fork_event_line("codex001", line).unwrap();
+        assert_eq!(context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn codex_token_usage_respects_the_registration_gate() {
+        let state_file = unique_temp_path("ctxcodexgate");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/tokenUsage/updated","payload":{"tokenUsage":{
+                    "last":{"totalTokens":181000},"modelContextWindow":258400}}}"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().tokens_used,
+            0
+        );
+        assert!(context_monitor_messages(&store).is_empty());
     }
 
     #[test]

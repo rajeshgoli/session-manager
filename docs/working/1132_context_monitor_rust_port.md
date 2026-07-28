@@ -103,6 +103,19 @@ far past the context window) and a `last` (the most recent request). Only `last`
 describes what is currently resident, so `last.totalTokens` over
 `modelContextWindow` is what maps onto Claude's `context_window` numbers.
 
+Two things the Claude path gets for free and this one does not:
+
+- **Delivery.** Nothing drains the message queue on a timer; HTTP handlers drain
+  as a side effect of the request they are already serving. The event monitor is
+  a background thread with no request behind it, so the store carries a
+  `delivery_runtime` for it. Without that, a codex context alert would sit queued
+  until an unrelated operation flushed the recipient — plausibly after the
+  compaction it was warning about.
+- **Cycle boundaries.** Codex has no `SessionStart(clear)` hook, so the latches
+  are re-armed in `reset_session_after_clear` instead. That covers `sm clear` for
+  every provider and leaves the Claude hook as redundancy rather than the only
+  path.
+
 ## Durability note
 
 This is the #1130 pattern a second time: a signal the system depended on arrived

@@ -15,7 +15,11 @@ set -u
 
 HOOK_BASE_URL="${SM_HOOK_BASE_URL:-http://localhost:8420}"
 HOOK_URL="${SM_CONTEXT_HOOK_URL:-${HOOK_BASE_URL%/}/hooks/context-usage}"
-SESSION_URL_BASE="${SM_HOOK_BASE_URL:-http://localhost:8420}"
+# The handoff lookup is an ordinary API read, not a hook post. On a remote node
+# those are different ingresses (nodes.<id>.api_url vs hook_base_url), so
+# borrowing the hook base here would send the read to a hook-only endpoint and
+# silently skip reinjection. SM_API_URL is the same variable the sm CLI resolves.
+API_BASE_URL="${SM_API_URL:-http://localhost:8420}"
 
 cat >/dev/null 2>&1
 
@@ -37,7 +41,7 @@ fi
 
 HANDOFF_PATH=$(
   curl -s --max-time 3 --connect-timeout 2 \
-    "${SESSION_URL_BASE%/}/sessions/$CLAUDE_SESSION_MANAGER_ID" 2>/dev/null |
+    "${API_BASE_URL%/}/sessions/$CLAUDE_SESSION_MANAGER_ID" 2>/dev/null |
     jq -r '.last_handoff_path // empty' 2>/dev/null
 ) || HANDOFF_PATH=""
 

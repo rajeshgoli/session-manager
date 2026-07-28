@@ -361,7 +361,13 @@ impl AppState {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let session_store = SessionStore::new_with_queue(state_file, queue_db_path)
-            .with_context_monitor_config(config.context_monitor.clone());
+            .with_context_monitor_config(config.context_monitor.clone())
+            .with_delivery_runtime(
+                config
+                    .rust_core
+                    .runtime_enabled
+                    .then(|| TmuxRuntime::from_app_config(&config)),
+            );
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
