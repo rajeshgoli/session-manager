@@ -314,6 +314,56 @@ def test_registered_binary_is_never_written_during_phase_one(env):
     assert all("[registered=ORIGINAL]" in l for l in recorded), recorded
 
 
+def test_build_refused_while_live_registration_runs_from_cargo_output(env):
+    """The state a first adoption starts in: config already points at the
+    installed path, but the loaded job still runs from cargo's output. Building
+    would overwrite the executable that job is using."""
+    env["plist"].write_text(
+        f"<plist><array><string>{env['cargo_output']}</string></array></plist>\n"
+    )
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "still runs from cargo's output" in result.stderr
+    assert "--adopt" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+
+
+def test_adopt_installs_the_running_build_without_rebuilding(env):
+    env["plist"].write_text(
+        f"<plist><array><string>{env['cargo_output']}</string></array></plist>\n"
+    )
+    _write(env["cargo_output"], "ALREADY_RUNNING", executable=True)
+
+    result = env["run"]("--adopt", "--allow-plist-change")
+
+    assert result.returncode == 0, result.stderr
+    assert "cargo build" not in calls(env)
+    assert env["installed"].read_text() == "ALREADY_RUNNING"
+    assert "[registered=ORIGINAL]" in cutover_line(env, "stop-rust")
+
+
+def test_adopt_and_skip_build_conflict(env):
+    result = env["run"]("--adopt", "--skip-build")
+
+    assert result.returncode == 2
+    assert "pick one" in result.stderr
+
+
+def test_adopt_with_nothing_to_adopt(env):
+    env["plist"].write_text(
+        f"<plist><array><string>{env['cargo_output']}</string></array></plist>\n"
+    )
+
+    result = env["run"]("--adopt", "--allow-plist-change")
+
+    assert result.returncode != 0
+    assert "nothing to adopt" in result.stderr
+    assert_service_untouched(env)
+
+
 def test_service_must_not_be_registered_against_cargo_output(env):
     """If they were the same path, a build would write the live binary."""
     same = str(env["cargo_output"])

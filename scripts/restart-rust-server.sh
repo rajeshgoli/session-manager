@@ -84,6 +84,14 @@ Options:
                         plist with different contents. Read the printed diff
                         first: this is how a deployment setting gets dropped.
   --skip-build          Install the currently installed binary again, re-signed.
+  --adopt               Migration step for a deployment still registered against
+                        cargo's output path. Installs the build already at
+                        $SM_CARGO_OUTPUT
+                        without rebuilding, and re-registers against the
+                        installed path. Building while the live registration
+                        still points at cargo's output would overwrite the
+                        running service's own executable, so that is refused;
+                        run --adopt once, then restart normally.
   -h, --help            Show this help.
 
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
@@ -98,8 +106,13 @@ EOF
 
 SKIP_BUILD=0
 ALLOW_PLIST_CHANGE=0
+ADOPT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --adopt)
+      ADOPT=1
+      shift
+      ;;
     --allow-drop)
       SM_ALLOW_SESSION_DROP="${2:?missing --allow-drop value}"
       shift 2
@@ -128,6 +141,12 @@ if ! [[ "$SM_ALLOW_SESSION_DROP" =~ ^[0-9]+$ ]]; then
   echo "--allow-drop must be a non-negative integer, got: $SM_ALLOW_SESSION_DROP" >&2
   exit 2
 fi
+
+if [[ "$ADOPT" -eq 1 && "$SKIP_BUILD" -eq 1 ]]; then
+  echo "--adopt and --skip-build take their source from different places; pick one" >&2
+  exit 2
+fi
+[[ "$ADOPT" -eq 1 ]] && SKIP_BUILD=1
 
 step() { printf '\n==> %s\n' "$1"; }
 fail() { echo "ERROR: $1" >&2; exit 1; }
@@ -237,6 +256,21 @@ if [[ "$SKIP_BUILD" -eq 0 && "$SM_BINARY" == "$SM_CARGO_OUTPUT" ]]; then
        The running service was not touched."
 fi
 
+# Same hazard, one step removed: the configuration above may already be correct
+# while the *live registration* still runs from cargo's output - which is exactly
+# the state a first adoption starts in. Building then would overwrite the
+# executable the loaded job is using, before we have re-registered it.
+if [[ "$SKIP_BUILD" -eq 0 && -f "$SM_PLIST" ]] \
+   && grep -qF "<string>$SM_CARGO_OUTPUT</string>" "$SM_PLIST"; then
+  fail "the live registration in $SM_PLIST still runs from cargo's output
+       ($SM_CARGO_OUTPUT).
+       Building now would overwrite the executable the loaded job is using, and a
+       server that exited before the restart would be respawned onto it under the
+       old registration. Run this once to migrate without building:
+         $0 --adopt --allow-plist-change
+       then restart normally. The running service was not touched."
+fi
+
 # Restarting rewrites the plist. Anything in the live plist that we would not
 # regenerate is a deployment setting about to be silently dropped - a custom
 # --local-env carrying auth secrets, for instance.
@@ -260,7 +294,13 @@ if [[ -f "$SM_PLIST" ]]; then
 fi
 echo "preconditions ok"
 
-if [[ "$SKIP_BUILD" -eq 1 ]]; then
+if [[ "$ADOPT" -eq 1 ]]; then
+  step "Adopting the existing build (--adopt, no rebuild)"
+  # Read-only source: the binary the live registration is already running.
+  [[ -x "$SM_CARGO_OUTPUT" ]] \
+    || fail "nothing to adopt at $SM_CARGO_OUTPUT - the running service was not touched"
+  SOURCE_BINARY="$SM_CARGO_OUTPUT"
+elif [[ "$SKIP_BUILD" -eq 1 ]]; then
   step "Skipping build (--skip-build)"
   [[ -x "$SM_BINARY" ]] || fail "no installed binary at $SM_BINARY to re-deploy - the running service was not touched"
   SOURCE_BINARY="$SM_BINARY"

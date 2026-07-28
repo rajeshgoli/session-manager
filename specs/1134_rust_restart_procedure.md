@@ -152,6 +152,15 @@ Adopting this changes the plist's program path, so the first run reports a plist
 divergence and needs `--allow-plist-change` once. That is the guard working as
 intended; subsequent runs are silent.
 
+The adoption run itself needs care, and this was easy to miss: before it, the
+*live registration* still runs from cargo's output, so simply building during
+that run would overwrite the executable the loaded job is using - the very
+hazard being migrated away from, on the one run that has not escaped it yet.
+The preflight therefore refuses to build whenever the live plist's program is
+`SM_CARGO_OUTPUT`, and points at `--adopt`, which installs the build already
+running (a read-only copy, no rebuild) and re-registers against the installed
+path. After that, normal runs build safely.
+
 ### `bootout` failures are silent
 
 `stop_rust` in the cutover runs `launchctl bootout ... || true` and prints
