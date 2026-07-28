@@ -282,11 +282,7 @@ impl TmuxRuntime {
                         prepend_arg_pair("resume", resume_id, &runtime.codex_fork_args);
                 }
                 "codex" => {
-                    runtime.claude_command = format!(
-                        "{} resume {}",
-                        runtime.claude_command,
-                        shell_quote(resume_id)
-                    );
+                    runtime.codex_args = prepend_arg_pair("resume", resume_id, &runtime.codex_args);
                 }
                 _ => {}
             };

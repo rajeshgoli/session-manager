@@ -1102,7 +1102,7 @@ impl SessionStore {
         if !is_primary_node(&record.node) {
             return Ok(Some(CoreRestoreOutcome::UnsupportedNode(record.node)));
         }
-        if !matches!(record.provider.as_str(), "claude" | "codex-fork") {
+        if !matches!(record.provider.as_str(), "claude" | "codex" | "codex-fork") {
             return Ok(Some(CoreRestoreOutcome::UnsupportedProvider(
                 record.provider,
             )));
