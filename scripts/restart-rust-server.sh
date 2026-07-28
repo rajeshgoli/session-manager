@@ -120,8 +120,11 @@ fail() { echo "ERROR: $1" >&2; exit 1; }
 # Every deployment value the cutover needs. It initialises its own defaults and
 # reads none of our variables, so anything not forwarded here silently reverts
 # to the default (production) deployment.
+# --plist must follow --label: the cutover recomputes the plist path from the
+# label, so passing them the other way round would discard our value.
 cutover_args=(
   --label "$SM_LABEL"
+  --plist "$SM_PLIST"
   --binary "$SM_BINARY"
   --config "$SM_CONFIG"
   --host "$SM_HOST"
@@ -204,6 +207,10 @@ step "Preflight: checking what the restart will require"
 # rust-service-cutover.sh restart-rust stops the service and only then validates
 # start-rust's preconditions, so a precondition that fails there leaves the
 # server down. Check the same things here, while stopping nothing.
+# Checked here, before anything writes to the binary: the plist comparison below
+# only runs when a live plist exists, so this would otherwise not be caught until
+# after the rebuild.
+[[ -x "$SM_CUTOVER" ]] || fail "cutover script not executable: $SM_CUTOVER - the running service was not touched"
 [[ -r "$SM_CONFIG" ]] || fail "config not readable: $SM_CONFIG - the running service was not touched"
 if [[ -n "$SM_LOCAL_ENV" && ! -r "$SM_LOCAL_ENV" ]]; then
   fail "local env overlay not readable: $SM_LOCAL_ENV - the running service was not touched"
@@ -281,10 +288,12 @@ echo "signature ok: $(codesign -dvvv "$SM_BINARY" 2>&1 | awk -F= '/^Identifier=/
 # Phase 2: from here on the service is affected, and the new binary stays.
 # ---------------------------------------------------------------------------
 
-RESTORE_BINARY=0
-
 step "Restarting service (bootout -> bootstrap -> kickstart)"
-[[ -x "$SM_CUTOVER" ]] || fail "cutover script not executable: $SM_CUTOVER"
+# Disarm only on the line before the restart itself. Anything that can still
+# fail while the rebuilt binary sits in the registered path must be able to roll
+# it back, or the next KeepAlive respawn boots a build this registration may
+# reject - the deferred outage this script exists to prevent.
+RESTORE_BINARY=0
 "$SM_CUTOVER" restart-rust "${cutover_args[@]}" \
   || fail "restart failed - see output above; service may be down"
 

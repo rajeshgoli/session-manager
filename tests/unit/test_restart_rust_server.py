@@ -346,6 +346,31 @@ def test_unreadable_local_env_blocks_before_any_restart(env):
     assert_service_untouched(env)
 
 
+def test_plist_path_is_forwarded_to_the_cutover(env):
+    """Otherwise the preflight compares one plist while the cutover writes and
+    bootstraps a different (default) one."""
+    env["run"]()
+
+    line = next(l for l in calls(env).splitlines() if l.startswith("cutover restart-rust"))
+    assert f"--plist {env['plist']}" in line
+    # The cutover recomputes the plist path from --label, so order matters.
+    assert line.index("--label") < line.index("--plist")
+
+
+def test_missing_cutover_blocks_before_the_binary_is_touched(env):
+    """With no live plist the render check is skipped, so a missing cutover has
+    to be caught in the preflight rather than after the rebuild."""
+    env["plist"].unlink()
+
+    result = env["run"](SM_CUTOVER=str(env["tmp"] / "gone.sh"))
+
+    assert result.returncode != 0
+    assert "cutover script not executable" in result.stderr
+    assert env["binary"].read_text() == "ORIGINAL"
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+
+
 def test_missing_plist_is_not_a_divergence(env):
     """A first-time bootstrap has no plist to compare against."""
     env["plist"].unlink()
