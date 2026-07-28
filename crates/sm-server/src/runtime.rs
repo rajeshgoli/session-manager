@@ -817,6 +817,7 @@ fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("no server running")
         || message.contains("can't find session")
+        || message.contains("no current target")
         || message.contains("server exited unexpectedly")
 }
 
@@ -1031,6 +1032,12 @@ mod tests {
         assert!(command.contains("unset CLAUDECODE"));
         assert!(command.contains("export ENABLE_TOOL_SEARCH=false"));
         assert!(command.ends_with("; claude"));
+    }
+
+    #[test]
+    fn tmux_no_current_target_counts_as_session_gone() {
+        let error = anyhow::anyhow!("tmux command failed: no current target");
+        assert!(is_tmux_session_gone_error(&error));
     }
 
     #[test]

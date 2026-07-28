@@ -1038,6 +1038,12 @@ class TestCompactionSuppressRemind:
         _post_event(client, session.id, event="compaction_complete")
         assert session._is_compacting is False
 
+    def test_context_reset_clears_is_compacting_flag(self, client, session):
+        """context_reset event clears stale compaction state."""
+        session._is_compacting = True
+        _post_event(client, session.id, event="context_reset")
+        assert session._is_compacting is False
+
     def test_compaction_complete_resets_remind_timer(self, client, mock_session_manager, session):
         """compaction_complete calls reset_remind on queue manager."""
         session._is_compacting = True

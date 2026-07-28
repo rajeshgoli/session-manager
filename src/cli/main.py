@@ -970,7 +970,7 @@ def main():
         "lock", "unlock", "subagent-start", "subagent-stop", "all", "send", "wait", "what",
         "subagents", "children", "kill", "retire", "restore", "unkill", "fork", "new", "claude", "codex", "codex-legacy", "codex-fork", "codex_fork",
         "codex-2", "codex-app", "codex-server", "nodes", "node",
-        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
+        "attach", "output", "codex-tui", "codex-fork-info", "codex-rollout-gates", "watch", "tail", "clear", "review", "context", "ctx", "context-monitor", "remind", "setup", "lookup", "roster", "email", "request-codex-review", None
     ]
     # Commands that require session_id: self-directed managed-session actions
     requires_session_id = ["spawn", "adopt", "maintainer", "register", "unregister"]

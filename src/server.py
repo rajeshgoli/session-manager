@@ -9062,6 +9062,7 @@ Provide ONLY the summary, no preamble or questions."""
             # Covers: TUI /clear and sm clear CLI (both trigger SessionStart source=clear).
             session._context_warning_sent = False
             session._context_critical_sent = False
+            session._is_compacting = False
             # Clear stale status from previous task (#283)
             session.agent_status_text = None
             session.agent_status_at = None
