@@ -334,6 +334,49 @@ class TestSpawnEndpointMonitoring:
         assert child.context_monitor_notify == "em0000aa"
         mock_sm.message_queue_manager.arm_stop_notify.assert_called_once()
 
+    def test_spawn_em_parent_keeps_codex_context_monitor_informational(self, app_client):
+        tc, mock_sm, _ = app_client
+        parent = Session(
+            id="em0000aa",
+            name="claude-em0000aa",
+            working_dir="/tmp/parent",
+            tmux_session="claude-em0000aa",
+            log_file="/tmp/parent.log",
+            status=SessionStatus.IDLE,
+            is_em=True,
+        )
+        child = Session(
+            id="child456",
+            name="codex-child456",
+            provider="codex-fork",
+            working_dir="/tmp/parent",
+            tmux_session="codex-child456",
+            log_file="/tmp/child.log",
+            status=SessionStatus.RUNNING,
+            parent_session_id="em0000aa",
+            spawned_at=datetime.now(),
+        )
+        mock_sm.get_session.side_effect = lambda sid: {
+            "em0000aa": parent,
+            "child456": child,
+        }.get(sid)
+        mock_sm.spawn_child_session = AsyncMock(return_value=child)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("src.server.get_auto_remind_config", lambda working_dir: (210, 420))
+            response = tc.post(
+                "/sessions/spawn",
+                json={
+                    "parent_session_id": "em0000aa",
+                    "prompt": "Implement feature X",
+                },
+            )
+
+        assert response.status_code == 200
+        assert child.context_monitor_enabled is False
+        assert child.context_monitor_notify is None
+        mock_sm.message_queue_manager.arm_stop_notify.assert_not_called()
+
     def test_spawn_returns_warning_when_tracking_registration_raises(self, app_client):
         tc, mock_sm, _ = app_client
         parent = Session(

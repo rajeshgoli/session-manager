@@ -15,6 +15,8 @@ use sm_server::{config::AppConfig, mobile_devices};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
+const CODEX_CONTEXT_MONITOR_FYI: &str =
+    "Context monitoring is FYI only for Codex agents; they manage compaction inline.";
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
 
@@ -195,9 +197,9 @@ struct OutputArgs {
 #[derive(Args)]
 struct TailArgs {
     session_id: String,
-    #[arg(long)]
+    #[arg(long, help = "Show rendered terminal output instead of activity")]
     raw: bool,
-    #[arg(long, default_value_t = 50)]
+    #[arg(short = 'n', long, default_value_t = 10)]
     lines: usize,
 }
 
@@ -676,7 +678,7 @@ fn run() -> Result<()> {
             }
         }
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
-        Command::Tail(args) => print_output(&client, &args.session_id, args.lines)?,
+        Command::Tail(args) => print_tail(&client, &args.session_id, args.lines, args.raw)?,
         Command::Children(args) => {
             let parent_session_id = match args.session_id {
                 Some(target) => {
@@ -2005,6 +2007,172 @@ fn print_output(client: &ApiClient, session_id: &str, lines: usize) -> Result<()
     Ok(())
 }
 
+fn print_tail(client: &ApiClient, identifier: &str, lines: usize, raw: bool) -> Result<()> {
+    if lines == 0 || lines > 100 {
+        bail!("tail lines must be between 1 and 100");
+    }
+    let session = client.get_json(&format!("/sessions/{}", encode_path_segment(identifier)))?;
+    let session_id = session["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("session response missing id"))?;
+    if raw {
+        let payload = client.get_json(&format!(
+            "/sessions/{}/output?lines={lines}&rendered=true",
+            encode_path_segment(session_id)
+        ))?;
+        let Some(output) = payload["output"].as_str() else {
+            bail!("No rendered output available for {identifier}");
+        };
+        print!("{}", strip_terminal_controls(output));
+        return Ok(());
+    }
+
+    let name = session["friendly_name"]
+        .as_str()
+        .or_else(|| session["name"].as_str())
+        .unwrap_or(session_id);
+    let provider = session["provider"].as_str().unwrap_or("claude");
+    if provider == "codex-app" {
+        let payload = client.get_json(&format!(
+            "/sessions/{}/activity-actions?limit={lines}",
+            encode_path_segment(session_id)
+        ))?;
+        let actions = payload["actions"].as_array().cloned().unwrap_or_default();
+        if actions.is_empty() {
+            println!("No activity data for {name} ({session_id})");
+            return Ok(());
+        }
+        println!(
+            "Last {} actions ({name} {}):",
+            actions.len(),
+            short_session_id(session_id)
+        );
+        for action in actions {
+            let timestamp = action["ended_at"]
+                .as_str()
+                .or_else(|| action["started_at"].as_str());
+            let summary = action["summary_text"]
+                .as_str()
+                .or_else(|| action["action_kind"].as_str())
+                .unwrap_or("activity");
+            let status = action["status"].as_str().unwrap_or("");
+            let status_suffix = if status.is_empty() {
+                String::new()
+            } else {
+                format!(" [{status}]")
+            };
+            println!(
+                "  [{} ago] {summary}{status_suffix}",
+                format_tail_age(timestamp)
+            );
+        }
+        return Ok(());
+    }
+
+    let payload = client.get_json(&format!(
+        "/sessions/{}/tool-calls?limit={lines}",
+        encode_path_segment(session_id)
+    ))?;
+    let mut rows = payload["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("No activity data for {name} ({session_id})");
+        println!("Use `sm tail {identifier} --raw` for rendered terminal output.");
+        return Ok(());
+    }
+    if rows.len() > 1
+        && rows.first().and_then(|row| row["timestamp"].as_str())
+            > rows.last().and_then(|row| row["timestamp"].as_str())
+    {
+        rows.reverse();
+    }
+    println!(
+        "Last {} actions ({name} {}):",
+        rows.len(),
+        short_session_id(session_id)
+    );
+    for row in rows {
+        let tool_name = row["tool_name"].as_str().unwrap_or("tool");
+        println!(
+            "  [{} ago] {tool_name}",
+            format_tail_age(row["timestamp"].as_str())
+        );
+    }
+    Ok(())
+}
+
+fn short_session_id(session_id: &str) -> &str {
+    session_id.get(..8).unwrap_or(session_id)
+}
+
+fn format_tail_age(timestamp: Option<&str>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "?".to_owned();
+    };
+    let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).or_else(|_| {
+        let format =
+            time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+        time::PrimitiveDateTime::parse(timestamp, format).map(|value| value.assume_utc())
+    });
+    let Ok(timestamp) = parsed else {
+        return "?".to_owned();
+    };
+    let seconds = (OffsetDateTime::now_utc() - timestamp)
+        .whole_seconds()
+        .max(0);
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    if seconds < 3600 {
+        return format!("{}m{:02}s", seconds / 60, seconds % 60);
+    }
+    format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60)
+}
+
+fn strip_terminal_controls(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut previous_escape = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' || (previous_escape && next == '\\') {
+                            break;
+                        }
+                        previous_escape = next == '\u{1b}';
+                    }
+                }
+                Some('P' | 'X' | '^' | '_') => {
+                    let mut previous_escape = false;
+                    for next in chars.by_ref() {
+                        if previous_escape && next == '\\' {
+                            break;
+                        }
+                        previous_escape = next == '\u{1b}';
+                    }
+                }
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        if ch == '\n' || ch == '\t' || !ch.is_control() {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 fn print_batch_send_result(payload: &Value) -> Result<()> {
     let Some(results) = payload["results"].as_array() else {
         bail!("batch send response missing results");
@@ -2603,7 +2771,7 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
         ContextMonitorCommand::Enable { target } => {
             let requester = current_session_id()?;
             let target = target.unwrap_or_else(|| requester.clone());
-            client.post_json(
+            let response = client.post_json(
                 &format!("/sessions/{target}/context-monitor"),
                 json!({
                     "enabled": true,
@@ -2611,6 +2779,10 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
                     "notify_session_id": requester
                 }),
             )?;
+            if context_monitor_is_informational(&response) {
+                println!("{CODEX_CONTEXT_MONITOR_FYI}");
+                return Ok(());
+            }
             if target == requester {
                 println!("Context monitoring enabled - notifications -> self ({requester})");
             } else {
@@ -2632,6 +2804,10 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
         }
     }
     Ok(())
+}
+
+fn context_monitor_is_informational(response: &Value) -> bool {
+    response["enabled"].as_bool() == Some(false)
 }
 
 fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
@@ -3630,6 +3806,79 @@ mod tests {
             reader.read_exact(&mut body).unwrap();
         }
         (method, path, String::from_utf8(body).unwrap())
+    }
+
+    #[test]
+    fn tail_parser_restores_legacy_defaults_and_short_line_flag() {
+        let default_cli = Cli::try_parse_from(["sm", "tail", "worker"]).unwrap();
+        let Command::Tail(default_args) = default_cli.command else {
+            panic!("expected tail command");
+        };
+        assert_eq!(default_args.session_id, "worker");
+        assert_eq!(default_args.lines, 10);
+        assert!(!default_args.raw);
+
+        let raw_cli = Cli::try_parse_from(["sm", "tail", "worker", "--raw", "-n", "7"]).unwrap();
+        let Command::Tail(raw_args) = raw_cli.command else {
+            panic!("expected tail command");
+        };
+        assert_eq!(raw_args.lines, 7);
+        assert!(raw_args.raw);
+    }
+
+    #[test]
+    fn tail_default_uses_structured_tool_activity_endpoint() {
+        let (client, server) = start_lookup_server([
+            (
+                "/sessions/worker",
+                200,
+                r#"{"id":"tail001","name":"codex-tail001","friendly_name":"worker","provider":"codex-fork"}"#,
+            ),
+            (
+                "/sessions/tail001/tool-calls?limit=3",
+                200,
+                r#"{"session_id":"tail001","tool_calls":[{"timestamp":"2026-07-28T20:00:00Z","tool_name":"exec_command","hook_type":"CodexForkToolCall"}]}"#,
+            ),
+        ]);
+
+        print_tail(&client, "worker", 3, false).unwrap();
+
+        assert_eq!(
+            server.join().unwrap(),
+            vec!["/sessions/worker", "/sessions/tail001/tool-calls?limit=3"]
+        );
+    }
+
+    #[test]
+    fn tail_raw_requests_rendered_output_instead_of_pipe_pane_log() {
+        let (client, server) = start_lookup_server([
+            (
+                "/sessions/worker",
+                200,
+                r#"{"id":"tail001","name":"codex-tail001","friendly_name":"worker","provider":"codex-fork"}"#,
+            ),
+            (
+                "/sessions/tail001/output?lines=4&rendered=true",
+                200,
+                r#"{"session_id":"tail001","output":"readable output\n"}"#,
+            ),
+        ]);
+
+        print_tail(&client, "worker", 4, true).unwrap();
+
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                "/sessions/worker",
+                "/sessions/tail001/output?lines=4&rendered=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn tail_terminal_cleanup_removes_csi_osc_and_control_bytes() {
+        let raw = "\u{1b}[31mred\u{1b}[0m\n\u{1b}]0;title\u{7}plain\u{0}\ttext";
+        assert_eq!(strip_terminal_controls(raw), "red\nplain\ttext");
     }
 
     #[test]
@@ -4796,6 +5045,20 @@ mod tests {
         assert_eq!(format_context_percentage(Some(&json!(43.5))), "43.5%");
         assert_eq!(format_context_percentage(Some(&Value::Null)), "unknown");
         assert_eq!(format_context_percentage(None), "unknown");
+    }
+
+    #[test]
+    fn context_monitor_false_response_uses_codex_fyi_contract() {
+        assert!(context_monitor_is_informational(
+            &json!({"status": "ok", "enabled": false})
+        ));
+        assert!(!context_monitor_is_informational(
+            &json!({"status": "ok", "enabled": true})
+        ));
+        assert_eq!(
+            CODEX_CONTEXT_MONITOR_FYI,
+            "Context monitoring is FYI only for Codex agents; they manage compaction inline."
+        );
     }
 
     #[test]

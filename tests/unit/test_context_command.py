@@ -1,6 +1,6 @@
 from unittest.mock import Mock
 
-from src.cli.commands import cmd_context
+from src.cli.commands import cmd_context, cmd_context_monitor
 
 
 def _snapshot(**overrides):
@@ -95,3 +95,20 @@ def test_context_requires_target_without_session_context(capsys):
     assert rc == 2
     assert "requires a managed session or explicit session target" in capsys.readouterr().err
     client.get_context_snapshot.assert_not_called()
+
+
+def test_context_monitor_enable_reports_codex_fyi_contract(capsys):
+    client = Mock()
+    client.set_context_monitor.return_value = (
+        {"status": "ok", "enabled": False},
+        True,
+        False,
+    )
+
+    rc = cmd_context_monitor(client, "abc12345", "enable", None)
+
+    assert rc == 0
+    assert capsys.readouterr().out == (
+        "Context monitoring is FYI only for Codex agents; "
+        "they manage compaction inline.\n"
+    )
