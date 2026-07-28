@@ -17,7 +17,7 @@ use std::{
 };
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query,
@@ -1378,8 +1378,15 @@ async fn context_usage_hook(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
+    // The migration contract for this route is "decodes JSON or returns 204"
+    // (specs/762_stage2_artifacts/route_auth_matrix.md:144). Taking the raw body
+    // rather than `Json<Value>` keeps that promise: the extractor would reject an
+    // empty or truncated body with a client error before the handler ran.
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
     let Some(session_id) = context_usage_session_id(&payload) else {
         return Ok(Json(json!({ "status": "unknown_session" })).into_response());
     };

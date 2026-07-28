@@ -7530,6 +7530,37 @@ async fn context_usage_hook_is_served_and_records_tokens() {
 }
 
 #[tokio::test]
+async fn context_usage_hook_drops_undecodable_bodies_without_erroring() {
+    // route_auth_matrix.md:144 — decodes JSON or returns 204. A hook that gets a
+    // client error back is a hook failure surfaced in a live pane.
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    for body in ["", "{\"session_id\":", "not json at all"] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/hooks/context-usage")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "body: {body:?} -> {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(bytes.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn context_usage_hook_reports_unregistered_and_unknown_sessions() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
