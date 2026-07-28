@@ -1,9 +1,11 @@
 """Tests for scripts/restart-rust-server.sh - sm#1134.
 
-The script restarts the live service, so the property that matters most is
-negative: if the build or the signature fails, nothing may touch launchd. These
-tests drive the real bash script with cargo/codesign/launchctl/curl replaced by
-PATH stubs that record every invocation.
+The script restarts the live service, so the properties that matter most are
+negative: if anything in phase 1 fails, launchd must not be touched and the
+binary launchd is registered against must not be written. These tests drive the
+real bash script with cargo/codesign/launchctl/curl and the cutover replaced by
+stubs that record every invocation - including what was sitting at the
+registered path at the time, which is how the install boundary is asserted.
 """
 
 import os
@@ -16,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "restart-rust-server.sh"
 
 CALLS = "calls.log"
+LABEL = "com.example.test"
 
 
 def _write(path: Path, body: str, executable: bool = False) -> Path:
@@ -33,12 +36,18 @@ def env(tmp_path):
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
 
+    # The installed binary launchd is registered against, kept deliberately
+    # separate from cargo's output just as the real deployment now is.
+    installed = _write(tmp_path / "installed" / "sm-server", "ORIGINAL", executable=True)
+    cargo_output = tmp_path / "cargo-out" / "sm-server"
+
     # Defaults; individual tests overwrite these knobs.
     (state / "cargo_rc").write_text("0")
     (state / "codesign_sign_rc").write_text("0")
     (state / "codesign_verify_rc").write_text("0")
-    (state / "cutover_rc").write_text("0")
+    (state / "start_rc").write_text("0")
     (state / "stop_rc").write_text("0")
+    (state / "stop_leaves_loaded").write_text("0")
     (state / "phase").write_text("before")
     (state / "before_health").write_text("0")  # 0 == healthy (curl exit code)
     (state / "after_health").write_text("0")
@@ -50,31 +59,31 @@ def env(tmp_path):
     (state / "pids").write_text("4242")  # whitespace-separated; last value repeats
     (state / "pid_index").write_text("0")
     (state / "job_state").write_text("running")
+    (state / "loaded_labels").write_text(f"{LABEL}\n")
 
     log = state / CALLS
+    # Every stub records what is at the registered path when it runs.
+    reg = f'reg="ABSENT"; [[ -f "{installed}" ]] && reg="$(cat "{installed}")"'
 
-    # A real build replaces the registered binary, which is what makes a later
-    # phase-1 failure dangerous; the stub reproduces that.
     _write(
         bin_dir / "cargo",
         f"""#!/bin/bash
-echo "cargo $*" >> "{log}"
+{reg}
+echo "cargo $* [registered=$reg]" >> "{log}"
 rc="$(cat "{state}/cargo_rc")"
 if [[ "$rc" == "0" ]]; then
-  printf 'REBUILT' > "{tmp_path}/sm-server"
-  chmod 755 "{tmp_path}/sm-server"
+  mkdir -p "$(dirname "{cargo_output}")"
+  printf 'REBUILT' > "{cargo_output}"
+  chmod 755 "{cargo_output}"
 fi
 exit "$rc"
 """,
         executable=True,
     )
-    # Both stubs record what is sitting at the registered path when they run, so
-    # tests can assert the live path only ever holds a binary launchd's current
-    # registration already accepted.
     _write(
         bin_dir / "codesign",
         f"""#!/bin/bash
-reg="ABSENT"; [[ -f "{tmp_path}/sm-server" ]] && reg="$(cat "{tmp_path}/sm-server")"
+{reg}
 echo "codesign $* [registered=$reg]" >> "{log}"
 for a in "$@"; do
   case "$a" in
@@ -88,8 +97,7 @@ exit "$(cat "{state}/codesign_sign_rc")"
     )
     # `launchctl print` is the only subcommand the script uses. It exits nonzero
     # for a label that is not loaded, which is how the preflight detects a
-    # lingering Python service.
-    (state / "loaded_labels").write_text("com.example.test\n")
+    # lingering Python service and how the script confirms the bootout worked.
     _write(
         bin_dir / "launchctl",
         f"""#!/bin/bash
@@ -136,22 +144,33 @@ exit 0
 """,
         executable=True,
     )
+    # stop-rust unloads the label, start-rust loads it back, mirroring what the
+    # real cutover does to the launchd registration.
     cutover = _write(
         tmp_path / "cutover.sh",
         f"""#!/bin/bash
-reg="ABSENT"; [[ -f "{tmp_path}/sm-server" ]] && reg="$(cat "{tmp_path}/sm-server")"
+{reg}
 echo "cutover $* [registered=$reg]" >> "{log}"
 case "$1" in
   render-plist) cat "{state}/rendered_plist"; exit 0 ;;
-  stop-rust) exit "$(cat "{state}/stop_rc")" ;;
-  start-rust) echo after > "{state}/phase"; exit "$(cat "{state}/cutover_rc")" ;;
+  stop-rust)
+    if [[ "$(cat "{state}/stop_leaves_loaded")" == "0" ]]; then
+      grep -vx "{LABEL}" "{state}/loaded_labels" > "{state}/tmp_labels" || true
+      mv "{state}/tmp_labels" "{state}/loaded_labels"
+    fi
+    exit "$(cat "{state}/stop_rc")"
+    ;;
+  start-rust)
+    echo "{LABEL}" >> "{state}/loaded_labels"
+    echo after > "{state}/phase"
+    exit "$(cat "{state}/start_rc")"
+    ;;
 esac
 exit 0
 """,
         executable=True,
     )
 
-    binary = _write(tmp_path / "sm-server", "ORIGINAL", executable=True)
     config = _write(tmp_path / "config.yaml", "server:\n  port: 8420\n")
     # Matches the stub's render-plist output, so there is no divergence by default.
     plist = _write(tmp_path / "service.plist", "<plist>canned</plist>\n")
@@ -160,20 +179,21 @@ exit 0
         "tmp": tmp_path,
         "state": state,
         "log": log,
-        "binary": binary,
+        "installed": installed,
+        "cargo_output": cargo_output,
         "plist": plist,
-        "run": _make_runner(bin_dir, cutover, binary, config, plist),
+        "run": _make_runner(bin_dir, cutover, installed, cargo_output, config, plist),
     }
 
 
-def _make_runner(bin_dir: Path, cutover: Path, binary: Path, config: Path, plist: Path):
+def _make_runner(bin_dir, cutover, installed, cargo_output, config, plist):
     def run(*args, **overrides):
         environ = {
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
-            "SM_BINARY": str(binary),
-            "SM_CARGO_OUTPUT": str(binary),
-            "SM_TARGET_DIR": str(binary.parent / "target"),
+            "SM_BINARY": str(installed),
+            "SM_CARGO_OUTPUT": str(cargo_output),
+            "SM_TARGET_DIR": str(cargo_output.parent.parent / "target"),
             "SM_PLIST": str(plist),
             "SM_CUTOVER": str(cutover),
             "SM_CONFIG": str(config),
@@ -182,7 +202,8 @@ def _make_runner(bin_dir: Path, cutover: Path, binary: Path, config: Path, plist
             "SM_PORT": "9",
             "SM_HEALTH_TIMEOUT": "3",
             "SM_PID_SETTLE_SECONDS": "2",
-            "SM_LABEL": "com.example.test",
+            "SM_UNLOAD_TIMEOUT": "2",
+            "SM_LABEL": LABEL,
         }
         environ.update(overrides)
         return subprocess.run(
@@ -194,8 +215,14 @@ def _make_runner(bin_dir: Path, cutover: Path, binary: Path, config: Path, plist
 
     return run
 
+
 def calls(env) -> str:
     return env["log"].read_text() if env["log"].exists() else ""
+
+
+def cutover_line(env, subcommand: str) -> str:
+    prefix = f"cutover {subcommand}"
+    return next(l for l in calls(env).splitlines() if l.startswith(prefix))
 
 
 def assert_service_untouched(env):
@@ -205,11 +232,11 @@ def assert_service_untouched(env):
     `cutover render-plist` to check preconditions before anything is stopped.
     """
     text = calls(env)
-    assert "cutover restart-rust" not in text, f"restart was attempted:\n{text}"
-    assert "cutover start-rust" not in text, f"restart was attempted:\n{text}"
-    assert "cutover stop-rust" not in text, f"service was stopped:\n{text}"
+    for mutating in ("restart-rust", "start-rust", "stop-rust"):
+        assert f"cutover {mutating}" not in text, f"service was touched:\n{text}"
     for mutating in ("bootout", "bootstrap", "kickstart", "unload", "load"):
         assert f"launchctl {mutating}" not in text, f"launchd was mutated:\n{text}"
+    assert env["installed"].read_text() == "ORIGINAL", "the registered binary was written"
 
 
 # --- the ordering guarantee -------------------------------------------------
@@ -245,104 +272,105 @@ def test_verify_failure_leaves_service_untouched(env):
     assert_service_untouched(env)
 
 
-def test_missing_binary_leaves_service_untouched(env):
-    missing = str(env["tmp"] / "nope")
+def test_build_producing_nothing_leaves_service_untouched(env):
+    """cargo can exit 0 without leaving an executable where we expect one."""
+    cargo = env["tmp"] / "bin" / "cargo"
+    cargo.write_text(f'#!/bin/bash\necho "cargo $*" >> "{env["log"]}"\nexit 0\n')
+    cargo.chmod(0o755)
 
-    result = env["run"](SM_BINARY=missing, SM_CARGO_OUTPUT=missing)
+    result = env["run"]()
 
     assert result.returncode != 0
-    assert "binary not found" in result.stderr
+    assert "produced no executable" in result.stderr
     assert_service_untouched(env)
 
 
-def test_binary_is_rolled_back_when_signing_fails(env):
-    """A build replaces the registered executable while the old process runs on.
-    If a later phase-1 step fails, the on-disk binary must go back, or the next
-    KeepAlive respawn boots a build the live registration never accepted."""
-    (env["state"] / "codesign_sign_rc").write_text("1")
+def test_missing_installed_binary_with_skip_build(env):
+    env["installed"].unlink()
 
-    result = env["run"]()
+    result = env["run"]("--skip-build")
 
     assert result.returncode != 0
-    assert env["binary"].read_text() == "ORIGINAL"
-    assert "rolled back" in result.stderr
-    assert_service_untouched(env)
+    assert "no installed binary" in result.stderr
 
 
-def test_binary_is_rolled_back_when_verification_fails(env):
-    (env["state"] / "codesign_verify_rc").write_text("1")
+def test_build_runs_before_anything_stops(env):
+    env["run"]()
 
-    result = env["run"]()
+    text = calls(env)
+    assert text.index("cargo build") < text.index("codesign --force")
+    assert text.index("codesign --verify") < text.index("cutover stop-rust")
+
+
+def test_registered_binary_is_never_written_during_phase_one(env):
+    """The whole guarantee in one assertion: everything before the bootout sees
+    the previously installed build at the registered path."""
+    env["run"]()
+
+    lines = calls(env).splitlines()
+    before_stop = lines[: next(i for i, l in enumerate(lines) if l.startswith("cutover stop-rust"))]
+    recorded = [l for l in before_stop if "[registered=" in l]
+    assert recorded, "expected stubs to have recorded the registered path"
+    assert all("[registered=ORIGINAL]" in l for l in recorded), recorded
+
+
+def test_service_must_not_be_registered_against_cargo_output(env):
+    """If they were the same path, a build would write the live binary."""
+    same = str(env["cargo_output"])
+
+    result = env["run"](SM_BINARY=same)
 
     assert result.returncode != 0
-    assert env["binary"].read_text() == "ORIGINAL"
+    assert "must not be" in result.stderr
+    assert "cutover stop-rust" not in calls(env)
 
 
-def test_successful_run_keeps_the_new_binary(env):
-    result = env["run"]()
-
-    assert result.returncode == 0, result.stderr
-    assert env["binary"].read_text() == "REBUILT"
+# --- signing and the restart path -------------------------------------------
 
 
-def test_new_binary_is_removed_when_none_existed_before(env):
-    """After a `cargo clean` the registered path is empty while launchd's process
-    runs on from its open inode. A build then creates a binary, and if phase 1
-    fails it must not be left there for the next respawn to execute."""
-    env["binary"].unlink()
-    (env["state"] / "codesign_sign_rc").write_text("1")
+def test_signs_with_a_stable_identifier(env):
+    env["run"]()
 
-    result = env["run"]()
-
-    assert result.returncode != 0
-    assert not env["binary"].exists()
-    assert_service_untouched(env)
+    assert "--identifier com.rajeshgoli.sm-server" in calls(env)
 
 
-def test_new_binary_is_kept_when_none_existed_and_the_run_succeeds(env):
-    env["binary"].unlink()
+def test_restart_goes_through_the_cutover_script(env):
+    env["run"]()
 
-    result = env["run"]()
+    text = calls(env)
+    # restart-rust is exactly stop-rust then start-rust; the install goes between.
+    assert "cutover stop-rust" in text
+    assert "cutover start-rust" in text
+    # The stale-constraint bug is exactly what a bare kickstart cannot fix.
+    assert "launchctl kickstart" not in text
+    assert "launchctl bootout" not in text
 
-    assert result.returncode == 0, result.stderr
-    assert env["binary"].read_text() == "REBUILT"
 
-
-def test_cargo_target_dir_is_pinned(env):
-    """A redirected target dir would put the new build elsewhere while we signed
-    and restarted a stale binary at the expected path."""
-    result = env["run"](CARGO_TARGET_DIR=str(env["tmp"] / "redirected"))
-
-    assert result.returncode == 0, result.stderr
-    line = next(l for l in calls(env).splitlines() if l.startswith("cargo build"))
-    assert f"--target-dir {env['tmp'] / 'target'}" in line
-    assert str(env["tmp"] / "redirected") not in line
+# --- the install boundary ---------------------------------------------------
 
 
 def test_binary_is_installed_only_while_the_job_is_stopped(env):
-    """The registered path must never hold an unverified build while the job is
-    still registered: a server that exited in that window would be respawned by
-    KeepAlive onto a binary the old registration may reject."""
     result = env["run"]()
 
     assert result.returncode == 0, result.stderr
-    lines = calls(env).splitlines()
-    stop = next(l for l in lines if l.startswith("cutover stop-rust"))
-    start = next(l for l in lines if l.startswith("cutover start-rust"))
     # Still the known-good build when the job is booted out...
-    assert "[registered=ORIGINAL]" in stop
+    assert "[registered=ORIGINAL]" in cutover_line(env, "stop-rust")
     # ...and only replaced once nothing can exec it.
-    assert "[registered=REBUILT]" in start
+    assert "[registered=REBUILT]" in cutover_line(env, "start-rust")
+    assert env["installed"].read_text() == "REBUILT"
 
 
-def test_signing_happens_off_the_registered_path(env):
-    """Signing and verification run against the staged copy, so the live path
-    keeps the binary launchd's current registration already accepted."""
-    env["run"]()
+def test_job_still_loaded_after_stop_aborts_before_install(env):
+    """The cutover runs `launchctl bootout ... || true` and reports success
+    regardless, so a job that refused to unload has to be caught here."""
+    (env["state"] / "stop_leaves_loaded").write_text("1")
 
-    signing = [l for l in calls(env).splitlines() if l.startswith("codesign --force")]
-    assert signing, "expected a signing call"
-    assert all("[registered=ORIGINAL]" in l for l in signing), signing
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "still loaded" in result.stderr
+    assert env["installed"].read_text() == "ORIGINAL"
+    assert "cutover start-rust" not in calls(env)
 
 
 def test_stop_failure_leaves_the_previous_binary_in_place(env):
@@ -352,45 +380,81 @@ def test_stop_failure_leaves_the_previous_binary_in_place(env):
 
     assert result.returncode != 0
     assert "could not stop" in result.stderr
-    assert env["binary"].read_text() == "ORIGINAL"
+    assert env["installed"].read_text() == "ORIGINAL"
     assert "cutover start-rust" not in calls(env)
 
 
 def test_staging_file_is_never_left_behind(env):
     env["run"]()
 
-    assert list(env["tmp"].glob("sm-server.staging*")) == []
+    assert list((env["installed"].parent).glob("sm-server.staging*")) == []
 
 
-def test_no_backup_file_is_left_behind(env):
+def test_staging_file_is_cleaned_up_after_failure(env):
+    (env["state"] / "codesign_verify_rc").write_text("1")
+
     env["run"]()
 
-    leftovers = list(env["tmp"].glob("sm-server.restart-backup*"))
-    assert leftovers == []
+    assert list((env["installed"].parent).glob("sm-server.staging*")) == []
 
 
-def test_cargo_output_mismatch_blocks_before_any_restart(env):
-    """cargo builds its own path; signing a different SM_BINARY would deploy
-    stale code while claiming a fresh build."""
-    other = _write(env["tmp"] / "elsewhere", "STALE", executable=True)
-
-    result = env["run"](SM_BINARY=str(other))
-
-    assert result.returncode != 0
-    assert "cargo builds" in result.stderr
-    assert other.read_text() == "STALE"
-    assert_service_untouched(env)
+# --- deployment settings ----------------------------------------------------
 
 
-def test_cargo_output_mismatch_is_allowed_with_skip_build(env):
-    other = _write(env["tmp"] / "elsewhere", "PREBUILT", executable=True)
+def test_deployment_overrides_reach_the_cutover(env):
+    """The cutover has its own defaults and reads none of our env vars, so a
+    non-default deployment must be forwarded or we would sign one service and
+    restart another - in the worst case, production."""
+    other = env["tmp"] / "other" / "sm-server"
+    _write(other, "ORIGINAL", executable=True)
+    other_config = _write(env["tmp"] / "other.yaml", "server: {}\n")
 
-    result = env["run"]("--skip-build", SM_BINARY=str(other))
+    result = env["run"](
+        SM_BINARY=str(other),
+        SM_CONFIG=str(other_config),
+        SM_PORT="10",
+    )
 
     assert result.returncode == 0, result.stderr
+    line = cutover_line(env, "start-rust")
+    assert f"--binary {other}" in line
+    assert f"--config {other_config}" in line
+    assert "--port 10" in line
+    assert "--host 127.0.0.1" in line
 
 
-# --- deployment settings that a plist rewrite would drop --------------------
+def test_health_check_targets_the_port_handed_to_the_cutover(env):
+    env["run"](SM_PORT="10")
+
+    text = calls(env)
+    assert "--port 10" in text
+    assert "http://127.0.0.1:10/health" in text
+
+
+def test_plist_path_is_forwarded_to_the_cutover(env):
+    env["run"]()
+
+    line = cutover_line(env, "start-rust")
+    assert f"--plist {env['plist']}" in line
+    # The cutover recomputes the plist path from --label, so order matters.
+    assert line.index("--label") < line.index("--plist")
+
+
+def test_local_env_is_forwarded_to_the_cutover(env):
+    overlay = _write(env["tmp"] / "local.env", "SECRET=1\n")
+
+    result = env["run"](SM_LOCAL_ENV=str(overlay))
+
+    assert result.returncode == 0, result.stderr
+    assert f"--local-env {overlay}" in cutover_line(env, "start-rust")
+
+
+def test_unreadable_local_env_blocks_before_any_restart(env):
+    result = env["run"](SM_LOCAL_ENV=str(env["tmp"] / "missing.env"))
+
+    assert result.returncode != 0
+    assert "local env overlay not readable" in result.stderr
+    assert_service_untouched(env)
 
 
 def test_plist_divergence_blocks_before_any_restart(env):
@@ -415,49 +479,6 @@ def test_allow_plist_change_proceeds_with_a_warning(env):
     assert "WARNING" in result.stderr
 
 
-def test_local_env_is_forwarded_to_the_cutover(env):
-    overlay = _write(env["tmp"] / "local.env", "SECRET=1\n")
-
-    result = env["run"](SM_LOCAL_ENV=str(overlay))
-
-    assert result.returncode == 0, result.stderr
-    line = next(l for l in calls(env).splitlines() if l.startswith("cutover start-rust"))
-    assert f"--local-env {overlay}" in line
-
-
-def test_unreadable_local_env_blocks_before_any_restart(env):
-    result = env["run"](SM_LOCAL_ENV=str(env["tmp"] / "missing.env"))
-
-    assert result.returncode != 0
-    assert "local env overlay not readable" in result.stderr
-    assert_service_untouched(env)
-
-
-def test_plist_path_is_forwarded_to_the_cutover(env):
-    """Otherwise the preflight compares one plist while the cutover writes and
-    bootstraps a different (default) one."""
-    env["run"]()
-
-    line = next(l for l in calls(env).splitlines() if l.startswith("cutover start-rust"))
-    assert f"--plist {env['plist']}" in line
-    # The cutover recomputes the plist path from --label, so order matters.
-    assert line.index("--label") < line.index("--plist")
-
-
-def test_missing_cutover_blocks_before_the_binary_is_touched(env):
-    """With no live plist the render check is skipped, so a missing cutover has
-    to be caught in the preflight rather than after the rebuild."""
-    env["plist"].unlink()
-
-    result = env["run"](SM_CUTOVER=str(env["tmp"] / "gone.sh"))
-
-    assert result.returncode != 0
-    assert "cutover script not executable" in result.stderr
-    assert env["binary"].read_text() == "ORIGINAL"
-    assert "cargo build" not in calls(env)
-    assert_service_untouched(env)
-
-
 def test_missing_plist_is_not_a_divergence(env):
     """A first-time bootstrap has no plist to compare against."""
     env["plist"].unlink()
@@ -467,12 +488,23 @@ def test_missing_plist_is_not_a_divergence(env):
     assert result.returncode == 0, result.stderr
 
 
+def test_cargo_target_dir_is_pinned(env):
+    """A redirected target dir would leave us installing a stale artifact."""
+    result = env["run"](CARGO_TARGET_DIR=str(env["tmp"] / "redirected"))
+
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in calls(env).splitlines() if l.startswith("cargo build"))
+    assert "--target-dir" in line
+    assert str(env["tmp"] / "redirected") not in line
+
+
+# --- preconditions ----------------------------------------------------------
+
+
 def test_lingering_python_label_blocks_before_anything_stops(env):
-    """start-rust refuses to start alongside Python, but restart-rust stops the
-    service first - so that precondition has to be caught in the preflight."""
-    (env["state"] / "loaded_labels").write_text(
-        "com.example.test\ncom.example.legacy-python\n"
-    )
+    """start-rust refuses to start alongside Python, but it stops the service
+    first - so that precondition has to be caught in the preflight."""
+    (env["state"] / "loaded_labels").write_text(f"{LABEL}\ncom.example.legacy-python\n")
 
     result = env["run"]()
 
@@ -489,67 +521,25 @@ def test_unreadable_config_leaves_service_untouched(env):
     assert_service_untouched(env)
 
 
-def test_build_runs_before_any_restart(env):
-    env["run"]()
+def test_missing_cutover_blocks_before_the_binary_is_touched(env):
+    """With no live plist the render check is skipped, so a missing cutover has
+    to be caught in the preflight rather than later."""
+    env["plist"].unlink()
 
-    text = calls(env)
-    assert text.index("cargo build") < text.index("codesign --force")
-    assert text.index("codesign --verify") < text.index("cutover stop-rust")
+    result = env["run"](SM_CUTOVER=str(env["tmp"] / "gone.sh"))
 
-
-# --- signing behaviour ------------------------------------------------------
-
-
-def test_signs_with_a_stable_identifier(env):
-    env["run"]()
-
-    assert "--identifier com.rajeshgoli.sm-server" in calls(env)
+    assert result.returncode != 0
+    assert "cutover script not executable" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
 
 
-def test_restart_goes_through_the_cutover_script(env):
-    env["run"]()
+def test_rejects_bad_allow_drop(env):
+    result = env["run"]("--allow-drop", "-1")
 
-    text = calls(env)
-    # restart-rust is exactly stop-rust then start-rust; the install goes between.
-    assert "cutover stop-rust" in text
-    assert "cutover start-rust" in text
-    # The stale-constraint bug is exactly what a bare kickstart cannot fix.
-    assert "launchctl kickstart" not in text
-    assert "launchctl bootout" not in text
-
-
-def test_deployment_overrides_reach_the_cutover(env):
-    """The cutover has its own defaults and reads none of our env vars, so a
-    non-default deployment must be forwarded or we would sign one service and
-    restart another - in the worst case, production."""
-    other = _write(env["tmp"] / "other-sm-server", "#!/bin/bash\ntrue\n", executable=True)
-    other_config = _write(env["tmp"] / "other.yaml", "server: {}\n")
-    (env["state"] / "loaded_labels").write_text("com.example.other\n")
-
-    result = env["run"](
-        SM_LABEL="com.example.other",
-        SM_BINARY=str(other),
-        SM_CARGO_OUTPUT=str(other),
-        SM_CONFIG=str(other_config),
-        SM_PORT="10",
-    )
-
-    assert result.returncode == 0, result.stderr
-    line = next(l for l in calls(env).splitlines() if l.startswith("cutover "))
-    assert "--label com.example.other" in line
-    assert f"--binary {other}" in line
-    assert f"--config {other_config}" in line
-    assert "--port 10" in line
-    assert "--host 127.0.0.1" in line
-
-
-def test_health_check_targets_the_port_handed_to_the_cutover(env):
-    """The polled endpoint must be the one the service was told to listen on."""
-    env["run"](SM_PORT="10")
-
-    text = calls(env)
-    assert "--port 10" in text
-    assert "http://127.0.0.1:10/health" in text
+    assert result.returncode == 2
+    assert "non-negative integer" in result.stderr
+    assert_service_untouched(env)
 
 
 # --- post-restart verification ---------------------------------------------
@@ -572,8 +562,8 @@ def test_unhealthy_after_restart_fails(env):
     assert "did not become healthy" in result.stderr
 
 
-def test_cutover_failure_is_reported(env):
-    (env["state"] / "cutover_rc").write_text("1")
+def test_start_failure_is_reported(env):
+    (env["state"] / "start_rc").write_text("1")
 
     result = env["run"]()
 
@@ -647,18 +637,11 @@ def test_recovery_restart_when_server_was_down(env):
     assert "skipping comparison" in result.stdout
 
 
-def test_skip_build_still_signs(env):
+def test_skip_build_reinstalls_the_installed_binary(env):
     result = env["run"]("--skip-build")
 
     assert result.returncode == 0, result.stderr
     text = calls(env)
     assert "cargo build" not in text
     assert "codesign --force" in text
-
-
-def test_rejects_bad_allow_drop(env):
-    result = env["run"]("--allow-drop", "-1")
-
-    assert result.returncode == 2
-    assert "non-negative integer" in result.stderr
-    assert_service_untouched(env)
+    assert env["installed"].read_text() == "ORIGINAL"

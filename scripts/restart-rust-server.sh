@@ -5,14 +5,14 @@
 # the build and the signature must BOTH fully succeed before anything stops the
 # running service, so a broken build can never take the server offline.
 #
-# "Untouched" has to include the binary on disk, not just the running process.
-# cargo writes its output straight to the path launchd has registered, so the
-# rebuilt binary is staged aside the moment it is produced and the known-good
-# one is put back. The registered path is then replaced exactly once, while the
-# job is booted out and there is no KeepAlive to exec anything. Otherwise a
-# server that exited between the build and the re-registration would be
-# respawned onto an unverified binary under the old registration - the same
-# crash loop this script exists to prevent.
+# That guarantee only holds if the service does not run out of the build
+# directory. cargo writes to target/release/sm-server; launchd is registered
+# against an installed copy under .local/bin. Nothing in phase 1 writes the
+# registered path at all, so there is no window in which launchd could exec a
+# build its current registration has not accepted - and an ordinary
+# `cargo build` by anyone working in this repo no longer touches the live
+# server's binary either. The registered path is written exactly once, by an
+# atomic rename, while the job is booted out.
 #
 # Why the restart is bootout -> bootstrap -> kickstart and not `kickstart -k`:
 # launchd can pin a launch constraint into the job registration. When it has,
@@ -37,10 +37,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Overridable for tests and non-default deployments.
 SM_LABEL="${SM_LABEL:-com.rajeshgoli.session-manager-rust}"
-SM_BINARY="${SM_BINARY:-$REPO_ROOT/target/release/sm-server}"
+# The installed path launchd is registered against. Deliberately NOT cargo's
+# output path - see the header.
+SM_BINARY="${SM_BINARY:-$REPO_ROOT/.local/bin/sm-server}"
 # Passed to cargo as --target-dir, which outranks CARGO_TARGET_DIR and
-# build.target-dir. Without pinning it, a redirected target dir would put the
-# new build somewhere else while we signed and restarted a stale binary here.
+# build.target-dir. Without pinning it, a redirected target dir would leave us
+# installing a stale artifact from the expected location.
 SM_TARGET_DIR="${SM_TARGET_DIR:-$REPO_ROOT/target}"
 SM_CARGO_OUTPUT="${SM_CARGO_OUTPUT:-$SM_TARGET_DIR/release/sm-server}"
 SM_CUTOVER="${SM_CUTOVER:-$REPO_ROOT/scripts/rust-service-cutover.sh}"
@@ -57,6 +59,7 @@ SM_BASE_URL="http://$SM_HOST:$SM_PORT"
 SM_SIGN_IDENTIFIER="${SM_SIGN_IDENTIFIER:-com.rajeshgoli.sm-server}"
 SM_HEALTH_TIMEOUT="${SM_HEALTH_TIMEOUT:-60}"
 SM_PID_SETTLE_SECONDS="${SM_PID_SETTLE_SECONDS:-20}"
+SM_UNLOAD_TIMEOUT="${SM_UNLOAD_TIMEOUT:-10}"
 SM_ALLOW_SESSION_DROP="${SM_ALLOW_SESSION_DROP:-0}"
 DOMAIN="gui/$(id -u)"
 
@@ -66,7 +69,12 @@ Usage: scripts/restart-rust-server.sh [options]
 
 Rebuilds, signs, and restarts the Rust Session Manager, then verifies it.
 A failing build or a failing signature leaves the running service untouched,
-including the binary on disk.
+including the binary launchd is registered against.
+
+The service runs from an installed copy ($SM_BINARY),
+not from cargo's output, so a build never disturbs the running server. The
+first run after adopting this script rewrites the plist to point at the
+installed path and therefore needs --allow-plist-change once.
 
 Options:
   --allow-drop N        Tolerate N fewer sessions after the restart (default: 0).
@@ -75,13 +83,13 @@ Options:
   --allow-plist-change  Proceed even though restarting would rewrite the launchd
                         plist with different contents. Read the printed diff
                         first: this is how a deployment setting gets dropped.
-  --skip-build          Reuse the existing binary. Still signs and verifies.
+  --skip-build          Install the currently installed binary again, re-signed.
   -h, --help            Show this help.
 
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
 SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, SM_PORT,
 SM_PYTHON_LABELS, SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
-SM_PID_SETTLE_SECONDS, SM_ALLOW_SESSION_DROP.
+SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP.
 
 SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, and SM_PORT are
 forwarded to the cutover script, so both phases act on the same deployment.
@@ -136,37 +144,14 @@ cutover_args=(
 )
 [[ -n "$SM_LOCAL_ENV" ]] && cutover_args+=(--local-env "$SM_LOCAL_ENV")
 
-# --- rollback ---------------------------------------------------------------
-# The registered path must end up holding exactly what it held at start-up -
-# including nothing at all - unless the run gets as far as installing.
-BINARY_BACKUP=""
-BINARY_WAS_ABSENT=0
-RESTORE_BINARY=0
+# Staging lives beside the installed binary so the install is an atomic rename.
 SM_STAGING="$SM_BINARY.staging.$$"
-RESTORING_TMP=""
 RENDERED_PLIST=""
 
 cleanup() {
   local rc=$?
-  if [[ "$RESTORE_BINARY" -eq 1 && $rc -ne 0 ]]; then
-    if [[ -n "$BINARY_BACKUP" && -f "$BINARY_BACKUP" ]]; then
-      if mv -f "$BINARY_BACKUP" "$SM_BINARY"; then
-        echo "rolled back $SM_BINARY to the previously registered build" >&2
-      else
-        echo "WARNING: could not restore $SM_BINARY from $BINARY_BACKUP" >&2
-      fi
-    elif [[ "$BINARY_WAS_ABSENT" -eq 1 && -e "$SM_BINARY" ]]; then
-      if rm -f "$SM_BINARY"; then
-        echo "removed the unverified binary this run created at $SM_BINARY" >&2
-      else
-        echo "WARNING: could not remove the unverified binary at $SM_BINARY" >&2
-      fi
-    fi
-  fi
-  [[ -n "$BINARY_BACKUP" ]] && rm -f "$BINARY_BACKUP"
-  [[ -n "$SM_STAGING" ]] && rm -f "$SM_STAGING"
-  [[ -n "$RESTORING_TMP" ]] && rm -f "$RESTORING_TMP"
-  [[ -n "$RENDERED_PLIST" ]] && rm -f "$RENDERED_PLIST"
+  rm -f "$SM_STAGING"
+  [[ -n "$RENDERED_PLIST" ]] && rm -f "$RENDERED_PLIST" "$RENDERED_PLIST.diff"
   return $rc
 }
 trap cleanup EXIT
@@ -192,6 +177,10 @@ print(len(sessions))
 ' 2>/dev/null || return 1
 }
 
+job_loaded() {
+  launchctl print "$DOMAIN/$SM_LABEL" >/dev/null 2>&1
+}
+
 # First "key = value" line only: launchctl repeats `state` for nested entries.
 launchctl_field() {
   launchctl print "$DOMAIN/$SM_LABEL" 2>/dev/null \
@@ -200,8 +189,8 @@ launchctl_field() {
 
 # ---------------------------------------------------------------------------
 # Phase 1: everything that can fail without consequence.
-# Nothing below this line may touch the running service, and the registered
-# binary must be back to its original state by the end of every step.
+# Nothing below this line may touch the running service, and nothing may write
+# to $SM_BINARY - the path launchd is registered against.
 # ---------------------------------------------------------------------------
 
 step "Recording pre-restart state"
@@ -224,10 +213,9 @@ fi
 step "Preflight: checking what the restart will require"
 # rust-service-cutover.sh stops the service and only then validates start-rust's
 # preconditions, so a precondition that fails there leaves the server down.
-# Check the same things here, while stopping nothing.
-# The cutover is checked before anything writes to the binary: the plist
-# comparison below only runs when a live plist exists, so a missing cutover
-# would otherwise not surface until after the rebuild.
+# Check the same things here, while stopping nothing. The cutover itself is
+# checked first: the plist comparison below only runs when a live plist exists,
+# so a missing cutover would otherwise not surface until much later.
 [[ -x "$SM_CUTOVER" ]] || fail "cutover script not executable: $SM_CUTOVER - the running service was not touched"
 [[ -r "$SM_CONFIG" ]] || fail "config not readable: $SM_CONFIG - the running service was not touched"
 if [[ -n "$SM_LOCAL_ENV" && ! -r "$SM_LOCAL_ENV" ]]; then
@@ -241,11 +229,12 @@ for label in $SM_PYTHON_LABELS; do
   fi
 done
 
-if [[ "$SKIP_BUILD" -eq 0 && "$SM_BINARY" != "$SM_CARGO_OUTPUT" ]]; then
-  fail "SM_BINARY is $SM_BINARY but cargo builds $SM_CARGO_OUTPUT, so a build would
-       not produce the binary we are about to sign and restart - the run would
-       deploy stale code while reporting a fresh build. Re-run with --skip-build
-       to deploy the existing binary. The running service was not touched."
+if [[ "$SKIP_BUILD" -eq 0 && "$SM_BINARY" == "$SM_CARGO_OUTPUT" ]]; then
+  fail "SM_BINARY and SM_CARGO_OUTPUT are both $SM_BINARY. The service must not be
+       registered against cargo's output path: a build would then write the
+       registered binary directly, and a server that exited before the restart
+       would be respawned by KeepAlive onto an unverified build.
+       The running service was not touched."
 fi
 
 # Restarting rewrites the plist. Anything in the live plist that we would not
@@ -258,59 +247,37 @@ if [[ -f "$SM_PLIST" ]]; then
   if ! diff -u "$SM_PLIST" "$RENDERED_PLIST" > "$RENDERED_PLIST.diff" 2>&1; then
     echo "--- live plist vs what the restart would write ---" >&2
     cat "$RENDERED_PLIST.diff" >&2
-    rm -f "$RENDERED_PLIST.diff"
     if [[ "$ALLOW_PLIST_CHANGE" -eq 0 ]]; then
       fail "restarting would rewrite $SM_PLIST with different contents (diff above).
-       Pass the missing settings (for example SM_LOCAL_ENV) so the rendered plist
-       matches, or re-run with --allow-plist-change to accept the rewrite.
+       If this is the first run after adopting this script, that diff should be
+       the program path moving to the installed binary - re-run with
+       --allow-plist-change to accept it. Otherwise pass the missing settings
+       (for example SM_LOCAL_ENV) so the rendered plist matches.
        The running service was not touched."
     fi
     echo "WARNING: proceeding with a plist rewrite because --allow-plist-change was given" >&2
   fi
-  rm -f "$RENDERED_PLIST.diff"
 fi
 echo "preconditions ok"
 
-# Snapshot before the build, because cargo writes over the registered path.
-if [[ -e "$SM_BINARY" ]]; then
-  BINARY_BACKUP="$SM_BINARY.restart-backup.$$"
-  cp -p "$SM_BINARY" "$BINARY_BACKUP" \
-    || fail "could not snapshot $SM_BINARY before rebuilding - the running service was not touched"
-else
-  BINARY_WAS_ABSENT=1
-fi
-RESTORE_BINARY=1
-
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   step "Skipping build (--skip-build)"
-  [[ -x "$SM_BINARY" ]] || fail "binary not found or not executable at $SM_BINARY - the running service was not touched"
-  cp -p "$SM_BINARY" "$SM_STAGING" \
-    || fail "could not stage $SM_BINARY - the running service was not touched"
+  [[ -x "$SM_BINARY" ]] || fail "no installed binary at $SM_BINARY to re-deploy - the running service was not touched"
+  SOURCE_BINARY="$SM_BINARY"
 else
   step "Building sm-server (service still running)"
   cargo build --release -p sm-server --target-dir "$SM_TARGET_DIR" \
     || fail "build failed - the running service was not touched"
-  [[ -x "$SM_BINARY" ]] || fail "binary not found or not executable at $SM_BINARY - the running service was not touched"
-
-  # cargo has just overwritten the registered path. Move the new build aside and
-  # put the original back, so the only binary launchd could exec before the
-  # install is the one its current registration already accepted.
-  mv -f "$SM_BINARY" "$SM_STAGING" \
-    || fail "could not stage the new build - the running service was not touched"
-  if [[ -n "$BINARY_BACKUP" && -f "$BINARY_BACKUP" ]]; then
-    # Copy then rename, so the swap back into the live path is atomic.
-    RESTORING_TMP="$SM_BINARY.restoring.$$"
-    if ! cp -p "$BINARY_BACKUP" "$RESTORING_TMP"; then
-      fail "could not put the previously registered binary back at $SM_BINARY"
-    fi
-    if ! mv -f "$RESTORING_TMP" "$SM_BINARY"; then
-      fail "could not put the previously registered binary back at $SM_BINARY"
-    fi
-    RESTORING_TMP=""
-  fi
+  [[ -x "$SM_CARGO_OUTPUT" ]] \
+    || fail "build reported success but produced no executable at $SM_CARGO_OUTPUT - the running service was not touched"
+  SOURCE_BINARY="$SM_CARGO_OUTPUT"
 fi
 
-step "Signing the staged build"
+step "Staging and signing"
+mkdir -p "$(dirname "$SM_BINARY")" \
+  || fail "could not create $(dirname "$SM_BINARY") - the running service was not touched"
+cp -p "$SOURCE_BINARY" "$SM_STAGING" \
+  || fail "could not stage $SOURCE_BINARY - the running service was not touched"
 # A stable identifier keeps the signing identity from churning per build. Ad-hoc
 # signing otherwise derives the identifier from the Mach-O UUID (and the linker
 # derives it from cargo's deps/ filename), so it changed on every rebuild.
@@ -328,19 +295,29 @@ echo "signature ok: $(codesign -dvvv "$SM_STAGING" 2>&1 | awk -F= '/^Identifier=
 
 step "Stopping the service (bootout)"
 "$SM_CUTOVER" stop-rust "${cutover_args[@]}" \
-  || fail "could not stop $SM_LABEL - the previous binary is still in place"
+  || fail "could not stop $SM_LABEL - the installed binary is untouched"
+
+step "Confirming the job is really unloaded"
+# stop_rust runs `launchctl bootout ... || true` and reports success either way,
+# so a job that refused to unload would otherwise let us install while KeepAlive
+# can still respawn it.
+unload_deadline=$((SECONDS + SM_UNLOAD_TIMEOUT))
+while job_loaded; do
+  if (( SECONDS >= unload_deadline )); then
+    fail "$SM_LABEL is still loaded ${SM_UNLOAD_TIMEOUT}s after stop-rust; refusing to
+       install while launchd can still respawn it. The installed binary is
+       untouched, so the service is still running its previous build."
+  fi
+  sleep 1
+done
+echo "job is unloaded"
 
 step "Installing the verified build"
-# The job is booted out, so there is no KeepAlive to respawn anything: this is
-# the one moment the registered path can be replaced with no chance of launchd
-# exec'ing an unverified build against the old registration.
-if ! mv -f "$SM_STAGING" "$SM_BINARY"; then
-  echo "ERROR: could not install the new binary at $SM_BINARY;" >&2
-  echo "       restarting the service on the previous build" >&2
-  "$SM_CUTOVER" start-rust "${cutover_args[@]}" || true
-  exit 1
-fi
-RESTORE_BINARY=0
+# Nothing can exec the registered path right now, so this is the one safe moment
+# to replace it. Atomic rename, and the only write to $SM_BINARY in the script.
+mv -f "$SM_STAGING" "$SM_BINARY" \
+  || fail "could not install the new binary at $SM_BINARY; the previous build is
+       still in place - re-run '$SM_CUTOVER start-rust' to bring the service back"
 
 step "Starting the service (bootstrap -> kickstart)"
 "$SM_CUTOVER" start-rust "${cutover_args[@]}" \

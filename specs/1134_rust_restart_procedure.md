@@ -91,16 +91,18 @@ substance: phase 1 contains everything that can fail without consequence, and
 nothing in it touches the service.
 
 ```
-Phase 1 (service untouched on any failure)
+Phase 1 (service untouched on any failure; nothing writes the registered path)
   record /health and session count (a healthy server must yield a baseline)
-  preflight: config readable, local-env readable, no lingering Python label,
-             SM_BINARY is cargo's output, plist would not be rewritten
-  snapshot the registered binary        <- rollback armed
-  cargo build --release -p sm-server
-  codesign --force --sign - --identifier com.rajeshgoli.sm-server <binary>
-  codesign --verify --strict <binary>
+  preflight: cutover executable, config readable, local-env readable,
+             no lingering Python label, registered path is NOT cargo's output,
+             plist would not be rewritten
+  cargo build --release -p sm-server --target-dir <pinned>
+  cp cargo output -> staging (beside the installed binary)
+  codesign --force --sign - --identifier com.rajeshgoli.sm-server <staging>
+  codesign --verify --strict <staging>
 Phase 2
-  cutover stop-rust                     <- bootout; no KeepAlive left to respawn
+  cutover stop-rust                     <- bootout
+  confirm the job is really unloaded    <- the cutover swallows bootout failures
   install: mv staging -> registered path (atomic, the only write to it)
   cutover start-rust                    <- bootstrap -> kickstart
   poll /health until healthy (timeout -> nonzero)
@@ -108,45 +110,56 @@ Phase 2
   require session count not to have dropped
 ```
 
-### "Untouched" has to include the binary on disk
+### The service must not run out of the build directory
 
 The obvious reading of the acceptance criterion - a failing build or sign leaves
-the running service alone - is not enough. A build replaces the registered
-executable while the old process keeps running from its own inode, so a failure
-*after* the build leaves a process that is alive now but whose next KeepAlive
-respawn would use a build the live registration never accepted. That is the
-outage, just deferred to whenever the service next restarts.
+the running service alone - is not enough on its own, and the reason is
+structural rather than a missing check.
 
-Phase 1 therefore snapshots the binary before the build and restores it if
-anything fails before the restart commits. Verified live: with signing forced to
-pass and verification forced to fail, the cdhash was restored byte-identical
-(`b06ed8fc...` before and after), the pid was unchanged, and no backup file was
-left behind.
+The service used to be registered against `target/release/sm-server`, which is
+also where cargo writes. So a build replaced the live binary while the old
+process kept running from its own inode. Any failure after that left a process
+alive *now* whose next KeepAlive respawn would use a build the registration had
+never accepted - the outage, deferred. Worse, it was not only a failure path: in
+the window between cargo writing and the job being re-registered, a server that
+merely *exited* would be respawned onto that binary, with the script having done
+nothing wrong.
 
-Rolling back on failure is not sufficient on its own, because the exposure is
-not only a failure path. cargo writes its output *straight to the registered
-path*, so between the build finishing and the job being re-registered there is a
-window - about a second, and cargo writes the binary at the end of linking, not
-during it - where the live path holds a build the current registration has never
-accepted. A server that exited in that window would be respawned by KeepAlive
-onto exactly that binary: the crash loop, reached without the script failing at
-all.
+Three separate defensive layers were tried against this (restore on failure,
+then make the restore total, then stage the build aside immediately) and each
+narrowed the window without closing it. The cause was that cargo's output path
+was the registered path, so that is what changed:
 
-So the structural cause is removed rather than patched. The new build is moved
-aside to a staging file the moment cargo produces it and the known-good binary
-is put back, so signing and verification run off the live path. The registered
-path is then replaced exactly once, by an atomic rename, *while the job is
-booted out* and there is no KeepAlive to exec anything. `restart-rust` is
-literally `stop_rust; start_rust`, so calling those two halves with the install
-between them runs the cutover's own code rather than a third path.
+- launchd is registered against an installed copy at `.local/bin/sm-server`;
+- cargo keeps writing `target/release/sm-server`, with `--target-dir` pinned
+  explicitly (it outranks `CARGO_TARGET_DIR` and `build.target-dir`);
+- nothing in phase 1 writes the registered path at all, so no rollback is
+  needed and there is no window to reason about;
+- the registered path is written exactly once, by an atomic rename, *while the
+  job is booted out*.
 
-The invariant is that SM_BINARY ends up exactly as it started, *including having
-been absent*. After a `cargo clean` the registered path is empty while launchd's
-process runs on from its open inode; a build then creates a binary, and if
-phase 1 fails that unverified binary is removed rather than left for the next
-respawn to execute. Relatedly, `--target-dir` is passed explicitly to cargo (it
-outranks `CARGO_TARGET_DIR` and `build.target-dir`), so a redirected target dir
-cannot put the new build elsewhere while we sign and restart a stale one.
+This also removes a hazard that had nothing to do with this script: an ordinary
+`cargo build` by anyone working in the repo used to replace the running server's
+registered binary. It no longer touches it.
+
+Evidence that the service really was running out of the build directory: the
+14:24 crash report's signing identifier is `sm_server-8e8fcd02d48ff250`, which
+is exactly what cargo's linker produces for `deps/sm_server-8e8fcd02d48ff250`.
+The installed copy now carries the stable `com.rajeshgoli.sm-server` identifier
+instead.
+
+Adopting this changes the plist's program path, so the first run reports a plist
+divergence and needs `--allow-plist-change` once. That is the guard working as
+intended; subsequent runs are silent.
+
+### `bootout` failures are silent
+
+`stop_rust` in the cutover runs `launchctl bootout ... || true` and prints
+`stopped` either way, so a job that refused to unload would still look stopped.
+Installing then would replace the binary with KeepAlive still able to respawn
+it. Phase 2 therefore polls `launchctl print` until the label is genuinely gone
+before installing, and aborts with the previous build still in place if it is
+not.
 
 ### A plist rewrite is a silent config change
 
@@ -187,10 +200,10 @@ Notes on specific choices:
   baseline - otherwise the post-restart comparison is skipped and a restart that
   dropped the whole registry still reports success. Only a genuinely down server
   (a recovery restart) is allowed to proceed without one.
-- **`SM_BINARY` must be cargo's output when building.** `cargo build` writes its
-  own path, so signing and restarting some other `SM_BINARY` would deploy stale
-  code while reporting a fresh build. Mismatch aborts; `--skip-build` is the
-  supported way to deploy a prebuilt binary from elsewhere.
+- **The registered path must NOT be cargo's output.** If they were the same, a
+  build would write the live binary directly; the script refuses to run in that
+  configuration. (An earlier revision required the opposite - that they match -
+  which was the wrong invariant and is superseded.)
 - **Session-count drops fail the run** (`--allow-drop N` to tolerate expected
   churn). Sessions do retire on their own - the count moved 13 -> 12 during this
   investigation with no restart - so the escape hatch exists, but the default is

@@ -99,8 +99,11 @@ codex_rollout:
 
 Always use this script. Hand-rolling `cargo build` + `launchctl kickstart -k`
 has taken the service down: launchd can pin a launch constraint into the job
-registration, and only re-registering the job clears it. See
-`specs/1134_rust_restart_procedure.md`.
+registration, and only re-registering the job clears it.
+
+The service runs from an installed copy at `.local/bin/sm-server`, not from
+`target/release/sm-server`, so an ordinary `cargo build` never disturbs the
+running server. See `specs/1134_rust_restart_procedure.md`.
 
 ### Testing
 
