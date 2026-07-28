@@ -619,7 +619,6 @@ impl TmuxRuntime {
             .tmux_command([
                 "capture-pane",
                 "-p",
-                "-J",
                 "-S",
                 start.as_str(),
                 "-t",
@@ -1066,7 +1065,7 @@ mod tests {
 
         assert_eq!(output, ">\n");
         let log = fs::read_to_string(log_path).unwrap();
-        assert!(log.contains("capture-pane -p -J -S -1 -t sm-test"));
+        assert!(log.contains("capture-pane -p -S -1 -t sm-test"));
     }
 
     #[test]

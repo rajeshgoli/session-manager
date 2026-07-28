@@ -81,6 +81,7 @@ impl SessionStore {
     pub fn new_with_queue(state_file: PathBuf, queue_db_path: PathBuf) -> Self {
         let mut store = Self::new(state_file);
         store.queue_store = Some(RetainedQueueStore::new(queue_db_path));
+        let _ = store.cancel_informational_context_alerts();
         store
     }
 
@@ -95,6 +96,18 @@ impl SessionStore {
     fn cancel_context_monitor_alerts(&self, session_id: &str) -> Result<()> {
         if let Some(queue) = &self.queue_store {
             queue.cancel_pending_messages_from_sender_category(session_id, "context_monitor")?;
+        }
+        Ok(())
+    }
+
+    fn cancel_informational_context_alerts(&self) -> Result<()> {
+        for session in self
+            .load_snapshot()?
+            .into_sessions()
+            .into_iter()
+            .filter(|session| provider_manages_context_inline(&session.provider))
+        {
+            self.cancel_context_monitor_alerts(&session.id)?;
         }
         Ok(())
     }
@@ -8747,6 +8760,68 @@ mod tests {
 
         store.apply_codex_fork_event_line("codex001", line).unwrap();
         assert!(context_monitor_messages(&store).is_empty());
+    }
+
+    #[test]
+    fn store_startup_purges_pending_codex_context_alerts() {
+        let state_file = unique_temp_path("ctxcodexstartup");
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "parent01",
+                        "name": "claude-parent01",
+                        "provider": "claude",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-parent01",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    },
+                    {
+                        "id": "codex001",
+                        "name": "codex-codex001",
+                        "provider": "codex-app",
+                        "working_dir": "/repo",
+                        "tmux_session": "",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue
+            .enqueue_message_with_metadata(
+                "parent01",
+                "[sm context] stale Codex handoff prompt",
+                "urgent",
+                QueueMessageMetadata {
+                    sender_session_id: Some("codex001".to_owned()),
+                    message_category: Some("context_monitor".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            queue
+                .pending_messages_for_target("parent01", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let _store = SessionStore::new_with_queue(state_file, queue_db);
+
+        assert!(queue
+            .pending_messages_for_target("parent01", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
