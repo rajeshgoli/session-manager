@@ -6491,16 +6491,7 @@ fn timestamp_is_within(value: &str, seconds: i64) -> bool {
 /// format, so both encodings are accepted. Returns false when either side is
 /// unparseable — an unknown ordering must never supersede anything.
 fn timestamp_is_after(value: &str, other: &str) -> bool {
-    if let (Ok(value), Ok(other)) = (
-        OffsetDateTime::parse(value.trim(), &Rfc3339),
-        OffsetDateTime::parse(other.trim(), &Rfc3339),
-    ) {
-        return value > other;
-    }
-    match (
-        parse_python_naive_datetime(value),
-        parse_python_naive_datetime(other),
-    ) {
+    match (parse_timestamp_ns(value), parse_timestamp_ns(other)) {
         (Some(value), Some(other)) => value > other,
         _ => false,
     }
@@ -7106,6 +7097,16 @@ mod tests {
         assert!(timestamp_is_after(
             "2026-07-27T18:30:56.000001Z",
             "2026-07-27T18:30:55.999999999Z"
+        ));
+        // Python-era state may have a naive ISO stamp while newer hooks carry
+        // RFC3339. Both accepted encodings must compare on one timeline.
+        assert!(timestamp_is_after(
+            "2026-07-27T18:30:56.000001Z",
+            "2026-07-27T18:30:55.999999"
+        ));
+        assert!(!timestamp_is_after(
+            "2026-07-27T18:30:55.999999",
+            "2026-07-27T18:30:56.000001Z"
         ));
         // An unparseable side must never supersede anything.
         assert!(!timestamp_is_after("not-a-timestamp", nanos));

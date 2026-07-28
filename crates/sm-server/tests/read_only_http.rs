@@ -8446,7 +8446,7 @@ async fn session_tool_calls_reads_pre_tool_use_rows() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/sessions/run12345/tool-calls?limit=2").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/tool-calls?limit=2").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["session_id"], "run12345");
@@ -8465,6 +8465,12 @@ async fn session_tool_calls_reads_pre_tool_use_rows() {
             }
         ])
     );
+
+    let (status, payload) = get_json(app, "/sessions/Runner/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(payload["tool_calls"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -8485,7 +8491,8 @@ async fn session_tool_calls_projects_codex_fork_observability_rows() {
                     "log_file": "/tmp/forktools.log",
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "fork-tools"
                 }
             ]
         })
@@ -8504,7 +8511,7 @@ async fn session_tool_calls_projects_codex_fork_observability_rows() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/sessions/forktools/tool-calls?limit=2").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/forktools/tool-calls?limit=2").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["session_id"], "forktools");
@@ -8523,6 +8530,12 @@ async fn session_tool_calls_projects_codex_fork_observability_rows() {
             }
         ])
     );
+
+    let (status, payload) = get_json(app, "/sessions/fork-tools/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "forktools");
+    assert_eq!(payload["tool_calls"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -8586,7 +8599,7 @@ async fn session_activity_actions_projects_codex_observability_rows() {
     }));
 
     let (status, payload) = get_json(
-        app,
+        app.clone(),
         "/sessions/codexproj/activity-actions?limit=%32&limit=3",
     )
     .await;
@@ -8625,6 +8638,16 @@ async fn session_activity_actions_projects_codex_observability_rows() {
         "Approval decision: accept"
     );
     assert_eq!(payload["actions"][2]["status"], "completed");
+
+    let (status, payload) = get_json(
+        app,
+        "/sessions/codex-app-codexproj/activity-actions?limit=3",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["actions"].as_array().unwrap().len(), 3);
+    assert_eq!(payload["actions"][0]["session_id"], "codexproj");
 }
 
 #[tokio::test]
@@ -8686,7 +8709,7 @@ async fn session_codex_events_reads_recent_events_with_python_cursor_shape() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/sessions/codexapp1/codex-events?limit=2").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/codexapp1/codex-events?limit=2").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["earliest_seq"], 1);
@@ -8717,6 +8740,14 @@ async fn session_codex_events_reads_recent_events_with_python_cursor_shape() {
             }
         ])
     );
+
+    let (status, payload) =
+        get_json(app, "/sessions/codex-app-codexapp1/codex-events?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["latest_seq"], 4);
+    assert_eq!(payload["events"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["events"][0]["session_id"], "codexapp1");
 }
 
 #[tokio::test]
@@ -8941,7 +8972,7 @@ async fn session_codex_pending_requests_reads_pending_and_optional_orphaned_rows
     );
 
     let (status, payload) = get_json(
-        app,
+        app.clone(),
         "/sessions/codexpending/codex-pending-requests?include_orphaned=false&include_orphaned=%74",
     )
     .await;
@@ -8953,6 +8984,16 @@ async fn session_codex_pending_requests_reads_pending_and_optional_orphaned_rows
     assert_eq!(requests[1]["status"], "orphaned");
     assert_eq!(requests[1]["resolution_source"], "policy");
     assert_eq!(requests[1]["error_code"], "server_restarted");
+
+    let (status, payload) = get_json(
+        app,
+        "/sessions/codex-app-codexpending/codex-pending-requests",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let requests = payload["requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["session_id"], "codexpending");
 }
 
 #[tokio::test]

@@ -6666,16 +6666,16 @@ async fn session_tool_calls(
     };
     if session.provider == "codex-fork" {
         let db_path = expand_home(&state.config.codex_observability.db_path);
-        let tool_calls = list_recent_codex_fork_tool_calls_from_path(&db_path, &session_id, limit)?;
+        let tool_calls = list_recent_codex_fork_tool_calls_from_path(&db_path, &session.id, limit)?;
         return Ok(Json(ToolCallsResponse {
-            session_id,
+            session_id: session.id,
             tool_calls,
         }));
     }
     let db_path = expand_home(&state.config.tool_logging.db_path);
-    let tool_calls = list_recent_tool_calls_from_path(&db_path, &session_id, limit)?;
+    let tool_calls = list_recent_tool_calls_from_path(&db_path, &session.id, limit)?;
     Ok(Json(ToolCallsResponse {
-        session_id,
+        session_id: session.id,
         tool_calls,
     }))
 }
@@ -6704,7 +6704,7 @@ async fn session_activity_actions(
         });
     }
     let db_path = expand_home(&state.config.codex_observability.db_path);
-    let response = list_codex_activity_actions_from_path(&db_path, &session_id, query.limit)?;
+    let response = list_codex_activity_actions_from_path(&db_path, &session.id, query.limit)?;
     Ok(Json(response))
 }
 
@@ -6733,7 +6733,7 @@ async fn session_codex_events(
     }
     let db_path = expand_home(&state.config.codex_events.db_path);
     let response =
-        list_codex_events_from_path(&db_path, &session_id, query.since_seq, query.limit)?;
+        list_codex_events_from_path(&db_path, &session.id, query.since_seq, query.limit)?;
     Ok(Json(response))
 }
 
@@ -6762,7 +6762,7 @@ async fn session_codex_pending_requests(
     }
     let db_path = expand_home(&state.config.codex_requests.db_path);
     let response =
-        list_codex_pending_requests_from_path(&db_path, &session_id, query.include_orphaned)?;
+        list_codex_pending_requests_from_path(&db_path, &session.id, query.include_orphaned)?;
     Ok(Json(response))
 }
 
