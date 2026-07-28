@@ -60,6 +60,7 @@ def env(tmp_path):
     (state / "pid_index").write_text("0")
     (state / "job_state").write_text("running")
     (state / "loaded_labels").write_text(f"{LABEL}\n")
+    (state / "job_program").write_text(str(installed))
 
     log = state / CALLS
     # Every stub records what is at the registered path when it runs.
@@ -110,9 +111,14 @@ if [[ "$1" == "print" ]]; then
   last=$(( ${{#pids[@]}} - 1 ))
   (( idx > last )) && idx=$last
   echo "	state = $(cat "{state}/job_state")"
+  echo "	program = $(cat "{state}/job_program")"
   echo "	pid = ${{pids[$idx]}}"
   echo "		state = active"
-  echo "$(( idx + 1 ))" > "{state}/pid_index"
+  # Only walk the pid list once the service has been restarted, so that
+  # preflight reads do not consume the sequence a crash loop is modelled with.
+  if [[ "$(cat "{state}/phase")" == "after" ]]; then
+    echo "$(( idx + 1 ))" > "{state}/pid_index"
+  fi
 fi
 exit 0
 """,
@@ -182,11 +188,13 @@ exit 0
         "installed": installed,
         "cargo_output": cargo_output,
         "plist": plist,
+        "lock": installed.parent / "restart.lock",
         "run": _make_runner(bin_dir, cutover, installed, cargo_output, config, plist),
     }
 
 
 def _make_runner(bin_dir, cutover, installed, cargo_output, config, plist):
+    binary_dir_lock = installed.parent / "restart.lock"
     def run(*args, **overrides):
         environ = {
             **os.environ,
@@ -204,6 +212,7 @@ def _make_runner(bin_dir, cutover, installed, cargo_output, config, plist):
             "SM_PID_SETTLE_SECONDS": "2",
             "SM_UNLOAD_TIMEOUT": "2",
             "SM_LABEL": LABEL,
+            "SM_LOCK": str(binary_dir_lock),
         }
         environ.update(overrides)
         return subprocess.run(
@@ -325,7 +334,7 @@ def test_build_refused_while_live_registration_runs_from_cargo_output(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "still runs from cargo's output" in result.stderr
+    assert "still set up to run from cargo's output" in result.stderr
     assert "--adopt" in result.stderr
     assert "cargo build" not in calls(env)
     assert_service_untouched(env)
@@ -364,6 +373,56 @@ def test_adopt_with_nothing_to_adopt(env):
     assert_service_untouched(env)
 
 
+def test_loaded_registration_is_checked_not_just_the_plist(env):
+    """An edited-but-not-reloaded plist still leaves launchd executing the old
+    program, so the loaded job is the authoritative source."""
+    (env["state"] / "job_program").write_text(str(env["cargo_output"]))
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "still set up to run from cargo's output" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+
+
+def test_concurrent_restart_is_refused(env):
+    """Two runs can both see the job unloaded and then race the install."""
+    env["lock"].mkdir(parents=True)
+    (env["lock"] / "pid").write_text(str(os.getpid()))  # a pid that is alive
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "already running" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_stale_lock_is_reclaimed(env):
+    env["lock"].mkdir(parents=True)
+    (env["lock"] / "pid").write_text("999999")  # not a live pid
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert "stale restart lock" in result.stderr
+
+
+def test_lock_is_released_afterwards(env):
+    assert env["run"]().returncode == 0
+    assert not env["lock"].exists()
+
+    # and a second run can therefore take it again
+    assert env["run"]().returncode == 0
+
+
+def test_lock_is_released_after_a_failure(env):
+    (env["state"] / "codesign_sign_rc").write_text("1")
+
+    assert env["run"]().returncode != 0
+    assert not env["lock"].exists()
+
+
 def test_symlink_alias_of_cargo_output_is_rejected(env):
     """A string compare would pass while launchd still execs cargo's artifact."""
     _write(env["cargo_output"], "REBUILT", executable=True)
@@ -395,6 +454,19 @@ def test_relative_overrides_resolve_against_the_repo_root(env):
     assert result.returncode != 0
     assert f"config not readable: {REPO_ROOT}/definitely-not-here.yaml" in result.stderr
     assert_service_untouched(env)
+
+
+@pytest.mark.parametrize("mode", [(), ("--skip-build",), ("--adopt",)])
+def test_cargo_output_registration_is_rejected_in_every_mode(env, mode):
+    """A run that does not build must still not leave the service registered
+    against cargo's output, or the next ordinary build replaces the live binary."""
+    _write(env["cargo_output"], "SOMETHING", executable=True)
+
+    result = env["run"](*mode, SM_BINARY=str(env["cargo_output"]))
+
+    assert result.returncode != 0
+    assert "cargo's output" in result.stderr
+    assert "cutover stop-rust" not in calls(env)
 
 
 def test_service_must_not_be_registered_against_cargo_output(env):

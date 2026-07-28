@@ -97,7 +97,7 @@ Options:
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
 SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, SM_PORT,
 SM_PYTHON_LABELS, SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
-SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP.
+SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
 
 SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, and SM_PORT are
 forwarded to the cutover script, so both phases act on the same deployment.
@@ -189,14 +189,46 @@ cutover_args=(
 # Staging lives beside the installed binary so the install is an atomic rename.
 SM_STAGING="$SM_BINARY.staging.$$"
 RENDERED_PLIST=""
+SM_LOCK="${SM_LOCK:-${TMPDIR:-/tmp}/sm-restart-$SM_LABEL.lock}"
+LOCK_OWNED=0
 
 cleanup() {
   local rc=$?
   rm -f "$SM_STAGING"
   [[ -n "$RENDERED_PLIST" ]] && rm -f "$RENDERED_PLIST" "$RENDERED_PLIST.diff"
+  [[ "$LOCK_OWNED" -eq 1 ]] && rm -rf "$SM_LOCK"
   return $rc
 }
 trap cleanup EXIT
+
+# Two concurrent restarts can both see the job unloaded, after which one installs
+# and starts while the other renames its staged binary over the now-live
+# registered path - leaving the service running a binary that was replaced
+# outside its registration. mkdir is the atomic primitive available here; macOS
+# has no flock(1). Held for the whole run, verification included.
+acquire_lock() {
+  local holder
+  if mkdir "$SM_LOCK" 2>/dev/null; then
+    LOCK_OWNED=1
+    echo $$ > "$SM_LOCK/pid"
+    return 0
+  fi
+  holder="$(cat "$SM_LOCK/pid" 2>/dev/null || true)"
+  if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+    fail "another restart of $SM_LABEL is already running (pid $holder).
+       Wait for it to finish; concurrent restarts can leave the service running a
+       binary that was replaced outside its registration. The running service was
+       not touched."
+  fi
+  echo "clearing a stale restart lock at $SM_LOCK (holder ${holder:-unknown} is gone)" >&2
+  rm -rf "$SM_LOCK"
+  if mkdir "$SM_LOCK" 2>/dev/null; then
+    LOCK_OWNED=1
+    echo $$ > "$SM_LOCK/pid"
+    return 0
+  fi
+  fail "could not acquire the restart lock at $SM_LOCK - the running service was not touched"
+}
 
 health_ok() {
   curl -sf --connect-timeout 2 --max-time 5 "$SM_BASE_URL/health" >/dev/null 2>&1
@@ -221,6 +253,26 @@ print(len(sessions))
 
 job_loaded() {
   launchctl print "$DOMAIN/$SM_LABEL" >/dev/null 2>&1
+}
+
+# True when the service is currently set up to run from cargo's output, whether
+# that is visible in the loaded registration or only in the plist on disk. The
+# two can disagree - an edited plist that has not been reloaded still leaves
+# launchd executing the old program - so both are checked, and the loaded job is
+# the authoritative one.
+registration_runs_cargo_output() {
+  local target program
+  target="$(canonical_path "$SM_CARGO_OUTPUT")"
+  if job_loaded; then
+    program="$(launchctl_field program)"
+    if [[ -n "$program" && "$(canonical_path "$program")" == "$target" ]]; then
+      return 0
+    fi
+  fi
+  if [[ -f "$SM_PLIST" ]] && plist_runs_cargo_output; then
+    return 0
+  fi
+  return 1
 }
 
 # True when any program argument in the live plist resolves to cargo's output.
@@ -249,9 +301,13 @@ PY
 }
 
 # First "key = value" line only: launchctl repeats `state` for nested entries.
+# awk deliberately reads to EOF rather than `exit`ing on the first match: exiting
+# early closes the pipe under launchctl, and with `pipefail` that SIGPIPE becomes
+# a 141 exit status for the whole function.
 launchctl_field() {
   launchctl print "$DOMAIN/$SM_LABEL" 2>/dev/null \
-    | awk -v key="$1" -F' = ' '$0 ~ "^[[:space:]]*" key " = " { print $2; exit }'
+    | awk -v key="$1" -F' = ' \
+        '!found && $0 ~ "^[[:space:]]*" key " = " { print $2; found = 1 }'
 }
 
 # ---------------------------------------------------------------------------
@@ -259,6 +315,10 @@ launchctl_field() {
 # Nothing below this line may touch the running service, and nothing may write
 # to $SM_BINARY - the path launchd is registered against.
 # ---------------------------------------------------------------------------
+
+step "Taking the restart lock"
+acquire_lock
+echo "holding $SM_LOCK"
 
 step "Recording pre-restart state"
 BEFORE_HEALTHY=0
@@ -296,10 +356,11 @@ for label in $SM_PYTHON_LABELS; do
   fi
 done
 
-# Compared canonically: a symlink or a `..` alias would otherwise slip past and
-# leave cargo writing the very executable launchd runs.
-if [[ "$SKIP_BUILD" -eq 0 ]] \
-   && [[ "$(canonical_path "$SM_BINARY")" == "$(canonical_path "$SM_CARGO_OUTPUT")" ]]; then
+# Unconditional: even a run that does not build must not leave the service
+# registered against cargo's output, or the next ordinary `cargo build` replaces
+# the live binary. Compared canonically, because a symlink or a `..` alias would
+# otherwise slip past and leave cargo writing the very executable launchd runs.
+if [[ "$(canonical_path "$SM_BINARY")" == "$(canonical_path "$SM_CARGO_OUTPUT")" ]]; then
   fail "$SM_BINARY resolves to the same file as cargo's output
        ($SM_CARGO_OUTPUT). The service must not be registered against cargo's
        output path: a build would then write the registered binary directly, and
@@ -311,9 +372,9 @@ fi
 # while the *live registration* still runs from cargo's output - which is exactly
 # the state a first adoption starts in. Building then would overwrite the
 # executable the loaded job is using, before we have re-registered it.
-if [[ "$SKIP_BUILD" -eq 0 && -f "$SM_PLIST" ]] && plist_runs_cargo_output; then
-  fail "the live registration in $SM_PLIST still runs from cargo's output
-       ($SM_CARGO_OUTPUT).
+if [[ "$SKIP_BUILD" -eq 0 ]] && registration_runs_cargo_output; then
+  fail "the service is still set up to run from cargo's output
+       ($SM_CARGO_OUTPUT), according to the loaded job or $SM_PLIST.
        Building now would overwrite the executable the loaded job is using, and a
        server that exited before the restart would be respawned onto it under the
        old registration. Run this once to migrate without building:

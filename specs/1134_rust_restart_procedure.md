@@ -161,6 +161,28 @@ The preflight therefore refuses to build whenever the live plist's program is
 running (a read-only copy, no rebuild) and re-registers against the installed
 path. After that, normal runs build safely.
 
+### Two restarts at once
+
+Both invocations can pass preflight and both see the job unloaded; one then
+installs and starts while the other renames its staged binary over the now-live
+registered path. The second `start-rust` fails on the occupied port, leaving the
+service running a binary that was replaced outside its registration - the exact
+state everything above is arranged to prevent. A per-label lock is taken before
+anything is read and held through verification. `mkdir` is the atomic primitive:
+macOS ships no `flock(1)`. A lock whose holder pid is gone is reclaimed rather
+than blocking forever.
+
+### Trust the loaded registration, not the plist file
+
+The plist on disk and the registration launchd actually has loaded can disagree -
+an edited plist that was never reloaded still leaves launchd executing the old
+program. So "is this deployment still running from cargo's output?" is answered
+from the loaded job's `program` field first, falling back to the plist only when
+the job is not loaded. The related distinct-path invariant is checked in *every*
+mode, including `--skip-build` and `--adopt`: a run that does not build must
+still not leave the service registered against cargo's output, or the next
+ordinary `cargo build` replaces the live binary.
+
 ### `bootout` failures are silent
 
 `stop_rust` in the cutover runs `launchctl bootout ... || true` and prints
