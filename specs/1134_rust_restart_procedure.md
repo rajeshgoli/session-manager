@@ -250,6 +250,24 @@ is readable but not writable, or absent with an uncreatable parent, would render
 and diff fine in phase 1 and then fail in the cutover's `write_plist` - leaving
 the old registration unloaded and the service down. Both are checked up front.
 
+### Numeric overrides are validated before phase 2, not in it
+
+`SM_HEALTH_TIMEOUT`, `SM_PID_SETTLE_SECONDS` and `SM_UNLOAD_TIMEOUT` are only used
+in arithmetic expansions that run *after* the bootout. Under `set -u` a typo there
+does not degrade gracefully - bash aborts the script outright:
+
+```
+$ bash -c 'set -euo pipefail; V=abc; d=$((SECONDS + V))'
+bash: abc: unbound variable
+$ bash -c 'set -euo pipefail; V=12x; d=$((SECONDS + V))'
+bash: 12x: value too great for base (error token is "12x")
+```
+
+Either way the service is already unloaded and never gets installed or restarted.
+All of them, plus `--allow-drop`, are therefore validated before anything is read
+or stopped. An *empty* override is not an error: `${VAR:-N}` treats empty as
+unset, so it means "use the default".
+
 ### `bootout` failures are silent
 
 `stop_rust` in the cutover runs `launchctl bootout ... || true` and prints

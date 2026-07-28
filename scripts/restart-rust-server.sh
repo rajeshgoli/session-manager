@@ -143,10 +143,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! [[ "$SM_ALLOW_SESSION_DROP" =~ ^[0-9]+$ ]]; then
-  echo "--allow-drop must be a non-negative integer, got: $SM_ALLOW_SESSION_DROP" >&2
-  exit 2
-fi
+# Every value that later reaches an arithmetic expansion is checked here, before
+# anything is read or stopped. The timeouts are only used in phase 2, after the
+# bootout, and under `set -u` a typo there aborts the script with an
+# unbound-variable or bad-token error - leaving the service unloaded and down
+# without ever installing or restarting it.
+require_non_negative_integer() {
+  if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+    echo "$1 must be a non-negative integer, got: $2" >&2
+    exit 2
+  fi
+}
+
+require_non_negative_integer --allow-drop "$SM_ALLOW_SESSION_DROP"
+require_non_negative_integer SM_HEALTH_TIMEOUT "$SM_HEALTH_TIMEOUT"
+require_non_negative_integer SM_PID_SETTLE_SECONDS "$SM_PID_SETTLE_SECONDS"
+require_non_negative_integer SM_UNLOAD_TIMEOUT "$SM_UNLOAD_TIMEOUT"
 
 if [[ "$ADOPT" -eq 1 && "$SKIP_BUILD" -eq 1 ]]; then
   echo "--adopt and --skip-build take their source from different places; pick one" >&2

@@ -866,6 +866,28 @@ def test_missing_cutover_blocks_before_the_binary_is_touched(env):
     assert_service_untouched(env)
 
 
+@pytest.mark.parametrize(
+    "var", ["SM_HEALTH_TIMEOUT", "SM_PID_SETTLE_SECONDS", "SM_UNLOAD_TIMEOUT"]
+)
+@pytest.mark.parametrize("value", ["abc", "12x", "-1", "3.5"])
+def test_rejects_non_integer_timeouts_before_stopping(env, var, value):
+    """These reach arithmetic expansion only in phase 2, after the bootout, where
+    under `set -u` a typo aborts the script and leaves the service down."""
+    result = env["run"](**{var: value})
+
+    assert result.returncode == 2, result.stderr
+    assert f"{var} must be a non-negative integer" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_empty_timeout_override_falls_back_to_the_default(env):
+    """`${VAR:-N}` treats empty as unset, so an empty override is the default,
+    not an error."""
+    result = env["run"](SM_UNLOAD_TIMEOUT="")
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_rejects_bad_allow_drop(env):
     result = env["run"]("--allow-drop", "-1")
 
