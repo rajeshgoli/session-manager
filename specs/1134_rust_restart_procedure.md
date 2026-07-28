@@ -228,6 +228,21 @@ config is validated by the code about to be deployed. When `--skip-build` or
 `--adopt` is deploying a build from before the flag existed, the check is skipped
 with a warning rather than failing.
 
+The check covers the listen address too, not just the config file: `--host` and
+`--port` are passed through, and the early return sits *after* the `SocketAddr`
+parse but *before* the bind. So a malformed host or port is rejected by the same
+code that would have to bind it, while the old server still holds the port.
+
+### The documented quick-start must not recreate the hazard
+
+`README.md` told people to bring the service up with
+`rust-service-cutover.sh start-rust`, whose default `--binary` is cargo's output.
+Following the primary quick-start therefore registered launchd against the build
+directory - the exact condition this ticket removes. The README now points at
+`restart-rust-server.sh`, documents the one-time `--adopt` migration, and says
+why not to call `start-rust` directly; the cutover's own usage carries the same
+warning.
+
 ### The plist has to be writable before the service is stopped
 
 `start-rust` rewrites the plist, and it does that after the bootout. A plist that

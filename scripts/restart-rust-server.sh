@@ -486,12 +486,17 @@ step "Validating the configuration with the new binary"
 # once the new one starts - after the service has been stopped, which KeepAlive
 # turns into a crash loop until the health timeout. --check-config runs the same
 # loader the server uses and exits before binding or touching any state.
-check_config_args=(--check-config --config "$SM_CONFIG")
+# Host and port are included so the exact address launchd will be told to use is
+# parsed by the same code that will have to bind it. Validation happens before
+# the bind, so it is safe while the old server still holds the port.
+check_config_args=(--check-config --config "$SM_CONFIG" --host "$SM_HOST" --port "$SM_PORT")
 [[ -n "$SM_LOCAL_ENV" ]] && check_config_args+=(--local-env "$SM_LOCAL_ENV")
 if "$SM_STAGING" --help 2>&1 | grep -q -- '--check-config'; then
   "$SM_STAGING" "${check_config_args[@]}" \
-    || fail "the new binary rejected the configuration; fix $SM_CONFIG before
-       restarting. The running service was not touched."
+    || fail "the new binary rejected the configuration or the listen address; see the
+       error above and fix $SM_CONFIG${SM_LOCAL_ENV:+ / $SM_LOCAL_ENV} or the
+       host/port ($SM_HOST:$SM_PORT) before restarting.
+       The running service was not touched."
 else
   # --skip-build/--adopt can be deploying a build from before the flag existed.
   echo "WARNING: this binary has no --check-config, so the configuration was not validated" >&2

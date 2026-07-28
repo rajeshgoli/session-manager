@@ -186,9 +186,23 @@ target/release/sm-server --host 127.0.0.1 --port 8420 --config config.yaml
 Or install/start the launchd-managed Rust service:
 
 ```bash
-./scripts/rust-service-cutover.sh plan
-./scripts/rust-service-cutover.sh start-rust --config "$PWD/config.yaml"
+./scripts/restart-rust-server.sh
 ./scripts/rust-service-cutover.sh status
+```
+
+`restart-rust-server.sh` builds, signs, installs, restarts, and verifies in the
+one safe order, and registers launchd against an installed copy at
+`.local/bin/sm-server` rather than `target/release/sm-server`. Do not call
+`rust-service-cutover.sh start-rust` directly to bring the service up: its
+default binary is cargo's output, so registering that way lets any later
+`cargo build` replace the executable launchd is running, which is how the service
+was taken down twice on 2026-07-27. See `specs/1134_rust_restart_procedure.md`.
+
+If a deployment is already registered against `target/release/sm-server`, migrate
+it once with:
+
+```bash
+./scripts/restart-rust-server.sh --adopt --allow-plist-change
 ```
 
 Use the Rust CLI:

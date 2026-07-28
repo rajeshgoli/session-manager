@@ -37,13 +37,18 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let config = AppConfig::load_from_path_with_local_env(&args.config, args.local_env.as_deref())?;
-    if args.check_config {
-        println!("configuration ok: {}", args.config.display());
-        return Ok(());
-    }
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .with_context(|| format!("invalid listen address {}:{}", args.host, args.port))?;
+    // After the address is parsed so a bad --host/--port is caught too, but
+    // before binding, so this can run while the old server still holds the port.
+    if args.check_config {
+        println!(
+            "configuration ok: {} (listen {address})",
+            args.config.display()
+        );
+        return Ok(());
+    }
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind {address}"))?;

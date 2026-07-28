@@ -38,6 +38,7 @@ def fake_binary(state: Path, marker: str) -> str:
     """
     return f"""#!/bin/bash
 # MARKER={marker}
+echo "sm-server $*" >> "{state}/{CALLS}"
 if [[ "$1" == "--help" ]]; then
   echo "Usage: sm-server [OPTIONS]"
   if [[ "$(cat "{state}/supports_check_config")" == "1" ]]; then
@@ -797,6 +798,16 @@ def test_config_validation_is_skipped_on_a_binary_without_the_flag(env):
 
     assert result.returncode == 0, result.stderr
     assert "no --check-config" in result.stderr
+
+
+def test_config_validation_covers_the_listen_address(env):
+    """A bad host/port would otherwise pass phase 1 and only fail once launchd
+    ran the replacement, after the bootout."""
+    env["run"](SM_PORT="10")
+
+    check = next(l for l in calls(env).splitlines() if "--check-config" in l)
+    assert "--host 127.0.0.1" in check
+    assert "--port 10" in check
 
 
 def test_config_validation_passes_the_local_env_overlay(env):
