@@ -169,16 +169,26 @@ registered path. The second `start-rust` fails on the occupied port, leaving the
 service running a binary that was replaced outside its registration - the exact
 state everything above is arranged to prevent. A per-label lock is taken before
 anything is read and held through verification. `mkdir` is the atomic primitive:
-macOS ships no `flock(1)`. A lock whose holder pid is gone is reclaimed rather
-than blocking forever.
+macOS ships no `flock(1)`.
+
+A lock whose holder is dead is *reported*, not reclaimed. Testing liveness and
+then removing the directory cannot be made atomic in shell - two invocations can
+both read the same dead pid, and the second `rm -rf` deletes the lock the first
+just created, leaving both believing they own it, which is exactly the
+interleaving the lock exists to stop. So nothing removes a lock it does not own;
+the error prints the `rm -rf` to run after confirming no restart is in flight.
 
 ### Trust the loaded registration, not the plist file
 
 The plist on disk and the registration launchd actually has loaded can disagree -
 an edited plist that was never reloaded still leaves launchd executing the old
 program. So "is this deployment still running from cargo's output?" is answered
-from the loaded job's `program` field first, falling back to the plist only when
-the job is not loaded. The related distinct-path invariant is checked in *every*
+from the loaded job's `program` field when the job is loaded - that is what
+launchd will actually exec, so it settles the question - and from the plist only
+when the job is not loaded. Consulting the plist as well would refuse a perfectly
+safe rebuild whenever an edited plist had not been reloaded, and would send the
+operator to `--adopt`, which would redeploy an older artifact. A stale plist is
+the divergence guard's business. The related distinct-path invariant is checked in *every*
 mode, including `--skip-build` and `--adopt`: a run that does not build must
 still not leave the service registered against cargo's output, or the next
 ordinary `cargo build` replaces the live binary.

@@ -220,14 +220,18 @@ acquire_lock() {
        binary that was replaced outside its registration. The running service was
        not touched."
   fi
-  echo "clearing a stale restart lock at $SM_LOCK (holder ${holder:-unknown} is gone)" >&2
-  rm -rf "$SM_LOCK"
-  if mkdir "$SM_LOCK" 2>/dev/null; then
-    LOCK_OWNED=1
-    echo $$ > "$SM_LOCK/pid"
-    return 0
-  fi
-  fail "could not acquire the restart lock at $SM_LOCK - the running service was not touched"
+  # A dead holder is NOT reclaimed automatically. Testing liveness and then
+  # removing the directory cannot be made atomic in shell: two invocations can
+  # both read the same dead pid, and the second `rm -rf` deletes the lock the
+  # first just created, leaving both believing they own it - which is precisely
+  # the interleaving this lock exists to stop. Nothing here removes a lock it
+  # does not own.
+  fail "a restart lock is present at $SM_LOCK but its holder
+       (${holder:-unknown}) is not running, so it was probably left behind by a
+       restart that was killed. Confirm no restart is in progress, then remove it
+       and re-run:
+         rm -rf $SM_LOCK
+       The running service was not touched."
 }
 
 health_ok() {
@@ -268,6 +272,12 @@ registration_runs_cargo_output() {
     if [[ -n "$program" && "$(canonical_path "$program")" == "$target" ]]; then
       return 0
     fi
+    # The loaded registration is what launchd will actually exec, so it settles
+    # the question on its own. Falling through to the plist here would refuse a
+    # perfectly safe rebuild whenever an edited plist had not been reloaded, and
+    # send the operator to --adopt, which would redeploy an older artifact. A
+    # stale plist is the plist-divergence guard's business, not this check's.
+    return 1
   fi
   if [[ -f "$SM_PLIST" ]] && plist_runs_cargo_output; then
     return 0

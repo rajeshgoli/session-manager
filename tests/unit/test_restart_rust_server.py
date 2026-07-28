@@ -324,12 +324,13 @@ def test_registered_binary_is_never_written_during_phase_one(env):
 
 
 def test_build_refused_while_live_registration_runs_from_cargo_output(env):
-    """The state a first adoption starts in: config already points at the
-    installed path, but the loaded job still runs from cargo's output. Building
-    would overwrite the executable that job is using."""
+    """The state a first adoption starts in. With the job not loaded, the plist
+    is the only evidence of what it will run, and it still names cargo's output -
+    so building would overwrite the executable the next spawn uses."""
     env["plist"].write_text(
         f"<plist><array><string>{env['cargo_output']}</string></array></plist>\n"
     )
+    (env["state"] / "loaded_labels").write_text("")  # job not loaded
 
     result = env["run"]()
 
@@ -398,14 +399,36 @@ def test_concurrent_restart_is_refused(env):
     assert_service_untouched(env)
 
 
-def test_stale_lock_is_reclaimed(env):
+def test_dead_holder_lock_is_reported_not_removed(env):
+    """Liveness-check-then-remove cannot be made atomic in shell: two racers
+    would both delete and recreate the lock and both believe they own it. So a
+    dead holder is reported for a human to clear, never reclaimed silently."""
     env["lock"].mkdir(parents=True)
     (env["lock"] / "pid").write_text("999999")  # not a live pid
 
     result = env["run"]()
 
+    assert result.returncode != 0
+    assert "is not running" in result.stderr
+    assert f"rm -rf {env['lock']}" in result.stderr
+    assert env["lock"].exists(), "a lock we do not own must not be removed"
+    assert_service_untouched(env)
+
+
+def test_loaded_registration_wins_over_a_stale_plist(env):
+    """Job already on the installed binary, plist not yet reloaded. The rebuild
+    is safe and must not be refused; the plist change is the divergence guard's
+    business."""
+    env["plist"].write_text(
+        f"<plist><array><string>{env['cargo_output']}</string></array></plist>\n"
+    )
+    (env["state"] / "job_program").write_text(str(env["installed"]))
+
+    result = env["run"]("--allow-plist-change")
+
     assert result.returncode == 0, result.stderr
-    assert "stale restart lock" in result.stderr
+    assert "cargo build" in calls(env)
+    assert "--adopt" not in result.stderr
 
 
 def test_lock_is_released_afterwards(env):
