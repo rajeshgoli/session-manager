@@ -682,6 +682,42 @@ def test_local_env_is_forwarded_to_the_cutover(env):
     assert f"--local-env {overlay}" in cutover_line(env, "start-rust")
 
 
+def test_log_dir_is_forwarded_when_set(env):
+    """A deployment registered with a custom --log-dir otherwise has no way to
+    make the rendered plist match: the comparison blocks every restart, and
+    --allow-plist-change silently rewrites both launchd log paths."""
+    log_dir = env["tmp"] / "custom-logs"
+    log_dir.mkdir()
+
+    result = env["run"](SM_LOG_DIR=str(log_dir))
+
+    assert result.returncode == 0, result.stderr
+    assert f"--log-dir {log_dir}" in cutover_line(env, "start-rust")
+
+
+def test_log_dir_is_not_forwarded_by_default(env):
+    """Unset must mean 'the cutover's own default', or every existing deployment
+    would see a plist diff on the first run."""
+    env["run"]()
+
+    assert "--log-dir" not in cutover_line(env, "start-rust")
+
+
+def test_unwritable_log_dir_blocks_before_the_service_is_stopped(env):
+    """write_plist creates the log directory, and that runs after the bootout."""
+    parent = env["tmp"] / "locked-logs"
+    parent.mkdir()
+    parent.chmod(0o500)
+    try:
+        result = env["run"](SM_LOG_DIR=str(parent / "nested"))
+    finally:
+        parent.chmod(0o700)
+
+    assert result.returncode != 0
+    assert "cannot write the launchd log directory" in result.stderr
+    assert_service_untouched(env)
+
+
 def test_unreadable_local_env_blocks_before_any_restart(env):
     result = env["run"](SM_LOCAL_ENV=str(env["tmp"] / "missing.env"))
 

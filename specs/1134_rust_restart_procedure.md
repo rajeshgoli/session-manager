@@ -243,6 +243,16 @@ directory - the exact condition this ticket removes. The README now points at
 why not to call `start-rust` directly; the cutover's own usage carries the same
 warning.
 
+### Every deployment value the cutover accepts is forwarded
+
+`--label`, `--plist`, `--binary`, `--config`, `--host`, `--port`, and - when set -
+`--local-env` and `--log-dir`. The cutover reads none of this script's
+environment, so anything not forwarded reverts to its default: at best the plist
+comparison then blocks every restart with no override that can make it match, and
+at worst `--allow-plist-change` silently rewrites that setting away. `SM_LOCAL_ENV`
+and `SM_LOG_DIR` are forwarded only when set, so an unset value keeps the
+cutover's own default and existing deployments see no plist diff.
+
 ### The plist has to be writable before the service is stopped
 
 `start-rust` rewrites the plist, and it does that after the bootout. A plist that

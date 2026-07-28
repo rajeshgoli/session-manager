@@ -48,6 +48,12 @@ SM_CARGO_OUTPUT="${SM_CARGO_OUTPUT:-$SM_TARGET_DIR/release/sm-server}"
 SM_CUTOVER="${SM_CUTOVER:-$REPO_ROOT/scripts/rust-service-cutover.sh}"
 SM_CONFIG="${SM_CONFIG:-$REPO_ROOT/config.yaml}"
 SM_LOCAL_ENV="${SM_LOCAL_ENV:-}"
+# Empty means "let the cutover use its own default", so an unset value keeps the
+# rendered plist identical to what a bare cutover run would write.
+SM_LOG_DIR="${SM_LOG_DIR:-}"
+# The cutover's default when --log-dir is not passed. Only used to check that the
+# directory it will create is writable; see the plist check for why that matters.
+CUTOVER_DEFAULT_LOG_DIR="$REPO_ROOT/logs"
 SM_PLIST="${SM_PLIST:-$HOME/Library/LaunchAgents/$SM_LABEL.plist}"
 # The set rust-service-cutover.sh enforces in start_rust. It is hard-coded there
 # with no CLI override, so it is always checked here no matter what
@@ -101,12 +107,14 @@ Options:
   -h, --help            Show this help.
 
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
-SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, SM_PORT,
+SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, SM_PORT,
 SM_PYTHON_LABELS (extra labels), SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
 SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
 
-SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_PLIST, SM_HOST, and SM_PORT are
-forwarded to the cutover script, so both phases act on the same deployment.
+SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, and
+SM_PORT are forwarded to the cutover script, so both phases act on the same
+deployment. SM_LOCAL_ENV and SM_LOG_DIR are only forwarded when set, so leaving
+them unset keeps the cutover's own defaults.
 EOF
 }
 
@@ -191,6 +199,7 @@ SM_CONFIG="$(resolve_path "$SM_CONFIG")"
 SM_PLIST="$(resolve_path "$SM_PLIST")"
 SM_CUTOVER="$(resolve_path "$SM_CUTOVER")"
 [[ -n "$SM_LOCAL_ENV" ]] && SM_LOCAL_ENV="$(resolve_path "$SM_LOCAL_ENV")"
+[[ -n "$SM_LOG_DIR" ]] && SM_LOG_DIR="$(resolve_path "$SM_LOG_DIR")"
 
 # --plist must follow --label: the cutover recomputes the plist path from the
 # label, so passing them the other way round would discard our value.
@@ -203,6 +212,10 @@ cutover_args=(
   --port "$SM_PORT"
 )
 [[ -n "$SM_LOCAL_ENV" ]] && cutover_args+=(--local-env "$SM_LOCAL_ENV")
+# A deployment registered with a custom --log-dir would otherwise have no way to
+# make the rendered plist match: the comparison would block every restart, and
+# --allow-plist-change would silently rewrite both launchd log paths.
+[[ -n "$SM_LOG_DIR" ]] && cutover_args+=(--log-dir "$SM_LOG_DIR")
 
 # Staging lives beside the installed binary so the install is an atomic rename.
 SM_STAGING="$SM_BINARY.staging.$$"
@@ -423,6 +436,15 @@ if [[ -e "$SM_PLIST" && ! -w "$SM_PLIST" ]]; then
        service has been stopped, so this would leave it down. The running service
        was not touched."
 fi
+
+# Same reasoning for the launchd log directory: write_plist creates it, and that
+# also runs after the bootout.
+effective_log_dir="${SM_LOG_DIR:-$CUTOVER_DEFAULT_LOG_DIR}"
+mkdir -p "$effective_log_dir" 2>/dev/null || true
+[[ -d "$effective_log_dir" && -w "$effective_log_dir" ]] \
+  || fail "cannot write the launchd log directory $effective_log_dir; start-rust
+       creates it after the service has been stopped, so this would leave it down.
+       The running service was not touched."
 
 # Restarting rewrites the plist. Anything in the live plist that we would not
 # regenerate is a deployment setting about to be silently dropped - a custom
