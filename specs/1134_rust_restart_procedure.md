@@ -278,6 +278,27 @@ All of them, plus `--allow-drop`, are therefore validated before anything is rea
 or stopped. An *empty* override is not an error: `${VAR:-N}` treats empty as
 unset, so it means "use the default".
 
+Digit-only validation is not sufficient on its own, because bash reads a leading
+zero as octal: `08` aborts with "value too great for base" and `010` silently
+means 8. Each value is therefore pinned to base 10 with `$((10#$value))` once it
+is known to be digits. That normalisation is done in the parent shell, never
+inside `$(...)`, because `exit` in a command substitution only leaves the subshell.
+
+### The bind address is not a probe URL
+
+`/health` and `/sessions` are polled at a loopback address derived from the bind
+address, not at the bind address itself:
+
+- a wildcard bind is not something to connect to, so `0.0.0.0` probes `127.0.0.1`
+  and `::` probes `::1`;
+- an IPv6 literal is bracketed, since `http://::1:8420` is not a valid authority;
+- the server's local bypass (`is_local_bypass_request`) only trusts a `Host` of
+  `127.0.0.1`, `localhost`, `::1` or `testserver`, so probing `0.0.0.0` would get
+  `/health` but be denied `/sessions` once Google auth is on - which, given the
+  baseline is mandatory, would abort every restart.
+
+launchd is still told to bind exactly what was asked for.
+
 ### `bootout` failures are silent
 
 `stop_rust` in the cutover runs `launchctl bootout ... || true` and prints

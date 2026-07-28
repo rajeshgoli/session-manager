@@ -656,6 +656,27 @@ def test_deployment_overrides_reach_the_cutover(env):
     assert "--host 127.0.0.1" in line
 
 
+@pytest.mark.parametrize(
+    "bind,expected_probe",
+    [
+        ("0.0.0.0", "http://127.0.0.1:9"),
+        ("::", "http://[::1]:9"),
+        ("::1", "http://[::1]:9"),
+        ("127.0.0.1", "http://127.0.0.1:9"),
+    ],
+)
+def test_probe_url_is_a_valid_loopback_authority(env, bind, expected_probe):
+    """The bind address is not usable as a probe URL: a wildcard is not something
+    to connect to, the server's local bypass only trusts loopback Host values, and
+    an IPv6 literal has to be bracketed."""
+    env["run"](SM_HOST=bind)
+
+    text = calls(env)
+    assert f"{expected_probe}/health" in text, text
+    # ...while launchd is still told to bind exactly what was asked for.
+    assert f"--host {bind}" in cutover_line(env, "start-rust")
+
+
 def test_health_check_targets_the_port_handed_to_the_cutover(env):
     env["run"](SM_PORT="10")
 
@@ -914,6 +935,26 @@ def test_rejects_non_integer_timeouts_before_stopping(env, var, value):
     assert result.returncode == 2, result.stderr
     assert f"{var} must be a non-negative integer" in result.stderr
     assert_service_untouched(env)
+
+
+@pytest.mark.parametrize(
+    "var", ["SM_HEALTH_TIMEOUT", "SM_PID_SETTLE_SECONDS", "SM_UNLOAD_TIMEOUT"]
+)
+def test_leading_zero_timeouts_are_read_as_base_ten(env, var):
+    """Bash treats a leading zero as octal, so `08` would abort the arithmetic in
+    phase 2 - after the bootout - and `010` would silently mean 8."""
+    result = env["run"](**{var: "08"})
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_leading_zero_allow_drop_is_read_as_base_ten(env):
+    (env["state"] / "after_sessions").write_text("4")  # 12 -> 4 is a drop of 8
+
+    # Octal would make this 0 and fail the comparison; base 10 tolerates it.
+    result = env["run"]("--allow-drop", "08")
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_empty_timeout_override_falls_back_to_the_default(env):

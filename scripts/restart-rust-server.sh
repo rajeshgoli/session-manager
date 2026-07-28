@@ -67,7 +67,21 @@ SM_PYTHON_LABELS="${SM_PYTHON_LABELS:-}"
 # health-check is by construction the one the service was told to listen on.
 SM_HOST="${SM_HOST:-127.0.0.1}"
 SM_PORT="${SM_PORT:-8420}"
-SM_BASE_URL="http://$SM_HOST:$SM_PORT"
+# The bind address is not usable as a probe URL. A wildcard bind is not an address
+# to connect to, and the server's local bypass only trusts a Host of 127.0.0.1,
+# localhost, ::1 or testserver - so probing 0.0.0.0 gets /health but is denied
+# /sessions once Google auth is on, which would abort every restart at the
+# baseline. An IPv6 literal also has to be bracketed to be a valid authority.
+case "$SM_HOST" in
+  0.0.0.0) SM_PROBE_HOST="127.0.0.1" ;;
+  ::|0:0:0:0:0:0:0:0) SM_PROBE_HOST="::1" ;;
+  *) SM_PROBE_HOST="$SM_HOST" ;;
+esac
+if [[ "$SM_PROBE_HOST" == *:* ]]; then
+  SM_BASE_URL="http://[$SM_PROBE_HOST]:$SM_PORT"
+else
+  SM_BASE_URL="http://$SM_PROBE_HOST:$SM_PORT"
+fi
 SM_SIGN_IDENTIFIER="${SM_SIGN_IDENTIFIER:-com.rajeshgoli.sm-server}"
 SM_HEALTH_TIMEOUT="${SM_HEALTH_TIMEOUT:-60}"
 SM_PID_SETTLE_SECONDS="${SM_PID_SETTLE_SECONDS:-20}"
@@ -167,6 +181,15 @@ require_non_negative_integer --allow-drop "$SM_ALLOW_SESSION_DROP"
 require_non_negative_integer SM_HEALTH_TIMEOUT "$SM_HEALTH_TIMEOUT"
 require_non_negative_integer SM_PID_SETTLE_SECONDS "$SM_PID_SETTLE_SECONDS"
 require_non_negative_integer SM_UNLOAD_TIMEOUT "$SM_UNLOAD_TIMEOUT"
+
+# Pin base 10 now that they are known to be digits. Bash reads a leading zero as
+# octal, so `08` would abort the arithmetic in phase 2 with "value too great for
+# base" - after the bootout - and `010` would silently mean 8.
+# Note these must not be done inside $(), where `exit` would only leave a subshell.
+SM_ALLOW_SESSION_DROP=$((10#$SM_ALLOW_SESSION_DROP))
+SM_HEALTH_TIMEOUT=$((10#$SM_HEALTH_TIMEOUT))
+SM_PID_SETTLE_SECONDS=$((10#$SM_PID_SETTLE_SECONDS))
+SM_UNLOAD_TIMEOUT=$((10#$SM_UNLOAD_TIMEOUT))
 
 if [[ "$ADOPT" -eq 1 && "$SKIP_BUILD" -eq 1 ]]; then
   echo "--adopt and --skip-build take their source from different places; pick one" >&2
