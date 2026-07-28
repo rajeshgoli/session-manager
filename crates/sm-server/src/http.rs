@@ -109,15 +109,15 @@ use crate::sessions::{
     claude_hook_gate, codex_fork_status_for_event_line, expand_home, is_primary_node,
     AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
     ChildSessionResponse, ClaudeHookGate, ClearSessionRequest, ClientSessionResponse,
-    ContextMonitorOutcome, ContextMonitorRequest, ContextUsageEvent, ContextUsageOutcome,
-    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
-    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
-    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
-    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
-    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
-    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
-    UpdateSessionMetadataRequest,
+    ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent,
+    ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult,
+    CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest,
+    HandoffOutcome, HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome,
+    RoleRegistrationRequest, SendCoreInputBatchRequest, SendCoreInputRequest,
+    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
+    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
+    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
+    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
@@ -945,6 +945,7 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{session_id}",
             get(get_session).patch(update_session_metadata),
         )
+        .route("/sessions/{session_id}/context", get(get_session_context))
         .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
             "/sessions/{parent_session_id}/children",
@@ -6355,6 +6356,18 @@ async fn set_context_monitor(
     }
 }
 
+async fn get_session_context(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<ContextSnapshotResponse>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    match state.session_store.get_context_snapshot(&session_id)? {
+        Some(snapshot) => Ok(Json(snapshot)),
+        None => Err(ApiError::NotFound("Session not found")),
+    }
+}
+
 async fn register_subagent_start(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -7369,6 +7382,26 @@ fn shadow_predict_session_read(
             "parent_session_id": parent_session_id,
             "children": children,
         }))?;
+        return Ok(Some(ShadowPrediction {
+            status: StatusCode::OK.as_u16(),
+            body_sha256: Some(sha256_hex(&body)),
+            support_status: "implemented_read",
+        }));
+    }
+
+    if let Some(session_id) = path
+        .strip_prefix("/sessions/")
+        .and_then(|value| value.strip_suffix("/context"))
+    {
+        let Some(snapshot) = state.session_store.get_context_snapshot(session_id)? else {
+            let body = serde_json::to_vec(&json!({ "detail": "Session not found" }))?;
+            return Ok(Some(ShadowPrediction {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                body_sha256: Some(sha256_hex(&body)),
+                support_status: "implemented_read",
+            }));
+        };
+        let body = serde_json::to_vec(&snapshot)?;
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
             body_sha256: Some(sha256_hex(&body)),

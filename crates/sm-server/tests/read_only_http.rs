@@ -7512,6 +7512,14 @@ async fn context_usage_hook_is_served_and_records_tokens() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["tokens_used"], json!(83_000));
 
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/context").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(payload["used_percentage"], json!(41.5));
+    assert_eq!(payload["total_input_tokens"], json!(83_000));
+    assert_eq!(payload["state"], "normal");
+    assert_eq!(payload["context_monitor_enabled"], true);
+
     // Before the first API call Claude reports a null percentage on every
     // render; that must not clobber the last real reading.
     let (status, payload) = post_json(
@@ -10760,9 +10768,13 @@ async fn fixture_registry_prunes_stale_roles_and_updates_maintainer_alias() {
         .iter()
         .map(|entry| entry["role"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(roles, vec!["live-role", "restorable-role"]);
+    assert_eq!(roles, vec!["live-role"]);
 
     let (status, payload) = get_json(app.clone(), "/registry/stale-role").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload, json!({ "detail": "Role not registered" }));
+
+    let (status, payload) = get_json(app.clone(), "/registry/restorable-role").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload, json!({ "detail": "Role not registered" }));
 
@@ -10772,11 +10784,15 @@ async fn fixture_registry_prunes_stale_roles_and_updates_maintainer_alias() {
         raw_state["agent_role_last_session_ids"]["stale-role"],
         "staleagent"
     );
+    assert_eq!(
+        raw_state["agent_role_last_session_ids"]["restorable-role"],
+        "restorable"
+    );
     assert!(raw_state["agent_registrations"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|entry| entry["role"] != "stale-role"));
+        .all(|entry| entry["role"] != "stale-role" && entry["role"] != "restorable-role"));
 }
 
 #[tokio::test]

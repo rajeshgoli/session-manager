@@ -117,6 +117,57 @@ class TestWarningThreshold:
         assert session._context_warning_sent is False
 
 
+class TestContextSnapshot:
+    """Cached context snapshot read path."""
+
+    def test_context_usage_is_cached_even_when_monitor_disabled(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert session.context_used_percentage == 43
+        assert session.context_total_input_tokens == 86_214
+        assert session.context_sampled_at is not None
+        assert not mock_session_manager.message_queue_manager.queue_message.called
+
+        context_resp = client.get(f"/sessions/{session.id}/context")
+        assert context_resp.status_code == 200
+        payload = context_resp.json()
+        assert payload["session_id"] == session.id
+        assert payload["used_percentage"] == 43
+        assert payload["total_input_tokens"] == 86_214
+        assert payload["state"] == "normal"
+        assert payload["context_monitor_enabled"] is False
+
+    def test_context_snapshot_unknown_before_first_sample(self, client, session):
+        resp = client.get(f"/sessions/{session.id}/context")
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["used_percentage"] is None
+        assert payload["total_input_tokens"] is None
+        assert payload["sampled_at"] is None
+        assert payload["state"] == "unknown"
+
+    def test_context_reset_clears_cached_snapshot(self, client, session):
+        _post_context(client, session.id, used_pct=55, total_input_tokens=110_000)
+
+        resp = _post_event(client, session.id, "context_reset")
+
+        assert resp.status_code == 200
+        assert session.context_used_percentage is None
+        assert session.context_total_input_tokens is None
+        assert session.context_sampled_at is None
+
+
 # ---------------------------------------------------------------------------
 # 2. Critical at 65% (one-shot, urgent)
 # ---------------------------------------------------------------------------

@@ -1158,6 +1158,23 @@ class ContextMonitorRequest(BaseModel):
     requester_session_id: str  # Required — caller's session ID for ownership check
 
 
+class ContextSnapshotResponse(BaseModel):
+    """Cached context usage snapshot for one session."""
+    session_id: str
+    friendly_name: Optional[str] = None
+    provider: Optional[str] = None
+    used_percentage: Optional[float] = None
+    total_input_tokens: Optional[int] = None
+    sampled_at: Optional[str] = None
+    state: str
+    warning_percentage: float
+    critical_percentage: float
+    context_monitor_enabled: bool = False
+    notify_session_id: Optional[str] = None
+    compaction_active: bool = False
+    last_handoff_path: Optional[str] = None
+
+
 class ArmStopNotifyRequest(BaseModel):
     """Request to arm stop notification for a session without a queued message (sm#277)."""
     sender_session_id: str  # Session to notify when target stops
@@ -5702,6 +5719,48 @@ def create_app(
         ]
         return {"monitored": monitored}
 
+    @app.get("/sessions/{session_id}/context", response_model=ContextSnapshotResponse)
+    async def get_session_context(session_id: str):
+        """Return the latest cached context usage snapshot for one session."""
+        if not app.state.session_manager:
+            raise HTTPException(status_code=503, detail="Session manager not configured")
+
+        session = _resolve_session_or_registry_role(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        config = (app.state.config or {}).get("context_monitor", {})
+        warning_pct = float(config.get("warning_percentage", 50))
+        critical_pct = float(config.get("critical_percentage", 65))
+        used_pct = getattr(session, "context_used_percentage", None)
+        if getattr(session, "_is_compacting", False):
+            state = "compacting"
+        elif used_pct is None:
+            state = "unknown"
+        elif used_pct >= critical_pct:
+            state = "critical"
+        elif used_pct >= warning_pct:
+            state = "warning"
+        else:
+            state = "normal"
+
+        sampled_at = getattr(session, "context_sampled_at", None)
+        return ContextSnapshotResponse(
+            session_id=session.id,
+            friendly_name=_effective_session_name(session, sync_native_title=False),
+            provider=getattr(session, "provider", None),
+            used_percentage=used_pct,
+            total_input_tokens=getattr(session, "context_total_input_tokens", None),
+            sampled_at=sampled_at.isoformat() if sampled_at else None,
+            state=state,
+            warning_percentage=warning_pct,
+            critical_percentage=critical_pct,
+            context_monitor_enabled=bool(getattr(session, "context_monitor_enabled", False)),
+            notify_session_id=getattr(session, "context_monitor_notify", None),
+            compaction_active=bool(getattr(session, "_is_compacting", False)),
+            last_handoff_path=getattr(session, "last_handoff_path", None),
+        )
+
     @app.post("/sessions/{session_id}/fork")
     async def fork_session(session_id: str, request: ForkSessionRequest):
         """Fork a provider-native session into a new SM-owned session."""
@@ -8946,6 +9005,9 @@ Provide ONLY the summary, no preamble or questions."""
         # soft-threshold window exactly when it wakes (#249).
         if data.get("event") == "compaction_complete":
             session._is_compacting = False
+            session.context_used_percentage = None
+            session.context_total_input_tokens = None
+            session.context_sampled_at = None
             if queue_mgr:
                 queue_mgr.reset_remind(session_id, force_tracked=True)
             logger.info(
@@ -8965,14 +9027,13 @@ Provide ONLY the summary, no preamble or questions."""
             session.agent_status_text = None
             session.agent_status_at = None
             session.agent_task_completed_at = None
+            session.context_used_percentage = None
+            session.context_total_input_tokens = None
+            session.context_sampled_at = None
             await _save_session_manager_state(app.state.session_manager)
             if queue_mgr:
                 queue_mgr.cancel_context_monitor_messages_from(session_id)
             return {"status": "flags_reset"}
-
-        # Gate: skip unregistered sessions for usage/warning/critical events (#206)
-        if not session.context_monitor_enabled:
-            return {"status": "not_registered"}
 
         # Handle context usage update (from status line script)
         used_pct = data.get("used_percentage")
@@ -8980,7 +9041,22 @@ Provide ONLY the summary, no preamble or questions."""
             # used_percentage is null before first API call — ignore
             return {"status": "ok", "used_percentage": None}
 
-        session.tokens_used = data.get("total_input_tokens", 0)
+        total_input_tokens = data.get("total_input_tokens", 0)
+        session.tokens_used = total_input_tokens
+        session.context_used_percentage = used_pct
+        session.context_total_input_tokens = total_input_tokens
+        emitted_at = data.get("sm_hook_emitted_at")
+        sampled_at = datetime.now()
+        if emitted_at:
+            try:
+                sampled_at = datetime.fromisoformat(str(emitted_at).replace("Z", "+00:00"))
+            except ValueError:
+                sampled_at = datetime.now()
+        session.context_sampled_at = sampled_at
+
+        # Gate: skip unregistered sessions for warning/critical alerts (#206).
+        if not session.context_monitor_enabled:
+            return {"status": "not_registered", "used_percentage": used_pct}
 
         config = (app.state.config or {}).get("context_monitor", {})
         warning_pct = config.get("warning_percentage", 50)

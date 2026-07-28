@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use sm_server::{config::AppConfig, mobile_devices};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
@@ -50,6 +51,8 @@ enum Command {
     TaskComplete(EmptyArgs),
     #[command(name = "turn-complete")]
     TurnComplete(EmptyArgs),
+    #[command(alias = "ctx")]
+    Context(ContextArgs),
     #[command(name = "context-monitor")]
     ContextMonitor(ContextMonitorArgs),
     Email(EmailArgs),
@@ -199,6 +202,17 @@ struct TailArgs {
 #[derive(Args)]
 struct HandoffArgs {
     file_path: Option<String>,
+}
+
+#[derive(Args)]
+struct ContextArgs {
+    session_id: Option<String>,
+    #[arg(long, conflicts_with = "detailed")]
+    details: bool,
+    #[arg(long)]
+    detailed: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -778,6 +792,9 @@ fn run() -> Result<()> {
                 bail!("Failed to mark turn complete");
             }
             println!("Turn complete. Remind cancelled until new work is assigned.");
+        }
+        Command::Context(args) => {
+            run_context(&client, args)?;
         }
         Command::ContextMonitor(args) => {
             run_context_monitor(&client, args)?;
@@ -2424,6 +2441,132 @@ fn wait_for_session(client: &ApiClient, session_id: &str, seconds: u64) -> Resul
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
+    let target = match args.session_id {
+        Some(session_id) => session_id,
+        None => optional_current_session_id().ok_or_else(|| {
+            anyhow!("sm context requires a managed session or explicit session target")
+        })?,
+    };
+    let payload = client.get_json(&format!("/sessions/{target}/context"))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    let percentage = format_context_percentage(payload.get("used_percentage"));
+    if !(args.details || args.detailed) {
+        println!("{percentage}");
+        return Ok(());
+    }
+
+    let token_text = payload
+        .get("total_input_tokens")
+        .and_then(Value::as_i64)
+        .map(|tokens| format!(" ({} tokens)", format_int(tokens)))
+        .unwrap_or_default();
+    let session_id = payload["session_id"].as_str().unwrap_or(&target);
+    let label = payload["friendly_name"].as_str().unwrap_or(session_id);
+    let provider = payload["provider"].as_str().unwrap_or("-");
+    let state = payload["state"].as_str().unwrap_or("unknown");
+    let warning = format_context_percentage(payload.get("warning_percentage"));
+    let critical = format_context_percentage(payload.get("critical_percentage"));
+    let notify = payload["notify_session_id"].as_str();
+    let notify_text = match notify {
+        Some(value) if value == session_id => "self".to_owned(),
+        Some(value) => value.to_owned(),
+        None => "none".to_owned(),
+    };
+    let monitor = if payload["context_monitor_enabled"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let compaction = if payload["compaction_active"].as_bool().unwrap_or(false) {
+        "active"
+    } else {
+        "not active"
+    };
+
+    println!("Context: {percentage}{token_text}");
+    println!(
+        "Sample: {}",
+        format_context_sample_age(payload["sampled_at"].as_str())
+    );
+    println!("State: {state} (warning {warning}, critical {critical})");
+    println!("Monitor: {monitor}, alerts -> {notify_text}");
+    println!("Compaction: {compaction}");
+    println!(
+        "Last handoff: {}",
+        payload["last_handoff_path"].as_str().unwrap_or("-")
+    );
+    println!("Session: {label} [{session_id}] {provider}");
+    Ok(())
+}
+
+fn format_context_percentage(value: Option<&Value>) -> String {
+    let Some(numeric) = value.and_then(Value::as_f64) else {
+        return "unknown".to_owned();
+    };
+    if (numeric.fract()).abs() < f64::EPSILON {
+        format!("{}%", numeric as i64)
+    } else {
+        let mut text = format!("{numeric:.1}");
+        while text.contains('.') && text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+        format!("{text}%")
+    }
+}
+
+fn format_context_sample_age(sampled_at: Option<&str>) -> String {
+    let Some(sampled_at) = sampled_at else {
+        return "unknown".to_owned();
+    };
+    let Ok(timestamp) = OffsetDateTime::parse(sampled_at, &Rfc3339) else {
+        return "unknown".to_owned();
+    };
+    let mut seconds = (OffsetDateTime::now_utc() - timestamp).whole_seconds();
+    if seconds < 0 {
+        seconds = 0;
+    }
+    if seconds < 60 {
+        return format!("{seconds}s ago");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}min ago");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}hr ago");
+    }
+    let days = hours / 24;
+    if days == 1 {
+        "1day ago".to_owned()
+    } else {
+        format!("{days}days ago")
+    }
+}
+
+fn format_int(value: i64) -> String {
+    let raw = value.to_string();
+    let mut output = String::new();
+    for (index, ch) in raw.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            output.push(',');
+        }
+        output.push(ch);
+    }
+    output.chars().rev().collect()
 }
 
 fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<()> {
@@ -4621,6 +4764,14 @@ mod tests {
             error,
             "Multiple node restore candidates match 'shared-alias': candidate-a, candidate-b. Use a session ID."
         );
+    }
+
+    #[test]
+    fn context_percentage_formatter_matches_terse_contract() {
+        assert_eq!(format_context_percentage(Some(&json!(43))), "43%");
+        assert_eq!(format_context_percentage(Some(&json!(43.5))), "43.5%");
+        assert_eq!(format_context_percentage(Some(&Value::Null)), "unknown");
+        assert_eq!(format_context_percentage(None), "unknown");
     }
 
     fn write_temp_config(content: &str) -> PathBuf {

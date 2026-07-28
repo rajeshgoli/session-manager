@@ -5638,6 +5638,102 @@ def cmd_context_monitor(
     return 1
 
 
+def _format_context_percentage(value) -> str:
+    """Format a context percentage for terse CLI output."""
+    if value is None:
+        return "unknown"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if numeric.is_integer():
+        return f"{int(numeric)}%"
+    return f"{numeric:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def _format_context_sample_age(sampled_at: Optional[str]) -> str:
+    """Format the context sample timestamp as a relative age."""
+    if not sampled_at:
+        return "unknown"
+    try:
+        timestamp = datetime.fromisoformat(str(sampled_at).replace("Z", "+00:00"))
+        now = datetime.now(timestamp.tzinfo) if timestamp.tzinfo else datetime.now()
+        seconds = int((now - timestamp).total_seconds())
+    except Exception:
+        return "unknown"
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}min ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}hr ago"
+    return f"{hours // 24}day ago" if hours < 48 else f"{hours // 24}days ago"
+
+
+def cmd_context(
+    client: SessionManagerClient,
+    session_id: Optional[str],
+    target: Optional[str] = None,
+    details: bool = False,
+    json_output: bool = False,
+) -> int:
+    """
+    Show the latest cached context usage snapshot for a session.
+
+    Default output is terse: "43%" or "unknown".
+    """
+    resolved_target = target or session_id
+    if not resolved_target:
+        print("Error: sm context requires a managed session or explicit session target", file=sys.stderr)
+        return 2
+
+    snapshot = client.get_context_snapshot(resolved_target)
+    if snapshot is None:
+        print("Error: Session manager unavailable, request timed out, or session not found", file=sys.stderr)
+        return 1
+
+    if json_output:
+        print(json.dumps(snapshot, indent=2, sort_keys=True))
+        return 0
+
+    used_percentage = snapshot.get("used_percentage")
+    if not details:
+        print(_format_context_percentage(used_percentage))
+        return 0
+
+    percent_text = _format_context_percentage(used_percentage)
+    token_count = snapshot.get("total_input_tokens")
+    token_text = f" ({int(token_count):,} tokens)" if isinstance(token_count, int) else ""
+    state = snapshot.get("state") or "unknown"
+    warning = _format_context_percentage(snapshot.get("warning_percentage"))
+    critical = _format_context_percentage(snapshot.get("critical_percentage"))
+    monitor_enabled = bool(snapshot.get("context_monitor_enabled"))
+    notify = snapshot.get("notify_session_id")
+    session_label = snapshot.get("friendly_name") or snapshot.get("session_id") or resolved_target
+    actual_session_id = snapshot.get("session_id") or resolved_target
+    provider = snapshot.get("provider") or "-"
+
+    if notify == actual_session_id:
+        notify_text = "self"
+    elif notify:
+        notify_text = str(notify)
+    else:
+        notify_text = "none"
+
+    print(f"Context: {percent_text}{token_text}")
+    print(f"Sample: {_format_context_sample_age(snapshot.get('sampled_at'))}")
+    print(f"State: {state} (warning {warning}, critical {critical})")
+    print(f"Monitor: {'enabled' if monitor_enabled else 'disabled'}, alerts -> {notify_text}")
+    print(f"Compaction: {'active' if snapshot.get('compaction_active') else 'not active'}")
+    print(f"Last handoff: {snapshot.get('last_handoff_path') or '-'}")
+    print(f"Session: {session_label} [{actual_session_id}] {provider}")
+    return 0
+
+
 def cmd_em(
     client: SessionManagerClient,
     session_id: Optional[str],
