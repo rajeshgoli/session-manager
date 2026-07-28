@@ -78,6 +78,8 @@ enum Command {
     Subagents(SessionIdArgs),
     Claude(ProviderLaunchArgs),
     Codex(ProviderLaunchArgs),
+    #[command(name = "codex-original", alias = "codex-stock")]
+    CodexOriginal(ProviderLaunchArgs),
     #[command(name = "codex-app")]
     CodexApp(ProviderLaunchArgs),
     #[command(name = "codex-fork", alias = "codex_fork")]
@@ -601,6 +603,12 @@ fn run() -> Result<()> {
         Command::Codex(args) => launch_provider_session(
             &client,
             launch_provider_for_alias("codex")?,
+            args.working_dir,
+            args.node,
+        )?,
+        Command::CodexOriginal(args) => launch_provider_session(
+            &client,
+            launch_provider_for_alias("codex-original")?,
             args.working_dir,
             args.node,
         )?,
@@ -2211,6 +2219,7 @@ fn send_registered_email_fallback(client: &ApiClient, recipient: &str, text: &st
 fn launch_provider_for_alias(alias: &str) -> Result<&'static str> {
     match alias {
         "new" | "claude" => Ok("claude"),
+        "codex-original" | "codex-stock" => Ok("codex"),
         "codex" | "codex-fork" | "codex_fork" | "codex-2" => Ok("codex-fork"),
         "codex-app" => Ok("codex-app"),
         _ => bail!("unsupported launch alias {alias}"),
@@ -4584,6 +4593,11 @@ mod tests {
         assert_eq!(launch_provider_for_alias("claude").unwrap(), "claude");
         assert_eq!(launch_provider_for_alias("codex").unwrap(), "codex-fork");
         assert_eq!(
+            launch_provider_for_alias("codex-original").unwrap(),
+            "codex"
+        );
+        assert_eq!(launch_provider_for_alias("codex-stock").unwrap(), "codex");
+        assert_eq!(
             launch_provider_for_alias("codex-fork").unwrap(),
             "codex-fork"
         );
@@ -4622,6 +4636,12 @@ mod tests {
             launch_provider_for_alias(&args.provider).unwrap(),
             "codex-fork"
         );
+
+        let cli = Cli::try_parse_from(["sm", "spawn", "codex-original", "review this"]).unwrap();
+        let Command::Spawn(args) = cli.command else {
+            panic!("expected spawn command");
+        };
+        assert_eq!(launch_provider_for_alias(&args.provider).unwrap(), "codex");
 
         let cli = Cli::try_parse_from(["sm", "spawn", "codex-2", "review this"]).unwrap();
         let Command::Spawn(args) = cli.command else {
