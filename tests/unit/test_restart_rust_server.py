@@ -143,7 +143,8 @@ def _make_runner(bin_dir: Path, cutover: Path, binary: Path, config: Path):
             "SM_CUTOVER": str(cutover),
             "SM_CONFIG": str(config),
             "SM_PYTHON_LABELS": "com.example.legacy-python",
-            "SM_BASE_URL": "http://127.0.0.1:9",
+            "SM_HOST": "127.0.0.1",
+            "SM_PORT": "9",
             "SM_HEALTH_TIMEOUT": "3",
             "SM_PID_SETTLE_SECONDS": "2",
             "SM_LABEL": "com.example.test",
@@ -262,6 +263,39 @@ def test_restart_goes_through_the_cutover_script(env):
     # The stale-constraint bug is exactly what a bare kickstart cannot fix.
     assert "launchctl kickstart" not in text
     assert "launchctl bootout" not in text
+
+
+def test_deployment_overrides_reach_the_cutover(env):
+    """The cutover has its own defaults and reads none of our env vars, so a
+    non-default deployment must be forwarded or we would sign one service and
+    restart another - in the worst case, production."""
+    other = _write(env["tmp"] / "other-sm-server", "#!/bin/bash\ntrue\n", executable=True)
+    other_config = _write(env["tmp"] / "other.yaml", "server: {}\n")
+    (env["state"] / "loaded_labels").write_text("com.example.other\n")
+
+    result = env["run"](
+        SM_LABEL="com.example.other",
+        SM_BINARY=str(other),
+        SM_CONFIG=str(other_config),
+        SM_PORT="10",
+    )
+
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in calls(env).splitlines() if l.startswith("cutover "))
+    assert "--label com.example.other" in line
+    assert f"--binary {other}" in line
+    assert f"--config {other_config}" in line
+    assert "--port 10" in line
+    assert "--host 127.0.0.1" in line
+
+
+def test_health_check_targets_the_port_handed_to_the_cutover(env):
+    """The polled endpoint must be the one the service was told to listen on."""
+    env["run"](SM_PORT="10")
+
+    text = calls(env)
+    assert "--port 10" in text
+    assert "http://127.0.0.1:10/health" in text
 
 
 # --- post-restart verification ---------------------------------------------

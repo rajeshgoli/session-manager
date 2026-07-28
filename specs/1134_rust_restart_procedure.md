@@ -118,6 +118,14 @@ Notes on specific choices:
 - **The pid must stay put for 20s.** A single health check cannot distinguish a
   healthy service from one mid-crash-loop, since `KeepAlive` makes each rejected
   spawn briefly look alive.
+- **Deployment values are forwarded to the cutover.** `rust-service-cutover.sh`
+  initialises its own defaults and reads none of this script's environment
+  variables, so `--label`, `--binary`, `--config`, `--host`, and `--port` are
+  passed explicitly. Without that, overriding a value would sign and verify one
+  deployment while booting out and restarting the default (production) one. For
+  the same reason the health URL is built from `SM_HOST`/`SM_PORT` rather than
+  being independently settable: the endpoint polled is by construction the one
+  the service was told to listen on.
 - **Session-count drops fail the run** (`--allow-drop N` to tolerate expected
   churn). Sessions do retire on their own - the count moved 13 -> 12 during this
   investigation with no restart - so the escape hatch exists, but the default is

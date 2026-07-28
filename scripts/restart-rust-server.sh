@@ -32,7 +32,11 @@ SM_CUTOVER="${SM_CUTOVER:-$REPO_ROOT/scripts/rust-service-cutover.sh}"
 SM_CONFIG="${SM_CONFIG:-$REPO_ROOT/config.yaml}"
 # Space-separated; must match the labels rust-service-cutover.sh refuses to start alongside.
 SM_PYTHON_LABELS="${SM_PYTHON_LABELS:-com.rajeshgoli.session-manager com.claude.session-manager}"
-SM_BASE_URL="${SM_BASE_URL:-http://127.0.0.1:8420}"
+# Host/port are owned here and forwarded to the cutover, so the endpoint we
+# health-check is by construction the one the service was told to listen on.
+SM_HOST="${SM_HOST:-127.0.0.1}"
+SM_PORT="${SM_PORT:-8420}"
+SM_BASE_URL="http://$SM_HOST:$SM_PORT"
 SM_SIGN_IDENTIFIER="${SM_SIGN_IDENTIFIER:-com.rajeshgoli.sm-server}"
 SM_HEALTH_TIMEOUT="${SM_HEALTH_TIMEOUT:-60}"
 SM_PID_SETTLE_SECONDS="${SM_PID_SETTLE_SECONDS:-20}"
@@ -53,9 +57,12 @@ Options:
   --skip-build     Reuse the existing binary. Still signs and verifies.
   -h, --help       Show this help.
 
-Environment overrides: SM_LABEL, SM_BINARY, SM_CUTOVER, SM_CONFIG,
-SM_PYTHON_LABELS, SM_BASE_URL, SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
+Environment overrides: SM_LABEL, SM_BINARY, SM_CUTOVER, SM_CONFIG, SM_HOST,
+SM_PORT, SM_PYTHON_LABELS, SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
 SM_PID_SETTLE_SECONDS, SM_ALLOW_SESSION_DROP.
+
+SM_LABEL, SM_BINARY, SM_CONFIG, SM_HOST, and SM_PORT are forwarded to the
+cutover script, so both phases always act on the same deployment.
 EOF
 }
 
@@ -175,7 +182,17 @@ echo "signature ok: $(codesign -dvvv "$SM_BINARY" 2>&1 | awk -F= '/^Identifier=/
 
 step "Restarting service (bootout -> bootstrap -> kickstart)"
 [[ -x "$SM_CUTOVER" ]] || fail "cutover script not executable: $SM_CUTOVER"
-"$SM_CUTOVER" restart-rust || fail "restart failed - see output above; service may be down"
+# Forward every deployment value explicitly. The cutover script initialises its
+# own defaults and reads none of these variables, so omitting them would let this
+# script sign and verify one deployment while restarting a different (default,
+# i.e. production) one.
+"$SM_CUTOVER" restart-rust \
+  --label "$SM_LABEL" \
+  --binary "$SM_BINARY" \
+  --config "$SM_CONFIG" \
+  --host "$SM_HOST" \
+  --port "$SM_PORT" \
+  || fail "restart failed - see output above; service may be down"
 
 step "Waiting for /health (timeout ${SM_HEALTH_TIMEOUT}s)"
 deadline=$((SECONDS + SM_HEALTH_TIMEOUT))
