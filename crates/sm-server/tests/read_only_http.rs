@@ -13,6 +13,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use sm_server::btw::BtwStore;
 use sm_server::config::RustShadowConfig;
 use sm_server::queue::{QueueAdmissionPolicy, RetainedQueueStore};
 use sm_server::{
@@ -608,6 +609,81 @@ async fn detailed_health_has_required_top_level_fields() {
     assert!(payload["checks"].is_object());
     assert!(payload["resources"].is_object());
     assert!(payload["timestamp"].is_string());
+}
+
+#[tokio::test]
+async fn what_request_is_durably_accepted_and_pollable() {
+    let state_file = write_session_fixture();
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, accepted) = post_json(
+        app.clone(),
+        "/sessions/run12345/what",
+        json!({
+            "prompt": "Summarize current work",
+            "delivery_mode": "poll"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(accepted["target_session_id"], "run12345");
+    assert_eq!(accepted["target_provider"], "claude");
+    assert_eq!(accepted["target_friendly_name"], "Runner Native");
+    assert_eq!(accepted["delivery_mode"], "poll");
+    let request_id = accepted["request_id"].as_str().unwrap();
+
+    let (status, record) = get_json(app, &format!("/btw-requests/{request_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(record["request_id"], request_id);
+}
+
+#[tokio::test]
+async fn what_request_rejects_unsafe_prompt_and_stopped_target() {
+    let state_file = write_session_fixture();
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/run12345/what",
+        json!({ "prompt": "one\ntwo", "delivery_mode": "poll" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(payload["detail"].as_str().unwrap().contains("single line"));
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions/stop1234/what",
+        json!({ "delivery_mode": "poll" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(payload["detail"], "Target session is not live");
+}
+
+#[tokio::test]
+async fn session_teardown_fails_requested_what_and_marks_response_undeliverable() {
+    let state_file = write_session_fixture();
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+    let store = BtwStore::new(queue_db).unwrap();
+    let request = store
+        .create(Some("run12345"), "oldstate", "claude", "session", "summary")
+        .unwrap();
+
+    let (status, payload) = post_json(app, "/sessions/run12345/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    let request = store.get(&request.request_id).unwrap().unwrap();
+    assert_eq!(request.status, "failed");
+    assert!(request.response_undeliverable_at.is_some());
+    assert!(store.list_recoverable().unwrap().is_empty());
 }
 
 #[tokio::test]

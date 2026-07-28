@@ -4678,6 +4678,48 @@ fn codex_fork_submit_message(control_socket_path: &Path, text: &str) -> Result<(
     ensure_codex_fork_response_ok(&response, "control command failed")
 }
 
+pub fn submit_codex_fork_btw(
+    session: &SessionRecord,
+    request_id: &str,
+    prompt: &str,
+    runtime: &TmuxRuntime,
+) -> Result<PathBuf> {
+    if !session.provider.eq_ignore_ascii_case("codex-fork") {
+        anyhow::bail!("session {} is not a codex-fork session", session.id);
+    }
+    let spec = TmuxSessionSpec {
+        session_id: session.id.clone(),
+        tmux_session: session.tmux_session.clone(),
+        working_dir: session.working_dir.clone(),
+        log_file: session
+            .log_file
+            .as_deref()
+            .map(expand_home)
+            .ok_or_else(|| anyhow::anyhow!("session {} missing log_file", session.id))?,
+        provider: "codex-fork".to_owned(),
+        initial_message: None,
+        model: session.model.clone(),
+    };
+    let artifacts = runtime
+        .codex_fork_runtime_artifacts(&spec)?
+        .ok_or_else(|| anyhow::anyhow!("codex-fork runtime artifacts unavailable"))?;
+    if !artifacts.control_socket_path.exists() {
+        anyhow::bail!(
+            "control socket not found: {}",
+            artifacts.control_socket_path.display()
+        );
+    }
+    let request = json!({
+        "request_id": request_id,
+        "command": "submit_btw",
+        "prompt": prompt,
+    });
+    let response = codex_fork_control_roundtrip(&artifacts.control_socket_path, &request)
+        .with_context(|| "submit_btw control command failed")?;
+    ensure_codex_fork_response_ok(&response, "submit_btw control command failed")?;
+    Ok(artifacts.event_stream_path)
+}
+
 fn codex_fork_set_thread_name(control_socket_path: &Path, friendly_name: &str) -> Result<()> {
     if !control_socket_path.exists() {
         return Err(anyhow::anyhow!(

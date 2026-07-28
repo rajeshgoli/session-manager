@@ -2,8 +2,7 @@
 
 ## Status
 
-Proposed. This is a specification-only change. Implementation must not begin until
-the owner approves this document.
+Implemented. The owner approved implementation after reviewing the specification PR.
 
 ## Problem
 
@@ -185,6 +184,7 @@ Required fields:
 | `created_at`, `started_at`, `finished_at` | Recovery and latency accounting |
 | `result` or `error` | Bounded terminal outcome |
 | `response_delivered_at` | One-shot requester relay guard |
+| `response_undeliverable_at` | Terminal marker when the requester is torn down |
 
 Lifecycle:
 

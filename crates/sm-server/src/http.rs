@@ -10,7 +10,7 @@ use std::{
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -74,6 +74,10 @@ use crate::app_artifacts::{
     hashed_path, meta_path, read_metadata, store_artifact, valid_app_name, valid_artifact_hash,
     APP_ARTIFACT_MAX_SIZE_BYTES,
 };
+use crate::btw::{
+    codex_btw_event, extract_stock_codex_answer, validate_prompt, BtwRequestRecord, BtwStore,
+    CreateBtwRequestError,
+};
 use crate::bug_reports::{BugReportStore, CreateBugReport};
 use crate::cloudflare_access::{
     classify_cloudflare_access_assertion_with_jwks, cloudflare_access_application_for_host,
@@ -102,22 +106,22 @@ use crate::mobile_devices::{self, mobile_device_db_path};
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
     CreateCodexReviewRequest, CreateQueueJob, QueueAdmissionPolicy, QueueJobFilters,
-    QueueJobRecord, RetainedQueueStore, RetryCodexReviewRequest,
+    QueueJobRecord, QueueMessageMetadata, RetainedQueueStore, RetryCodexReviewRequest,
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
     claude_hook_gate, codex_fork_status_for_event_line, expand_home, is_primary_node,
-    AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
-    ChildSessionResponse, ClaudeHookGate, ClearSessionRequest, ClientSessionResponse,
-    ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent,
-    ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult,
-    CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest,
-    HandoffOutcome, HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome,
-    RoleRegistrationRequest, SendCoreInputBatchRequest, SendCoreInputRequest,
-    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
-    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
-    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    submit_codex_fork_btw, AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome,
+    ArmStopNotifyRequest, ChildSessionResponse, ClaudeHookGate, ClearSessionRequest,
+    ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse,
+    ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse,
+    CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
+    CreateCoreSessionRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
+    RegistryMutationOutcome, RoleRegistrationRequest, SendCoreInputBatchRequest,
+    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
+    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
+    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
+    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
@@ -150,6 +154,9 @@ const GOOGLE_ID_TOKEN_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_se
 const DEVICE_TOKEN_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const REVIEW_WAIT_IDLE_THRESHOLD: Duration = Duration::from_secs(1);
 const REVIEW_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const BTW_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
+const BTW_PROVIDER_POLL: Duration = Duration::from_millis(250);
+static BTW_NATIVE_COPY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -866,6 +873,7 @@ pub fn router(state: AppState) -> Router {
         .unwrap_or_else(|| DEFAULT_EMAIL_WEBHOOK_PATH.to_owned());
     let state = Arc::new(state);
     recover_codex_review_request_watchers(state.clone());
+    recover_btw_requests(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
@@ -920,6 +928,7 @@ pub fn router(state: AppState) -> Router {
             "/codex-review-requests/{request_id}",
             get(get_codex_review_request).delete(cancel_codex_review_request),
         )
+        .route("/btw-requests/{request_id}", get(get_btw_request))
         .route("/reviews/pr", post(start_pr_review))
         .route("/nodes", get(list_nodes))
         .route("/nodes/{node_id}/ping", post(ping_node))
@@ -978,6 +987,7 @@ pub fn router(state: AppState) -> Router {
             post(register_subagent_stop),
         )
         .route("/sessions/{session_id}/input", post(send_session_input))
+        .route("/sessions/{session_id}/what", post(create_btw_request))
         .route("/sessions/{session_id}/kill", post(retire_session))
         .route("/sessions/{session_id}/restore", post(restore_session))
         .route("/sessions/{session_id}/clear", post(clear_session))
@@ -5920,6 +5930,563 @@ async fn send_session_input(
     Ok(Json(serde_json::to_value(result)?))
 }
 
+async fn create_btw_request(
+    State(state): State<Arc<AppState>>,
+    Path(target_identifier): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateBtwHttpRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/sessions/{target_identifier}/what"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let Some(target) = resolve_session_or_registry_role(&state, &target_identifier)? else {
+        return Err(ApiError::NotFound("Target session not found"));
+    };
+    ensure_btw_session_live(&target, "Target")?;
+    ensure_core_runtime_session_node_supported(&state, &target.id)?;
+
+    let requester = match payload
+        .requester_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(identifier) => {
+            let Some(session) = resolve_session_or_registry_role(&state, identifier)? else {
+                return Err(ApiError::NotFound("Requester session not found"));
+            };
+            ensure_btw_session_live(&session, "Requester")?;
+            Some(session)
+        }
+        None => None,
+    };
+    let delivery_mode = payload
+        .delivery_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(if requester.is_some() {
+            "session"
+        } else {
+            "poll"
+        });
+    if !matches!(delivery_mode, "session" | "poll") {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "delivery_mode must be session or poll".to_owned(),
+        });
+    }
+    if delivery_mode == "session" && requester.is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "session delivery requires requester_session_id".to_owned(),
+        });
+    }
+    let prompt = validate_prompt(payload.prompt.as_deref()).map_err(|error| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: error.to_string(),
+    })?;
+    let store = btw_store(&state)?;
+    let record = match store.create(
+        requester.as_ref().map(|session| session.id.as_str()),
+        &target.id,
+        &target.provider,
+        delivery_mode,
+        &prompt,
+    ) {
+        Ok(record) => record,
+        Err(CreateBtwRequestError::Active(request_id)) => {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!("Target already has active sm what request {request_id}"),
+            });
+        }
+        Err(CreateBtwRequestError::Other(error)) => return Err(error.into()),
+    };
+
+    let worker_state = state.clone();
+    let worker_request_id = record.request_id.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = run_btw_request(&worker_state, &worker_request_id) {
+            eprintln!("sm what worker {worker_request_id} failed: {error:#}");
+        }
+    });
+
+    let mut accepted = serde_json::to_value(&record)?;
+    accepted["target_friendly_name"] = json!(target
+        .cached_display_name()
+        .unwrap_or_else(|| target.id.clone()));
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
+}
+
+async fn get_btw_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Json<BtwRequestRecord>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let Some(record) = btw_store(&state)?.get(&request_id)? else {
+        return Err(ApiError::NotFound("sm what request not found"));
+    };
+    Ok(Json(record))
+}
+
+fn recover_btw_requests(state: Arc<AppState>) {
+    if !btw_db_path(&state).exists() {
+        return;
+    }
+    let Ok(store) = btw_store(&state) else {
+        return;
+    };
+    let Ok(requests) = store.list_recoverable() else {
+        return;
+    };
+    for request in requests {
+        let worker_state = state.clone();
+        let worker_store = store.clone();
+        thread::spawn(move || {
+            if !matches!(request.status.as_str(), "pending" | "running") {
+                let _ = deliver_btw_response(&worker_state, &worker_store, &request.request_id);
+                return;
+            }
+            if request.target_provider == "codex-fork" {
+                let _ = run_btw_request(&worker_state, &request.request_id);
+                return;
+            }
+            if let Ok(Some(target)) = worker_state
+                .session_store
+                .get_session(&request.target_session_id)
+            {
+                let runtime = TmuxRuntime::from_app_config(&worker_state.config)
+                    .for_socket_name(target.tmux_socket_name.as_deref());
+                let pane = runtime
+                    .capture_pane_tail(&target.tmux_session, 200)
+                    .unwrap_or_default();
+                let recovered = match request.target_provider.as_str() {
+                    "claude" if pane.contains("c to copy") && pane.contains("Esc to close") => {
+                        recover_claude_btw(&runtime, &target).ok()
+                    }
+                    "codex"
+                        if pane.contains("Side from main thread")
+                            && pane.contains("Ctrl+C to return") =>
+                    {
+                        capture_stock_codex_btw_result(&runtime, &target, &request.prompt).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(result) = recovered {
+                    let _ = finish_btw_request(
+                        &worker_state,
+                        &worker_store,
+                        &request.request_id,
+                        Ok(result),
+                    );
+                    return;
+                }
+                let cleanup_key = if request.target_provider == "claude" {
+                    "Escape"
+                } else {
+                    "C-c"
+                };
+                let _ = runtime.send_key_input(&target.tmux_session, cleanup_key);
+            }
+            let _ = worker_store.fail(&request.request_id, "session manager restarted during /btw");
+            let _ = deliver_btw_response(&worker_state, &worker_store, &request.request_id);
+        });
+    }
+}
+
+fn run_btw_request(state: &AppState, request_id: &str) -> anyhow::Result<()> {
+    let store = btw_store(state)?;
+    let Some(request) = store.get(request_id)? else {
+        anyhow::bail!("sm what request {request_id} not found");
+    };
+    store.mark_running(request_id, None)?;
+    let outcome = (|| {
+        let target = state
+            .session_store
+            .get_session(&request.target_session_id)?
+            .ok_or_else(|| anyhow::anyhow!("target session no longer exists"))?;
+        let runtime = TmuxRuntime::from_app_config(&state.config)
+            .for_socket_name(target.tmux_socket_name.as_deref());
+        if matches!(target.provider.as_str(), "claude" | "codex") {
+            store.set_provider_correlation(request_id, &format!("tmux:{}", target.tmux_session))?;
+        }
+
+        match target.provider.as_str() {
+            "claude" => run_claude_btw(&runtime, &target, &request.prompt),
+            "codex" => run_stock_codex_btw(&runtime, &target, &request.prompt),
+            "codex-fork" => {
+                run_codex_fork_btw(&store, &runtime, &target, request_id, &request.prompt)
+            }
+            provider => Err(anyhow::anyhow!(
+                "provider {provider} does not support native /btw"
+            )),
+        }
+    })();
+
+    finish_btw_request(state, &store, request_id, outcome)
+}
+
+fn finish_btw_request(
+    state: &AppState,
+    store: &BtwStore,
+    request_id: &str,
+    outcome: anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    match &outcome {
+        Ok(result) if !result.trim().is_empty() => store.complete(request_id, result)?,
+        Ok(_) => store.fail(request_id, "provider returned an empty summary")?,
+        Err(error) if error.to_string().contains("timed out") => {
+            store.time_out(request_id, &error.to_string())?
+        }
+        Err(error) => store.fail(request_id, &error.to_string())?,
+    }
+    deliver_btw_response(state, &store, request_id)?;
+    Ok(())
+}
+
+fn run_codex_fork_btw(
+    store: &BtwStore,
+    runtime: &TmuxRuntime,
+    target: &SessionRecord,
+    request_id: &str,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let event_stream_path = submit_codex_fork_btw(target, request_id, prompt, runtime)?;
+    store.set_provider_correlation(request_id, &event_stream_path.display().to_string())?;
+    let deadline = Instant::now() + BTW_PROVIDER_TIMEOUT;
+    let mut offset = 0u64;
+    let mut partial = String::new();
+    loop {
+        if let Ok(chunk) = read_btw_file_from_offset(&event_stream_path, &mut offset) {
+            partial.push_str(&chunk);
+            while let Some(newline) = partial.find('\n') {
+                let line = partial[..newline].to_owned();
+                partial.drain(..=newline);
+                if let Some(outcome) = codex_btw_event(&line, request_id) {
+                    return outcome.map_err(anyhow::Error::msg);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("provider timed out waiting for /btw result");
+        }
+        thread::sleep(BTW_PROVIDER_POLL);
+    }
+}
+
+fn run_claude_btw(
+    runtime: &TmuxRuntime,
+    target: &SessionRecord,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let _copy_guard = BTW_NATIVE_COPY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("native copy lock poisoned"))?;
+    let initial = runtime
+        .capture_pane_tail(&target.tmux_session, 80)
+        .ok_or_else(|| anyhow::anyhow!("unable to inspect Claude pane"))?;
+    if initial.contains("c to copy") && initial.contains("Esc to close") {
+        anyhow::bail!("Claude is already displaying a /btw result");
+    }
+    if initial.contains("Do you trust the files")
+        || initial.contains("Allow this action")
+        || initial.contains("Waiting for approval")
+    {
+        anyhow::bail!("Claude is not ready for a native /btw command");
+    }
+
+    let before = runtime
+        .list_buffer_ids()?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let command = format!("/btw {prompt}");
+    if !runtime.send_input(&target.tmux_session, &command)? {
+        anyhow::bail!("target tmux session is not running");
+    }
+    capture_claude_btw_result(runtime, target, &before)
+}
+
+fn recover_claude_btw(runtime: &TmuxRuntime, target: &SessionRecord) -> anyhow::Result<String> {
+    let _copy_guard = BTW_NATIVE_COPY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("native copy lock poisoned"))?;
+    let before = runtime
+        .list_buffer_ids()?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    capture_claude_btw_result(runtime, target, &before)
+}
+
+fn capture_claude_btw_result(
+    runtime: &TmuxRuntime,
+    target: &SessionRecord,
+    before: &BTreeSet<String>,
+) -> anyhow::Result<String> {
+    wait_for_pane(
+        runtime,
+        &target.tmux_session,
+        BTW_PROVIDER_TIMEOUT,
+        |pane| pane.contains("c to copy") && pane.contains("Esc to close"),
+    )?;
+    if !runtime.send_key_input(&target.tmux_session, "c")? {
+        anyhow::bail!("target tmux session stopped before native copy");
+    }
+    let result = (|| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let buffer_id = loop {
+            let after = runtime
+                .list_buffer_ids()?
+                .into_iter()
+                .filter(|buffer_id| !before.contains(buffer_id))
+                .collect::<Vec<_>>();
+            if after.len() == 1 {
+                break after[0].clone();
+            }
+            if after.len() > 1 {
+                anyhow::bail!("Claude native copy created multiple tmux buffers");
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("Claude native copy did not create a tmux buffer");
+            }
+            thread::sleep(BTW_PROVIDER_POLL);
+        };
+        let answer = runtime.read_buffer(&buffer_id)?;
+        runtime.delete_buffer(&buffer_id)?;
+        Ok(answer)
+    })();
+    let _ = runtime.send_key_input(&target.tmux_session, "Escape");
+    if result.is_ok() {
+        wait_for_pane(
+            runtime,
+            &target.tmux_session,
+            Duration::from_secs(5),
+            |pane| !(pane.contains("c to copy") && pane.contains("Esc to close")),
+        )?;
+    }
+    result
+}
+
+fn run_stock_codex_btw(
+    runtime: &TmuxRuntime,
+    target: &SessionRecord,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let command = format!("/btw {prompt}");
+    if !runtime.send_input(&target.tmux_session, &command)? {
+        anyhow::bail!("target tmux session is not running");
+    }
+    capture_stock_codex_btw_result(runtime, target, prompt)
+}
+
+fn capture_stock_codex_btw_result(
+    runtime: &TmuxRuntime,
+    target: &SessionRecord,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let result = (|| {
+        let deadline = Instant::now() + BTW_PROVIDER_TIMEOUT;
+        let mut previous = String::new();
+        let mut stable_samples = 0usize;
+        loop {
+            let snapshot = runtime
+                .capture_pane_tail(&target.tmux_session, 200)
+                .ok_or_else(|| anyhow::anyhow!("unable to inspect Codex pane"))?;
+            let side_visible =
+                snapshot.contains("Side from main thread") && snapshot.contains("Ctrl+C to return");
+            let still_running = snapshot.contains("esc to interrupt");
+            if side_visible && !still_running && snapshot == previous {
+                stable_samples += 1;
+            } else {
+                stable_samples = 0;
+            }
+            if stable_samples >= 3 {
+                return extract_stock_codex_answer(&snapshot, prompt)
+                    .ok_or_else(|| anyhow::anyhow!("unable to isolate stock Codex /btw answer"));
+            }
+            previous = snapshot;
+            if Instant::now() >= deadline {
+                anyhow::bail!("provider timed out waiting for /btw result");
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    })();
+    let _ = runtime.send_key_input(&target.tmux_session, "C-c");
+    if result.is_ok() {
+        wait_for_pane(
+            runtime,
+            &target.tmux_session,
+            Duration::from_secs(5),
+            |pane| !pane.contains("Side from main thread"),
+        )?;
+    }
+    result
+}
+
+fn wait_for_pane(
+    runtime: &TmuxRuntime,
+    tmux_session: &str,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) -> anyhow::Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(pane) = runtime.capture_pane_tail(tmux_session, 200) {
+            if predicate(&pane) {
+                return Ok(pane);
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("provider UI did not reach the expected /btw state");
+        }
+        thread::sleep(BTW_PROVIDER_POLL);
+    }
+}
+
+fn read_btw_file_from_offset(path: &StdPath, offset: &mut u64) -> anyhow::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if *offset > len {
+        *offset = 0;
+    }
+    file.seek(SeekFrom::Start(*offset))?;
+    let mut chunk = String::new();
+    file.read_to_string(&mut chunk)?;
+    *offset = file.stream_position()?;
+    Ok(chunk)
+}
+
+fn deliver_btw_response(
+    state: &AppState,
+    store: &BtwStore,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    let Some(request) = store.get(request_id)? else {
+        anyhow::bail!("sm what request {request_id} disappeared");
+    };
+    if request.delivery_mode != "session"
+        || request.response_delivered_at.is_some()
+        || request.response_undeliverable_at.is_some()
+    {
+        return Ok(());
+    }
+    let requester_session_id = request
+        .requester_session_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("session delivery missing requester"))?;
+    let target = state
+        .session_store
+        .get_session(&request.target_session_id)?;
+    let target_id = target
+        .as_ref()
+        .map(|session| session.id.as_str())
+        .unwrap_or(request.target_session_id.as_str());
+    let target_name = target
+        .as_ref()
+        .and_then(SessionRecord::cached_display_name)
+        .unwrap_or_else(|| target_id.to_owned());
+    let text = if request.status == "completed" {
+        format!(
+            "[Input from {target_name} ({}) via sm what] {}",
+            target_id,
+            request.result.as_deref().unwrap_or_default()
+        )
+    } else {
+        format!(
+            "[sm what for {target_name} ({}) failed] {}",
+            target_id,
+            request.error.as_deref().unwrap_or("unknown failure")
+        )
+    };
+    let requester = state.session_store.get_session(requester_session_id)?;
+    if requester
+        .as_ref()
+        .is_none_or(|session| ensure_btw_session_live(session, "Requester").is_err())
+    {
+        return Ok(());
+    }
+    let queue = RetainedQueueStore::new(btw_db_path(state));
+    queue.enqueue_message_once_with_metadata(
+        &format!("btw-response-{request_id}"),
+        requester_session_id,
+        &text,
+        "sequential",
+        QueueMessageMetadata {
+            message_category: Some("btw_response".to_owned()),
+            ..QueueMessageMetadata::default()
+        },
+    )?;
+    store.mark_response_delivered(request_id)?;
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    state
+        .session_store
+        .drain_runtime_pending_messages_for_session_category(
+            requester_session_id,
+            &runtime,
+            Some("btw_response"),
+        )?;
+    Ok(())
+}
+
+fn teardown_btw_requests_for_session(state: &AppState, session_id: &str) -> anyhow::Result<()> {
+    if !btw_db_path(state).exists() {
+        return Ok(());
+    }
+    let store = btw_store(state)?;
+    let requests =
+        store.fail_for_session(session_id, &format!("session {session_id} was torn down"))?;
+    for request in requests {
+        if let Some(target) = state
+            .session_store
+            .get_session(&request.target_session_id)?
+        {
+            let runtime = TmuxRuntime::from_app_config(&state.config)
+                .for_socket_name(target.tmux_socket_name.as_deref());
+            let cleanup_key = match target.provider.as_str() {
+                "claude" => Some("Escape"),
+                "codex" => Some("C-c"),
+                _ => None,
+            };
+            if let Some(cleanup_key) = cleanup_key {
+                let _ = runtime.send_key_input(&target.tmux_session, cleanup_key);
+            }
+        }
+        if request.requester_session_id.as_deref() != Some(session_id) {
+            let _ = deliver_btw_response(state, &store, &request.request_id);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_btw_session_live(session: &SessionRecord, label: &str) -> Result<(), ApiError> {
+    if matches!(
+        session.status.trim().to_ascii_lowercase().as_str(),
+        "stopped" | "killed" | "completed" | "error"
+    ) {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!("{label} session is not live"),
+        });
+    }
+    Ok(())
+}
+
+fn btw_store(state: &AppState) -> anyhow::Result<BtwStore> {
+    BtwStore::new(btw_db_path(state))
+}
+
+fn btw_db_path(state: &AppState) -> PathBuf {
+    expand_home(&state.config.sm_send.db_path)
+}
+
 async fn send_session_input_batch(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -6213,6 +6780,17 @@ async fn retire_session(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let may_retire = state
+        .session_store
+        .get_session(&session_id)?
+        .is_some_and(|session| {
+            requester_session_id.is_none_or(|requester| {
+                requester.is_empty() || session.parent_session_id.as_deref() == Some(requester)
+            }) && (!state.config.rust_core.runtime_enabled || is_primary_node(&session.node))
+        });
+    if may_retire {
+        teardown_btw_requests_for_session(&state, &session_id)?;
+    }
     let outcome = if state.config.rust_core.runtime_enabled {
         let runtime = TmuxRuntime::from_app_config(&state.config);
         state.session_store.retire_core_session_with_runtime(
@@ -11052,6 +11630,16 @@ struct ListCodexReviewRequestsQuery {
     pr_number: Option<i64>,
     #[serde(default)]
     include_inactive: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBtwHttpRequest {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    requester_session_id: Option<String>,
+    #[serde(default)]
+    delivery_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

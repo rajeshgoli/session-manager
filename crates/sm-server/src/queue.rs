@@ -897,6 +897,47 @@ impl RetainedQueueStore {
         })
     }
 
+    pub fn enqueue_message_once_with_metadata(
+        &self,
+        id: &str,
+        target_session_id: &str,
+        text: &str,
+        delivery_mode: &str,
+        metadata: QueueMessageMetadata,
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            let message_category = metadata.message_category.clone();
+            let inserted = enqueue_message_with_id_and_metadata_conn(
+                conn,
+                id,
+                target_session_id,
+                text,
+                delivery_mode,
+                metadata,
+            )?;
+            if inserted {
+                return Ok(());
+            }
+            let existing_matches = conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM message_queue
+                WHERE id = ?1
+                  AND target_session_id = ?2
+                  AND text = ?3
+                  AND delivery_mode = ?4
+                  AND message_category IS ?5
+                "#,
+                params![id, target_session_id, text, delivery_mode, message_category,],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if !existing_matches {
+                anyhow::bail!("queue message id {id} already exists with different content");
+            }
+            Ok(())
+        })
+    }
+
     pub fn active_parent_wake_parent(&self, child_session_id: &str) -> Result<Option<String>> {
         self.with_connection(|conn| {
             conn.query_row(
@@ -1366,13 +1407,35 @@ fn enqueue_message_with_metadata_conn(
     metadata: QueueMessageMetadata,
 ) -> Result<String> {
     let id = generate_record_id("msg");
+    let inserted = enqueue_message_with_id_and_metadata_conn(
+        conn,
+        &id,
+        target_session_id,
+        text,
+        delivery_mode,
+        metadata,
+    )?;
+    if !inserted {
+        anyhow::bail!("generated duplicate queue message id {id}");
+    }
+    Ok(id)
+}
+
+fn enqueue_message_with_id_and_metadata_conn(
+    conn: &Connection,
+    id: &str,
+    target_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    metadata: QueueMessageMetadata,
+) -> Result<bool> {
     let timeout_at = timeout_at_rfc3339(metadata.timeout_seconds)?;
     let response_relay_source = metadata
         .response_relay_source
         .or_else(|| metadata.from_sm_send.then(|| "sm-send".to_owned()));
-    conn.execute(
+    let inserted = conn.execute(
         r#"
-        INSERT INTO message_queue
+        INSERT OR IGNORE INTO message_queue
             (id, target_session_id, sender_session_id, sender_name, text,
              delivery_mode, from_sm_send, queued_at, timeout_at, notify_on_delivery,
              notify_after_seconds, notify_on_stop, remind_soft_threshold,
@@ -1402,7 +1465,7 @@ fn enqueue_message_with_metadata_conn(
             response_relay_source,
         ],
     )?;
-    Ok(id)
+    Ok(inserted > 0)
 }
 
 fn mark_delivered_conn(conn: &Connection, message_id: &str) -> Result<bool> {
@@ -3502,6 +3565,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stop_notify, ("em002".to_owned(), "other-em".to_owned(), 0));
+    }
+
+    #[test]
+    fn explicit_queue_message_id_is_idempotent_and_rejects_conflicts() {
+        let db_path = unique_temp_path("queue-once");
+        let store = RetainedQueueStore::new(db_path);
+        let metadata = QueueMessageMetadata {
+            message_category: Some("btw_response".to_owned()),
+            ..QueueMessageMetadata::default()
+        };
+        store
+            .enqueue_message_once_with_metadata(
+                "btw-response-request-1",
+                "requester",
+                "summary",
+                "sequential",
+                metadata.clone(),
+            )
+            .unwrap();
+        store
+            .enqueue_message_once_with_metadata(
+                "btw-response-request-1",
+                "requester",
+                "summary",
+                "sequential",
+                metadata.clone(),
+            )
+            .unwrap();
+        assert!(store
+            .enqueue_message_once_with_metadata(
+                "btw-response-request-1",
+                "requester",
+                "different",
+                "sequential",
+                metadata,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .pending_messages_for_target_by_category("requester", "btw_response", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

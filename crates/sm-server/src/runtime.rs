@@ -637,6 +637,54 @@ impl TmuxRuntime {
         ))
     }
 
+    pub fn send_key_input(&self, tmux_session: &str, key: &str) -> Result<bool> {
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
+        }
+        self.send_key(tmux_session, key)?;
+        Ok(true)
+    }
+
+    pub fn list_buffer_ids(&self) -> Result<Vec<String>> {
+        let output = self
+            .tmux_command(["list-buffers", "-F", "#{buffer_name}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| "failed to list tmux buffers")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("no buffers") {
+                return Ok(Vec::new());
+            }
+            bail!("tmux list-buffers failed: {}", stderr.trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    pub fn read_buffer(&self, buffer_id: &str) -> Result<String> {
+        let output = self
+            .tmux_command(["show-buffer", "-b", buffer_id])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| "failed to read tmux buffer")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("tmux show-buffer failed: {}", stderr.trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    pub fn delete_buffer(&self, buffer_id: &str) -> Result<()> {
+        self.run_tmux(["delete-buffer", "-b", buffer_id])
+    }
+
     fn capture_pane_last_line(&self, tmux_session: &str) -> Option<String> {
         let text = self.capture_pane_text(tmux_session)?;
         text.trim_end_matches('\n')
