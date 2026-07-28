@@ -13305,6 +13305,97 @@ async fn runtime_core_rejects_unsupported_provider() {
 }
 
 #[tokio::test]
+async fn runtime_core_restores_codex_session() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-restore-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimecodex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex",
+            "initial_message": "stock codex initial prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["provider"], "codex");
+    let created_at = payload["created_at"].as_str().unwrap().to_owned();
+    let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
+    wait_for_output_contains(app.clone(), "runtimecodex", "stock codex initial prompt").await;
+
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimecodex/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "killed");
+    assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+
+    let day_dir = state_file
+        .with_extension("codex-home")
+        .join("sessions")
+        .join(&created_at[0..4])
+        .join(&created_at[5..7])
+        .join(&created_at[8..10]);
+    fs::create_dir_all(&day_dir).unwrap();
+    fs::write(
+        day_dir.join("rollout-stock-thread-123.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "stock-thread-123",
+                    "cwd": working_dir.display().to_string(),
+                    "timestamp": created_at
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimecodex/restore", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["provider"], "codex");
+    assert_eq!(payload["provider_resume_id"], "stock-thread-123");
+    assert_eq!(payload["status"], "running");
+    assert!(tmux_session_exists(&tmux_socket, &tmux_session));
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimecodex/input",
+        json!({
+            "text": "restored stock codex prompt",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    let output =
+        wait_for_output_contains(app, "runtimecodex", "argv:resume stock-thread-123").await;
+    assert!(output["output"]
+        .as_str()
+        .unwrap()
+        .contains("argv:resume stock-thread-123"));
+}
+
+#[tokio::test]
 async fn runtime_core_starts_review_on_existing_codex_session() {
     if !tmux_available() {
         return;
@@ -15694,6 +15785,13 @@ fn runtime_app_with_command(
             command: runtime_command.to_owned(),
             args: Vec::new(),
             default_model: None,
+            session_index_path: Some(
+                state_file
+                    .with_extension("codex-home")
+                    .join("session_index.jsonl")
+                    .display()
+                    .to_string(),
+            ),
         },
         ..AppConfig::default()
     }))

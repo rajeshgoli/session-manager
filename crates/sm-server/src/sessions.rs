@@ -36,6 +36,8 @@ const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json"
 const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
 const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
 const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
+const CODEX_CLI_SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(1);
+const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -45,6 +47,7 @@ static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct SessionStore {
     state_file: PathBuf,
     legacy_state_file: Option<PathBuf>,
+    codex_sessions_root: PathBuf,
     write_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
     /// Carried on the store rather than read per-request because the codex-fork
@@ -67,6 +70,7 @@ impl SessionStore {
         Self {
             state_file,
             legacy_state_file,
+            codex_sessions_root: expand_home("~/.codex/sessions"),
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
@@ -107,6 +111,7 @@ impl SessionStore {
         Self {
             state_file,
             legacy_state_file: Some(legacy_state_file),
+            codex_sessions_root: expand_home("~/.codex/sessions"),
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
@@ -545,7 +550,30 @@ impl SessionStore {
             model: request.model.clone(),
         };
         let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
+        let codex_cli_creation_binding = (record.provider == "codex").then(|| {
+            let mut excluded_ids = sessions
+                .iter()
+                .filter_map(|session| json_text(session.get("provider_resume_id")))
+                .collect::<BTreeSet<_>>();
+            excluded_ids.extend(codex_cli_existing_session_ids(
+                &record,
+                &self.codex_sessions_root,
+            ));
+            (
+                excluded_ids,
+                OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            )
+        });
         runtime.create_session(&spec)?;
+        if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
+            record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
+                &record,
+                &self.codex_sessions_root,
+                &excluded_ids,
+                launched_at_ns,
+                CODEX_CLI_SESSION_BIND_TIMEOUT,
+            );
+        }
         if let Some(artifacts) = &codex_fork_artifacts {
             match wait_for_codex_fork_provider_resume_id(
                 &artifacts.event_stream_path,
@@ -1102,10 +1130,25 @@ impl SessionStore {
         if !is_primary_node(&record.node) {
             return Ok(Some(CoreRestoreOutcome::UnsupportedNode(record.node)));
         }
-        if !matches!(record.provider.as_str(), "claude" | "codex-fork") {
+        if !matches!(record.provider.as_str(), "claude" | "codex" | "codex-fork") {
             return Ok(Some(CoreRestoreOutcome::UnsupportedProvider(
                 record.provider,
             )));
+        }
+        let stored_provider_resume_id = record.provider_resume_id.clone();
+        if record.provider == "codex" && provider_resume_id_for_restore(&record).is_none() {
+            let claimed_ids = snapshot
+                .sessions
+                .iter()
+                .filter(|session| session.id != record.id)
+                .filter_map(|session| session.provider_resume_id.clone())
+                .collect::<BTreeSet<_>>();
+            record.provider_resume_id = discover_codex_cli_resume_id(
+                &record,
+                &self.codex_sessions_root,
+                &claimed_ids,
+                CodexCliSessionDiscoveryMode::Restore,
+            );
         }
         if record.provider == "claude"
             && record
@@ -1168,8 +1211,7 @@ impl SessionStore {
                 Value::String(socket_name.to_owned()),
             );
         }
-        if record
-            .provider_resume_id
+        if stored_provider_resume_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -5550,6 +5592,161 @@ fn provider_resume_id_for_restore(record: &SessionRecord) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn wait_for_codex_cli_provider_resume_id(
+    record: &SessionRecord,
+    sessions_root: &Path,
+    excluded_ids: &BTreeSet<String>,
+    launched_at_ns: i128,
+    timeout: Duration,
+) -> Option<String> {
+    let started = Instant::now();
+    loop {
+        if let Some(resume_id) = discover_codex_cli_resume_id(
+            record,
+            sessions_root,
+            excluded_ids,
+            CodexCliSessionDiscoveryMode::Creation { launched_at_ns },
+        ) {
+            return Some(resume_id);
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        thread::sleep(CODEX_CLI_SESSION_BIND_POLL);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CodexCliSessionDiscoveryMode {
+    Creation { launched_at_ns: i128 },
+    Restore,
+}
+
+fn discover_codex_cli_resume_id(
+    record: &SessionRecord,
+    sessions_root: &Path,
+    excluded_ids: &BTreeSet<String>,
+    mode: CodexCliSessionDiscoveryMode,
+) -> Option<String> {
+    if record.provider != "codex" || record.working_dir.trim().is_empty() {
+        return None;
+    }
+    if !sessions_root.is_dir() {
+        return None;
+    }
+
+    let resolved_working_dir = resolve_path_lossy(expand_home(&record.working_dir));
+    let target_time_ns = match mode {
+        CodexCliSessionDiscoveryMode::Creation { launched_at_ns } => launched_at_ns,
+        CodexCliSessionDiscoveryMode::Restore => {
+            parse_timestamp_ns(&record.created_at).unwrap_or(0)
+        }
+    };
+    let mut candidates = Vec::new();
+
+    for path in codex_cli_session_files(record, sessions_root) {
+        let Some((candidate_id, candidate_cwd, started_at_ns)) =
+            read_codex_cli_session_metadata(&path)
+        else {
+            continue;
+        };
+        if excluded_ids.contains(&candidate_id)
+            || resolve_path_lossy(expand_home(&candidate_cwd)) != resolved_working_dir
+        {
+            continue;
+        }
+        let started_at_ns = match (mode, started_at_ns) {
+            (CodexCliSessionDiscoveryMode::Creation { launched_at_ns }, Some(started_at_ns))
+                if started_at_ns >= launched_at_ns =>
+            {
+                started_at_ns
+            }
+            (CodexCliSessionDiscoveryMode::Creation { .. }, _) => continue,
+            (CodexCliSessionDiscoveryMode::Restore, started_at_ns) => started_at_ns.unwrap_or(0),
+        };
+        let distance = if started_at_ns == 0 {
+            i128::MAX
+        } else {
+            (target_time_ns - started_at_ns).abs()
+        };
+        candidates.push((distance, -started_at_ns, candidate_id));
+    }
+
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, candidate_id)| candidate_id)
+}
+
+fn codex_cli_existing_session_ids(
+    record: &SessionRecord,
+    sessions_root: &Path,
+) -> BTreeSet<String> {
+    codex_cli_session_files(record, sessions_root)
+        .into_iter()
+        .filter_map(|path| {
+            read_codex_cli_session_metadata(&path).map(|(session_id, _, _)| session_id)
+        })
+        .collect()
+}
+
+fn codex_cli_session_files(record: &SessionRecord, sessions_root: &Path) -> Vec<PathBuf> {
+    let base_date = parse_timestamp(&record.created_at)
+        .unwrap_or_else(OffsetDateTime::now_utc)
+        .date();
+    let mut session_files = Vec::new();
+    for day_offset in [-1, 0, 1] {
+        let Some(date) = base_date.checked_add(TimeDuration::days(day_offset)) else {
+            continue;
+        };
+        let day_dir = sessions_root
+            .join(format!("{:04}", date.year()))
+            .join(format!("{:02}", date.month() as u8))
+            .join(format!("{:02}", date.day()));
+        let Ok(entries) = fs::read_dir(day_dir) else {
+            continue;
+        };
+        session_files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|file_name| file_name.starts_with("rollout-"))
+                && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        }));
+    }
+    session_files
+}
+
+fn read_codex_cli_session_metadata(path: &Path) -> Option<(String, String, Option<i128>)> {
+    let first_line = BufReader::new(fs::File::open(path).ok()?)
+        .lines()
+        .next()?
+        .ok()?;
+    let record = serde_json::from_str::<Value>(&first_line).ok()?;
+    if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = record.get("payload")?.as_object()?;
+    let session_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    let started_at_ns = payload
+        .get("timestamp")
+        .or_else(|| record.get("timestamp"))
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp_ns);
+    Some((session_id, cwd, started_at_ns))
+}
+
 #[derive(Debug, Default)]
 struct ClaudeTranscriptMetadata {
     mtime_ns: i128,
@@ -5681,14 +5878,18 @@ fn session_time_ns(record: &SessionRecord) -> Option<i128> {
 }
 
 fn parse_timestamp_ns(value: &str) -> Option<i128> {
+    parse_timestamp(value).map(OffsetDateTime::unix_timestamp_nanos)
+}
+
+fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
     if let Ok(parsed) = OffsetDateTime::parse(value, &Rfc3339) {
-        return Some(parsed.unix_timestamp_nanos());
+        return Some(parsed);
     }
-    parse_python_naive_datetime(value).map(|parsed| parsed.assume_utc().unix_timestamp_nanos())
+    parse_python_naive_datetime(value).map(PrimitiveDateTime::assume_utc)
 }
 
 fn file_mtime_ns(path: impl AsRef<Path>) -> Result<i128> {
@@ -7634,6 +7835,119 @@ mod tests {
         session.transcript_path = None;
 
         assert_eq!(provider_resume_id_for_restore(&session), None);
+    }
+
+    #[test]
+    fn codex_resume_discovery_matches_cwd_time_and_unclaimed_id() {
+        let temp_dir = unique_temp_path("codex-resume-discovery");
+        let working_dir = temp_dir.join("repo");
+        let other_working_dir = temp_dir.join("other-repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("07").join("28");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&other_working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+
+        for (id, cwd, timestamp) in [
+            (
+                "wrong-cwd",
+                other_working_dir.as_path(),
+                "2026-07-28T20:00:00Z",
+            ),
+            ("claimed-id", working_dir.as_path(), "2026-07-28T20:00:01Z"),
+            ("closest-id", working_dir.as_path(), "2026-07-28T20:00:02Z"),
+            ("farther-id", working_dir.as_path(), "2026-07-28T20:10:00Z"),
+        ] {
+            fs::write(
+                day_dir.join(format!("rollout-{id}.jsonl")),
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "session_meta",
+                        "payload": {
+                            "id": id,
+                            "cwd": cwd.display().to_string(),
+                            "timestamp": timestamp
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut session = session_record("stopped");
+        session.provider = "codex".to_owned();
+        session.working_dir = working_dir.display().to_string();
+        session.created_at = "2026-07-28T20:00:00Z".to_owned();
+        session.last_activity = "2026-07-28T20:09:00Z".to_owned();
+        let claimed_ids = BTreeSet::from(["claimed-id".to_owned()]);
+
+        assert_eq!(
+            discover_codex_cli_resume_id(
+                &session,
+                &sessions_root,
+                &claimed_ids,
+                CodexCliSessionDiscoveryMode::Restore,
+            )
+            .as_deref(),
+            Some("closest-id")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn codex_creation_binding_excludes_preexisting_rollouts() {
+        let temp_dir = unique_temp_path("codex-creation-binding");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("07").join("28");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+
+        let rollout = |id: &str, timestamp: &str| {
+            fs::write(
+                day_dir.join(format!("rollout-{id}.jsonl")),
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "session_meta",
+                        "payload": {
+                            "id": id,
+                            "cwd": working_dir.display().to_string(),
+                            "timestamp": timestamp
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        };
+        rollout("stale-id", "2026-07-28T20:00:00Z");
+
+        let mut session = session_record("stopped");
+        session.provider = "codex".to_owned();
+        session.working_dir = working_dir.display().to_string();
+        session.created_at = "2026-07-28T20:00:00Z".to_owned();
+        session.last_activity = "2026-07-28T20:00:00Z".to_owned();
+        let excluded_ids = codex_cli_existing_session_ids(&session, &sessions_root);
+
+        rollout("delayed-earlier-id", "2026-07-28T19:59:59Z");
+        rollout("new-id", "2026-07-28T20:00:01Z");
+
+        assert_eq!(
+            discover_codex_cli_resume_id(
+                &session,
+                &sessions_root,
+                &excluded_ids,
+                CodexCliSessionDiscoveryMode::Creation {
+                    launched_at_ns: parse_timestamp_ns("2026-07-28T20:00:00Z").unwrap(),
+                },
+            )
+            .as_deref(),
+            Some("new-id")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
