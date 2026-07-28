@@ -179,6 +179,13 @@ def _parse_hook_emitted_at(value: object) -> Optional[datetime]:
         return None
 
 
+def _datetime_is_after(value: datetime, other: datetime) -> Optional[bool]:
+    try:
+        return value > other
+    except TypeError:
+        return None
+
+
 def _is_valid_app_artifact_hash(artifact_hash: str) -> bool:
     return bool(APP_ARTIFACT_HASH_PATTERN.fullmatch(artifact_hash))
 
@@ -9060,7 +9067,18 @@ Provide ONLY the summary, no preamble or questions."""
         emitted_at = data.get("sm_hook_emitted_at")
         parsed_emitted_at = _parse_hook_emitted_at(emitted_at)
         reset_boundary = getattr(session, "context_cycle_reset_emitted_at", None)
-        if parsed_emitted_at and reset_boundary and parsed_emitted_at <= reset_boundary:
+        if (
+            parsed_emitted_at
+            and reset_boundary
+            and _datetime_is_after(parsed_emitted_at, reset_boundary) is False
+        ):
+            return {"status": "stale_sample"}
+        stored_sampled_at = getattr(session, "context_sampled_at", None)
+        if (
+            parsed_emitted_at
+            and stored_sampled_at
+            and _datetime_is_after(parsed_emitted_at, stored_sampled_at) is False
+        ):
             return {"status": "stale_sample"}
 
         sampled_at = parsed_emitted_at or datetime.now()

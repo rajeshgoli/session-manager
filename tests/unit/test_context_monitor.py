@@ -226,6 +226,31 @@ class TestContextSnapshot:
         assert session.context_sampled_at is None
         mock_session_manager._save_state.assert_not_called()
 
+    def test_out_of_order_context_usage_sample_is_ignored(self, client, mock_session_manager, session):
+        _post_context(
+            client,
+            session.id,
+            used_pct=60,
+            total_input_tokens=120_000,
+            sm_hook_emitted_at="2026-07-28T10:01:00Z",
+        )
+        mock_session_manager._save_state.reset_mock()
+
+        stale_resp = _post_context(
+            client,
+            session.id,
+            used_pct=45,
+            total_input_tokens=90_000,
+            sm_hook_emitted_at="2026-07-28T10:00:30Z",
+        )
+
+        assert stale_resp.status_code == 200
+        assert stale_resp.json()["status"] == "stale_sample"
+        assert session.context_used_percentage == 60
+        assert session.context_total_input_tokens == 120_000
+        assert session.tokens_used == 120_000
+        mock_session_manager._save_state.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 2. Critical at 65% (one-shot, urgent)

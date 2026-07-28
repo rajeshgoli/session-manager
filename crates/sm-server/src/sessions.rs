@@ -1486,6 +1486,15 @@ impl SessionStore {
                 return Ok(ContextUsageOutcome::StaleSample);
             }
         }
+        let stored_sample_at =
+            session_snapshot.and_then(|session| json_text(session.get("context_sampled_at")));
+        if let (Some(emitted_at), Some(stored_sample_at)) =
+            (event.emitted_at.as_deref(), stored_sample_at.as_deref())
+        {
+            if !timestamp_is_after(emitted_at, stored_sample_at) {
+                return Ok(ContextUsageOutcome::StaleSample);
+            }
+        }
         // Null until the first API call of a session — nothing to record yet.
         let Some(used_percentage) = event.used_percentage else {
             return Ok(ContextUsageOutcome::NoUsage);
@@ -7727,6 +7736,18 @@ mod tests {
         }
     }
 
+    fn usage_event_at(
+        session_id: &str,
+        used_percentage: f64,
+        tokens: i64,
+        emitted_at: &str,
+    ) -> ContextUsageEvent {
+        ContextUsageEvent {
+            emitted_at: Some(emitted_at.to_owned()),
+            ..usage_event(session_id, used_percentage, tokens)
+        }
+    }
+
     fn lifecycle_event(session_id: &str, event: &str) -> ContextUsageEvent {
         ContextUsageEvent {
             session_id: session_id.to_owned(),
@@ -7834,6 +7855,32 @@ mod tests {
             store.get_session("child001").unwrap().unwrap().tokens_used,
             42_000
         );
+    }
+
+    #[test]
+    fn out_of_order_usage_samples_do_not_regress_the_cached_snapshot() {
+        let store = store_with_monitored_child("ctxoldsample", false, Some("parent01"));
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 60.0, 120_000, "2026-07-28T10:01:00.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(
+                    &usage_event_at("child001", 45.0, 90_000, "2026-07-28T10:00:30.000000Z",),
+                    None,
+                )
+                .unwrap(),
+            ContextUsageOutcome::StaleSample
+        );
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.context_used_percentage, Some(60.0));
+        assert_eq!(session.context_total_input_tokens, Some(120_000));
+        assert_eq!(session.tokens_used, 120_000);
     }
 
     #[test]
