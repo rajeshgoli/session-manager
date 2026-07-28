@@ -3902,25 +3902,8 @@ done
         return session
 
     def get_session(self, session_id: str) -> Optional[Session]:
-        """Get a session by ID, durable alias, or exact user-visible name."""
-        if not session_id:
-            return None
-        session = self.sessions.get(session_id)
-        if session is not None:
-            return session
-
-        for candidate in self.sessions.values():
-            if session_id in self.get_session_aliases(candidate.id):
-                return candidate
-
-        for candidate in self.sessions.values():
-            if session_id in {
-                candidate.friendly_name,
-                candidate.native_title,
-                candidate.name,
-            }:
-                return candidate
-        return None
+        """Get a session by canonical ID."""
+        return self.sessions.get(session_id)
 
     def _default_fork_friendly_name(self, source: Session) -> str:
         """Derive a short explicit name for a fork session."""

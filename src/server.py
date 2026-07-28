@@ -2386,7 +2386,7 @@ def create_app(
         )
 
     def _resolve_session_or_registry_role(session_id: str):
-        """Resolve a direct session id first, then fall back to a live registry role."""
+        """Resolve API-facing session identifiers to a concrete live session."""
         if not app.state.session_manager:
             return None
 
@@ -2395,12 +2395,27 @@ def create_app(
             return session
 
         getter = getattr(app.state.session_manager, "lookup_agent_registration", None)
-        if not callable(getter):
+        if callable(getter):
+            registration = getter(session_id)
+            if registration is not None:
+                return app.state.session_manager.get_session(registration.session_id)
+
+        lister = getattr(app.state.session_manager, "list_sessions", None)
+        if not callable(lister):
             return None
-        registration = getter(session_id)
-        if registration is None:
-            return None
-        return app.state.session_manager.get_session(registration.session_id)
+        try:
+            sessions = lister(include_stopped=False)
+        except TypeError:
+            sessions = lister()
+        alias_getter = getattr(app.state.session_manager, "get_session_aliases", None)
+        for candidate in sessions or []:
+            aliases = alias_getter(candidate.id) if callable(alias_getter) else []
+            if session_id in aliases:
+                return candidate
+        for candidate in sessions or []:
+            if _effective_session_name(candidate, sync_native_title=False) == session_id:
+                return candidate
+        return None
 
     def _job_watch_to_response(registration) -> JobWatchResponse:
         target_session = app.state.session_manager.get_session(registration.target_session_id)
@@ -9027,6 +9042,7 @@ Provide ONLY the summary, no preamble or questions."""
             session.context_used_percentage = None
             session.context_total_input_tokens = None
             session.context_sampled_at = None
+            await _save_session_manager_state(app.state.session_manager)
             if queue_mgr:
                 queue_mgr.reset_remind(session_id, force_tracked=True)
             logger.info(
@@ -9087,6 +9103,7 @@ Provide ONLY the summary, no preamble or questions."""
             or session.context_used_percentage != used_pct
             or session.context_total_input_tokens != total_input_tokens
             or session.context_sampled_at is None
+            or (parsed_emitted_at is not None and session.context_sampled_at != sampled_at)
         )
         if changed:
             session.tokens_used = total_input_tokens

@@ -169,7 +169,7 @@ class TestContextSnapshot:
         assert session.context_total_input_tokens is None
         assert session.context_sampled_at is None
 
-    def test_context_usage_unchanged_sample_is_not_resaved(self, client, mock_session_manager, session):
+    def test_context_usage_unstamped_unchanged_sample_is_not_resaved(self, client, mock_session_manager, session):
         session.context_monitor_enabled = False
 
         _post_context(
@@ -186,12 +186,37 @@ class TestContextSnapshot:
             session.id,
             used_pct=43,
             total_input_tokens=86_214,
-            sm_hook_emitted_at="2026-07-28T10:00:30Z",
         )
 
         assert resp.status_code == 200
         assert resp.json()["status"] == "not_registered"
         mock_session_manager._save_state.assert_not_called()
+
+    def test_context_usage_unchanged_sample_advances_watermark(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+
+        _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+        first_sampled_at = session.context_sampled_at
+        mock_session_manager._save_state.reset_mock()
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:30Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert session.context_sampled_at > first_sampled_at
+        mock_session_manager._save_state.assert_called_once()
 
     def test_context_usage_before_latest_reset_is_ignored(self, client, mock_session_manager, session):
         _post_context(
@@ -1004,6 +1029,7 @@ class TestCompactionSuppressRemind:
         _post_event(client, session.id, event="compaction_complete")
         queue_mgr = mock_session_manager.message_queue_manager
         queue_mgr.reset_remind.assert_called_once_with(session.id, force_tracked=True)
+        mock_session_manager._save_state.assert_called_once()
 
     def test_compaction_complete_returns_logged_status(self, client, session):
         """compaction_complete returns compaction_complete_logged status."""

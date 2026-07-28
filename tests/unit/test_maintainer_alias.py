@@ -85,7 +85,7 @@ def test_get_session_resolves_friendly_name(tmp_path):
     session.friendly_name = "arch-orch-4"
     manager.sessions[session.id] = session
 
-    assert manager.get_session("arch-orch-4") is session
+    assert manager.get_session("arch-orch-4") is None
 
     client = TestClient(create_app(session_manager=manager))
     response = client.get("/sessions/arch-orch-4")

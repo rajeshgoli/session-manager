@@ -1522,7 +1522,10 @@ impl SessionStore {
             let changed = previous_used != Some(tokens_used)
                 || previous_pct != Some(used_percentage)
                 || previous_context_tokens != Some(tokens_used)
-                || json_text(session.get("context_sampled_at")).is_none();
+                || json_text(session.get("context_sampled_at")).is_none()
+                || event.emitted_at.is_some()
+                    && json_text(session.get("context_sampled_at")).as_deref()
+                        != Some(sampled_at.as_str());
             if changed {
                 session.insert("tokens_used".to_owned(), json!(tokens_used));
                 session.insert("context_used_percentage".to_owned(), json!(used_percentage));
@@ -7881,6 +7884,42 @@ mod tests {
         assert_eq!(session.context_used_percentage, Some(60.0));
         assert_eq!(session.context_total_input_tokens, Some(120_000));
         assert_eq!(session.tokens_used, 120_000);
+    }
+
+    #[test]
+    fn identical_stamped_usage_samples_advance_the_ordering_watermark() {
+        let store = store_with_monitored_child("ctxsamewatermark", false, Some("parent01"));
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 60.0, 120_000, "2026-07-28T10:00:00.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 60.0, 120_000, "2026-07-28T10:01:00.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(
+                    &usage_event_at("child001", 45.0, 90_000, "2026-07-28T10:00:30.000000Z",),
+                    None,
+                )
+                .unwrap(),
+            ContextUsageOutcome::StaleSample
+        );
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.context_used_percentage, Some(60.0));
+        assert_eq!(session.context_total_input_tokens, Some(120_000));
+        assert_eq!(
+            session.context_sampled_at.as_deref(),
+            Some("2026-07-28T10:01:00.000000Z")
+        );
     }
 
     #[test]
