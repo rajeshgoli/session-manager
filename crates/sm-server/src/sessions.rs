@@ -1519,18 +1519,24 @@ impl SessionStore {
             let previous_context_tokens = session
                 .get("context_total_input_tokens")
                 .and_then(Value::as_i64);
+            let previous_compaction_active = session
+                .get("context_compaction_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let changed = previous_used != Some(tokens_used)
                 || previous_pct != Some(used_percentage)
                 || previous_context_tokens != Some(tokens_used)
                 || json_text(session.get("context_sampled_at")).is_none()
                 || event.emitted_at.is_some()
                     && json_text(session.get("context_sampled_at")).as_deref()
-                        != Some(sampled_at.as_str());
+                        != Some(sampled_at.as_str())
+                || previous_compaction_active;
             if changed {
                 session.insert("tokens_used".to_owned(), json!(tokens_used));
                 session.insert("context_used_percentage".to_owned(), json!(used_percentage));
                 session.insert("context_total_input_tokens".to_owned(), json!(tokens_used));
                 session.insert("context_sampled_at".to_owned(), Value::String(sampled_at));
+                session.insert("context_compaction_active".to_owned(), Value::Bool(false));
             }
             if !enabled {
                 if changed {
@@ -8211,6 +8217,30 @@ mod tests {
             .unwrap();
         // compaction notice + the two warnings
         assert_eq!(context_monitor_messages(&store).len(), 3);
+    }
+
+    #[test]
+    fn fresh_usage_sample_clears_stale_compaction_state() {
+        let store = store_with_monitored_child("ctxcompactfresh", true, Some("parent01"));
+        let mut compaction = lifecycle_event("child001", "compaction");
+        compaction.emitted_at = Some("2026-07-28T10:00:00.000000Z".to_owned());
+        store.apply_context_usage_event(&compaction, None).unwrap();
+
+        let compacting = store.get_context_snapshot("child001").unwrap().unwrap();
+        assert_eq!(compacting.state, "compacting");
+        assert!(compacting.compaction_active);
+
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 43.0, 86_214, "2026-07-28T10:00:01.000000Z"),
+                None,
+            )
+            .unwrap();
+
+        let snapshot = store.get_context_snapshot("child001").unwrap().unwrap();
+        assert_eq!(snapshot.state, "normal");
+        assert!(!snapshot.compaction_active);
+        assert_eq!(snapshot.used_percentage, Some(43.0));
     }
 
     #[test]

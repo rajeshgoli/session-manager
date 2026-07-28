@@ -9106,12 +9106,14 @@ Provide ONLY the summary, no preamble or questions."""
             or session.context_total_input_tokens != total_input_tokens
             or session.context_sampled_at is None
             or (parsed_emitted_at is not None and session.context_sampled_at != sampled_at)
+            or getattr(session, "_is_compacting", False)
         )
         if changed:
             session.tokens_used = total_input_tokens
             session.context_used_percentage = used_pct
             session.context_total_input_tokens = total_input_tokens
             session.context_sampled_at = sampled_at
+            session._is_compacting = False
 
         # Gate: skip unregistered sessions for warning/critical alerts (#206).
         if not session.context_monitor_enabled:

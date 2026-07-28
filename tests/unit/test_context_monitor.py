@@ -276,6 +276,30 @@ class TestContextSnapshot:
         assert session.tokens_used == 120_000
         mock_session_manager._save_state.assert_not_called()
 
+    def test_context_usage_clears_stale_compaction_state(self, client, mock_session_manager, session):
+        session.context_monitor_enabled = False
+        session._is_compacting = True
+        session.context_cycle_reset_emitted_at = None
+
+        resp = _post_context(
+            client,
+            session.id,
+            used_pct=43,
+            total_input_tokens=86_214,
+            sm_hook_emitted_at="2026-07-28T10:00:00Z",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "not_registered"
+        assert session._is_compacting is False
+        mock_session_manager._save_state.assert_called_once()
+
+        context_resp = client.get(f"/sessions/{session.id}/context")
+        assert context_resp.status_code == 200
+        payload = context_resp.json()
+        assert payload["state"] == "normal"
+        assert payload["compaction_active"] is False
+
 
 # ---------------------------------------------------------------------------
 # 2. Critical at 65% (one-shot, urgent)
