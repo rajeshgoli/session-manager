@@ -562,7 +562,8 @@ impl SessionStore {
             initial_message: request.initial_message.clone(),
             model: request.model.clone(),
         };
-        let codex_cli_excluded_ids = (record.provider == "codex").then(|| {
+        let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
+        let codex_cli_creation_binding = (record.provider == "codex").then(|| {
             let mut excluded_ids = sessions
                 .iter()
                 .filter_map(|session| json_text(session.get("provider_resume_id")))
@@ -571,15 +572,18 @@ impl SessionStore {
                 &record,
                 &self.codex_sessions_root,
             ));
-            excluded_ids
+            (
+                excluded_ids,
+                OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            )
         });
-        let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
         runtime.create_session(&spec)?;
-        if let Some(excluded_ids) = codex_cli_excluded_ids {
+        if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
                 &record,
                 &self.codex_sessions_root,
                 &excluded_ids,
+                launched_at_ns,
                 CODEX_CLI_SESSION_BIND_TIMEOUT,
             );
         }
@@ -1152,8 +1156,12 @@ impl SessionStore {
                 .filter(|session| session.id != record.id)
                 .filter_map(|session| session.provider_resume_id.clone())
                 .collect::<BTreeSet<_>>();
-            record.provider_resume_id =
-                discover_codex_cli_resume_id(&record, &self.codex_sessions_root, &claimed_ids);
+            record.provider_resume_id = discover_codex_cli_resume_id(
+                &record,
+                &self.codex_sessions_root,
+                &claimed_ids,
+                CodexCliSessionDiscoveryMode::Restore,
+            );
         }
         if record.provider == "claude"
             && record
@@ -5601,11 +5609,17 @@ fn wait_for_codex_cli_provider_resume_id(
     record: &SessionRecord,
     sessions_root: &Path,
     excluded_ids: &BTreeSet<String>,
+    launched_at_ns: i128,
     timeout: Duration,
 ) -> Option<String> {
     let started = Instant::now();
     loop {
-        if let Some(resume_id) = discover_codex_cli_resume_id(record, sessions_root, excluded_ids) {
+        if let Some(resume_id) = discover_codex_cli_resume_id(
+            record,
+            sessions_root,
+            excluded_ids,
+            CodexCliSessionDiscoveryMode::Creation { launched_at_ns },
+        ) {
             return Some(resume_id);
         }
         if started.elapsed() >= timeout {
@@ -5615,10 +5629,17 @@ fn wait_for_codex_cli_provider_resume_id(
     }
 }
 
+#[derive(Clone, Copy)]
+enum CodexCliSessionDiscoveryMode {
+    Creation { launched_at_ns: i128 },
+    Restore,
+}
+
 fn discover_codex_cli_resume_id(
     record: &SessionRecord,
     sessions_root: &Path,
     excluded_ids: &BTreeSet<String>,
+    mode: CodexCliSessionDiscoveryMode,
 ) -> Option<String> {
     if record.provider != "codex" || record.working_dir.trim().is_empty() {
         return None;
@@ -5628,7 +5649,12 @@ fn discover_codex_cli_resume_id(
     }
 
     let resolved_working_dir = resolve_path_lossy(expand_home(&record.working_dir));
-    let target_time_ns = session_time_ns(record).unwrap_or(0);
+    let target_time_ns = match mode {
+        CodexCliSessionDiscoveryMode::Creation { launched_at_ns } => launched_at_ns,
+        CodexCliSessionDiscoveryMode::Restore => {
+            parse_timestamp_ns(&record.created_at).unwrap_or(0)
+        }
+    };
     let mut candidates = Vec::new();
 
     for path in codex_cli_session_files(record, sessions_root) {
@@ -5642,7 +5668,15 @@ fn discover_codex_cli_resume_id(
         {
             continue;
         }
-        let started_at_ns = started_at_ns.unwrap_or(0);
+        let started_at_ns = match (mode, started_at_ns) {
+            (CodexCliSessionDiscoveryMode::Creation { launched_at_ns }, Some(started_at_ns))
+                if started_at_ns >= launched_at_ns =>
+            {
+                started_at_ns
+            }
+            (CodexCliSessionDiscoveryMode::Creation { .. }, _) => continue,
+            (CodexCliSessionDiscoveryMode::Restore, started_at_ns) => started_at_ns.unwrap_or(0),
+        };
         let distance = if started_at_ns == 0 {
             i128::MAX
         } else {
@@ -7858,11 +7892,17 @@ mod tests {
         session.provider = "codex".to_owned();
         session.working_dir = working_dir.display().to_string();
         session.created_at = "2026-07-28T20:00:00Z".to_owned();
-        session.last_activity = "2026-07-28T20:00:00Z".to_owned();
+        session.last_activity = "2026-07-28T20:09:00Z".to_owned();
         let claimed_ids = BTreeSet::from(["claimed-id".to_owned()]);
 
         assert_eq!(
-            discover_codex_cli_resume_id(&session, &sessions_root, &claimed_ids).as_deref(),
+            discover_codex_cli_resume_id(
+                &session,
+                &sessions_root,
+                &claimed_ids,
+                CodexCliSessionDiscoveryMode::Restore,
+            )
+            .as_deref(),
             Some("closest-id")
         );
 
@@ -7904,10 +7944,19 @@ mod tests {
         session.last_activity = "2026-07-28T20:00:00Z".to_owned();
         let excluded_ids = codex_cli_existing_session_ids(&session, &sessions_root);
 
+        rollout("delayed-earlier-id", "2026-07-28T19:59:59Z");
         rollout("new-id", "2026-07-28T20:00:01Z");
 
         assert_eq!(
-            discover_codex_cli_resume_id(&session, &sessions_root, &excluded_ids).as_deref(),
+            discover_codex_cli_resume_id(
+                &session,
+                &sessions_root,
+                &excluded_ids,
+                CodexCliSessionDiscoveryMode::Creation {
+                    launched_at_ns: parse_timestamp_ns("2026-07-28T20:00:00Z").unwrap(),
+                },
+            )
+            .as_deref(),
             Some("new-id")
         );
 
