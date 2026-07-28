@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub tmux: TmuxConfig,
     pub sm_send: SmSendConfig,
     pub tool_logging: ToolLoggingConfig,
+    pub context_monitor: ContextMonitorConfig,
     pub codex_rollout: CodexRolloutConfig,
     pub codex_requests: CodexRequestsConfig,
     pub codex_events: CodexEventsConfig,
@@ -56,6 +57,7 @@ impl Default for AppConfig {
             tmux: TmuxConfig::default(),
             sm_send: SmSendConfig::default(),
             tool_logging: ToolLoggingConfig::default(),
+            context_monitor: ContextMonitorConfig::default(),
             codex_rollout: CodexRolloutConfig::default(),
             codex_requests: CodexRequestsConfig::default(),
             codex_events: CodexEventsConfig::default(),
@@ -779,6 +781,34 @@ fn default_tool_usage_db_path() -> String {
     "~/.local/share/claude-sessions/tool_usage.db".to_owned()
 }
 
+/// Thresholds for the context monitor (sm#203/#206). Percentages are of the
+/// model's context window, matching what Claude reports as
+/// `context_window.used_percentage`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextMonitorConfig {
+    #[serde(default = "default_context_warning_percentage")]
+    pub warning_percentage: f64,
+    #[serde(default = "default_context_critical_percentage")]
+    pub critical_percentage: f64,
+}
+
+impl Default for ContextMonitorConfig {
+    fn default() -> Self {
+        Self {
+            warning_percentage: default_context_warning_percentage(),
+            critical_percentage: default_context_critical_percentage(),
+        }
+    }
+}
+
+fn default_context_warning_percentage() -> f64 {
+    50.0
+}
+
+fn default_context_critical_percentage() -> f64 {
+    65.0
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexRolloutConfig {
     #[serde(
@@ -1062,6 +1092,8 @@ struct RawConfig {
     #[serde(default)]
     tool_logging: ToolLoggingConfig,
     #[serde(default)]
+    context_monitor: ContextMonitorConfig,
+    #[serde(default)]
     codex_rollout: CodexRolloutConfig,
     #[serde(default)]
     codex_requests: Option<RawCodexRequestsConfig>,
@@ -1160,6 +1192,7 @@ impl From<RawConfig> for AppConfig {
             tmux: raw.tmux,
             sm_send: raw.sm_send,
             tool_logging: raw.tool_logging,
+            context_monitor: raw.context_monitor,
             codex_rollout: raw.codex_rollout,
             codex_requests,
             codex_events,

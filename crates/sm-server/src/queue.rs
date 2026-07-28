@@ -1268,6 +1268,29 @@ impl RetainedQueueStore {
         })
     }
 
+    /// Drops undelivered messages a session raised about *itself*. A context
+    /// reset invalidates the alerts that describe the discarded context, and
+    /// those are addressed to the monitor rather than the session, so they
+    /// cannot be found by target.
+    pub fn cancel_pending_messages_from_sender_category(
+        &self,
+        sender_session_id: &str,
+        message_category: &str,
+    ) -> Result<usize> {
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                r#"
+                DELETE FROM message_queue
+                WHERE sender_session_id = ?1
+                  AND message_category = ?2
+                  AND delivered_at IS NULL
+                "#,
+                params![sender_session_id, message_category],
+            )?;
+            Ok(changed)
+        })
+    }
+
     pub fn upsert_stop_notify(
         &self,
         session_id: &str,

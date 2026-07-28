@@ -7488,6 +7488,180 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
 }
 
 #[tokio::test]
+async fn context_usage_hook_is_served_and_records_tokens() {
+    // The route existed only in the Python server until #1132, so every status
+    // line post 404'd and tokens_used stayed at its fixture value forever.
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "used_percentage": 41.5,
+            "total_input_tokens": 83_000
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["used_percentage"], json!(41.5));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tokens_used"], json!(83_000));
+
+    // Before the first API call Claude reports a null percentage on every
+    // render; that must not clobber the last real reading.
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({ "session_id": "run12345", "used_percentage": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert!(payload["used_percentage"].is_null());
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tokens_used"], json!(83_000));
+}
+
+#[tokio::test]
+async fn compaction_complete_returns_the_handoff_path_for_reinjection() {
+    // post_compact_recovery.sh reads the path off this response rather than from
+    // /sessions/{id}: that route sits behind Google auth, which a hook on a
+    // remote node cannot satisfy — it carries only a node hook secret, and only
+    // /hooks/* accepts one.
+    let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let handoff = unique_temp_path();
+    fs::write(&handoff, "handoff contents").unwrap();
+    state["sessions"][0]["last_handoff_path"] = json!(handoff.display().to_string());
+    fs::write(&state_file, state.to_string()).unwrap();
+
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({ "session_id": "run12345", "event": "compaction_complete" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "compaction_complete_logged");
+    assert_eq!(
+        payload["last_handoff_path"],
+        json!(handoff.display().to_string())
+    );
+
+    // A session that never ran a handoff reports null rather than omitting it.
+    let (status, payload) = post_json(
+        app,
+        "/hooks/context-usage",
+        json!({ "session_id": "oldstate", "event": "compaction_complete" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["last_handoff_path"].is_null());
+}
+
+#[tokio::test]
+async fn context_usage_hook_rejects_a_sample_emitted_before_the_current_cycle() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    // A status-line render that raced the reset: emitted before it, delivered
+    // after it by its own detached curl.
+    let (status, _) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "event": "context_reset",
+            "sm_hook_emitted_at": "2026-01-01T00:00:00.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "used_percentage": 90.0,
+            "total_input_tokens": 180_000,
+            "sm_hook_emitted_at": "2020-01-01T00:00:00.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "stale_sample");
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tokens_used"], json!(42));
+}
+
+#[tokio::test]
+async fn context_usage_hook_drops_undecodable_bodies_without_erroring() {
+    // route_auth_matrix.md:144 — decodes JSON or returns 204. A hook that gets a
+    // client error back is a hook failure surfaced in a live pane.
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    for body in ["", "{\"session_id\":", "not json at all"] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/hooks/context-usage")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "body: {body:?} -> {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(bytes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn context_usage_hook_reports_unregistered_and_unknown_sessions() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({ "session_id": "oldstate", "used_percentage": 90.0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "not_registered");
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/context-usage",
+        json!({ "session_id": "nosuchid", "used_percentage": 90.0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "unknown_session");
+}
+
+#[tokio::test]
 async fn claude_user_prompt_submit_hook_marks_session_working_at_turn_start() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
