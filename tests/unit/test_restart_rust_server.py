@@ -364,6 +364,39 @@ def test_adopt_with_nothing_to_adopt(env):
     assert_service_untouched(env)
 
 
+def test_symlink_alias_of_cargo_output_is_rejected(env):
+    """A string compare would pass while launchd still execs cargo's artifact."""
+    _write(env["cargo_output"], "REBUILT", executable=True)
+    alias = env["tmp"] / "alias-sm-server"
+    alias.symlink_to(env["cargo_output"])
+
+    result = env["run"](SM_BINARY=str(alias))
+
+    assert result.returncode != 0
+    assert "resolves to the same file as cargo's output" in result.stderr
+    assert "cargo build" not in calls(env)
+
+
+def test_lexical_alias_of_cargo_output_is_rejected(env):
+    aliased = str(env["cargo_output"].parent / ".." / env["cargo_output"].parent.name
+                  / env["cargo_output"].name)
+
+    result = env["run"](SM_BINARY=aliased)
+
+    assert result.returncode != 0
+    assert "resolves to the same file as cargo's output" in result.stderr
+
+
+def test_relative_overrides_resolve_against_the_repo_root(env):
+    """The cutover resolves relative paths against its repo root, so we must
+    too, or we would install one file and register another."""
+    result = env["run"](SM_CONFIG="definitely-not-here.yaml")
+
+    assert result.returncode != 0
+    assert f"config not readable: {REPO_ROOT}/definitely-not-here.yaml" in result.stderr
+    assert_service_untouched(env)
+
+
 def test_service_must_not_be_registered_against_cargo_output(env):
     """If they were the same path, a build would write the live binary."""
     same = str(env["cargo_output"])

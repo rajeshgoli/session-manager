@@ -151,6 +151,29 @@ fi
 step() { printf '\n==> %s\n' "$1"; }
 fail() { echo "ERROR: $1" >&2; exit 1; }
 
+# Relative paths must resolve exactly as rust-service-cutover.sh resolves them
+# (against the repo root, not the caller's cwd). Otherwise we would stage and
+# install one file while registering another, and still pass every health check.
+resolve_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$REPO_ROOT/$1" ;;
+  esac
+}
+
+# Follows symlinks and normalises `..`, and works on paths that do not exist yet.
+canonical_path() {
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+SM_BINARY="$(resolve_path "$SM_BINARY")"
+SM_CARGO_OUTPUT="$(resolve_path "$SM_CARGO_OUTPUT")"
+SM_TARGET_DIR="$(resolve_path "$SM_TARGET_DIR")"
+SM_CONFIG="$(resolve_path "$SM_CONFIG")"
+SM_PLIST="$(resolve_path "$SM_PLIST")"
+SM_CUTOVER="$(resolve_path "$SM_CUTOVER")"
+[[ -n "$SM_LOCAL_ENV" ]] && SM_LOCAL_ENV="$(resolve_path "$SM_LOCAL_ENV")"
+
 # --plist must follow --label: the cutover recomputes the plist path from the
 # label, so passing them the other way round would discard our value.
 cutover_args=(
@@ -198,6 +221,31 @@ print(len(sessions))
 
 job_loaded() {
   launchctl print "$DOMAIN/$SM_LABEL" >/dev/null 2>&1
+}
+
+# True when any program argument in the live plist resolves to cargo's output.
+# Compared canonically rather than as a literal string, for the same reason as
+# the SM_BINARY check: an alias would otherwise hide the migration state.
+plist_runs_cargo_output() {
+  python3 - "$SM_PLIST" "$SM_CARGO_OUTPUT" <<'PY'
+import os, re, sys
+
+plist_path, target = sys.argv[1], sys.argv[2]
+try:
+    with open(plist_path, encoding="utf-8", errors="replace") as handle:
+        text = handle.read()
+except OSError:
+    sys.exit(1)
+
+target = os.path.realpath(target)
+for value in re.findall(r"<string>(.*?)</string>", text, re.S):
+    value = value.strip()
+    if not value or os.pathsep in value:  # skip PATH-style joined values
+        continue
+    if os.path.realpath(value) == target:
+        sys.exit(0)
+sys.exit(1)
+PY
 }
 
 # First "key = value" line only: launchctl repeats `state` for nested entries.
@@ -248,20 +296,22 @@ for label in $SM_PYTHON_LABELS; do
   fi
 done
 
-if [[ "$SKIP_BUILD" -eq 0 && "$SM_BINARY" == "$SM_CARGO_OUTPUT" ]]; then
-  fail "SM_BINARY and SM_CARGO_OUTPUT are both $SM_BINARY. The service must not be
-       registered against cargo's output path: a build would then write the
-       registered binary directly, and a server that exited before the restart
-       would be respawned by KeepAlive onto an unverified build.
-       The running service was not touched."
+# Compared canonically: a symlink or a `..` alias would otherwise slip past and
+# leave cargo writing the very executable launchd runs.
+if [[ "$SKIP_BUILD" -eq 0 ]] \
+   && [[ "$(canonical_path "$SM_BINARY")" == "$(canonical_path "$SM_CARGO_OUTPUT")" ]]; then
+  fail "$SM_BINARY resolves to the same file as cargo's output
+       ($SM_CARGO_OUTPUT). The service must not be registered against cargo's
+       output path: a build would then write the registered binary directly, and
+       a server that exited before the restart would be respawned by KeepAlive
+       onto an unverified build. The running service was not touched."
 fi
 
 # Same hazard, one step removed: the configuration above may already be correct
 # while the *live registration* still runs from cargo's output - which is exactly
 # the state a first adoption starts in. Building then would overwrite the
 # executable the loaded job is using, before we have re-registered it.
-if [[ "$SKIP_BUILD" -eq 0 && -f "$SM_PLIST" ]] \
-   && grep -qF "<string>$SM_CARGO_OUTPUT</string>" "$SM_PLIST"; then
+if [[ "$SKIP_BUILD" -eq 0 && -f "$SM_PLIST" ]] && plist_runs_cargo_output; then
   fail "the live registration in $SM_PLIST still runs from cargo's output
        ($SM_CARGO_OUTPUT).
        Building now would overwrite the executable the loaded job is using, and a
