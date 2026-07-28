@@ -8432,6 +8432,74 @@ async fn session_output_resolves_exact_friendly_name() {
 }
 
 #[tokio::test]
+async fn rendered_session_output_rejects_remote_tmux_sessions() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "remoteout",
+                    "name": "codex-fork-remoteout",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-fork-remoteout",
+                    "node": "macbook",
+                    "provider": "codex-fork",
+                    "log_file": "/tmp/remoteout.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) =
+        get_json(app, "/sessions/remoteout/output?lines=10&rendered=true").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "Rendered output is unavailable for remote node macbook"
+    );
+}
+
+#[tokio::test]
+async fn rendered_session_output_is_empty_for_tmuxless_codex_app() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "appout",
+                    "name": "codex-app-appout",
+                    "working_dir": "/repo",
+                    "tmux_session": "",
+                    "node": "primary",
+                    "provider": "codex-app",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions/appout/output?lines=10&rendered=true").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "appout");
+    assert!(payload["output"].is_null());
+}
+
+#[tokio::test]
 async fn session_tool_calls_reads_pre_tool_use_rows() {
     let state_file = write_session_fixture();
     let tool_db = unique_temp_path();
@@ -11378,6 +11446,16 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
         wait_for_output_contains(app.clone(), "runtimecore", "runtime:initial runtime prompt")
             .await;
     assert_eq!(payload["session_id"], "runtimecore");
+    let (status, rendered) = get_json(
+        app.clone(),
+        "/sessions/runtimecore/output?lines=5&rendered=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rendered = rendered["output"].as_str().unwrap();
+    assert!(rendered.contains("runtime:initial runtime prompt"));
+    assert!(rendered.lines().count() <= 5);
+    assert!(!rendered.contains('\u{1b}'));
     wait_for_output_contains(
         app.clone(),
         "runtimecore",

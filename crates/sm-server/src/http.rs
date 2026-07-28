@@ -6639,9 +6639,39 @@ async fn session_output(
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    let output = state
-        .session_store
-        .capture_output(&session.id, query.lines.unwrap_or(50))?;
+    let lines = query.lines.unwrap_or(50);
+    if query.rendered {
+        if !is_primary_node(&session.node) {
+            return Err(ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!(
+                    "Rendered output is unavailable for remote node {}",
+                    session.node
+                ),
+            });
+        }
+        if session.provider == "codex-app" {
+            return Ok(Json(SessionOutputResponse {
+                session_id: session.id,
+                output: None,
+            }));
+        }
+        let runtime = TmuxRuntime::from_app_config(&state.config)
+            .for_socket_name(session.tmux_socket_name.as_deref());
+        let tmux_session = session.tmux_session.clone();
+        let output =
+            tokio::task::spawn_blocking(move || runtime.capture_pane_tail(&tmux_session, lines))
+                .await
+                .map_err(|error| ApiError::Status {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    detail: format!("Failed to capture rendered session output: {error}"),
+                })?;
+        return Ok(Json(SessionOutputResponse {
+            session_id: session.id,
+            output,
+        }));
+    }
+    let output = state.session_store.capture_output(&session.id, lines)?;
     Ok(Json(SessionOutputResponse {
         session_id: session.id,
         output,
@@ -11073,6 +11103,8 @@ fn queue_job_default_timeout_seconds(job_type: &str) -> Option<i64> {
 #[derive(Debug, Deserialize)]
 struct SessionOutputQuery {
     lines: Option<usize>,
+    #[serde(default)]
+    rendered: bool,
 }
 
 #[derive(Debug, Deserialize)]

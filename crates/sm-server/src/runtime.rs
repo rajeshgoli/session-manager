@@ -610,6 +610,34 @@ impl TmuxRuntime {
         Some(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    pub fn capture_pane_tail(&self, tmux_session: &str, lines: usize) -> Option<String> {
+        if lines == 0 {
+            return Some(String::new());
+        }
+        let start = format!("-{}", lines.min(500));
+        let output = self
+            .tmux_command([
+                "capture-pane",
+                "-p",
+                "-J",
+                "-S",
+                start.as_str(),
+                "-t",
+                tmux_session,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(tail_text_lines(
+            &String::from_utf8_lossy(&output.stdout),
+            lines,
+        ))
+    }
+
     fn capture_pane_last_line(&self, tmux_session: &str) -> Option<String> {
         let text = self.capture_pane_text(tmux_session)?;
         text.trim_end_matches('\n')
@@ -785,6 +813,25 @@ fn split_send_text_chunks(text: &str, max_chunk_chars: usize) -> Vec<&str> {
         remaining = &remaining[split_at..];
     }
     chunks
+}
+
+fn tail_text_lines(text: &str, lines: usize) -> String {
+    if lines == 0 {
+        return String::new();
+    }
+    let mut rows = text.lines().collect::<Vec<_>>();
+    while rows.last().is_some_and(|row| row.trim().is_empty()) {
+        rows.pop();
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    let start = rows.len().saturating_sub(lines);
+    let mut output = rows[start..].join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output
 }
 
 fn byte_index_after_chars(value: &str, char_count: usize) -> usize {
@@ -1007,6 +1054,19 @@ mod tests {
     fn split_send_text_chunks_preserves_utf8_boundaries() {
         let chunks = split_send_text_chunks("åßçdé", 2);
         assert_eq!(chunks, vec!["åß", "çd", "é"]);
+    }
+
+    #[test]
+    fn capture_pane_tail_requests_rendered_scrollback_and_bounds_rows() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let output = runtime.capture_pane_tail("sm-test", 1).unwrap();
+
+        assert_eq!(output, ">\n");
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("capture-pane -p -J -S -1 -t sm-test"));
     }
 
     #[test]
