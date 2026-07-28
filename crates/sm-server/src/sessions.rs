@@ -562,17 +562,24 @@ impl SessionStore {
             initial_message: request.initial_message.clone(),
             model: request.model.clone(),
         };
-        let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
-        runtime.create_session(&spec)?;
-        if record.provider == "codex" {
-            let claimed_ids = sessions
+        let codex_cli_excluded_ids = (record.provider == "codex").then(|| {
+            let mut excluded_ids = sessions
                 .iter()
                 .filter_map(|session| json_text(session.get("provider_resume_id")))
                 .collect::<BTreeSet<_>>();
+            excluded_ids.extend(codex_cli_existing_session_ids(
+                &record,
+                &self.codex_sessions_root,
+            ));
+            excluded_ids
+        });
+        let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
+        runtime.create_session(&spec)?;
+        if let Some(excluded_ids) = codex_cli_excluded_ids {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
                 &record,
                 &self.codex_sessions_root,
-                &claimed_ids,
+                &excluded_ids,
                 CODEX_CLI_SESSION_BIND_TIMEOUT,
             );
         }
@@ -5593,12 +5600,12 @@ fn provider_resume_id_for_restore(record: &SessionRecord) -> Option<String> {
 fn wait_for_codex_cli_provider_resume_id(
     record: &SessionRecord,
     sessions_root: &Path,
-    claimed_ids: &BTreeSet<String>,
+    excluded_ids: &BTreeSet<String>,
     timeout: Duration,
 ) -> Option<String> {
     let started = Instant::now();
     loop {
-        if let Some(resume_id) = discover_codex_cli_resume_id(record, sessions_root, claimed_ids) {
+        if let Some(resume_id) = discover_codex_cli_resume_id(record, sessions_root, excluded_ids) {
             return Some(resume_id);
         }
         if started.elapsed() >= timeout {
@@ -5611,7 +5618,7 @@ fn wait_for_codex_cli_provider_resume_id(
 fn discover_codex_cli_resume_id(
     record: &SessionRecord,
     sessions_root: &Path,
-    claimed_ids: &BTreeSet<String>,
+    excluded_ids: &BTreeSet<String>,
 ) -> Option<String> {
     if record.provider != "codex" || record.working_dir.trim().is_empty() {
         return None;
@@ -5622,11 +5629,52 @@ fn discover_codex_cli_resume_id(
 
     let resolved_working_dir = resolve_path_lossy(expand_home(&record.working_dir));
     let target_time_ns = session_time_ns(record).unwrap_or(0);
+    let mut candidates = Vec::new();
+
+    for path in codex_cli_session_files(record, sessions_root) {
+        let Some((candidate_id, candidate_cwd, started_at_ns)) =
+            read_codex_cli_session_metadata(&path)
+        else {
+            continue;
+        };
+        if excluded_ids.contains(&candidate_id)
+            || resolve_path_lossy(expand_home(&candidate_cwd)) != resolved_working_dir
+        {
+            continue;
+        }
+        let started_at_ns = started_at_ns.unwrap_or(0);
+        let distance = if started_at_ns == 0 {
+            i128::MAX
+        } else {
+            (target_time_ns - started_at_ns).abs()
+        };
+        candidates.push((distance, -started_at_ns, candidate_id));
+    }
+
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, candidate_id)| candidate_id)
+}
+
+fn codex_cli_existing_session_ids(
+    record: &SessionRecord,
+    sessions_root: &Path,
+) -> BTreeSet<String> {
+    codex_cli_session_files(record, sessions_root)
+        .into_iter()
+        .filter_map(|path| {
+            read_codex_cli_session_metadata(&path).map(|(session_id, _, _)| session_id)
+        })
+        .collect()
+}
+
+fn codex_cli_session_files(record: &SessionRecord, sessions_root: &Path) -> Vec<PathBuf> {
     let base_date = parse_timestamp(&record.created_at)
         .unwrap_or_else(OffsetDateTime::now_utc)
         .date();
-    let mut candidates = Vec::new();
-
+    let mut session_files = Vec::new();
     for day_offset in [-1, 0, 1] {
         let Some(date) = base_date.checked_add(TimeDuration::days(day_offset)) else {
             continue;
@@ -5638,41 +5686,14 @@ fn discover_codex_cli_resume_id(
         let Ok(entries) = fs::read_dir(day_dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if !file_name.starts_with("rollout-")
-                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-            {
-                continue;
-            }
-            let Some((candidate_id, candidate_cwd, started_at_ns)) =
-                read_codex_cli_session_metadata(&path)
-            else {
-                continue;
-            };
-            if claimed_ids.contains(&candidate_id)
-                || resolve_path_lossy(expand_home(&candidate_cwd)) != resolved_working_dir
-            {
-                continue;
-            }
-            let started_at_ns = started_at_ns.unwrap_or(0);
-            let distance = if started_at_ns == 0 {
-                i128::MAX
-            } else {
-                (target_time_ns - started_at_ns).abs()
-            };
-            candidates.push((distance, -started_at_ns, candidate_id));
-        }
+        session_files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|file_name| file_name.starts_with("rollout-"))
+                && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        }));
     }
-
-    candidates.sort();
-    candidates
-        .into_iter()
-        .next()
-        .map(|(_, _, candidate_id)| candidate_id)
+    session_files
 }
 
 fn read_codex_cli_session_metadata(path: &Path) -> Option<(String, String, Option<i128>)> {
@@ -7843,6 +7864,51 @@ mod tests {
         assert_eq!(
             discover_codex_cli_resume_id(&session, &sessions_root, &claimed_ids).as_deref(),
             Some("closest-id")
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn codex_creation_binding_excludes_preexisting_rollouts() {
+        let temp_dir = unique_temp_path("codex-creation-binding");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("07").join("28");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+
+        let rollout = |id: &str, timestamp: &str| {
+            fs::write(
+                day_dir.join(format!("rollout-{id}.jsonl")),
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "session_meta",
+                        "payload": {
+                            "id": id,
+                            "cwd": working_dir.display().to_string(),
+                            "timestamp": timestamp
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        };
+        rollout("stale-id", "2026-07-28T20:00:00Z");
+
+        let mut session = session_record("stopped");
+        session.provider = "codex".to_owned();
+        session.working_dir = working_dir.display().to_string();
+        session.created_at = "2026-07-28T20:00:00Z".to_owned();
+        session.last_activity = "2026-07-28T20:00:00Z".to_owned();
+        let excluded_ids = codex_cli_existing_session_ids(&session, &sessions_root);
+
+        rollout("new-id", "2026-07-28T20:00:01Z");
+
+        assert_eq!(
+            discover_codex_cli_resume_id(&session, &sessions_root, &excluded_ids).as_deref(),
+            Some("new-id")
         );
 
         let _ = fs::remove_dir_all(temp_dir);
