@@ -41,8 +41,18 @@ did that by overwriting `statusLine` outright, which silently replaced whatever
 the user had (here, a rendered progress bar) with `NN% ctx`. The installer now
 captures the existing command into `~/.claude/hooks/context_monitor_delegate` and
 `context_monitor.sh` re-runs it with the same stdin, so installing the monitor
-costs nothing visible. Re-running the installer will not capture our own script as
-its own delegate.
+costs nothing visible.
+
+**Registrations are compared by the file they run, not by their spelling.** The
+deleted installer registered these same scripts as `~/.claude/hooks/...`; this one
+uses absolute paths. A raw string comparison would treat the two as unrelated, and
+on any machine configured by the old installer that produces two failures at once:
+every lifecycle hook registered twice (so each compaction posts twice and the
+parent is notified twice), and — worse — the legacy `statusLine` captured as its
+own delegate, so `context_monitor.sh` would invoke itself on every render forever.
+Commands are therefore tokenized and resolved to real paths before comparison.
+`context_monitor.sh` also carries an `SM_STATUSLINE_ACTIVE` guard so a
+hand-edited delegate cannot reintroduce the recursion.
 
 ### Consumer
 
@@ -70,6 +80,11 @@ object (`session._context_warning_sent`), so every server restart re-alerted abo
 context the agent had already been told about. They are now
 `context_warning_sent` / `context_critical_sent` on the session record. The cycle
 ends at a compaction or an explicit reset, not at a process boundary.
+
+**Enabling monitoring re-arms the latches.** A persisted latch outlives the
+registration that set it, so a monitor registering against a session whose context
+is already high would hear nothing until a compaction happened to clear it.
+`set_context_monitor` resets both latches whenever it enables.
 
 **Identical samples do not rewrite the state file.** Python mutated
 `tokens_used` in memory and never persisted it on the usage path. Rust persists,

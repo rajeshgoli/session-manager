@@ -25,6 +25,9 @@ DELEGATE_FILE="${SM_STATUSLINE_DELEGATE_FILE:-$HOME/.claude/hooks/context_monito
 INPUT=$(cat)
 
 post_usage() {
+  # Reached only as somebody else's delegate; the outer invocation already
+  # posted this exact sample.
+  [ -z "${SM_STATUSLINE_ACTIVE:-}" ] || return 0
   [ -n "${CLAUDE_SESSION_MANAGER_ID:-}" ] || return 0
   [ -n "$INPUT" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -58,7 +61,13 @@ post_usage() {
 
 render() {
   local delegate=""
-  if [ -n "${SM_STATUSLINE_DELEGATE:-}" ]; then
+  # A delegate that points back here would fork on every render until the
+  # machine gives up. The installer will not create one, but a hand-edited
+  # delegate file or a hand-edited statusLine still can, and the failure mode is
+  # bad enough to be worth catching at the point of use as well.
+  if [ -n "${SM_STATUSLINE_ACTIVE:-}" ]; then
+    delegate=""
+  elif [ -n "${SM_STATUSLINE_DELEGATE:-}" ]; then
     delegate="$SM_STATUSLINE_DELEGATE"
   elif [ -r "$DELEGATE_FILE" ]; then
     delegate=$(cat "$DELEGATE_FILE" 2>/dev/null)
@@ -67,7 +76,7 @@ render() {
   if [ -n "$delegate" ]; then
     # The captured value is a shell command line ("bash ~/.claude/foo.sh"), not
     # necessarily a bare executable, so it has to go through a shell.
-    printf '%s' "$INPUT" | sh -c "$delegate" 2>/dev/null
+    printf '%s' "$INPUT" | SM_STATUSLINE_ACTIVE=1 sh -c "$delegate" 2>/dev/null
     return 0
   fi
 

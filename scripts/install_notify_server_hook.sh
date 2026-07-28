@@ -36,6 +36,7 @@ done
 python3 - "$SETTINGS" "$TARGET_DIR" <<'PY'
 import json
 import os
+import shlex
 import sys
 
 settings_path, hooks_dir = sys.argv[1], sys.argv[2]
@@ -43,6 +44,27 @@ settings_path, hooks_dir = sys.argv[1], sys.argv[2]
 
 def hook_path(name):
     return os.path.join(hooks_dir, name)
+
+
+def resolve(path):
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def invokes(command, script):
+    """Whether a hook command line runs `script`, however it spells the path.
+
+    The deleted install_context_hooks.sh registered these same scripts as
+    `~/.claude/hooks/...`, and settings.json commands are shell strings that may
+    carry an interpreter ("bash ~/.claude/foo.sh"). Comparing raw strings would
+    treat every legacy spelling as a different hook — appending a duplicate that
+    runs the same file twice, and, for statusLine, capturing our own script as
+    its own delegate."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    target = resolve(script)
+    return any("/" in token and resolve(token) == target for token in tokens)
 
 
 try:
@@ -61,15 +83,15 @@ hooks = settings.setdefault("hooks", {})
 
 
 def register(event, command, matcher=None):
-    """Append a hook entry unless this exact command is already registered under
-    the same matcher. Other entries on the event are left untouched — users and
-    other tools register hooks here too."""
+    """Append a hook entry unless this script is already registered under the
+    same matcher, under any spelling of its path. Other entries on the event are
+    left untouched — users and other tools register hooks here too."""
     matchers = hooks.setdefault(event, [])
     for entry in matchers:
         if not isinstance(entry, dict) or entry.get("matcher") != matcher:
             continue
         for inner in entry.get("hooks", []):
-            if isinstance(inner, dict) and inner.get("command") == command:
+            if isinstance(inner, dict) and invokes(inner.get("command") or "", command):
                 return
     new_entry = {"hooks": [{"type": "command", "command": command}]}
     if matcher is not None:
@@ -86,8 +108,10 @@ register("SessionStart", hook_path("session_clear_notify.sh"), matcher="clear")
 register("SessionStart", hook_path("post_compact_recovery.sh"), matcher="compact")
 
 # statusLine: capture whatever is configured now so context_monitor.sh can re-run
-# it, then point statusLine at context_monitor.sh. Re-running the installer must
-# not capture our own script as its own delegate — that would recurse forever.
+# it, then point statusLine at context_monitor.sh. Capturing our own script as
+# its own delegate would recurse on every render, so a statusLine that already
+# runs the monitor — under any spelling, including the legacy `~/.claude/...`
+# one — is left exactly as it is.
 context_monitor = hook_path("context_monitor.sh")
 delegate_file = hook_path("context_monitor_delegate")
 status_line = settings.get("statusLine")
@@ -95,13 +119,12 @@ existing_command = ""
 if isinstance(status_line, dict) and status_line.get("type") == "command":
     existing_command = (status_line.get("command") or "").strip()
 
-if existing_command and existing_command != context_monitor:
-    with open(delegate_file, "w") as handle:
-        handle.write(existing_command + "\n")
-    os.chmod(delegate_file, 0o600)
-    changes.append(f"statusLine delegate ({existing_command})")
-
-if existing_command != context_monitor:
+if not invokes(existing_command, context_monitor):
+    if existing_command:
+        with open(delegate_file, "w") as handle:
+            handle.write(existing_command + "\n")
+        os.chmod(delegate_file, 0o600)
+        changes.append(f"statusLine delegate ({existing_command})")
     settings["statusLine"] = {"type": "command", "command": context_monitor}
     changes.append("statusLine")
 

@@ -1268,6 +1268,12 @@ impl SessionStore {
                 "context_monitor_notify".to_owned(),
                 Value::String(notify_session_id.unwrap()),
             );
+            // Enabling starts a fresh notification cycle. Without this, latches
+            // left set by an earlier cycle suppress the first warning until a
+            // compaction or reset happens to clear them — and a newly
+            // registered monitor would never hear about context that was
+            // already high when it registered.
+            reset_context_oneshot_flags(session);
         } else {
             session.insert("context_monitor_notify".to_owned(), Value::Null);
         }
@@ -7548,6 +7554,39 @@ mod tests {
             store.get_session("child001").unwrap().unwrap().tokens_used,
             42_000
         );
+    }
+
+    #[test]
+    fn enabling_monitoring_rearms_the_latches() {
+        // A monitor that registers after the context is already high would
+        // otherwise hear nothing until a compaction happened to clear the
+        // latches a previous cycle set.
+        let store = store_with_monitored_child("ctxreenable", true, Some("parent01"));
+        // A sample past the critical line takes the critical branch only.
+        store
+            .apply_context_usage_event(&usage_event("child001", 70.0, 140_000), None)
+            .unwrap();
+        assert_eq!(context_monitor_messages(&store).len(), 1);
+
+        store
+            .set_context_monitor(
+                "child001",
+                ContextMonitorRequest {
+                    enabled: true,
+                    requester_session_id: "parent01".to_owned(),
+                    notify_session_id: Some("parent01".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert!(!session.context_warning_sent);
+        assert!(!session.context_critical_sent);
+
+        store
+            .apply_context_usage_event(&usage_event("child001", 70.0, 140_000), None)
+            .unwrap();
+        assert_eq!(context_monitor_messages(&store).len(), 2);
     }
 
     #[test]
