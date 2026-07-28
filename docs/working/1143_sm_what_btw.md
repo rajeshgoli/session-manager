@@ -44,8 +44,10 @@ opened a result modal containing the question, answer, and this stable footer:
 ↑/↓ to scroll · c to copy · f to fork · Esc to close
 ```
 
-The answer was visible in the terminal but was not available through an SM
-response API. `Escape` returned Claude to its main conversation.
+Pressing `c` created a new buffer on the dedicated Session Manager tmux server
+containing only the exact answer text, with no question, decorations, or ANSI
+sequences. `c` did not close the result modal; `Escape` returned Claude to its
+main conversation.
 
 ### Stock Codex
 
@@ -66,9 +68,11 @@ not invoke the slash command. It created an ordinary main-thread user turn and
 consumed the main agent context.
 
 The fork already implements `/btw` internally through its `StartSide` path, but
-the control socket exposes no operation for that path. A dedicated operation is
-required. Because the fork owns a structured control and event contract, SM must
-not use tmux for codex-fork submission, result capture, or cleanup.
+the control socket exposes no operation for that path. A dedicated operation must
+fork and run the transient side thread without changing the displayed TUI thread,
+then emit the exact result as a correlated structured event. Because the fork
+owns this control and event contract, SM must not use tmux for codex-fork
+submission, result capture, readiness detection, or cleanup.
 
 ## Decision
 
@@ -96,8 +100,8 @@ The provider receives a literal native command equivalent to:
 
 The quote characters used at a shell prompt are not sent to the provider.
 
-The command returns after the request is durably accepted. The answer arrives
-as input to the requesting managed session:
+For a managed caller, the command returns silently after the request is durably
+accepted. The answer arrives as input to that session:
 
 ```text
 [Input from <friendly_name> (<session_id>) via sm what] <summary>
@@ -107,24 +111,27 @@ as input to the requesting managed session:
 summarized. The full stable session ID is used. If the summary is multiline,
 subsequent lines are preserved after the first line.
 
+For an unmanaged CLI caller, the command waits for the same request to finish and
+prints only the summary to stdout. The native SM app submits asynchronously and
+polls the same request API.
+
 ## CLI Contract
 
 ### Target and requester
 
 1. `<target>` uses normal exact ID, unique ID prefix, friendly-name, and role
    resolution.
-2. The requester is read from `SESSION_MANAGER_ID`, with
+2. The optional requester is read from `SESSION_MANAGER_ID`, with
    `CLAUDE_SESSION_MANAGER_ID` as the compatibility fallback.
-3. The requester and target must both be live managed sessions.
+3. The target must be a live managed session. When present, the requester must
+   also resolve to a live managed session.
 4. Self-targeting is allowed. The response is not queued until provider cleanup
    has restored the main conversation.
-5. An unmanaged shell is rejected with:
-
-   ```text
-   Error: sm what requires a managed requester session
-   ```
-
-An operator-only synchronous `--print` mode is not part of this version.
+5. A managed caller uses asynchronous session delivery.
+6. An unmanaged caller uses synchronous stdout delivery without requiring a
+   separate `--print` flag.
+7. The app uses asynchronous polling delivery and does not emulate a shell or
+   attach to tmux.
 
 ### Prompt
 
@@ -137,21 +144,26 @@ An operator-only synchronous `--print` mode is not part of this version.
 These rules keep the native input to one slash-command line and prevent prompt
 text from becoming a second terminal command.
 
-### Acknowledgement
+### Command completion
 
-On acceptance:
+A managed call writes nothing to stdout on successful acceptance. The agent
+already knows it asked for the summary, and an acknowledgement would add no useful
+context.
+
+An unmanaged call waits up to the request timeout. On success it writes only the
+summary plus a trailing newline to stdout.
+
+Immediate validation or submission failures return nonzero and do not create a
+request. Failures after acceptance are delivered to a managed requester through
+the same internal response category:
 
 ```text
-Requested context summary from <friendly_name> (<session_id>)
+[sm what for <friendly_name> (<session_id>) failed] <reason>
 ```
 
-Immediate validation or delivery failures return nonzero and do not create a
-request. Failures after acceptance are delivered to the requester through the
-same internal response category:
-
-```text
-[sm what request <request_id> for <friendly_name> (<session_id>) failed] <reason>
-```
+Unmanaged failures are written to stderr and return nonzero. The internal
+`request_id` is not shown to managed agents; it remains available to API clients
+for polling and diagnostics.
 
 ## Request Lifecycle
 
@@ -163,9 +175,10 @@ Required fields:
 | Field | Purpose |
 |---|---|
 | `request_id` | Globally unique correlation ID |
-| `requester_session_id` | Destination for the answer |
+| `requester_session_id` | Optional managed-session destination |
 | `target_session_id` | Session whose context is queried |
 | `target_provider` | Provider adapter selected at acceptance |
+| `delivery_mode` | `session` or `poll` |
 | `prompt` | Validated `/btw` argument |
 | `status` | `pending`, `running`, `completed`, `failed`, or `timed_out` |
 | `provider_correlation` | Fork request/thread IDs or terminal capture marker |
@@ -175,17 +188,20 @@ Required fields:
 
 Lifecycle:
 
-1. Resolve and validate requester and target.
+1. Resolve and validate the target and optional requester.
 2. In one transaction, reject another nonterminal request for the same target
    and insert the new request.
-3. Return the CLI acknowledgement.
+3. Return acceptance to asynchronous callers; synchronous callers begin polling.
 4. Acquire the target's provider-native input lock.
 5. Submit the request through the provider adapter.
 6. Observe the correlated result.
 7. Restore the target's normal provider UI state.
 8. Persist the terminal outcome.
-9. Queue exactly one preformatted response for the requester.
-10. Mark `response_delivered_at` only after queue insertion succeeds.
+9. For `session` delivery, queue exactly one preformatted response for the
+   requester.
+10. For `poll` delivery, expose the bounded terminal result through the status
+    API.
+11. Mark `response_delivered_at` only after session queue insertion succeeds.
 
 One target may have only one active `sm what` request. Different targets may run
 concurrently. A duplicate request fails with HTTP `409` and names the active
@@ -213,12 +229,20 @@ Submission:
 
 Completion and cleanup:
 
-1. Locate the new `/btw` result region after the baseline snapshot.
-2. Require the Claude result footer before extracting an answer.
-3. Strip ANSI/control sequences with the existing terminal parser.
-4. Exclude the question, separators, footer, and any baseline content.
-5. Send `Escape` after the result is captured.
-6. Verify that the result modal is gone before marking the request completed.
+1. Hold the SM-wide native-copy lock and snapshot buffer IDs on the dedicated
+   `tmux -L session-manager` server.
+2. Require the Claude result footer before invoking native copy.
+3. Send `c`.
+4. Require exactly one newly created tmux buffer, read it by buffer ID, enforce
+   output bounds, and delete that buffer after persistence.
+5. Do not parse the summary from pane rows. Pane inspection is limited to result
+   readiness and cleanup verification.
+6. Send `Escape` after the buffer is captured.
+7. Verify that the result modal is gone before marking the request completed.
+
+The dedicated tmux socket isolates these buffers from ordinary user tmux
+servers. The lock plus before/after buffer IDs makes the buffer request-scoped;
+an ambiguous buffer change fails rather than returning unrelated clipboard data.
 
 ### Stock Codex
 
@@ -288,12 +312,16 @@ Required safeguards:
 
 1. Capture physical terminal rows without tmux join-wrapped-lines behavior.
 2. Bound every capture by rows and bytes.
-3. Use a terminal/ANSI parser rather than regular expressions alone.
-4. Require provider-specific start and completion markers.
-5. Never return baseline rows or screen chrome as the summary.
-6. Reject ambiguous screens instead of typing into an unknown UI state.
-7. Use one lock for all SM-owned native keyboard operations on a session.
-8. Verify cleanup from a fresh pane capture.
+3. Use a terminal/ANSI parser rather than regular expressions alone wherever
+   stock Codex answer extraction still requires terminal rows.
+4. Use Claude's native `c` action and request-scoped tmux buffer for exact answer
+   extraction; never scrape Claude answer text from the pane.
+5. Require provider-specific start and completion markers.
+6. Never return baseline rows or screen chrome as the summary.
+7. Reject ambiguous screens instead of typing into an unknown UI state.
+8. Use one lock for all SM-owned native keyboard operations on a session and an
+   SM-wide lock for shared tmux copy buffers.
+9. Verify cleanup from a fresh pane capture.
 
 Default timeout is 60 seconds from provider submission. The extracted answer is
 limited to 16 KiB after ANSI stripping. Truncation is explicit:
@@ -314,7 +342,7 @@ Request:
 
 ```json
 {
-  "requester_session_id": "<managed-session-id>",
+  "requester_session_id": "<managed-session-id-or-null>",
   "prompt": "Summarize what you've done so far"
 }
 ```
@@ -330,10 +358,11 @@ Accepted response (`202`):
 }
 ```
 
-The server resolves `requester_session_id` to a live session before accepting the
-request. As with existing requester-aware SM endpoints, the loopback API remains
-inside the same-user local trust boundary; this ticket does not add a new
-authentication scheme.
+When `requester_session_id` is present, the server resolves it to a live session
+and selects `session` delivery. When absent, it selects `poll` delivery. As with
+existing requester-aware SM endpoints, the loopback API remains inside the
+same-user local trust boundary; this ticket does not add a new authentication
+scheme.
 
 Add an internal status read for recovery and tests:
 
@@ -341,13 +370,15 @@ Add an internal status read for recovery and tests:
 GET /btw-requests/{request_id}
 ```
 
-It returns bounded request metadata and status for local recovery and diagnostics.
+It returns bounded request metadata and status. For `poll` delivery, a terminal
+response includes `result` or `error`; this is the contract used by unmanaged CLI
+callers and the native app.
 
 ## Requester Delivery
 
-The answer uses the existing durable message queue transport with a new
-`message_category` of `btw_response`, but it bypasses cross-session `sm send`
-formatting.
+For `session` delivery, the answer uses the existing durable message queue
+transport with a new `message_category` of `btw_response`, but it bypasses
+cross-session `sm send` formatting.
 
 The queue payload is already fully formatted as:
 
@@ -365,6 +396,10 @@ Delivery invariants:
 6. If the requester is retired before completion, mark the response undeliverable
    and retain the terminal request record for normal retention cleanup.
 
+For `poll` delivery, no queue message is created. The caller reads the result from
+`GET /btw-requests/{request_id}`. The app's native `What?` action is tracked
+separately in #1148 and must use this mode instead of invoking a shell command.
+
 ## Restart Recovery
 
 On server startup:
@@ -375,7 +410,7 @@ On server startup:
    state and continue capture/cleanup when unambiguous.
 3. If the pane or correlation state is gone, fail the request rather than
    resubmitting `/btw`.
-4. Requeue terminal responses whose `response_delivered_at` is null.
+4. Requeue `session` responses whose `response_delivered_at` is null.
 5. Never deliver a response twice.
 
 Session teardown fails any nonterminal request targeting or requested by that
@@ -409,8 +444,9 @@ Supported targets are `claude`, `codex`, and `codex-fork`. Retired
 
 1. Parse default and custom prompts for both command names.
 2. Prove `sm btw` and `sm what` issue identical API requests.
-3. Validate requester, target, self-target, prompt bounds, and retired flags.
-4. Verify exact acknowledgement and exit codes.
+3. Validate managed, unmanaged, self-target, prompt bounds, and retired flags.
+4. Verify silent managed acceptance, synchronous unmanaged output, and exit
+   codes.
 
 ### Server and persistence
 
@@ -421,6 +457,7 @@ Supported targets are `claude`, `codex`, and `codex-fork`. Retired
 5. Requester or target teardown during each lifecycle stage.
 6. Exact response envelope without `sm send` wrapping.
 7. No notify-on-stop, reminder, response-relay, or completion side effects.
+8. Poll delivery exposes one bounded result and never queues a session message.
 
 ### Provider adapters
 
@@ -443,8 +480,9 @@ Run disposable sessions for all three supported providers:
 2. Ask a custom question while the target has an active main task.
 3. Verify the target returns to or remains in its main context.
 4. Verify the requester receives exactly one clean response.
-5. Restart SM during an in-flight request and verify recovery.
-6. Confirm no terminal control bytes appear in requester input.
+5. Verify an unmanaged CLI prints only the clean response.
+6. Restart SM during an in-flight request and verify recovery.
+7. Confirm no terminal control bytes appear in requester input.
 
 ## Rollout
 
