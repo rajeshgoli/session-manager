@@ -362,7 +362,6 @@ impl AppState {
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let session_store = SessionStore::new_with_queue(state_file, queue_db_path)
             .with_context_monitor_config(config.context_monitor.clone())
-            .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_delivery_runtime(
                 config
                     .rust_core
