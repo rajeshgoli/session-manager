@@ -7488,6 +7488,72 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
 }
 
 #[tokio::test]
+async fn context_usage_hook_is_served_and_records_tokens() {
+    // The route existed only in the Python server until #1132, so every status
+    // line post 404'd and tokens_used stayed at its fixture value forever.
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "used_percentage": 41.5,
+            "total_input_tokens": 83_000
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["used_percentage"], json!(41.5));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tokens_used"], json!(83_000));
+
+    // Before the first API call Claude reports a null percentage on every
+    // render; that must not clobber the last real reading.
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({ "session_id": "run12345", "used_percentage": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert!(payload["used_percentage"].is_null());
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tokens_used"], json!(83_000));
+}
+
+#[tokio::test]
+async fn context_usage_hook_reports_unregistered_and_unknown_sessions() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({ "session_id": "oldstate", "used_percentage": 90.0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "not_registered");
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/context-usage",
+        json!({ "session_id": "nosuchid", "used_percentage": 90.0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "unknown_session");
+}
+
+#[tokio::test]
 async fn claude_user_prompt_submit_hook_marks_session_working_at_turn_start() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));

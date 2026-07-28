@@ -109,14 +109,15 @@ use crate::sessions::{
     claude_hook_gate, codex_fork_status_for_event_line, expand_home, is_primary_node,
     AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
     ChildSessionResponse, ClaudeHookGate, ClearSessionRequest, ClientSessionResponse,
-    ContextMonitorOutcome, ContextMonitorRequest, CoreClearOutcome, CoreInputBatchResponse,
-    CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
-    CreateCoreSessionRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
-    RegistryMutationOutcome, RoleRegistrationRequest, SendCoreInputBatchRequest,
-    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    ContextMonitorOutcome, ContextMonitorRequest, ContextUsageEvent, ContextUsageOutcome,
+    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
+    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
@@ -359,7 +360,8 @@ impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
-        let session_store = SessionStore::new_with_queue(state_file, queue_db_path);
+        let session_store = SessionStore::new_with_queue(state_file, queue_db_path)
+            .with_context_monitor_config(config.context_monitor.clone());
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
@@ -866,6 +868,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hooks/claude", post(claude_hook))
         .route("/hooks/tool-use", post(tool_use_hook))
         .route("/hooks/tmux-client", post(tmux_client_hook))
+        .route("/hooks/context-usage", post(context_usage_hook))
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
@@ -1361,6 +1364,69 @@ fn hook_emitted_at(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Context monitor producer hooks (sm#203): the Claude status line posts usage
+/// samples here, and `PreCompact`/`SessionStart` post lifecycle events.
+async fn context_usage_hook(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Response, ApiError> {
+    let Some(session_id) = context_usage_session_id(&payload) else {
+        return Ok(Json(json!({ "status": "unknown_session" })).into_response());
+    };
+    verify_hook_auth_or_secret(
+        &state,
+        &headers,
+        Some(peer_addr),
+        &session_id,
+        "/hooks/context-usage",
+    )?;
+
+    let event = ContextUsageEvent {
+        session_id,
+        event: payload
+            .get("event")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        used_percentage: payload.get("used_percentage").and_then(Value::as_f64),
+        total_input_tokens: payload_i64(payload.get("total_input_tokens")),
+    };
+
+    let runtime = state
+        .config
+        .rust_core
+        .runtime_enabled
+        .then(|| TmuxRuntime::from_app_config(&state.config));
+    let outcome = state
+        .session_store
+        .apply_context_usage_event(&event, runtime.as_ref())?;
+
+    let mut body = json!({ "status": outcome.status() });
+    if let ContextUsageOutcome::Recorded { used_percentage } = outcome {
+        body["used_percentage"] = json!(used_percentage);
+    } else if matches!(outcome, ContextUsageOutcome::NoUsage) {
+        body["used_percentage"] = Value::Null;
+    }
+    Ok(Json(body).into_response())
+}
+
+/// The producer hooks post the sm session id as `session_id`, unlike the Claude
+/// lifecycle hooks which forward Claude's own payload under
+/// `session_manager_id`. Accept both so either transport works.
+fn context_usage_session_id(payload: &Value) -> Option<String> {
+    payload
+        .get("session_id")
+        .or_else(|| payload.get("session_manager_id"))
+        .or_else(|| payload.get("CLAUDE_SESSION_MANAGER_ID"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn tool_use_hook(

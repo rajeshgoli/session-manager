@@ -27,7 +27,7 @@ use crate::queue::{
     StopNotifyState,
 };
 use crate::{
-    config::CodexReviewConfig,
+    config::{CodexReviewConfig, ContextMonitorConfig},
     runtime::{TmuxRuntime, TmuxSessionSpec},
 };
 
@@ -47,6 +47,10 @@ pub struct SessionStore {
     legacy_state_file: Option<PathBuf>,
     write_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
+    /// Carried on the store rather than read per-request because the codex-fork
+    /// event monitor threads evaluate the same thresholds and have no access to
+    /// the HTTP layer's `AppConfig`.
+    context_monitor: ContextMonitorConfig,
 }
 
 impl SessionStore {
@@ -61,6 +65,7 @@ impl SessionStore {
             legacy_state_file,
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
+            context_monitor: ContextMonitorConfig::default(),
         }
     }
 
@@ -70,6 +75,11 @@ impl SessionStore {
         store
     }
 
+    pub fn with_context_monitor_config(mut self, config: ContextMonitorConfig) -> Self {
+        self.context_monitor = config;
+        self
+    }
+
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
         Self {
@@ -77,6 +87,7 @@ impl SessionStore {
             legacy_state_file: Some(legacy_state_file),
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
+            context_monitor: ContextMonitorConfig::default(),
         }
     }
 
@@ -1267,6 +1278,277 @@ impl SessionStore {
         }))
     }
 
+    /// Apply one context-usage event from the Claude status line or the
+    /// `PreCompact`/`SessionStart` hooks (sm#203).
+    ///
+    /// Compaction and context-reset bypass the `context_monitor_enabled` gate:
+    /// they describe context *loss*, which matters to a parent whether or not
+    /// anyone opted into usage reporting (#210). Usage, warning, and critical
+    /// stay opt-in (#206).
+    pub fn apply_context_usage_event(
+        &self,
+        event: &ContextUsageEvent,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<ContextUsageOutcome> {
+        let session_id = event.session_id.trim();
+        if session_id.is_empty() {
+            return Ok(ContextUsageOutcome::UnknownSession);
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if raw_session_object(&state, session_id).is_none() {
+            return Ok(ContextUsageOutcome::UnknownSession);
+        }
+
+        match event.event.as_deref().map(str::trim).unwrap_or("") {
+            "compaction" => self.apply_compaction_event(&mut state, session_id, runtime),
+            // No `_is_compacting` equivalent exists on the Rust side yet, so this
+            // is an acknowledgement only. It is still routed rather than rejected
+            // because `post_compact_recovery.sh` is already installed and posts
+            // here; a 404 would show up as a hook failure in live panes.
+            "compaction_complete" => Ok(ContextUsageOutcome::CompactionCompleteLogged),
+            "context_reset" => self.apply_context_reset_event(&mut state, session_id),
+            _ => self.apply_context_usage_update(&mut state, session_id, event, runtime),
+        }
+    }
+
+    fn apply_compaction_event(
+        &self,
+        state: &mut Value,
+        session_id: &str,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<ContextUsageOutcome> {
+        let (notify_target, label) = {
+            let sessions = ensure_sessions_array_mut(state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(ContextUsageOutcome::UnknownSession);
+            };
+            // `PreCompact` fires before the context is refreshed, so this is the
+            // reliable reset point for the next cycle. Waiting for usage to drop
+            // back under the warning threshold would not work: post-compaction
+            // context can legitimately land above it.
+            reset_context_oneshot_flags(session);
+            let notify_target = json_text(session.get("context_monitor_notify"))
+                // Fall back to the parent so an unregistered child still reports
+                // its own context loss upward (#210).
+                .or_else(|| json_text(session.get("parent_session_id")));
+            (notify_target, raw_session_label(session, session_id))
+        };
+
+        if let Some(notify_target) = notify_target {
+            let text = format!(
+                "[sm context] Compaction fired for {label} ({session_id}). \
+                 Context was compacted — agent is still running."
+            );
+            self.queue_context_monitor_message(
+                state,
+                session_id,
+                &notify_target,
+                &text,
+                "sequential",
+                runtime,
+            )?;
+        }
+
+        self.write_raw_json_value(state)?;
+        Ok(ContextUsageOutcome::CompactionLogged)
+    }
+
+    fn apply_context_reset_event(
+        &self,
+        state: &mut Value,
+        session_id: &str,
+    ) -> Result<ContextUsageOutcome> {
+        {
+            let sessions = ensure_sessions_array_mut(state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(ContextUsageOutcome::UnknownSession);
+            };
+            reset_context_oneshot_flags(session);
+            // The discarded context is what the previous status was describing.
+            session.insert("agent_status_text".to_owned(), Value::Null);
+            session.insert("agent_status_at".to_owned(), Value::Null);
+            session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        }
+        if let Some(queue) = &self.queue_store {
+            queue.cancel_pending_messages_from_sender_category(session_id, "context_monitor")?;
+        }
+        self.write_raw_json_value(state)?;
+        Ok(ContextUsageOutcome::FlagsReset)
+    }
+
+    fn apply_context_usage_update(
+        &self,
+        state: &mut Value,
+        session_id: &str,
+        event: &ContextUsageEvent,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<ContextUsageOutcome> {
+        let enabled = raw_session_object(state, session_id)
+            .and_then(|session| session.get("context_monitor_enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            return Ok(ContextUsageOutcome::NotRegistered);
+        }
+        // Null until the first API call of a session — nothing to record yet.
+        let Some(used_percentage) = event.used_percentage else {
+            return Ok(ContextUsageOutcome::NoUsage);
+        };
+
+        let (alert, mut changed) = {
+            let sessions = ensure_sessions_array_mut(state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(ContextUsageOutcome::UnknownSession);
+            };
+            let tokens_used = event.total_input_tokens.unwrap_or(0);
+            let changed = session.get("tokens_used").and_then(Value::as_i64) != Some(tokens_used);
+            if changed {
+                session.insert("tokens_used".to_owned(), json!(tokens_used));
+            }
+            (
+                self.latch_context_alert(session, session_id, used_percentage, tokens_used),
+                changed,
+            )
+        };
+
+        if let Some(alert) = alert {
+            self.queue_context_monitor_message(
+                state,
+                session_id,
+                &alert.notify_target,
+                &alert.text,
+                alert.delivery_mode,
+                runtime,
+            )?;
+            changed = true;
+        }
+
+        // The status line re-renders far more often than the context actually
+        // moves, and the state file is around a megabyte. Rewriting it for a
+        // sample identical to the stored one would put the heaviest write in the
+        // server on the most frequent event it handles.
+        if changed {
+            self.write_raw_json_value(state)?;
+        }
+        Ok(ContextUsageOutcome::Recorded { used_percentage })
+    }
+
+    /// Decide whether this usage sample trips a threshold, latching the
+    /// corresponding one-shot flag when it does. Returns the alert to queue, or
+    /// `None` when the threshold is not reached or has already fired this cycle.
+    fn latch_context_alert(
+        &self,
+        session: &mut Map<String, Value>,
+        session_id: &str,
+        used_percentage: f64,
+        tokens_used: i64,
+    ) -> Option<ContextAlert> {
+        let notify_target = json_text(session.get("context_monitor_notify"))?;
+        let is_self_alert = notify_target == session_id;
+        let label = raw_session_label(session, session_id);
+        let rounded = format_percentage(used_percentage);
+
+        if used_percentage >= self.context_monitor.critical_percentage {
+            if flag_is_set(session, "context_critical_sent") {
+                return None;
+            }
+            session.insert("context_critical_sent".to_owned(), Value::Bool(true));
+            let text = if is_self_alert {
+                format!(
+                    "[sm context] Context at {rounded}% — critically high. \
+                     Write your handoff doc NOW and run `sm handoff <path>`. \
+                     Compaction is imminent."
+                )
+            } else {
+                format!(
+                    "[sm context] Child {label} ({session_id}) context at {rounded}% \
+                     — critically high. Compaction is imminent."
+                )
+            };
+            return Some(ContextAlert {
+                notify_target,
+                text,
+                delivery_mode: "urgent",
+            });
+        }
+
+        if used_percentage >= self.context_monitor.warning_percentage {
+            if flag_is_set(session, "context_warning_sent") {
+                return None;
+            }
+            session.insert("context_warning_sent".to_owned(), Value::Bool(true));
+            let text = if is_self_alert {
+                format!(
+                    "[sm context] Context at {rounded}% ({} tokens). \
+                     Consider writing a handoff doc and running `sm handoff <path>`.",
+                    format_thousands(tokens_used)
+                )
+            } else {
+                format!("[sm context] Child {label} ({session_id}) context at {rounded}%.")
+            };
+            return Some(ContextAlert {
+                notify_target,
+                text,
+                delivery_mode: "sequential",
+            });
+        }
+
+        None
+    }
+
+    fn queue_context_monitor_message(
+        &self,
+        state: &mut Value,
+        sender_session_id: &str,
+        notify_target: &str,
+        text: &str,
+        delivery_mode: &str,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<()> {
+        if raw_session_object(state, notify_target).is_none() {
+            return Ok(());
+        }
+        if let Some(queue) = &self.queue_store {
+            let message_id = queue.enqueue_message_with_metadata(
+                notify_target,
+                text,
+                delivery_mode,
+                QueueMessageMetadata {
+                    sender_session_id: Some(sender_session_id.to_owned()),
+                    message_category: Some("context_monitor".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )?;
+            if let Some(runtime) = runtime {
+                let target_node = raw_session_object(state, notify_target)
+                    .and_then(|session| json_text(session.get("node")))
+                    .unwrap_or_else(default_node);
+                if is_primary_node(&target_node) {
+                    drain_pending_runtime_messages_raw(
+                        self,
+                        state,
+                        notify_target,
+                        runtime,
+                        queue,
+                        None,
+                        None,
+                        Some(&message_id),
+                    )?;
+                }
+            }
+        }
+        push_retained_message_raw(
+            state,
+            notify_target,
+            text,
+            delivery_mode,
+            Some("context_monitor"),
+        )?;
+        Ok(())
+    }
+
     pub fn schedule_handoff(
         &self,
         session_id: &str,
@@ -2271,6 +2553,36 @@ impl SessionStore {
             changed = true;
         }
 
+        // Codex reports token usage on its own event rather than through a
+        // status line, so this is the codex-fork equivalent of the Claude
+        // `/hooks/context-usage` usage update — same gate, same thresholds,
+        // same one-shot latches.
+        let mut context_alert = None;
+        if let Some(usage) = codex_fork_context_usage(event) {
+            if flag_is_set(session, "context_monitor_enabled") {
+                session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
+                changed = true;
+                context_alert = self.latch_context_alert(
+                    session,
+                    session_id,
+                    usage.used_percentage,
+                    usage.tokens_used,
+                );
+            }
+        }
+
+        if let Some(alert) = context_alert {
+            self.queue_context_monitor_message(
+                &mut state,
+                session_id,
+                &alert.notify_target,
+                &alert.text,
+                alert.delivery_mode,
+                None,
+            )?;
+            changed = true;
+        }
+
         if changed {
             self.write_raw_json_value(&state)?;
         }
@@ -2394,6 +2706,8 @@ impl SessionStore {
             tokens_used: 0,
             context_monitor_enabled: false,
             context_monitor_notify: None,
+            context_warning_sent: false,
+            context_critical_sent: false,
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
         })
@@ -2546,6 +2860,47 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         other if other.ends_with("_begin") => Some("running"),
         _ => None,
     }
+}
+
+struct CodexContextUsage {
+    tokens_used: i64,
+    used_percentage: f64,
+}
+
+/// Read context occupancy out of a `thread/tokenUsage/updated` event.
+///
+/// The event carries both a `total` (every token the thread has ever spent,
+/// which runs far past the context window) and a `last` (the most recent
+/// request). Only `last` describes what is currently resident in the window, so
+/// that is what maps onto Claude's `context_window.total_input_tokens`.
+fn codex_fork_context_usage(event: &Map<String, Value>) -> Option<CodexContextUsage> {
+    let event_type =
+        normalize_codex_fork_event_type(&codex_fork_event_type(event)?.replace('/', "_"));
+    // `thread/tokenUsage/updated` normalizes to `thread_token_usage_updated`;
+    // the unprefixed spelling is accepted too since other codex event names
+    // appear both with and without the `thread` scope.
+    if !matches!(
+        event_type.as_str(),
+        "thread_token_usage_updated" | "token_usage_updated"
+    ) {
+        return None;
+    }
+    let usage = codex_fork_payload(event)?
+        .get("tokenUsage")
+        .and_then(Value::as_object)?;
+    let tokens_used = usage
+        .get("last")
+        .and_then(Value::as_object)
+        .and_then(|last| last.get("totalTokens"))
+        .and_then(Value::as_i64)?;
+    let context_window = usage
+        .get("modelContextWindow")
+        .and_then(Value::as_i64)
+        .filter(|window| *window > 0)?;
+    Some(CodexContextUsage {
+        tokens_used,
+        used_percentage: (tokens_used as f64 / context_window as f64) * 100.0,
+    })
 }
 
 fn codex_fork_item_completed_status(event: &Map<String, Value>) -> Option<&'static str> {
@@ -2790,6 +3145,51 @@ pub struct ContextMonitorRequest {
     pub requester_session_id: String,
     #[serde(default)]
     pub notify_session_id: Option<String>,
+}
+
+/// One post from a context-monitor producer hook. `event` distinguishes the
+/// lifecycle hooks (`compaction`, `compaction_complete`, `context_reset`) from a
+/// plain status-line usage sample, which carries no `event` at all.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContextUsageEvent {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub used_percentage: Option<f64>,
+    #[serde(default)]
+    pub total_input_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContextUsageOutcome {
+    UnknownSession,
+    CompactionLogged,
+    CompactionCompleteLogged,
+    FlagsReset,
+    NotRegistered,
+    NoUsage,
+    Recorded { used_percentage: f64 },
+}
+
+impl ContextUsageOutcome {
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::UnknownSession => "unknown_session",
+            Self::CompactionLogged => "compaction_logged",
+            Self::CompactionCompleteLogged => "compaction_complete_logged",
+            Self::FlagsReset => "flags_reset",
+            Self::NotRegistered => "not_registered",
+            Self::NoUsage | Self::Recorded { .. } => "ok",
+        }
+    }
+}
+
+struct ContextAlert {
+    notify_target: String,
+    text: String,
+    delivery_mode: &'static str,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3235,6 +3635,49 @@ fn clear_stop_notify_raw(state: &mut Value, session_id: &str) -> Result<()> {
     let entries = ensure_array_field_mut(state, "retained_stop_notify_states")?;
     entries.retain(|entry| entry.get("session_id").and_then(Value::as_str) != Some(session_id));
     Ok(())
+}
+
+fn reset_context_oneshot_flags(session: &mut Map<String, Value>) {
+    session.insert("context_warning_sent".to_owned(), Value::Bool(false));
+    session.insert("context_critical_sent".to_owned(), Value::Bool(false));
+}
+
+fn flag_is_set(session: &Map<String, Value>, key: &str) -> bool {
+    session.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Human label for a session held as raw JSON, where the richer
+/// `cached_display_name` resolution is not available.
+fn raw_session_label(session: &Map<String, Value>, session_id: &str) -> String {
+    json_text(session.get("friendly_name"))
+        .or_else(|| json_text(session.get("name")))
+        .unwrap_or_else(|| session_id.to_owned())
+}
+
+/// Percentages arrive as floats but read as noise past the decimal point, so
+/// whole numbers are printed bare and anything else keeps one place.
+fn format_percentage(value: f64) -> String {
+    if (value - value.round()).abs() < f64::EPSILON {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn format_thousands(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if negative {
+        grouped.push('-');
+    }
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn push_retained_message_raw(
@@ -5393,6 +5836,14 @@ pub struct SessionRecord {
     pub context_monitor_enabled: bool,
     #[serde(default)]
     pub context_monitor_notify: Option<String>,
+    /// One-shot latches for the current accumulation cycle. Persisted rather
+    /// than held in memory (as the Python server did) so a server restart does
+    /// not re-fire a warning the agent has already been told about; the cycle
+    /// only ends at a compaction or an explicit context reset.
+    #[serde(default)]
+    pub context_warning_sent: bool,
+    #[serde(default)]
+    pub context_critical_sent: bool,
     #[serde(skip)]
     pub aliases: Vec<String>,
     #[serde(skip)]
@@ -6117,6 +6568,8 @@ mod tests {
             tokens_used: 0,
             context_monitor_enabled: false,
             context_monitor_notify: None,
+            context_warning_sent: false,
+            context_critical_sent: false,
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
         }
@@ -6959,6 +7412,333 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// A monitored child plus the parent it reports to. `enabled` drives the
+    /// `context_monitor_enabled` gate; `notify` is the monitor target, left
+    /// unset to exercise the parent fallback.
+    fn store_with_monitored_child(
+        label: &str,
+        enabled: bool,
+        notify: Option<&str>,
+    ) -> SessionStore {
+        let state_file = unique_temp_path(label);
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "parent01",
+                        "name": "claude-parent01",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-parent01",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    },
+                    {
+                        "id": "child001",
+                        "name": "claude-child001",
+                        "friendly_name": "worker",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-child001",
+                        "parent_session_id": "parent01",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00",
+                        "context_monitor_enabled": enabled,
+                        "context_monitor_notify": notify
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+    }
+
+    fn usage_event(session_id: &str, used_percentage: f64, tokens: i64) -> ContextUsageEvent {
+        ContextUsageEvent {
+            session_id: session_id.to_owned(),
+            event: None,
+            used_percentage: Some(used_percentage),
+            total_input_tokens: Some(tokens),
+        }
+    }
+
+    fn lifecycle_event(session_id: &str, event: &str) -> ContextUsageEvent {
+        ContextUsageEvent {
+            session_id: session_id.to_owned(),
+            event: Some(event.to_owned()),
+            used_percentage: None,
+            total_input_tokens: None,
+        }
+    }
+
+    fn context_monitor_messages(store: &SessionStore) -> Vec<Value> {
+        store
+            .load_raw_json_value()
+            .unwrap()
+            .get("retained_pending_messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|message| {
+                message.get("message_category").and_then(Value::as_str) == Some("context_monitor")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn context_usage_update_persists_tokens_and_warns_once_per_cycle() {
+        let store = store_with_monitored_child("ctxwarn", true, Some("parent01"));
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&usage_event("child001", 52.0, 104_000), None)
+                .unwrap(),
+            ContextUsageOutcome::Recorded {
+                used_percentage: 52.0
+            }
+        );
+        // Every subsequent render posts again; the agent must not be told twice.
+        store
+            .apply_context_usage_event(&usage_event("child001", 55.0, 110_000), None)
+            .unwrap();
+        store
+            .apply_context_usage_event(&usage_event("child001", 60.0, 120_000), None)
+            .unwrap();
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 120_000);
+        assert!(session.context_warning_sent);
+        assert!(!session.context_critical_sent);
+        assert_eq!(context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn repeated_identical_usage_samples_do_not_rewrite_the_state_file() {
+        // The status line re-renders far more often than the context moves, and
+        // the live state file is around a megabyte.
+        let store = store_with_monitored_child("ctxnowrite", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 20.0, 40_000), None)
+            .unwrap();
+
+        let modified_at = fs::metadata(&store.state_file).unwrap().modified().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        store
+            .apply_context_usage_event(&usage_event("child001", 20.0, 40_000), None)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&store.state_file).unwrap().modified().unwrap(),
+            modified_at
+        );
+
+        // A real change still lands.
+        store
+            .apply_context_usage_event(&usage_event("child001", 21.0, 42_000), None)
+            .unwrap();
+        assert_ne!(
+            fs::metadata(&store.state_file).unwrap().modified().unwrap(),
+            modified_at
+        );
+        assert_eq!(
+            store.get_session("child001").unwrap().unwrap().tokens_used,
+            42_000
+        );
+    }
+
+    #[test]
+    fn context_warning_does_not_refire_after_a_restart() {
+        // The Python server kept these latches in memory, so every restart
+        // re-alerted the parent about context it had already been told about.
+        let store = store_with_monitored_child("ctxrestart", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 52.0, 104_000), None)
+            .unwrap();
+
+        let restarted = SessionStore::new_with_legacy_fallback(
+            store.state_file.clone(),
+            store.state_file.clone(),
+        );
+        restarted
+            .apply_context_usage_event(&usage_event("child001", 53.0, 106_000), None)
+            .unwrap();
+
+        assert_eq!(context_monitor_messages(&restarted).len(), 1);
+    }
+
+    #[test]
+    fn context_critical_fires_separately_from_the_warning() {
+        let store = store_with_monitored_child("ctxcrit", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 52.0, 104_000), None)
+            .unwrap();
+        store
+            .apply_context_usage_event(&usage_event("child001", 70.0, 140_000), None)
+            .unwrap();
+        store
+            .apply_context_usage_event(&usage_event("child001", 72.0, 144_000), None)
+            .unwrap();
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert!(session.context_critical_sent);
+        let messages = context_monitor_messages(&store);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[1].get("delivery_mode").and_then(Value::as_str),
+            Some("urgent")
+        );
+    }
+
+    #[test]
+    fn context_usage_is_suppressed_for_unregistered_sessions() {
+        // #206: usage reporting is opt-in.
+        let store = store_with_monitored_child("ctxgate", false, None);
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&usage_event("child001", 90.0, 180_000), None)
+                .unwrap(),
+            ContextUsageOutcome::NotRegistered
+        );
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 0);
+        assert!(context_monitor_messages(&store).is_empty());
+    }
+
+    #[test]
+    fn compaction_notifies_the_parent_even_when_unregistered() {
+        // #210: compaction is context loss, so it bypasses the opt-in gate and
+        // falls back to the parent when no monitor is registered.
+        let store = store_with_monitored_child("ctxcompact", false, None);
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&lifecycle_event("child001", "compaction"), None)
+                .unwrap(),
+            ContextUsageOutcome::CompactionLogged
+        );
+
+        let messages = context_monitor_messages(&store);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("target_session_id").and_then(Value::as_str),
+            Some("parent01")
+        );
+        assert!(messages[0]
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("worker")));
+    }
+
+    #[test]
+    fn compaction_rearms_the_warning_for_the_next_cycle() {
+        let store = store_with_monitored_child("ctxrearm", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 52.0, 104_000), None)
+            .unwrap();
+        store
+            .apply_context_usage_event(&lifecycle_event("child001", "compaction"), None)
+            .unwrap();
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert!(!session.context_warning_sent);
+
+        // Post-compaction context can legitimately sit above the warning line,
+        // so the next cycle's first sample must be able to warn again.
+        store
+            .apply_context_usage_event(&usage_event("child001", 52.0, 104_000), None)
+            .unwrap();
+        // compaction notice + the two warnings
+        assert_eq!(context_monitor_messages(&store).len(), 3);
+    }
+
+    #[test]
+    fn context_reset_rearms_flags_and_clears_stale_status() {
+        let store = store_with_monitored_child("ctxreset", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 70.0, 140_000), None)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&lifecycle_event("child001", "context_reset"), None)
+                .unwrap(),
+            ContextUsageOutcome::FlagsReset
+        );
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert!(!session.context_warning_sent);
+        assert!(!session.context_critical_sent);
+        assert!(session.agent_status_text.is_none());
+    }
+
+    #[test]
+    fn context_usage_ignores_unknown_sessions_and_null_percentages() {
+        let store = store_with_monitored_child("ctxnull", true, Some("parent01"));
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&usage_event("nosuchid", 90.0, 1), None)
+                .unwrap(),
+            ContextUsageOutcome::UnknownSession
+        );
+        assert_eq!(
+            store
+                .apply_context_usage_event(
+                    &ContextUsageEvent {
+                        session_id: "child001".to_owned(),
+                        event: None,
+                        used_percentage: None,
+                        total_input_tokens: Some(0),
+                    },
+                    None
+                )
+                .unwrap(),
+            ContextUsageOutcome::NoUsage
+        );
+        assert_eq!(
+            store.get_session("child001").unwrap().unwrap().tokens_used,
+            0
+        );
+    }
+
+    #[test]
+    fn codex_token_usage_event_reports_the_resident_context() {
+        // `total` accumulates across every turn and runs far past the window;
+        // only `last` describes what is currently resident.
+        let event: Value = serde_json::from_str(
+            r#"{"event_type":"thread/tokenUsage/updated","payload":{"tokenUsage":{
+                 "total":{"totalTokens":1362757,"inputTokens":1354397},
+                 "last":{"totalTokens":129200,"inputTokens":114706},
+                 "modelContextWindow":258400}}}"#,
+        )
+        .unwrap();
+
+        let usage = codex_fork_context_usage(event.as_object().unwrap()).unwrap();
+
+        assert_eq!(usage.tokens_used, 129_200);
+        assert!((usage.used_percentage - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn codex_token_usage_ignores_unrelated_events() {
+        let event: Value =
+            serde_json::from_str(r#"{"event_type":"turn/started","payload":{}}"#).unwrap();
+
+        assert!(codex_fork_context_usage(event.as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn thousands_formatting_matches_the_python_message_text() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(104_000), "104,000");
+        assert_eq!(format_thousands(1_234_567), "1,234,567");
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

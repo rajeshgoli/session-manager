@@ -26,6 +26,8 @@ Multi-agent orchestration system for Claude Code. Manages sessions, enables pare
 - `src/tool_logger.py` - Tool usage logging for security audit
 - `src/telegram_bot.py` - Telegram bot integration
 - `hooks/log_tool_use.sh` - Claude Code hook for tool logging
+- `hooks/context_monitor.sh` - statusLine hook feeding `/hooks/context-usage` (delegates rendering to the previously configured status line)
+- `scripts/install_notify_server_hook.sh` - installs and registers every hook in `hooks/`
 
 ## sm CLI Commands
 
