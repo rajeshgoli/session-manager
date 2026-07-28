@@ -38,6 +38,7 @@ def env(tmp_path):
     (state / "codesign_sign_rc").write_text("0")
     (state / "codesign_verify_rc").write_text("0")
     (state / "cutover_rc").write_text("0")
+    (state / "stop_rc").write_text("0")
     (state / "phase").write_text("before")
     (state / "before_health").write_text("0")  # 0 == healthy (curl exit code)
     (state / "after_health").write_text("0")
@@ -67,10 +68,14 @@ exit "$rc"
 """,
         executable=True,
     )
+    # Both stubs record what is sitting at the registered path when they run, so
+    # tests can assert the live path only ever holds a binary launchd's current
+    # registration already accepted.
     _write(
         bin_dir / "codesign",
         f"""#!/bin/bash
-echo "codesign $*" >> "{log}"
+reg="ABSENT"; [[ -f "{tmp_path}/sm-server" ]] && reg="$(cat "{tmp_path}/sm-server")"
+echo "codesign $* [registered=$reg]" >> "{log}"
 for a in "$@"; do
   case "$a" in
     --verify) exit "$(cat "{state}/codesign_verify_rc")" ;;
@@ -134,13 +139,14 @@ exit 0
     cutover = _write(
         tmp_path / "cutover.sh",
         f"""#!/bin/bash
-echo "cutover $*" >> "{log}"
-if [[ "$1" == "render-plist" ]]; then
-  cat "{state}/rendered_plist"
-  exit 0
-fi
-echo after > "{state}/phase"
-exit "$(cat "{state}/cutover_rc")"
+reg="ABSENT"; [[ -f "{tmp_path}/sm-server" ]] && reg="$(cat "{tmp_path}/sm-server")"
+echo "cutover $* [registered=$reg]" >> "{log}"
+case "$1" in
+  render-plist) cat "{state}/rendered_plist"; exit 0 ;;
+  stop-rust) exit "$(cat "{state}/stop_rc")" ;;
+  start-rust) echo after > "{state}/phase"; exit "$(cat "{state}/cutover_rc")" ;;
+esac
+exit 0
 """,
         executable=True,
     )
@@ -290,7 +296,6 @@ def test_new_binary_is_removed_when_none_existed_before(env):
 
     assert result.returncode != 0
     assert not env["binary"].exists()
-    assert "removed the unverified binary" in result.stderr
     assert_service_untouched(env)
 
 
@@ -312,6 +317,49 @@ def test_cargo_target_dir_is_pinned(env):
     line = next(l for l in calls(env).splitlines() if l.startswith("cargo build"))
     assert f"--target-dir {env['tmp'] / 'target'}" in line
     assert str(env["tmp"] / "redirected") not in line
+
+
+def test_binary_is_installed_only_while_the_job_is_stopped(env):
+    """The registered path must never hold an unverified build while the job is
+    still registered: a server that exited in that window would be respawned by
+    KeepAlive onto a binary the old registration may reject."""
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    lines = calls(env).splitlines()
+    stop = next(l for l in lines if l.startswith("cutover stop-rust"))
+    start = next(l for l in lines if l.startswith("cutover start-rust"))
+    # Still the known-good build when the job is booted out...
+    assert "[registered=ORIGINAL]" in stop
+    # ...and only replaced once nothing can exec it.
+    assert "[registered=REBUILT]" in start
+
+
+def test_signing_happens_off_the_registered_path(env):
+    """Signing and verification run against the staged copy, so the live path
+    keeps the binary launchd's current registration already accepted."""
+    env["run"]()
+
+    signing = [l for l in calls(env).splitlines() if l.startswith("codesign --force")]
+    assert signing, "expected a signing call"
+    assert all("[registered=ORIGINAL]" in l for l in signing), signing
+
+
+def test_stop_failure_leaves_the_previous_binary_in_place(env):
+    (env["state"] / "stop_rc").write_text("1")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "could not stop" in result.stderr
+    assert env["binary"].read_text() == "ORIGINAL"
+    assert "cutover start-rust" not in calls(env)
+
+
+def test_staging_file_is_never_left_behind(env):
+    env["run"]()
+
+    assert list(env["tmp"].glob("sm-server.staging*")) == []
 
 
 def test_no_backup_file_is_left_behind(env):
@@ -373,7 +421,7 @@ def test_local_env_is_forwarded_to_the_cutover(env):
     result = env["run"](SM_LOCAL_ENV=str(overlay))
 
     assert result.returncode == 0, result.stderr
-    line = next(l for l in calls(env).splitlines() if l.startswith("cutover restart-rust"))
+    line = next(l for l in calls(env).splitlines() if l.startswith("cutover start-rust"))
     assert f"--local-env {overlay}" in line
 
 
@@ -390,7 +438,7 @@ def test_plist_path_is_forwarded_to_the_cutover(env):
     bootstraps a different (default) one."""
     env["run"]()
 
-    line = next(l for l in calls(env).splitlines() if l.startswith("cutover restart-rust"))
+    line = next(l for l in calls(env).splitlines() if l.startswith("cutover start-rust"))
     assert f"--plist {env['plist']}" in line
     # The cutover recomputes the plist path from --label, so order matters.
     assert line.index("--label") < line.index("--plist")
@@ -446,7 +494,7 @@ def test_build_runs_before_any_restart(env):
 
     text = calls(env)
     assert text.index("cargo build") < text.index("codesign --force")
-    assert text.index("codesign --verify") < text.index("cutover restart-rust")
+    assert text.index("codesign --verify") < text.index("cutover stop-rust")
 
 
 # --- signing behaviour ------------------------------------------------------
@@ -462,7 +510,9 @@ def test_restart_goes_through_the_cutover_script(env):
     env["run"]()
 
     text = calls(env)
-    assert "cutover restart-rust" in text
+    # restart-rust is exactly stop-rust then start-rust; the install goes between.
+    assert "cutover stop-rust" in text
+    assert "cutover start-rust" in text
     # The stale-constraint bug is exactly what a bare kickstart cannot fix.
     assert "launchctl kickstart" not in text
     assert "launchctl bootout" not in text
@@ -528,7 +578,7 @@ def test_cutover_failure_is_reported(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "restart failed" in result.stderr
+    assert "start failed" in result.stderr
 
 
 def test_pid_churn_is_detected_as_a_crash_loop(env):

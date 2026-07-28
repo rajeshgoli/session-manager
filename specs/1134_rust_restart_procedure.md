@@ -99,8 +99,10 @@ Phase 1 (service untouched on any failure)
   cargo build --release -p sm-server
   codesign --force --sign - --identifier com.rajeshgoli.sm-server <binary>
   codesign --verify --strict <binary>
-Phase 2                                 <- rollback disarmed; the new binary stays
-  scripts/rust-service-cutover.sh restart-rust <forwarded deployment args>
+Phase 2
+  cutover stop-rust                     <- bootout; no KeepAlive left to respawn
+  install: mv staging -> registered path (atomic, the only write to it)
+  cutover start-rust                    <- bootstrap -> kickstart
   poll /health until healthy (timeout -> nonzero)
   require state=running and an unchanged pid for 20s
   require session count not to have dropped
@@ -120,6 +122,23 @@ anything fails before the restart commits. Verified live: with signing forced to
 pass and verification forced to fail, the cdhash was restored byte-identical
 (`b06ed8fc...` before and after), the pid was unchanged, and no backup file was
 left behind.
+
+Rolling back on failure is not sufficient on its own, because the exposure is
+not only a failure path. cargo writes its output *straight to the registered
+path*, so between the build finishing and the job being re-registered there is a
+window - about a second, and cargo writes the binary at the end of linking, not
+during it - where the live path holds a build the current registration has never
+accepted. A server that exited in that window would be respawned by KeepAlive
+onto exactly that binary: the crash loop, reached without the script failing at
+all.
+
+So the structural cause is removed rather than patched. The new build is moved
+aside to a staging file the moment cargo produces it and the known-good binary
+is put back, so signing and verification run off the live path. The registered
+path is then replaced exactly once, by an atomic rename, *while the job is
+booted out* and there is no KeepAlive to exec anything. `restart-rust` is
+literally `stop_rust; start_rust`, so calling those two halves with the install
+between them runs the cutover's own code rather than a third path.
 
 The invariant is that SM_BINARY ends up exactly as it started, *including having
 been absent*. After a `cargo clean` the registered path is empty while launchd's
