@@ -1404,12 +1404,25 @@ impl SessionStore {
         event: &ContextUsageEvent,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<ContextUsageOutcome> {
-        let enabled = raw_session_object(state, session_id)
+        let session_snapshot = raw_session_object(state, session_id);
+        let enabled = session_snapshot
             .and_then(|session| session.get("context_monitor_enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if !enabled {
             return Ok(ContextUsageOutcome::NotRegistered);
+        }
+        // A sample emitted before the current cycle began describes context that
+        // no longer exists. Samples from a hook too old to stamp themselves are
+        // still accepted — the same tolerance the lifecycle hooks apply.
+        let cycle_reset_at =
+            session_snapshot.and_then(|session| json_text(session.get("context_cycle_reset_at")));
+        if let (Some(emitted_at), Some(cycle_reset_at)) =
+            (event.emitted_at.as_deref(), cycle_reset_at.as_deref())
+        {
+            if !timestamp_is_after(emitted_at, cycle_reset_at) {
+                return Ok(ContextUsageOutcome::StaleSample);
+            }
         }
         // Null until the first API call of a session — nothing to record yet.
         let Some(used_percentage) = event.used_percentage else {
@@ -3184,6 +3197,11 @@ pub struct ContextUsageEvent {
     pub used_percentage: Option<f64>,
     #[serde(default)]
     pub total_input_tokens: Option<i64>,
+    /// Stamped by the producer hook before it detached its curl, so it describes
+    /// when the sample was taken rather than when it arrived. Absent for hooks
+    /// predating that change.
+    #[serde(default)]
+    pub emitted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3194,6 +3212,7 @@ pub enum ContextUsageOutcome {
     FlagsReset,
     NotRegistered,
     NoUsage,
+    StaleSample,
     Recorded { used_percentage: f64 },
 }
 
@@ -3205,6 +3224,7 @@ impl ContextUsageOutcome {
             Self::CompactionCompleteLogged => "compaction_complete_logged",
             Self::FlagsReset => "flags_reset",
             Self::NotRegistered => "not_registered",
+            Self::StaleSample => "stale_sample",
             Self::NoUsage | Self::Recorded { .. } => "ok",
         }
     }
@@ -3661,9 +3681,21 @@ fn clear_stop_notify_raw(state: &mut Value, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Re-arm the one-shot latches and open a new accumulation cycle.
+///
+/// The stamp is what lets a usage sample be placed on one side of the boundary
+/// or the other. Status-line samples ride a detached curl, so a render that
+/// races a reset can arrive after it while still describing the context that was
+/// just discarded; applying that sample would restore the stale token count and
+/// re-latch the flags this call cleared, silencing the next real warning for a
+/// whole cycle.
 fn reset_context_oneshot_flags(session: &mut Map<String, Value>) {
     session.insert("context_warning_sent".to_owned(), Value::Bool(false));
     session.insert("context_critical_sent".to_owned(), Value::Bool(false));
+    session.insert(
+        "context_cycle_reset_at".to_owned(),
+        Value::String(now_rfc3339()),
+    );
 }
 
 fn flag_is_set(session: &Map<String, Value>, key: &str) -> bool {
@@ -7492,6 +7524,7 @@ mod tests {
             event: None,
             used_percentage: Some(used_percentage),
             total_input_tokens: Some(tokens),
+            emitted_at: None,
         }
     }
 
@@ -7501,6 +7534,7 @@ mod tests {
             event: Some(event.to_owned()),
             used_percentage: None,
             total_input_tokens: None,
+            emitted_at: None,
         }
     }
 
@@ -7642,6 +7676,61 @@ mod tests {
         let session = store.get_session("child001").unwrap().unwrap();
         assert!(!session.context_warning_sent);
         assert!(!session.context_critical_sent);
+    }
+
+    #[test]
+    fn a_sample_that_raced_a_reset_does_not_reopen_the_old_cycle() {
+        // Status-line samples ride a detached curl, so a render that races a
+        // /clear can arrive after it while still describing the discarded
+        // context. Applying it would restore the stale token count and re-latch
+        // the flags the reset just cleared, silencing the next real warning.
+        let store = store_with_monitored_child("ctxrace", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&usage_event("child001", 20.0, 40_000), None)
+            .unwrap();
+
+        let sampled_at = now_rfc3339();
+        thread::sleep(Duration::from_millis(5));
+        store
+            .apply_context_usage_event(&lifecycle_event("child001", "context_reset"), None)
+            .unwrap();
+
+        let mut late = usage_event("child001", 70.0, 140_000);
+        late.emitted_at = Some(sampled_at);
+        assert_eq!(
+            store.apply_context_usage_event(&late, None).unwrap(),
+            ContextUsageOutcome::StaleSample
+        );
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 40_000);
+        assert!(!session.context_critical_sent);
+        assert!(context_monitor_messages(&store).is_empty());
+
+        // The next sample of the new cycle still warns.
+        let mut fresh = usage_event("child001", 70.0, 140_000);
+        fresh.emitted_at = Some(now_rfc3339());
+        store.apply_context_usage_event(&fresh, None).unwrap();
+        assert_eq!(context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn unstamped_samples_are_still_accepted() {
+        // A hook script too old to stamp itself must keep working, matching the
+        // tolerance the lifecycle hooks already apply.
+        let store = store_with_monitored_child("ctxunstamped", true, Some("parent01"));
+        store
+            .apply_context_usage_event(&lifecycle_event("child001", "context_reset"), None)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&usage_event("child001", 70.0, 140_000), None)
+                .unwrap(),
+            ContextUsageOutcome::Recorded {
+                used_percentage: 70.0
+            }
+        );
     }
 
     #[test]
@@ -7789,6 +7878,7 @@ mod tests {
                         event: None,
                         used_percentage: None,
                         total_input_tokens: Some(0),
+                        emitted_at: None,
                     },
                     None
                 )

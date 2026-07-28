@@ -81,6 +81,16 @@ context the agent had already been told about. They are now
 `context_warning_sent` / `context_critical_sent` on the session record. The cycle
 ends at a compaction or an explicit reset, not at a process boundary.
 
+**Samples are ordered against cycle boundaries.** The status-line post rides a
+detached curl, so a render that races a `/clear` or a compaction can arrive
+*after* the lifecycle hook while still describing the context that was just
+discarded. Applying it would restore the stale token count, re-latch the flags
+the reset had just cleared, and silence the next real warning for a whole cycle.
+Every re-arm point stamps `context_cycle_reset_at`, the hook stamps
+`sm_hook_emitted_at` before detaching, and a sample older than the current cycle
+is dropped. Samples with no stamp are still accepted — the same tolerance the
+lifecycle hooks apply to scripts too old to send one.
+
 **Enabling monitoring re-arms the latches.** A persisted latch outlives the
 registration that set it, so a monitor registering against a session whose context
 is already high would hear nothing until a compaction happened to clear it.

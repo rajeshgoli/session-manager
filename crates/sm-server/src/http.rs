@@ -1408,6 +1408,7 @@ async fn context_usage_hook(
             .map(ToOwned::to_owned),
         used_percentage: payload.get("used_percentage").and_then(Value::as_f64),
         total_input_tokens: payload_i64(payload.get("total_input_tokens")),
+        emitted_at: hook_emitted_at(&payload).map(ToOwned::to_owned),
     };
 
     let runtime = state

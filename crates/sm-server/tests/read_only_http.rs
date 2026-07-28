@@ -7530,6 +7530,40 @@ async fn context_usage_hook_is_served_and_records_tokens() {
 }
 
 #[tokio::test]
+async fn context_usage_hook_rejects_a_sample_emitted_before_the_current_cycle() {
+    let state_file = write_session_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    // A status-line render that raced the reset: emitted before it, delivered
+    // after it by its own detached curl.
+    let (status, _) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({ "session_id": "run12345", "event": "context_reset" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "used_percentage": 90.0,
+            "total_input_tokens": 180_000,
+            "sm_hook_emitted_at": "2020-01-01T00:00:00.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "stale_sample");
+
+    let (status, payload) = get_json(app, "/sessions/run12345").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["tokens_used"], json!(42));
+}
+
+#[tokio::test]
 async fn context_usage_hook_drops_undecodable_bodies_without_erroring() {
     // route_auth_matrix.md:144 — decodes JSON or returns 204. A hook that gets a
     // client error back is a hook failure surfaced in a live pane.

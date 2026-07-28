@@ -34,14 +34,27 @@ post_usage() {
 
   # used_percentage is null until the first API call of a session. Nothing to
   # report yet, and reporting it every render before then is pure noise.
+  #
+  # sm_hook_emitted_at is stamped here, before the curl detaches, so the server
+  # can tell a sample that describes pre-reset context from one that describes
+  # the new cycle. A render that races a /clear or a compaction would otherwise
+  # land after the lifecycle hook and re-latch the flags it just cleared,
+  # silencing the next real warning. Stamping inside the jq run that builds the
+  # body keeps this off the hot path — the status line renders constantly.
   local body
   body=$(
     printf '%s' "$INPUT" | jq -c \
       --arg sid "$CLAUDE_SESSION_MANAGER_ID" \
-      'select(.context_window.used_percentage != null)
+      'def stamp:
+         now as $t | ($t | floor) as $s
+         | ($s | strftime("%Y-%m-%dT%H:%M:%S"))
+           + "." + (("000000" + ((($t - $s) * 1000000) | floor | tostring))[-6:])
+           + "Z";
+       select(.context_window.used_percentage != null)
        | {session_id: $sid,
           used_percentage: .context_window.used_percentage,
-          total_input_tokens: (.context_window.total_input_tokens // 0)}' 2>/dev/null
+          total_input_tokens: (.context_window.total_input_tokens // 0),
+          sm_hook_emitted_at: stamp}' 2>/dev/null
   ) || return 0
   [ -n "$body" ] || return 0
 
