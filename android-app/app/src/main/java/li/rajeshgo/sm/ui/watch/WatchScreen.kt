@@ -27,7 +27,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -1469,15 +1468,11 @@ private fun MarkdownText(markdown: String) {
     val textColor = MaterialTheme.colorScheme.onSurface.toArgb()
     val linkColor = Cyan.toArgb()
     androidx.compose.ui.viewinterop.AndroidView(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 420.dp),
+        modifier = Modifier.fillMaxWidth(),
         factory = { viewContext ->
             android.widget.TextView(viewContext).apply {
                 setTextIsSelectable(true)
                 movementMethod = android.text.method.LinkMovementMethod.getInstance()
-                isVerticalScrollBarEnabled = true
-                overScrollMode = android.view.View.OVER_SCROLL_IF_CONTENT_SCROLLS
                 setLineSpacing(0f, 1.15f)
                 setPadding(0, 0, 0, 0)
                 textSize = 15f
