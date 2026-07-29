@@ -6186,10 +6186,6 @@ fn run_claude_btw(
     target: &SessionRecord,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let _copy_guard = BTW_NATIVE_COPY_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| anyhow::anyhow!("native copy lock poisoned"))?;
     let initial = runtime
         .capture_pane_tail(&target.tmux_session, 80)
         .ok_or_else(|| anyhow::anyhow!("unable to inspect Claude pane"))?;
@@ -6203,18 +6199,27 @@ fn run_claude_btw(
         anyhow::bail!("Claude is not ready for a native /btw command");
     }
 
-    let before = runtime
-        .list_buffer_ids()?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
     let command = format!("/btw {prompt}");
     if !runtime.send_input(&target.tmux_session, &command)? {
         anyhow::bail!("target tmux session is not running");
     }
-    capture_claude_btw_result(runtime, target, &before)
+    capture_claude_btw_result(runtime, target)
 }
 
 fn recover_claude_btw(runtime: &TmuxRuntime, target: &SessionRecord) -> anyhow::Result<String> {
+    capture_claude_btw_result(runtime, target)
+}
+
+fn capture_claude_btw_result(
+    runtime: &TmuxRuntime,
+    target: &SessionRecord,
+) -> anyhow::Result<String> {
+    wait_for_pane(
+        runtime,
+        &target.tmux_session,
+        BTW_PROVIDER_TIMEOUT,
+        |pane| pane.contains("c to copy") && pane.contains("Esc to close"),
+    )?;
     let _copy_guard = BTW_NATIVE_COPY_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -6223,20 +6228,6 @@ fn recover_claude_btw(runtime: &TmuxRuntime, target: &SessionRecord) -> anyhow::
         .list_buffer_ids()?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    capture_claude_btw_result(runtime, target, &before)
-}
-
-fn capture_claude_btw_result(
-    runtime: &TmuxRuntime,
-    target: &SessionRecord,
-    before: &BTreeSet<String>,
-) -> anyhow::Result<String> {
-    wait_for_pane(
-        runtime,
-        &target.tmux_session,
-        BTW_PROVIDER_TIMEOUT,
-        |pane| pane.contains("c to copy") && pane.contains("Esc to close"),
-    )?;
     if !runtime.send_key_input(&target.tmux_session, "c")? {
         anyhow::bail!("target tmux session stopped before native copy");
     }

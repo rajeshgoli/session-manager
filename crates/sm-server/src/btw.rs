@@ -388,9 +388,7 @@ pub fn codex_btw_event(line: &str, request_id: &str) -> Option<Result<String, St
 
 pub fn extract_stock_codex_answer(snapshot: &str, prompt: &str) -> Option<String> {
     let lines = snapshot.lines().map(str::trim).collect::<Vec<_>>();
-    let prompt_index = lines
-        .iter()
-        .rposition(|line| *line == prompt || line.ends_with(prompt))?;
+    let prompt_index = stock_codex_prompt_end(&lines, prompt)?;
     let mut answer = Vec::new();
     for line in lines.into_iter().skip(prompt_index + 1) {
         if line.contains("Side from main thread")
@@ -414,6 +412,41 @@ pub fn extract_stock_codex_answer(snapshot: &str, prompt: &str) -> Option<String
     }
     let answer = answer.join("\n").trim().to_owned();
     (!answer.is_empty()).then_some(answer)
+}
+
+fn stock_codex_prompt_end(lines: &[&str], prompt: &str) -> Option<usize> {
+    if let Some(index) = lines
+        .iter()
+        .rposition(|line| *line == prompt || line.ends_with(prompt))
+    {
+        return Some(index);
+    }
+    let prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    for start in (0..lines.len()).rev() {
+        let mut candidate = String::new();
+        for (index, line) in lines.iter().enumerate().skip(start) {
+            let part = line
+                .trim_matches(|ch: char| matches!(ch, '│' | '╭' | '╮' | '╰' | '╯' | '─'))
+                .trim()
+                .trim_start_matches(['›', '>'])
+                .trim();
+            if part.is_empty() {
+                continue;
+            }
+            if !candidate.is_empty() {
+                candidate.push(' ');
+            }
+            candidate.push_str(part);
+            let normalized = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized == prompt {
+                return Some(index);
+            }
+            if !prompt.starts_with(&normalized) {
+                break;
+            }
+        }
+    }
+    None
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -643,6 +676,23 @@ Side from main thread · Ctrl+C to return\n";
         assert_eq!(
             extract_stock_codex_answer(snapshot, "Summarize now").as_deref(),
             Some("The implementation is complete.\nTests are passing.")
+        );
+    }
+
+    #[test]
+    fn extracts_stock_codex_answer_after_wrapped_prompt() {
+        let snapshot = "\
+› Summarize the implementation and\n\
+  current verification status\n\
+The implementation is complete.\n\
+Side from main thread · Ctrl+C to return\n";
+        assert_eq!(
+            extract_stock_codex_answer(
+                snapshot,
+                "Summarize the implementation and current verification status",
+            )
+            .as_deref(),
+            Some("The implementation is complete.")
         );
     }
 }
