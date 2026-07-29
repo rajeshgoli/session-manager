@@ -56,6 +56,7 @@ class SessionManagerRepository(
     private companion object {
         private const val READ_RETRY_ATTEMPTS = 3
         private const val READ_RETRY_BASE_DELAY_MS = 600L
+        private const val WHAT_REQUEST_POLL_INTERVAL_MS = 500L
         private const val GENERIC_TRANSIENT_READ_MESSAGE = "Server temporarily unavailable. Retrying soon."
         private const val GENERIC_TRANSIENT_WRITE_MESSAGE = "Server temporarily unavailable. Try again."
         private const val BACKEND_UNREACHABLE_ERROR = "backend_unreachable"
@@ -109,11 +110,16 @@ class SessionManagerRepository(
         baseUrl: String,
         token: String = "",
         block: suspend (ApiService) -> T,
+    ): T = executeReadRequest(api(baseUrl, token), block)
+
+    private suspend fun <T> executeReadRequest(
+        service: ApiService,
+        block: suspend (ApiService) -> T,
     ): T {
         var lastTransient: Throwable? = null
         repeat(READ_RETRY_ATTEMPTS) { attempt ->
             try {
-                return block(api(baseUrl, token))
+                return block(service)
             } catch (error: HttpException) {
                 when (error.code()) {
                     401, 403 -> throw SessionManagerAuthException("Session expired. Sign in again.", error)
@@ -209,14 +215,16 @@ class SessionManagerRepository(
         }.mapFailure(::classifyWriteFailure)
     }
 
-    suspend fun createWhatRequest(
+    suspend fun runWhatRequest(
         baseUrl: String,
         token: String,
         sessionId: String,
+        onUpdate: (WhatRequestRecord) -> Unit,
     ): Result<WhatRequestRecord> = withContext(Dispatchers.IO) {
         runCatching {
-            try {
-                api(baseUrl, token).createWhatRequest(
+            val service = api(baseUrl, token)
+            var current = try {
+                service.createWhatRequest(
                     sessionId = sessionId,
                     request = WhatRequestBody(deliveryMode = "poll"),
                 )
@@ -230,21 +238,23 @@ class SessionManagerRepository(
                         detail ?: "Another summary request is already active.",
                         error,
                     )
-                executeReadRequest(baseUrl, token) {
+                executeReadRequest(service) {
                     it.getWhatRequest(activeRequestId)
                 }
             } catch (error: Throwable) {
                 throw classifyWriteFailure(error)
             }
-        }
-    }
 
-    suspend fun fetchWhatRequest(
-        baseUrl: String,
-        token: String,
-        requestId: String,
-    ): WhatRequestRecord = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getWhatRequest(requestId) }
+            onUpdate(current)
+            while (current.status !in setOf("completed", "failed", "timed_out")) {
+                delay(WHAT_REQUEST_POLL_INTERVAL_MS)
+                current = executeReadRequest(service) {
+                    it.getWhatRequest(current.requestId)
+                }
+                onUpdate(current)
+            }
+            current
+        }.mapFailure(::classifyWriteFailure)
     }
 
     suspend fun createMobileAttachTicket(

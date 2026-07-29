@@ -76,7 +76,6 @@ data class WatchUiState(
 class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         private const val MOBILE_TERMINAL_SOCKET_RETRY_DELAY_MS = 600L
-        private const val WHAT_REQUEST_POLL_INTERVAL_MS = 500L
     }
 
     private val settingsRepository = SettingsRepository(application)
@@ -282,8 +281,10 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                val created = sessionRepository
-                    .createWhatRequest(serverUrl, accessToken, session.id)
+                sessionRepository
+                    .runWhatRequest(serverUrl, accessToken, session.id) { record ->
+                        updateWhatRecord(session, record)
+                    }
                     .getOrElse { error ->
                         if (error is CancellationException) {
                             throw error
@@ -291,18 +292,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                         updateWhatFailure(session, error.message ?: "Summary request failed")
                         return@launch
                     }
-                updateWhatRecord(session, created)
-
-                var current = created
-                while (current.status !in setOf("completed", "failed", "timed_out")) {
-                    delay(WHAT_REQUEST_POLL_INTERVAL_MS)
-                    current = sessionRepository.fetchWhatRequest(
-                        serverUrl,
-                        accessToken,
-                        current.requestId,
-                    )
-                    updateWhatRecord(session, current)
-                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
