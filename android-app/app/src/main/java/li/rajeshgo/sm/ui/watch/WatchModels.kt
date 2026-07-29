@@ -5,6 +5,7 @@ import java.time.OffsetDateTime
 import java.time.format.DateTimeParseException
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.data.model.WhatRequestRecord
 
 
 data class WatchSection(
@@ -27,6 +28,36 @@ data class WatchRepoGroup(
 
 const val RETIRE_SESSION_ACTION_LABEL = "Retire"
 const val SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE = "Sign in to retire sessions"
+
+enum class SessionVisualState {
+    Active,
+    Inactive,
+    Stopped,
+}
+
+data class WhatUiState(
+    val targetSessionId: String,
+    val targetName: String,
+    val requestId: String? = null,
+    val status: String = "pending",
+    val createdAt: String? = null,
+    val finishedAt: String? = null,
+    val result: String? = null,
+    val error: String? = null,
+)
+
+fun WhatUiState.isTerminal(): Boolean = status in setOf("completed", "failed", "timed_out")
+
+fun WhatUiState.withRecord(record: WhatRequestRecord): WhatUiState {
+    return copy(
+        requestId = record.requestId,
+        status = record.status,
+        createdAt = record.createdAt,
+        finishedAt = record.finishedAt,
+        result = record.result,
+        error = record.error,
+    )
+}
 
 fun sessionDisplayName(session: ClientSession): String {
     return session.friendlyName?.takeIf { it.isNotBlank() } ?: session.name.ifBlank { session.id }
@@ -67,6 +98,14 @@ fun isOperationallyActive(session: ClientSession): Boolean {
         activity == "working" || activity == "thinking" || activity == "waiting" || activity == "bg-wait" -> true
         !rawActivity.isNullOrEmpty() -> false
         else -> session.status == "running"
+    }
+}
+
+fun sessionVisualState(session: ClientSession): SessionVisualState {
+    return when {
+        session.status == "stopped" -> SessionVisualState.Stopped
+        isOperationallyActive(session) -> SessionVisualState.Active
+        else -> SessionVisualState.Inactive
     }
 }
 

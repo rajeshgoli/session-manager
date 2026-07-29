@@ -20,6 +20,8 @@ import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.StudioSshStatusResponse
 import li.rajeshgo.sm.data.model.ToolCallRow
+import li.rajeshgo.sm.data.model.WhatRequestBody
+import li.rajeshgo.sm.data.model.WhatRequestRecord
 import li.rajeshgo.sm.data.remote.ApiService
 import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.security.DeviceProof
@@ -39,6 +41,11 @@ class SessionManagerTransientException(message: String, cause: Throwable? = null
 class SessionManagerBackendUnavailableException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 
 const val RETIRE_REQUEST_FAILED_MESSAGE = "Retire request failed"
+private val ACTIVE_WHAT_REQUEST_ID = Regex("""\bbtw-[A-Za-z0-9_-]+\b""")
+
+fun activeWhatRequestId(detail: String?): String? {
+    return detail?.let { ACTIVE_WHAT_REQUEST_ID.find(it)?.value }
+}
 
 class SessionManagerRepository(
     private val settingsRepository: SettingsRepository? = null,
@@ -200,6 +207,44 @@ class SessionManagerRepository(
             val response = api(baseUrl, token).killSession(sessionId)
             check(response.status == "killed") { response.error ?: RETIRE_REQUEST_FAILED_MESSAGE }
         }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun createWhatRequest(
+        baseUrl: String,
+        token: String,
+        sessionId: String,
+    ): Result<WhatRequestRecord> = withContext(Dispatchers.IO) {
+        runCatching {
+            try {
+                api(baseUrl, token).createWhatRequest(
+                    sessionId = sessionId,
+                    request = WhatRequestBody(deliveryMode = "poll"),
+                )
+            } catch (error: HttpException) {
+                if (error.code() != 409) {
+                    throw classifyWriteFailure(error)
+                }
+                val detail = extractServerError(error)?.message
+                val activeRequestId = activeWhatRequestId(detail)
+                    ?: throw SessionManagerRequestException(
+                        detail ?: "Another summary request is already active.",
+                        error,
+                    )
+                executeReadRequest(baseUrl, token) {
+                    it.getWhatRequest(activeRequestId)
+                }
+            } catch (error: Throwable) {
+                throw classifyWriteFailure(error)
+            }
+        }
+    }
+
+    suspend fun fetchWhatRequest(
+        baseUrl: String,
+        token: String,
+        requestId: String,
+    ): WhatRequestRecord = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getWhatRequest(requestId) }
     }
 
     suspend fun createMobileAttachTicket(

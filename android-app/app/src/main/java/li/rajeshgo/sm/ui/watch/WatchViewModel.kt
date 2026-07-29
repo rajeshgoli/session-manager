@@ -3,6 +3,7 @@ package li.rajeshgo.sm.ui.watch
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -56,6 +57,8 @@ data class WatchUiState(
     val sessions: List<ClientSession> = emptyList(),
     val expandedSessionIds: Set<String> = emptySet(),
     val detailsBySessionId: Map<String, SessionDetail> = emptyMap(),
+    val whatBySessionId: Map<String, WhatUiState> = emptyMap(),
+    val selectedWhatSessionId: String? = null,
     val loading: Boolean = true,
     val refreshing: Boolean = false,
     val requestingStatus: Boolean = false,
@@ -73,12 +76,14 @@ data class WatchUiState(
 class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         private const val MOBILE_TERMINAL_SOCKET_RETRY_DELAY_MS = 600L
+        private const val WHAT_REQUEST_POLL_INTERVAL_MS = 500L
     }
 
     private val settingsRepository = SettingsRepository(application)
     private val sessionRepository = SessionManagerRepository(settingsRepository)
     private val deviceKeyManager = DeviceKeyManager()
     private var refreshJob: Job? = null
+    private val whatRequestJobs = mutableMapOf<String, Job>()
     // Bumped on every Studio SSH toggle so status reads that began before the
     // latest toggle can be discarded instead of applying stale pre-toggle data.
     private var studioSshStatusGeneration = 0
@@ -105,6 +110,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        whatRequestJobs.values.forEach { it.cancel() }
+        whatRequestJobs.clear()
         terminalAttachToken = null
         pendingTerminalResize = null
         terminalSocket?.close(1000, "viewmodel cleared")
@@ -136,9 +143,13 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     .onSuccess { sessions ->
                         val sessionIds = sessions.map { it.id }.toSet()
                         val preservedDetails = _uiState.value.detailsBySessionId.filterKeys { it in sessionIds }
+                        val preservedWhat = _uiState.value.whatBySessionId.filterKeys { it in sessionIds }
                         _uiState.value = _uiState.value.copy(
                             sessions = sessions,
                             detailsBySessionId = preservedDetails,
+                            whatBySessionId = preservedWhat,
+                            selectedWhatSessionId = _uiState.value.selectedWhatSessionId
+                                ?.takeIf { it in sessionIds },
                             loading = false,
                             refreshing = false,
                             userEmail = userEmail,
@@ -159,6 +170,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                     sessions = emptyList(),
                                     expandedSessionIds = emptySet(),
                                     detailsBySessionId = emptyMap(),
+                                    whatBySessionId = emptyMap(),
+                                    selectedWhatSessionId = null,
                                     lastSync = null,
                                     userEmail = "",
                                     error = error.message ?: "Session expired. Sign in again.",
@@ -171,6 +184,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                     sessions = emptyList(),
                                     expandedSessionIds = emptySet(),
                                     detailsBySessionId = emptyMap(),
+                                    whatBySessionId = emptyMap(),
+                                    selectedWhatSessionId = null,
                                     lastSync = null,
                                     userEmail = userEmail,
                                     error = error.message
@@ -232,6 +247,97 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun openWhat(session: ClientSession) {
+        _uiState.value = _uiState.value.copy(selectedWhatSessionId = session.id)
+        if (_uiState.value.whatBySessionId[session.id] == null) {
+            startWhatRequest(session)
+        }
+    }
+
+    fun refreshWhat(session: ClientSession) {
+        whatRequestJobs.remove(session.id)?.cancel()
+        startWhatRequest(session)
+    }
+
+    fun dismissWhat() {
+        _uiState.value = _uiState.value.copy(selectedWhatSessionId = null)
+    }
+
+    private fun startWhatRequest(session: ClientSession) {
+        val initial = WhatUiState(
+            targetSessionId = session.id,
+            targetName = sessionDisplayName(session),
+        )
+        _uiState.value = _uiState.value.copy(
+            selectedWhatSessionId = session.id,
+            whatBySessionId = _uiState.value.whatBySessionId + (session.id to initial),
+        )
+
+        val job = viewModelScope.launch {
+            try {
+                val serverUrl = settingsRepository.serverUrl.first()
+                val accessToken = settingsRepository.accessToken.first()
+                if (serverUrl.isBlank() || accessToken.isBlank()) {
+                    updateWhatFailure(session, "Sign in to request a summary")
+                    return@launch
+                }
+
+                val created = sessionRepository
+                    .createWhatRequest(serverUrl, accessToken, session.id)
+                    .getOrElse { error ->
+                        if (error is CancellationException) {
+                            throw error
+                        }
+                        updateWhatFailure(session, error.message ?: "Summary request failed")
+                        return@launch
+                    }
+                updateWhatRecord(session, created)
+
+                var current = created
+                while (current.status !in setOf("completed", "failed", "timed_out")) {
+                    delay(WHAT_REQUEST_POLL_INTERVAL_MS)
+                    current = sessionRepository.fetchWhatRequest(
+                        serverUrl,
+                        accessToken,
+                        current.requestId,
+                    )
+                    updateWhatRecord(session, current)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                updateWhatFailure(session, error.message ?: "Unable to refresh summary")
+            }
+        }
+        whatRequestJobs[session.id] = job
+        job.invokeOnCompletion {
+            if (whatRequestJobs[session.id] === job) {
+                whatRequestJobs.remove(session.id)
+            }
+        }
+    }
+
+    private fun updateWhatRecord(
+        session: ClientSession,
+        record: li.rajeshgo.sm.data.model.WhatRequestRecord,
+    ) {
+        val current = _uiState.value.whatBySessionId[session.id]
+            ?: WhatUiState(session.id, sessionDisplayName(session))
+        _uiState.value = _uiState.value.copy(
+            whatBySessionId = _uiState.value.whatBySessionId +
+                (session.id to current.withRecord(record)),
+        )
+    }
+
+    private fun updateWhatFailure(session: ClientSession, message: String) {
+        val current = _uiState.value.whatBySessionId[session.id]
+            ?: WhatUiState(session.id, sessionDisplayName(session))
+        _uiState.value = _uiState.value.copy(
+            whatBySessionId = _uiState.value.whatBySessionId +
+                (session.id to current.copy(status = "failed", error = message)),
+        )
+    }
+
     fun killSession(sessionId: String, onComplete: (Result<Unit>) -> Unit) {
         viewModelScope.launch {
             val serverUrl = settingsRepository.serverUrl.first()
@@ -247,6 +353,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     sessions = emptyList(),
                     expandedSessionIds = emptySet(),
                     detailsBySessionId = emptyMap(),
+                    whatBySessionId = emptyMap(),
+                    selectedWhatSessionId = null,
                     lastSync = null,
                     userEmail = "",
                 )
@@ -256,6 +364,9 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     sessions = _uiState.value.sessions.filterNot { it.id == sessionId },
                     expandedSessionIds = _uiState.value.expandedSessionIds - sessionId,
                     detailsBySessionId = _uiState.value.detailsBySessionId - sessionId,
+                    whatBySessionId = _uiState.value.whatBySessionId - sessionId,
+                    selectedWhatSessionId = _uiState.value.selectedWhatSessionId
+                        ?.takeUnless { it == sessionId },
                 )
             }
             onComplete(result)
@@ -683,6 +794,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                         sessions = emptyList(),
                         expandedSessionIds = emptySet(),
                         detailsBySessionId = emptyMap(),
+                        whatBySessionId = emptyMap(),
+                        selectedWhatSessionId = null,
                         lastSync = null,
                         userEmail = "",
                     )
@@ -761,6 +874,8 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     sessions = emptyList(),
                     expandedSessionIds = emptySet(),
                     detailsBySessionId = emptyMap(),
+                    whatBySessionId = emptyMap(),
+                    selectedWhatSessionId = null,
                     lastSync = null,
                     userEmail = "",
                 )

@@ -158,6 +158,31 @@ data class EnsureMaintainerRequest(
 )
 
 @Serializable
+data class WhatRequestBody(
+    @SerialName("delivery_mode")
+    val deliveryMode: String,
+)
+
+@Serializable
+data class WhatRequestRecord(
+    @SerialName("request_id")
+    val requestId: String,
+    @SerialName("target_session_id")
+    val targetSessionId: String,
+    @SerialName("target_provider")
+    val targetProvider: String,
+    val status: String,
+    @SerialName("created_at")
+    val createdAt: String,
+    @SerialName("started_at")
+    val startedAt: String? = null,
+    @SerialName("finished_at")
+    val finishedAt: String? = null,
+    val result: String? = null,
+    val error: String? = null,
+)
+
+@Serializable
 data class ClientSession(
     val id: String,
     val name: String,

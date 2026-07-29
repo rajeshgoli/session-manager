@@ -15,6 +15,21 @@ class SessionManagerRepositoryTest {
     }
 
     @Test
+    fun activeWhatRequestIdExtractsConflictRequest() {
+        assertEquals(
+            "btw-cbc3c6fcccfeef9adc1023f795c3e971",
+            activeWhatRequestId(
+                "Target already has active sm what request btw-cbc3c6fcccfeef9adc1023f795c3e971"
+            ),
+        )
+    }
+
+    @Test
+    fun activeWhatRequestIdRejectsUncorrelatedConflict() {
+        assertNull(activeWhatRequestId("Another request is already active"))
+    }
+
+    @Test
     fun mobileAttachTicketPathIncludesBaseUrlPathPrefix() {
         val repository = SessionManagerRepository()
 
