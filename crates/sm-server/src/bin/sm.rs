@@ -36,6 +36,8 @@ enum Command {
     Who(EmptyArgs),
     All(EmptyArgs),
     Send(SendArgs),
+    #[command(alias = "btw")]
+    What(WhatArgs),
     Wait(WaitArgs),
     Spawn(SpawnArgs),
     Fork(ForkArgs),
@@ -107,6 +109,12 @@ struct SendArgs {
     urgent: bool,
     #[arg(long, value_name = "SECONDS")]
     wait: Option<u64>,
+}
+
+#[derive(Args)]
+struct WhatArgs {
+    session_id: String,
+    prompt: Vec<String>,
 }
 
 #[derive(Args)]
@@ -677,6 +685,7 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Command::What(args) => run_what(&client, args)?,
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
         Command::Tail(args) => print_tail(&client, &args.session_id, args.lines, args.raw)?,
         Command::Children(args) => {
@@ -2318,6 +2327,53 @@ fn resolve_send_target(client: &ApiClient, identifier: &str) -> Result<String> {
     }
 }
 
+fn run_what(client: &ApiClient, args: WhatArgs) -> Result<()> {
+    let target_id = lookup_identifier_exact(client, &args.session_id)?
+        .ok_or_else(|| anyhow!("No agent named '{}' is reachable.", args.session_id))?;
+    let requester_session_id = optional_current_session_id();
+    let managed_caller = requester_session_id.is_some();
+    let prompt = args.prompt.join(" ");
+    let response = client.post_json(
+        &format!("/sessions/{}/what", encode_path_segment(&target_id)),
+        json!({
+            "prompt": (!prompt.trim().is_empty()).then_some(prompt),
+            "requester_session_id": requester_session_id,
+            "delivery_mode": if managed_caller { "session" } else { "poll" },
+        }),
+    )?;
+    let request_id = response["request_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("sm what response missing request_id"))?;
+    if managed_caller {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(125);
+    loop {
+        let status = client.get_json(&format!(
+            "/btw-requests/{}",
+            encode_path_segment(request_id)
+        ))?;
+        match status["status"].as_str().unwrap_or("unknown") {
+            "completed" => {
+                println!("{}", status["result"].as_str().unwrap_or_default());
+                return Ok(());
+            }
+            "failed" | "timed_out" => {
+                bail!(
+                    "{}",
+                    status["error"].as_str().unwrap_or("sm what request failed")
+                );
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            bail!("sm what timed out waiting for request {request_id}");
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn send_input_payload(text: String, delivery_mode: &str, wait: Option<u64>) -> Value {
     let mut payload = json!({
         "text": text,
@@ -2882,7 +2938,20 @@ fn lookup_identifier_exact(client: &ApiClient, identifier: &str) -> Result<Optio
         return bail_ambiguous_lookup(identifier, &exact_matches);
     }
 
-    Ok(None)
+    let prefix_matches = sessions
+        .iter()
+        .filter(|session| {
+            session["id"]
+                .as_str()
+                .is_some_and(|session_id| session_id.starts_with(identifier))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match prefix_matches.len() {
+        1 => Ok(prefix_matches[0]["id"].as_str().map(ToOwned::to_owned)),
+        count if count > 1 => bail_ambiguous_lookup(identifier, &prefix_matches),
+        _ => Ok(None),
+    }
 }
 
 fn bail_ambiguous_lookup(identifier: &str, matches: &[Value]) -> Result<Option<String>> {
@@ -3689,9 +3758,15 @@ fn home_dir() -> Option<PathBuf> {
 fn retire_removed_surface_if_requested() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let command = command_tokens_after_globals(&args);
-    let retired = match command.as_slice() {
+    if let Some(message) = retired_command_message(&command) {
+        eprintln!("{message}");
+        process::exit(2);
+    }
+}
+
+fn retired_command_message(command: &[&str]) -> Option<&'static str> {
+    match command {
         ["kill", ..] => Some("removed: use sm retire instead of sm kill"),
-        ["what", ..] => Some("removed: use sm tail --raw or sm send for explicit status"),
         ["dispatch", ..] => Some("removed: dispatch is not part of the Rust cutover scope"),
         ["remind", ..] => Some("removed: reminders are not part of the Rust cutover scope"),
         ["watch-job", ..] => Some("removed: watch-job is not part of the Rust cutover scope"),
@@ -3705,10 +3780,6 @@ fn retire_removed_surface_if_requested() {
             Some("removed: queue policy CI commands are not part of the Rust cutover scope")
         }
         _ => None,
-    };
-    if let Some(message) = retired {
-        eprintln!("{message}");
-        process::exit(2);
     }
 }
 
@@ -3824,6 +3895,21 @@ mod tests {
         };
         assert_eq!(raw_args.lines, 7);
         assert!(raw_args.raw);
+    }
+
+    #[test]
+    fn what_and_btw_parse_to_the_same_command() {
+        for command in ["what", "btw"] {
+            let cli =
+                Cli::try_parse_from(["sm", command, "worker", "Summarize", "current", "work"])
+                    .unwrap();
+            let Command::What(args) = cli.command else {
+                panic!("expected what command");
+            };
+            assert_eq!(args.session_id, "worker");
+            assert_eq!(args.prompt.join(" "), "Summarize current work");
+        }
+        assert_eq!(retired_command_message(&["what", "worker"]), None);
     }
 
     #[test]
@@ -4110,6 +4196,36 @@ mod tests {
             server.join().unwrap(),
             vec!["/registry/rajesh", "/sessions/rajesh", "/sessions"]
         );
+    }
+
+    #[test]
+    fn lookup_identifier_exact_accepts_only_unique_session_id_prefixes() {
+        let (client, server) = start_lookup_server([
+            ("/registry/abc1", 404, r#"{"detail":"Role not found"}"#),
+            ("/sessions/abc1", 404, r#"{"detail":"Session not found"}"#),
+            (
+                "/sessions",
+                200,
+                r#"{"sessions":[{"id":"abc12345","friendly_name":"one","aliases":[]},{"id":"def12345","friendly_name":"two","aliases":[]}]}"#,
+            ),
+        ]);
+        assert_eq!(
+            lookup_identifier_exact(&client, "abc1").unwrap().as_deref(),
+            Some("abc12345")
+        );
+        server.join().unwrap();
+
+        let (client, server) = start_lookup_server([
+            ("/registry/abc", 404, r#"{"detail":"Role not found"}"#),
+            ("/sessions/abc", 404, r#"{"detail":"Session not found"}"#),
+            (
+                "/sessions",
+                200,
+                r#"{"sessions":[{"id":"abc12345","friendly_name":"one","aliases":[]},{"id":"abc99999","friendly_name":"two","aliases":[]}]}"#,
+            ),
+        ]);
+        assert!(lookup_identifier_exact(&client, "abc").is_err());
+        server.join().unwrap();
     }
 
     #[test]

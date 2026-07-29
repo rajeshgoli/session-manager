@@ -226,6 +226,7 @@ If `target/release` is on your `PATH`, `sm` resolves to the Rust CLI.
 | `sm all` | List active sessions |
 | `sm spawn <provider> "<prompt>" --name <name>` | Start a new managed agent |
 | `sm send <id> "<text>"` | Send input to an agent |
+| `sm what <id> [prompt]` / `sm btw ...` | Ask an agent for a provider-native context summary |
 | `sm wait <id> <seconds>` | Wait for a session state transition |
 | `sm attach <id>` | Attach to the live tmux session |
 | `sm tail <id>` | Show recent output/tool activity |
@@ -251,9 +252,9 @@ sm send agent "message" --important  # Queue behind current work
 sm send agent "message" --urgent     # Interrupt immediately
 ```
 
-Retired surfaces are intentionally absent rather than half-supported. Use
-`sm tail --raw` or explicit `sm send` prompts instead of old summary helpers.
-Use `sm retire`, not legacy kill aliases.
+The old transcript summarizer and its `--lines`/`--deep` options remain retired.
+`sm what` now delegates to the target provider's native `/btw` command. Use
+`sm retire`, not legacy kill aliases.
 
 ---
 
@@ -453,7 +454,8 @@ cd android-app
 ## Operator Notes
 
 - Prefer `sm status`, `sm all`, `sm tail`, and the Android app for live state.
-- Prefer explicit `sm send` prompts over summary helpers.
+- Use `sm what <agent>` for a bounded context summary without disturbing the
+  target's main conversation.
 - Use `sm retire` for lifecycle stop; avoid legacy kill terminology.
 - Keep app updates and Cloudflare mobile device policy changes auditable through
   Session Manager commands.
