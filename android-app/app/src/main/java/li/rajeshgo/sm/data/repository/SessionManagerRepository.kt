@@ -395,7 +395,17 @@ class SessionManagerRepository(
     suspend fun fetchSessionDetail(baseUrl: String, token: String, session: ClientSession): SessionDetail = withContext(Dispatchers.IO) {
         val service = api(baseUrl, token)
         coroutineScope {
-            val outputDeferred = async { runCatching { service.getSessionOutput(session.id, lines = 10).output } }
+            val outputDeferred = async {
+                runCatching {
+                    val rendered = runCatching {
+                        service.getSessionOutput(session.id, lines = 10, rendered = true).output
+                    }.getOrNull()
+                    rendered ?: service
+                        .getSessionOutput(session.id, lines = 10, rendered = false)
+                        .output
+                        .orEmpty()
+                }
+            }
             val actionsDeferred = async {
                 if (session.provider == "codex-app") {
                     runCatching { summarizeActions(service.getActivityActions(session.id, limit = 10).actions) }

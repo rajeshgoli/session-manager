@@ -262,19 +262,17 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
 
     fun regenerateWhat(session: ClientSession) {
         whatRequestJobs.remove(session.id)?.cancel()
-        startWhatRequest(session, WhatRequestMode.Full, clearExisting = true)
+        startWhatRequest(session, WhatRequestMode.Full)
     }
 
     private fun startWhatRequest(
         session: ClientSession,
         mode: WhatRequestMode,
-        clearExisting: Boolean = false,
     ) {
         val current = _uiState.value.whatBySessionId[session.id]
             ?: WhatUiState(session.id, sessionDisplayName(session))
         val initial = current.copy(
             targetName = sessionDisplayName(session),
-            entries = if (clearExisting) emptyList() else current.entries,
             requestId = null,
             status = "pending",
             activeMode = mode,
@@ -288,9 +286,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
 
         val job = viewModelScope.launch {
             try {
-                if (clearExisting) {
-                    settingsRepository.clearWhatSummary(session.id)
-                }
                 val serverUrl = settingsRepository.serverUrl.first()
                 val accessToken = settingsRepository.accessToken.first()
                 if (serverUrl.isBlank() || accessToken.isBlank()) {

@@ -76,8 +76,13 @@ fun WhatUiState.withRecord(record: WhatRequestRecord): WhatUiState {
                 isUpdate = activeMode == WhatRequestMode.Update,
             )
         }
+    val updatedEntries = when {
+        completedEntry == null -> entries
+        activeMode == WhatRequestMode.Full -> listOf(completedEntry)
+        else -> entries + completedEntry
+    }
     return copy(
-        entries = completedEntry?.let(entries::plus) ?: entries,
+        entries = updatedEntries,
         requestId = record.requestId,
         status = record.status,
         createdAt = record.createdAt,

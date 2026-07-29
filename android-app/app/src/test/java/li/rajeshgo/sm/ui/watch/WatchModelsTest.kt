@@ -157,6 +157,48 @@ class WatchModelsTest {
     }
 
     @Test
+    fun successfulRegenerationReplacesHistoryButFailureKeepsIt() {
+        val existingEntry = WhatSummaryEntry(
+            requestId = "btw-1",
+            markdown = "# Existing",
+            createdAt = "2026-07-29T00:00:00Z",
+            isUpdate = false,
+        )
+        val regenerating = WhatUiState(
+            targetSessionId = "sess-1",
+            targetName = "agent",
+            entries = listOf(existingEntry),
+            status = "running",
+            activeMode = WhatRequestMode.Full,
+        )
+
+        val failed = regenerating.withRecord(
+            WhatRequestRecord(
+                requestId = "btw-2",
+                targetSessionId = "sess-1",
+                targetProvider = "claude",
+                status = "failed",
+                createdAt = "2026-07-29T00:10:00Z",
+                error = "unavailable",
+            )
+        )
+        val completed = regenerating.withRecord(
+            WhatRequestRecord(
+                requestId = "btw-3",
+                targetSessionId = "sess-1",
+                targetProvider = "claude",
+                status = "completed",
+                createdAt = "2026-07-29T00:11:00Z",
+                finishedAt = "2026-07-29T00:11:03Z",
+                result = "# Fresh",
+            )
+        )
+
+        assertEquals(listOf(existingEntry), failed.entries)
+        assertEquals(listOf("# Fresh"), completed.entries.map { it.markdown })
+    }
+
+    @Test
     fun updatePromptIsSingleLineAndWithinServerByteLimit() {
         val prompt = buildWhatUpdatePrompt(
             listOf(

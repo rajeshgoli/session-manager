@@ -339,7 +339,7 @@ data class PrimaryAction(
 
 @Serializable
 data class OutputResponse(
-    val output: String = "",
+    val output: String? = null,
 )
 
 @Serializable
