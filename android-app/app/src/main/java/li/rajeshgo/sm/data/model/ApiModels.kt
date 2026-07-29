@@ -161,6 +161,7 @@ data class EnsureMaintainerRequest(
 data class WhatRequestBody(
     @SerialName("delivery_mode")
     val deliveryMode: String,
+    val prompt: String? = null,
 )
 
 @Serializable
@@ -404,8 +405,35 @@ data class KillSessionRequest(
 data class SessionDetail(
     val actionLines: List<String> = emptyList(),
     val tailLines: List<String> = emptyList(),
+    val contextPercentage: Double? = null,
+    val contextState: String? = null,
     val lastError: String? = null,
     val fetchedAt: Long = System.currentTimeMillis(),
+)
+
+@Serializable
+data class ContextSnapshotResponse(
+    @SerialName("session_id")
+    val sessionId: String,
+    @SerialName("used_percentage")
+    val usedPercentage: Double? = null,
+    val state: String = "unknown",
+)
+
+@Serializable
+data class PersistedWhatSummaryEntry(
+    val requestId: String,
+    val markdown: String,
+    val createdAt: String,
+    val isUpdate: Boolean,
+)
+
+@Serializable
+data class PersistedWhatSummary(
+    val targetSessionId: String,
+    val targetName: String,
+    val entries: List<PersistedWhatSummaryEntry>,
+    val updatedAt: String,
 )
 
 @Serializable

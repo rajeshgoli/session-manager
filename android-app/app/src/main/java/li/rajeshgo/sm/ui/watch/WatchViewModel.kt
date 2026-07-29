@@ -58,7 +58,6 @@ data class WatchUiState(
     val expandedSessionIds: Set<String> = emptySet(),
     val detailsBySessionId: Map<String, SessionDetail> = emptyMap(),
     val whatBySessionId: Map<String, WhatUiState> = emptyMap(),
-    val selectedWhatSessionId: String? = null,
     val loading: Boolean = true,
     val refreshing: Boolean = false,
     val requestingStatus: Boolean = false,
@@ -95,6 +94,9 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
+            val persistedWhat = settingsRepository.loadWhatSummaries()
+                .associate { summary -> summary.targetSessionId to summary.toUiState() }
+            _uiState.value = _uiState.value.copy(whatBySessionId = persistedWhat)
             val serverUrl = settingsRepository.serverUrl.first()
             val accessToken = settingsRepository.accessToken.first()
             val userEmail = settingsRepository.userEmail.first()
@@ -147,8 +149,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                             sessions = sessions,
                             detailsBySessionId = preservedDetails,
                             whatBySessionId = preservedWhat,
-                            selectedWhatSessionId = _uiState.value.selectedWhatSessionId
-                                ?.takeIf { it in sessionIds },
                             loading = false,
                             refreshing = false,
                             userEmail = userEmail,
@@ -169,8 +169,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                     sessions = emptyList(),
                                     expandedSessionIds = emptySet(),
                                     detailsBySessionId = emptyMap(),
-                                    whatBySessionId = emptyMap(),
-                                    selectedWhatSessionId = null,
                                     lastSync = null,
                                     userEmail = "",
                                     error = error.message ?: "Session expired. Sign in again.",
@@ -183,8 +181,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                                     sessions = emptyList(),
                                     expandedSessionIds = emptySet(),
                                     detailsBySessionId = emptyMap(),
-                                    whatBySessionId = emptyMap(),
-                                    selectedWhatSessionId = null,
                                     lastSync = null,
                                     userEmail = userEmail,
                                     error = error.message
@@ -246,34 +242,55 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun openWhat(session: ClientSession) {
-        _uiState.value = _uiState.value.copy(selectedWhatSessionId = session.id)
-        if (_uiState.value.whatBySessionId[session.id] == null) {
-            startWhatRequest(session)
+    fun requestWhat(session: ClientSession) {
+        if (whatRequestJobs[session.id]?.isActive == true) {
+            return
+        }
+        val mode = if (_uiState.value.whatBySessionId[session.id]?.entries.isNullOrEmpty()) {
+            WhatRequestMode.Full
+        } else {
+            WhatRequestMode.Update
+        }
+        startWhatRequest(session, mode)
+    }
+
+    fun updateWhat(session: ClientSession) {
+        if (whatRequestJobs[session.id]?.isActive != true) {
+            startWhatRequest(session, WhatRequestMode.Update)
         }
     }
 
-    fun refreshWhat(session: ClientSession) {
+    fun regenerateWhat(session: ClientSession) {
         whatRequestJobs.remove(session.id)?.cancel()
-        startWhatRequest(session)
+        startWhatRequest(session, WhatRequestMode.Full, clearExisting = true)
     }
 
-    fun dismissWhat() {
-        _uiState.value = _uiState.value.copy(selectedWhatSessionId = null)
-    }
-
-    private fun startWhatRequest(session: ClientSession) {
-        val initial = WhatUiState(
-            targetSessionId = session.id,
+    private fun startWhatRequest(
+        session: ClientSession,
+        mode: WhatRequestMode,
+        clearExisting: Boolean = false,
+    ) {
+        val current = _uiState.value.whatBySessionId[session.id]
+            ?: WhatUiState(session.id, sessionDisplayName(session))
+        val initial = current.copy(
             targetName = sessionDisplayName(session),
+            entries = if (clearExisting) emptyList() else current.entries,
+            requestId = null,
+            status = "pending",
+            activeMode = mode,
+            createdAt = null,
+            finishedAt = null,
+            error = null,
         )
         _uiState.value = _uiState.value.copy(
-            selectedWhatSessionId = session.id,
             whatBySessionId = _uiState.value.whatBySessionId + (session.id to initial),
         )
 
         val job = viewModelScope.launch {
             try {
+                if (clearExisting) {
+                    settingsRepository.clearWhatSummary(session.id)
+                }
                 val serverUrl = settingsRepository.serverUrl.first()
                 val accessToken = settingsRepository.accessToken.first()
                 if (serverUrl.isBlank() || accessToken.isBlank()) {
@@ -281,8 +298,13 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
+                val prompt = if (mode == WhatRequestMode.Update) {
+                    buildWhatUpdatePrompt(initial.entries)
+                } else {
+                    null
+                }
                 sessionRepository
-                    .runWhatRequest(serverUrl, accessToken, session.id) { record ->
+                    .runWhatRequest(serverUrl, accessToken, session.id, prompt) { record ->
                         updateWhatRecord(session, record)
                     }
                     .getOrElse { error ->
@@ -292,6 +314,9 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                         updateWhatFailure(session, error.message ?: "Summary request failed")
                         return@launch
                     }
+                _uiState.value.whatBySessionId[session.id]
+                    ?.takeIf { it.entries.isNotEmpty() }
+                    ?.let { settingsRepository.saveWhatSummary(it.toPersisted()) }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -323,7 +348,7 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
             ?: WhatUiState(session.id, sessionDisplayName(session))
         _uiState.value = _uiState.value.copy(
             whatBySessionId = _uiState.value.whatBySessionId +
-                (session.id to current.copy(status = "failed", error = message)),
+                (session.id to current.copy(status = "failed", activeMode = null, error = message)),
         )
     }
 
@@ -343,19 +368,17 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     expandedSessionIds = emptySet(),
                     detailsBySessionId = emptyMap(),
                     whatBySessionId = emptyMap(),
-                    selectedWhatSessionId = null,
                     lastSync = null,
                     userEmail = "",
                 )
             }
             if (result.isSuccess) {
+                settingsRepository.clearWhatSummary(sessionId)
                 _uiState.value = _uiState.value.copy(
                     sessions = _uiState.value.sessions.filterNot { it.id == sessionId },
                     expandedSessionIds = _uiState.value.expandedSessionIds - sessionId,
                     detailsBySessionId = _uiState.value.detailsBySessionId - sessionId,
                     whatBySessionId = _uiState.value.whatBySessionId - sessionId,
-                    selectedWhatSessionId = _uiState.value.selectedWhatSessionId
-                        ?.takeUnless { it == sessionId },
                 )
             }
             onComplete(result)
@@ -784,7 +807,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                         expandedSessionIds = emptySet(),
                         detailsBySessionId = emptyMap(),
                         whatBySessionId = emptyMap(),
-                        selectedWhatSessionId = null,
                         lastSync = null,
                         userEmail = "",
                     )
@@ -864,7 +886,6 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
                     expandedSessionIds = emptySet(),
                     detailsBySessionId = emptyMap(),
                     whatBySessionId = emptyMap(),
-                    selectedWhatSessionId = null,
                     lastSync = null,
                     userEmail = "",
                 )

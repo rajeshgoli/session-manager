@@ -7,6 +7,9 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import li.rajeshgo.sm.data.model.PersistedWhatSummary
 import li.rajeshgo.sm.data.security.CloudflareDeviceCredentialManager
 import li.rajeshgo.sm.data.security.CloudflareDevicePrivateKeyProtector
 import li.rajeshgo.sm.util.LocalDefaults
@@ -22,6 +25,8 @@ class SettingsRepository(
     private val context: Context,
     private val cloudflarePrivateKeyProtector: CloudflareDevicePrivateKeyProtector = CloudflareDevicePrivateKeyProtector(),
 ) {
+    private val json = Json { ignoreUnknownKeys = true }
+
     private object Keys {
         val SERVER_URL = stringPreferencesKey("server_url")
         val ACCESS_TOKEN = stringPreferencesKey("access_token")
@@ -34,6 +39,7 @@ class SettingsRepository(
         val CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8_WRAPPED =
             stringPreferencesKey("cloudflare_device_private_key_pkcs8_wrapped")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
+        val WHAT_SUMMARIES = stringPreferencesKey("what_summaries")
     }
 
     val serverUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -146,6 +152,34 @@ class SettingsRepository(
         }
     }
 
+    suspend fun loadWhatSummaries(): List<PersistedWhatSummary> {
+        val encoded = context.dataStore.data.first()[Keys.WHAT_SUMMARIES].orEmpty()
+        return decodeWhatSummaries(encoded)
+    }
+
+    suspend fun saveWhatSummary(summary: PersistedWhatSummary) {
+        context.dataStore.edit { prefs ->
+            val summaries = decodeWhatSummaries(prefs[Keys.WHAT_SUMMARIES].orEmpty())
+                .filterNot { it.targetSessionId == summary.targetSessionId }
+                .plus(summary)
+                .sortedByDescending { it.updatedAt }
+                .take(MAX_PERSISTED_WHAT_SUMMARIES)
+            prefs[Keys.WHAT_SUMMARIES] = json.encodeToString(summaries)
+        }
+    }
+
+    suspend fun clearWhatSummary(sessionId: String) {
+        context.dataStore.edit { prefs ->
+            val summaries = decodeWhatSummaries(prefs[Keys.WHAT_SUMMARIES].orEmpty())
+                .filterNot { it.targetSessionId == sessionId }
+            if (summaries.isEmpty()) {
+                prefs.remove(Keys.WHAT_SUMMARIES)
+            } else {
+                prefs[Keys.WHAT_SUMMARIES] = json.encodeToString(summaries)
+            }
+        }
+    }
+
     suspend fun clearAuth() {
         context.dataStore.edit { prefs ->
             prefs.remove(Keys.ACCESS_TOKEN)
@@ -189,4 +223,17 @@ class SettingsRepository(
             .ifBlank {
                 prefs[Keys.LEGACY_CLOUDFLARE_DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
             }
+
+    private fun decodeWhatSummaries(encoded: String): List<PersistedWhatSummary> {
+        if (encoded.isBlank()) {
+            return emptyList()
+        }
+        return runCatching {
+            json.decodeFromString<List<PersistedWhatSummary>>(encoded)
+        }.getOrDefault(emptyList())
+    }
+
+    private companion object {
+        private const val MAX_PERSISTED_WHAT_SUMMARIES = 20
+    }
 }

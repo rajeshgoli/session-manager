@@ -1,6 +1,7 @@
 package li.rajeshgo.sm.ui.watch
 
 import li.rajeshgo.sm.data.model.ClientSession
+import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.WhatRequestRecord
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -104,6 +105,8 @@ class WatchModelsTest {
         val initial = WhatUiState(
             targetSessionId = "sess-1",
             targetName = "agent",
+            status = "pending",
+            activeMode = WhatRequestMode.Full,
         )
         val completed = initial.withRecord(
             WhatRequestRecord(
@@ -118,8 +121,93 @@ class WatchModelsTest {
         )
 
         assertTrue(completed.isTerminal())
-        assertEquals("Current summary", completed.result)
+        assertEquals("Current summary", completed.entries.single().markdown)
+        assertFalse(completed.entries.single().isUpdate)
         assertEquals("btw-1", completed.requestId)
+    }
+
+    @Test
+    fun whatUpdateAppendsChronologicallyAndPersists() {
+        val existing = WhatUiState(
+            targetSessionId = "sess-1",
+            targetName = "agent",
+            entries = listOf(
+                WhatSummaryEntry("btw-1", "# Initial\n\n- Built API", "2026-07-29T00:00:00Z", false)
+            ),
+            status = "running",
+            activeMode = WhatRequestMode.Update,
+        )
+        val updated = existing.withRecord(
+            WhatRequestRecord(
+                requestId = "btw-2",
+                targetSessionId = "sess-1",
+                targetProvider = "codex-fork",
+                status = "completed",
+                createdAt = "2026-07-29T00:10:00Z",
+                finishedAt = "2026-07-29T00:10:02Z",
+                result = "## Changed\n\n- Added tests",
+            )
+        )
+        val restored = updated.toPersisted().toUiState()
+
+        assertEquals(listOf("btw-1", "btw-2"), updated.entries.map { it.requestId })
+        assertTrue(updated.entries.last().isUpdate)
+        assertEquals(updated.entries, restored.entries)
+        assertEquals("completed", restored.status)
+    }
+
+    @Test
+    fun updatePromptIsSingleLineAndWithinServerByteLimit() {
+        val prompt = buildWhatUpdatePrompt(
+            listOf(
+                WhatSummaryEntry(
+                    requestId = "btw-1",
+                    markdown = "# Summary\n\n" + "🌐 changed `code`\n".repeat(2_000),
+                    createdAt = "2026-07-29T00:00:00Z",
+                    isUpdate = false,
+                ),
+                WhatSummaryEntry(
+                    requestId = "btw-2",
+                    markdown = "## LATEST CHANGE\n\n- Kept the newest update",
+                    createdAt = "2026-07-29T00:10:00Z",
+                    isUpdate = true,
+                ),
+            )
+        )
+
+        assertTrue(prompt.startsWith("Summarize only what has changed"))
+        assertFalse(prompt.contains('\n'))
+        assertTrue(prompt.toByteArray().size <= 4 * 1024)
+        assertTrue(prompt.contains("LATEST CHANGE"))
+    }
+
+    @Test
+    fun compactDetailOmitsLowValueMetadataAndReplacesTailWhenSummaryExists() {
+        val session = session(status = "running", activityState = "working")
+        val detail = SessionDetail(
+            actionLines = listOf("exec", "read"),
+            tailLines = listOf("clean tail"),
+        )
+
+        val fallback = detailLines(session, detail, hasSummary = false)
+        val summarized = detailLines(session, detail, hasSummary = true)
+
+        assertTrue(fallback.contains("last 10 tail lines:"))
+        assertTrue(fallback.contains("clean tail"))
+        assertFalse(summarized.any { it.contains("tail lines") || it.contains("clean tail") })
+        assertFalse((fallback + summarized).any {
+            it.startsWith("tmux:") ||
+                it.startsWith("git remote:") ||
+                it.startsWith("aliases:") ||
+                it.startsWith("current task:")
+        })
+    }
+
+    @Test
+    fun contextPercentageUsesCompactSmContextFormatting() {
+        assertEquals("43%", formatContextPercentage(43.0))
+        assertEquals("75.2%", formatContextPercentage(75.237))
+        assertEquals(null, formatContextPercentage(null))
     }
 
     private fun session(

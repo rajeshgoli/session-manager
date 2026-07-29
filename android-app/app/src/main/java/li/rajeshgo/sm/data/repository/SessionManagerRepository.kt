@@ -47,6 +47,53 @@ fun activeWhatRequestId(detail: String?): String? {
     return detail?.let { ACTIVE_WHAT_REQUEST_ID.find(it)?.value }
 }
 
+fun stripTerminalControls(text: String): String {
+    val output = StringBuilder(text.length)
+    var index = 0
+    while (index < text.length) {
+        val char = text[index++]
+        if (char == '\u001B') {
+            if (index >= text.length) continue
+            when (text[index++]) {
+                '[' -> {
+                    while (index < text.length) {
+                        if (text[index++] in '@'..'~') break
+                    }
+                }
+                ']' -> {
+                    while (index < text.length) {
+                        val next = text[index++]
+                        if (next == '\u0007') break
+                        if (next == '\u001B' && index < text.length && text[index] == '\\') {
+                            index++
+                            break
+                        }
+                    }
+                }
+                'P', 'X', '^', '_' -> {
+                    while (index < text.length) {
+                        if (text[index++] == '\u001B' && index < text.length && text[index] == '\\') {
+                            index++
+                            break
+                        }
+                    }
+                }
+            }
+            continue
+        }
+        if (char == '\u009B') {
+            while (index < text.length) {
+                if (text[index++] in '@'..'~') break
+            }
+            continue
+        }
+        if (char == '\n' || char == '\t' || !char.isISOControl()) {
+            output.append(char)
+        }
+    }
+    return output.toString()
+}
+
 class SessionManagerRepository(
     private val settingsRepository: SettingsRepository? = null,
 ) {
@@ -219,6 +266,7 @@ class SessionManagerRepository(
         baseUrl: String,
         token: String,
         sessionId: String,
+        prompt: String? = null,
         onUpdate: (WhatRequestRecord) -> Unit,
     ): Result<WhatRequestRecord> = withContext(Dispatchers.IO) {
         runCatching {
@@ -226,7 +274,7 @@ class SessionManagerRepository(
             var current = try {
                 service.createWhatRequest(
                     sessionId = sessionId,
-                    request = WhatRequestBody(deliveryMode = "poll"),
+                    request = WhatRequestBody(deliveryMode = "poll", prompt = prompt),
                 )
             } catch (error: HttpException) {
                 if (error.code() != 409) {
@@ -355,15 +403,30 @@ class SessionManagerRepository(
                     runCatching { summarizeToolCalls(session.provider ?: "claude", service.getToolCalls(session.id, limit = 10).toolCalls) }
                 }
             }
+            val contextDeferred = async {
+                runCatching { service.getSessionContext(session.id) }
+            }
 
             val outputResult = outputDeferred.await()
             val actionsResult = actionsDeferred.await()
-            val lastError = listOf(outputResult.exceptionOrNull(), actionsResult.exceptionOrNull())
+            val contextResult = contextDeferred.await()
+            val lastError = listOf(
+                outputResult.exceptionOrNull(),
+                actionsResult.exceptionOrNull(),
+                contextResult.exceptionOrNull(),
+            )
                 .firstOrNull()?.message
+            val context = contextResult.getOrNull()
 
             SessionDetail(
                 actionLines = actionsResult.getOrElse { listOf("n/a (unavailable)") },
-                tailLines = outputResult.getOrElse { "" }.lines().takeLast(10).filter { it.isNotEmpty() }.ifEmpty { listOf("-") },
+                tailLines = stripTerminalControls(outputResult.getOrElse { "" })
+                    .lines()
+                    .takeLast(10)
+                    .filter { it.isNotBlank() }
+                    .ifEmpty { listOf("-") },
+                contextPercentage = context?.usedPercentage,
+                contextState = context?.state,
                 lastError = lastError,
             )
         }
