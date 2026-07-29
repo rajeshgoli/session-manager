@@ -20,6 +20,18 @@ def _python_entry_point(path: Path) -> Path:
     return path
 
 
+def _shell_wrapped_python_entry_point(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        "'''exec' \"/a long path/venv/bin/python3\" \"$0\" \"$@\"\n"
+        "' '''\n"
+        "from src.cli.launcher import main\n"
+    )
+    path.chmod(0o755)
+    return path
+
+
 def test_find_rust_sm_skips_cached_python_entry_point(tmp_path):
     cached_entry = _executable(tmp_path / "venv/bin/sm")
     rust_cli = _executable(tmp_path / "target/release/sm")
@@ -68,6 +80,24 @@ def test_find_rust_sm_skips_a_distinct_python_console_script(tmp_path):
     assert found == rust_cli.resolve()
 
 
+def test_find_rust_sm_skips_a_shell_wrapped_python_console_script(tmp_path):
+    cached_entry = _python_entry_point(tmp_path / "venv/bin/sm")
+    shell_wrapper = _shell_wrapped_python_entry_point(
+        tmp_path / "long path/venv/bin/sm"
+    )
+    rust_cli = _executable(tmp_path / "bin/sm")
+
+    found = launcher.find_rust_sm(
+        argv0=str(cached_entry),
+        environ={
+            "PATH": os.pathsep.join([str(shell_wrapper.parent), str(rust_cli.parent)])
+        },
+        repo_root=tmp_path / "missing-repo",
+    )
+
+    assert found == rust_cli.resolve()
+
+
 def test_main_execs_rust_cli_with_unchanged_arguments(monkeypatch, tmp_path):
     rust_cli = _executable(tmp_path / "sm")
     observed = {}
@@ -95,3 +125,18 @@ def test_main_fails_clearly_when_rust_cli_is_missing(monkeypatch, capsys):
 
     assert launcher.main([]) == 127
     assert "Rust sm CLI not found" in capsys.readouterr().err
+
+
+def test_main_reports_exec_failure_without_a_traceback(monkeypatch, tmp_path, capsys):
+    rust_cli = _executable(tmp_path / "sm")
+    monkeypatch.setattr(launcher, "find_rust_sm", lambda: rust_cli)
+    monkeypatch.setattr(
+        launcher.os,
+        "execv",
+        lambda _path, _argv: (_ for _ in ()).throw(OSError("bad architecture")),
+    )
+
+    assert launcher.main(["what", "abc123"]) == 126
+    error = capsys.readouterr().err
+    assert f"failed to execute Rust sm CLI at {rust_cli}" in error
+    assert "bad architecture" in error

@@ -21,10 +21,17 @@ def _resolved(path: Path) -> Path:
 def _is_python_console_script(path: Path) -> bool:
     try:
         with path.open("rb") as candidate:
-            first_line = candidate.readline(256).lower()
+            content = candidate.read(4096).lower()
     except OSError:
         return False
-    return first_line.startswith(b"#!") and b"python" in first_line
+    first_line = content.splitlines()[0] if content else b""
+    if first_line.startswith(b"#!") and b"python" in first_line:
+        return True
+    return (
+        first_line in {b"#!/bin/sh", b"#!/usr/bin/env sh"}
+        and b"exec" in content
+        and b"python" in content
+    )
 
 
 def find_rust_sm(
@@ -79,5 +86,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 127
 
     arguments = list(sys.argv[1:] if argv is None else argv)
-    os.execv(str(rust_sm), [str(rust_sm), *arguments])
+    try:
+        os.execv(str(rust_sm), [str(rust_sm), *arguments])
+    except OSError as error:
+        print(
+            f"Error: failed to execute Rust sm CLI at {rust_sm}: {error}",
+            file=sys.stderr,
+        )
     return 126
