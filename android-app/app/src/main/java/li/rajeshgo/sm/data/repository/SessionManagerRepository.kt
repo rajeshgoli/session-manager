@@ -20,6 +20,8 @@ import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.StudioSshStatusResponse
 import li.rajeshgo.sm.data.model.ToolCallRow
+import li.rajeshgo.sm.data.model.WhatRequestBody
+import li.rajeshgo.sm.data.model.WhatRequestRecord
 import li.rajeshgo.sm.data.remote.ApiService
 import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.security.DeviceProof
@@ -39,6 +41,11 @@ class SessionManagerTransientException(message: String, cause: Throwable? = null
 class SessionManagerBackendUnavailableException(message: String, cause: Throwable? = null) : SessionManagerRequestException(message, cause)
 
 const val RETIRE_REQUEST_FAILED_MESSAGE = "Retire request failed"
+private val ACTIVE_WHAT_REQUEST_ID = Regex("""\bbtw-[A-Za-z0-9_-]+\b""")
+
+fun activeWhatRequestId(detail: String?): String? {
+    return detail?.let { ACTIVE_WHAT_REQUEST_ID.find(it)?.value }
+}
 
 class SessionManagerRepository(
     private val settingsRepository: SettingsRepository? = null,
@@ -49,6 +56,7 @@ class SessionManagerRepository(
     private companion object {
         private const val READ_RETRY_ATTEMPTS = 3
         private const val READ_RETRY_BASE_DELAY_MS = 600L
+        private const val WHAT_REQUEST_POLL_INTERVAL_MS = 500L
         private const val GENERIC_TRANSIENT_READ_MESSAGE = "Server temporarily unavailable. Retrying soon."
         private const val GENERIC_TRANSIENT_WRITE_MESSAGE = "Server temporarily unavailable. Try again."
         private const val BACKEND_UNREACHABLE_ERROR = "backend_unreachable"
@@ -102,11 +110,16 @@ class SessionManagerRepository(
         baseUrl: String,
         token: String = "",
         block: suspend (ApiService) -> T,
+    ): T = executeReadRequest(api(baseUrl, token), block)
+
+    private suspend fun <T> executeReadRequest(
+        service: ApiService,
+        block: suspend (ApiService) -> T,
     ): T {
         var lastTransient: Throwable? = null
         repeat(READ_RETRY_ATTEMPTS) { attempt ->
             try {
-                return block(api(baseUrl, token))
+                return block(service)
             } catch (error: HttpException) {
                 when (error.code()) {
                     401, 403 -> throw SessionManagerAuthException("Session expired. Sign in again.", error)
@@ -199,6 +212,48 @@ class SessionManagerRepository(
         runCatching {
             val response = api(baseUrl, token).killSession(sessionId)
             check(response.status == "killed") { response.error ?: RETIRE_REQUEST_FAILED_MESSAGE }
+        }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun runWhatRequest(
+        baseUrl: String,
+        token: String,
+        sessionId: String,
+        onUpdate: (WhatRequestRecord) -> Unit,
+    ): Result<WhatRequestRecord> = withContext(Dispatchers.IO) {
+        runCatching {
+            val service = api(baseUrl, token)
+            var current = try {
+                service.createWhatRequest(
+                    sessionId = sessionId,
+                    request = WhatRequestBody(deliveryMode = "poll"),
+                )
+            } catch (error: HttpException) {
+                if (error.code() != 409) {
+                    throw classifyWriteFailure(error)
+                }
+                val detail = extractServerError(error)?.message
+                val activeRequestId = activeWhatRequestId(detail)
+                    ?: throw SessionManagerRequestException(
+                        detail ?: "Another summary request is already active.",
+                        error,
+                    )
+                executeReadRequest(service) {
+                    it.getWhatRequest(activeRequestId)
+                }
+            } catch (error: Throwable) {
+                throw classifyWriteFailure(error)
+            }
+
+            onUpdate(current)
+            while (current.status !in setOf("completed", "failed", "timed_out")) {
+                delay(WHAT_REQUEST_POLL_INTERVAL_MS)
+                current = executeReadRequest(service) {
+                    it.getWhatRequest(current.requestId)
+                }
+                onUpdate(current)
+            }
+            current
         }.mapFailure(::classifyWriteFailure)
     }
 

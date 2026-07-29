@@ -1,6 +1,7 @@
 package li.rajeshgo.sm.ui.watch
 
 import li.rajeshgo.sm.data.model.ClientSession
+import li.rajeshgo.sm.data.model.WhatRequestRecord
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -22,6 +23,7 @@ class WatchModelsTest {
         assertTrue(isOperationallyActive(session))
         assertTrue(isActiveSession(session))
         assertEquals("working", projectedStatusLabel(session))
+        assertEquals(SessionVisualState.Active, sessionVisualState(session))
     }
 
     @Test
@@ -37,6 +39,18 @@ class WatchModelsTest {
 
         assertTrue(isOperationallyActive(session))
         assertEquals("bg-wait", projectedStatusLabel(session))
+        assertEquals(SessionVisualState.Active, sessionVisualState(session))
+    }
+
+    @Test
+    fun allOperationalActivityStatesUseActiveVisualTreatment() {
+        listOf("working", "thinking", "waiting", "waiting_input", "waiting_permission")
+            .forEach { activity ->
+                val session = session(status = "running", activityState = activity)
+
+                assertTrue(activity, isOperationallyActive(session))
+                assertEquals(activity, SessionVisualState.Active, sessionVisualState(session))
+            }
     }
 
     @Test
@@ -58,6 +72,7 @@ class WatchModelsTest {
         assertFalse(isOperationallyActive(session))
         assertFalse(isActiveSession(session))
         assertEquals("idle", projectedStatusLabel(session))
+        assertEquals(SessionVisualState.Inactive, sessionVisualState(session))
     }
 
     @Test
@@ -68,12 +83,43 @@ class WatchModelsTest {
         assertFalse(isOperationallyActive(session))
         assertFalse(isActiveSession(session))
         assertEquals("idle", projectedStatusLabel(session))
+        assertEquals(SessionVisualState.Inactive, sessionVisualState(session))
 
         val runningSections = filterSections(sections, statusFilter = "running", query = "")
         val idleSections = filterSections(sections, statusFilter = "idle", query = "")
 
         assertTrue(runningSections.isEmpty())
         assertEquals(listOf(session.id), idleSections.flatMap { it.roots }.map { it.session.id })
+    }
+
+    @Test
+    fun stoppedStatusWinsOverWorkingActivityVisualTreatment() {
+        val session = session(status = "stopped", activityState = "working")
+
+        assertEquals(SessionVisualState.Stopped, sessionVisualState(session))
+    }
+
+    @Test
+    fun whatUiStateTracksTerminalServerRecord() {
+        val initial = WhatUiState(
+            targetSessionId = "sess-1",
+            targetName = "agent",
+        )
+        val completed = initial.withRecord(
+            WhatRequestRecord(
+                requestId = "btw-1",
+                targetSessionId = "sess-1",
+                targetProvider = "codex-fork",
+                status = "completed",
+                createdAt = "2026-07-29T00:00:00Z",
+                finishedAt = "2026-07-29T00:00:02Z",
+                result = "Current summary",
+            )
+        )
+
+        assertTrue(completed.isTerminal())
+        assertEquals("Current summary", completed.result)
+        assertEquals("btw-1", completed.requestId)
     }
 
     private fun session(

@@ -20,6 +20,8 @@ import li.rajeshgo.sm.data.model.SessionListResponse
 import li.rajeshgo.sm.data.model.StudioSshStatusResponse
 import li.rajeshgo.sm.data.model.StudioSshToggleRequest
 import li.rajeshgo.sm.data.model.ToolCallsResponse
+import li.rajeshgo.sm.data.model.WhatRequestBody
+import li.rajeshgo.sm.data.model.WhatRequestRecord
 import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.Header
@@ -96,4 +98,15 @@ interface ApiService {
         @Path("session_id") sessionId: String,
         @Body request: KillSessionRequest = KillSessionRequest(),
     ): KillSessionResponse
+
+    @POST("sessions/{session_id}/what")
+    suspend fun createWhatRequest(
+        @Path("session_id") sessionId: String,
+        @Body request: WhatRequestBody,
+    ): WhatRequestRecord
+
+    @GET("btw-requests/{request_id}")
+    suspend fun getWhatRequest(
+        @Path("request_id") requestId: String,
+    ): WhatRequestRecord
 }
