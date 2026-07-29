@@ -255,6 +255,22 @@ impl BtwStore {
         })
     }
 
+    pub fn mark_response_undeliverable(&self, request_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                UPDATE btw_requests
+                SET response_undeliverable_at = ?2
+                WHERE request_id = ?1
+                  AND response_delivered_at IS NULL
+                  AND response_undeliverable_at IS NULL
+                "#,
+                params![request_id, now_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn fail_for_session(&self, session_id: &str, error: &str) -> Result<Vec<BtwRequestRecord>> {
         let error = bound_utf8(error.trim(), MAX_BTW_RESULT_BYTES);
         let mut conn = self.open()?;
@@ -592,6 +608,16 @@ mod tests {
             )
             .unwrap();
         store.complete(&session.request_id, "done").unwrap();
+        let undeliverable = store
+            .create(
+                Some("retired-requester"),
+                "target-undeliverable",
+                "codex-fork",
+                "session",
+                "summary",
+            )
+            .unwrap();
+        store.complete(&undeliverable.request_id, "done").unwrap();
         let poll = store
             .create(None, "target-poll", "codex-fork", "poll", "summary")
             .unwrap();
@@ -608,10 +634,14 @@ mod tests {
             std::collections::BTreeSet::from([
                 active.request_id.clone(),
                 session.request_id.clone(),
+                undeliverable.request_id.clone(),
             ])
         );
 
         store.mark_response_delivered(&session.request_id).unwrap();
+        store
+            .mark_response_undeliverable(&undeliverable.request_id)
+            .unwrap();
         let recoverable = store.list_recoverable().unwrap();
         assert_eq!(recoverable.len(), 1);
         assert_eq!(recoverable[0].request_id, active.request_id);

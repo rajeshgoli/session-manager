@@ -6075,7 +6075,7 @@ fn recover_btw_requests(state: Arc<AppState>) {
                         if pane.contains("Side from main thread")
                             && pane.contains("Ctrl+C to return") =>
                     {
-                        capture_stock_codex_btw_result(&runtime, &target, &request.prompt).ok()
+                        recover_stock_codex_btw(&runtime, &target, &request.prompt).ok()
                     }
                     _ => None,
                 };
@@ -6186,6 +6186,7 @@ fn run_claude_btw(
     target: &SessionRecord,
     prompt: &str,
 ) -> anyhow::Result<String> {
+    let _input_guard = runtime.lock_session_input(&target.tmux_session)?;
     let initial = runtime
         .capture_pane_tail(&target.tmux_session, 80)
         .ok_or_else(|| anyhow::anyhow!("unable to inspect Claude pane"))?;
@@ -6200,13 +6201,14 @@ fn run_claude_btw(
     }
 
     let command = format!("/btw {prompt}");
-    if !runtime.send_input(&target.tmux_session, &command)? {
+    if !runtime.send_input_while_locked(&target.tmux_session, &command)? {
         anyhow::bail!("target tmux session is not running");
     }
     capture_claude_btw_result(runtime, target)
 }
 
 fn recover_claude_btw(runtime: &TmuxRuntime, target: &SessionRecord) -> anyhow::Result<String> {
+    let _input_guard = runtime.lock_session_input(&target.tmux_session)?;
     capture_claude_btw_result(runtime, target)
 }
 
@@ -6228,7 +6230,7 @@ fn capture_claude_btw_result(
         .list_buffer_ids()?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if !runtime.send_key_input(&target.tmux_session, "c")? {
+    if !runtime.send_key_input_while_locked(&target.tmux_session, "c")? {
         anyhow::bail!("target tmux session stopped before native copy");
     }
     let result = (|| {
@@ -6254,7 +6256,7 @@ fn capture_claude_btw_result(
         runtime.delete_buffer(&buffer_id)?;
         Ok(answer)
     })();
-    let _ = runtime.send_key_input(&target.tmux_session, "Escape");
+    let _ = runtime.send_key_input_while_locked(&target.tmux_session, "Escape");
     if result.is_ok() {
         wait_for_pane(
             runtime,
@@ -6271,8 +6273,9 @@ fn run_stock_codex_btw(
     target: &SessionRecord,
     prompt: &str,
 ) -> anyhow::Result<String> {
+    let _input_guard = runtime.lock_session_input(&target.tmux_session)?;
     let command = format!("/btw {prompt}");
-    if !runtime.send_input(&target.tmux_session, &command)? {
+    if !runtime.send_input_while_locked(&target.tmux_session, &command)? {
         anyhow::bail!("target tmux session is not running");
     }
     capture_stock_codex_btw_result(runtime, target, prompt)
@@ -6310,7 +6313,7 @@ fn capture_stock_codex_btw_result(
             thread::sleep(Duration::from_millis(500));
         }
     })();
-    let _ = runtime.send_key_input(&target.tmux_session, "C-c");
+    let _ = runtime.send_key_input_while_locked(&target.tmux_session, "C-c");
     if result.is_ok() {
         wait_for_pane(
             runtime,
@@ -6320,6 +6323,15 @@ fn capture_stock_codex_btw_result(
         )?;
     }
     result
+}
+
+fn recover_stock_codex_btw(
+    runtime: &TmuxRuntime,
+    target: &SessionRecord,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let _input_guard = runtime.lock_session_input(&target.tmux_session)?;
+    capture_stock_codex_btw_result(runtime, target, prompt)
 }
 
 fn wait_for_pane(
@@ -6402,6 +6414,7 @@ fn deliver_btw_response(
         .as_ref()
         .is_none_or(|session| ensure_btw_session_live(session, "Requester").is_err())
     {
+        store.mark_response_undeliverable(request_id)?;
         return Ok(());
     }
     let queue = RetainedQueueStore::new(btw_db_path(state));

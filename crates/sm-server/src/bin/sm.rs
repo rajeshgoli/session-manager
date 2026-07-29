@@ -2938,7 +2938,20 @@ fn lookup_identifier_exact(client: &ApiClient, identifier: &str) -> Result<Optio
         return bail_ambiguous_lookup(identifier, &exact_matches);
     }
 
-    Ok(None)
+    let prefix_matches = sessions
+        .iter()
+        .filter(|session| {
+            session["id"]
+                .as_str()
+                .is_some_and(|session_id| session_id.starts_with(identifier))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match prefix_matches.len() {
+        1 => Ok(prefix_matches[0]["id"].as_str().map(ToOwned::to_owned)),
+        count if count > 1 => bail_ambiguous_lookup(identifier, &prefix_matches),
+        _ => Ok(None),
+    }
 }
 
 fn bail_ambiguous_lookup(identifier: &str, matches: &[Value]) -> Result<Option<String>> {
@@ -4183,6 +4196,36 @@ mod tests {
             server.join().unwrap(),
             vec!["/registry/rajesh", "/sessions/rajesh", "/sessions"]
         );
+    }
+
+    #[test]
+    fn lookup_identifier_exact_accepts_only_unique_session_id_prefixes() {
+        let (client, server) = start_lookup_server([
+            ("/registry/abc1", 404, r#"{"detail":"Role not found"}"#),
+            ("/sessions/abc1", 404, r#"{"detail":"Session not found"}"#),
+            (
+                "/sessions",
+                200,
+                r#"{"sessions":[{"id":"abc12345","friendly_name":"one","aliases":[]},{"id":"def12345","friendly_name":"two","aliases":[]}]}"#,
+            ),
+        ]);
+        assert_eq!(
+            lookup_identifier_exact(&client, "abc1").unwrap().as_deref(),
+            Some("abc12345")
+        );
+        server.join().unwrap();
+
+        let (client, server) = start_lookup_server([
+            ("/registry/abc", 404, r#"{"detail":"Role not found"}"#),
+            ("/sessions/abc", 404, r#"{"detail":"Session not found"}"#),
+            (
+                "/sessions",
+                200,
+                r#"{"sessions":[{"id":"abc12345","friendly_name":"one","aliases":[]},{"id":"abc99999","friendly_name":"two","aliases":[]}]}"#,
+            ),
+        ]);
+        assert!(lookup_identifier_exact(&client, "abc").is_err());
+        server.join().unwrap();
     }
 
     #[test]

@@ -4709,15 +4709,32 @@ pub fn submit_codex_fork_btw(
             artifacts.control_socket_path.display()
         );
     }
-    let request = json!({
-        "request_id": request_id,
-        "command": "submit_btw",
-        "prompt": prompt,
-    });
-    let response = codex_fork_control_roundtrip(&artifacts.control_socket_path, &request)
-        .with_context(|| "submit_btw control command failed")?;
-    ensure_codex_fork_response_ok(&response, "submit_btw control command failed")?;
+    codex_fork_submit_btw(&artifacts.control_socket_path, request_id, prompt)?;
     Ok(artifacts.event_stream_path)
+}
+
+fn codex_fork_submit_btw(control_socket_path: &Path, request_id: &str, prompt: &str) -> Result<()> {
+    let mut epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+    let mut response = codex_fork_send_control_command_payload_with_request_id(
+        control_socket_path,
+        request_id,
+        "submit_btw",
+        &epoch,
+        json!({ "prompt": prompt }),
+    )?;
+    if !codex_fork_response_ok(&response)
+        && codex_fork_error_code(&response).as_deref() == Some("stale_epoch")
+    {
+        epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
+        response = codex_fork_send_control_command_payload_with_request_id(
+            control_socket_path,
+            request_id,
+            "submit_btw",
+            &epoch,
+            json!({ "prompt": prompt }),
+        )?;
+    }
+    ensure_codex_fork_response_ok(&response, "submit_btw control command failed")
 }
 
 fn codex_fork_set_thread_name(control_socket_path: &Path, friendly_name: &str) -> Result<()> {
@@ -4781,10 +4798,26 @@ fn codex_fork_send_control_command_payload(
     expected_epoch: &str,
     payload: Value,
 ) -> Result<Value> {
+    codex_fork_send_control_command_payload_with_request_id(
+        control_socket_path,
+        &codex_fork_control_request_id(),
+        command,
+        expected_epoch,
+        payload,
+    )
+}
+
+fn codex_fork_send_control_command_payload_with_request_id(
+    control_socket_path: &Path,
+    request_id: &str,
+    command: &str,
+    expected_epoch: &str,
+    payload: Value,
+) -> Result<Value> {
     let mut request = Map::new();
     request.insert(
         "request_id".to_owned(),
-        Value::String(codex_fork_control_request_id()),
+        Value::String(request_id.to_owned()),
     );
     request.insert(
         "expected_epoch".to_owned(),
@@ -7114,6 +7147,71 @@ mod tests {
         assert_eq!(session_id.len(), 8);
         assert!(session_id.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_eq!(session_id, session_id.to_ascii_lowercase());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_btw_retries_stale_epoch_with_the_same_request_id() {
+        use std::os::unix::net::UnixListener;
+
+        let socket_path =
+            env::temp_dir().join(format!("sm-btw-{}.control.sock", generate_session_id()));
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw_request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut raw_request)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&raw_request).unwrap();
+                requests.push(request);
+                let response = match index {
+                    0 => json!({
+                        "ok": true,
+                        "epoch": "epoch-stale",
+                        "result": { "epoch": "epoch-stale" }
+                    }),
+                    1 => json!({
+                        "ok": false,
+                        "error": {
+                            "code": "stale_epoch",
+                            "message": "stale epoch"
+                        }
+                    }),
+                    2 => json!({
+                        "ok": true,
+                        "epoch": "epoch-fresh",
+                        "result": { "epoch": "epoch-fresh" }
+                    }),
+                    3 => json!({
+                        "ok": true,
+                        "epoch": "epoch-fresh",
+                        "result": {}
+                    }),
+                    _ => unreachable!(),
+                };
+                let mut raw_response = serde_json::to_string(&response).unwrap();
+                raw_response.push('\n');
+                stream.write_all(raw_response.as_bytes()).unwrap();
+            }
+            requests
+        });
+
+        codex_fork_submit_btw(&socket_path, "btw-request-1", "summarize").unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["command"], "get_epoch");
+        assert_eq!(requests[1]["command"], "submit_btw");
+        assert_eq!(requests[1]["request_id"], "btw-request-1");
+        assert_eq!(requests[1]["expected_epoch"], "epoch-stale");
+        assert_eq!(requests[1]["prompt"], "summarize");
+        assert_eq!(requests[2]["command"], "get_epoch");
+        assert_eq!(requests[3]["command"], "submit_btw");
+        assert_eq!(requests[3]["request_id"], "btw-request-1");
+        assert_eq!(requests[3]["expected_epoch"], "epoch-fresh");
+        assert_eq!(requests[3]["prompt"], "summarize");
+        let _ = fs::remove_file(socket_path);
     }
 
     fn session_record(status: &str) -> SessionRecord {

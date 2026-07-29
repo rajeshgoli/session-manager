@@ -1,9 +1,11 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -18,6 +20,28 @@ const DEFAULT_SEND_KEYS_SETTLE_MAX_MS: f64 = 900.0;
 const DEFAULT_SEND_KEYS_SETTLE_PER_KI_MS: f64 = 60.0;
 const DEFAULT_SEND_KEYS_SETTLE_PER_EXTRA_LINE_MS: f64 = 15.0;
 const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 4096;
+static SESSION_INPUT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<SessionInputLock>>>> =
+    OnceLock::new();
+
+#[derive(Debug)]
+struct SessionInputLock {
+    held: Mutex<bool>,
+    available: Condvar,
+}
+
+#[derive(Debug)]
+pub struct SessionInputGuard {
+    lock: Arc<SessionInputLock>,
+}
+
+impl Drop for SessionInputGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.lock.held.lock() {
+            *held = false;
+            self.lock.available.notify_one();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TmuxRuntime {
@@ -293,6 +317,11 @@ impl TmuxRuntime {
     }
 
     pub fn send_input(&self, tmux_session: &str, text: &str) -> Result<bool> {
+        let _guard = self.lock_session_input(tmux_session)?;
+        self.send_input_while_locked(tmux_session, text)
+    }
+
+    pub fn send_input_while_locked(&self, tmux_session: &str, text: &str) -> Result<bool> {
         if !self.session_exists(tmux_session)? {
             return Ok(false);
         }
@@ -301,6 +330,16 @@ impl TmuxRuntime {
     }
 
     pub fn send_urgent_input(
+        &self,
+        tmux_session: &str,
+        text: &str,
+        background_claude_task: bool,
+    ) -> Result<bool> {
+        let _guard = self.lock_session_input(tmux_session)?;
+        self.send_urgent_input_while_locked(tmux_session, text, background_claude_task)
+    }
+
+    fn send_urgent_input_while_locked(
         &self,
         tmux_session: &str,
         text: &str,
@@ -319,6 +358,43 @@ impl TmuxRuntime {
         Ok(true)
     }
 
+    pub fn lock_session_input(&self, tmux_session: &str) -> Result<SessionInputGuard> {
+        let key = format!(
+            "{}:{tmux_session}",
+            self.socket_name.as_deref().unwrap_or("default")
+        );
+        let lock = {
+            let mut locks = SESSION_INPUT_LOCKS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session input lock registry poisoned"))?;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(SessionInputLock {
+                    held: Mutex::new(false),
+                    available: Condvar::new(),
+                });
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let mut held = lock
+            .held
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
+        while *held {
+            held = lock
+                .available
+                .wait(held)
+                .map_err(|_| anyhow::anyhow!("session input lock poisoned"))?;
+        }
+        *held = true;
+        drop(held);
+        Ok(SessionInputGuard { lock })
+    }
+
     pub fn send_review_sequence(
         &self,
         tmux_session: &str,
@@ -329,6 +405,7 @@ impl TmuxRuntime {
         branch_position: Option<usize>,
         timing: &CodexReviewConfig,
     ) -> Result<bool> {
+        let _guard = self.lock_session_input(tmux_session)?;
         if !self.session_exists(tmux_session)? {
             return Ok(false);
         }
@@ -379,6 +456,7 @@ impl TmuxRuntime {
     }
 
     pub fn send_steer_text(&self, tmux_session: &str, text: &str) -> Result<bool> {
+        let _guard = self.lock_session_input(tmux_session)?;
         if !self.session_exists(tmux_session)? {
             return Ok(false);
         }
@@ -395,6 +473,7 @@ impl TmuxRuntime {
         prompt: Option<&str>,
         wake_completed: bool,
     ) -> Result<bool> {
+        let _guard = self.lock_session_input(tmux_session)?;
         if !self.session_exists(tmux_session)? {
             return Ok(false);
         }
@@ -638,6 +717,11 @@ impl TmuxRuntime {
     }
 
     pub fn send_key_input(&self, tmux_session: &str, key: &str) -> Result<bool> {
+        let _guard = self.lock_session_input(tmux_session)?;
+        self.send_key_input_while_locked(tmux_session, key)
+    }
+
+    pub fn send_key_input_while_locked(&self, tmux_session: &str, key: &str) -> Result<bool> {
         if !self.session_exists(tmux_session)? {
             return Ok(false);
         }
@@ -1101,6 +1185,27 @@ mod tests {
     fn split_send_text_chunks_preserves_utf8_boundaries() {
         let chunks = split_send_text_chunks("åßçdé", 2);
         assert_eq!(chunks, vec!["åß", "çd", "é"]);
+    }
+
+    #[test]
+    fn session_input_lock_serializes_the_same_tmux_target() {
+        let runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        let session = "lock-test".to_owned();
+        let guard = runtime.lock_session_input(&session).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let contender_runtime = runtime.clone();
+        let contender_session = session.clone();
+        let contender = thread::spawn(move || {
+            let _guard = contender_runtime
+                .lock_session_input(&contender_session)
+                .unwrap();
+            sender.send(()).unwrap();
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        contender.join().unwrap();
     }
 
     #[test]
