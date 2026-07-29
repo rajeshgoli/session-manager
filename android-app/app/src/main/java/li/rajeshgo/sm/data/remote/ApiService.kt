@@ -6,6 +6,7 @@ import li.rajeshgo.sm.data.model.AppArtifactMetadata
 import li.rajeshgo.sm.data.model.AuthSessionResponse
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
+import li.rajeshgo.sm.data.model.ContextSnapshotResponse
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthRequest
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
 import li.rajeshgo.sm.data.model.EnsureMaintainerRequest
@@ -79,7 +80,13 @@ interface ApiService {
     suspend fun getSessionOutput(
         @Path("session_id") sessionId: String,
         @Query("lines") lines: Int = 10,
+        @Query("rendered") rendered: Boolean = true,
     ): OutputResponse
+
+    @GET("sessions/{session_id}/context")
+    suspend fun getSessionContext(
+        @Path("session_id") sessionId: String,
+    ): ContextSnapshotResponse
 
     @GET("sessions/{session_id}/tool-calls")
     suspend fun getToolCalls(

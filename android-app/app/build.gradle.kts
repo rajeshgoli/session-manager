@@ -102,6 +102,7 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("io.noties.markwon:core:4.6.2")
 
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.browser:browser:1.8.0")

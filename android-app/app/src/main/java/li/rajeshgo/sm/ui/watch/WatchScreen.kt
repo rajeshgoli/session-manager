@@ -16,8 +16,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -44,6 +42,7 @@ import androidx.compose.material.icons.rounded.Campaign
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.QuestionAnswer
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SupportAgent
 import androidx.compose.material.icons.rounded.Terminal
@@ -51,7 +50,6 @@ import androidx.compose.material.icons.rounded.UnfoldLess
 import androidx.compose.material.icons.rounded.UnfoldMore
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -79,6 +77,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.platform.LocalContext
@@ -287,6 +286,7 @@ fun WatchScreen(
                             sessionsById = sessionsById,
                             expandedSessionIds = state.expandedSessionIds,
                             detailsById = state.detailsBySessionId,
+                            whatById = state.whatBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
                             onOpenAttach = openAttach,
                             onCopyAttach = { session ->
@@ -313,7 +313,9 @@ fun WatchScreen(
                                     }
                                 }
                             },
-                            onWhat = viewModel::openWhat,
+                            onWhat = viewModel::requestWhat,
+                            onUpdateWhat = viewModel::updateWhat,
+                            onRegenerateWhat = viewModel::regenerateWhat,
                             onKill = { session ->
                                 viewModel.killSession(session.id) { result ->
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
@@ -334,6 +336,7 @@ fun WatchScreen(
                             sessionsById = sessionsById,
                             expandedSessionIds = state.expandedSessionIds,
                             detailsById = state.detailsBySessionId,
+                            whatById = state.whatBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
                             onOpenAttach = openAttach,
                             onCopyAttach = { session ->
@@ -360,7 +363,9 @@ fun WatchScreen(
                                     }
                                 }
                             },
-                            onWhat = viewModel::openWhat,
+                            onWhat = viewModel::requestWhat,
+                            onUpdateWhat = viewModel::updateWhat,
+                            onRegenerateWhat = viewModel::regenerateWhat,
                             onKill = { session ->
                                 viewModel.killSession(session.id) { result ->
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
@@ -391,17 +396,6 @@ fun WatchScreen(
                 currentRoute = Routes.WATCH,
                 onWatch = {},
                 onAnalytics = onNavigateToAnalytics,
-            )
-        }
-
-        val selectedWhatSession = state.selectedWhatSessionId?.let(sessionsById::get)
-        val selectedWhat = state.selectedWhatSessionId?.let(state.whatBySessionId::get)
-        if (selectedWhatSession != null && selectedWhat != null) {
-            WhatDialog(
-                session = selectedWhatSession,
-                state = selectedWhat,
-                onDismiss = viewModel::dismissWhat,
-                onRefresh = { viewModel.refreshWhat(selectedWhatSession) },
             )
         }
 
@@ -1142,11 +1136,14 @@ private fun WatchTree(
     sessionsById: Map<String, ClientSession>,
     expandedSessionIds: Set<String>,
     detailsById: Map<String, SessionDetail>,
+    whatById: Map<String, WhatUiState>,
     onToggleExpanded: (ClientSession) -> Unit,
     onOpenAttach: (ClientSession) -> Unit,
     onCopyAttach: (ClientSession) -> Unit,
     onOpenTelegram: (ClientSession) -> Unit,
     onWhat: (ClientSession) -> Unit,
+    onUpdateWhat: (ClientSession) -> Unit,
+    onRegenerateWhat: (ClientSession) -> Unit,
     onKill: (ClientSession) -> Unit,
 ) {
     if (!nodeMatchesSlice(node, slice)) {
@@ -1161,11 +1158,14 @@ private fun WatchTree(
             parentLabel = parentLabel(node.session, sessionsById),
             expanded = expandedSessionIds.contains(node.session.id),
             detail = detailsById[node.session.id],
+            whatState = whatById[node.session.id],
             onToggleExpanded = { onToggleExpanded(node.session) },
             onOpenAttach = { onOpenAttach(node.session) },
             onCopyAttach = { onCopyAttach(node.session) },
             onOpenTelegram = { onOpenTelegram(node.session) },
             onWhat = { onWhat(node.session) },
+            onUpdateWhat = { onUpdateWhat(node.session) },
+            onRegenerateWhat = { onRegenerateWhat(node.session) },
             onKill = { onKill(node.session) },
         )
     }
@@ -1175,7 +1175,7 @@ private fun WatchTree(
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onKill)
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -1192,7 +1192,7 @@ private fun WatchTree(
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onKill)
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
         }
     }
 }
@@ -1205,14 +1205,18 @@ private fun SessionRow(
     parentLabel: String,
     expanded: Boolean,
     detail: SessionDetail?,
+    whatState: WhatUiState?,
     onToggleExpanded: () -> Unit,
     onOpenAttach: () -> Unit,
     onCopyAttach: () -> Unit,
     onOpenTelegram: () -> Unit,
     onWhat: () -> Unit,
+    onUpdateWhat: () -> Unit,
+    onRegenerateWhat: () -> Unit,
     onKill: () -> Unit,
 ) {
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
+    val hasSummary = whatState?.entries?.isNotEmpty() == true
     Surface(
         modifier = Modifier.padding(start = (depth * 14).dp),
         shape = RoundedCornerShape(22.dp),
@@ -1307,6 +1311,16 @@ private fun SessionRow(
                         StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
                         StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
                         if (session.role != null) StatusChip(label = session.role, tint = Violet)
+                        formatContextPercentage(detail?.contextPercentage)?.let { percentage ->
+                            StatusChip(
+                                label = "context $percentage",
+                                tint = when (detail?.contextState) {
+                                    "critical" -> Rose
+                                    "warning" -> Amber
+                                    else -> TextSecondary
+                                },
+                            )
+                        }
                     }
                     Row(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -1319,10 +1333,19 @@ private fun SessionRow(
                         if (telegramLink(session) != null) {
                             ActionPill(label = "TG", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = onOpenTelegram, tint = Cyan)
                         }
-                        ActionPill(label = "What?", icon = Icons.Rounded.QuestionAnswer, onClick = onWhat, tint = Violet)
+                        if (!hasSummary) {
+                            ActionPill(label = "What?", icon = Icons.Rounded.QuestionAnswer, onClick = onWhat, tint = Violet)
+                        }
                         ActionPill(label = RETIRE_SESSION_ACTION_LABEL, icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
                     }
-                    detailLines(session, detail).forEach { line ->
+                    whatState?.takeIf { it.entries.isNotEmpty() || it.status != "idle" }?.let { summary ->
+                        WhatSummarySection(
+                            state = summary,
+                            onUpdate = onUpdateWhat,
+                            onRegenerate = onRegenerateWhat,
+                        )
+                    }
+                    detailLines(session, detail, hasSummary).forEach { line ->
                         Text(
                             text = line,
                             style = MaterialTheme.typography.bodySmall,
@@ -1342,136 +1365,129 @@ private fun SessionRow(
 }
 
 @Composable
-private fun WhatDialog(
-    session: ClientSession,
+private fun WhatSummarySection(
     state: WhatUiState,
-    onDismiss: () -> Unit,
-    onRefresh: () -> Unit,
+    onUpdate: () -> Unit,
+    onRegenerate: () -> Unit,
 ) {
-    val terminal = state.isTerminal()
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    text = "What is ${sessionDisplayName(session)} doing?",
-                    style = MaterialTheme.typography.titleLarge,
-                )
-                Text(
-                    text = session.id,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextMuted,
-                    fontFamily = FontFamily.Monospace,
-                )
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 420.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
+    val busy = state.status == "pending" || state.status == "running"
+    HorizontalDivider(color = Border)
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = "Summary",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (busy) {
                 StatusChip(
-                    label = when (state.status) {
-                        "pending" -> "requesting"
-                        "running" -> "summarizing"
-                        "timed_out" -> "timed out"
-                        else -> state.status
-                    },
-                    tint = when (state.status) {
-                        "completed" -> Emerald
-                        "failed", "timed_out" -> Rose
-                        "running" -> Cyan
-                        else -> Amber
-                    },
+                    label = if (state.activeMode == WhatRequestMode.Update) "updating" else "summarizing",
+                    tint = Cyan,
                 )
-                when (state.status) {
-                    "pending", "running" -> {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        ) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(20.dp),
-                                strokeWidth = 2.dp,
-                                color = Cyan,
-                            )
-                            Text(
-                                text = if (state.status == "pending") {
-                                    "Requesting a summary..."
-                                } else {
-                                    "Waiting for the agent's summary..."
-                                },
-                                color = TextSecondary,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                    }
-                    "completed" -> {
-                        SelectionContainer {
-                            Text(
-                                text = state.result?.trim().orEmpty().ifBlank {
-                                    "The agent returned an empty summary."
-                                },
-                                color = MaterialTheme.colorScheme.onSurface,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                    }
-                    else -> {
-                        Text(
-                            text = state.error?.trim().orEmpty().ifBlank {
-                                "The summary request did not complete."
-                            },
-                            color = Rose,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
-                }
-                val metadata = buildList {
-                    state.createdAt?.let { add("Requested ${ageFromIso(it)} ago") }
-                    state.finishedAt?.let { add("Finished ${ageFromIso(it)} ago") }
-                    state.requestId?.let { add(it) }
-                }
-                if (metadata.isNotEmpty()) {
-                    Text(
-                        text = metadata.joinToString(" • "),
-                        color = TextMuted,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
+            }
+        }
+
+        state.entries.forEachIndexed { index, entry ->
+            if (index > 0) {
+                HorizontalDivider(color = Border)
+            }
+            if (entry.isUpdate) {
+                Text(
+                    text = "Update · ${ageFromIso(entry.createdAt)}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Cyan,
+                )
+            }
+            MarkdownText(entry.markdown)
+        }
+
+        if (busy) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = Cyan,
+                )
+                Text(
+                    text = if (state.activeMode == WhatRequestMode.Update) {
+                        "Checking what changed..."
+                    } else {
+                        "Generating a fresh summary..."
+                    },
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+
+        state.error?.takeIf { state.status == "failed" || state.status == "timed_out" }?.let { error ->
+            Text(
+                text = error,
+                color = Rose,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        if (!busy) {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (state.entries.isNotEmpty()) {
+                    ActionPill(
+                        label = "Update",
+                        icon = Icons.Rounded.Refresh,
+                        onClick = onUpdate,
+                        tint = Cyan,
                     )
                 }
+                ActionPill(
+                    label = if (state.entries.isEmpty()) "Try again" else "Regenerate",
+                    icon = Icons.Rounded.RestartAlt,
+                    onClick = onRegenerate,
+                    tint = Violet,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownText(markdown: String) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val markwon = remember(context) { io.noties.markwon.Markwon.create(context) }
+    val textColor = MaterialTheme.colorScheme.onSurface.toArgb()
+    val linkColor = Cyan.toArgb()
+    androidx.compose.ui.viewinterop.AndroidView(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 420.dp),
+        factory = { viewContext ->
+            android.widget.TextView(viewContext).apply {
+                setTextIsSelectable(true)
+                movementMethod = android.text.method.LinkMovementMethod.getInstance()
+                isVerticalScrollBarEnabled = true
+                overScrollMode = android.view.View.OVER_SCROLL_IF_CONTENT_SCROLLS
+                setLineSpacing(0f, 1.15f)
+                setPadding(0, 0, 0, 0)
+                textSize = 15f
             }
         },
-        confirmButton = {
-            if (terminal) {
-                TextButton(onClick = onRefresh) {
-                    Icon(
-                        Icons.Rounded.Refresh,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text("Refresh")
-                }
-            } else {
-                TextButton(onClick = onDismiss) {
-                    Text("Close")
-                }
-            }
+        update = { textView ->
+            textView.setTextColor(textColor)
+            textView.setLinkTextColor(linkColor)
+            markwon.setMarkdown(textView, markdown)
         },
-        dismissButton = if (terminal) {
-            {
-                TextButton(onClick = onDismiss) {
-                    Text("Close")
-                }
-            }
-        } else {
-            null
-        },
-        containerColor = PanelElevated,
     )
 }
 

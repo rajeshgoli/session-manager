@@ -30,6 +30,13 @@ class SessionManagerRepositoryTest {
     }
 
     @Test
+    fun terminalCleanupRemovesAnsiAndControlBytes() {
+        val raw = "\u001B[31mred\u001B[0m\n\u001B]0;title\u0007plain\u0000\ttext\u009B32mgreen"
+
+        assertEquals("red\nplain\ttextgreen", stripTerminalControls(raw))
+    }
+
+    @Test
     fun mobileAttachTicketPathIncludesBaseUrlPathPrefix() {
         val repository = SessionManagerRepository()
 

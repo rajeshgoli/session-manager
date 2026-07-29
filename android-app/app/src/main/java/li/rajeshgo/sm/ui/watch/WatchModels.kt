@@ -4,6 +4,8 @@ import java.time.Duration
 import java.time.OffsetDateTime
 import java.time.format.DateTimeParseException
 import li.rajeshgo.sm.data.model.ClientSession
+import li.rajeshgo.sm.data.model.PersistedWhatSummary
+import li.rajeshgo.sm.data.model.PersistedWhatSummaryEntry
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.WhatRequestRecord
 
@@ -35,28 +37,117 @@ enum class SessionVisualState {
     Stopped,
 }
 
+enum class WhatRequestMode {
+    Full,
+    Update,
+}
+
+data class WhatSummaryEntry(
+    val requestId: String,
+    val markdown: String,
+    val createdAt: String,
+    val isUpdate: Boolean,
+)
+
 data class WhatUiState(
     val targetSessionId: String,
     val targetName: String,
+    val entries: List<WhatSummaryEntry> = emptyList(),
     val requestId: String? = null,
-    val status: String = "pending",
+    val status: String = "idle",
+    val activeMode: WhatRequestMode? = null,
     val createdAt: String? = null,
     val finishedAt: String? = null,
-    val result: String? = null,
     val error: String? = null,
 )
 
 fun WhatUiState.isTerminal(): Boolean = status in setOf("completed", "failed", "timed_out")
 
 fun WhatUiState.withRecord(record: WhatRequestRecord): WhatUiState {
+    val completedEntry = record.result
+        ?.trim()
+        ?.takeIf { record.status == "completed" && it.isNotEmpty() }
+        ?.takeIf { result -> entries.none { it.requestId == record.requestId && it.markdown == result } }
+        ?.let { result ->
+            WhatSummaryEntry(
+                requestId = record.requestId,
+                markdown = result,
+                createdAt = record.finishedAt ?: record.createdAt,
+                isUpdate = activeMode == WhatRequestMode.Update,
+            )
+        }
+    val updatedEntries = when {
+        completedEntry == null -> entries
+        activeMode == WhatRequestMode.Full -> listOf(completedEntry)
+        else -> entries + completedEntry
+    }
     return copy(
+        entries = updatedEntries,
         requestId = record.requestId,
         status = record.status,
         createdAt = record.createdAt,
         finishedAt = record.finishedAt,
-        result = record.result,
         error = record.error,
+        activeMode = activeMode.takeUnless { record.status in setOf("completed", "failed", "timed_out") },
     )
+}
+
+fun WhatUiState.toPersisted(): PersistedWhatSummary {
+    return PersistedWhatSummary(
+        targetSessionId = targetSessionId,
+        targetName = targetName,
+        entries = entries.map { entry ->
+            PersistedWhatSummaryEntry(
+                requestId = entry.requestId,
+                markdown = entry.markdown,
+                createdAt = entry.createdAt,
+                isUpdate = entry.isUpdate,
+            )
+        },
+        updatedAt = entries.lastOrNull()?.createdAt ?: OffsetDateTime.now().toString(),
+    )
+}
+
+fun PersistedWhatSummary.toUiState(): WhatUiState {
+    return WhatUiState(
+        targetSessionId = targetSessionId,
+        targetName = targetName,
+        entries = entries.map { entry ->
+            WhatSummaryEntry(
+                requestId = entry.requestId,
+                markdown = entry.markdown,
+                createdAt = entry.createdAt,
+                isUpdate = entry.isUpdate,
+            )
+        },
+        status = if (entries.isEmpty()) "idle" else "completed",
+    )
+}
+
+fun buildWhatUpdatePrompt(entries: List<WhatSummaryEntry>): String {
+    val prefix = "Summarize only what has changed since this prior summary. " +
+        "Do not repeat unchanged work. Most recent prior summary excerpt: "
+    val priorSummary = entries
+        .joinToString(" ") { it.markdown }
+        .replace(Regex("\\s+"), " ")
+        .trim()
+    return prefix + priorSummary.takeLastUtf8Bytes(4 * 1024 - prefix.toByteArray().size)
+}
+
+private fun String.takeLastUtf8Bytes(maxBytes: Int): String {
+    val output = StringBuilder()
+    var index = length
+    var usedBytes = 0
+    while (index > 0) {
+        val codePoint = codePointBefore(index)
+        val value = String(Character.toChars(codePoint))
+        val bytes = value.toByteArray().size
+        if (usedBytes + bytes > maxBytes) break
+        output.insert(0, value)
+        usedBytes += bytes
+        index -= Character.charCount(codePoint)
+    }
+    return output.toString()
 }
 
 fun sessionDisplayName(session: ClientSession): String {
@@ -340,27 +431,42 @@ fun parentLabel(session: ClientSession, sessionsById: Map<String, ClientSession>
     return if (name == parentId) parentId else "$name [$parentId]"
 }
 
-fun detailLines(session: ClientSession, detail: SessionDetail?): List<String> {
-    val lines = mutableListOf(
-        "meta: ${sessionDisplayName(session)} [${session.id}] provider=${session.provider ?: "claude"} activity=${activityLabel(session.activityState)} status=${session.status} role=${session.role ?: if (session.isEm) "em" else "-"}${if (session.isMaintainer) " maintainer=yes" else ""}",
-        "working dir: ${session.workingDir}",
-        "tmux: ${session.tmuxSession}",
-        "git remote: ${session.gitRemoteUrl ?: "N/A"}",
-        "aliases: ${session.aliases.ifEmpty { listOf("-") }.joinToString(", ")}",
-        "current task: ${session.currentTask ?: "No current task"}",
-        "context size: ${if (session.contextMonitorEnabled) "${session.tokensUsed} tokens" else "n/a (monitor off)"}",
-    )
+fun detailLines(
+    session: ClientSession,
+    detail: SessionDetail?,
+    hasSummary: Boolean,
+): List<String> {
+    val lines = mutableListOf<String>()
     session.agentStatusText?.let { lines += "status: \"$it\"${session.agentStatusAt?.let { at -> " (${ageFromIso(at)})" } ?: ""}" }
-    session.agentTaskCompletedAt?.let { lines += "task: completed (${ageFromIso(it)})" }
     session.pendingAdoptionProposals.filter { (it.status ?: "pending") == "pending" }.forEach { proposal ->
         val proposerName = proposal.proposerName ?: proposal.proposerSessionId ?: "unknown"
         val proposerId = proposal.proposerSessionId ?: "unknown"
         lines += "adopt: pending from $proposerName [$proposerId]${proposal.createdAt?.let { " (${ageFromIso(it)})" } ?: ""}"
     }
-    lines += "last 10 tool calls/actions:"
-    lines += (detail?.actionLines ?: listOf("  loading..."))
-    lines += "last 10 tail lines:"
-    lines += (detail?.tailLines ?: listOf("  loading..."))
+    if (!hasSummary) {
+        val actions = detail?.actionLines
+            ?.take(5)
+            ?.filterNot { it == "-" || it.startsWith("n/a") }
+        if (actions == null) {
+            lines += "recent activity:"
+            lines += "  loading..."
+        } else if (actions.isNotEmpty()) {
+            lines += "recent activity:"
+            lines += actions
+        }
+        lines += "last 10 tail lines:"
+        lines += (detail?.tailLines ?: listOf("  loading..."))
+    }
     detail?.lastError?.let { lines += "warning: $it" }
     return lines
+}
+
+fun formatContextPercentage(value: Double?): String? {
+    val percentage = value?.takeIf { it.isFinite() && it >= 0.0 } ?: return null
+    val rounded = kotlin.math.round(percentage * 10.0) / 10.0
+    return if (rounded % 1.0 == 0.0) {
+        "${rounded.toInt()}%"
+    } else {
+        "$rounded%"
+    }
 }
