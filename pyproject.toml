@@ -47,7 +47,7 @@ dev = [
 
 [project.scripts]
 claude-session-manager = "src.main:run"
-sm = "src.cli.main:main"
+sm = "src.cli.launcher:main"
 sm-node-agent = "src.node_agent:main"
 
 [tool.setuptools.packages.find]
