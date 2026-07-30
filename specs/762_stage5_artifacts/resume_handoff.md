@@ -4,7 +4,8 @@ Status: handoff snapshot from 2026-06-17 after PR #1049 added Android emulator
 smoke tooling. The first Rust canary flip moved local production traffic to
 Rust. Issue #1042 adds the public tunnel preflight that keeps
 `sm-app.rajeshgo.li` pointed at the launchd-managed Rust service and keeps
-legacy `sm.rajeshgo.li` off origin. Issue #1044 adds the post-cutover live Rust
+legacy `sm.rajeshgo.li` off origin except for the retained path-scoped inbound
+email webhook. Issue #1044 adds the post-cutover live Rust
 canary report. Issue #1046 adds public mTLS Cloudflare/mobile smoke evidence
 and a live canary artifact with that smoke supplied. Issue #1048 adds an
 adb-managed Android emulator smoke for native app enrollment/cert-auth evidence
@@ -36,8 +37,9 @@ Service cutover commands live in
   `.local/rust-final-backup-20260617T033653Z`.
 - `sm-app.rajeshgo.li` is the protected public app hostname. It should route
   through Cloudflare Access to `http://127.0.0.1:8420`.
-- Legacy `sm.rajeshgo.li` should not route to origin. It may return Cloudflare
-  denial or tunnel 404, but must not return the Rust origin health response.
+- Legacy `sm.rajeshgo.li` should route only `^/api/email-inbound$` to origin for
+  the deployed email worker. Other paths may return Cloudflare denial or tunnel
+  404, but must not return the Rust origin health response.
 - The prior `127.0.0.1:8421` Rust sidecar was useful for shadow/rehearsal but
   is not part of the live target after the tunnel is repointed to `8420`.
 - Validate the local public tunnel shape with
@@ -203,11 +205,12 @@ Merged Rust slices cover:
 - PR #1041 adds the Rust service cutover helper and runbook for reviewed
   launchd ownership transfer.
 - Issue #1042 adds the public tunnel preflight so the protected app hostname is
-  validated against `127.0.0.1:8420` and legacy public host routes are blocked
-  before relying on the app path.
+  validated against `127.0.0.1:8420`, the exact inbound email route is retained,
+  and other legacy public-host routes are blocked before relying on the app
+  path.
 - Issue #1044 adds the live canary report that records launchd ownership, local
   Rust health/native reads, `sm status`, public tunnel shape, public Access
-  denial, and legacy-host absence without mutating live state.
+  denial, and legacy health-path absence without mutating live state.
 - Issue #1048 adds `scripts.rust_migration.android_emulator_smoke`, a
   debug-APK/emulator smoke that enrolls the app over an `adb reverse` pairing
   listener and verifies native HTTPS cert-auth reads through
@@ -430,7 +433,7 @@ Post-cutover live Rust canary evidence:
 Summary: `11` passed, `0` blocked, `0` skipped. The passing checks cover the
 Rust launchd label, local Rust health/detailed health/bootstrap/session
 list/native analytics reads, `sm status`, local public tunnel preflight,
-unauthenticated `sm-app` public denial before origin, and legacy public-host
+unauthenticated `sm-app` public denial before origin, and legacy public health
 absence. The final passing check is the supplied public mTLS Cloudflare/mobile
 smoke report.
 

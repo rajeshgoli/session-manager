@@ -311,7 +311,11 @@ def test_handoff_and_progress_are_current_through_public_mtls_issue1046():
     assert "PR #1045" in handoff
     assert "rust_service_cutover_runbook.md" in handoff
     assert "127.0.0.1:8420" in handoff
-    assert "Legacy `sm.rajeshgo.li` should not route to origin" in handoff
+    assert (
+        "Legacy `sm.rajeshgo.li` should route only `^/api/email-inbound$` to origin"
+        in handoff
+    )
+    assert "must not return the Rust origin health response" in handoff
     assert "Camera-app" in handoff
     assert "deep-link enrollment" in handoff
     assert "app update artifact access works through the certificate-gated app path" in handoff

@@ -62,6 +62,9 @@ def _write_tunnel_config(path: Path, service="http://127.0.0.1:8420") -> None:
 tunnel: test-tunnel
 credentials-file: /tmp/test-tunnel.json
 ingress:
+  - hostname: sm.rajeshgo.li
+    path: ^/api/email-inbound$
+    service: http://127.0.0.1:8420
   - hostname: sm-app.rajeshgo.li
     service: {service}
   - service: http_status:404
@@ -289,6 +292,9 @@ def test_live_canary_report_uses_configured_legacy_host_in_tunnel_preflight(tmp_
 tunnel: test-tunnel
 credentials-file: /tmp/test-tunnel.json
 ingress:
+  - hostname: sm.rajeshgo.li
+    path: ^/api/email-inbound$
+    service: http://127.0.0.1:8420
   - hostname: sm-app.rajeshgo.li
     service: http://127.0.0.1:8420
   - hostname: old.example.com

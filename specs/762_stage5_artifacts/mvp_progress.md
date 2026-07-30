@@ -128,7 +128,7 @@ not change retained or removed scope. Binding scope remains
 | #1037 | Contract harness HTTP reads default to a larger budget for live `/client/sessions` payloads |
 | #1039 | Accelerated Rust canary evidence mode for Python-origin instability |
 | #1041 | Rust service launchd cutover tooling and first-canary runbook |
-| issue #1042 | Public tunnel preflight for the protected app hostname and legacy-host absence |
+| issue #1042 | Public tunnel preflight for the protected app hostname and legacy-route restrictions |
 | issue #1044 | Live Rust canary evidence collector for launchd/local/public-tunnel post-cutover checks |
 | issue #1048 | Android emulator native app smoke for enrollment, cert-auth reads, and attach-ticket proof |
 | #1045 | Merge of the live Rust canary evidence collector |

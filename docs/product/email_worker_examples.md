@@ -28,6 +28,17 @@ Required worker variables:
 - `SM_WEBHOOK_URL=https://sm.rajeshgo.li/api/email-inbound`
 - `EMAIL_WORKER_SECRET=<same value as email_bridge.worker_secret>`
 
+The public cloudflared config must retain only this exact legacy-host route:
+
+```yaml
+- hostname: sm.rajeshgo.li
+  path: ^/api/email-inbound$
+  service: http://127.0.0.1:8420
+```
+
+Keep a terminal `http_status:404` catch-all so no other legacy-host path reaches
+the Session Manager origin.
+
 Required Session Manager config:
 
 ```yaml

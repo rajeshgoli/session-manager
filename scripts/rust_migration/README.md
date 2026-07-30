@@ -96,7 +96,9 @@ python -m scripts.rust_migration.public_tunnel_preflight \
 The default gate expects:
 
 - `sm-app.rajeshgo.li` routes to `http://127.0.0.1:8420`;
-- legacy `sm.rajeshgo.li` is absent;
+- `sm.rajeshgo.li` routes only `^/api/email-inbound$` to that origin so the
+  deployed email worker can deliver replies;
+- every other legacy-host path remains closed by the final catch-all;
 - wildcard SM hostnames are absent;
 - the final catch-all ingress row is `http_status:404`.
 
@@ -115,7 +117,7 @@ python -m scripts.rust_migration.live_canary_report \
 The report records launchd ownership, local Rust health/bootstrap/session and
 analytics reads, `sm status` against the live Rust origin, local cloudflared
 ingress shape, unauthenticated public `sm-app` Cloudflare Access denial, legacy
-public-host absence, and an optional supplied Cloudflare/mobile smoke report.
+health-path absence, and an optional supplied Cloudflare/mobile smoke report.
 It performs no writes and is intended as post-cutover evidence, not as a
 replacement for the state backup/freeze/rollback gates.
 

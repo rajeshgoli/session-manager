@@ -417,14 +417,14 @@ def _public_tunnel_check(
     if report["status"] != "passed":
         return _blocked(
             "tunnel.public_preflight",
-            "public tunnel routes app host to Rust and blocks legacy host",
+            "public tunnel routes app and exact email webhook paths to Rust",
             "tunnel_preflight_blocked",
             f"{report['summary']['blockers']} tunnel blocker(s)",
             response=response,
         )
     return _passed(
         "tunnel.public_preflight",
-        "public tunnel routes app host to Rust and blocks legacy host",
+        "public tunnel routes app and exact email webhook paths to Rust",
         response=response,
     )
 

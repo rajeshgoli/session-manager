@@ -110,7 +110,8 @@ label is still loaded, even if Rust could bind the configured host/port.
 After Rust owns `127.0.0.1:8420`, the Cloudflare tunnel should forward the
 protected app hostname directly to that launchd-managed Rust service. Do not
 leave `sm-app.rajeshgo.li` pointed at a manually started `8421` sidecar, and do
-not leave legacy `sm.rajeshgo.li` routed to origin.
+not leave legacy `sm.rajeshgo.li` broadly routed to origin. The deployed email
+worker still posts replies to `/api/email-inbound`, so retain that exact route.
 
 Validate the local cloudflared ingress shape:
 
@@ -124,6 +125,9 @@ Expected post-cutover shape:
 
 ```yaml
 ingress:
+  - hostname: sm.rajeshgo.li
+    path: ^/api/email-inbound$
+    service: http://127.0.0.1:8420
   - hostname: sm-app.rajeshgo.li
     service: http://127.0.0.1:8420
   - service: http_status:404
@@ -137,7 +141,7 @@ launchctl kickstart -k gui/$(id -u)/com.rajesh.sm-android-tunnel
 ```
 
 Public unauthenticated probes should show Cloudflare Access on the app host and
-no origin route on the legacy host:
+no origin route for non-email paths on the legacy host:
 
 ```bash
 curl -sS -o /tmp/sm-app-health-public.txt -w 'sm-app %{http_code}\n' https://sm-app.rajeshgo.li/health
@@ -159,7 +163,8 @@ Collect the same checks as a single JSON evidence artifact:
 
 This command is non-mutating. It records Rust launchd ownership, local Rust
 health/native-read checks, `sm status`, tunnel config shape, public Access
-denial, legacy-host absence, and optional Cloudflare/mobile smoke evidence.
+denial, legacy health-path absence, and optional Cloudflare/mobile smoke
+evidence.
 
 ## First 15-Minute Smoke Checklist
 
