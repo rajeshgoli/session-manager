@@ -2,8 +2,8 @@
 
 This is intentionally local and non-mutating. It reads a cloudflared ingress
 config and verifies that the protected SM app hostname reaches the
-launchd-managed Rust service origin while legacy public operational hostnames
-do not route to origin.
+launchd-managed Rust service origin, the retained email webhook has an exact
+path-scoped route, and legacy public operational paths do not route to origin.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import yaml
 
 DEFAULT_CONFIG = Path(".local/android-parity/cloudflared/config-http-only.yml")
 DEFAULT_APP_HOST = "sm-app.rajeshgo.li"
+DEFAULT_EMAIL_HOST = "sm.rajeshgo.li"
+DEFAULT_EMAIL_PATH = "^/api/email-inbound$"
 DEFAULT_EXPECTED_ORIGIN = "http://127.0.0.1:8420"
 DEFAULT_FORBIDDEN_HOSTS = ("sm.rajeshgo.li",)
 
@@ -36,6 +38,8 @@ def build_public_tunnel_preflight_report(
     *,
     config_path: Path = DEFAULT_CONFIG,
     app_host: str = DEFAULT_APP_HOST,
+    email_host: str = DEFAULT_EMAIL_HOST,
+    email_path: str = DEFAULT_EMAIL_PATH,
     expected_origin: str = DEFAULT_EXPECTED_ORIGIN,
     forbidden_hosts: tuple[str, ...] = DEFAULT_FORBIDDEN_HOSTS,
 ) -> dict[str, Any]:
@@ -59,7 +63,16 @@ def build_public_tunnel_preflight_report(
             blockers.append(_issue("ingress_missing", "cloudflared config must contain an ingress list"))
         else:
             rows = [_row_from_raw(index, raw) for index, raw in enumerate(ingress)]
-            blockers.extend(_validate_rows(rows, app_host, expected_origin, forbidden_hosts))
+            blockers.extend(
+                _validate_rows(
+                    rows,
+                    app_host,
+                    email_host,
+                    email_path,
+                    expected_origin,
+                    forbidden_hosts,
+                )
+            )
             warnings.extend(_warning_rows(rows))
 
     return {
@@ -69,6 +82,8 @@ def build_public_tunnel_preflight_report(
         "inputs": {
             "config": str(config_path),
             "app_host": _normalize_host(app_host),
+            "email_host": _normalize_host(email_host),
+            "email_path": email_path,
             "expected_origin": expected_origin,
             "forbidden_hosts": [_normalize_host(host) for host in forbidden_hosts],
         },
@@ -99,6 +114,7 @@ def render_text_report(report: dict[str, Any]) -> str:
         f"status: {report['status']}",
         f"config: {inputs['config']}",
         f"app_host: {inputs['app_host']}",
+        f"email_route: {inputs['email_host']} {inputs['email_path']}",
         f"expected_origin: {inputs['expected_origin']}",
         f"forbidden_hosts: {', '.join(inputs['forbidden_hosts']) or '<none>'}",
         f"ingress_rows: {summary['ingress_rows']}",
@@ -126,11 +142,14 @@ def render_text_report(report: dict[str, Any]) -> str:
 def _validate_rows(
     rows: list[IngressRow],
     app_host: str,
+    email_host: str,
+    email_path: str,
     expected_origin: str,
     forbidden_hosts: tuple[str, ...],
 ) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     normalized_app_host = _normalize_host(app_host)
+    normalized_email_host = _normalize_host(email_host)
     normalized_forbidden = {_normalize_host(host) for host in forbidden_hosts if host.strip()}
 
     unscoped_app_rows = [
@@ -202,13 +221,81 @@ def _validate_rows(
             )
         )
 
+    email_host_rows = [
+        row for row in rows if _normalize_host(row.hostname) == normalized_email_host
+    ]
+    email_rows = [row for row in email_host_rows if row.path == email_path]
+    if not email_rows:
+        blockers.append(
+            _issue(
+                "email_route_missing",
+                (
+                    f"{normalized_email_host} is missing the exact retained "
+                    f"path route {email_path!r}"
+                ),
+            )
+        )
+    elif len(email_rows) > 1:
+        blockers.append(
+            _issue(
+                "email_route_duplicate",
+                (
+                    f"{normalized_email_host} {email_path!r} appears "
+                    f"{len(email_rows)} times"
+                ),
+            )
+        )
+    elif email_rows[0].service != expected_origin:
+        blockers.append(
+            _issue(
+                "email_route_wrong_origin",
+                (
+                    f"{normalized_email_host} {email_path!r} routes to "
+                    f"{email_rows[0].service!r}; expected {expected_origin!r}"
+                ),
+                index=email_rows[0].index,
+            )
+        )
+    else:
+        shadowing_row = _shadowing_row(rows, email_rows[0], normalized_email_host)
+        if shadowing_row is not None:
+            blockers.append(
+                _issue(
+                    "email_route_shadowed",
+                    (
+                        f"row {shadowing_row.index} matches {normalized_email_host} "
+                        f"before the retained email route"
+                    ),
+                    index=shadowing_row.index,
+                )
+            )
+
     for row in rows:
         host = _normalize_host(row.hostname)
-        if host in normalized_forbidden:
+        is_retained_email_route = (
+            host == normalized_email_host
+            and row.path == email_path
+            and row.service == expected_origin
+        )
+        if host == normalized_email_host and not is_retained_email_route:
+            blockers.append(
+                _issue(
+                    "email_host_unexpected_route",
+                    (
+                        f"{host} may only expose the exact retained "
+                        f"email route {email_path!r}"
+                    ),
+                    index=row.index,
+                )
+            )
+        elif host in normalized_forbidden and not is_retained_email_route:
             blockers.append(
                 _issue(
                     "forbidden_host_present",
-                    f"{host} must not be present in the public ingress config",
+                    (
+                        f"{host} may only be present for the exact retained "
+                        f"email route {email_path!r}"
+                    ),
                     index=row.index,
                 )
             )
@@ -271,6 +358,18 @@ def _first_host_match(rows: list[IngressRow], hostname: str) -> IngressRow | Non
     return None
 
 
+def _shadowing_row(
+    rows: list[IngressRow],
+    target: IngressRow,
+    hostname: str,
+) -> IngressRow | None:
+    for row in rows[: target.index]:
+        row_host = _normalize_host(row.hostname)
+        if row.hostname is None or row_host == hostname or _wildcard_matches(row_host, hostname):
+            return row
+    return None
+
+
 def _wildcard_matches(pattern: str, hostname: str) -> bool:
     if pattern == "*":
         return True
@@ -303,12 +402,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--app-host", default=DEFAULT_APP_HOST)
+    parser.add_argument("--email-host", default=DEFAULT_EMAIL_HOST)
+    parser.add_argument("--email-path", default=DEFAULT_EMAIL_PATH)
     parser.add_argument("--expected-origin", default=DEFAULT_EXPECTED_ORIGIN)
     parser.add_argument(
         "--forbid-host",
         action="append",
         default=list(DEFAULT_FORBIDDEN_HOSTS),
-        help="Hostnames that must not appear in ingress. Repeatable.",
+        help="Hostnames that may only expose the retained email route. Repeatable.",
     )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--fail-on-blockers", action="store_true")
@@ -317,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
     report = build_public_tunnel_preflight_report(
         config_path=args.config,
         app_host=args.app_host,
+        email_host=args.email_host,
+        email_path=args.email_path,
         expected_origin=args.expected_origin,
         forbidden_hosts=tuple(args.forbid_host),
     )
