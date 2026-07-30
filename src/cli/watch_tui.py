@@ -1486,9 +1486,7 @@ def run_watch_tui(
         palette = _init_colors()
 
         rollout_flags = client.get_rollout_flags()
-        codex_projection_enabled = bool(
-            rollout_flags and rollout_flags.get("enable_observability_projection", True)
-        )
+        codex_projection_enabled = _codex_projection_enabled(rollout_flags)
 
         detail_worker = None if restore_mode else DetailFetchWorker(client=client, codex_projection_enabled=codex_projection_enabled)
 
@@ -2003,3 +2001,10 @@ def run_watch_tui(
 
     curses.wrapper(_loop)
     return 0
+
+
+def _codex_projection_enabled(rollout_flags: Optional[dict]) -> bool:
+    """Default retained projection on when the Rust server omits legacy flags."""
+    if rollout_flags is None:
+        return True
+    return bool(rollout_flags.get("enable_observability_projection", True))

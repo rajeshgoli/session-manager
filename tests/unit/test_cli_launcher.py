@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -118,8 +119,7 @@ def test_main_execs_rust_cli_with_unchanged_arguments(monkeypatch, tmp_path):
         "path": str(rust_cli),
         "argv": [str(rust_cli), "btw", "abc123"],
     }
-
-
+    assert os.environ["SM_WATCH_PYTHON"] == sys.executable
 def test_main_fails_clearly_when_rust_cli_is_missing(monkeypatch, capsys):
     monkeypatch.setattr(launcher, "find_rust_sm", lambda: None)
 

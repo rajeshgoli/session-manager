@@ -8,8 +8,6 @@ import urllib.parse
 import urllib.request
 import json
 
-import yaml
-
 # Default API endpoint
 DEFAULT_API_URL = "http://127.0.0.1:8420"
 CLIENT_CONFIG_ENV = "SM_CLIENT_CONFIG"
@@ -71,10 +69,21 @@ def _read_client_config_payload(config_path: Optional[Path] = None) -> Optional[
     """Read shared client config YAML, ignoring only a missing config file."""
     path = config_path or _client_config_path()
     try:
-        with path.open() as config_file:
-            payload = yaml.safe_load(config_file) or {}
+        content = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+    except Exception as exc:
+        raise ClientConfigError(f"Invalid Session Manager client config {path}: {exc}") from exc
+
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise ClientConfigError(
+            "PyYAML is required when Session Manager must read client YAML config"
+        ) from exc
+
+    try:
+        payload = yaml.safe_load(content) or {}
     except Exception as exc:
         raise ClientConfigError(f"Invalid Session Manager client config {path}: {exc}") from exc
 

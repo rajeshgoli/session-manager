@@ -87,6 +87,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
+        os.environ.setdefault("SM_WATCH_PYTHON", sys.executable)
         os.execv(str(rust_sm), [str(rust_sm), *arguments])
     except OSError as error:
         print(
