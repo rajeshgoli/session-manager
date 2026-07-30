@@ -329,6 +329,16 @@ def test_handoff_and_progress_are_current_through_public_mtls_issue1046():
     assert "live_canary_report" in readme
 
 
+def test_retained_rust_watch_has_real_dispatch_not_core_slice_stub():
+    rust_cli = (
+        REPO_ROOT / "crates/sm-server/src/bin/sm.rs"
+    ).read_text(encoding="utf-8")
+
+    assert "Watch(WatchArgs)" in rust_cli
+    assert "Command::Watch(args) => run_watch(&api_url, args)?" in rust_cli
+    assert "fn run_watch(api_url: &str, args: WatchArgs)" in rust_cli
+
+
 def test_manifest_covers_rust_only_retired_http_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
