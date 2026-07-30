@@ -308,6 +308,19 @@ def _validate_rows(
                 )
             )
 
+    for row in rows[:-1]:
+        if row.hostname is None:
+            blockers.append(
+                _issue(
+                    "nonterminal_hostless_rule",
+                    (
+                        f"hostless row {row.index} matches every request not handled "
+                        "by an earlier rule; only the terminal 404 may be hostless"
+                    ),
+                    index=row.index,
+                )
+            )
+
     if not rows:
         blockers.append(_issue("ingress_empty", "ingress list is empty"))
     elif rows[-1].hostname is not None or rows[-1].service != "http_status:404":

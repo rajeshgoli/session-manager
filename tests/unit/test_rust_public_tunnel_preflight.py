@@ -218,6 +218,27 @@ def test_public_tunnel_preflight_blocks_shadowed_email_route(tmp_path):
     )
 
 
+def test_public_tunnel_preflight_blocks_later_hostless_forwarding_rule(tmp_path):
+    config = tmp_path / "cloudflared.yml"
+    _write_tunnel_config(
+        config,
+        f"""
+{EMAIL_ROUTE.rstrip()}
+  - hostname: sm-app.rajeshgo.li
+    service: http://127.0.0.1:8420
+  - service: http://127.0.0.1:8420
+  - service: http_status:404
+""".rstrip(),
+    )
+
+    report = build_public_tunnel_preflight_report(config_path=config)
+
+    assert any(
+        issue["kind"] == "nonterminal_hostless_rule" and issue["index"] == 2
+        for issue in report["blockers"]
+    )
+
+
 def test_public_tunnel_preflight_restricts_custom_email_host(tmp_path):
     config = tmp_path / "cloudflared.yml"
     _write_tunnel_config(
