@@ -8,6 +8,7 @@ from pathlib import Path
 from src.cli.watch_tui import (
     DetailFetchWorker,
     DetailSnapshot,
+    _codex_projection_enabled,
     _arm_retire_confirmation,
     _create_watch_session,
     _fork_watch_session,
@@ -30,6 +31,15 @@ from src.cli.watch_tui import (
     restore_selection_from_key,
     restore_selection_key,
 )
+
+
+def test_projection_defaults_on_when_rust_server_omits_legacy_rollout_flags():
+    assert _codex_projection_enabled(None)
+    assert _codex_projection_enabled({})
+    assert _codex_projection_enabled({"enable_observability_projection": True})
+    assert not _codex_projection_enabled(
+        {"enable_observability_projection": False}
+    )
 
 
 def test_retire_confirmation_requires_same_session_before_expiry():

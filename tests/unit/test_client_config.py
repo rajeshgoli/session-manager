@@ -1,3 +1,4 @@
+import builtins
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,24 @@ def test_read_client_config_api_url_from_top_level_key(tmp_path: Path):
     config_path.write_text('api_url: "http://primary.example.test:8420/"\n')
 
     assert read_client_config_api_url(config_path) == "http://primary.example.test:8420"
+
+
+def test_present_client_config_reports_missing_pyyaml_clearly(
+    monkeypatch, tmp_path: Path
+):
+    config_path = tmp_path / "client.yaml"
+    config_path.write_text("api_url: http://primary.example.test:8420\n")
+    real_import = builtins.__import__
+
+    def import_without_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ModuleNotFoundError("No module named 'yaml'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_yaml)
+
+    with pytest.raises(ClientConfigError, match="PyYAML is required"):
+        read_client_config_api_url(config_path)
 
 
 def test_read_client_config_api_url_from_client_section(tmp_path: Path):

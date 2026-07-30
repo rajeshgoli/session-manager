@@ -170,6 +170,17 @@ cd session-manager
 cargo build -p sm-server --release
 ```
 
+Provision the retained local `sm watch` dashboard compatibility environment:
+
+```bash
+python3.11 -m venv venv
+venv/bin/python -m pip install PyYAML
+```
+
+When `sm` is launched through the Python console wrapper, it forwards that
+wrapper's interpreter to Rust. Direct Rust builds use `venv/bin/python` when
+present.
+
 Create local config from the example and adjust host/auth/state paths:
 
 ```bash
