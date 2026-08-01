@@ -29,6 +29,23 @@ pub struct RetainedQueueStore {
     db_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledReminder {
+    pub id: String,
+    pub target_session_id: String,
+    pub message: String,
+    pub fire_at: String,
+    pub recurring_interval_seconds: Option<i64>,
+    pub fired: bool,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledReminderDelivery {
+    pub reminder: ScheduledReminder,
+    pub queue_message_id: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CodexReviewRequestFilters {
     pub notify_session_id: Option<String>,
@@ -861,6 +878,180 @@ impl RetainedQueueStore {
         self.with_connection(|_| Ok(()))
     }
 
+    pub fn schedule_reminder(
+        &self,
+        target_session_id: &str,
+        delay_seconds: u64,
+        message: &str,
+        recurring_interval_seconds: Option<u64>,
+    ) -> Result<ScheduledReminder> {
+        let target_session_id = target_session_id.trim();
+        if target_session_id.is_empty() {
+            anyhow::bail!("target_session_id must not be empty");
+        }
+        if delay_seconds == 0 {
+            anyhow::bail!("delay_seconds must be greater than zero");
+        }
+        if recurring_interval_seconds == Some(0) {
+            anyhow::bail!("recurring_interval_seconds must be greater than zero");
+        }
+        let message = if message.trim().is_empty() {
+            "Reminder"
+        } else {
+            message.trim()
+        };
+        let delay_seconds = u64_to_i64(delay_seconds)?;
+        let recurring_interval_seconds = recurring_interval_seconds.map(u64_to_i64).transpose()?;
+        let fire_at =
+            (OffsetDateTime::now_utc() + Duration::seconds(delay_seconds)).format(&Rfc3339)?;
+        let id = generate_scheduled_reminder_id();
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                INSERT INTO scheduled_reminders
+                    (id, target_session_id, message, fire_at, task_type, fired,
+                     recurring_interval_seconds, is_active)
+                VALUES (?1, ?2, ?3, ?4, 'reminder', 0, ?5, 1)
+                "#,
+                params![
+                    id,
+                    target_session_id,
+                    message,
+                    fire_at,
+                    recurring_interval_seconds
+                ],
+            )?;
+            scheduled_reminder_conn(conn, &id)?
+                .ok_or_else(|| anyhow::anyhow!("scheduled reminder {id} was not persisted"))
+        })
+    }
+
+    pub fn cancel_scheduled_reminder(
+        &self,
+        reminder_id: &str,
+    ) -> Result<Option<ScheduledReminder>> {
+        self.with_connection(|conn| {
+            let Some(reminder) = scheduled_reminder_conn(conn, reminder_id)? else {
+                return Ok(None);
+            };
+            conn.execute(
+                "UPDATE scheduled_reminders SET is_active = 0 WHERE id = ?1",
+                params![reminder_id],
+            )?;
+            Ok(Some(reminder))
+        })
+    }
+
+    pub fn due_scheduled_reminders(
+        &self,
+        now_utc: OffsetDateTime,
+    ) -> Result<Vec<ScheduledReminder>> {
+        if !self.db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        let mut statement = conn.prepare(
+            r#"
+            SELECT id, target_session_id, message, fire_at,
+                   recurring_interval_seconds, fired, is_active
+            FROM scheduled_reminders
+            WHERE is_active = 1
+              AND (fired = 0 OR recurring_interval_seconds IS NOT NULL)
+            ORDER BY fire_at, id
+            "#,
+        )?;
+        let reminders = statement
+            .query_map([], scheduled_reminder_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(reminders
+            .into_iter()
+            .filter(|reminder| scheduled_reminder_is_due(&reminder.fire_at, now_utc))
+            .collect())
+    }
+
+    pub fn deactivate_scheduled_reminder(&self, reminder_id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            Ok(conn.execute(
+                "UPDATE scheduled_reminders SET is_active = 0 WHERE id = ?1 AND is_active = 1",
+                params![reminder_id],
+            )? > 0)
+        })
+    }
+
+    pub fn claim_due_scheduled_reminder(
+        &self,
+        reminder_id: &str,
+        now_utc: OffsetDateTime,
+    ) -> Result<Option<ScheduledReminderDelivery>> {
+        self.with_connection(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<Option<ScheduledReminderDelivery>> {
+                let Some(reminder) = scheduled_reminder_conn(conn, reminder_id)? else {
+                    return Ok(None);
+                };
+                if !reminder.is_active
+                    || reminder.fired && reminder.recurring_interval_seconds.is_none()
+                    || !scheduled_reminder_is_due(&reminder.fire_at, now_utc)
+                {
+                    return Ok(None);
+                }
+
+                let text = scheduled_reminder_message(&reminder);
+                let queue_message_id = enqueue_message_with_metadata_conn(
+                    conn,
+                    &reminder.target_session_id,
+                    &text,
+                    "urgent",
+                    QueueMessageMetadata {
+                        message_category: Some("scheduled_reminder".to_owned()),
+                        ..QueueMessageMetadata::default()
+                    },
+                )?;
+                let changed = if let Some(interval) = reminder.recurring_interval_seconds {
+                    let next_fire_at = (now_utc + Duration::seconds(interval)).format(&Rfc3339)?;
+                    conn.execute(
+                        r#"
+                        UPDATE scheduled_reminders
+                        SET fire_at = ?2, fired = 0, is_active = 1
+                        WHERE id = ?1 AND is_active = 1
+                        "#,
+                        params![reminder.id, next_fire_at],
+                    )?
+                } else {
+                    conn.execute(
+                        r#"
+                        UPDATE scheduled_reminders
+                        SET fired = 1, is_active = 0
+                        WHERE id = ?1 AND is_active = 1
+                        "#,
+                        params![reminder.id],
+                    )?
+                };
+                if changed != 1 {
+                    anyhow::bail!(
+                        "scheduled reminder {} changed while being claimed",
+                        reminder.id
+                    );
+                }
+                Ok(Some(ScheduledReminderDelivery {
+                    reminder,
+                    queue_message_id,
+                }))
+            })();
+            match result {
+                Ok(value) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
     pub fn enqueue_message(
         &self,
         target_session_id: &str,
@@ -1638,6 +1829,16 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_pending
             ON message_queue(target_session_id, delivered_at)
             WHERE delivered_at IS NULL;
+        CREATE TABLE IF NOT EXISTS scheduled_reminders (
+            id TEXT PRIMARY KEY,
+            target_session_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            fire_at TIMESTAMP NOT NULL,
+            task_type TEXT DEFAULT 'reminder',
+            fired INTEGER DEFAULT 0,
+            recurring_interval_seconds INTEGER,
+            is_active INTEGER DEFAULT 1
+        );
         CREATE TABLE IF NOT EXISTS remind_registrations (
             id TEXT PRIMARY KEY,
             target_session_id TEXT NOT NULL UNIQUE,
@@ -1693,6 +1894,43 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "message_queue",
         "response_relay_source",
         "TEXT DEFAULT NULL",
+    )?;
+    ensure_column(
+        conn,
+        "scheduled_reminders",
+        "recurring_interval_seconds",
+        "INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "scheduled_reminders",
+        "is_active",
+        "INTEGER DEFAULT 1",
+    )?;
+    conn.execute(
+        r#"
+        UPDATE scheduled_reminders
+        SET is_active = 1
+        WHERE is_active IS NULL
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        UPDATE scheduled_reminders
+        SET is_active = 0
+        WHERE fired = 1
+          AND recurring_interval_seconds IS NULL
+          AND is_active = 1
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_scheduled_reminders_active_fire
+        ON scheduled_reminders(is_active, fire_at)
+        "#,
+        [],
     )?;
     ensure_column(
         conn,
@@ -3447,6 +3685,67 @@ fn generate_codex_review_request_id() -> String {
         .collect::<String>()
 }
 
+fn generate_scheduled_reminder_id() -> String {
+    let mut bytes = [0u8; 6];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn scheduled_reminder_conn(
+    conn: &Connection,
+    reminder_id: &str,
+) -> Result<Option<ScheduledReminder>> {
+    conn.query_row(
+        r#"
+        SELECT id, target_session_id, message, fire_at,
+               recurring_interval_seconds, fired, is_active
+        FROM scheduled_reminders
+        WHERE id = ?1
+        "#,
+        params![reminder_id],
+        scheduled_reminder_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn scheduled_reminder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledReminder> {
+    Ok(ScheduledReminder {
+        id: row.get(0)?,
+        target_session_id: row.get(1)?,
+        message: row.get(2)?,
+        fire_at: row.get(3)?,
+        recurring_interval_seconds: row.get(4)?,
+        fired: row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
+        is_active: row.get::<_, Option<i64>>(6)?.unwrap_or(1) != 0,
+    })
+}
+
+fn scheduled_reminder_is_due(fire_at: &str, now_utc: OffsetDateTime) -> bool {
+    if let Ok(parsed) = OffsetDateTime::parse(fire_at.trim(), &Rfc3339) {
+        return parsed <= now_utc;
+    }
+    parse_python_naive_datetime(fire_at.trim())
+        .is_some_and(|parsed| parsed <= local_now_naive(now_utc))
+}
+
+fn scheduled_reminder_message(reminder: &ScheduledReminder) -> String {
+    if reminder.recurring_interval_seconds.is_some() {
+        format!(
+            "[sm] Recurring reminder: ({})\n{}\n[sm] Cancel: sm remind cancel {}",
+            reminder.id, reminder.message, reminder.id
+        )
+    } else {
+        format!(
+            "[sm] Scheduled reminder: ({})\n{}",
+            reminder.id, reminder.message
+        )
+    }
+}
+
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -3609,6 +3908,227 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn one_shot_reminder_claim_is_atomic_and_exactly_once() {
+        let db_path = unique_temp_path("scheduled-reminder-once");
+        let store = RetainedQueueStore::new(db_path.clone());
+        let reminder = store
+            .schedule_reminder("agent-1", 60, "Check the gate", None)
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+                params![
+                    reminder.id,
+                    (now - Duration::seconds(1)).format(&Rfc3339).unwrap()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(store.due_scheduled_reminders(now).unwrap().len(), 1);
+        let delivery = store
+            .claim_due_scheduled_reminder(&reminder.id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.reminder.id, reminder.id);
+        assert!(store
+            .claim_due_scheduled_reminder(&reminder.id, now)
+            .unwrap()
+            .is_none());
+
+        let pending = store.pending_messages_for_target("agent-1", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_mode, "urgent");
+        assert_eq!(
+            pending[0].message_category.as_deref(),
+            Some("scheduled_reminder")
+        );
+        assert_eq!(
+            pending[0].text,
+            format!("[sm] Scheduled reminder: ({})\nCheck the gate", reminder.id)
+        );
+        let persisted = scheduled_reminder_conn(&Connection::open(&db_path).unwrap(), &reminder.id)
+            .unwrap()
+            .unwrap();
+        assert!(persisted.fired);
+        assert!(!persisted.is_active);
+    }
+
+    #[test]
+    fn recurring_reminder_advances_from_fire_time_and_can_be_cancelled() {
+        let db_path = unique_temp_path("scheduled-reminder-recurring");
+        let store = RetainedQueueStore::new(db_path.clone());
+        let reminder = store
+            .schedule_reminder("agent-2", 17, "Inspect queues", Some(17))
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+                params![
+                    reminder.id,
+                    (now - Duration::seconds(1)).format(&Rfc3339).unwrap()
+                ],
+            )
+            .unwrap();
+
+        store
+            .claim_due_scheduled_reminder(&reminder.id, now)
+            .unwrap()
+            .unwrap();
+        let persisted = scheduled_reminder_conn(&Connection::open(&db_path).unwrap(), &reminder.id)
+            .unwrap()
+            .unwrap();
+        assert!(persisted.is_active);
+        assert!(!persisted.fired);
+        assert_eq!(persisted.recurring_interval_seconds, Some(17));
+        assert_eq!(
+            OffsetDateTime::parse(&persisted.fire_at, &Rfc3339).unwrap(),
+            now + Duration::seconds(17)
+        );
+        let pending = store.pending_messages_for_target("agent-2", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0]
+            .text
+            .ends_with(&format!("[sm] Cancel: sm remind cancel {}", reminder.id)));
+
+        let cancelled = store
+            .cancel_scheduled_reminder(&reminder.id)
+            .unwrap()
+            .unwrap();
+        assert!(cancelled.is_active);
+        assert!(store
+            .due_scheduled_reminders(now + Duration::minutes(1))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reminder_claim_rolls_back_queue_insert_when_schedule_update_fails() {
+        let db_path = unique_temp_path("scheduled-reminder-rollback");
+        let store = RetainedQueueStore::new(db_path.clone());
+        let reminder = store
+            .schedule_reminder("agent-3", 30, "Do not split state", None)
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+            params![
+                reminder.id,
+                (now - Duration::seconds(1)).format(&Rfc3339).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER reject_scheduled_reminder_update
+            BEFORE UPDATE ON scheduled_reminders
+            BEGIN
+                SELECT RAISE(ABORT, 'forced reminder update failure');
+            END;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(store
+            .claim_due_scheduled_reminder(&reminder.id, now)
+            .is_err());
+        assert!(store
+            .pending_messages_for_target("agent-3", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn due_reminders_accept_legacy_python_local_timestamps() {
+        let db_path = unique_temp_path("scheduled-reminder-legacy-time");
+        let store = RetainedQueueStore::new(db_path.clone());
+        store.ensure_schema().unwrap();
+        let now = OffsetDateTime::now_utc();
+        let local_past = local_now_naive(now) - Duration::seconds(1);
+        let fire_at = python_naive_timestamp(local_past);
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                r#"
+                INSERT INTO scheduled_reminders
+                    (id, target_session_id, message, fire_at, fired, is_active)
+                VALUES ('legacy-reminder', 'agent-4', 'legacy', ?1, 0, 1)
+                "#,
+                params![fire_at],
+            )
+            .unwrap();
+
+        let due = store.due_scheduled_reminders(now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "legacy-reminder");
+    }
+
+    #[test]
+    fn scheduled_reminder_schema_migrates_before_creating_active_index() {
+        let db_path = unique_temp_path("scheduled-reminder-legacy-schema");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE scheduled_reminders (
+                id TEXT PRIMARY KEY,
+                target_session_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                fire_at TIMESTAMP NOT NULL,
+                task_type TEXT DEFAULT 'reminder',
+                fired INTEGER DEFAULT 0
+            );
+            INSERT INTO scheduled_reminders
+                (id, target_session_id, message, fire_at, fired)
+            VALUES
+                ('legacy-schema', 'agent-5', 'migrate me', '2099-01-01T00:00:00', 0);
+            INSERT INTO scheduled_reminders
+                (id, target_session_id, message, fire_at, fired)
+            VALUES
+                ('legacy-fired', 'agent-5', 'already fired', '2020-01-01T00:00:00', 1);
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = RetainedQueueStore::new(db_path.clone());
+        store.ensure_schema().unwrap();
+
+        let conn = Connection::open(db_path).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(scheduled_reminders)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "is_active"));
+        assert!(columns
+            .iter()
+            .any(|column| column == "recurring_interval_seconds"));
+        let is_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM scheduled_reminders WHERE id = 'legacy-schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_active, 1);
+        let fired_is_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM scheduled_reminders WHERE id = 'legacy-fired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fired_is_active, 0);
     }
 
     #[test]

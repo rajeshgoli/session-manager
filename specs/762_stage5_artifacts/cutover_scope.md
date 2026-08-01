@@ -29,7 +29,7 @@ These surfaces are in scope for the first Rust release:
 | Area | Retained Scope |
 | --- | --- |
 | Core session lifecycle | create/new, spawn, fork, restore, retire, open where local, attach to tmux, output/tail, clear, handoff, parent/child relationships, registry/role/maintainer identity that current agent workflows depend on. |
-| Core CLI | `sm me`, `who`, `status`, `all`, `watch`, `send`, `email`, `wait`, `spawn`, `fork`, `new`, `children`, `retire`, `restore`, `attach`, `output`, `tail`, `clear`, `handoff`, `context-monitor`, `maintainer`, `register`, `unregister`, `lookup`, `roster`, `review`, `request-codex-review`, and current Codex provider commands that are active. |
+| Core CLI | `sm me`, `who`, `status`, `all`, `watch`, `send`, `email`, `remind`, `wait`, `spawn`, `fork`, `new`, `children`, `retire`, `restore`, `attach`, `output`, `tail`, `clear`, `handoff`, `context-monitor`, `maintainer`, `register`, `unregister`, `lookup`, `roster`, `review`, `request-codex-review`, and current Codex provider commands that are active. |
 | Native mobile app | Google/device auth, bootstrap, client session list/detail, mobile terminal attach, request-status, analytics, bug reports, app update/artifact flow, device inventory/revocation. |
 | Mobile terminal | Keep or redesign the current attach-ticket/WebSocket path, but preserve auth, device proof, session binding, quotas, revocation, audit, and fail-closed behavior. Termux is not part of this scope. |
 | Public remote access | Public edge proof is required before operational public traffic reaches origin. Public callers must prove enrolled phone or approved node possession, then pass OAuth/device-bearer or node authorization at origin. |
@@ -37,7 +37,7 @@ These surfaces are in scope for the first Rust release:
 | Codex runtime | Keep Codex app/fork event ingestion, reducer/cursor behavior, pending-request ledger semantics needed by current providers, and Codex review request flow. |
 | GitHub/Codex review | Keep PR review request/watch flow, but add repo allowlists or explicit approval gates as part of the cutover hardening. |
 | Hooks and audit | Keep local hook ingestion, tool-use audit, context usage, tmux-client local-only hook, lock/worktree safety, and no-secret logging. Non-loopback hooks require route-local proof. |
-| Message delivery | Keep direct session delivery, queued delivery, parent wakes, notify-on-stop, response relay, and stop-hook delivery semantics used by agent workflows. |
+| Message delivery | Keep direct session delivery, queued delivery, durable one-shot/recurring scheduled reminders, parent wakes, notify-on-stop, response relay, and stop-hook delivery semantics used by agent workflows. |
 | Email/human fallback delivery | Keep outbound email/human recipient delivery and inbound email webhook delivery as the fallback external channel after Telegram removal. Inbound email must require route-local worker proof before trusting the session header, enforce authorized senders, preserve restore-and-deliver behavior, and log accept/reject reasons without raw email or secrets. |
 | Queue runner, narrow mode | Keep basic command queue create/list/status/cancel/run with policy/audit/resource gates. Remove policy-run and CI-helper sprawl unless reintroduced by a later owner-approved ticket. |
 | Watch diagnostics | Keep local/operator `sm watch` and authenticated/proofed watch diagnostics where useful. Do not expose public operational browser data. |
@@ -57,7 +57,6 @@ These surfaces are out of scope for the Rust cutover:
 | Telegram bot commands, callbacks, topic cleanup, and remote control | Do not port. Telegram telemetry/topic state may be archived or migrated only for rollback/history. Native app replaces this remote-control surface. |
 | Generic public browser/watch data | Do not expose public operational data at `sm.rajeshgo.li`. Local/authenticated/proofed diagnostics are allowed; unauthenticated public operational browser views are not. |
 | `watch-job` and external job watches | Do not port. Retained state is empty and simple queue jobs cover the useful command-execution path. |
-| Scheduled reminders and periodic remind APIs/CLI | Do not port as a standalone feature. Preserve parent wake, notify-on-stop, and direct queue delivery used by agent workflows. |
 | Queue policy runs and CI helper subcommands | Do not port. Keep only the narrow queue runner scope above. |
 | AI summary provider HTTP route and `sm what` summarizer | Do not port as public/sensitive read APIs or CLI commands. Prefer raw tail/output and explicit status prompts over lossy low-capability summarization. |
 | Legacy provider aliases and retired entrypoints | Do not port `codex-server`, `codex-legacy`, or other inactive legacy aliases beyond clear retirement errors where needed. Keep active Codex app/fork/provider commands. |

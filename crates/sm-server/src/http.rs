@@ -107,6 +107,7 @@ use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
     CreateCodexReviewRequest, CreateQueueJob, QueueAdmissionPolicy, QueueJobFilters,
     QueueJobRecord, QueueMessageMetadata, RetainedQueueStore, RetryCodexReviewRequest,
+    ScheduledReminder,
 };
 use crate::runtime::TmuxRuntime;
 use crate::sessions::{
@@ -874,6 +875,7 @@ pub fn router(state: AppState) -> Router {
     let state = Arc::new(state);
     recover_codex_review_request_watchers(state.clone());
     recover_btw_requests(state.clone());
+    spawn_scheduled_reminder_dispatcher(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
@@ -929,6 +931,11 @@ pub fn router(state: AppState) -> Router {
             get(get_codex_review_request).delete(cancel_codex_review_request),
         )
         .route("/btw-requests/{request_id}", get(get_btw_request))
+        .route("/scheduler/remind", post(schedule_reminder))
+        .route(
+            "/scheduler/remind/{reminder_id}",
+            delete(cancel_scheduled_reminder),
+        )
         .route("/reviews/pr", post(start_pr_review))
         .route("/nodes", get(list_nodes))
         .route("/nodes/{node_id}/ping", post(ping_node))
@@ -4055,6 +4062,148 @@ fn complete_codex_review_request(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn spawn_scheduled_reminder_dispatcher(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let queue_db_path = expand_home(&state.config.sm_send.db_path);
+        match tokio::task::spawn_blocking(move || {
+            RetainedQueueStore::new(queue_db_path).ensure_schema()
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("scheduled reminder schema initialization failed: {error:#}")
+            }
+            Err(error) => eprintln!("scheduled reminder schema task failed: {error}"),
+        }
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let state = state.clone();
+            match tokio::task::spawn_blocking(move || dispatch_due_scheduled_reminders(&state))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("scheduled reminder dispatch failed: {error:#}"),
+                Err(error) => eprintln!("scheduled reminder dispatch task failed: {error}"),
+            }
+        }
+    });
+}
+
+fn dispatch_due_scheduled_reminders(state: &AppState) -> anyhow::Result<()> {
+    let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+    let now = OffsetDateTime::now_utc();
+    for reminder in queue.due_scheduled_reminders(now)? {
+        let target = state
+            .session_store
+            .get_session(&reminder.target_session_id)?;
+        if target
+            .as_ref()
+            .is_none_or(|session| session.status.trim().eq_ignore_ascii_case("stopped"))
+        {
+            queue.deactivate_scheduled_reminder(&reminder.id)?;
+            continue;
+        }
+        let Some(delivery) = queue.claim_due_scheduled_reminder(&reminder.id, now)? else {
+            continue;
+        };
+        if state.config.rust_core.runtime_enabled {
+            let runtime = TmuxRuntime::from_app_config(&state.config);
+            if let Err(error) = state
+                .session_store
+                .drain_runtime_pending_messages_for_session_category(
+                    &delivery.reminder.target_session_id,
+                    &runtime,
+                    Some("scheduled_reminder"),
+                )
+            {
+                eprintln!(
+                    "failed to immediately deliver scheduled reminder {} to {}: {error:#}",
+                    delivery.reminder.id, delivery.reminder.target_session_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn schedule_reminder(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(payload): Query<ScheduleReminderQuery>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/scheduler/remind",
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    if payload.delay_seconds == 0 || payload.recurring_interval_seconds == Some(0) {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Reminder intervals must be greater than zero".to_owned(),
+        });
+    }
+    let Some(session) = state.session_store.get_session(&payload.session_id)? else {
+        return Err(ApiError::NotFound("Session not found"));
+    };
+    if session.status.trim().eq_ignore_ascii_case("stopped") {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Cannot schedule a reminder for a stopped session".to_owned(),
+        });
+    }
+    let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+    let reminder = queue.schedule_reminder(
+        &session.id,
+        payload.delay_seconds,
+        &payload.message,
+        payload.recurring_interval_seconds,
+    )?;
+    Ok(Json(json!({
+        "status": "scheduled",
+        "reminder_id": reminder.id,
+        "session_id": reminder.target_session_id,
+        "fires_in_seconds": payload.delay_seconds,
+        "mode": if reminder.recurring_interval_seconds.is_some() { "recurring" } else { "one-shot" },
+        "recurring_interval_seconds": reminder.recurring_interval_seconds,
+    })))
+}
+
+async fn cancel_scheduled_reminder(
+    State(state): State<Arc<AppState>>,
+    Path(reminder_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        &format!("/scheduler/remind/{reminder_id}"),
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
+    let Some(reminder) = queue.cancel_scheduled_reminder(&reminder_id)? else {
+        return Err(ApiError::NotFound("Reminder not found"));
+    };
+    Ok(Json(scheduled_reminder_cancelled_response(reminder)))
+}
+
+fn scheduled_reminder_cancelled_response(reminder: ScheduledReminder) -> Value {
+    json!({
+        "status": "cancelled",
+        "reminder_id": reminder.id,
+        "session_id": reminder.target_session_id,
+        "recurring_interval_seconds": reminder.recurring_interval_seconds,
+        "fired": reminder.fired,
+    })
 }
 
 fn render_codex_review_landed_message(
@@ -11659,6 +11808,14 @@ struct ListQueueJobsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ScheduleReminderQuery {
+    session_id: String,
+    message: String,
+    delay_seconds: u64,
+    recurring_interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct QueueJobCreateRequest {
     #[serde(default = "default_queue_job_type", rename = "type")]
     job_type: String,
@@ -12379,6 +12536,7 @@ mod tests {
         ecdsa::{signature::Signer, SigningKey},
         pkcs8::{EncodePublicKey, LineEnding},
     };
+    use rusqlite::Connection;
     use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
@@ -13254,6 +13412,114 @@ mod tests {
             .extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4200))));
         request
+    }
+
+    fn reminder_test_config(status: &str) -> (AppConfig, PathBuf) {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-reminder-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state_file = dir.join("sessions.json");
+        fs::write(
+            &state_file,
+            serde_json::to_vec(&json!({
+                "sessions": [{
+                    "id": "reminder-agent",
+                    "name": "codex-fork-reminder-agent",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-fork-reminder-agent",
+                    "provider": "codex-fork",
+                    "status": status,
+                    "created_at": "2026-07-31T00:00:00Z",
+                    "last_activity": "2026-07-31T00:00:00Z"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let queue_path = dir.join("message_queue.db");
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file.display().to_string();
+        config.sm_send.db_path = queue_path.display().to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        (config, queue_path)
+    }
+
+    #[tokio::test]
+    async fn reminder_http_surface_schedules_and_cancels() {
+        let (config, _) = reminder_test_config("running");
+        let app = router(AppState::new(config));
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::POST,
+                "/scheduler/remind?session_id=reminder-agent&delay_seconds=60&message=Check%20status&recurring_interval_seconds=60",
+                Body::from("{}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["mode"], "recurring");
+        let reminder_id = payload["reminder_id"].as_str().unwrap();
+
+        let response = app
+            .oneshot(local_request(
+                Method::DELETE,
+                &format!("/scheduler/remind/{reminder_id}"),
+                Body::from("{}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["reminder_id"], reminder_id);
+    }
+
+    #[test]
+    fn reminder_dispatch_deactivates_stopped_targets_without_queueing() {
+        let (config, queue_path) = reminder_test_config("stopped");
+        let state = AppState::new(config);
+        let queue = RetainedQueueStore::new(queue_path.clone());
+        let reminder = queue
+            .schedule_reminder("reminder-agent", 60, "Should not fire", Some(60))
+            .unwrap();
+        Connection::open(&queue_path)
+            .unwrap()
+            .execute(
+                "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    reminder.id,
+                    (OffsetDateTime::now_utc() - TimeDuration::seconds(1))
+                        .format(&Rfc3339)
+                        .unwrap()
+                ],
+            )
+            .unwrap();
+
+        dispatch_due_scheduled_reminders(&state).unwrap();
+
+        assert!(queue
+            .pending_messages_for_target("reminder-agent", 10)
+            .unwrap()
+            .is_empty());
+        let conn = Connection::open(queue_path).unwrap();
+        let is_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM scheduled_reminders WHERE id = ?1",
+                rusqlite::params![reminder.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_active, 0);
     }
 
     fn public_request(method: Method, uri: &str, body: Body) -> axum::http::Request<Body> {
