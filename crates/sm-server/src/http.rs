@@ -4070,6 +4070,7 @@ fn complete_codex_review_request(
 
 fn spawn_scheduled_reminder_dispatcher(state: Arc<AppState>) {
     tokio::spawn(async move {
+        let compaction_wait_started = Arc::new(Mutex::new(BTreeMap::new()));
         let queue_db_path = expand_home(&state.config.sm_send.db_path);
         match tokio::task::spawn_blocking(move || {
             RetainedQueueStore::new(queue_db_path).ensure_schema()
@@ -4087,8 +4088,11 @@ fn spawn_scheduled_reminder_dispatcher(state: Arc<AppState>) {
         loop {
             ticker.tick().await;
             let state = state.clone();
-            match tokio::task::spawn_blocking(move || dispatch_due_scheduled_reminders(&state))
-                .await
+            let compaction_wait_started = compaction_wait_started.clone();
+            match tokio::task::spawn_blocking(move || {
+                dispatch_due_scheduled_reminders(&state, &compaction_wait_started)
+            })
+            .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => eprintln!("scheduled reminder dispatch failed: {error:#}"),
@@ -4098,10 +4102,22 @@ fn spawn_scheduled_reminder_dispatcher(state: Arc<AppState>) {
     });
 }
 
-fn dispatch_due_scheduled_reminders(state: &AppState) -> anyhow::Result<()> {
+fn dispatch_due_scheduled_reminders(
+    state: &AppState,
+    compaction_wait_started: &Mutex<BTreeMap<String, Instant>>,
+) -> anyhow::Result<()> {
     let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
     let now = OffsetDateTime::now_utc();
-    for reminder in queue.due_scheduled_reminders(now)? {
+    let reminders = queue.due_scheduled_reminders(now)?;
+    let due_ids = reminders
+        .iter()
+        .map(|reminder| reminder.id.as_str())
+        .collect::<BTreeSet<_>>();
+    compaction_wait_started
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scheduled reminder compaction wait lock was poisoned"))?
+        .retain(|reminder_id, _| due_ids.contains(reminder_id.as_str()));
+    for reminder in reminders {
         if !reminder.recurring_interval_is_valid_at(now) {
             eprintln!(
                 "deactivating scheduled reminder {} with an invalid recurring interval",
@@ -4120,13 +4136,30 @@ fn dispatch_due_scheduled_reminders(state: &AppState) -> anyhow::Result<()> {
             queue.deactivate_scheduled_reminder(&reminder.id)?;
             continue;
         }
-        if target.as_ref().is_some_and(|session| {
-            session.context_compaction_active
-                && reminder
-                    .overdue_seconds(now)
-                    .is_some_and(|elapsed| elapsed < SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS)
-        }) {
-            continue;
+        if target
+            .as_ref()
+            .is_some_and(|session| session.context_compaction_active)
+        {
+            let should_defer = {
+                let mut wait_started = compaction_wait_started.lock().map_err(|_| {
+                    anyhow::anyhow!("scheduled reminder compaction wait lock was poisoned")
+                })?;
+                wait_started
+                    .entry(reminder.id.clone())
+                    .or_insert_with(Instant::now)
+                    .elapsed()
+                    < Duration::from_secs(SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS as u64)
+            };
+            if should_defer {
+                continue;
+            }
+        } else {
+            compaction_wait_started
+                .lock()
+                .map_err(|_| {
+                    anyhow::anyhow!("scheduled reminder compaction wait lock was poisoned")
+                })?
+                .remove(&reminder.id);
         }
         let delivery = match queue.claim_due_scheduled_reminder(&reminder.id, now) {
             Ok(Some(delivery)) => delivery,
@@ -4155,6 +4188,10 @@ fn dispatch_due_scheduled_reminders(state: &AppState) -> anyhow::Result<()> {
                 );
             }
         }
+        compaction_wait_started
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scheduled reminder compaction wait lock was poisoned"))?
+            .remove(&delivery.reminder.id);
     }
     Ok(())
 }
@@ -13573,7 +13610,7 @@ mod tests {
             )
             .unwrap();
 
-        dispatch_due_scheduled_reminders(&state).unwrap();
+        dispatch_due_scheduled_reminders(&state, &Mutex::new(BTreeMap::new())).unwrap();
 
         assert!(queue
             .pending_messages_for_target("reminder-agent", 10)
@@ -13626,7 +13663,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        dispatch_due_scheduled_reminders(&state).unwrap();
+        dispatch_due_scheduled_reminders(&state, &Mutex::new(BTreeMap::new())).unwrap();
 
         let pending = queue
             .pending_messages_for_target("reminder-agent", 10)
@@ -13645,7 +13682,7 @@ mod tests {
     }
 
     #[test]
-    fn reminder_dispatch_defers_active_compaction_for_at_most_five_minutes() {
+    fn reminder_dispatch_starts_compaction_wait_when_due_is_observed() {
         let (config, queue_path) = reminder_test_config("running");
         let state_path = PathBuf::from(&config.paths.state_file);
         let mut session_state: Value =
@@ -13658,30 +13695,31 @@ mod tests {
             .schedule_reminder("reminder-agent", 60, "Wait for compaction", None)
             .unwrap();
         let now = OffsetDateTime::now_utc();
-        let set_fire_at = |elapsed_seconds: i64| {
-            Connection::open(&queue_path)
-                .unwrap()
-                .execute(
-                    "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
-                    rusqlite::params![
-                        &reminder.id,
-                        (now - TimeDuration::seconds(elapsed_seconds))
-                            .format(&Rfc3339)
-                            .unwrap()
-                    ],
-                )
-                .unwrap();
-        };
+        Connection::open(&queue_path)
+            .unwrap()
+            .execute(
+                "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    &reminder.id,
+                    (now - TimeDuration::seconds(SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS))
+                        .format(&Rfc3339)
+                        .unwrap()
+                ],
+            )
+            .unwrap();
+        let compaction_wait_started = Mutex::new(BTreeMap::new());
 
-        set_fire_at(1);
-        dispatch_due_scheduled_reminders(&state).unwrap();
+        dispatch_due_scheduled_reminders(&state, &compaction_wait_started).unwrap();
         assert!(queue
             .pending_messages_for_target("reminder-agent", 10)
             .unwrap()
             .is_empty());
 
-        set_fire_at(SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS);
-        dispatch_due_scheduled_reminders(&state).unwrap();
+        compaction_wait_started.lock().unwrap().insert(
+            reminder.id.clone(),
+            Instant::now() - Duration::from_secs(SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS as u64),
+        );
+        dispatch_due_scheduled_reminders(&state, &compaction_wait_started).unwrap();
         assert_eq!(
             queue
                 .pending_messages_for_target("reminder-agent", 10)

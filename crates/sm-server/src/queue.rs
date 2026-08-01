@@ -48,9 +48,9 @@ impl ScheduledReminder {
     pub fn recurring_interval_is_valid_at(&self, now_utc: OffsetDateTime) -> bool {
         self.recurring_interval_seconds.is_none_or(|interval| {
             interval > 0
-                && local_now_naive(now_utc)
-                    .checked_add(Duration::seconds(interval))
-                    .is_some()
+                && local_now_naive(now_utc).is_some_and(|now_local| {
+                    now_local.checked_add(Duration::seconds(interval)).is_some()
+                })
         })
     }
 }
@@ -919,6 +919,7 @@ impl RetainedQueueStore {
         let recurring_interval_seconds = recurring_interval_seconds.map(u64_to_i64).transpose()?;
         let now_utc = OffsetDateTime::now_utc();
         let fire_at_local = local_now_naive(now_utc)
+            .context("could not determine the local UTC offset for reminder persistence")?
             .checked_add(Duration::seconds(delay_seconds))
             .context("reminder delay is outside the supported timestamp range")?;
         if let Some(interval) = recurring_interval_seconds {
@@ -1033,6 +1034,9 @@ impl RetainedQueueStore {
                 )?;
                 let changed = if let Some(interval) = reminder.recurring_interval_seconds {
                     let next_fire_at_local = local_now_naive(now_utc)
+                        .context(
+                            "could not determine the local UTC offset for reminder persistence",
+                        )?
                         .checked_add(Duration::seconds(interval))
                         .context("recurring reminder interval exceeds the timestamp range")?;
                     let next_fire_at = python_compatible_reminder_timestamp(next_fire_at_local)?;
@@ -2914,7 +2918,7 @@ fn queue_elapsed_since(value: &str, now_utc: OffsetDateTime) -> Option<i64> {
         return Some((now_utc - parsed).whole_seconds());
     }
     let parsed = parse_python_naive_datetime(value)?;
-    Some((local_now_naive(now_utc) - parsed).whole_seconds())
+    Some((local_now_naive(now_utc)? - parsed).whole_seconds())
 }
 
 fn queue_job_is_cancelled_in_state_dir(state_dir: &Path, job_id: &str) -> bool {
@@ -3639,7 +3643,7 @@ fn expire_pending_messages_for_target(conn: &Connection, target_session_id: &str
 fn timeout_is_expired(
     timeout_at: &str,
     now_utc: OffsetDateTime,
-    now_local: PrimitiveDateTime,
+    now_local: Option<PrimitiveDateTime>,
 ) -> bool {
     let timeout_at = timeout_at.trim();
     if timeout_at.is_empty() {
@@ -3649,7 +3653,7 @@ fn timeout_is_expired(
         return parsed <= now_utc;
     }
     if let Some(parsed) = parse_python_naive_datetime(timeout_at) {
-        return parsed <= now_local;
+        return now_local.is_some_and(|now_local| parsed <= now_local);
     }
     false
 }
@@ -3668,11 +3672,10 @@ fn parse_python_naive_datetime(value: &str) -> Option<PrimitiveDateTime> {
     .ok()
 }
 
-fn local_now_naive(now_utc: OffsetDateTime) -> PrimitiveDateTime {
-    let local = UtcOffset::local_offset_at(now_utc)
-        .map(|offset| now_utc.to_offset(offset))
-        .unwrap_or(now_utc);
-    PrimitiveDateTime::new(local.date(), local.time())
+fn local_now_naive(now_utc: OffsetDateTime) -> Option<PrimitiveDateTime> {
+    let offset = UtcOffset::local_offset_at(now_utc).ok()?;
+    let local = now_utc.to_offset(offset);
+    Some(PrimitiveDateTime::new(local.date(), local.time()))
 }
 
 fn python_compatible_reminder_timestamp(value: PrimitiveDateTime) -> Result<String> {
@@ -3767,7 +3770,7 @@ fn scheduled_reminder_elapsed_seconds(fire_at: &str, now_utc: OffsetDateTime) ->
         return Some((now_utc - parsed).whole_seconds());
     }
     parse_python_naive_datetime(fire_at.trim())
-        .map(|parsed| (local_now_naive(now_utc) - parsed).whole_seconds())
+        .and_then(|parsed| local_now_naive(now_utc).map(|now| (now - parsed).whole_seconds()))
 }
 
 fn scheduled_reminder_message(reminder: &ScheduledReminder) -> String {
@@ -4040,7 +4043,7 @@ mod tests {
         assert_eq!(persisted.recurring_interval_seconds, Some(17));
         assert_eq!(
             parse_python_naive_datetime(&persisted.fire_at).unwrap(),
-            local_now_naive(now + Duration::seconds(17))
+            local_now_naive(now + Duration::seconds(17)).unwrap()
         );
         let pending = store.pending_messages_for_target("agent-2", 10).unwrap();
         assert_eq!(pending.len(), 1);
@@ -4158,7 +4161,7 @@ mod tests {
         let store = RetainedQueueStore::new(db_path.clone());
         store.ensure_schema().unwrap();
         let now = OffsetDateTime::now_utc();
-        let local_past = local_now_naive(now) - Duration::seconds(1);
+        let local_past = local_now_naive(now).unwrap() - Duration::seconds(1);
         let fire_at = python_naive_timestamp(local_past);
         Connection::open(&db_path)
             .unwrap()
@@ -4243,7 +4246,7 @@ mod tests {
         let store = RetainedQueueStore::new(db_path.clone());
         store.ensure_schema().unwrap();
         let now_utc = OffsetDateTime::now_utc();
-        let now_local = local_now_naive(now_utc);
+        let now_local = local_now_naive(now_utc).unwrap();
         let expired_naive = python_naive_timestamp(now_local - Duration::seconds(5));
         let future_naive = python_naive_timestamp(now_local + Duration::minutes(5));
         let expired_rfc3339 = (now_utc - Duration::seconds(5)).format(&Rfc3339).unwrap();
@@ -4294,7 +4297,7 @@ mod tests {
     #[test]
     fn queue_job_timeout_treats_python_naive_started_at_as_local_time() {
         let now_utc = OffsetDateTime::now_utc();
-        let now_local = local_now_naive(now_utc);
+        let now_local = local_now_naive(now_utc).unwrap();
         let recent_started_at = python_naive_timestamp(now_local - Duration::seconds(30));
         let old_started_at = python_naive_timestamp(now_local - Duration::seconds(300));
         let mut job = QueueJobRuntimeRecord {
