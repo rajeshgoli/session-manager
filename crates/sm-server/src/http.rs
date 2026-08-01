@@ -877,7 +877,9 @@ pub fn router(state: AppState) -> Router {
     let state = Arc::new(state);
     recover_codex_review_request_watchers(state.clone());
     recover_btw_requests(state.clone());
-    spawn_scheduled_reminder_dispatcher(state.clone());
+    if state.config.rust_core.runtime_enabled {
+        spawn_scheduled_reminder_dispatcher(state.clone());
+    }
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))
@@ -13492,6 +13494,46 @@ mod tests {
                 .unwrap();
         assert_eq!(payload["status"], "cancelled");
         assert_eq!(payload["reminder_id"], reminder_id);
+    }
+
+    #[tokio::test]
+    async fn read_only_router_does_not_claim_or_dispatch_reminders() {
+        let (mut config, queue_path) = reminder_test_config("running");
+        let queue = RetainedQueueStore::new(queue_path.clone());
+        let reminder = queue
+            .schedule_reminder("reminder-agent", 60, "Python owns this", None)
+            .unwrap();
+        Connection::open(&queue_path)
+            .unwrap()
+            .execute(
+                "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    reminder.id,
+                    (OffsetDateTime::now_utc() - TimeDuration::seconds(1))
+                        .format(&Rfc3339)
+                        .unwrap()
+                ],
+            )
+            .unwrap();
+        config.rust_core.fixture_writes_enabled = false;
+        config.rust_core.runtime_enabled = false;
+        let _app = router(AppState::new(config));
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let conn = Connection::open(queue_path).unwrap();
+        let is_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM scheduled_reminders WHERE id = ?1",
+                rusqlite::params![reminder.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_active, 1);
+        assert!(queue
+            .pending_messages_for_target("reminder-agent", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
