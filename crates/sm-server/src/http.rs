@@ -124,6 +124,7 @@ use crate::sessions::{
     SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
     TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
+
 use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
@@ -135,6 +136,7 @@ const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
 const CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES: u64 = 256 * 1024;
 const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
+const SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS: i64 = 300;
 const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
 const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
@@ -4106,6 +4108,14 @@ fn dispatch_due_scheduled_reminders(state: &AppState) -> anyhow::Result<()> {
             .is_none_or(|session| session.status.trim().eq_ignore_ascii_case("stopped"))
         {
             queue.deactivate_scheduled_reminder(&reminder.id)?;
+            continue;
+        }
+        if target.as_ref().is_some_and(|session| {
+            session.context_compaction_active
+                && reminder
+                    .overdue_seconds(now)
+                    .is_some_and(|elapsed| elapsed < SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS)
+        }) {
             continue;
         }
         let Some(delivery) = queue.claim_due_scheduled_reminder(&reminder.id, now)? else {
@@ -13520,6 +13530,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(is_active, 0);
+    }
+
+    #[test]
+    fn reminder_dispatch_defers_active_compaction_for_at_most_five_minutes() {
+        let (config, queue_path) = reminder_test_config("running");
+        let state_path = PathBuf::from(&config.paths.state_file);
+        let mut session_state: Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        session_state["sessions"][0]["context_compaction_active"] = Value::Bool(true);
+        fs::write(&state_path, serde_json::to_vec(&session_state).unwrap()).unwrap();
+        let state = AppState::new(config);
+        let queue = RetainedQueueStore::new(queue_path.clone());
+        let reminder = queue
+            .schedule_reminder("reminder-agent", 60, "Wait for compaction", None)
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let set_fire_at = |elapsed_seconds: i64| {
+            Connection::open(&queue_path)
+                .unwrap()
+                .execute(
+                    "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+                    rusqlite::params![
+                        &reminder.id,
+                        (now - TimeDuration::seconds(elapsed_seconds))
+                            .format(&Rfc3339)
+                            .unwrap()
+                    ],
+                )
+                .unwrap();
+        };
+
+        set_fire_at(1);
+        dispatch_due_scheduled_reminders(&state).unwrap();
+        assert!(queue
+            .pending_messages_for_target("reminder-agent", 10)
+            .unwrap()
+            .is_empty());
+
+        set_fire_at(SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS);
+        dispatch_due_scheduled_reminders(&state).unwrap();
+        assert_eq!(
+            queue
+                .pending_messages_for_target("reminder-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     fn public_request(method: Method, uri: &str, body: Body) -> axum::http::Request<Body> {

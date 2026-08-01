@@ -57,7 +57,7 @@ Service cutover commands live in
 - Owner-approved cutover decisions are incorporated:
   - keep useful stable core and native mobile app;
   - keep email/human fallback and inbound email;
-  - remove Telegram, `sm dispatch`, `sm what`, standalone reminders,
+  - remove Telegram and `sm dispatch`; later owner decisions restored `sm what` and durable standalone reminders,
     watch-job, policy/CI queue helpers, Termux attach, and public unauthenticated
     operational browser data;
   - require public-edge proof before public operational traffic reaches origin.

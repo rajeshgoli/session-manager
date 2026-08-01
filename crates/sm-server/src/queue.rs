@@ -40,6 +40,12 @@ pub struct ScheduledReminder {
     pub is_active: bool,
 }
 
+impl ScheduledReminder {
+    pub fn overdue_seconds(&self, now_utc: OffsetDateTime) -> Option<i64> {
+        scheduled_reminder_elapsed_seconds(&self.fire_at, now_utc)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledReminderDelivery {
     pub reminder: ScheduledReminder,
@@ -3725,11 +3731,15 @@ fn scheduled_reminder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sche
 }
 
 fn scheduled_reminder_is_due(fire_at: &str, now_utc: OffsetDateTime) -> bool {
+    scheduled_reminder_elapsed_seconds(fire_at, now_utc).is_some_and(|elapsed| elapsed >= 0)
+}
+
+fn scheduled_reminder_elapsed_seconds(fire_at: &str, now_utc: OffsetDateTime) -> Option<i64> {
     if let Ok(parsed) = OffsetDateTime::parse(fire_at.trim(), &Rfc3339) {
-        return parsed <= now_utc;
+        return Some((now_utc - parsed).whole_seconds());
     }
     parse_python_naive_datetime(fire_at.trim())
-        .is_some_and(|parsed| parsed <= local_now_naive(now_utc))
+        .map(|parsed| (local_now_naive(now_utc) - parsed).whole_seconds())
 }
 
 fn scheduled_reminder_message(reminder: &ScheduledReminder) -> String {
