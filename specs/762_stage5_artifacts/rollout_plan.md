@@ -4,7 +4,7 @@ Status: converged after three sequential independent reviewer convergence signal
 
 ## Default Release Position
 
-The first Rust release is the cutover port, not a clone of every Python surface. The owner-approved retained and removed surfaces are in [cutover_scope.md](cutover_scope.md). Native `sm` mobile app flows, on-the-go attach, mobile auth/bootstrap, proofed app artifacts, core CLI/session workflows, email/human fallback delivery, Codex review/runtime, narrow queue jobs, and registered nodes remain first-class. Generic public browser/watch data, Telegram control, `sm what`, the redundant `sm kill` CLI alias, dispatch, Termux attach, watch-job, scheduled reminders, queue policy/CI helpers, and public unauthenticated artifacts are not Rust targets.
+The first Rust release is the cutover port, not a clone of every Python surface. The owner-approved retained and removed surfaces are in [cutover_scope.md](cutover_scope.md). Native `sm` mobile app flows, on-the-go attach, mobile auth/bootstrap, proofed app artifacts, core CLI/session workflows, durable scheduled reminders, email/human fallback delivery, Codex review/runtime, narrow queue jobs, and registered nodes remain first-class. Generic public browser/watch data, Telegram control, the redundant `sm kill` CLI alias, dispatch, Termux attach, watch-job, queue policy/CI helpers, and public unauthenticated artifacts are not Rust targets.
 
 The initial shipping shape should be:
 
@@ -94,7 +94,7 @@ The first Rust release must expose documented operator switches for:
 - Codex review watchers.
 - Codex event ingestion and provider control.
 - email/human recipient delivery and inbound email webhook admission.
-- retired-surface denial behavior for Telegram, `sm what`, the `sm kill` CLI alias, dispatch, remind/watch-job/policy/Termux/summary-provider routes and commands.
+- retired-surface denial behavior for Telegram, the `sm kill` CLI alias, dispatch, watch-job/policy/Termux/summary-provider routes and commands.
 - service/infra sidecar repair.
 
 Kill switches must have observable status and must fail closed for public or command-execution surfaces where compatible.

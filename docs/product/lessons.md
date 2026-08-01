@@ -4,6 +4,7 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 
 ## Current Lessons
 
+- Cutover removal decisions must be revisited when live agent workflows prove a surface is still operationally required. Durable `sm remind --recurring` belongs in the Rust queue database and scheduler; launchd timers are not an acceptable substitute because they bypass session teardown, cancellation, restart recovery, and queue observability.
 - Claude Code UI forks can create a new Session Manager session ID while continuing in the same tmux runtime. When that happens, inherited recurring reminders need to be self-identifying so the active fork can cancel them directly.
 - The repo already supports generic file-driven service-role bootstrap via `service_roles.<role>.bootstrap_prompt_file` in `config.yaml`. Prefer that path over hard-coded prompt text when workflow instructions need to evolve.
 - The maintainer role should prefer `codex-fork`, then `codex`, then `claude` by default. Keep the file-backed `service_roles.maintainer.preferred_providers` entry and the legacy maintainer fallback defaults aligned.

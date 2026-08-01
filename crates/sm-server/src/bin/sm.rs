@@ -40,6 +40,7 @@ enum Command {
     Send(SendArgs),
     #[command(alias = "btw")]
     What(WhatArgs),
+    Remind(RemindArgs),
     Wait(WaitArgs),
     Spawn(SpawnArgs),
     Fork(ForkArgs),
@@ -117,6 +118,16 @@ struct SendArgs {
 struct WhatArgs {
     session_id: String,
     prompt: Vec<String>,
+}
+
+#[derive(Args)]
+struct RemindArgs {
+    #[arg(long)]
+    recurring: bool,
+    #[arg(value_name = "DELAY_OR_ACTION")]
+    delay_or_action: String,
+    #[arg(value_name = "MESSAGE_OR_ID")]
+    message_or_id: Vec<String>,
 }
 
 #[derive(Args)]
@@ -708,6 +719,7 @@ fn run() -> Result<()> {
             }
         }
         Command::What(args) => run_what(&client, args)?,
+        Command::Remind(args) => run_remind(&client, args)?,
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
         Command::Tail(args) => print_tail(&client, &args.session_id, args.lines, args.raw)?,
         Command::Children(args) => {
@@ -2521,6 +2533,73 @@ fn run_what(client: &ApiClient, args: WhatArgs) -> Result<()> {
     }
 }
 
+fn run_remind(client: &ApiClient, args: RemindArgs) -> Result<()> {
+    if args.delay_or_action == "cancel" {
+        if args.recurring || args.message_or_id.len() != 1 {
+            bail!("usage: sm remind cancel <reminder-id>");
+        }
+        let reminder_id = &args.message_or_id[0];
+        let payload = client.delete_json(
+            &format!("/scheduler/remind/{}", encode_path_segment(reminder_id)),
+            json!({}),
+        )?;
+        println!(
+            "Reminder cancelled ({}) for {}",
+            payload["reminder_id"].as_str().unwrap_or(reminder_id),
+            payload["session_id"].as_str().unwrap_or("unknown")
+        );
+        return Ok(());
+    }
+
+    let delay_seconds = args.delay_or_action.parse::<u64>().with_context(|| {
+        format!(
+            "Expected integer delay (seconds), got: {:?}",
+            args.delay_or_action
+        )
+    })?;
+    if delay_seconds == 0 {
+        bail!("Reminder delay must be greater than zero");
+    }
+    let session_id = current_session_id()?;
+    let message = if args.message_or_id.is_empty() {
+        "Reminder".to_owned()
+    } else {
+        args.message_or_id.join(" ")
+    };
+    let mut path = format!(
+        "/scheduler/remind?session_id={}&delay_seconds={delay_seconds}&message={}",
+        encode_query_component(&session_id),
+        encode_query_component(&message)
+    );
+    if args.recurring {
+        path.push_str(&format!("&recurring_interval_seconds={delay_seconds}"));
+    }
+    let payload = client.post_json(&path, json!({}))?;
+    let reminder_id = payload["reminder_id"].as_str().unwrap_or("unknown");
+    if args.recurring {
+        println!(
+            "Recurring reminder scheduled ({reminder_id}): every {}",
+            format_reminder_delay(delay_seconds)
+        );
+    } else {
+        println!(
+            "Reminder scheduled ({reminder_id}): fires in {}",
+            format_reminder_delay(delay_seconds)
+        );
+    }
+    Ok(())
+}
+
+fn format_reminder_delay(seconds: u64) -> String {
+    if seconds % 3600 == 0 {
+        format!("{}h", seconds / 3600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn send_input_payload(text: String, delivery_mode: &str, wait: Option<u64>) -> Value {
     let mut payload = json!({
         "text": text,
@@ -3915,7 +3994,6 @@ fn retired_command_message(command: &[&str]) -> Option<&'static str> {
     match command {
         ["kill", ..] => Some("removed: use sm retire instead of sm kill"),
         ["dispatch", ..] => Some("removed: dispatch is not part of the Rust cutover scope"),
-        ["remind", ..] => Some("removed: reminders are not part of the Rust cutover scope"),
         ["watch-job", ..] => Some("removed: watch-job is not part of the Rust cutover scope"),
         ["telegram", ..] | ["tg", ..] => {
             Some("removed: Telegram control is not part of the Rust cutover scope")
@@ -4042,6 +4120,28 @@ mod tests {
         };
         assert_eq!(raw_args.lines, 7);
         assert!(raw_args.raw);
+    }
+
+    #[test]
+    fn remind_parser_restores_recurring_and_cancel_forms() {
+        let recurring =
+            Cli::try_parse_from(["sm", "remind", "--recurring", "1020", "Inspect", "queues"])
+                .unwrap();
+        let Command::Remind(recurring) = recurring.command else {
+            panic!("expected remind command");
+        };
+        assert!(recurring.recurring);
+        assert_eq!(recurring.delay_or_action, "1020");
+        assert_eq!(recurring.message_or_id, ["Inspect", "queues"]);
+
+        let cancel = Cli::try_parse_from(["sm", "remind", "cancel", "abc123"]).unwrap();
+        let Command::Remind(cancel) = cancel.command else {
+            panic!("expected remind command");
+        };
+        assert!(!cancel.recurring);
+        assert_eq!(cancel.delay_or_action, "cancel");
+        assert_eq!(cancel.message_or_id, ["abc123"]);
+        assert_eq!(retired_command_message(&["remind"]), None);
     }
 
     #[test]

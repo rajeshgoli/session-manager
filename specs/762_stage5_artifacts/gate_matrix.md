@@ -41,7 +41,7 @@ Python hardening/config variant comparisons are owner-waived for the Rust cutove
 - disabling integrations that are already disabled or unused in the current config.
 - reducing retained event/log scan windows where compatible.
 - deferring startup background work that is not needed for first response where compatible.
-- removing retired Telegram, `sm what`, the `sm kill` CLI alias, dispatch, remind/watch-job/policy/Termux surfaces per cutover scope, and isolating retained email/node/queue-runner/mobile-terminal work when disabled by config.
+- removing retired Telegram, the `sm kill` CLI alias, dispatch, watch-job/policy/Termux surfaces per cutover scope, and isolating retained reminder/email/node/queue-runner/mobile-terminal work when disabled by config.
 - reducing logging verbosity or request timing thresholds where compatible.
 
 ## Target Thresholds
