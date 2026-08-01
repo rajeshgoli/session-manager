@@ -21,7 +21,7 @@ use rusqlite::{
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 use time::{
     format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
-    PrimitiveDateTime, UtcOffset,
+    PrimitiveDateTime,
 };
 
 #[derive(Debug, Clone)]
@@ -3673,9 +3673,31 @@ fn parse_python_naive_datetime(value: &str) -> Option<PrimitiveDateTime> {
 }
 
 fn local_now_naive(now_utc: OffsetDateTime) -> Option<PrimitiveDateTime> {
-    let offset = UtcOffset::local_offset_at(now_utc).ok()?;
-    let local = now_utc.to_offset(offset);
-    Some(PrimitiveDateTime::new(local.date(), local.time()))
+    #[cfg(unix)]
+    {
+        let timestamp = nix::libc::time_t::try_from(now_utc.unix_timestamp()).ok()?;
+        let mut local = std::mem::MaybeUninit::<nix::libc::tm>::uninit();
+        // localtime_r writes only to caller-owned storage and is safe across server threads.
+        let result = unsafe { nix::libc::localtime_r(&timestamp, local.as_mut_ptr()) };
+        if result.is_null() {
+            return None;
+        }
+        let local = unsafe { local.assume_init() };
+        let year = local.tm_year.checked_add(1900)?;
+        let ordinal = u16::try_from(local.tm_yday.checked_add(1)?).ok()?;
+        let date = time::Date::from_ordinal_date(year, ordinal).ok()?;
+        let hour = u8::try_from(local.tm_hour).ok()?;
+        let minute = u8::try_from(local.tm_min).ok()?;
+        let second = u8::try_from(local.tm_sec.min(59)).ok()?;
+        let time = time::Time::from_hms_nano(hour, minute, second, now_utc.nanosecond()).ok()?;
+        Some(PrimitiveDateTime::new(date, time))
+    }
+    #[cfg(not(unix))]
+    {
+        let offset = time::UtcOffset::local_offset_at(now_utc).ok()?;
+        let local = now_utc.to_offset(offset);
+        Some(PrimitiveDateTime::new(local.date(), local.time()))
+    }
 }
 
 fn python_compatible_reminder_timestamp(value: PrimitiveDateTime) -> Result<String> {
@@ -4010,6 +4032,19 @@ mod tests {
         assert!(parse_python_naive_datetime(&reminder.fire_at).is_some());
         assert!(OffsetDateTime::parse(&reminder.fire_at, &Rfc3339).is_err());
         assert!(!reminder.fire_at.ends_with('Z'));
+    }
+
+    #[test]
+    fn local_naive_conversion_works_in_multiple_threads() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let expected = local_now_naive(now).unwrap();
+        let conversions = (0..8)
+            .map(|_| std::thread::spawn(move || local_now_naive(now)))
+            .collect::<Vec<_>>();
+
+        for conversion in conversions {
+            assert_eq!(conversion.join().unwrap(), Some(expected));
+        }
     }
 
     #[test]
