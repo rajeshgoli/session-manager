@@ -4102,6 +4102,14 @@ fn dispatch_due_scheduled_reminders(state: &AppState) -> anyhow::Result<()> {
     let queue = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path));
     let now = OffsetDateTime::now_utc();
     for reminder in queue.due_scheduled_reminders(now)? {
+        if !reminder.recurring_interval_is_valid_at(now) {
+            eprintln!(
+                "deactivating scheduled reminder {} with an invalid recurring interval",
+                reminder.id
+            );
+            queue.deactivate_scheduled_reminder(&reminder.id)?;
+            continue;
+        }
         let target = state
             .session_store
             .get_session(&reminder.target_session_id)?;
@@ -4120,8 +4128,16 @@ fn dispatch_due_scheduled_reminders(state: &AppState) -> anyhow::Result<()> {
         }) {
             continue;
         }
-        let Some(delivery) = queue.claim_due_scheduled_reminder(&reminder.id, now)? else {
-            continue;
+        let delivery = match queue.claim_due_scheduled_reminder(&reminder.id, now) {
+            Ok(Some(delivery)) => delivery,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!(
+                    "failed to claim scheduled reminder {}: {error:#}",
+                    reminder.id
+                );
+                continue;
+            }
         };
         if state.config.rust_core.runtime_enabled {
             let runtime = TmuxRuntime::from_app_config(&state.config);
@@ -13572,6 +13588,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(is_active, 0);
+    }
+
+    #[test]
+    fn invalid_recurring_interval_does_not_block_later_reminders() {
+        let (config, queue_path) = reminder_test_config("running");
+        let state = AppState::new(config);
+        let queue = RetainedQueueStore::new(queue_path.clone());
+        let invalid = queue
+            .schedule_reminder("reminder-agent", 60, "Invalid interval", Some(60))
+            .unwrap();
+        let valid = queue
+            .schedule_reminder("reminder-agent", 60, "Still deliver", None)
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let conn = Connection::open(&queue_path).unwrap();
+        conn.execute(
+            r#"
+            UPDATE scheduled_reminders
+            SET fire_at = ?2, recurring_interval_seconds = ?3
+            WHERE id = ?1
+            "#,
+            rusqlite::params![
+                invalid.id,
+                (now - TimeDuration::seconds(2)).format(&Rfc3339).unwrap(),
+                i64::MAX
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                valid.id,
+                (now - TimeDuration::seconds(1)).format(&Rfc3339).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        dispatch_due_scheduled_reminders(&state).unwrap();
+
+        let pending = queue
+            .pending_messages_for_target("reminder-agent", 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].text.contains("Still deliver"));
+        let invalid_is_active: i64 = Connection::open(queue_path)
+            .unwrap()
+            .query_row(
+                "SELECT is_active FROM scheduled_reminders WHERE id = ?1",
+                rusqlite::params![invalid.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_is_active, 0);
     }
 
     #[test]

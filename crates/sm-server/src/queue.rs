@@ -21,7 +21,7 @@ use rusqlite::{
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 use time::{
     format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
-    PrimitiveDateTime,
+    PrimitiveDateTime, UtcOffset,
 };
 
 #[derive(Debug, Clone)]
@@ -43,6 +43,15 @@ pub struct ScheduledReminder {
 impl ScheduledReminder {
     pub fn overdue_seconds(&self, now_utc: OffsetDateTime) -> Option<i64> {
         scheduled_reminder_elapsed_seconds(&self.fire_at, now_utc)
+    }
+
+    pub fn recurring_interval_is_valid_at(&self, now_utc: OffsetDateTime) -> bool {
+        self.recurring_interval_seconds.is_none_or(|interval| {
+            interval > 0
+                && local_now_naive(now_utc)
+                    .checked_add(Duration::seconds(interval))
+                    .is_some()
+        })
     }
 }
 
@@ -908,8 +917,16 @@ impl RetainedQueueStore {
         };
         let delay_seconds = u64_to_i64(delay_seconds)?;
         let recurring_interval_seconds = recurring_interval_seconds.map(u64_to_i64).transpose()?;
-        let fire_at =
-            (OffsetDateTime::now_utc() + Duration::seconds(delay_seconds)).format(&Rfc3339)?;
+        let now_utc = OffsetDateTime::now_utc();
+        let fire_at_local = local_now_naive(now_utc)
+            .checked_add(Duration::seconds(delay_seconds))
+            .context("reminder delay is outside the supported timestamp range")?;
+        if let Some(interval) = recurring_interval_seconds {
+            fire_at_local
+                .checked_add(Duration::seconds(interval))
+                .context("recurring reminder interval is outside the supported timestamp range")?;
+        }
+        let fire_at = python_compatible_reminder_timestamp(fire_at_local)?;
         let id = generate_scheduled_reminder_id();
         self.with_connection(|conn| {
             conn.execute(
@@ -1015,7 +1032,10 @@ impl RetainedQueueStore {
                     },
                 )?;
                 let changed = if let Some(interval) = reminder.recurring_interval_seconds {
-                    let next_fire_at = (now_utc + Duration::seconds(interval)).format(&Rfc3339)?;
+                    let next_fire_at_local = local_now_naive(now_utc)
+                        .checked_add(Duration::seconds(interval))
+                        .context("recurring reminder interval exceeds the timestamp range")?;
+                    let next_fire_at = python_compatible_reminder_timestamp(next_fire_at_local)?;
                     conn.execute(
                         r#"
                         UPDATE scheduled_reminders
@@ -3649,8 +3669,16 @@ fn parse_python_naive_datetime(value: &str) -> Option<PrimitiveDateTime> {
 }
 
 fn local_now_naive(now_utc: OffsetDateTime) -> PrimitiveDateTime {
-    let local = OffsetDateTime::now_local().unwrap_or(now_utc);
+    let local = UtcOffset::local_offset_at(now_utc)
+        .map(|offset| now_utc.to_offset(offset))
+        .unwrap_or(now_utc);
     PrimitiveDateTime::new(local.date(), local.time())
+}
+
+fn python_compatible_reminder_timestamp(value: PrimitiveDateTime) -> Result<String> {
+    Ok(value.format(format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
+    ))?)
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> Result<()> {
@@ -3969,6 +3997,19 @@ mod tests {
     }
 
     #[test]
+    fn new_reminder_timestamps_remain_python_rollback_compatible() {
+        let db_path = unique_temp_path("scheduled-reminder-python-time");
+        let store = RetainedQueueStore::new(db_path);
+        let reminder = store
+            .schedule_reminder("agent-python", 60, "Rollback safely", None)
+            .unwrap();
+
+        assert!(parse_python_naive_datetime(&reminder.fire_at).is_some());
+        assert!(OffsetDateTime::parse(&reminder.fire_at, &Rfc3339).is_err());
+        assert!(!reminder.fire_at.ends_with('Z'));
+    }
+
+    #[test]
     fn recurring_reminder_advances_from_fire_time_and_can_be_cancelled() {
         let db_path = unique_temp_path("scheduled-reminder-recurring");
         let store = RetainedQueueStore::new(db_path.clone());
@@ -3998,8 +4039,8 @@ mod tests {
         assert!(!persisted.fired);
         assert_eq!(persisted.recurring_interval_seconds, Some(17));
         assert_eq!(
-            OffsetDateTime::parse(&persisted.fire_at, &Rfc3339).unwrap(),
-            now + Duration::seconds(17)
+            parse_python_naive_datetime(&persisted.fire_at).unwrap(),
+            local_now_naive(now + Duration::seconds(17))
         );
         let pending = store.pending_messages_for_target("agent-2", 10).unwrap();
         assert_eq!(pending.len(), 1);
@@ -4014,6 +4055,61 @@ mod tests {
         assert!(cancelled.is_active);
         assert!(store
             .due_scheduled_reminders(now + Duration::minutes(1))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reminder_intervals_outside_timestamp_range_are_rejected_without_writes() {
+        let db_path = unique_temp_path("scheduled-reminder-range");
+        let store = RetainedQueueStore::new(db_path.clone());
+        store.ensure_schema().unwrap();
+
+        let error = store
+            .schedule_reminder("agent-range", 1, "Never persist", Some(i64::MAX as u64))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside the supported timestamp range"));
+
+        let conn = Connection::open(db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scheduled_reminders", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn invalid_persisted_recurring_interval_rolls_back_delivery() {
+        let db_path = unique_temp_path("scheduled-reminder-invalid-recurring");
+        let store = RetainedQueueStore::new(db_path.clone());
+        let reminder = store
+            .schedule_reminder("agent-invalid", 60, "Do not deliver", Some(60))
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                r#"
+                UPDATE scheduled_reminders
+                SET fire_at = ?2, recurring_interval_seconds = ?3
+                WHERE id = ?1
+                "#,
+                params![
+                    reminder.id,
+                    (now - Duration::seconds(1)).format(&Rfc3339).unwrap(),
+                    i64::MAX
+                ],
+            )
+            .unwrap();
+
+        assert!(store
+            .claim_due_scheduled_reminder(&reminder.id, now)
+            .is_err());
+        assert!(store
+            .pending_messages_for_target("agent-invalid", 10)
             .unwrap()
             .is_empty());
     }
