@@ -2796,6 +2796,7 @@ async fn spawn_session(
         node: Some(node),
         initial_message: Some(payload.prompt),
         model: payload.model,
+        reasoning_effort: payload.reasoning_effort,
         wait: wait_seconds,
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
@@ -2934,6 +2935,7 @@ async fn spawn_review_session(
         node: Some("primary".to_owned()),
         initial_message: None,
         model: payload.model.clone(),
+        reasoning_effort: None,
         wait: None,
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
@@ -9078,6 +9080,7 @@ fn codex_fork_event_stream_path_for_session(
         provider: session.provider.clone(),
         initial_message: None,
         model: session.model.clone(),
+        reasoning_effort: session.reasoning_effort.clone(),
     };
     TmuxRuntime::from_app_config(&state.config)
         .for_socket_name(session.tmux_socket_name.as_deref())
@@ -12223,6 +12226,8 @@ struct SpawnCoreSessionRequest {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
     working_dir: Option<String>,
     #[serde(default)]
     provider: Option<String>,
@@ -12243,6 +12248,7 @@ struct SpawnSessionResponse {
     node: String,
     provider: String,
     model: Option<String>,
+    reasoning_effort: Option<String>,
     created_at: String,
 }
 
@@ -12272,6 +12278,7 @@ impl From<SessionRecord> for SpawnSessionResponse {
                 session.provider
             },
             model: session.model,
+            reasoning_effort: session.reasoning_effort,
             created_at: session.created_at,
         }
     }
@@ -13092,6 +13099,7 @@ mod tests {
             provider: session.provider.clone(),
             initial_message: None,
             model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
         };
         let event_stream = TmuxRuntime::from_app_config(&AppConfig::default())
             .codex_fork_runtime_artifacts(&spec)
@@ -13140,6 +13148,7 @@ mod tests {
             provider: session.provider.clone(),
             initial_message: None,
             model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
         };
         let event_stream = TmuxRuntime::from_app_config(&AppConfig::default())
             .codex_fork_runtime_artifacts(&spec)
@@ -13191,6 +13200,7 @@ mod tests {
             provider: session.provider.clone(),
             initial_message: None,
             model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
         };
         let event_stream = TmuxRuntime::from_app_config(&AppConfig::default())
             .codex_fork_runtime_artifacts(&spec)

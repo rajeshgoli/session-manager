@@ -564,6 +564,7 @@ impl SessionStore {
             provider: record.provider.clone(),
             initial_message: request.initial_message.clone(),
             model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
         };
         let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
         let codex_cli_creation_binding = (record.provider == "codex").then(|| {
@@ -1205,6 +1206,7 @@ impl SessionStore {
             provider: record.provider.clone(),
             initial_message: None,
             model: record.model.clone(),
+            reasoning_effort: record.reasoning_effort.clone(),
         };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
         session_runtime.restore_session(&spec, &record.provider, provider_resume_id.as_deref())?;
@@ -2956,6 +2958,7 @@ impl SessionStore {
             node,
             provider,
             model: optional_trimmed(request.model.as_deref()),
+            reasoning_effort: optional_trimmed(request.reasoning_effort.as_deref()),
             log_file: Some(log_file.display().to_string()),
             provider_resume_id: None,
             transcript_path: None,
@@ -3339,6 +3342,8 @@ pub struct CreateCoreSessionRequest {
     pub initial_message: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub wait: Option<u64>,
 }
@@ -4654,6 +4659,7 @@ fn codex_fork_spec_for_session_raw(
         provider: "codex-fork".to_owned(),
         initial_message: None,
         model: json_text(session.get("model")),
+        reasoning_effort: json_text(session.get("reasoning_effort")),
     })
 }
 
@@ -4699,6 +4705,7 @@ pub fn submit_codex_fork_btw(
         provider: "codex-fork".to_owned(),
         initial_message: None,
         model: session.model.clone(),
+        reasoning_effort: session.reasoning_effort.clone(),
     };
     let artifacts = runtime
         .codex_fork_runtime_artifacts(&spec)?
@@ -6386,6 +6393,8 @@ pub struct SessionRecord {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
     pub log_file: Option<String>,
     #[serde(default)]
     pub provider_resume_id: Option<String>,
@@ -7224,6 +7233,7 @@ mod tests {
             node: "primary".to_owned(),
             provider: "claude".to_owned(),
             model: None,
+            reasoning_effort: None,
             log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
             transcript_path: None,

@@ -146,6 +146,8 @@ struct SpawnArgs {
     wait: Option<u64>,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long, value_name = "LEVEL")]
+    effort: Option<String>,
     #[arg(long)]
     working_dir: Option<String>,
     #[arg(long)]
@@ -592,6 +594,7 @@ fn run() -> Result<()> {
                         "name": args.name,
                         "wait": args.wait,
                         "model": args.model,
+                        "reasoning_effort": args.effort,
                         "working_dir": args.working_dir,
                         "provider": provider,
                         "node": args.node
@@ -608,6 +611,7 @@ fn run() -> Result<()> {
                         "node": args.node,
                         "initial_message": prompt,
                         "model": args.model,
+                        "reasoning_effort": args.effort,
                         "wait": args.wait
                     }),
                 )?
@@ -5348,7 +5352,17 @@ mod tests {
 
     #[test]
     fn spawn_cli_provider_aliases_match_launch_aliases() {
-        let cli = Cli::try_parse_from(["sm", "spawn", "codex", "review this"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "sm",
+            "spawn",
+            "codex",
+            "--model",
+            "gpt-5.6-terra",
+            "--effort",
+            "xhigh",
+            "review this",
+        ])
+        .unwrap();
         let Command::Spawn(args) = cli.command else {
             panic!("expected spawn command");
         };
@@ -5356,6 +5370,8 @@ mod tests {
             launch_provider_for_alias(&args.provider).unwrap(),
             "codex-fork"
         );
+        assert_eq!(args.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(args.effort.as_deref(), Some("xhigh"));
 
         let cli = Cli::try_parse_from(["sm", "spawn", "codex-original", "review this"]).unwrap();
         let Command::Spawn(args) = cli.command else {

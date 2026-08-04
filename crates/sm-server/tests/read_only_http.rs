@@ -12938,6 +12938,7 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
             "prompt": "spawn endpoint runtime prompt",
             "name": "runtime-child",
             "model": "opus",
+            "reasoning_effort": "xhigh",
             "wait": 5
         }),
     )
@@ -12951,6 +12952,7 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
     assert_eq!(payload["node"], "primary");
     assert_eq!(payload["provider"], "claude");
     assert_eq!(payload["model"], "opus");
+    assert_eq!(payload["reasoning_effort"], "xhigh");
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
     assert!(tmux_session.starts_with("sm-rust-claude-runtimechild-"));
 
@@ -12960,7 +12962,12 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
         "runtime:spawn endpoint runtime prompt",
     )
     .await;
-    wait_for_output_contains(app.clone(), "runtimechild", "argv:--model opus").await;
+    wait_for_output_contains(
+        app.clone(),
+        "runtimechild",
+        "argv:--model opus --effort xhigh",
+    )
+    .await;
 
     let (status, payload) = get_json(app.clone(), "/sessions/runtimechild").await;
     assert_eq!(status, StatusCode::OK);
@@ -12973,6 +12980,7 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
         .find(|session| session["id"] == "runtimechild")
         .unwrap();
     assert_eq!(runtime_child["model"], "opus");
+    assert_eq!(runtime_child["reasoning_effort"], "xhigh");
 
     let (status, payload) = post_json(app.clone(), "/sessions/runtimechild/kill", json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -14176,7 +14184,8 @@ while true; do sleep 1; done
             "id": "runtimefork",
             "working_dir": working_dir.display().to_string(),
             "provider": "codex-fork",
-            "initial_message": "hello from codex fork"
+            "initial_message": "hello from codex fork",
+            "reasoning_effort": "ultra"
         }),
     )
     .await;
@@ -14206,8 +14215,11 @@ while true; do sleep 1; done
     assert!(output_text.contains("--event-schema-version 7"));
     assert!(output_text.contains(&control_path.display().to_string()));
     assert!(output_text.contains("--model gpt-default"));
+    assert!(output_text.contains("-c model_reasoning_effort=ultra"));
     assert!(output_text.contains("-- hello from codex fork"));
     assert!(output_text.contains("ids:runtimefork:runtimefork:false"));
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(state["sessions"][0]["reasoning_effort"], "ultra");
     let mut lifecycle_status = String::new();
     for _ in 0..30 {
         let (_, session) = get_json(app.clone(), "/sessions/runtimefork").await;
@@ -14459,6 +14471,7 @@ while true; do sleep 1; done
     assert!(restored_text.contains("resume provider-thread-123"));
     assert!(restored_text.contains("--event-schema-version 7"));
     assert!(restored_text.contains("--model gpt-default"));
+    assert!(restored_text.contains("-c model_reasoning_effort=ultra"));
 }
 
 #[tokio::test]
