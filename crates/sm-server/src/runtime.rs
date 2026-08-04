@@ -78,6 +78,7 @@ pub struct TmuxSessionSpec {
     pub provider: String,
     pub initial_message: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -832,6 +833,20 @@ impl TmuxRuntime {
             parts.push("--model".to_owned());
             parts.push(shell_quote(model));
         }
+        if let Some(effort) = spec
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if spec.provider == "claude" {
+                parts.push("--effort".to_owned());
+                parts.push(shell_quote(effort));
+            } else {
+                parts.push("-c".to_owned());
+                parts.push(shell_quote(&format!("model_reasoning_effort={effort}")));
+            }
+        }
         if prompt_mode == "argv" {
             if let Some(initial_message) = spec
                 .initial_message
@@ -1281,6 +1296,7 @@ mod tests {
             provider: "claude".to_owned(),
             initial_message: None,
             model: None,
+            reasoning_effort: None,
         };
 
         runtime.create_session(&spec).unwrap();
@@ -1349,6 +1365,7 @@ mod tests {
             provider: "claude".to_owned(),
             initial_message: None,
             model: None,
+            reasoning_effort: None,
         };
 
         runtime.create_session(&spec).unwrap();
@@ -1386,6 +1403,7 @@ mod tests {
             provider: "claude".to_owned(),
             initial_message: None,
             model: None,
+            reasoning_effort: None,
         };
 
         runtime.create_session(&spec).unwrap();
@@ -1418,6 +1436,7 @@ mod tests {
             provider: "claude".to_owned(),
             initial_message: None,
             model: None,
+            reasoning_effort: Some("high".to_owned()),
         };
 
         runtime
@@ -1433,12 +1452,14 @@ mod tests {
             .find("'--dangerously-skip-permissions'")
             .expect(command_line);
         let custom_arg = command_line.find("'--some flag'").expect(command_line);
+        let effort_flag = command_line.find("--effort 'high'").expect(command_line);
         let resume_flag = command_line.find("'--resume'").expect(command_line);
         let resume_id = command_line.find("'resume'\\''id'").expect(command_line);
 
         assert!(dangerous < custom_arg);
         assert!(custom_arg < resume_flag);
         assert!(resume_flag < resume_id);
+        assert!(resume_id < effort_flag);
     }
 
     #[test]

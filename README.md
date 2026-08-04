@@ -221,6 +221,7 @@ Use the Rust CLI:
 ```bash
 target/release/sm status
 target/release/sm spawn claude "say hello and exit" --name hello-agent
+target/release/sm spawn codex --model gpt-5.6-terra --effort high "review this change"
 target/release/sm all
 ```
 
@@ -235,7 +236,7 @@ If `target/release` is on your `PATH`, `sm` resolves to the Rust CLI.
 | `sm status` | Show your status and active sessions |
 | `sm me` | Show the current session identity |
 | `sm all` | List active sessions |
-| `sm spawn <provider> "<prompt>" --name <name>` | Start a new managed agent |
+| `sm spawn <provider> "<prompt>" [--model <model>] [--effort <level>]` | Start a managed agent with optional provider model and reasoning effort |
 | `sm send <id> "<text>"` | Send input to an agent |
 | `sm what <id> [prompt]` / `sm btw ...` | Ask an agent for a provider-native context summary |
 | `sm wait <id> <seconds>` | Wait for a session state transition |
