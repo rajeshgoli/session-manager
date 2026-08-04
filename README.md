@@ -265,6 +265,8 @@ sm send agent "message" --urgent     # Interrupt immediately
 
 The old transcript summarizer and its `--lines`/`--deep` options remain retired.
 `sm what` now delegates to the target provider's native `/btw` command. Use
+`sm what <agent>` to summarize the agent's main conversation thread; an optional
+prompt replaces that default. Use
 `sm retire`, not legacy kill aliases.
 
 ---

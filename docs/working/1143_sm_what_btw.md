@@ -88,7 +88,7 @@ responses say `via sm what`.
 When `prompt` is omitted, use:
 
 ```text
-Summarize what you've done so far
+Summarize what you have done so far in the main conversation thread. Do not summarize this /btw side conversation.
 ```
 
 The provider receives a literal native command equivalent to:
@@ -343,7 +343,7 @@ Request:
 ```json
 {
   "requester_session_id": "<managed-session-id-or-null>",
-  "prompt": "Summarize what you've done so far"
+  "prompt": "Summarize what you have done so far in the main conversation thread. Do not summarize this /btw side conversation."
 }
 ```
 
