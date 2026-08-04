@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-pub const DEFAULT_BTW_PROMPT: &str = "Summarize what you've done so far";
+pub const DEFAULT_BTW_PROMPT: &str = "Summarize what you have done so far in the main conversation thread. Do not summarize this /btw side conversation.";
 pub const MAX_BTW_PROMPT_BYTES: usize = 4 * 1024;
 pub const MAX_BTW_RESULT_BYTES: usize = 32 * 1024;
 
@@ -571,6 +571,12 @@ mod tests {
     #[test]
     fn prompt_validation_applies_default_and_rejects_multiline() {
         assert_eq!(validate_prompt(None).unwrap(), DEFAULT_BTW_PROMPT);
+        assert!(DEFAULT_BTW_PROMPT.contains("main conversation thread"));
+        assert!(DEFAULT_BTW_PROMPT.contains("Do not summarize this /btw side conversation"));
+        assert_eq!(
+            validate_prompt(Some("Summarize the current blocker")).unwrap(),
+            "Summarize the current blocker"
+        );
         assert!(validate_prompt(Some("one\ntwo")).is_err());
         assert!(validate_prompt(Some(&"x".repeat(MAX_BTW_PROMPT_BYTES + 1))).is_err());
     }
