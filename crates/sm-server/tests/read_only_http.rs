@@ -9416,6 +9416,20 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
 
     let (status, payload) = post_json(
         app.clone(),
+        "/sessions",
+        json!({
+            "id": "rustgrandchild",
+            "name": "rust-grandchild",
+            "parent_session_id": "rustchild",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["parent_session_id"], "rustchild");
+
+    let (status, payload) = post_json(
+        app.clone(),
         "/sessions/rustcore/input",
         json!({
             "text": "hello from rust fixture",
@@ -9479,6 +9493,34 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     );
 
     let (status, payload) = get_json(app.clone(), "/sessions/rustchild").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "running");
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/rustcore/kill",
+        json!({ "requester_session_id": "rustcore" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["error"],
+        "Cannot kill session rustcore - not your child session"
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/rustgrandchild/kill",
+        json!({ "requester_session_id": "rustcore" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["error"],
+        "Cannot kill session rustgrandchild - not your child session"
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/rustgrandchild").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "running");
 

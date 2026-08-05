@@ -765,9 +765,12 @@ fn run() -> Result<()> {
             }
         }
         Command::Retire(args) => {
-            let payload =
-                client.post_json(&format!("/sessions/{}/kill", args.session_id), json!({}))?;
-            println!("{}", payload["status"].as_str().unwrap_or("stopped"));
+            let requester_session_id = optional_current_session_id();
+            let payload = client.post_json(
+                &format!("/sessions/{}/kill", args.session_id),
+                retire_request_payload(requester_session_id),
+            )?;
+            println!("{}", retire_response_status(&payload, &args.session_id)?);
         }
         Command::Restore(args) => {
             restore_session(&client, args)?;
@@ -1050,6 +1053,19 @@ fn required_positional(value: Option<String>, label: &str) -> Result<String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("{label} is required"))
+}
+
+fn retire_request_payload(requester_session_id: Option<String>) -> Value {
+    json!({ "requester_session_id": requester_session_id })
+}
+
+fn retire_response_status<'a>(payload: &'a Value, target_session_id: &str) -> Result<&'a str> {
+    if let Some(error) = payload["error"].as_str() {
+        bail!("{error}");
+    }
+    payload["status"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Invalid retire response for session {target_session_id}"))
 }
 
 fn run_email(client: &ApiClient, args: EmailArgs) -> Result<()> {
@@ -4146,6 +4162,37 @@ mod tests {
         assert_eq!(cancel.delay_or_action, "cancel");
         assert_eq!(cancel.message_or_id, ["abc123"]);
         assert_eq!(retired_command_message(&["remind"]), None);
+    }
+
+    #[test]
+    fn retire_payload_carries_managed_identity_and_surfaces_errors() {
+        assert_eq!(
+            retire_request_payload(Some("parent001".to_owned())),
+            json!({ "requester_session_id": "parent001" })
+        );
+        assert_eq!(
+            retire_request_payload(None),
+            json!({ "requester_session_id": null })
+        );
+        assert_eq!(
+            retire_response_status(&json!({ "status": "killed" }), "child001").unwrap(),
+            "killed"
+        );
+        assert_eq!(
+            retire_response_status(
+                &json!({ "error": "Cannot kill session child001 - not your child session" }),
+                "child001"
+            )
+            .unwrap_err()
+            .to_string(),
+            "Cannot kill session child001 - not your child session"
+        );
+        assert_eq!(
+            retire_response_status(&json!({}), "child001")
+                .unwrap_err()
+                .to_string(),
+            "Invalid retire response for session child001"
+        );
     }
 
     #[test]
