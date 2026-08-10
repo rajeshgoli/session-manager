@@ -7970,6 +7970,17 @@ async fn claude_stop_hooks_append_distinct_provider_sessions_without_losing_the_
     fs::create_dir_all(&transcript_dir).unwrap();
     let first_transcript = transcript_dir.join("provider-session-first.jsonl");
     let second_transcript = transcript_dir.join("provider-session-second.jsonl");
+    let legacy_transcript = transcript_dir.join("provider-session-before-deployment.jsonl");
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    session["provider_resume_id"] = json!("provider-session-before-deployment");
+    session["transcript_path"] = json!(legacy_transcript.display().to_string());
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
     for transcript_path in [&first_transcript, &second_transcript] {
@@ -8006,6 +8017,10 @@ async fn claude_stop_hooks_append_distinct_provider_sessions_without_losing_the_
     assert_eq!(
         rows,
         vec![
+            (
+                "provider-session-before-deployment".to_owned(),
+                legacy_transcript.display().to_string(),
+            ),
             (
                 "provider-session-first".to_owned(),
                 first_transcript.display().to_string(),

@@ -313,6 +313,21 @@ impl SessionStore {
             return Ok(false);
         };
         let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+        if provider == "claude" {
+            let previous_transcript_path = json_text(session.get("transcript_path"));
+            let previous_provider_resume_id = previous_transcript_path
+                .as_deref()
+                .and_then(provider_resume_id_from_transcript_path)
+                .or_else(|| json_text(session.get("provider_resume_id")));
+            if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
+                self.append_seat_session(
+                    session_id,
+                    &provider,
+                    previous_provider_resume_id,
+                    previous_transcript_path.as_deref(),
+                );
+            }
+        }
         let provider_resume_id = if provider == "claude" {
             transcript_path.and_then(provider_resume_id_from_transcript_path)
         } else {
@@ -1144,6 +1159,28 @@ impl SessionStore {
             Ok((record, excluded_ids, launched_at.unix_timestamp_nanos()))
         });
         let codex_cli_clear_binding = codex_cli_clear_binding.transpose()?;
+        let codex_fork_clear_binding = (provider == "codex-fork")
+            .then(|| -> Result<_> {
+                let spec = codex_fork_spec_for_session_raw(session_id, session)?;
+                let artifacts = session_runtime
+                    .codex_fork_runtime_artifacts(&spec)?
+                    .ok_or_else(|| anyhow::anyhow!("session {session_id} has no fork artifacts"))?;
+                if let Some(previous_provider_resume_id) =
+                    json_text(session.get("provider_resume_id"))
+                {
+                    self.append_seat_session(
+                        session_id,
+                        &provider,
+                        &previous_provider_resume_id,
+                        artifacts.event_stream_path.to_str(),
+                    );
+                }
+                let initial_offset = fs::metadata(&artifacts.event_stream_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                Ok((artifacts.event_stream_path, initial_offset))
+            })
+            .transpose()?;
         let prompt = request
             .prompt
             .as_deref()
@@ -1176,6 +1213,29 @@ impl SessionStore {
                 self.append_seat_session(session_id, &provider, &provider_resume_id, None);
             } else {
                 eprintln!("failed to discover replacement Codex thread for seat {session_id}");
+            }
+        }
+        if let Some((event_stream_path, initial_offset)) = codex_fork_clear_binding {
+            match wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                initial_offset,
+                CODEX_FORK_THREAD_STARTED_TIMEOUT,
+            ) {
+                Ok(provider_resume_id) => {
+                    session.insert(
+                        "provider_resume_id".to_owned(),
+                        Value::String(provider_resume_id.clone()),
+                    );
+                    self.append_seat_session(
+                        session_id,
+                        &provider,
+                        &provider_resume_id,
+                        event_stream_path.to_str(),
+                    );
+                }
+                Err(error) => eprintln!(
+                    "failed to discover replacement codex-fork thread for seat {session_id}: {error:#}"
+                ),
             }
         }
         let now = now_rfc3339();
@@ -3395,9 +3455,18 @@ fn wait_for_codex_fork_provider_resume_id(
     event_stream_path: &Path,
     timeout: Duration,
 ) -> Result<String> {
+    wait_for_codex_fork_provider_resume_id_after_offset(event_stream_path, 0, timeout)
+}
+
+fn wait_for_codex_fork_provider_resume_id_after_offset(
+    event_stream_path: &Path,
+    initial_offset: u64,
+    timeout: Duration,
+) -> Result<String> {
     let started = Instant::now();
+    let mut offset = initial_offset;
     loop {
-        if let Ok(content) = fs::read_to_string(event_stream_path) {
+        if let Ok(content) = read_file_from_offset(event_stream_path, &mut offset) {
             for line in content.lines() {
                 let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
                     continue;
@@ -3412,7 +3481,7 @@ fn wait_for_codex_fork_provider_resume_id(
         }
         if started.elapsed() >= timeout {
             anyhow::bail!(
-                "timed out waiting for codex-fork thread_started event in {}",
+                "timed out waiting for a new codex-fork thread_started event in {}",
                 event_stream_path.display()
             );
         }
@@ -8418,6 +8487,38 @@ mod tests {
                 .as_deref(),
             Some("thread-after-handoff")
         );
+    }
+
+    #[test]
+    fn codex_fork_clear_rebind_reads_only_events_after_the_clear_offset() {
+        let event_stream_path = unique_temp_path("codex-clear-rebind-events");
+        fs::write(
+            &event_stream_path,
+            r#"{"event_type":"thread/started","payload":{"thread":{"id":"old-thread"}}}
+"#,
+        )
+        .unwrap();
+        let clear_offset = fs::metadata(&event_stream_path).unwrap().len();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&event_stream_path)
+            .unwrap()
+            .write_all(
+                br#"{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                clear_offset,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            "new-thread"
+        );
+        let _ = fs::remove_file(event_stream_path);
     }
 
     #[test]
