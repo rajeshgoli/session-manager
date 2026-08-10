@@ -2000,7 +2000,7 @@ impl SessionStore {
     }
 
     fn execute_pending_codex_fork_handoff(&self, session_id: &str) -> Result<bool> {
-        let (file_path, tmux_session, socket_name) = {
+        let (file_path, tmux_session, socket_name, event_stream_path, event_offset) = {
             let _guard = self.write_guard()?;
             let state = self.load_raw_json_value()?;
             let Some(session) = raw_session_object(&state, session_id) else {
@@ -2009,11 +2009,24 @@ impl SessionStore {
             let Some(file_path) = json_text(session.get("pending_handoff_path")) else {
                 return Ok(false);
             };
+            let runtime = self
+                .delivery_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("codex-fork handoff requires the tmux runtime"))?;
+            let spec = codex_fork_spec_for_session_raw(session_id, session)?;
+            let artifacts = runtime
+                .codex_fork_runtime_artifacts(&spec)?
+                .ok_or_else(|| anyhow::anyhow!("codex-fork runtime artifacts unavailable"))?;
+            let event_offset = fs::metadata(&artifacts.event_stream_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
             (
                 file_path,
                 json_text(session.get("tmux_session"))
                     .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?,
                 json_text(session.get("tmux_socket_name")),
+                artifacts.event_stream_path,
+                event_offset,
             )
         };
 
@@ -2027,7 +2040,12 @@ impl SessionStore {
                 .ok_or_else(|| anyhow::anyhow!("codex-fork handoff requires the tmux runtime"))?
                 .for_socket_name(socket_name.as_deref());
             let prompt = format!("Read {file_path} and continue from where you left off.");
-            if !runtime.clear_session(&tmux_session, "/new", Some(&prompt), false)? {
+            if !runtime.clear_codex_session_confirming_prompt(
+                &tmux_session,
+                &prompt,
+                &event_stream_path,
+                event_offset,
+            )? {
                 anyhow::bail!("tmux session is not running");
             }
             Ok(())
@@ -8419,7 +8437,6 @@ mod tests {
             fs::write(&handoff_path, "durable handoff body").unwrap();
             let tmux_socket = format!("sm-handoff-{}-{}", std::process::id(), label);
             let tmux_session = "codex-fork-handoff".to_owned();
-            start_codex_fork_handoff_tmux(&tmux_socket, &tmux_session);
 
             fs::write(
                 &state_file,
@@ -8455,6 +8472,7 @@ mod tests {
                 .unwrap()
                 .event_stream_path;
             fs::write(&event_stream_path, "").unwrap();
+            start_codex_fork_handoff_tmux(&tmux_socket, &tmux_session, &event_stream_path);
             Some(Self {
                 state_file,
                 event_stream_path,
@@ -8528,7 +8546,11 @@ mod tests {
         }
 
         fn start_tmux(&self) {
-            start_codex_fork_handoff_tmux(&self.tmux_socket, &self.tmux_session);
+            start_codex_fork_handoff_tmux(
+                &self.tmux_socket,
+                &self.tmux_session,
+                &self.event_stream_path,
+            );
         }
 
         fn wait_for_handoff_error(&self, store: &SessionStore) {
@@ -8561,13 +8583,22 @@ mod tests {
         }
     }
 
-    fn start_codex_fork_handoff_tmux(socket: &str, session: &str) {
-        let command = r#"/bin/sh -lc 'printf "› "; while IFS= read -r line; do printf "received:%s\n› " "$line"; done' handoff-shell"#;
+    fn start_codex_fork_handoff_tmux(socket: &str, session: &str, event_stream_path: &Path) {
+        let script = r#"event_file=$1; pending=; printf '› '; while IFS= read -r line; do if [ -n "$pending" ]; then printf '{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"%s"}]}}}\n' "$pending" >> "$event_file"; pending=; printf '\n› '; elif [ "${line#Read }" != "$line" ]; then pending=$line; printf 'received:%s\n› %s' "$line" "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
+        let command = format!(
+            "/bin/sh -lc {} handoff-shell {}",
+            shell_quote_handoff_fixture(script),
+            shell_quote_handoff_fixture(&event_stream_path.display().to_string())
+        );
         let status = Command::new("tmux")
-            .args(["-L", socket, "new-session", "-d", "-s", session, command])
+            .args(["-L", socket, "new-session", "-d", "-s", session, &command])
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    fn shell_quote_handoff_fixture(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     #[test]

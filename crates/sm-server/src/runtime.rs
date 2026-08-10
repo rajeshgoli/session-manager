@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     env, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
@@ -11,6 +12,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::{AppConfig, CodexReviewConfig, RustCoreConfig};
@@ -474,6 +476,33 @@ impl TmuxRuntime {
         prompt: Option<&str>,
         wake_completed: bool,
     ) -> Result<bool> {
+        self.clear_session_inner(tmux_session, clear_command, prompt, wake_completed, None)
+    }
+
+    pub fn clear_codex_session_confirming_prompt(
+        &self,
+        tmux_session: &str,
+        prompt: &str,
+        event_stream_path: &Path,
+        initial_event_offset: u64,
+    ) -> Result<bool> {
+        self.clear_session_inner(
+            tmux_session,
+            "/new",
+            Some(prompt),
+            false,
+            Some((event_stream_path, initial_event_offset)),
+        )
+    }
+
+    fn clear_session_inner(
+        &self,
+        tmux_session: &str,
+        clear_command: &str,
+        prompt: Option<&str>,
+        wake_completed: bool,
+        codex_prompt_confirmation: Option<(&Path, u64)>,
+    ) -> Result<bool> {
         let _guard = self.lock_session_input(tmux_session)?;
         if !self.session_exists(tmux_session)? {
             return Ok(false);
@@ -515,6 +544,33 @@ impl TmuxRuntime {
 
         if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
             self.send_text_then_enter(tmux_session, prompt)?;
+            if let Some((event_stream_path, initial_event_offset)) = codex_prompt_confirmation {
+                let mut retry_at = Instant::now() + Duration::from_secs(2);
+                let confirmation_deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if codex_event_stream_has_user_turn(
+                        event_stream_path,
+                        initial_event_offset,
+                        prompt,
+                    ) {
+                        break;
+                    }
+                    if !self.session_exists(tmux_session)? {
+                        return Ok(false);
+                    }
+                    if Instant::now() >= confirmation_deadline {
+                        anyhow::bail!(
+                            "timed out confirming Codex handoff prompt in {}",
+                            event_stream_path.display()
+                        );
+                    }
+                    if Instant::now() >= retry_at {
+                        self.send_key(tmux_session, "Enter")?;
+                        retry_at = Instant::now() + Duration::from_secs(2);
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
         Ok(true)
     }
@@ -999,6 +1055,48 @@ fn codex_composer_after_reset(pane: &str, cursor_y: usize, pre_reset_pane: Optio
             .lines()
             .nth(cursor_y)
             .is_some_and(|line| line.trim_start().starts_with('›'))
+}
+
+fn codex_event_stream_has_user_turn(path: &Path, initial_offset: u64, prompt: &str) -> bool {
+    let Ok(mut file) = fs::OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    let read_offset = initial_offset.saturating_sub(1);
+    if file.seek(SeekFrom::Start(read_offset)).is_err() {
+        return false;
+    }
+    let mut content = Vec::new();
+    if file.read_to_end(&mut content).is_err() {
+        return false;
+    }
+    let start = if initial_offset == 0 {
+        0
+    } else if content.first() == Some(&b'\n') {
+        1
+    } else {
+        let Some(relative_newline) = content.iter().position(|byte| *byte == b'\n') else {
+            return false;
+        };
+        relative_newline + 1
+    };
+    let Ok(content) = std::str::from_utf8(&content[start..]) else {
+        return false;
+    };
+    content.lines().any(|line| {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        event
+            .get("payload")
+            .and_then(|payload| payload.get("UserTurn"))
+            .and_then(|turn| turn.get("items"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("text").and_then(Value::as_str) == Some(prompt))
+            })
+    })
 }
 
 fn split_send_text_chunks(text: &str, max_chunk_chars: usize) -> Vec<&str> {
@@ -1576,6 +1674,40 @@ mod tests {
         assert!(codex_composer_after_reset(pane, 3, None));
         assert!(!codex_composer_after_reset(pane, 5, None));
         assert!(!codex_composer_after_reset(pane, 3, Some(pane)));
+    }
+
+    #[test]
+    fn codex_prompt_confirmation_requires_exact_user_turn_after_offset() {
+        let (_tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
+        let events = temp_dir.join("events.jsonl");
+        let old = r#"{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"handoff prompt"}]}}}"#;
+        fs::write(&events, format!("{old}\n")).unwrap();
+        let offset = fs::metadata(&events).unwrap().len();
+        fs::write(
+            &events,
+            format!(
+                "{old}\n{}\n{}\n",
+                r#"{"event_type":"op_submitted","payload":{"ListSkills":{}}}"#,
+                r#"{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"handoff prompt"}]}}}"#
+            ),
+        )
+        .unwrap();
+
+        assert!(codex_event_stream_has_user_turn(
+            &events,
+            offset,
+            "handoff prompt"
+        ));
+        assert!(!codex_event_stream_has_user_turn(
+            &events,
+            offset,
+            "different prompt"
+        ));
+        assert!(codex_event_stream_has_user_turn(
+            &events,
+            offset - 3,
+            "handoff prompt"
+        ));
     }
 
     #[test]
