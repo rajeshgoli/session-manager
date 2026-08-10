@@ -327,6 +327,17 @@ observations rather than one comparison.</p>
 </table>
 </div>
 
+<blockquote>
+  <p><strong>Phase 4 is optional for a useful v1.</strong> Everything through Phase 3 — measured account
+  burn, per-seat token attribution, the exact premium decomposition, per-account subtree rollups — works
+  without any fitted weight. Phase 5 can ship reading proportional shares with
+  <code>residual: unknown</code> and weights labelled <code>prior</code>, which is honest and answers the
+  orchestrator's question well enough to act on. The fitted path buys absolute burn and a real coverage
+  figure, and it carries most of this design's remaining complexity: segment keying, the unobserved-burn
+  intercept, provider-lag alignment, and credit-metered filtering. Build it when the proportional report
+  proves insufficient, not on principle.</p>
+</blockquote>
+
 <p>Phase 2 is unusually cheap. The statusLine payload already carries
 <code>rate_limits.five_hour.used_percentage</code> and <code>.seven_day.used_percentage</code>, the hook
 already POSTs to an endpoint <code>sm</code> owns, and <code>hooks/context_monitor.sh</code> lines 53–56
@@ -1209,9 +1220,20 @@ at 0 headroom keeps working on credits (A.1, C.2b) — so report exhaustion as a
 not as a stop. An orchestrator deciding whether to expand lanes needs both facts: no quota left, and work
 continuing at a price.</p>
 
-<p>With <code>--include-children</code>, sum over descendants using the existing preorder walk
-(<code>collect_descendants_preorder</code>, <code>sessions.rs:5906-5928</code>), then compute the share once
-on the aggregate. <code>--since-reset</code> restricts to the current window; without it the report also
+<p>With <code>--include-children</code>, walk descendants using the existing preorder helper
+(<code>collect_descendants_preorder</code>, <code>sessions.rs:5906-5928</code>), then
+<strong>group by <code>(account_key, window_kind)</code> and compute each group separately</strong>.</p>
+
+<blockquote>
+  <p><strong>Never aggregate a subtree into one number.</strong> A subtree routinely spans providers — the
+  <code>sm children</code> example below has Codex and Claude children under one parent — and units carry
+  weights denominated in different caps. Summing them either charges Codex work against a Claude
+  denominator or drops it silently, and both produce a plausible-looking figure. There is no meaningful
+  single "subtree burn"; there is one figure per account per window, and the report renders each.</p>
+</blockquote>
+
+<p>The same applies to caps: a <code>usage_cap_fraction</code> is evaluated per account (decision 2), so a
+subtree spanning two accounts is measured against each independently. <code>--since-reset</code> restricts to the current window; without it the report also
 prints the last three closed windows from <code>window_ledger</code>, so historic rate sits beside current
 burn.</p>
 
@@ -1300,8 +1322,17 @@ worked, from this account: 7 × 0.50 = <strong>3.5</strong> points of the pool f
 <p>This settles the question that motivated the weighting work in the first place — whether premium
 tokens get over- or under-penalised. They get neither: their share of the pool is read off two
 first-party numbers and a published constant. Any premium seat's own burn is then that 3.5 points
-apportioned by its share of premium tokens, which is a within-family split where model weight cancels
-entirely.</p>
+apportioned by its share of premium <strong>bucket-weighted units</strong>, not its share of raw premium
+tokens.</p>
+
+<blockquote>
+  <p><strong>The per-model scalar cancels within the family; the bucket ratios do not.</strong> Cache reads
+  weigh 0.1× input and output weighs 5× input (D.1), so two premium seats with identical raw token counts
+  — one cache-read dominated, one output dominated — differ by a factor of fifty in quota units.
+  Apportioning by raw tokens would hand them equal burn. Use
+  <code>Σ<sub>b</sub> tokens[b] × bucket_ratio[b]</code> per seat; the model scalar divides out of both
+  numerator and denominator, which is why this split needs no fitted weight.</p>
+</blockquote>
 
 <blockquote>
   <p><strong>Apportion only over tokens that actually consumed quota.</strong> Once the scoped meter reaches
@@ -1373,6 +1404,31 @@ Then fit on active intervals against the corrected target:<br>
 <p>These intervals genuinely occur — the fleet is idle overnight while the account is used from a browser
 or another machine. Carry <code>u</code> as an explicit non-negative intercept in the regression as well,
 regularised toward the zero-activity estimate, so the two agree or the disagreement is visible.</p>
+
+<blockquote>
+  <p><strong>Provider lag will masquerade as off-machine usage unless samples are aligned.</strong>
+  <code>cachedUsageUtilization</code> was observed six minutes stale (A.1), so an increment caused by local
+  tokens can surface during a <em>later</em> interval in which <code>Δunits = 0</code>. Counting that as
+  unobserved "by definition" inflates <code>u</code>, which then subtracts real local burn from active
+  intervals and corrupts every absolute weight — in the direction that makes coverage look worse and
+  weights look smaller, so it will not announce itself.</p>
+</blockquote>
+
+<p>Two defences, both required:</p>
+<ol>
+  <li><strong>Timestamp each sample by provider effective time, not poll time.</strong> Claude's
+  <code>fetchedAtMs</code> is exactly this and must be used as the sample's clock. The statusLine push
+  carries no equivalent, so prefer <code>~/.claude.json</code> samples for fitting and treat statusLine
+  samples as liveness only. Codex's <code>resetsAt</code> pins the window but not the sample instant —
+  use arrival time and widen the guard band accordingly.</li>
+  <li><strong>Require a quiet band before the interval.</strong> Only count an interval toward <code>u</code>
+  if local units were zero for at least the maximum observed staleness before it opened — twice that, to be
+  safe. An interval that merely happens to be quiet is not evidence; an interval preceded by a long enough
+  silence is.</li>
+</ol>
+
+<p>Track observed staleness (<code>now − fetchedAtMs</code>) as a running maximum and derive the guard band
+from it rather than hard-coding a constant, so the band adapts if provider behaviour changes.</p>
 
 <p><strong>Gate the <code>fitted</code> label on <code>u</code> being well-determined</strong>, not just on the
 condition number. Concretely: require a minimum number of zero-activity intervals, and require the
@@ -1472,16 +1528,23 @@ dormant.</p>
 </div>
 
 <pre><code>$ sm usage 320 --include-children
-seat 320 (a4af4272) · claude:primary · max_20x · model opus
+seat 320 (a4af4272) · model opus · 4 descendants across 2 accounts
 
-  window                 self     +children      account     headroom
-  week (all models)      2.1%          3.8%           8%       resets Sun 09:00 (5d 14h)
-  week (Fable)           0.0%          1.4%           7%
-  session (5h)           0.9%          1.6%           9%       resets 13:39 (2h 41m)
+claude:primary · max_20x
+  window                 self     +children      account    free headroom
+  week (all models)      2.1%          3.0%           8%     92.0 pts · resets Sun 09:00
+  week (Fable)           0.0%          1.4%           7%     46.5 pts  (binding for fable seats)
+  session (5h)           0.9%          1.2%           9%     91.0 pts · resets 13:39
+  cap 28.6% of week → 10.5% consumed
+  children here (2): 9db430 0.4% · c81a55 0.0%
 
-  cap 28.6% of week → 13.3% consumed
-  children (4): 7f2a1c 1.1% · 9db430 0.4% · 22e0f1 0.2% · c81a55 0.0%
-  weights: fitted (n=612, rms 0.31pp) · unassigned on this account: 0.4%</code></pre>
+codex:acct-a · pro
+  window                 self     +children      account    free headroom
+  week (10080m)          0.0%          4.3%          39%     61.0 pts · resets Thu 02:29
+  children here (2): 7f2a1c 4.2% · 22e0f1 0.1%
+
+  weights: claude fitted (n=612, rms 0.31pp) · codex prior (n=38, ill-conditioned)
+  unassigned: claude 0.4% · codex 1.1%   residual: claude 2.0% · codex unknown</code></pre>
 
 <pre><code>$ sm children --usage
 review-bot   (7f2a1c) | codex-fork | running   | sol   | 4.2% wk
