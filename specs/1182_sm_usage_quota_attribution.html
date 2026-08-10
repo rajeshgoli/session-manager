@@ -638,6 +638,7 @@ CREATE TABLE account_timeline (
   from_ts           TEXT NOT NULL,
   to_ts             TEXT,                        -- NULL = current
   from_uncertain_ms INTEGER NOT NULL DEFAULT 0,  -- poll-interval boundary width
+  is_assumed        INTEGER NOT NULL DEFAULT 0,  -- bootstrap interval; see C.7b
   PRIMARY KEY (provider, from_ts)
 );
 
@@ -1049,6 +1050,30 @@ refuses to guess in the same situation.</p>
 <p>Messages whose <code>sessionId</code> maps to no seat accumulate under the reserved seat id
 <code>unassigned</code>.</p>
 
+<h3>C.7b Bootstrap — messages older than the first poll</h3>
+
+<p>On first deployment, and after any <code>usage.db</code> rebuild, the current 5-hour and weekly windows
+already contain messages whose timestamps predate the first <code>account_timeline</code> row. The
+covering-interval lookup returns nothing for them. Left undefined, the first report either drops up to
+seven days of per-seat usage or refuses to attribute it — while the provider cheerfully reports the full
+cumulative burn those messages caused, so the numbers visibly fail to reconcile exactly when someone is
+looking at them for the first time.</p>
+
+<p>On the first poll for a provider, write a bootstrap interval: <code>from_ts</code> = the earliest
+message timestamp in any window still open, <code>account_key</code> = the account observed by that first
+poll, <code>is_assumed = 1</code>. Messages inside it attribute normally but are marked assumed.</p>
+
+<p>The assumption — that the account signed in now is the account that was signed in for the whole
+pre-deployment stretch — is usually right, because switching is manual and rare. It is wrong if a switch
+happened before <code>sm</code> started watching, and nothing on disk can settle that (transcripts carry no
+account identity, A.4). So:</p>
+
+<ul>
+  <li>Report windows overlapping a bootstrap interval as <code>partial</code>, with the assumed portion stated.</li>
+  <li><strong>Exclude bootstrap intervals from the weight fit entirely.</strong> An interval whose account attribution is a guess must not calibrate coefficients everything else depends on.</li>
+  <li>Close the bootstrap interval at the first genuinely observed poll; from there on attribution is real.</li>
+</ul>
+
 <h3>C.7a Coverage — burn that has no local tokens at all</h3>
 
 <blockquote>
@@ -1076,6 +1101,11 @@ add up to the account figure by construction:</p>
 <div class="eq">
 Σ known seats&nbsp;&nbsp;+&nbsp;&nbsp;unassigned&nbsp;&nbsp;+&nbsp;&nbsp;residual&nbsp;&nbsp;=&nbsp;&nbsp;account_burn
 </div>
+
+<p>This is only sound if the weights were <em>not themselves fitted through</em> the unobserved burn —
+otherwise the residual is absorbed into <code>w</code> and reads zero no matter how much is missing. D.4
+covers how the unobserved component is estimated first and how the <code>fitted</code> label is gated on
+it. Where the two are collinear, coverage is a lower bound rather than a measurement.</p>
 
 <p><strong>Before the fit converges this cannot be computed honestly.</strong> With prior weights the
 unit-to-burn conversion is a guess, so the residual would be an artefact of the prior rather than a
@@ -1283,6 +1313,46 @@ different families active at different times this is satisfied naturally, but it
 if the fleet runs one family exclusively for a week, that week yields no information about the others.
 Report conditioning rather than silently returning an arbitrary solution from a singular system.</p>
 
+<h4>Unobserved burn must be estimated before <code>w</code>, not after</h4>
+<blockquote>
+  <p><strong>There is a circularity here that has to be broken explicitly.</strong> When the account is
+  also used off-machine, <code>Δburn</code> contains consumption the regressors know nothing about. NNLS
+  is non-negative and wants to explain <code>Δburn</code>, so it absorbs that unexplained burn into
+  inflated model weights wherever the two overlap in time. Those weights then make
+  <code>predicted_burn</code> approach the full account burn, coverage reports near 100%, the C.7a
+  residual collapses to zero, and visible seats are overcharged — with every number looking healthy.
+  Treating the omission as <code>ε</code> does not save it: <code>ε</code> is assumed zero-mean, and this
+  term is strictly non-negative.</p>
+</blockquote>
+
+<p>Break it by measuring the unobserved component from intervals where it is the <em>only</em> possible
+explanation:</p>
+
+<div class="eq">
+Zero-activity intervals: Δunits<sub>m</sub> = 0 ∀m, yet Δburn &gt; 0<br>
+&nbsp;&nbsp;→ that burn is unobserved <em>by definition</em>. Estimate the rate u = Δburn / Δt from them.<br>
+<br>
+Then fit on active intervals against the corrected target:<br>
+&nbsp;&nbsp;(Δburn<sub>i</sub> − u·Δt<sub>i</sub>) = Σ<sub>m</sub> w<sub>m</sub> · Δunits<sub>m,i</sub> + ε<sub>i</sub>
+</div>
+
+<p>These intervals genuinely occur — the fleet is idle overnight while the account is used from a browser
+or another machine. Carry <code>u</code> as an explicit non-negative intercept in the regression as well,
+regularised toward the zero-activity estimate, so the two agree or the disagreement is visible.</p>
+
+<p><strong>Gate the <code>fitted</code> label on <code>u</code> being well-determined</strong>, not just on the
+condition number. Concretely: require a minimum number of zero-activity intervals, and require the
+intercept's confidence interval to exclude implausible values. Without that, hold the prior — an
+absolute weight fitted through unmeasured burn is worse than an admitted approximation, because it
+produces a confident coverage figure that is wrong in the flattering direction.</p>
+
+<p><strong>The residual risk, stated plainly:</strong> if off-machine usage is <em>concurrent</em> with fleet
+activity rather than interleaved with it, no intercept can separate the two — they are collinear over
+the observation window. That is a real limit of this method, not an implementation gap. When it applies,
+coverage is a <strong>lower bound on visible burn</strong> rather than a measurement, and the report says so.
+The mitigation is behavioural, not statistical: usage that goes through <code>sm</code> is observable, and
+the coverage figure is precisely the incentive to keep it there.</p>
+
 <blockquote>
   <p><strong>Segment the fit at every cap change.</strong> Reported burn is a percentage of a cap that can
   move: promotional boosts (this account currently carries a "+50% weekly limits" promo expiring
@@ -1396,7 +1466,8 @@ scout        (22e0f1) | codex-fork | running   | luna  | 0.1% wk</code></pre>
   <tr><td>Plan has no premium inclusion (Pro, Standard Team)</td><td>No sub-cap exists; the exact premium derivation does not apply. Fall back to fitting that family like any other</td></tr>
   <tr><td>Scoped meter at 100% while overall has headroom</td><td>Expected, not an error. Report the seat as blocked-on-scoped with the overall headroom shown separately, since switching models or paying credits both unblock it</td></tr>
   <tr><td>Account switch mid-window</td><td>Each account's window tracked independently; a seat can hold burn on two accounts in one calendar week</td></tr>
-  <tr><td>New account, no history</td><td>Report normally — burn is measured, not fitted; only the weights need warm-up, and they carry over across accounts of the same provider</td></tr>
+  <tr><td>New account, no history</td><td>Burn is measured, so account-level reporting works immediately. <strong>Absolute weights do not carry over</strong> — they are percentage points of one account's cap, and a different plan, promo, or tier makes them wrong. Transfer only the dimensionless model-to-model ratios as a prior shape; the new account fits its own absolute scale. Until it does, that account reports proportionally with <code>residual: unknown</code></td></tr>
+  <tr><td>Messages predate the first account poll (fresh install, or rebuilt <code>usage.db</code>)</td><td>Attribute to a bootstrap interval flagged <code>is_assumed</code>, report affected windows as <code>partial</code>, and exclude those intervals from the fit (C.7b)</td></tr>
   <tr><td>Seat's transcript missing</td><td>Tokens fall to <code>unassigned</code>; the seat is flagged <code>unmapped</code></td></tr>
   <tr><td>Two seats in one cwd, both missing <code>transcript_path</code></td><td>Do not guess — both go to <code>unassigned</code></td></tr>
   <tr><td>Codex thread has token events before any <code>thread/settings/updated</code></td><td>Fall back to <code>SessionRecord.model</code>, then the launch-config default; mark the bucket <code>model_inferred</code> so the fit can down-weight it</td></tr>
