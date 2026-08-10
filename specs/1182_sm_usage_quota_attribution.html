@@ -700,7 +700,8 @@ CREATE TABLE seat_tokens (
   cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
   message_count      INTEGER NOT NULL DEFAULT 0,
   updated_at         TEXT NOT NULL,
-  PRIMARY KEY (seat_id, account_key, window_kind, window_start, bucket_ts, model, credit_metered)
+  PRIMARY KEY (seat_id, account_key, project_key, window_kind, window_start,
+               bucket_ts, model, credit_metered)
 );
 CREATE INDEX idx_seat_tokens_fit ON seat_tokens(account_key, window_kind, bucket_ts);
 
@@ -1163,17 +1164,37 @@ trustworthy.</p>
 <em>that window and cap segment</em> have converged. They must not be mixed.</p>
 
 <div class="eq">
-units(seat, w, m) = Σ<sub>b</sub> tokens[m][b] × bucket_ratio[b]<br>
+units(seat, w, m) = Σ<sub>b</sub> tokens[m][b] × bucket_ratio[b]&nbsp;&nbsp;<em>(bucket-weighted, per model, quota-metered only)</em><br>
 <br>
-<strong>FITTED</strong> — absolute conversion; the shortfall is real and reserved<br>
-&nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;= Σ<sub>m</sub> weight[account, w, segment, m] × units(seat, w, m)<br>
-&nbsp;&nbsp;residual(w)&nbsp;&nbsp;&nbsp;= max(0, account_burn(w) − Σ<sub>all seats</sub> burn(seat, w))<br>
+<strong>PREMIUM TERM — exact, both modes, never fitted</strong>&nbsp;&nbsp;<em>(scoped plans only; D.3)</em><br>
+&nbsp;&nbsp;premium_pts(w)&nbsp;&nbsp;&nbsp;&nbsp;= weekly_scoped_pct × r<br>
+&nbsp;&nbsp;burn<sub>prem</sub>(seat)&nbsp;&nbsp;= premium_pts(w) × units<sub>prem</sub>(seat) / Σ<sub>seats</sub> units<sub>prem</sub><br>
+<br>
+<strong>FITTED</strong> — absolute conversion over the remaining families<br>
+&nbsp;&nbsp;burn<sub>rest</sub>(seat)&nbsp;&nbsp;= Σ<sub>m ∉ premium</sub> weight[account, w, segment, m] × units(seat, w, m)<br>
+&nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;&nbsp;&nbsp;= burn<sub>prem</sub>(seat) + burn<sub>rest</sub>(seat)<br>
+&nbsp;&nbsp;residual(w)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= max(0, account_burn(w) − Σ<sub>all seats</sub> burn(seat, w))<br>
 &nbsp;&nbsp;→ Σ seats + unassigned + residual = account_burn&nbsp;&nbsp;<em>by construction</em><br>
 <br>
-<strong>PRIOR</strong> — proportional fallback; residual is not computable<br>
-&nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;= account_burn(w) × units(seat, w) / Σ<sub>all seats</sub> units(w)<br>
-&nbsp;&nbsp;residual(w)&nbsp;&nbsp;&nbsp;= <code>unknown</code>, and seat figures are flagged possibly-inflated
+<strong>PRIOR</strong> — proportional over the remainder; residual not computable<br>
+&nbsp;&nbsp;wu(seat)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= Σ<sub>m ∉ premium</sub> <strong>prior_w[m]</strong> × units(seat, w, m)<br>
+&nbsp;&nbsp;burn<sub>rest</sub>(seat)&nbsp;&nbsp;= (account_burn(w) − premium_pts(w)) × wu(seat) / Σ<sub>seats</sub> wu<br>
+&nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;&nbsp;&nbsp;= burn<sub>prem</sub>(seat) + burn<sub>rest</sub>(seat)<br>
+&nbsp;&nbsp;residual(w)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= <code>unknown</code>; seat figures flagged possibly-inflated
 </div>
+
+<blockquote>
+  <p><strong>The premium term is exact in both modes and must never be fitted.</strong> D.3 deliberately
+  removes that family from the regression, so requiring a fitted coefficient for every model would leave an
+  implementation with two bad choices: drop premium seats from the report, or apply a stale prior to the one
+  family whose contribution is actually known. Either corrupts seat totals and the residual. Compute the
+  premium term first, then fit or apportion only what remains.</p>
+  <p><strong>The proportional fallback still applies the per-model prior.</strong> Aggregating bare
+  bucket-weighted units would treat a Sol token and a Luna token as equal despite a 25× documented spread —
+  reintroducing exactly the bias this design exists to remove, in the mode most likely to be running.
+  Sparse accounts may sit in prior mode indefinitely, so this path has to be right on its own terms, not
+  merely a placeholder until the fit lands.</p>
+</blockquote>
 
 <blockquote>
   <p><strong>Do not normalise once the fit has converged.</strong> Scaling observed units to 100% and
