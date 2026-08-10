@@ -96,6 +96,19 @@ impl SessionStore {
         self
     }
 
+    pub fn with_codex_session_index_path(mut self, session_index_path: Option<&str>) -> Self {
+        if let Some(session_index_path) = session_index_path
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let session_index_path = expand_home(session_index_path);
+            if let Some(parent) = session_index_path.parent() {
+                self.codex_sessions_root = parent.join("sessions");
+            }
+        }
+        self
+    }
+
     /// Drop context alerts this session raised about context it no longer has.
     /// An undelivered warning describes the discarded cycle, so delivering it
     /// after a clear tells the monitor about a problem that no longer exists.
