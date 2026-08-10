@@ -14499,6 +14499,15 @@ while true; do sleep 1; done
     assert!(output_text.contains("ids:runtimefork:runtimefork:false"));
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     assert_eq!(state["sessions"][0]["reasoning_effort"], "ultra");
+    let connection = Connection::open(state_file.with_extension("usage.db")).unwrap();
+    let provider_session_id: String = connection
+        .query_row(
+            "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'runtimefork'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(provider_session_id, "provider-thread-123");
     let mut lifecycle_status = String::new();
     for _ in 0..30 {
         let (_, session) = get_json(app.clone(), "/sessions/runtimefork").await;

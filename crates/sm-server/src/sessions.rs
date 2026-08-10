@@ -677,9 +677,16 @@ impl SessionStore {
             let _ = runtime.kill_session(&record.tmux_session);
             return Err(error);
         }
-        if record.provider == "codex" {
+        if matches!(record.provider.as_str(), "codex" | "codex-fork") {
             if let Some(provider_resume_id) = record.provider_resume_id.as_deref() {
-                self.append_seat_session(&record.id, &record.provider, provider_resume_id, None);
+                self.append_seat_session(
+                    &record.id,
+                    &record.provider,
+                    provider_resume_id,
+                    codex_fork_artifacts
+                        .as_ref()
+                        .and_then(|artifacts| artifacts.event_stream_path.to_str()),
+                );
             }
         }
         if let Some(artifacts) = codex_fork_artifacts {
@@ -2158,7 +2165,14 @@ impl SessionStore {
     }
 
     fn execute_pending_codex_fork_handoff(&self, session_id: &str) -> Result<bool> {
-        let (file_path, tmux_session, socket_name, event_stream_path, event_offset) = {
+        let (
+            file_path,
+            tmux_session,
+            socket_name,
+            event_stream_path,
+            event_offset,
+            previous_provider_resume_id,
+        ) = {
             let _guard = self.write_guard()?;
             let state = self.load_raw_json_value()?;
             let Some(session) = raw_session_object(&state, session_id) else {
@@ -2185,6 +2199,7 @@ impl SessionStore {
                 json_text(session.get("tmux_socket_name")),
                 artifacts.event_stream_path,
                 event_offset,
+                json_text(session.get("provider_resume_id")),
             )
         };
 
@@ -2206,7 +2221,11 @@ impl SessionStore {
             )? {
                 anyhow::bail!("tmux session is not running");
             }
-            Ok(())
+            wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                event_offset,
+                CODEX_FORK_THREAD_STARTED_TIMEOUT,
+            )
         })();
 
         let _guard = self.write_guard()?;
@@ -2216,7 +2235,25 @@ impl SessionStore {
             return Ok(false);
         };
         match result {
-            Ok(()) => {
+            Ok(provider_resume_id) => {
+                if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
+                    self.append_seat_session(
+                        session_id,
+                        "codex-fork",
+                        previous_provider_resume_id,
+                        event_stream_path.to_str(),
+                    );
+                }
+                self.append_seat_session(
+                    session_id,
+                    "codex-fork",
+                    &provider_resume_id,
+                    event_stream_path.to_str(),
+                );
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id),
+                );
                 session.insert(
                     "last_handoff_path".to_owned(),
                     Value::String(file_path.clone()),
@@ -8557,17 +8594,19 @@ mod tests {
             session.last_handoff_path.as_deref(),
             Some(fixture.handoff_path.to_str().unwrap())
         );
-        assert_eq!(session.provider_resume_id.as_deref(), Some("old-thread"));
-        store
-            .apply_codex_fork_event_line(
-                "codex001",
-                r#"{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}"#,
-            )
-            .unwrap();
-        let session = store.get_session("codex001").unwrap().unwrap();
-        assert_eq!(session.id, "codex001");
-        assert_eq!(session.friendly_name.as_deref(), Some("stable-agent"));
         assert_eq!(session.provider_resume_id.as_deref(), Some("new-thread"));
+        let connection =
+            rusqlite::Connection::open(fixture.state_file.with_extension("usage.db")).unwrap();
+        let provider_session_ids = connection
+            .prepare(
+                "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(provider_session_ids, vec!["new-thread", "old-thread"]);
         let state = store.load_raw_json_value().unwrap();
         let session = raw_session_object(&state, "codex001").unwrap();
         assert!(json_text(session.get("pending_handoff_path")).is_none());
@@ -8617,6 +8656,15 @@ mod tests {
                 .last_handoff_path
                 .as_deref(),
             Some(fixture.handoff_path.to_str().unwrap())
+        );
+        assert_eq!(
+            restarted
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("new-thread")
         );
     }
 
@@ -8870,7 +8918,7 @@ mod tests {
     }
 
     fn start_codex_fork_handoff_tmux(socket: &str, session: &str, event_stream_path: &Path) {
-        let script = r#"event_file=$1; pending=; printf '› '; while IFS= read -r line; do if [ -n "$pending" ]; then printf '{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"%s"}]}}}\n' "$pending" >> "$event_file"; pending=; printf '\n› '; elif [ "${line#Read }" != "$line" ]; then pending=$line; printf 'received:%s\n› %s' "$line" "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
+        let script = r#"event_file=$1; pending=; printf '› '; while IFS= read -r line; do if [ "${line%/new}" != "$line" ]; then printf '{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}\n' >> "$event_file"; printf 'received:%s\n› ' "$line"; elif [ -n "$pending" ]; then printf '{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"%s"}]}}}\n' "$pending" >> "$event_file"; pending=; printf '\n› '; elif [ "${line#Read }" != "$line" ]; then pending=$line; printf 'received:%s\n› %s' "$line" "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
         let command = format!(
             "/bin/sh -lc {} handoff-shell {}",
             shell_quote_handoff_fixture(script),
