@@ -2045,9 +2045,9 @@ impl SessionStore {
                     "last_handoff_path".to_owned(),
                     Value::String(file_path.clone()),
                 );
-                if json_text(session.get("pending_handoff_path")).as_deref()
-                    == Some(file_path.as_str())
-                {
+                let cleared_pending = json_text(session.get("pending_handoff_path")).as_deref()
+                    == Some(file_path.as_str());
+                if cleared_pending {
                     session.insert("pending_handoff_path".to_owned(), Value::Null);
                     session.insert("pending_handoff_event_offset".to_owned(), Value::Null);
                 }
@@ -2056,9 +2056,10 @@ impl SessionStore {
                 session.insert("status".to_owned(), Value::String("running".to_owned()));
                 clear_codex_fork_control_degraded_raw(session);
                 clear_codex_fork_handoff_error_raw(session);
-                self.cancel_context_monitor_alerts(session_id)?;
                 self.write_raw_json_value(&state)?;
-                Ok(true)
+                drop(_guard);
+                let _ = self.cancel_context_monitor_alerts(session_id);
+                Ok(cleared_pending)
             }
             Err(error) => {
                 session.insert(
