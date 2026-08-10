@@ -1,0 +1,1403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sm usage — per-seat quota attribution</title>
+<style>
+  :root {
+    --ink: #14161a; --muted: #5b6270; --rule: #d7dbe2; --bg: #ffffff;
+    --accent: #8a3a12; --code-bg: #f5f6f8; --note-bg: #f8f9fb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink: #e6e8ec; --muted: #9aa3b2; --rule: #333944; --bg: #14161a;
+      --accent: #e8a06a; --code-bg: #1c2027; --note-bg: #1a1e25;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 16px/1.55 -apple-system, "Helvetica Neue", Arial, sans-serif;
+    max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    -webkit-text-size-adjust: 100%;
+  }
+  h1 { font-size: 1.75rem; line-height: 1.2; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  h2 {
+    font-size: 1.2rem; margin: 2.4rem 0 .7rem; padding-top: .6rem;
+    border-top: 2px solid var(--rule); letter-spacing: -.005em;
+  }
+  h3 { font-size: 1rem; margin: 1.5rem 0 .4rem; color: var(--accent); }
+  h4 { font-size: .95rem; margin: 1.1rem 0 .3rem; }
+  p, li { margin: .55rem 0; }
+  ul, ol { padding-left: 1.35rem; }
+  .sub { color: var(--muted); font-size: .9rem; margin: 0 0 1.6rem; }
+  .lede { font-size: 1.05rem; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--code-bg); font-size: .855em;
+  }
+  code { padding: .1em .32em; border-radius: 3px; }
+  pre {
+    padding: .8rem .9rem; border-radius: 5px; overflow-x: auto;
+    border: 1px solid var(--rule); line-height: 1.45; font-size: .8rem;
+  }
+  pre code { background: none; padding: 0; }
+  .tw { overflow-x: auto; margin: .9rem 0; }
+  table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+  th, td { text-align: left; padding: .38rem .55rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-weight: 600; border-bottom: 2px solid var(--rule); white-space: nowrap; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  blockquote {
+    margin: 1rem 0; padding: .7rem 1rem; background: var(--note-bg);
+    border-left: 3px solid var(--accent); border-radius: 0 4px 4px 0;
+  }
+  blockquote p { margin: .3rem 0; }
+  .eq { background: var(--note-bg); border: 1px solid var(--rule); border-radius: 5px;
+        padding: .8rem .9rem; margin: .9rem 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; line-height: 1.6; }
+  .decision { border-left: 3px solid var(--accent); padding-left: .9rem; margin: 1.1rem 0; }
+  .decision .q { font-weight: 600; }
+  .decision .a { color: var(--accent); font-weight: 600; }
+  hr.major { border: 0; border-top: 3px double var(--rule); margin: 3rem 0 2rem; }
+  .tag { display: inline-block; font-size: .72rem; text-transform: uppercase;
+         letter-spacing: .04em; padding: .1rem .4rem; border: 1px solid var(--rule);
+         border-radius: 3px; color: var(--muted); }
+  @media print {
+    @page { margin: 16mm 14mm; }
+    body { max-width: none; padding: 0; font-size: 10.5pt; line-height: 1.4; color: #000; background: #fff; }
+    h1 { font-size: 17pt; } h2 { font-size: 12.5pt; page-break-after: avoid; }
+    h3, h4 { page-break-after: avoid; color: #000; }
+    pre, table, blockquote, .eq, .decision { page-break-inside: avoid; }
+    pre { font-size: 8pt; } table { font-size: 8.5pt; }
+    a { color: #000; text-decoration: none; }
+    hr.major { page-break-before: always; border: 0; margin: 0; }
+  }
+</style>
+</head>
+<body>
+
+<h1>sm usage — per-seat quota attribution</h1>
+<p class="sub">
+  <span class="tag">proposed</span>
+  &nbsp;2026-08-10 &nbsp;·&nbsp; session-manager &nbsp;·&nbsp;
+  tracked as <code>1182</code>
+</p>
+
+<h2>The problem</h2>
+
+<p class="lede">An orchestrator cannot see what it is spending. It knows which seats it spawned;
+it does not know how much quota they burned, so it cannot decide whether to expand lanes,
+and owner-set budget caps are unenforceable because nothing attributes usage to a seat.</p>
+
+<p>The fleet runs several projects, each with its own orchestrator, drawing on a shared pool
+of provider accounts — today one Claude account and two Codex accounts, with the counts
+changing as workload grows. Quota is owned by the <em>account</em>; demand comes from
+<em>seats</em>; projects sit in between and cannot see each other. An orchestrator in project A
+therefore cannot answer "how much of this account is left" from its own subtree, because
+seats it never spawned are drawing on the same pool.</p>
+
+<p>Three questions have to be answerable, and today none of them are:</p>
+
+<ol>
+  <li><strong>How much have I and my seats burned</strong>, as a fraction of the account's current window?</li>
+  <li><strong>How does that break down</strong> — which of my seats is expensive, and how much is me rather than them?</li>
+  <li><strong>How much headroom is left</strong> on this account, including usage from projects I cannot see?</li>
+</ol>
+
+<p>Only <code>sm</code> can answer them. The providers publish account-level burn but know nothing
+about seats; the transcripts on disk record tokens but know nothing about lineage. The spawn
+tree exists in exactly one place, which is why this belongs here.</p>
+
+<h3>Definitions</h3>
+<div class="tw">
+<table>
+  <tr><th>Term</th><th>Meaning</th></tr>
+  <tr><td><strong>Seat</strong></td><td>One agent identity <code>sm</code> manages — a session record with an id, a name, a provider, a model, a parent.</td></tr>
+  <tr><td><strong>Account</strong></td><td>One provider login. The unit that owns quota.</td></tr>
+  <tr><td><strong>Window</strong></td><td>A provider quota period. Claude: a 5-hour rolling session window, a 7-day week, and a 7-day cap scoped to the premium model. Codex: the same two shapes, carried as <code>primary</code>/<code>secondary</code>.</td></tr>
+  <tr><td><strong>Burn</strong></td><td>Consumed fraction of a window, 0–100%.</td></tr>
+  <tr><td><strong>Quota units</strong></td><td>Tokens scaled by a per-model, per-bucket weight, so one scalar is comparable across models. The weights are what this design has to get right.</td></tr>
+  <tr><td><strong>Share</strong></td><td>A seat's fraction of all quota units spent on an account in a window.</td></tr>
+  <tr><td><strong>Attributed burn</strong></td><td>Account burn × share. What <code>sm usage</code> reports.</td></tr>
+</table>
+</div>
+
+<h2>The solution</h2>
+
+<p>Two layers. The account total is measured; only the split across seats is derived.</p>
+
+<div class="eq">
+LAYER 1 — MEASURED (first-party, exact, zero token cost)<br>
+&nbsp;&nbsp;claude:primary → 5h 9% · week 8% · week/Fable 7% · resets 2026-08-16T16:00Z<br>
+&nbsp;&nbsp;codex:acct-a&nbsp;&nbsp;→ 10080-min window 31% · resets @1786825765<br>
+<br>
+LAYER 2 — DERIVED (sm's contribution)<br>
+&nbsp;&nbsp;units(seat, w)&nbsp;&nbsp;= Σ<sub>model,bucket</sub> tokens × weight[model][bucket]<br>
+&nbsp;&nbsp;share(seat, w)&nbsp;&nbsp;= units(seat, w) / units(all seats on account, w)<br>
+&nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;&nbsp;= account_burn(w) × share(seat, w)
+</div>
+
+<p>Both providers publish their own burn percentage, machine-readable, at zero token cost —
+verified on this machine and listed in Appendix A. <code>sm</code> reads those numbers rather
+than modelling them, so there is no denominator to estimate and no account-level error.
+Everything <code>sm</code> reports is the product above.</p>
+
+<p><strong>Account identity is a timeline, not a label.</strong> One account per provider is signed in
+at a time, and switching means signing out, signing back in, and resuming. So <code>sm</code>
+polls one small file per provider, records "provider P was account A from T1 to T2", and books
+each message to whichever interval holds its timestamp. A seat straddling a switch splits
+correctly on its own, because every message carries its own time.</p>
+
+<p><strong>Subagent usage lands on the parent seat for free.</strong> Sidechain transcripts live in a
+separate file but carry the same <code>sessionId</code> as the parent, so they map to the same seat by
+construction. The care needed is de-duplication (Appendix C.3), not routing.</p>
+
+<h2>Why model weighting is the crux</h2>
+
+<p>A seat holds one model for its lifecycle. Model changes happen, but only when the owner makes
+them, and they are rare. So seats do not converge toward a common model mix — they stay
+separated by family, which is exactly the condition under which naive attribution fails worst.</p>
+
+<p>The current fleet, from <code>sessions.json</code>:</p>
+
+<div class="tw">
+<table>
+  <tr><th>Provider</th><th>Model</th><th class="num">Seats</th><th>Tier</th></tr>
+  <tr><td>codex-fork</td><td><code>gpt-5.6-sol</code></td><td class="num">149</td><td>premium reasoning</td></tr>
+  <tr><td>codex-fork</td><td><code>gpt-5.6-luna</code></td><td class="num">55</td><td>economy</td></tr>
+  <tr><td>codex-fork</td><td><code>gpt-5.6-terra</code></td><td class="num">49</td><td>mid</td></tr>
+  <tr><td>claude</td><td><code>opus</code></td><td class="num">93</td><td>high</td></tr>
+  <tr><td>claude</td><td><code>sonnet</code></td><td class="num">43</td><td>mid</td></tr>
+  <tr><td>claude</td><td><code>fable</code></td><td class="num">21</td><td>premium</td></tr>
+  <tr><td>either</td><td><code>unset</code> (inherits config default)</td><td class="num">~460</td><td>—</td></tr>
+</table>
+</div>
+
+<p>Attributing by raw token count treats a Luna token and a Sol-at-xhigh token as equal. They are
+not, by a wide margin, and the error does not average out — it is systematic, and it always runs
+the same direction: <strong>economy seats are charged for burn they did not cause, and premium
+seats are let off.</strong> A report with that bias is worse than no report, because a cap set on it
+would throttle the cheap seats while the expensive ones run unchecked.</p>
+
+<p>Two independent effects compound, and both must be captured:</p>
+
+<ul>
+  <li><strong>Rate per token</strong> — published spread is 10× end to end across Claude families
+  (Fable $10/$50 per MTok down to Haiku $1/$5; Opus to Sonnet only 1.67×) and <strong>25× across
+  Codex families</strong> (Sol $5/$30 down to Luna $0.20/$1.20). Weighting handles this.</li>
+  <li><strong>Tokens per unit of work</strong> — a premium seat at high reasoning effort emits far more
+  tokens for the same task than an economy seat. Token counting already captures this, provided
+  reasoning tokens are counted at the output rate and not double-counted (Appendix A.6).</li>
+</ul>
+
+<p>Multiplied together these produce the order-of-magnitude gaps seen in practice: a 25× rate gap
+between Sol and Luna, times a volume gap from running Sol at high effort, lands near the ~100×
+difference observed in real use. Neither factor alone explains it, which is why the design needs both
+a weight table and honest token accounting.</p>
+
+<p>The providers give part of the split and withhold the rest. Claude's premium-scoped weekly meter,
+combined with a published ratio, yields an <strong>exact</strong> premium-versus-everything-else
+decomposition — no fitting required (Appendix D.3). It says nothing about Opus versus Sonnet, which is
+the split covering 136 of the Claude seats. Codex says nothing at all: across 93,825 real rate-limit
+events on this machine, every sample carries <code>limitId: "codex"</code> and a null
+<code>limitName</code> — one shared account-wide bucket all models draw from together. Codex's own client
+agrees the rates differ, offering at 90% to switch the user to Luna "for lower credit usage"; it just
+never says by how much. Anthropic likewise confirms the premium model "uses [your limits] faster than
+other Claude models" and publishes no coefficient.</p>
+
+<h2>Where the weights come from</h2>
+
+<p>Published API prices give a starting ratio, but subscription quota weighting is not published and
+need not match API pricing — Anthropic states only that the premium model "uses [your weekly limits]
+faster than other Claude models", with no coefficient anywhere. So the residual weights are
+<strong>fitted from data <code>sm</code> already collects</strong>, with price ratios as the prior.</p>
+
+<p>One large piece, though, does not need fitting at all. The premium-scoped weekly meter is a
+<em>sub-cap</em> of the overall weekly pool, sized at a published 50%, which makes the premium family's
+share of account burn exactly computable from two first-party numbers. Only the models <em>below</em>
+the premium tier — Opus versus Sonnet versus Haiku, and all three Codex families — have to be
+inferred. Appendix D.3 derives both.</p>
+
+<p>Burn samples are cumulative and arrive every few minutes. Each consecutive pair yields one
+equation:</p>
+
+<div class="eq">
+Δburn<sub>i</sub> = Σ<sub>m</sub> w<sub>m</sub> · Δtokens<sub>m,i</sub> + ε<sub>i</sub>
+</div>
+
+<p>Different seats are active in different intervals, so the model mix varies naturally across
+samples — the system is identifiable without any deliberate experiment. Solve by non-negative
+least squares, ridge-regularised toward the price prior so it degrades to the prior rather than
+to noise when data is thin. Within a model, hold the bucket ratios (input : output : cache-write :
+cache-read) at their published values, leaving one free scalar per family: three or four unknowns
+per provider, not twenty.</p>
+
+<p>Claude's premium-scoped weekly figure supplies a second, independent equation series
+constraining the Fable weight specifically — note that <code>weekly_all</code> and
+<code>weekly_scoped</code> are percentages of <em>different</em> caps, so they are two separate
+observations rather than one comparison.</p>
+
+<blockquote>
+  <p><strong>The honest limit is convergence time, not permanent error.</strong> Burn is reported as an
+  integer percent, so each equation carries roughly ±0.5 percentage points of quantisation noise.
+  Individual intervals are therefore useless and the fit needs a full window of samples. Expect the
+  prior to govern for the first week or two and the fitted weights to take over after that. Until
+  the fit is well-conditioned, <code>sm usage</code> labels its weights <code>prior</code> rather than
+  <code>fitted</code> and says so in the output.</p>
+</blockquote>
+
+<p>Accuracy, stated plainly:</p>
+
+<div class="tw">
+<table>
+  <tr><th>Quantity</th><th>Status</th><th>Basis</th></tr>
+  <tr><td>Account burn %</td><td><strong>Exact</strong></td><td>Read verbatim from the provider</td></tr>
+  <tr><td>Reset instants</td><td><strong>Exact</strong></td><td>Read from the provider, never configured</td></tr>
+  <tr><td>Per-seat token counts</td><td><strong>Exact</strong></td><td>Transcript / event artefacts, after dedupe</td></tr>
+  <tr><td>Premium family's share of burn</td><td><strong>Exact</strong></td><td>Scoped meter × the published 50% sub-cap ratio</td></tr>
+  <tr><td>Sub-premium family weights</td><td>Fitted</td><td>Regression on the overall series with the premium term substituted out; price prior until converged</td></tr>
+  <tr><td>Per-seat burn %</td><td>Derived</td><td>Product of the above</td></tr>
+</table>
+</div>
+
+<h2>What sm reads</h2>
+
+<div class="tw">
+<table>
+  <tr><th>Source</th><th>Gives</th><th>Mechanism</th></tr>
+  <tr><td>statusLine hook payload</td><td><code>rate_limits.five_hour</code>, <code>.seven_day</code></td><td>Push — already POSTs to <code>/hooks/context-usage</code>; currently discarded</td></tr>
+  <tr><td><code>~/.claude.json</code> → <code>cachedUsageUtilization</code></td><td>All three Claude windows, ISO resets, severity, credits</td><td>Poll, 30 s</td></tr>
+  <tr><td><code>claude -p "/usage"</code></td><td>Same numbers as text</td><td>Verification only; costs zero</td></tr>
+  <tr><td><code>account/rateLimits/updated</code></td><td>Codex <code>usedPercent</code>, window, reset, plan</td><td>Already written by <code>sm</code> to the codex-fork event stream</td></tr>
+  <tr><td>Claude transcripts</td><td>Per-message tokens by model</td><td>Incremental scan with byte offsets</td></tr>
+  <tr><td><code>thread/tokenUsage/updated</code></td><td>Codex cumulative per-thread tokens</td><td>Same event stream; <code>sm</code> currently reads only <code>.last</code></td></tr>
+  <tr><td><code>sessions.json</code></td><td>Seat model, lineage, provider</td><td>Existing registry — the only per-turn model signal on the Codex side</td></tr>
+</table>
+</div>
+
+<h2>Decisions taken</h2>
+
+<div class="decision">
+  <p class="q">Enforcement posture</p>
+  <p><span class="a">Report only.</span> <code>sm usage</code> answers when asked. No warnings, no spawn refusal.
+  Caps are recorded on the seat and rendered against, but nothing blocks on them.</p>
+</div>
+
+<div class="decision">
+  <p class="q">What a cap is measured against</p>
+  <p><span class="a">The current account's measured burn.</span> A cap of two sevenths means two sevenths of
+  whichever account the seat is running on, as that account currently reports it.</p>
+</div>
+
+<div class="decision">
+  <p class="q">Unattributed usage</p>
+  <p><span class="a">A separate <code>unassigned</code> seat per account.</span> Shares then sum to 100% and the gap
+  is visible. Expected to be small, since work normally goes through <code>sm</code>; if it grows large that is
+  itself a finding worth surfacing rather than hiding.</p>
+</div>
+
+<div class="decision">
+  <p class="q">Provider coverage in v1</p>
+  <p><span class="a">Both providers, per seat.</span> Account-level Codex burn is nearly free, but per-seat
+  Codex attribution is the point of the feature, not a follow-up.</p>
+</div>
+
+<div class="decision">
+  <p class="q">Delivery surface</p>
+  <p><span class="a"><code>sm usage</code>, a burn column on <code>sm children</code>, and an HTTP endpoint.</span>
+  <code>sm children</code> is where an orchestrator already looks when deciding to expand lanes, and it is a
+  one-line change to <code>format_child_line</code>. <code>sm status</code> is deliberately excluded: it is global and
+  cross-project, so a burn figure there would sit against a different denominator than the caller's and invite
+  exactly the misreading this feature exists to prevent.</p>
+</div>
+
+<h2>Scope and sequence</h2>
+
+<div class="tw">
+<table>
+  <tr><th>Phase</th><th>Delivers</th><th>Depends on</th></tr>
+  <tr><td>0</td><td>Session chaining: append provider session ids instead of overwriting <code>transcript_path</code></td><td>—</td></tr>
+  <tr><td>1</td><td>Account identity and switch timeline, both providers</td><td>—</td></tr>
+  <tr><td>2</td><td>Burn ingest: statusLine <code>rate_limits</code>, <code>~/.claude.json</code> poll, Codex rate-limit events</td><td>1</td></tr>
+  <tr><td>3</td><td>Token ledger: transcript scan, dedupe, sidechain rollup, Codex thread totals, per-model split</td><td>0</td></tr>
+  <tr><td>4</td><td>Weight prior + fitting job; <code>prior</code>/<code>fitted</code> labelling</td><td>2, 3</td></tr>
+  <tr><td>5</td><td><code>sm usage</code>, <code>sm children</code> column, HTTP endpoint</td><td>4</td></tr>
+</table>
+</div>
+
+<p>Phase 2 is unusually cheap. The statusLine payload already carries
+<code>rate_limits.five_hour.used_percentage</code> and <code>.seven_day.used_percentage</code>, the hook
+already POSTs to an endpoint <code>sm</code> owns, and <code>hooks/context_monitor.sh</code> lines 53–56
+currently drop both fields on the floor. Forwarding them is a <code>jq</code> filter change plus two struct
+fields.</p>
+
+<h2>Risks</h2>
+
+<div class="tw">
+<table>
+  <tr><th>Risk</th><th>Severity</th><th>Mitigation</th></tr>
+  <tr><td>Weight fit stays ill-conditioned because model mixes correlate with time of day</td><td>High</td><td>Report conditioning; hold the prior and label output <code>prior</code> rather than shipping a badly-fitted weight silently</td></tr>
+  <tr><td><code>~/.claude.json</code> internals are undocumented and version-pinned</td><td>High</td><td>Three redundant sources; validate shape per read; report <code>unknown</code> with data age rather than a stale number stated confidently</td></tr>
+  <tr><td>Integer-percent quantisation slows convergence</td><td>Medium</td><td>Accumulate intervals until Δburn ≥ 1; fit over weeks, never per-sample</td></tr>
+  <tr><td>Switch detection latency mis-books messages near a boundary</td><td>Medium</td><td>30 s poll bounds it; record the boundary as an uncertainty window; switches follow exhaustion, when the old account has little headroom left to mis-book</td></tr>
+  <tr><td>Transcript volume (345 MB, ~15 MB/day) makes scans slow</td><td>Medium</td><td>Per-file byte-offset checkpoints; full rescan only on <code>--rebuild</code></td></tr>
+  <tr><td>Usage writes through <code>sessions.json</code> would serialise against every session mutation</td><td>Medium</td><td>Separate SQLite in WAL mode; <code>sessions.json</code> stays the lineage source of truth</td></tr>
+  <tr><td>~460 seats carry <code>model: unset</code></td><td>Medium</td><td>Resolve against the provider launch config default at scan time and record the resolved value; Claude transcripts carry the real model per message and override</td></tr>
+  <tr><td>Codex model families absent from published price lists</td><td>Low</td><td>Uniform prior for missing entries; the fit supplies the real ratio within a window or two</td></tr>
+</table>
+</div>
+
+<hr class="major">
+
+<h1>Appendices</h1>
+
+<h2>A · Provider surfaces</h2>
+<p class="sub">All payloads below were read from this machine on 2026-08-10.</p>
+
+<h3>A.1 Claude — <code>~/.claude.json</code> → <code>cachedUsageUtilization</code></h3>
+<p>Primary source. Refreshed by Claude Code via <code>GET /api/oauth/usage</code>; observed 6 minutes
+stale at read and consistent with <code>/usage</code>.</p>
+
+<pre><code>"cachedUsageUtilization": {
+  "fetchedAtMs": 1786381198050,
+  "accountUuid": "&lt;uuid&gt;",
+  "utilization": {
+    "five_hour": {"utilization": 9, "resets_at": "2026-08-10T20:39:59.641317+00:00",
+                  "limit_dollars": null, "used_dollars": null, "remaining_dollars": null},
+    "seven_day": {"utilization": 8, "resets_at": "2026-08-16T16:00:00.641341+00:00", ...},
+    "seven_day_opus": null,          // ← null on this plan
+    "seven_day_sonnet": null,        // ← null on this plan
+    "seven_day_oauth_apps": null,
+    "extra_usage": {"is_enabled": true, "monthly_limit": 14885, "used_credits": 0,
+                    "currency": "USD", "decimal_places": 2, "spend_limit_reached": false,
+                    "user_disabled": false, "credits_ever_enabled": true},
+    "limits": [
+      {"kind": "session",       "group": "session", "percent": 9, "severity": "normal",
+       "resets_at": "...", "scope": null, "is_active": true},
+      {"kind": "weekly_all",    "group": "weekly",  "percent": 8, "severity": "normal",
+       "resets_at": "...", "scope": null, "is_active": false},
+      {"kind": "weekly_scoped", "group": "weekly",  "percent": 7, "severity": "normal",
+       "resets_at": "...", "is_active": false,
+       "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+    ],
+    "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+              "limit": {"amount_minor": 14885, ...}, "percent": 0, "enabled": true}
+  }
+}</code></pre>
+
+<ul>
+  <li><code>percent</code> / <code>utilization</code> are <strong>integers</strong> 0–100 — the quantisation that governs fit convergence.</li>
+  <li><code>resets_at</code> is ISO-8601 with offset. <code>severity</code> ∈ <code>normal | warning | critical</code>. <code>is_active</code> marks the currently binding limit.</li>
+  <li><code>kind</code> ∈ <code>session | weekly_all | weekly_scoped</code>; only <code>weekly_scoped</code> carries <code>scope.model.display_name</code>.</li>
+  <li>Client-internal <code>rateLimitType</code> enum: <code>five_hour | seven_day | seven_day_opus | seven_day_sonnet | seven_day_overage_included | overage</code>. The Opus and Sonnet variants exist in the schema but are unpopulated here.</li>
+  <li><code>extra_usage</code> means 100% is a soft wall — work spills into paid credits (ceiling $148.85/month) rather than stopping.</li>
+  <li>Undocumented and version-pinned. Validate shape on every read; never fail closed on a missing key.</li>
+</ul>
+
+<h4>The scoped weekly limit is a sub-cap, not a second budget</h4>
+<p>This is the single most important semantic in the whole design, and it is officially documented:
+<em>"Fable 5 draws from your plan's regular weekly usage limits and uses them faster than other Claude
+models"</em>, and <em>"You can use up to 50% of your weekly usage limits on Fable 5 at no extra
+cost."</em></p>
+
+<p>So a premium-model token decrements <strong>both</strong> meters; every other model's tokens decrement
+only <code>weekly_all</code>. <code>weekly_scoped</code> is a ceiling on how much of the one pool the
+premium model may consume, not a separate pool. Consequences:</p>
+
+<ul>
+  <li><strong>Exhausting the scoped meter does not stop work.</strong> The user is offered two paths — continue on paid usage credits, or switch models and keep working against the remaining overall pool. Shipped UI copy: <em>"You've reached your Fable 5 limit"</em>, <em>"Buy more to keep using Fable 5, or switch models to keep working."</em>, and even a runway hint, <em>"try /model opus [N] more runway"</em>.</li>
+  <li><strong>Exhausting the overall pool does stop everything</strong>, and any unused scoped headroom is moot — it was never a balance, only an unused fraction of a ceiling.</li>
+  <li>Therefore the <strong>binding limit is model-dependent</strong>: a premium seat is blocked by whichever of the two meters hits 100% first; every other seat is blocked only by <code>weekly_all</code>. The report must say which one binds (C.8).</li>
+</ul>
+
+<p><strong>Do not hard-code the premium model.</strong> The scoped slot has moved repeatedly — Opus-specific
+when weekly limits launched (Aug 2025), removed and re-pointed at Sonnet (Nov 2025), now Fable. Team
+Premium seats scope Sonnet today while Max scopes Fable, so the answer differs by plan on the same date.
+The legacy hard-coded fields <code>seven_day_opus</code> / <code>seven_day_sonnet</code> survive in the
+schema but read <code>null</code>; the live path is the generic <code>scope.model.display_name</code>
+pointer. Read it, map it to a model family, and treat "which model is scoped" as data.</p>
+
+<p><strong>The 50% ratio is plan-dependent too.</strong> It applies to Max, Team Premium, and Enterprise
+Premium seats. On Pro and Standard Team the premium model is not included in weekly limits at all — it
+runs purely on paid credits, so there is no sub-cap to reason about. Key the ratio off
+<code>organizationRateLimitTier</code> rather than assuming.</p>
+
+<blockquote>
+  <p><strong>Two different 50%s — do not conflate them.</strong> Alongside the sub-cap ratio, this machine's
+  feature-flag cache currently carries <code>tengu_rate_limit_promo_notices</code> with
+  <em>"+50% weekly limits promo through Aug 19"</em> — a temporary boost to the <em>overall</em> weekly
+  cap, unrelated to the premium sub-cap. It matters beyond naming: a promo starting or ending changes the
+  denominator that every reported percentage is relative to, mid-window. See D.4.</p>
+</blockquote>
+
+<h3>A.2 Claude — statusLine hook payload</h3>
+<p>Push source, already wired into <code>sm</code>.</p>
+
+<pre><code>{
+  "session_id": "...", "cwd": "...",
+  "model": {"id": "...", "display_name": "..."},
+  "version": "2.1.226",
+  "cost": {"total_cost_usd": 0.0, "total_duration_ms": 0, "total_api_duration_ms": 0,
+           "total_lines_added": 0, "total_lines_removed": 0},
+  "context_window": {"total_input_tokens": 0, "total_output_tokens": 0,
+                     "context_window_size": 200000, "current_usage": {...},
+                     "used_percentage": 0.0, "remaining_percentage": 0.0},
+  "exceeds_200k_tokens": false,
+  "rate_limits": {                          // present when utilization data exists
+    "five_hour": {"used_percentage": 9, "resets_at": "..."},
+    "seven_day": {"used_percentage": 8, "resets_at": "..."}
+  }
+}</code></pre>
+
+<p><code>hooks/context_monitor.sh</code> selects only <code>.context_window.used_percentage</code> and
+<code>.context_window.total_input_tokens</code> (lines 53–56) and re-reads <code>used_percentage</code>
+for rendering (line 100). The <code>rate_limits</code> block is discarded. Note the payload also carries
+<code>model.id</code> per render — a second per-seat model signal.</p>
+
+<h3>A.3 Claude — <code>claude -p "/usage"</code></h3>
+<p>Non-interactive, costs nothing (<code>total_cost_usd: 0</code>, <code>num_turns: 0</code>,
+<code>duration_api_ms: 0</code>). With <code>--output-format json</code> the text lands in <code>.result</code>:</p>
+
+<pre><code>Current session: 10% used · resets Aug 10 at 1:39pm (America/Los_Angeles)
+Current week (all models): 8% used · resets Aug 16 at 9am (America/Los_Angeles)
+Current week (Fable): 7% used · resets Aug 16 at 9am (America/Los_Angeles)</code></pre>
+
+<p>Aug 16 2026 is a Sunday, so the weekly reset is Sunday 09:00 local today — read it, do not
+assume it. Text format: parse defensively, treat as tertiary. <code>/usage</code>, <code>/cost</code>,
+<code>/stats</code> are aliases; none takes <code>--json</code>.</p>
+
+<h3>A.4 Claude — account identity</h3>
+<pre><code>$ claude auth status --json        # --json is the default; ~0.2 s, local read
+{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty",
+ "email": "...", "orgId": "41a8ca2d-...", "orgName": "...", "subscriptionType": "max"}</code></pre>
+
+<div class="tw">
+<table>
+  <tr><th><code>~/.claude.json</code> → <code>oauthAccount</code></th><th>Use</th></tr>
+  <tr><td><code>accountUuid</code></td><td><strong>Ledger key.</strong> Immutable across email and org renames</td></tr>
+  <tr><td><code>emailAddress</code></td><td>Human label</td></tr>
+  <tr><td><code>organizationUuid</code></td><td>Matches <code>orgId</code>; identifies the org, not the person</td></tr>
+  <tr><td><code>organizationRateLimitTier</code></td><td><strong>Exact plan tier</strong> — <code>default_claude_max_20x</code> here. <code>auth status</code> returns only <code>"max"</code></td></tr>
+  <tr><td><code>hasExtraUsageEnabled</code></td><td>Whether 100% is a soft wall</td></tr>
+</table>
+</div>
+
+<p>Credentials live in the macOS Keychain (<code>Claude Code-credentials</code>); its <code>acct</code> field is
+the OS username, not the Claude identity. Never read the secret.</p>
+
+<h3>A.5 Codex — <code>account/rateLimits/updated</code></h3>
+<p><code>sm</code> already writes this to
+<code>&lt;log_dir&gt;/&lt;basename&gt;.codex-fork.events.jsonl</code>. Verified live:</p>
+
+<pre><code>{"schema_version":2,"ts":"2026-08-10T17:02:03.430Z","session_id":"unknown","seq":447010,
+ "session_epoch":1,"event_type":"account/rateLimits/updated",
+ "payload":{"rateLimits":{"limitId":"codex","limitName":null,
+   "primary":{"usedPercent":31,"windowDurationMins":10080,"resetsAt":1786825765},
+   "secondary":null,
+   "credits":{"hasCredits":false,"unlimited":false,"balance":"0"},
+   "individualLimit":null,"spendControlReached":null,
+   "planType":"pro","rateLimitReachedType":null}}}</code></pre>
+
+<p>Parsing rules that matter:</p>
+<ul>
+  <li><strong>Sparse rolling merge.</strong> A null field means "no update", not "cleared". Merge non-null values onto the last snapshot; never overwrite wholesale.</li>
+  <li><strong>Key windows by <code>(limitId, windowDurationMins)</code>, not by <code>primary</code>/<code>secondary</code> position</strong> — the same window has been observed in either slot.</li>
+  <li><code>windowDurationMins</code>: 300 = 5 h, 1440 = daily, 10080 = weekly, 43200 = monthly, 525600 = annual.</li>
+  <li><code>resetsAt</code> is Unix seconds. <code>session_id</code> is literally <code>"unknown"</code>; the file path identifies the session.</li>
+  <li><strong>Field-name skew.</strong> Rollout JSONL and the exec stream use snake_case (<code>used_percent</code>, <code>window_minutes</code>, <code>resets_at</code>); the app-server v2 surface — which is what the codex-fork stream carries — uses camelCase (<code>usedPercent</code>, <code>windowDurationMins</code>, <code>resetsAt</code>). Historical files may carry <code>resets_in_seconds</code> (relative) instead of an absolute reset.</li>
+  <li><strong>All models share one bucket.</strong> Across 93,825 real rate-limit events in 442 local event streams, <code>limitId</code> is <code>"codex"</code> in every sample carrying data and <code>limitName</code> is <code>null</code> in <em>all</em> of them. <code>rateLimitsByLimitId</code> — the multi-bucket map in <code>GetAccountRateLimitsResponse</code> — never appears, because the fork records the sparse <code>account/rateLimits/updated</code> stream rather than the batched read response. A <code>limitId: "premium"</code> bucket appears 4 times with <code>primary</code> and <code>secondary</code> both null, i.e. never carrying usage. The per-model bucket mechanism is real in the protocol (headers are templated <code>x-{limit_id}-primary-used-percent</code>, and <code>limit_name</code> can hold a model slug) but is <strong>not in use on this account</strong>. Treat Codex as one shared account-wide bucket.</li>
+  <li><code>credits</code> is <code>{"hasCredits": false, "unlimited": false, "balance": "0"}</code> in every sample — this account has never been observed on credit metering despite the April 2026 rollout. <code>rateLimitReachedType</code> is null in all 93,825 samples; the account has not hit a limit locally.</li>
+  <li>Window distribution observed: 85,825 sparse updates carrying only a 10080-min primary; 7,962 full snapshots carrying 300-min primary + 10080-min secondary; 33 carrying a 43200-min primary. This is the concrete reason to merge sparsely and key by <code>(limitId, windowDurationMins)</code> rather than by slot.</li>
+  <li><code>planType</code> ∈ <code>free, go, plus, pro, prolite, team, self_serve_business_prolite, self_serve_business_usage_based, business, ent26, enterprise_cbp_automation, enterprise_cbp_usage_based, enterprise, edu, unknown</code>. There is <strong>no "Max" plan</strong> — "Codex Max" names the model <code>gpt-5.1-codex-max</code>. This account reports <code>pro</code>, and the wire format does not distinguish Pro 5× from Pro 20×.</li>
+</ul>
+
+<h3>A.6 Codex — per-thread token totals</h3>
+<pre><code>{"threadId":"019fd93f-...","turnId":"019fec9f-...",
+ "tokenUsage":{
+   "total":{"totalTokens":1723201841,"inputTokens":1722233031,"cachedInputTokens":1701731072,
+            "cacheWriteInputTokens":0,"outputTokens":968810,"reasoningOutputTokens":158043},
+   "last":{"totalTokens":149580, ...},
+   "modelContextWindow":258400}}</code></pre>
+
+<p><code>sm</code> parses this event today but reads only <code>tokenUsage.last.totalTokens</code> for context
+occupancy and discards <code>tokenUsage.total</code> (<code>sessions.rs:3423-3462</code>, with a doc comment
+noting the omission). <code>total</code> is the cumulative per-thread spend this feature needs; take deltas
+between consecutive observations.</p>
+
+<blockquote>
+  <p><strong><code>reasoningOutputTokens</code> is a subset of <code>outputTokens</code>, not an addend.</strong>
+  Verified numerically on a real sample: <code>inputTokens 14274 + outputTokens 311 = totalTokens 14585</code>
+  exactly, while <code>reasoningOutputTokens</code> is 115 — inside the 311. Source confirms it: the CLI prints
+  reasoning as a parenthetical annotation on output and never adds it to the total. Summing reasoning
+  alongside output double-counts every reasoning token, which would inflate exactly the high-effort premium
+  seats this design exists to measure. Carry it as an informational column only.</p>
+</blockquote>
+
+<h4>Model and effort per turn</h4>
+<p>The token event carries no model. Model and reasoning effort arrive on a <em>separate</em> notification
+keyed by the same <code>threadId</code>:</p>
+
+<pre><code>{"event_type":"thread/settings/updated","payload":{
+  "threadId":"019fc223-0000-7000-0000-000000000000",
+  "threadSettings":{"model":"gpt-5.6-sol","modelProvider":"openai","effort":"high",
+    "serviceTier":"default",
+    "collaborationMode":{"mode":"default",
+      "settings":{"model":"gpt-5.6-sol","reasoning_effort":"high", ...}}}}}</code></pre>
+
+<p><strong>Attribution recipe:</strong> join each <code>thread/tokenUsage/updated</code> to the most recent
+<em>preceding</em> <code>thread/settings/updated</code> for the same <code>threadId</code>. Settings change
+mid-thread — the user switches with <code>/model</code>, and Codex itself nudges a switch at 90% (below) — so
+this must be a temporal lookup, not a one-time read. The rollout-file equivalent is a
+<code>type: "turn_context"</code> line carrying <code>model</code> and <code>effort</code> per turn.</p>
+
+<p>This is strictly better than reading <code>SessionRecord.model</code>: it is per-turn, it captures
+mid-session model changes, and it needs no fallback for seats recorded as <code>unset</code>. Keep the
+registry value only as a backstop when no settings event precedes the first token event.</p>
+
+<p><strong>Codex nudges model switches on quota pressure</strong> — precedent worth knowing:
+<code>RATE_LIMIT_SWITCH_PROMPT_THRESHOLD = 90.0</code> and <code>NUDGE_MODEL_SLUG = "gpt-5.6-luna"</code>. At
+90% of the shared bucket the TUI offers to switch to Luna "for lower credit usage". Codex therefore agrees
+that models burn the shared bucket at materially different rates — it just never tells a client what those
+rates are.</p>
+
+<h3>A.7 Codex — account identity</h3>
+<pre><code>{"auth_mode": "chatgpt", "OPENAI_API_KEY": null,
+ "tokens": {"id_token": "&lt;JWT&gt;", "access_token": "&lt;JWT&gt;", "refresh_token": "rt.1...",
+            "account_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+ "last_refresh": "2026-08-10T15:26:56.753405Z"}</code></pre>
+
+<ul>
+  <li><code>tokens.account_id</code> is plaintext and is the <strong>ledger key</strong> — byte-identical to the <code>chatgpt_account_id</code> JWT claim, and the dimension quota is metered against.</li>
+  <li>Plan tier: decode the <code>id_token</code> middle segment → <code>https://api.openai.com/auth.chatgpt_plan_type</code>, or take <code>planType</code> free from every rate-limit event.</li>
+  <li><code>email</code> is a top-level JWT claim; <code>chatgpt_user_id</code> identifies the human and differs from <code>account_id</code>.</li>
+  <li><code>codex login status</code> prints only <code>Logged in using ChatGPT</code>; <code>codex doctor --json</code> likewise exposes no identity.</li>
+</ul>
+
+<h3>A.8 Switch detection</h3>
+<div class="tw">
+<table>
+  <tr><th>Provider</th><th>Watch</th><th>Compare</th><th>Do <em>not</em> trigger on</th></tr>
+  <tr><td>Claude</td><td><code>~/.claude.json</code></td><td><code>oauthAccount.accountUuid</code></td><td>mtime — rewritten constantly for unrelated reasons</td></tr>
+  <tr><td>Codex</td><td><code>~/.codex/auth.json</code></td><td><code>tokens.account_id</code>; file absence = logged out</td><td><code>last_refresh</code> / mtime — routine refresh rewrites the whole file, roughly hourly in active use</td></tr>
+</table>
+</div>
+
+<p>Codex's refresh path errors explicitly on an account mismatch ("Your access token could not be
+refreshed because you have since logged out or signed in to another account"), which guarantees
+routine refresh never silently rotates the account. Poll every 30 s; record the boundary as an
+uncertainty window bounded by the interval, not an instant.</p>
+
+<h3>A.9 Exhaustion signals</h3>
+<p><strong>Claude</strong> writes a synthetic transcript entry:</p>
+<pre><code>{"type":"assistant",
+ "message":{"model":"&lt;synthetic&gt;","role":"assistant","stop_reason":"stop_sequence",
+   "usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,
+            "cache_read_input_tokens":0},
+   "content":[{"type":"text","text":"API Error: 529 Overloaded. ..."}]},
+ "requestId":"req_...","error":"server_error","isApiErrorMessage":true,"apiErrorStatus":529}</code></pre>
+
+<p>The mechanism is generic across 400/429/500/529. The exact <code>error</code> string for a usage-limit
+429 was not observed locally (this machine's history holds only <code>{500: 5, 529: 2}</code>) — match on
+<code>apiErrorStatus == 429</code> and treat <code>error</code> as informational. 529 is explicitly not a usage
+limit; the client copy reads "Server is temporarily limiting requests (not your usage limit)".</p>
+
+<p><strong>Codex</strong> emits both a <code>TokenCount</code> event carrying
+<code>rate_limits.rateLimitReachedType</code> and a separate formatted error. Body:
+<code>{"error": {"type": "usage_limit_reached", "plan_type": "pro", "resets_at": 1738888888}}</code>.
+<code>rateLimitReachedType</code> ∈ <code>rate_limit_reached | workspace_owner_credits_depleted |
+workspace_member_credits_depleted | workspace_owner_usage_limit_reached |
+workspace_member_usage_limit_reached</code>. <code>usage_not_included</code> is a distinct sibling meaning
+the account is not entitled at all.</p>
+
+<p>Record exhaustion as a hard marker: it is the one moment an account is known to be at 100%, it
+anchors the regression, and it usually immediately precedes a manual account switch.</p>
+
+<h2>B · Data model</h2>
+
+<p>New SQLite database at <code>~/.local/share/claude-sessions/usage.db</code>, WAL mode. Deliberately not
+<code>sessions.json</code>: that file is rewritten in full under a single global mutex on every mutation, so
+per-turn usage writes there would serialise against every session operation on the machine.</p>
+
+<pre><code>-- Accounts seen, per provider.
+CREATE TABLE accounts (
+  account_key   TEXT PRIMARY KEY,   -- 'claude:&lt;accountUuid&gt;' | 'codex:&lt;account_id&gt;'
+  provider      TEXT NOT NULL,
+  external_id   TEXT NOT NULL,
+  label         TEXT,               -- email, for humans
+  plan_tier     TEXT,               -- 'default_claude_max_20x' | 'pro' | ...
+  first_seen    TEXT NOT NULL,
+  last_seen     TEXT NOT NULL
+);
+
+-- Which account was signed in, when. Half-open [from_ts, to_ts).
+CREATE TABLE account_timeline (
+  provider          TEXT NOT NULL,
+  account_key       TEXT NOT NULL REFERENCES accounts(account_key),
+  from_ts           TEXT NOT NULL,
+  to_ts             TEXT,                        -- NULL = current
+  from_uncertain_ms INTEGER NOT NULL DEFAULT 0,  -- poll-interval boundary width
+  PRIMARY KEY (provider, from_ts)
+);
+
+-- One agent identity spans many provider session ids. Append-only.
+CREATE TABLE seat_sessions (
+  seat_id             TEXT NOT NULL,
+  provider            TEXT NOT NULL,
+  provider_session_id TEXT NOT NULL,   -- Claude session uuid | Codex thread id
+  artifact_path       TEXT,
+  first_seen          TEXT NOT NULL,
+  last_seen           TEXT NOT NULL,
+  PRIMARY KEY (seat_id, provider_session_id)
+);
+CREATE INDEX idx_seat_sessions_provider ON seat_sessions(provider_session_id);
+
+-- Observed account burn. Append-only; every sample retained (the regression needs them).
+CREATE TABLE burn_samples (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_key  TEXT NOT NULL REFERENCES accounts(account_key),
+  window_kind  TEXT NOT NULL,   -- 'session_5h'|'weekly_all'|'weekly_scoped'|'codex_300'|'codex_10080'
+  window_scope TEXT,            -- model display name for weekly_scoped, else NULL
+  window_start TEXT NOT NULL,
+  percent      REAL NOT NULL,
+  resets_at    TEXT NOT NULL,
+  severity     TEXT,
+  is_active    INTEGER,
+  source       TEXT NOT NULL,   -- 'statusline'|'claude_json'|'codex_event'|'usage_cli'
+  observed_at  TEXT NOT NULL
+);
+CREATE INDEX idx_burn_window ON burn_samples(account_key, window_kind, observed_at);
+
+-- Per-seat token spend by model, deduped. The numerator, and the regression design matrix.
+CREATE TABLE seat_tokens (
+  seat_id            TEXT NOT NULL,
+  account_key        TEXT NOT NULL,
+  project_key        TEXT NOT NULL,   -- git-root-normalised; see B.1
+  window_kind        TEXT NOT NULL,
+  window_start       TEXT NOT NULL,
+  bucket_ts          TEXT NOT NULL,   -- minute bucket, for delta alignment with burn_samples
+  model              TEXT NOT NULL,   -- resolved, never 'unset'
+  effort             TEXT,            -- Codex reasoning effort, when known
+  input_tokens       INTEGER NOT NULL DEFAULT 0,
+  output_tokens      INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens   INTEGER NOT NULL DEFAULT 0,  -- SUBSET of output_tokens. Never add to the weight sum.
+  cache_write_5m     INTEGER NOT NULL DEFAULT 0,
+  cache_write_1h     INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+  message_count      INTEGER NOT NULL DEFAULT 0,
+  updated_at         TEXT NOT NULL,
+  PRIMARY KEY (seat_id, account_key, window_kind, window_start, bucket_ts, model)
+);
+CREATE INDEX idx_seat_tokens_fit ON seat_tokens(account_key, window_kind, bucket_ts);
+
+-- Fitted per-model weights, versioned so a bad fit can be rolled back.
+CREATE TABLE model_weights (
+  account_key   TEXT NOT NULL,
+  model         TEXT NOT NULL,
+  weight        REAL NOT NULL,       -- quota units per input-token equivalent
+  source        TEXT NOT NULL,       -- 'prior' | 'fitted'
+  n_samples     INTEGER NOT NULL,
+  condition_num REAL,
+  residual_rms  REAL,
+  fitted_at     TEXT NOT NULL,
+  PRIMARY KEY (account_key, model, fitted_at)
+);
+
+-- Incremental scan checkpoints.
+CREATE TABLE scan_offsets (
+  artifact_path TEXT PRIMARY KEY,
+  byte_offset   INTEGER NOT NULL,
+  last_uuid     TEXT,
+  mtime_ns      INTEGER NOT NULL,
+  scanned_at    TEXT NOT NULL
+);
+
+-- Dedupe register, window-scoped so it can be pruned.
+CREATE TABLE seen_messages (
+  dedupe_key   TEXT PRIMARY KEY,     -- hash(message_id, request_id)
+  message_id   TEXT NOT NULL,
+  is_sidechain INTEGER NOT NULL,
+  total_tokens INTEGER NOT NULL,
+  window_start TEXT NOT NULL
+);
+CREATE INDEX idx_seen_msgid ON seen_messages(message_id);
+
+-- Immutable snapshot of what a seat was, so history stays readable after the
+-- seat is renamed, reparented, or dropped from sessions.json. One row per seat
+-- per change; ledger rows join here rather than to the live registry.
+CREATE TABLE seat_meta (
+  seat_id      TEXT NOT NULL,
+  observed_at  TEXT NOT NULL,
+  friendly_name TEXT,
+  provider     TEXT NOT NULL,
+  model        TEXT,
+  project_key  TEXT NOT NULL,
+  working_dir  TEXT,
+  parent_seat_id TEXT,
+  root_seat_id TEXT,               -- denormalised; makes subtree rollups a single scan
+  PRIMARY KEY (seat_id, observed_at)
+);
+
+-- Closed windows. Append-only ledger; historic rate lives here.
+CREATE TABLE window_ledger (
+  account_key   TEXT NOT NULL,
+  window_kind   TEXT NOT NULL,
+  window_start  TEXT NOT NULL,
+  window_end    TEXT NOT NULL,
+  final_percent REAL,
+  exhausted     INTEGER NOT NULL DEFAULT 0,
+  closed_at     TEXT NOT NULL,
+  PRIMARY KEY (account_key, window_kind, window_start)
+);</code></pre>
+
+<p><code>SessionRecord</code> (<code>sessions.rs:6647</code>) gains two optional fields:
+<code>account_key: Option&lt;String&gt;</code> (observed, not assigned) and
+<code>usage_cap_fraction: Option&lt;f64&gt;</code> (owner-set cap, e.g. <code>0.2857</code>).</p>
+
+<h3>B.1 Two dimensions carried from day one</h3>
+<p>Both cost almost nothing to populate during the scan and are effectively impossible to backfill
+once the source data has aged out. Both exist for Appendix J.</p>
+
+<p><strong><code>project_key</code></strong> — several projects share every account, so "which project burned
+the account" is a question that will be asked, and <code>cwd</code> alone cannot answer it: a sibling
+worktree at <code>/Users/rajesh/worktrees/&lt;name&gt;</code> has a different <code>cwd</code> and a different
+Claude project slug from the repo it belongs to, so a naive grouping splits one project into many.
+Resolve to the git common directory (<code>git rev-parse --git-common-dir</code>, which collapses
+worktrees onto their parent repository) and fall back to the canonicalised <code>working_dir</code> when
+the seat is not in a repo. Store the resolved value on every row.</p>
+
+<p><strong><code>seat_meta</code></strong> — seats are renamed, reparented, and retired, and
+<code>sessions.json</code> is the live registry rather than an archive. Without a snapshot, a
+three-month-old ledger row degrades to an opaque 8-character id. <code>root_seat_id</code> is
+denormalised deliberately: it turns "everything under orchestrator X" from a recursive walk into a
+single indexed scan, which is the difference between a fast dashboard and a slow one.</p>
+
+<h2>C · Attribution pipeline</h2>
+
+<h3>C.1 Discovery</h3>
+<p>Claude transcripts live at
+<code>$CLAUDE_CONFIG_DIR/projects/&lt;slug&gt;/&lt;session-uuid&gt;.jsonl</code>. <code>CLAUDE_CONFIG_DIR</code> is
+comma-separated and defaults to <code>$XDG_CONFIG_HOME/claude</code> then <code>~/.claude</code>. The slug is the
+canonicalised absolute cwd with every <code>/</code> replaced by <code>-</code> —
+<code>sessions.rs:6300-6302</code> already reimplements this.</p>
+
+<p>Three layouts must be handled:</p>
+<ul>
+  <li><code>projects/&lt;project&gt;/&lt;session&gt;.jsonl</code> — normal</li>
+  <li><code>projects/&lt;project&gt;/&lt;session&gt;/chat.jsonl</code> — nested</li>
+  <li><code>projects/&lt;project&gt;/&lt;session&gt;/subagents/agent-&lt;id&gt;.jsonl</code> — subagent; the session id is the third-from-last path component, i.e. the parent's</li>
+</ul>
+
+<p>Worktrees: a sibling worktree (<code>/Users/rajesh/worktrees/&lt;name&gt;</code>) gets its own project
+directory. A nested <code>&lt;repo&gt;/.claude/worktrees/&lt;name&gt;</code> does not — the session stays in the
+original repo's directory and emits <code>type: "relocated"</code> and <code>type: "worktree-state"</code>
+markers. Neither affects attribution, which keys on seat → session id rather than on project.</p>
+
+<p>Volume on this machine: 40 project directories, 223 files, 345 MB, largest 17.2 MB, ~15 MB/day
+sustained. Use <code>scan_offsets</code> checkpointing; full rescan only on <code>--rebuild</code>.</p>
+
+<h3>C.2 Line filter</h3>
+<p>Keep a line only if all hold:</p>
+<ol>
+  <li>Raw bytes contain <code>"usage":{</code> — a cheap prefilter before any JSON parse.</li>
+  <li>None of <code>id, cwd, model, speed, costUSD, version, sessionId, requestId, isApiErrorMessage, cache_read_input_tokens, cache_creation_input_tokens</code> is explicitly <code>null</code>. (<code>content: null</code> is allowed.)</li>
+  <li>It deserialises with <code>message.usage</code> present.</li>
+  <li><code>version</code>, if present, starts with <code>N.N.N</code>.</li>
+  <li><code>sessionId</code>, <code>requestId</code>, <code>message.id</code>, <code>message.model</code>, if present, are non-empty.</li>
+  <li><code>timestamp</code> parses.</li>
+</ol>
+
+<p><code>message.model == "&lt;synthetic&gt;"</code> marks an error entry
+(<code>isApiErrorMessage: true</code>): count its raw tokens in totals, exclude it from the per-model
+breakdown, give it weight 0. Its usage counters are zero anyway.</p>
+
+<p>Cache-creation split: prefer
+<code>usage.cache_creation.ephemeral_5m_input_tokens</code> and <code>ephemeral_1h_input_tokens</code>
+when the nested object exists, since they carry different weights; fall back to the flat
+<code>cache_creation_input_tokens</code> at the 5-minute rate.</p>
+
+<h3>C.3 Dedupe — the correctness-critical step</h3>
+<p>The same assistant message appears in several files after resume, fork, and subagent runs. A
+subagent transcript <em>replays parent messages with new <code>requestId</code>s and inflated
+<code>cache_read_input_tokens</code></em>. Naive summing roughly doubles a busy seat.</p>
+
+<pre><code>key_exact = hash(message.id, requestId)
+key_loose = hash(message.id, NULL)
+
+on new entry E:
+  existing = lookup(key_exact)
+  if not existing and sidechain-ness differs for this message.id:
+      existing = lookup(key_loose)          # sidechain replay of a parent message
+  if existing:
+      replace only if should_replace(E, existing)
+  else:
+      insert E under both keys
+
+should_replace(cand, prev):
+  if cand.isSidechain != prev.isSidechain:
+      return prev.isSidechain               # the non-sidechain copy ALWAYS wins
+  if total_tokens(cand) != total_tokens(prev):
+      return total_tokens(cand) &gt; total_tokens(prev)   # streamed rewrite: keep the fuller
+  return cand.usage.speed is set and prev.usage.speed is not</code></pre>
+
+<p><code>total_tokens = input + output + cache_creation_total + cache_read</code>. The first rule is the
+one that matters: preferring the non-sidechain copy regardless of token count is exactly what
+prevents subagent cache-read inflation from being counted.</p>
+
+<h3>C.4 Sidechain → parent seat</h3>
+<p>Subagent lines carry <code>isSidechain: true</code>, an <code>agentId</code>, and the same
+<code>sessionId</code> as the parent. Because attribution maps <code>sessionId</code> → seat, subagent usage
+lands on the parent seat automatically. On this machine <code>isSidechain: true</code> never appears
+inside a main session file, so the <code>subagents/</code> path is a reliable secondary detector.</p>
+
+<p>Free cross-check: the parent transcript records a <code>type: "queue-operation"</code> completion line
+containing
+<code>&lt;usage&gt;&lt;subagent_tokens&gt;N&lt;/subagent_tokens&gt;&lt;tool_uses&gt;N&lt;/tool_uses&gt;&lt;duration_ms&gt;N&lt;/duration_ms&gt;&lt;/usage&gt;</code>
+— a pre-aggregated self-reported total with no model breakdown. Useful as a test assertion, not as
+a source.</p>
+
+<h3>C.5 Session chaining</h3>
+<p><code>sm</code> sets <code>transcript_path</code> and <code>provider_resume_id</code> on every Claude
+<code>Stop</code> hook (<code>sessions.rs:322-333</code>) by overwriting them;
+<code>provider_resume_id</code> is the transcript filename stem, i.e. the Claude session UUID
+(<code>sessions.rs:6006-6012</code>). When a session resumes under a new UUID the old one is lost, which
+loses its usage. Phase 0 fixes this: on every <code>Stop</code>, additionally
+<code>INSERT OR IGNORE</code> into <code>seat_sessions</code>. <code>transcript_path</code> stays as the
+"current" pointer for compatibility; the chain becomes the source of truth.</p>
+
+<p>Verified behaviours:</p>
+<ul>
+  <li><strong>Auto-compaction stays in the same file with the same session UUID</strong> — the marker is a <code>type: "user"</code> line with <code>isCompactSummary: true</code> and <code>isVisibleInTranscriptOnly: true</code>. No new chain entry needed. This build emits no <code>type: "summary"</code> / <code>leafUuid</code> lines at all.</li>
+  <li><strong>Resume behaviour is unverified.</strong> Binary strings reference a <code>sessionStore</code> / <code>transcript_mirror</code> subsystem consistent with same-file continuation, but no before/after example was found. The chain table is correct either way — a same-file resume simply produces no new row.</li>
+  <li>Codex-fork handoffs already mint a new <code>provider_resume_id</code>; treat each as a chain entry.</li>
+</ul>
+
+<p>Backfill: for each seat with a known <code>working_dir</code>, scan its project directory for transcripts
+whose <code>sessionId</code> is unclaimed and whose time range overlaps the seat's lifetime. Ambiguous
+matches go to <code>unassigned</code> rather than being guessed — mirroring the existing
+<code>MissingProviderResumeId</code> restore path (<code>sessions.rs:1180-1188</code>), which already
+refuses to guess in the same situation.</p>
+
+<h3>C.6 Model resolution</h3>
+<p>Every token bucket must carry a resolved model, never <code>unset</code>. Resolution order:</p>
+<ol>
+  <li><strong>Claude</strong>: <code>message.model</code> on the transcript line. Authoritative and per-message, so a mid-session model change is captured exactly. Observed aliases: <code>claude-opus-5</code>, <code>claude-fable-5</code>, <code>claude-opus-4-8</code>, <code>claude-sonnet-5</code>.</li>
+  <li><strong>Codex</strong>: the most recent <code>thread/settings/updated</code> preceding the token event for that <code>threadId</code>, giving both <code>model</code> and <code>effort</code> per turn (A.6). Mid-session model changes are captured.</li>
+  <li><strong>Codex fallback</strong>: <code>SessionRecord.model</code> for the seat, when no settings event precedes the first token event on a thread.</li>
+  <li><strong>Either, when both are absent or the record says <code>unset</code></strong>: the provider launch config default at the time the seat started (<code>claude.default_model</code>, <code>codex.default_model</code>, <code>codex_fork.default_model</code>). Persist the resolved value so a later config change cannot retroactively rewrite history.</li>
+</ol>
+
+<h3>C.7 Window assignment and the timeline join</h3>
+<p>For each deduped message:</p>
+<ol>
+  <li><code>account_key</code> = the <code>account_timeline</code> row covering <code>(provider, timestamp)</code>.</li>
+  <li><code>window_start</code> = derived per window by walking back from the observed <code>resets_at</code> by the window length. Claude's reset plus a known 5 h / 7 d length fixes the boundaries exactly; Codex supplies <code>windowDurationMins</code> directly.</li>
+  <li>Accumulate into <code>seat_tokens</code> at minute granularity so buckets align with <code>burn_samples</code> for the fit.</li>
+</ol>
+
+<p>Messages whose <code>sessionId</code> maps to no seat accumulate under the reserved seat id
+<code>unassigned</code>.</p>
+
+<h3>C.8 Report</h3>
+<div class="eq">
+units(seat, w)&nbsp;&nbsp;&nbsp;= Σ<sub>m,b</sub> tokens[m][b] × weight[m] × bucket_ratio[b]<br>
+account_units(w) = Σ over all seats incl. <code>unassigned</code><br>
+share(seat, w)&nbsp;&nbsp;&nbsp;= units(seat, w) / account_units(w)<br>
+burn(seat, w)&nbsp;&nbsp;&nbsp;&nbsp;= latest burn_samples.percent for (account, w) × share(seat, w)
+</div>
+
+<p><strong>Report the binding limit, not just the biggest number.</strong> A seat on the scoped premium
+model is blocked by whichever of <code>weekly_all</code> and <code>weekly_scoped</code> reaches 100%
+first; every other seat is blocked only by <code>weekly_all</code> (A.1). So the headroom a seat actually
+has is:</p>
+
+<div class="eq">
+headroom(seat) = 100 − weekly_all_pct&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if the seat's model is not scoped<br>
+headroom(seat) = min(100 − weekly_all_pct, 100 − weekly_scoped_pct)&nbsp;&nbsp; if it is
+</div>
+
+<p>These diverge in practice. An account at <code>weekly_all 8%</code> / <code>weekly_scoped 7%</code> has
+92 points of headroom for a Sonnet seat and 93 for a premium seat — but run premium-only and the scoped
+meter climbs twice as fast per point of pool, so it hits 100% with roughly half the pool untouched. At
+that moment the account reads "50% used" while premium seats can no longer run for free. Surfacing only
+<code>weekly_all</code> would show an orchestrator ample headroom that its own seats cannot reach.</p>
+
+<p>With <code>--include-children</code>, sum over descendants using the existing preorder walk
+(<code>collect_descendants_preorder</code>, <code>sessions.rs:5906-5928</code>), then compute the share once
+on the aggregate. <code>--since-reset</code> restricts to the current window; without it the report also
+prints the last three closed windows from <code>window_ledger</code>, so historic rate sits beside current
+burn.</p>
+
+<h2>D · Model weights</h2>
+
+<h3>D.1 Prior — Claude</h3>
+<p>Anthropic first-party list prices per million tokens, current as of 2026-08-10. Ratios are what
+matter; absolute scale cancels in <code>share</code>.</p>
+
+<div class="tw">
+<table>
+  <tr><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache write 5m</th><th class="num">Cache write 1h</th><th class="num">Cache read</th></tr>
+  <tr><td><code>claude-fable-5</code></td><td class="num">$10.00</td><td class="num">$50.00</td><td class="num">$12.50</td><td class="num">$20.00</td><td class="num">$1.00</td></tr>
+  <tr><td><code>claude-opus-5</code></td><td class="num">$5.00</td><td class="num">$25.00</td><td class="num">$6.25</td><td class="num">$10.00</td><td class="num">$0.50</td></tr>
+  <tr><td><code>claude-opus-4-8</code></td><td class="num">$5.00</td><td class="num">$25.00</td><td class="num">$6.25</td><td class="num">$10.00</td><td class="num">$0.50</td></tr>
+  <tr><td><code>claude-sonnet-5</code></td><td class="num">$3.00</td><td class="num">$15.00</td><td class="num">$3.75</td><td class="num">$6.00</td><td class="num">$0.30</td></tr>
+  <tr><td><code>claude-haiku-4-5</code></td><td class="num">$1.00</td><td class="num">$5.00</td><td class="num">$1.25</td><td class="num">$2.00</td><td class="num">$0.10</td></tr>
+</table>
+</div>
+
+<p>Bucket ratios are derived, not independently priced: cache write (5 m) = 1.25 × input, cache write
+(1 h) = 2 × input, cache read = 0.1 × input. <code>claude-sonnet-5</code> carries an introductory
+$2/$10 rate through 2026-08-31; prefer list price for stability and note the caveat.</p>
+
+<p><strong>Reasoning and thinking tokens are already inside <code>output_tokens</code> on both providers.</strong>
+Weight them at the output rate by weighting output; never add a separate reasoning term. Doing so
+double-counts precisely the high-effort premium seats this design exists to measure — the error
+would run the same direction as the one the weighting is meant to remove, and would look like
+confirmation rather than a bug.</p>
+
+<p>End-to-end spread Fable → Haiku is 10×. Opus → Sonnet is 1.67× on price alone — the larger
+observed gap between those seats comes from token volume, which token counting already captures.
+Whether subscription quota weights the families the same way as API price is unknown, which is the
+reason for D.3.</p>
+
+<h3>D.2 Prior — Codex</h3>
+<p>Per million tokens. <strong>Lower confidence than D.1</strong>: OpenAI's own pricing page was
+unreachable, so these are cross-corroborated from OpenRouter plus two or more independent aggregators
+per model. Input and output are multiply-sourced; cached-input is single-sourced and partly
+inconsistent with the usual 90%-off pattern, so treat cached rates as provisional and let the fit
+correct them.</p>
+
+<div class="tw">
+<table>
+  <tr><th>Model</th><th>Tier</th><th class="num">Input</th><th class="num">Cached input</th><th class="num">Output</th><th>Confidence</th></tr>
+  <tr><td><code>gpt-5.6-sol</code></td><td>frontier</td><td class="num">$5.00</td><td class="num">~$0.50</td><td class="num">$30.00</td><td>in/out high</td></tr>
+  <tr><td><code>gpt-5.6-terra</code></td><td>balanced</td><td class="num">$2.00</td><td class="num">~$0.25 ?</td><td class="num">$12.00</td><td>in/out medium</td></tr>
+  <tr><td><code>gpt-5.6-luna</code></td><td>economy</td><td class="num">$0.20</td><td class="num">~$0.10 ?</td><td class="num">$1.20</td><td>in/out medium</td></tr>
+  <tr><td><code>gpt-5.5</code></td><td>frontier, general</td><td class="num">$5.00</td><td class="num">$0.50</td><td class="num">$30.00</td><td>high</td></tr>
+  <tr><td><code>gpt-5.4</code></td><td>deprecated → terra</td><td class="num">$2.50</td><td class="num">~$0.25</td><td class="num">$15.00</td><td>in/out medium</td></tr>
+  <tr><td><code>gpt-5.4-mini</code></td><td>deprecated → luna</td><td class="num">$0.75</td><td class="num">$0.075</td><td class="num">$4.50</td><td>high</td></tr>
+  <tr><td><code>gpt-5.6-sol-wm</code>, <code>gpt-5.3-codex-spark</code>, <code>codex-auto-review</code></td><td>not on public API</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td>no price exists</td></tr>
+</table>
+</div>
+
+<p>Models not on the public API get a uniform prior of 1.0 and are resolved by the fit. Effort levels
+(<code>low</code> … <code>xhigh</code>, <code>max</code>, and <code>ultra</code> on Sol and Terra) need no separate
+weight, since effort changes token volume rather than the per-token rate.</p>
+
+<blockquote>
+  <p><strong>The backend does compute a true weighted unit, and it is walled off.</strong> Raw upstream
+  <code>response.completed</code> events carry <code>usage.codex_rollout_budget_units</code>, which is
+  demonstrably <em>not</em> linear in the token counts (100 input / 40 cached / 60 cache-write / 10 output
+  / 5 reasoning → 2.5 units). It powers a separate local sub-agent budget feature, is disabled on this
+  account, and is stripped from every client-facing schema
+  (<code>#[serde(skip_serializing)]</code>, <code>#[ts(skip)]</code>, <code>#[schemars(skip)]</code>) — zero
+  occurrences across all 442 local event streams. So a real weighting exists, it is not recoverable, and
+  fitting it from observed burn is the only route.</p>
+</blockquote>
+
+<h3>D.3 Deriving the premium share exactly, then fitting the rest</h3>
+
+<p>Because the scoped meter is a sub-cap of known size (A.1), the premium family's contribution to
+account burn is arithmetic, not inference. Writing <code>C</code> for the overall weekly cap, the scoped
+cap is <code>r·C</code> with <code>r = 0.50</code> published:</p>
+
+<div class="eq">
+premium_share_of_pool&nbsp;&nbsp;= weekly_scoped_pct × r<br>
+rest_share_of_pool&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= weekly_all_pct − (weekly_scoped_pct × r)<br>
+<br>
+worked, from this account: 7 × 0.50 = <strong>3.5</strong> points of the pool from the premium model<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 8 − 3.5 = <strong>4.5</strong> points from everything else<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; → the premium family is 44% of this week's burn
+</div>
+
+<p>This settles the question that motivated the weighting work in the first place — whether premium
+tokens get over- or under-penalised. They get neither: their share of the pool is read off two
+first-party numbers and a published constant. Any premium seat's own burn is then that 3.5 points
+apportioned by its share of premium tokens, which is a within-family split where model weight cancels
+entirely.</p>
+
+<p>It also strengthens the fit for everything else. Substituting the premium term out of the overall
+equation removes one unknown <em>and</em> the family with the widest price spread, leaving a
+better-conditioned system over the sub-premium models alone.</p>
+
+<h3>D.4 Fitting the remainder</h3>
+<p>Within a window, burn is cumulative and monotone. For consecutive burn samples <em>i</em> and
+<em>i+1</em> on the same account and window, with the premium contribution already subtracted:</p>
+
+<div class="eq">
+Δburn<sub>i</sub> = Σ<sub>m</sub> w<sub>m</sub> · Δunits<sub>m,i</sub> + ε<sub>i</sub><br>
+<br>
+where Δunits<sub>m,i</sub> = Σ<sub>b</sub> tokens[m][b] in (t<sub>i</sub>, t<sub>i+1</sub>] × bucket_ratio[b]
+</div>
+
+<p>Procedure:</p>
+<ol>
+  <li>Bucket <code>seat_tokens</code> by minute; align to burn samples by timestamp.</li>
+  <li>Coalesce consecutive intervals until Δburn ≥ 1 percentage point, so quantisation noise does not dominate.</li>
+  <li>Solve non-negative least squares for <code>w</code>, ridge-regularised toward the D.1/D.2 prior.</li>
+  <li>Record condition number and residual RMS in <code>model_weights</code>.</li>
+  <li>Accept the fit only if the condition number is below threshold and at least <em>N</em> intervals contributed; otherwise keep the prior and label output <code>prior</code>.</li>
+</ol>
+
+<p><strong>Identifiability.</strong> The fit needs intervals in which model mixes differ. With many seats on
+different families active at different times this is satisfied naturally, but it is not guaranteed —
+if the fleet runs one family exclusively for a week, that week yields no information about the others.
+Report conditioning rather than silently returning an arbitrary solution from a singular system.</p>
+
+<blockquote>
+  <p><strong>Segment the fit at every cap change.</strong> Reported burn is a percentage of a cap that can
+  move: promotional boosts (this account currently carries a "+50% weekly limits" promo expiring
+  Aug 19), plan changes, and Anthropic's periodic limit adjustments all rescale the denominator without
+  announcing themselves in the utilization payload. A Δburn straddling such a change is not a valid
+  equation and will silently corrupt the weights. Detect a change three ways — a promo notice in the
+  feature-flag cache, a shift in <code>organizationRateLimitTier</code>, and a burn percentage that
+  <em>decreases</em> without a window reset — and start a new fit segment at each. Never pool observations
+  across a boundary; prefer discarding a segment to fitting through one.</p>
+</blockquote>
+
+<p><strong>Codex has no scoped meter</strong>, so all three families there are fitted from the single shared
+bucket with no exact term to substitute out. Expect Codex weights to converge more slowly than Claude's
+and to carry wider error bars. Report them separately rather than presenting one blended confidence.</p>
+
+<h2>E · sm integration points</h2>
+
+<p>Rust crate <code>crates/sm-server</code>, one launchd job
+(<code>com.rajeshgoli.session-manager-rust</code>), one global registry. The Python <code>src/</code> tree is
+dormant.</p>
+
+<div class="tw">
+<table>
+  <tr><th>Concern</th><th>Location</th><th>Change</th></tr>
+  <tr><td>Session record</td><td><code>sessions.rs:6647-6775</code></td><td>Add <code>account_key</code>, <code>usage_cap_fraction</code></td></tr>
+  <tr><td>Lineage</td><td><code>sessions.rs:3224</code></td><td>None — <code>parent_session_id</code> is already correct</td></tr>
+  <tr><td>Descendant walk</td><td><code>sessions.rs:5906-5928</code></td><td>Reuse as-is</td></tr>
+  <tr><td>Claude Stop hook</td><td><code>sessions.rs:259-362</code>, <code>http.rs:1300-1388</code></td><td>Append to <code>seat_sessions</code> rather than overwrite only</td></tr>
+  <tr><td>statusLine ingest</td><td><code>http.rs:1402-1466</code>; <code>ContextUsageEvent</code> at <code>sessions.rs:3714</code></td><td>Add <code>five_hour_percent</code>, <code>five_hour_resets_at</code>, <code>seven_day_percent</code>, <code>seven_day_resets_at</code></td></tr>
+  <tr><td>statusLine hook script</td><td><code>hooks/context_monitor.sh:46-56</code></td><td>Extend the <code>jq</code> filter to forward <code>.rate_limits.*</code></td></tr>
+  <tr><td>Codex token parse</td><td><code>sessions.rs:3423-3462</code></td><td>Also read <code>tokenUsage.total</code>; today only <code>.last</code> is used</td></tr>
+  <tr><td>Codex rate-limit parse</td><td><em>does not exist</em></td><td>New handler for <code>account/rateLimits/updated</code> — currently referenced only in a test fixture at <code>http.rs:13344</code>, where it is deliberately ignored</td></tr>
+  <tr><td>Codex artifacts</td><td><code>runtime.rs:1105-1115</code></td><td>Reuse path computation</td></tr>
+  <tr><td>Child env</td><td><code>runtime.rs:1240-1249</code></td><td>None — account is observed, not injected</td></tr>
+  <tr><td>Config</td><td><code>config.rs:13-41</code> + <code>RawConfig</code> at <code>config.rs:1087</code></td><td>New <code>usage:</code> section</td></tr>
+  <tr><td>CLI</td><td><code>bin/sm.rs</code> — clap enum <code>:34-97</code>, args <code>:182-193</code>, dispatch <code>:729-766</code></td><td>New <code>Usage(UsageArgs)</code></td></tr>
+  <tr><td>Children output</td><td><code>bin/sm.rs:3606-3619</code> (<code>format_child_line</code>)</td><td>Append a burn column</td></tr>
+  <tr><td>Routes</td><td><code>http.rs:886-1042</code></td><td><code>GET /sessions/{id}/usage</code>, <code>GET /usage/accounts</code></td></tr>
+  <tr><td>Deploy</td><td><code>scripts/restart-rust-server.sh</code></td><td>Mandatory; never hand-roll <code>launchctl kickstart</code></td></tr>
+</table>
+</div>
+
+<blockquote>
+  <p><strong>Do not build on <code>codex_events.db</code>.</strong> Its <code>codex_session_events</code> table has no
+  writer in the current crate and stopped receiving rows on 2026-06-17; the three
+  <code>/sessions/{id}/codex-*</code> endpoints that read it are gated to
+  <code>provider == "codex-app"</code>, a retired provider. The live source is the per-session
+  <code>.codex-fork.events.jsonl</code> file.</p>
+</blockquote>
+
+<h3>E.1 Config</h3>
+<pre><code>usage:
+  enabled: true
+  poll_interval_secs: 30        # account identity + ~/.claude.json
+  scan_interval_secs: 60        # transcript incremental scan
+  db_path: ~/.local/share/claude-sessions/usage.db
+  fit:
+    min_intervals: 40           # below this, hold the prior
+    max_condition_number: 50.0
+    min_delta_burn_pct: 1.0     # coalesce intervals to at least this
+  accounts:
+    - key: "claude:0e22ff27-..."
+      label: "primary"
+    - key: "codex:aaaaaaaa-..."
+      label: "codex-a"</code></pre>
+
+<p>No denominator field, and no per-model weight field — weights are fitted state, not configuration.</p>
+
+<h3>E.2 CLI</h3>
+<pre><code>sm usage [AGENT] [--include-children] [--since-reset] [--account] [--by-model] [--json]</code></pre>
+
+<div class="tw">
+<table>
+  <tr><th>Flag</th><th>Behaviour</th></tr>
+  <tr><td><em>(none)</em></td><td>Current seat, current windows</td></tr>
+  <tr><td><code>AGENT</code></td><td>Named seat or session id</td></tr>
+  <tr><td><code>--include-children</code></td><td>Roll up the descendant subtree</td></tr>
+  <tr><td><code>--since-reset</code></td><td>Current window only; otherwise also prints the last three closed windows</td></tr>
+  <tr><td><code>--account</code></td><td>Account view: every seat's share, including <code>unassigned</code></td></tr>
+  <tr><td><code>--by-model</code></td><td>Break the seat's own burn down by model family, with the weight source</td></tr>
+  <tr><td><code>--json</code></td><td>Machine-readable; per-subcommand flag, matching existing convention</td></tr>
+</table>
+</div>
+
+<pre><code>$ sm usage 320 --include-children
+seat 320 (a4af4272) · claude:primary · max_20x · model opus
+
+  window                 self     +children      account     headroom
+  week (all models)      2.1%          3.8%           8%       resets Sun 09:00 (5d 14h)
+  week (Fable)           0.0%          1.4%           7%
+  session (5h)           0.9%          1.6%           9%       resets 13:39 (2h 41m)
+
+  cap 28.6% of week → 13.3% consumed
+  children (4): 7f2a1c 1.1% · 9db430 0.4% · 22e0f1 0.2% · c81a55 0.0%
+  weights: fitted (n=612, rms 0.31pp) · unassigned on this account: 0.4%</code></pre>
+
+<pre><code>$ sm children --usage
+review-bot   (7f2a1c) | codex-fork | running   | sol   | 4.2% wk
+docs-writer  (9db430) | claude     | idle      | sonnet| 0.4% wk
+scout        (22e0f1) | codex-fork | running   | luna  | 0.1% wk</code></pre>
+
+<h2>F · Failure modes</h2>
+<div class="tw">
+<table>
+  <tr><th>Condition</th><th>Behaviour</th></tr>
+  <tr><td><code>~/.claude.json</code> unreadable or shape changed</td><td>Fall back to statusLine samples; if those are also stale &gt; 10 min, report <code>unknown</code> with the last-known value and its age. Never print a confident number from stale data</td></tr>
+  <tr><td>No burn sample for a window</td><td>Report token totals and share only; omit the percentage</td></tr>
+  <tr><td>Weight fit ill-conditioned</td><td>Hold the prior; label output <code>prior</code>; surface the condition number in <code>--json</code></td></tr>
+  <tr><td>Overall cap changes mid-window (promo starts/ends, plan change, provider adjustment)</td><td>Close the current fit segment and open a new one; discard any Δ straddling the boundary. Detect via promo notice, <code>organizationRateLimitTier</code> change, or a burn percentage that decreases without a reset</td></tr>
+  <tr><td>Scoped model changes (premium slot re-pointed, or plan differs)</td><td>Read <code>scope.model.display_name</code> per sample; never assume the premium family. If the scoped model changes, close the segment</td></tr>
+  <tr><td>Plan has no premium inclusion (Pro, Standard Team)</td><td>No sub-cap exists; the exact premium derivation does not apply. Fall back to fitting that family like any other</td></tr>
+  <tr><td>Scoped meter at 100% while overall has headroom</td><td>Expected, not an error. Report the seat as blocked-on-scoped with the overall headroom shown separately, since switching models or paying credits both unblock it</td></tr>
+  <tr><td>Account switch mid-window</td><td>Each account's window tracked independently; a seat can hold burn on two accounts in one calendar week</td></tr>
+  <tr><td>New account, no history</td><td>Report normally — burn is measured, not fitted; only the weights need warm-up, and they carry over across accounts of the same provider</td></tr>
+  <tr><td>Seat's transcript missing</td><td>Tokens fall to <code>unassigned</code>; the seat is flagged <code>unmapped</code></td></tr>
+  <tr><td>Two seats in one cwd, both missing <code>transcript_path</code></td><td>Do not guess — both go to <code>unassigned</code></td></tr>
+  <tr><td>Codex thread has token events before any <code>thread/settings/updated</code></td><td>Fall back to <code>SessionRecord.model</code>, then the launch-config default; mark the bucket <code>model_inferred</code> so the fit can down-weight it</td></tr>
+  <tr><td>Clock skew between message timestamps and poll times</td><td>Half-open intervals with recorded uncertainty; a message inside an uncertainty window attributes to the earlier account and is flagged</td></tr>
+  <tr><td>Codex <code>rate_limits</code> never arrives</td><td>Report Codex token totals without a percentage; log once per session</td></tr>
+  <tr><td>Exhaustion event seen</td><td>Write <code>window_ledger.exhausted = 1</code>; hold the last percentage rather than decaying it; use as a fit anchor</td></tr>
+  <tr><td><code>usage.db</code> corrupt</td><td>Rebuild from artefacts. Everything is a cache of on-disk truth except <code>account_timeline</code> and <code>model_weights</code>, which must be backed up</td></tr>
+</table>
+</div>
+
+<h2>G · Test plan</h2>
+
+<p><strong>Unit</strong> (inline <code>#[cfg(test)]</code>, matching crate convention):</p>
+<ul>
+  <li>Dedupe: exact-key collision; sidechain replay with inflated cache-read (assert the parent copy wins); streamed rewrite with growing totals; <code>speed</code> tiebreak.</li>
+  <li>Line filter: each of the six reject conditions; <code>&lt;synthetic&gt;</code> handling; nested vs flat <code>cache_creation</code>.</li>
+  <li>Model resolution: transcript model beats record; record beats config default; resolved value persists across a config change.</li>
+  <li>Weighting: known token vector → expected units; missing model → uniform prior plus a warning.</li>
+  <li>Fit: synthetic series with known weights recovers them within tolerance; a singular design matrix is rejected rather than solved; quantisation noise at ±0.5 pp does not bias the estimate.</li>
+  <li>Window derivation: <code>resets_at</code> + length → boundaries, across a DST transition.</li>
+  <li>Timeline join: message before / inside / after a switch; message inside the uncertainty window.</li>
+  <li>Codex sparse merge: a null field must not clear a previously-observed value; window keyed by <code>(limitId, windowDurationMins)</code> across a primary/secondary swap.</li>
+  <li>Share arithmetic: shares sum to 1.0 including <code>unassigned</code>.</li>
+</ul>
+
+<p><strong>Integration</strong> (<code>tests/read_only_http.rs</code>, real router via <code>oneshot</code>):</p>
+<ul>
+  <li><code>/hooks/context-usage</code> carrying a <code>rate_limits</code> block → a <code>burn_samples</code> row.</li>
+  <li><code>GET /sessions/{id}/usage</code> with and without <code>include_children</code>.</li>
+  <li>Chaining: two <code>Stop</code> hooks with different transcript paths → two <code>seat_sessions</code> rows, no data loss.</li>
+</ul>
+
+<p><strong>Fixture corpus:</strong> a redacted transcript set with a hand-computed expected answer, covering
+one parent, one subagent, one compaction, one resume, and two model families. This is the regression
+net for the dedupe and weighting logic.</p>
+
+<p><strong>Live check:</strong> <code>sm usage --account</code> account totals must equal
+<code>claude -p "/usage"</code> exactly — both read the same first-party number, so any disagreement is
+an ingest bug, not a modelling error.</p>
+
+<h2>H · Open questions, triaged</h2>
+
+<p><strong>None of these block execution.</strong> Every phase in Appendix I can be built and merged with
+all of them open; each either has a safe default already specified or affects only the accuracy of a
+number the design labels as fitted. They are listed with what it would take to close them.</p>
+
+<h3>H.1 Closed during spec work</h3>
+<div class="tw">
+<table>
+  <tr><th>Question</th><th>Answer</th></tr>
+  <tr><td>Does <code>codex exec</code> populate <code>rate_limits</code>? (An upstream issue was closed without a fix.)</td><td><strong>Yes.</strong> Probed on the installed build: a rollout with <code>originator: codex_exec</code> carries a populated <code>rate_limits</code> on its <code>token_count</code> event. The historical gap is fixed. No special-casing needed for exec-mode seats.</td></tr>
+  <tr><td>Is there any machine-readable signal for an overall-cap change?</td><td><strong>Partially, and it is enough.</strong> Promo notices live at <code>cachedGrowthBookFeatures.tengu_rate_limit_promo_notices</code> as <code>[{bar, text, variant}]</code>, where <code>bar</code> names the affected window (<code>seven_day</code>), alongside a <code>cachedGrowthBookFeaturesAt</code> timestamp. The magnitude is only in prose ("+50% weekly limits promo through Aug 19") — but the fit needs the <em>boundary</em>, not the size, so presence/absence transitions on <code>bar</code> are sufficient to segment. Keep the "burn decreased without a reset" heuristic as the backstop for changes that never appear here.</td></tr>
+</table>
+</div>
+
+<h3>H.2 Open — affects a reported number</h3>
+<div class="tw">
+<table>
+  <tr><th>Question</th><th>Impact</th><th>How to close</th></tr>
+  <tr><td><strong>Is the premium sub-cap exactly 0.50 on Max 20×?</strong> Documented as one figure for "Max plans" without separating 5× from 20×.</td><td><strong>Highest of any open item.</strong> D.3 is linear in <code>r</code>, so an error scales the premium family's share proportionally — at <code>r=0.4</code> the current 3.5-point premium contribution would read 2.8.</td><td><em>Owner can settle this in ten minutes.</em> Run a premium-only burst — a few Fable turns with no other model active — and record <code>weekly_all</code> and <code>weekly_scoped</code> before and after from <code>~/.claude.json</code>. Then <code>r ≈ Δweekly_all / Δweekly_scoped</code>. Two or three such samples pin it. Until then the code reads <code>r</code> from config with a default of 0.50 and labels the premium share <code>assumed-ratio</code>.</td></tr>
+  <tr><td><code>GET /api/oauth/usage</code> refresh cadence, which bounds worst-case staleness of <code>cachedUsageUtilization</code>.</td><td>Medium. Sets the threshold at which the report stops trusting the cache and falls back. Observed 6 minutes once; the true upper bound is unknown.</td><td>Offline: sample <code>fetchedAtMs</code> every minute for a day and take the maximum gap. Cheap, no interaction, no quota. Until then use a conservative 10-minute staleness threshold.</td></tr>
+  <tr><td>Cached-input rates for the Codex families. Input and output are multiply-sourced; the cached column is single-sourced and breaks the usual 90%-off pattern for Terra and Luna.</td><td>Low. Cached input is the cheapest bucket, and the fit corrects the prior within a window or two.</td><td><em>Owner can help:</em> OpenAI's pricing page refused anonymous fetches — one look while signed in would confirm or correct three numbers. Otherwise the fit handles it.</td></tr>
+</table>
+</div>
+
+<h3>H.3 Open — no effect on this build</h3>
+<div class="tw">
+<table>
+  <tr><th>Question</th><th>Why it does not matter yet</th></tr>
+  <tr><td>What feeds the Codex <code>premium</code> <code>limitId</code>? It appears 4 times in 93,825 events, always with null windows and no usage.</td><td>Carries no data, so nothing reads it. Worth watching: if it ever populates it becomes a second constraint on the Sol weight, exactly as the scoped meter constrains Fable.</td></tr>
+  <tr><td>The true Sol-to-Luna ratio. Base price says 25×; practice suggests nearer 100×.</td><td>The fit measures the combined rate-and-volume effect directly. The only requirement is not hard-coding either number, which D.2 already avoids.</td></tr>
+  <tr><td>Does <code>claude --resume</code> mint a new session UUID?</td><td><code>seat_sessions</code> is append-only and correct either way — a same-file resume simply produces no new row. Closable with a single probe if it ever matters.</td></tr>
+  <tr><td>Exact <code>error</code> string on a Claude usage-limit 429.</td><td>Matching is on <code>apiErrorStatus == 429</code>; the string is informational. <em>Owner can help opportunistically:</em> paste the transcript entry next time a limit is hit — this account has never recorded one.</td></tr>
+  <tr><td>OTEL attribute set on <code>claude_code.token.usage</code>.</td><td>Belongs to the future dashboard (J), not this build. Closable by enabling telemetry and inspecting one export.</td></tr>
+  <tr><td>Published per-model consumption multipliers.</td><td>Confirmed absent: Anthropic states only that the premium model "uses [your limits] faster", with no coefficient, across every source checked. Third-party 5×/10× figures appear to be back-of-envelope from list prices and should be discarded rather than used. This is precisely why the fit exists. A support ticket is the only remaining avenue and is not worth blocking on.</td></tr>
+</table>
+</div>
+
+<h2>I · Maintainer bootstrap</h2>
+
+<p>This appendix is the execution contract. A maintainer agent handed this document should be able to
+run the whole build from here without further instruction.</p>
+
+<blockquote>
+  <p><strong>Never work in the main checkout.</strong> Other agents commit and switch branches in
+  <code>/Users/rajesh/projects/session-manager</code> continuously — the reflog for 2026-08-10 alone shows
+  three branch switches and four commits inside twenty minutes, by processes unrelated to this epic.
+  Every phase runs in its own worktree. The main checkout is shared ground.</p>
+</blockquote>
+
+<h3>I.1 Branch topology</h3>
+<ol>
+  <li>Create the epic branch off current <code>main</code>: <code>epic/1182-sm-usage</code>.</li>
+  <li>Ensure this spec is on the epic branch. If it already merged to <code>main</code>, branching from <code>main</code> is sufficient and there is nothing to do; otherwise commit it as the epic branch's first commit. Either way the spec travels with the epic.</li>
+  <li>Each phase gets its own worktree branched off the epic branch: <code>1182-phase&lt;N&gt;-&lt;slug&gt;</code>, created under <code>/Users/rajesh/worktrees/</code> (the convention already in use on this machine).</li>
+  <li>Each phase opens a PR <strong>into the epic branch</strong>, never into <code>main</code>.</li>
+  <li>When every phase has merged into the epic branch, open one PR from the epic branch into <code>main</code> and run the review process on that too.</li>
+  <li>Stop there. Do not merge the epic into <code>main</code>. Report readiness to the owner and wait.</li>
+</ol>
+
+<h3>I.2 Phase order and what may run concurrently</h3>
+<p>The dependency graph is not a straight line — phases pair up, and running the pairs concurrently
+roughly halves wall-clock time. A phase may start as soon as its dependencies have <em>merged into the
+epic branch</em>, regardless of whether other phases are still in review.</p>
+
+<pre><code>  Phase 0 (chaining) ─────┐
+                          ├──▶ Phase 3 (token ledger) ──┐
+  Phase 1 (identity) ──┐  │                             ├──▶ Phase 4 (weights/fit) ──▶ Phase 5 (surfaces)
+                       └──┴──▶ Phase 2 (burn ingest) ───┘
+
+  concurrent pair 1:  Phase 0  ‖  Phase 1
+  concurrent pair 2:  Phase 2  ‖  Phase 3
+  then sequential:    Phase 4, then Phase 5</code></pre>
+
+<p>So Phase 0 and Phase 1 start together in two worktrees. When Phase 1 merges, Phase 2 may begin even
+while Phase 0 is still in review; when Phase 0 merges, Phase 3 may begin. Phase 4 needs both 2 and 3
+merged. Do not start a phase whose dependency is merely "in review" — the ledger schema is shared and
+rebasing half-built phases onto a changed schema costs more than the wait.</p>
+
+<h3>I.3 Review protocol per phase</h3>
+<p>Follow <code>docs/working/pr_review_process.md</code> independently for each phase PR, with these
+epic-specific rules layered on top:</p>
+
+<ul>
+  <li><strong>Only <code>P1</code> items force a re-review.</strong> This matches the existing exit criteria: unresolved <code>P1</code> means exit criteria are not met; <code>P2</code> or lower means they are met.</li>
+  <li><strong>Do not loop on <code>P2</code>s.</strong> A review that comes back with only <code>P2</code>/<code>P3</code> items — or a second review that is again <code>P2</code>-only — is an exit, not another cycle. Fix what is cheap, then merge.</li>
+  <li><strong>Carry the rest forward.</strong> Unfixed <code>P2</code>/<code>P3</code> items fold into the next phase's scope. Record them in the epic PR description so nothing is silently dropped.</li>
+  <li>Prefer <code>sm request-codex-review &lt;pr-number&gt;</code> and let Session Manager wake you, rather than polling.</li>
+  <li>On merge: delete the phase branch, remove its worktree, return to the epic branch.</li>
+</ul>
+
+<h3>I.4 Interruption protocol</h3>
+<p>Workflow breakage outside this epic — a broken build on <code>main</code>, a failing service, anything
+blocking other agents — <strong>outranks the epic</strong>. When it happens:</p>
+
+<ol>
+  <li>Stash or commit work-in-progress on the current phase branch. Leave the worktree in place; do not delete it.</li>
+  <li><strong>Write a handoff before touching the breakage.</strong> Not after — the interruption is exactly when context is most likely to be lost.</li>
+  <li>Fix the breakage.</li>
+  <li>Re-read the handoff, re-enter the worktree, resume.</li>
+</ol>
+
+<p>The handoff must survive <em>repeated</em> compaction — the maintainer may compact several times while
+working an unrelated fire. Write it to
+<code>~/.local/share/claude-sessions/handoffs/1182-epic-&lt;YYYYMMDD-HHMM-tz&gt;.md</code>, matching the
+existing convention on this machine. Rewrite the file — do not append — so the newest one is always
+complete on its own. It must state:</p>
+
+<blockquote>
+  <p><strong>Do not use <code>sm handoff</code> for this.</strong> That command clears the session's context
+  and hands it the document — it is a context-reset tool, not a bookmark. Using it mid-phase would
+  discard the working state this file exists to protect.</p>
+  <p><strong>Re-reading is self-enforced.</strong> Nothing replays the handoff automatically; the maintainer
+  has to remember to open it after the interruption and resume from it. Treat that as a standing
+  obligation, and re-read before touching the phase branch, not after starting work on it.</p>
+  <p><strong>The two failure modes are not symmetric — bias hard toward writing.</strong> Forgetting to
+  re-read is recoverable: the file is on disk and the owner can point at it. Forgetting to <em>write</em>
+  one is not — once context is gone the state cannot be reconstructed by anyone. So write the handoff
+  even when the interruption looks trivial and even when you expect to be back in a minute. A redundant
+  handoff costs a few seconds; a missing one costs the epic.</p>
+</blockquote>
+
+<ul>
+  <li>Epic branch name, and the exact commit the epic branch is at.</li>
+  <li>Every phase: not-started / in-worktree / in-review / merged, with its PR number and worktree path.</li>
+  <li>The phase currently in hand, what was done, and the precise next action.</li>
+  <li>Carried-forward <code>P2</code>/<code>P3</code> items not yet folded in.</li>
+  <li>Anything learned that contradicts this spec — that is the highest-value line in the file.</li>
+</ul>
+
+<h3>I.5 Definition of done per phase</h3>
+<ul>
+  <li>Tests from Appendix G covering that phase pass, including the fixture corpus where it applies.</li>
+  <li><code>cargo test</code> is green from the repo root.</li>
+  <li>The server was restarted <strong>only</strong> via <code>scripts/restart-rust-server.sh</code>. Hand-rolling <code>cargo build</code> plus <code>launchctl kickstart</code> has taken the service down before — launchd pins a launch constraint into the job registration that only re-registration clears (<code>specs/1134_rust_restart_procedure.md</code>).</li>
+  <li>No change to <code>sessions.json</code> write paths beyond the two new optional fields.</li>
+  <li>Phase 5 additionally: <code>sm usage --account</code> totals equal <code>claude -p "/usage"</code> exactly.</li>
+</ul>
+
+<h3>I.6 Stop condition</h3>
+<p>After the epic → <code>main</code> PR has met exit criteria, <strong>stop and tell the owner it is
+ready</strong>. Do not merge to <code>main</code>, do not deploy, do not enable the feature in
+<code>config.yaml</code>. The owner takes it from there.</p>
+
+<h2>J · Future: analysis and dashboards</h2>
+
+<p>Out of scope for this build. Recorded so the schema does not have to be rebuilt to support it.</p>
+
+<h3>J.1 What is already paid for</h3>
+<p>Four choices in Appendix B exist for this and cost nothing now:</p>
+<div class="tw">
+<table>
+  <tr><th>Choice</th><th>Enables later</th></tr>
+  <tr><td><code>burn_samples</code> append-only, every sample kept</td><td>Burn-over-time curves; "how fast did we spend the week"; velocity alerts</td></tr>
+  <tr><td><code>seat_tokens.bucket_ts</code> at minute granularity</td><td>Any time series — per seat, per model, per project — without re-parsing transcripts</td></tr>
+  <tr><td><code>project_key</code> on every row</td><td>Per-project rollups across shared accounts, worktree-safe</td></tr>
+  <tr><td><code>seat_meta</code> + <code>root_seat_id</code></td><td>Readable history after seats retire; subtree rollups as one indexed scan</td></tr>
+</table>
+</div>
+<p>The only additional discipline required now is <strong>retention</strong>: do not prune
+<code>burn_samples</code> or <code>seat_tokens</code> on a short horizon. They are small — a year of
+minute buckets across a few hundred seats is tens of megabytes — and they are the entire dataset any
+later analysis would want. Prune <code>seen_messages</code> instead, which is the only table that grows
+without analytical value.</p>
+
+<h3>J.2 Questions the data will already answer</h3>
+<ul>
+  <li>Burn rate per project per week, and which project is growing.</li>
+  <li>Cost per seat-hour by model family — the empirical version of "is Sol worth it here".</li>
+  <li>Whether a seat's burn is front-loaded or steady, which distinguishes a runaway loop from steady work.</li>
+  <li>Fitted weights over time: if <code>w<sub>fable</sub></code> moves, provider quota weighting changed underneath us.</li>
+  <li>Unassigned share trend — the health metric for whether work is escaping <code>sm</code>.</li>
+</ul>
+
+<h3>J.3 Sketch</h3>
+<p>A single page served from the existing HTTP surface, reading <code>usage.db</code> directly. No new
+storage, no new ingest.</p>
+
+<pre><code>┌─ account: claude:primary ────────── max_20x ── week resets Sun 09:00 ─┐
+│  8%  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  weekly (all)   │
+│  7%  ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  weekly (Fable) │
+│  9%  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  session (5h)   │
+│                                                                       │
+│  burn ▁▁▂▂▃▃▄▄▄▅▅▆▆▆▇▇  ← 7d, one point per hour                     │
+├───────────────────────────────────────────────────────────────────────┤
+│  by project          by model            top seats                    │
+│  session-mgr  4.1%   opus     5.2%       320/orch      3.8%           │
+│  fractal-algo 2.6%   fable    1.9%       review-bot    1.1%           │
+│  office-auto  0.9%   sonnet   0.5%       docs-writer   0.4%           │
+│  unassigned   0.4%                       scout         0.1%           │
+└───────────────────────────────────────────────────────────────────────┘
+  weights: fitted · n=612 · rms 0.31pp · last fit 2026-08-10 09:14</code></pre>
+
+<p>Two things worth building only when the need is real: a <strong>forecast</strong> ("at this rate the week
+exhausts Thursday 14:00"), which is a linear extrapolation of <code>burn_samples</code> and needs no new
+data; and <strong>OTEL export</strong>, since Claude Code already emits
+<code>claude_code.token.usage</code> with session and model dimensions when telemetry env vars are set at
+launch. OTEL would give real-time streaming without the scan, but carries no quota metric of its own —
+it complements this ledger rather than replacing it, because the account burn percentage still has to
+come from the surfaces in Appendix A.</p>
+
+</body>
+</html>
