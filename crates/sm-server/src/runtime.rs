@@ -495,12 +495,19 @@ impl TmuxRuntime {
             // full-screen prompt is not the bare `>` recognized by Claude's
             // prompt waiter. Require both a changed frame and a composer at the
             // live cursor row so transcript prompts cannot satisfy readiness.
-            if !self.wait_for_codex_composer(
+            while !self.wait_for_codex_composer(
                 tmux_session,
                 pre_reset_pane.as_deref(),
                 Duration::from_secs(10),
             ) {
-                anyhow::bail!("timed out waiting for Codex composer after /new");
+                // `/new` has already destroyed the prior turn, so returning to
+                // the event monitor here would deadlock the handoff: no old
+                // turn remains to emit another completion. Keep the input lock
+                // and retry readiness until the new composer appears, unless
+                // the tmux session itself has gone away.
+                if !self.session_exists(tmux_session)? {
+                    return Ok(false);
+                }
             }
         } else {
             let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(5.0));
