@@ -371,6 +371,7 @@ impl AppState {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let session_store = SessionStore::new_with_queue(state_file, queue_db_path)
+            .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_context_monitor_config(config.context_monitor.clone())
             .with_delivery_runtime(
                 config
