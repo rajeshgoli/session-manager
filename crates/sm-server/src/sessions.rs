@@ -1125,17 +1125,23 @@ impl SessionStore {
             "/clear"
         };
         let codex_cli_clear_binding = (provider == "codex").then(|| -> Result<_> {
-            let record = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+            let mut record =
+                serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+            if let Some(previous_provider_resume_id) = record.provider_resume_id.as_deref() {
+                self.append_seat_session(session_id, &provider, previous_provider_resume_id, None);
+            }
+            let launched_at = OffsetDateTime::now_utc();
+            // `/new` writes under today's rollout directory, which may be far
+            // from the seat's original creation date.
+            record.created_at = launched_at
+                .format(&Rfc3339)
+                .context("failed to format Codex clear timestamp")?;
             let mut excluded_ids = claimed_provider_resume_ids;
             excluded_ids.extend(codex_cli_existing_session_ids(
                 &record,
                 &self.codex_sessions_root,
             ));
-            Ok((
-                record,
-                excluded_ids,
-                OffsetDateTime::now_utc().unix_timestamp_nanos(),
-            ))
+            Ok((record, excluded_ids, launched_at.unix_timestamp_nanos()))
         });
         let codex_cli_clear_binding = codex_cli_clear_binding.transpose()?;
         let prompt = request

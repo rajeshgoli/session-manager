@@ -16,7 +16,6 @@ use sha2::Sha256;
 use sm_server::btw::BtwStore;
 use sm_server::config::RustShadowConfig;
 use sm_server::queue::{QueueAdmissionPolicy, RetainedQueueStore};
-use sm_server::seat_sessions::SeatSessionStore;
 use sm_server::{
     config::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
@@ -14169,31 +14168,6 @@ async fn runtime_core_clear_rebinds_plain_codex_provider_session_chain() {
         .join(format!("{:02}", now.month() as u8))
         .join(format!("{:02}", now.day()));
     fs::create_dir_all(&day_dir).unwrap();
-    let write_rollout = |path: &PathBuf, id: &str, timestamp: time::OffsetDateTime| {
-        fs::write(
-            path,
-            format!(
-                "{}\n",
-                json!({
-                    "type": "session_meta",
-                    "payload": {
-                        "id": id,
-                        "cwd": working_dir.display().to_string(),
-                        "timestamp": timestamp
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap()
-                    }
-                })
-            ),
-        )
-        .unwrap();
-    };
-    write_rollout(
-        &day_dir.join("rollout-old-thread.jsonl"),
-        "old-thread",
-        now - time::Duration::seconds(1),
-    );
-
     let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let session = state["sessions"]
         .as_array_mut()
@@ -14203,10 +14177,8 @@ async fn runtime_core_clear_rebinds_plain_codex_provider_session_chain() {
         .unwrap();
     session["parent_session_id"] = json!("operator-parent");
     session["provider_resume_id"] = json!("old-thread");
+    session["created_at"] = json!("2026-07-01T12:00:00Z");
     fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-    SeatSessionStore::for_state_file(&state_file)
-        .append("clearcodex", "codex", "old-thread", None)
-        .unwrap();
 
     let new_rollout = day_dir.join("rollout-new-thread.jsonl");
     let new_working_dir = working_dir.clone();
